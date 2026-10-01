@@ -65,7 +65,7 @@ impl App {
                     ui.end_row();
 
                     ui.label("");
-                    ui.checkbox(&mut self.settings.auto_start_buffer, "Start the replay buffer when hesteclips opens");
+                    ui.checkbox(&mut self.settings.auto_start_buffer, "Start the replay buffer when HesteClips opens");
                     ui.end_row();
                 });
             });

@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="crates/app/assets/icon-1024.png" width="128" alt="hesteclips icon">
+  <img src="crates/app/assets/icon-1024.png" width="128" alt="HesteClips icon">
 </p>
 
-<h1 align="center">hesteclips</h1>
+<h1 align="center">HesteClips</h1>
 
 <p align="center">
   A fast, no-nonsense clip recorder and trimmer.<br>

@@ -1,4 +1,4 @@
-//! hesteclips — a fast, no-nonsense clip recorder.
+//! HesteClips — a fast, no-nonsense clip recorder.
 //!
 //! The app opens on your clips. A slim capture bar on top always shows what's
 //! happening (buffer armed, recording, idle) and holds the one or two buttons that
@@ -43,13 +43,13 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1040.0, 700.0])
             .with_min_inner_size([560.0, 420.0])
-            .with_title("hesteclips")
+            .with_title("HesteClips")
             .with_icon(app_icon()),
         ..Default::default()
     };
 
     eframe::run_native(
-        "hesteclips",
+        "HesteClips",
         options,
         Box::new(|cc| Ok(Box::new(App::new(cc.egui_ctx.clone())))),
     )
@@ -563,7 +563,7 @@ impl App {
             ui.set_width(ui.available_width());
             ui.colored_label(
                 ui.visuals().warn_fg_color,
-                "hesteclips needs Screen Recording permission before it can capture.",
+                "HesteClips needs Screen Recording permission before it can capture.",
             );
             ui.horizontal(|ui| {
                 if ui.button("Grant permission").clicked() {
