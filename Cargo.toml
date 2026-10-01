@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["crates/app", "crates/capture", "crates/hestefiles", "crates/media"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/Kaillr/hesteclips"
+
+# Optimize dependencies even in debug builds so capture/encode/preview stay smooth
+# while iterating. Our own crates stay fast to compile at opt-level 0.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

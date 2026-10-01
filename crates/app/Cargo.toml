@@ -1,0 +1,36 @@
+[package]
+name = "hesteclips"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "hesteclips"
+path = "src/main.rs"
+
+[dependencies]
+capture = { path = "../capture" }
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+clipboard-rs = { version = "0.3", default-features = false }
+cpal = "0.18"
+ctrlc = { version = "3.5.2", features = ["termination"] }
+dirs = "6.0.0"
+drag = "2"
+eframe = "0.36.1"
+egui = "0.36.1"
+global-hotkey = "0.8.0"
+hestefiles = { version = "0.1.0", path = "../hestefiles" }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+media = { path = "../media" }
+raw-window-handle = "0.6"
+rfd = "0.17.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+trash = "5"
+
+# macOS-only: the system share sheet (AirDrop, Messages, Mail, …).
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+objc2-foundation = { version = "0.3.2", features = ["NSArray", "NSString", "NSURL", "NSGeometry"] }
+objc2-app-kit = { version = "0.3.2", features = ["NSSharingService", "NSView", "NSResponder"] }
