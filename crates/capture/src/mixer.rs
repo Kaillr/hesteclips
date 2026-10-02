@@ -341,6 +341,26 @@ impl SourceFeed {
         st.feed(&l, &r);
     }
 
+    /// `n` frames starting at output frame `from` (silence where nothing has
+    /// arrived), without consuming them — for the meters, which look at audio
+    /// well ahead of what's being written.
+    pub(crate) fn peek(&self, from: i64, n: usize) -> Vec<[f32; 2]> {
+        let mut buf = vec![[0f32; 2]; n];
+        {
+            let st = self.st.lock().unwrap();
+            let end = from + n as i64;
+            let lo = from.max(st.out_base);
+            let hi = end.min(st.out_base + st.out.len() as i64);
+            for idx in lo..hi {
+                buf[(idx - from) as usize] = st.out[(idx - st.out_base) as usize];
+            }
+        }
+        for child in self.children.lock().unwrap().iter() {
+            add(&mut buf, &child.peek(from, n));
+        }
+        buf
+    }
+
     /// Exactly `n` frames starting at output frame `from` (silence where nothing
     /// arrived), and forget everything before `from + n`.
     pub(crate) fn take(&self, from: i64, n: usize) -> Vec<[f32; 2]> {
@@ -428,10 +448,19 @@ pub(crate) struct MixInput {
     pub track: Option<Sender<Vec<f32>>>,
 }
 
+/// How far behind real time the meters run: just enough for the sources'
+/// newest audio to have arrived.
+const METER_LAG: f64 = 0.04;
+
 /// Mix sources into tracks until `stop` is set: every 10 ms, take the span that's
-/// `latency` seconds behind now from every feed, apply volume, meter, sum the mix
+/// `latency` seconds behind now from every feed, apply volume, sum the mix
 /// (through the limiter) and send each track as interleaved 48 kHz stereo. On
 /// stop it flushes up to the current time, then drops the senders.
+///
+/// The meters don't wait for that: `latency` is there so late audio still
+/// makes it into the file (up to 300 ms while recording), which made meters
+/// lag just as far. Each tick they look ahead at audio only [`METER_LAG`] old,
+/// which the feeds still hold, and run the same volume, mix and limiter on it.
 ///
 /// `rest_track` gets the sum of sources that are in the mix without a track of
 /// their own, so the separate tracks always add up to the mix (the editor
@@ -451,9 +480,39 @@ pub(crate) fn spawn_mixer(
         let mut gains: Vec<f32> = inputs.iter().map(|i| i.channel.effective_gain()).collect();
         let mut limiter = Limiter::new();
         let mut mixed: Option<i64> = None;
+        // The meters' own position and limiter, ahead of the mix.
+        let mut metered: Option<i64> = None;
+        let mut meter_limiter = Limiter::new();
         loop {
             let stopping = stop.load(Ordering::Relaxed);
             if let Some(t0) = clock.get() {
+                let target = ((now() - t0 - METER_LAG) * RATE as f64).floor() as i64;
+                let from = metered.get_or_insert(target.max(0));
+                // Never meter what's already been written (and so is gone).
+                *from = (*from).max(mixed.unwrap_or(0));
+                while *from < target {
+                    let n = ((target - *from) as usize).min(RATE as usize / 50);
+                    let mut mix = vec![[0f32; 2]; n];
+                    for input in &inputs {
+                        let mut block = input.feed.peek(*from, n);
+                        input.channel.input.record(&block);
+                        let g = input.channel.effective_gain();
+                        for f in block.iter_mut() {
+                            f[0] *= g;
+                            f[1] *= g;
+                        }
+                        input.channel.meter.record(&block);
+                        if input.in_mix {
+                            add(&mut mix, &block);
+                        }
+                    }
+                    if live.limiter.load(Ordering::Relaxed) {
+                        let reduction = meter_limiter.process(&mut mix);
+                        live.reduction_db.fetch_max(reduction);
+                    }
+                    live.master.record(&mix);
+                    *from += n as i64;
+                }
                 let behind = if stopping { 0.0 } else { latency };
                 let target = ((now() - t0 - behind) * RATE as f64).floor() as i64;
                 let from = mixed.get_or_insert(0);
@@ -463,7 +522,6 @@ pub(crate) fn spawn_mixer(
                     let mut rest = vec![[0f32; 2]; if rest_track.is_some() { n } else { 0 }];
                     for (input, gain) in inputs.iter().zip(gains.iter_mut()) {
                         let mut block = input.feed.take(*from, n);
-                        input.channel.input.record(&block);
                         // Ramp to the new volume across the block so fader moves don't click.
                         let target_gain = input.channel.effective_gain();
                         for (k, f) in block.iter_mut().enumerate() {
@@ -472,7 +530,6 @@ pub(crate) fn spawn_mixer(
                             f[1] *= g;
                         }
                         *gain = target_gain;
-                        input.channel.meter.record(&block);
                         if input.in_mix {
                             add(&mut mix, &block);
                             if input.track.is_none() {
@@ -484,10 +541,8 @@ pub(crate) fn spawn_mixer(
                         }
                     }
                     if live.limiter.load(Ordering::Relaxed) {
-                        let reduction = limiter.process(&mut mix);
-                        live.reduction_db.fetch_max(reduction);
+                        limiter.process(&mut mix);
                     }
-                    live.master.record(&mix);
                     if let Some(tx) = &mix_track {
                         let _ = tx.send(interleave(&mix));
                     }
@@ -597,6 +652,16 @@ mod tests {
         b.push(1000.01, &vec![0.5; 960], 2);
         a.push(1000.01, &vec![0.25; 960], 2);
         assert!(feed.take(480, 480).iter().all(|f| (f[0] - 0.25).abs() < 1e-6));
+    }
+
+    #[test]
+    fn peek_reads_ahead_without_consuming() {
+        let feed = SourceFeed::new(RATE, clock_at_zero());
+        feed.push(1000.0, &vec![0.5; 960], 2); // 10 ms
+        assert!(feed.peek(0, 480).iter().all(|f| f[0] == 0.5));
+        assert!(feed.peek(240, 480)[..240].iter().all(|f| f[0] == 0.5), "still there");
+        assert!(feed.peek(240, 480)[240..].iter().all(|f| f[0] == 0.0), "silence past what arrived");
+        assert!(feed.take(0, 480).iter().all(|f| f[0] == 0.5), "peeking took nothing");
     }
 
     #[test]

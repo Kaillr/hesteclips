@@ -166,11 +166,36 @@ fn start_mic(name: &str, feed: Arc<SourceFeed>) -> Result<cpal::Stream> {
             let start = info.timestamp().capture.as_nanos() as f64 / 1e9;
             feed.push(start, data, channels);
         },
-        |e| eprintln!("microphone error: {e}"),
+        quiet_xruns(name.to_owned()),
         None,
     )?;
     stream.play()?;
     Ok(stream)
+}
+
+/// The mic's error handler. Windows marks the first packets after a stream
+/// starts as a gap (an "underrun or overrun"), which isn't lost audio: that's
+/// ignored. A real dropout later — the mic's buffer filled before it was read,
+/// usually because the PC was too busy — is reported, at most once a minute.
+fn quiet_xruns(name: String) -> impl FnMut(cpal::Error) + Send + 'static {
+    let started = std::time::Instant::now();
+    let mut dropouts = 0u32;
+    let mut reported: Option<std::time::Instant> = None;
+    move |e| {
+        if !matches!(e.kind(), cpal::ErrorKind::Xrun) {
+            eprintln!("microphone \"{name}\": {e}");
+            return;
+        }
+        if started.elapsed() < std::time::Duration::from_secs(1) {
+            return;
+        }
+        dropouts += 1;
+        if reported.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(60)) {
+            eprintln!("microphone \"{name}\": {dropouts} short dropout(s) — it wasn't read in time (the PC was busy)");
+            reported = Some(std::time::Instant::now());
+            dropouts = 0;
+        }
+    }
 }
 
 /// Captures sources only to drive the meters (nothing is written anywhere).
