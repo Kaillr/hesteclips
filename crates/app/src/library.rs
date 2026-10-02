@@ -101,6 +101,7 @@ enum Action {
     SelectAll,
     Deselect,
     TrashSelected,
+    CancelUpload(PathBuf),
 }
 
 enum Card<'a> {
@@ -226,6 +227,11 @@ impl App {
                 self.selection.paths = self.clips.iter().map(|c| c.path.clone()).collect();
             }
             Some(Action::Deselect) => self.selection.clear(),
+            Some(Action::CancelUpload(p)) => {
+                if let Some(up) = self.cloud.upload_for(&p) {
+                    up.cancel();
+                }
+            }
             Some(Action::TrashSelected) => {
                 // In library order, so the toast and any failure read naturally.
                 let paths: Vec<PathBuf> = self.clips.iter().filter(|c| self.selection.paths.contains(&c.path)).map(|c| c.path.clone()).collect();
@@ -450,6 +456,13 @@ impl App {
             p.text(thumb_rect.center() + Vec2::new(0.0, 14.0), Align2::CENTER_CENTER, format!("Saving edit  {:.0}%", f * 100.0), FontId::proportional(14.0), Color32::WHITE);
             progress_bar(p, thumb_rect, f, ACCENT);
             ui.ctx().request_repaint();
+        } else if let Some(up) = self.cloud.upload_for(&clip.path) {
+            // Uploading: a slim bar along the bottom and a label, without hiding the clip.
+            let f = up.progress();
+            let label = if up.merging() { "Finishing upload…".to_owned() } else { format!("☁ Uploading  {:.0}%", f * 100.0) };
+            badge(p, thumb_rect.left_top() + Vec2::new(6.0, 6.0), Align2::LEFT_TOP, &label, Color32::from_black_alpha(190));
+            progress_bar(p, thumb_rect, f, ACCENT);
+            ui.ctx().request_repaint();
         } else if is_new && !selecting && !hovered {
             badge(p, thumb_rect.left_top() + Vec2::new(6.0, 6.0), Align2::LEFT_TOP, "NEW", ACCENT);
         }
@@ -570,6 +583,7 @@ impl App {
             });
         }
         let n = self.selection.paths.len();
+        let uploading = self.cloud.upload_for(&clip.path).is_some();
         resp.context_menu(|ui| {
             ui.set_min_width(190.0);
             // Right-clicking one of several selected clips acts on all of them.
@@ -595,7 +609,11 @@ impl App {
                 action = Some(Action::Select { path: clip.path.clone(), range: false });
             }
             ui.separator();
-            if let Some(a) = share_menu(ui, clip, ui.ctx().pointer_latest_pos().unwrap_or_default()) {
+            if uploading {
+                if ui.button("✕  Cancel upload").clicked() {
+                    action = Some(Action::CancelUpload(clip.path.clone()));
+                }
+            } else if let Some(a) = share_menu(ui, clip, ui.ctx().pointer_latest_pos().unwrap_or_default()) {
                 action = Some(a);
             }
             ui.separator();

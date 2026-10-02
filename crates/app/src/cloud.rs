@@ -1,14 +1,17 @@
 //! HesteFiles integration: the account token (kept in the OS keychain), the default
-//! clips folder (kept in a small config file), and a folders-only browser used both
-//! to pick that default and to pick a one-off folder when sharing.
+//! clips folder (kept in a small config file), a folders-only browser used both
+//! to pick that default and to pick a one-off folder when sharing, and uploads,
+//! which run in the background with their progress shown on the clip's card.
 //!
 //! Network calls run on short-lived threads; results come back over a channel that
 //! `poll` drains each frame, so the UI never blocks on the server.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
 
-use hestefiles::{Account, BaseFolder, Client};
+use hestefiles::{Account, BaseFolder, Client, UploadProgress};
 use serde::{Deserialize, Serialize};
 
 const KEYCHAIN_SERVICE: &str = "hesteclips";
@@ -81,6 +84,41 @@ enum Evt {
     Validated { client: Client, result: Result<Account, String> },
     BaseFolders(Result<Vec<BaseFolder>, String>),
     Dir { at: FolderRef, result: Result<(Vec<String>, bool), String> },
+    Uploaded { id: u64, result: Result<(), String> },
+}
+
+/// A clip on its way to HesteFiles.
+pub struct Upload {
+    id: u64,
+    /// The clip in the library.
+    pub clip: PathBuf,
+    pub to: FolderRef,
+    /// 0..=1 as f32 bits, written by the upload thread.
+    progress: Arc<AtomicU32>,
+    /// The server is joining the chunks (the last few percent).
+    merging: Arc<AtomicBool>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl Upload {
+    pub fn progress(&self) -> f32 {
+        f32::from_bits(self.progress.load(Ordering::Relaxed))
+    }
+
+    pub fn merging(&self) -> bool {
+        self.merging.load(Ordering::Relaxed)
+    }
+
+    pub fn cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+/// How an upload ended, for the app to tell the user.
+pub enum UploadDone {
+    Uploaded { clip: PathBuf, to: FolderRef },
+    Failed { clip: PathBuf, error: String },
+    Cancelled { clip: PathBuf },
 }
 
 /// Folders-only browser state. `at == None` is the top level: the list of base
@@ -101,6 +139,9 @@ pub struct Cloud {
     pub token_input: String,
     pub default_folder: Option<FolderRef>,
     pub browser: FolderBrowser,
+    pub uploads: Vec<Upload>,
+    next_upload: u64,
+    finished: Vec<UploadDone>,
     ctx: egui::Context,
     tx: Sender<Evt>,
     rx: Receiver<Evt>,
@@ -121,13 +162,22 @@ impl Cloud {
             token_input: String::new(),
             default_folder: config.default_folder,
             browser: FolderBrowser::default(),
+            uploads: Vec::new(),
+            next_upload: 0,
+            finished: Vec::new(),
             ctx,
             tx,
             rx,
         };
+        cloud.connection = Connection::Connecting;
+        // Dev aid: `HESTEFILES_TOKEN=…` connects with that token, skipping the
+        // keychain (and its password prompt on every rebuild).
+        if let Ok(token) = std::env::var("HESTEFILES_TOKEN") {
+            cloud.connect(&token);
+            return cloud;
+        }
         // Reading the keychain can block on a system permission prompt, so never do
         // it on the UI thread.
-        cloud.connection = Connection::Connecting;
         cloud.spawn(|| Evt::StoredToken(keychain().and_then(|k| k.get_password().ok())));
         cloud
     }
@@ -179,7 +229,8 @@ impl Cloud {
                 Evt::StoredToken(None) => self.connection = Connection::Disconnected,
                 Evt::Validated { client, result } => match result {
                     Ok(account) => {
-                        if let Some(k) = keychain() {
+                        let from_env = std::env::var("HESTEFILES_TOKEN").is_ok_and(|t| t.trim() == client.token());
+                        if let (false, Some(k)) = (from_env, keychain()) {
                             let _ = k.set_password(client.token());
                         }
                         self.client = Some(client);
@@ -194,8 +245,55 @@ impl Cloud {
                     self.browser.listing = Some(result);
                 }
                 Evt::Dir { .. } => {}
+                Evt::Uploaded { id, result } => {
+                    let Some(i) = self.uploads.iter().position(|u| u.id == id) else { continue };
+                    let up = self.uploads.remove(i);
+                    self.finished.push(match result {
+                        Ok(()) => UploadDone::Uploaded { clip: up.clip, to: up.to },
+                        Err(_) if up.cancel.load(Ordering::Relaxed) => UploadDone::Cancelled { clip: up.clip },
+                        Err(error) => UploadDone::Failed { clip: up.clip, error },
+                    });
+                }
             }
         }
+    }
+
+    /// Start uploading `clip` into `to` in the background. Its progress shows on
+    /// the clip's card; how it ended comes back from [`Cloud::take_finished`].
+    pub fn upload(&mut self, clip: PathBuf, to: FolderRef) {
+        let Some(client) = self.client.clone() else { return };
+        let id = self.next_upload;
+        self.next_upload += 1;
+        let (progress, merging, cancel) = (Arc::new(AtomicU32::new(0)), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        self.uploads.push(Upload { id, clip: clip.clone(), to: to.clone(), progress: progress.clone(), merging: merging.clone(), cancel: cancel.clone() });
+        let ctx = self.ctx.clone();
+        self.spawn(move || {
+            let name = clip.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let result = client
+                .upload(&clip, &to.base_id, &to.path, &name, &cancel, |p| {
+                    // Sending is ~95% of the bar; the server's merge fills the rest.
+                    let f = match p {
+                        UploadProgress::Sending { sent, total } => 0.95 * sent as f32 / total.max(1) as f32,
+                        UploadProgress::Merging { percent } => {
+                            merging.store(true, Ordering::Relaxed);
+                            0.95 + 0.05 * percent as f32 / 100.0
+                        }
+                    };
+                    progress.store(f.to_bits(), Ordering::Relaxed);
+                    ctx.request_repaint();
+                })
+                .map_err(|e| e.to_string());
+            Evt::Uploaded { id, result }
+        });
+    }
+
+    pub fn upload_for(&self, clip: &std::path::Path) -> Option<&Upload> {
+        self.uploads.iter().find(|u| u.clip == clip)
+    }
+
+    /// Uploads that ended since the last call.
+    pub fn take_finished(&mut self) -> Vec<UploadDone> {
+        std::mem::take(&mut self.finished)
     }
 
     /// Reset the browser and open it at `start` (or the top level).

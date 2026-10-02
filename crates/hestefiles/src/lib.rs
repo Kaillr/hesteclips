@@ -5,10 +5,14 @@
 //! regardless of HTTP status, so we always parse the body and map `error` to
 //! [`Error::Api`].
 //!
-//! The API is read-only for now (validate token, list folders). Upload lands when
-//! the server exposes it.
+//! Uploads are chunked: `prepare_upload` reserves the file, each chunk (at most
+//! 2 MB) is posted on its own, then `merge_chunks` starts a background job that
+//! joins them, polled with `get_merge_status`. See [`Client::upload`].
 
-use std::time::Duration;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -25,6 +29,10 @@ pub enum Error {
     Http(#[from] ureq::Error),
     #[error("unexpected response from server")]
     Malformed,
+    #[error("couldn't read the file: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("upload cancelled")]
+    Cancelled,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -80,6 +88,18 @@ pub struct Directory {
     pub folders: Vec<FolderEntry>,
     pub files: Vec<FileEntry>,
     pub read_only: bool,
+}
+
+/// Largest chunk the server accepts.
+pub const MAX_CHUNK: u64 = 2 * 1024 * 1024;
+
+/// Where an upload is, for progress display.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum UploadProgress {
+    /// Bytes sent so far, of the file's size.
+    Sending { sent: u64, total: u64 },
+    /// All chunks are up; the server is joining them (0..=100).
+    Merging { percent: u8 },
 }
 
 /// One authenticated connection to a HesteFiles server. Calls block; run them off
@@ -155,6 +175,164 @@ impl Client {
             files: resp.directory_list.files,
             read_only: resp.read_only,
         })
+    }
+
+    /// Upload `file` into `path` of `base_folder_id`, named `filename`. The server
+    /// keeps both if the name is taken (the new one gets " - Copy (1)").
+    ///
+    /// `progress` is called as chunks go up and while the server merges them;
+    /// setting `cancel` stops between chunks. A chunk that fails for a network
+    /// reason is retried a few times before giving up.
+    pub fn upload(
+        &self,
+        file: &Path,
+        base_folder_id: &str,
+        path: &str,
+        filename: &str,
+        cancel: &AtomicBool,
+        mut progress: impl FnMut(UploadProgress),
+    ) -> Result<()> {
+        let mut f = std::fs::File::open(file)?;
+        let size = f.metadata()?.len();
+        let chunk = self.chunk_size().unwrap_or(MAX_CHUNK);
+
+        #[derive(Serialize)]
+        struct Prepare<'a> {
+            filename: &'a str,
+            base_folder_id: &'a str,
+            path: &'a str,
+            size: u64,
+            chunk_size: u64,
+        }
+        #[derive(Deserialize)]
+        struct Prepared {
+            upload_id: String,
+            total_chunks: u64,
+        }
+        let prepared: Prepared = self.parse(
+            self.agent
+                .post(format!("{}/prepare_upload", self.base_url))
+                .header("X-AccountToken", &self.token)
+                .send_json(Prepare { filename, base_folder_id, path: path.trim_matches('/'), size, chunk_size: chunk })?,
+        )?;
+
+        // The server doesn't check chunk sizes, so send exactly `chunk` bytes
+        // each (the last one shorter): a short chunk would silently truncate.
+        let mut buf = vec![0u8; chunk as usize];
+        let mut sent = 0u64;
+        progress(UploadProgress::Sending { sent, total: size });
+        for index in 0..prepared.total_chunks {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(Error::Cancelled);
+            }
+            let start = index * chunk;
+            let len = chunk.min(size - start) as usize;
+            f.seek(SeekFrom::Start(start))?;
+            f.read_exact(&mut buf[..len])?;
+            self.send_chunk(&prepared.upload_id, index, &buf[..len])?;
+            sent += len as u64;
+            progress(UploadProgress::Sending { sent, total: size });
+        }
+
+        #[derive(Deserialize)]
+        struct Merge {
+            task_id: String,
+        }
+        let merge: Merge = self.parse(
+            self.agent
+                .get(format!("{}/merge_chunks", self.base_url))
+                .query("ui", &prepared.upload_id)
+                .header("X-AccountToken", &self.token)
+                .call()?,
+        )?;
+        #[derive(Deserialize)]
+        struct Status {
+            percent: f64,
+            error: bool,
+            done: bool,
+        }
+        let started = Instant::now();
+        loop {
+            let status: Status = self.parse(
+                self.agent
+                    .get(format!("{}/get_merge_status", self.base_url))
+                    .query("ti", &merge.task_id)
+                    .header("X-AccountToken", &self.token)
+                    .call()?,
+            )?;
+            if status.error {
+                return Err(Error::Api { code: "MERGE_FAILED".into(), message: "The server couldn't put the file together.".into() });
+            }
+            progress(UploadProgress::Merging { percent: status.percent.clamp(0.0, 100.0) as u8 });
+            if status.done {
+                return Ok(());
+            }
+            // Merging is quick (a few MB a second at worst); don't wait forever.
+            if started.elapsed() > Duration::from_secs(600) {
+                return Err(Error::Api { code: "MERGE_TIMEOUT".into(), message: "The server took too long to finish the upload.".into() });
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
+
+    /// The server's recommended chunk size for this connection, from a short
+    /// speed test. Smaller chunks on slow links make progress smoother and a
+    /// failed chunk cheaper to resend.
+    fn chunk_size(&self) -> Result<u64> {
+        let sample = vec![0u8; 512 * 1024];
+        let t = Instant::now();
+        self.agent
+            .post(format!("{}/test_upload_speed", self.base_url))
+            .header("X-AccountToken", &self.token)
+            .header("Content-Type", "application/octet-stream")
+            .send(&sample[..])?;
+        let mbps = (sample.len() as f64 * 8.0) / t.elapsed().as_secs_f64().max(1e-3) / 1e6;
+        #[derive(Serialize)]
+        struct Req {
+            mbps: f64,
+        }
+        #[derive(Deserialize)]
+        struct Resp {
+            chunk_bytes: u64,
+        }
+        let r: Resp = self.parse(
+            self.agent
+                .post(format!("{}/get_recommended_chunk_size", self.base_url))
+                .header("X-AccountToken", &self.token)
+                .send_json(Req { mbps })?,
+        )?;
+        Ok(r.chunk_bytes.clamp(64 * 1024, MAX_CHUNK))
+    }
+
+    fn send_chunk(&self, upload_id: &str, index: u64, bytes: &[u8]) -> Result<()> {
+        let mut attempt = 0;
+        loop {
+            let result = self
+                .agent
+                .post(format!("{}/upload_chunk", self.base_url))
+                .query("ui", upload_id)
+                .query("ci", index.to_string())
+                .header("X-AccountToken", &self.token)
+                .header("Content-Type", "application/octet-stream")
+                // 2 MB at 0.5 Mbit/s is ~35 s: well past the 15 s used for the
+                // small JSON calls.
+                .config()
+                .timeout_global(Some(Duration::from_secs(120)))
+                .build()
+                .send(bytes)
+                .map_err(Error::from)
+                .and_then(|r| self.parse::<serde_json::Value>(r));
+            match result {
+                Ok(_) => return Ok(()),
+                // Network trouble or a server hiccup: try again. A clear "no"
+                // from the API won't change by retrying.
+                Err(Error::Http(_) | Error::Malformed) if attempt < 3 => {
+                    attempt += 1;
+                    std::thread::sleep(Duration::from_millis(500 * attempt));
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     fn get<T: DeserializeOwned>(&self, endpoint: &str) -> Result<T> {
