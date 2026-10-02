@@ -69,7 +69,8 @@ use crate::aac::AacEncoder;
 use crate::mixer::{self, Channel, Clock, LiveAudio, SourceFeed, SourceStatus};
 use crate::output::{in_progress, timestamp};
 use crate::sources::{AudioCapture, AudioSource, SourceKind, mix_inputs, track_layout};
-use crate::writer::{self, Layout, Media, SendFormat, SendSample, Writer};
+use crate::avwriter::{SendFormat, SendSample};
+use crate::writer::{self, Layout, Media, Writer};
 use crate::{EncodeSettings, Mode, Recorder};
 
 /// AAC bitrate per audio track.
@@ -886,7 +887,7 @@ unsafe extern "C-unwind" fn on_encoded(
     let key = is_keyframe(sample);
     let sample = unsafe { CFRetained::retain(NonNull::from(sample)) };
     if let Some(tx) = &sink.tx {
-        let _ = tx.send(writer::Command::Media(Media::Video { sample: SendSample(sample), pts, key }));
+        let _ = tx.send(writer::Command::Media(Media::Video { frame: SendSample(sample), pts, key }));
     }
 }
 

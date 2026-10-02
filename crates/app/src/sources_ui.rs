@@ -176,7 +176,7 @@ impl App {
                 }
             });
             if menu.response.clicked() {
-                self.sources_view.apps = list_apps();
+                self.sources_view.apps = capture::list_apps();
             }
             let has_desktop = self.settings.audio_sources.iter().any(|s| matches!(s.kind, SourceKind::Desktop { .. }));
             if !has_desktop && ui.button("➕ Desktop sound").clicked() {
@@ -440,17 +440,6 @@ fn card(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
         ui.set_width(ui.available_width());
         add(ui);
     });
-}
-
-fn list_apps() -> Vec<capture::Device> {
-    #[cfg(target_os = "macos")]
-    {
-        capture::macos::list_apps()
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        Vec::new()
-    }
 }
 
 fn format_db(db: f32) -> String {

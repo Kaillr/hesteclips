@@ -34,3 +34,18 @@ trash = "5"
 objc2 = "0.6.4"
 objc2-foundation = { version = "0.3.2", features = ["NSArray", "NSString", "NSURL", "NSGeometry"] }
 objc2-app-kit = { version = "0.3.2", features = ["NSSharingService", "NSView", "NSResponder"] }
+
+# Windows-only: the system Share UI, and opening files with their default app.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-collections = "0.3"
+windows-core = "0.62"
+windows-future = "0.3"
+windows = { version = "0.62", features = [
+    "ApplicationModel_DataTransfer",
+    "Foundation_Collections",
+    "Storage",
+    "Storage_Streams",
+    "Win32_Foundation",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }

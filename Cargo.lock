@@ -711,6 +711,8 @@ dependencies = [
  "objc2-screen-capture-kit",
  "objc2-video-toolbox",
  "rubato",
+ "windows 0.62.2",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -2093,6 +2095,10 @@ dependencies = [
  "serde",
  "serde_json",
  "trash",
+ "windows 0.62.2",
+ "windows-collections",
+ "windows-core 0.62.2",
+ "windows-future",
 ]
 
 [[package]]

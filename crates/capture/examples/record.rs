@@ -1,10 +1,11 @@
-//! Record with the ScreenCaptureKit backend to /tmp/hc, printing live meters.
+//! Record with this platform's backend to `<temp>/hc`, printing live meters.
 //!
 //! Args are sources: `mic:<device>`, `desktop`, `desktop-excl` (desktop minus app
-//! sources), `app:<bundle id>`. Append `@mix`, `@track` to limit where it goes
-//! (default both). Env: REPLAY=1, SECS=n, EXT=mkv, HEIGHT=n.
+//! sources), `app:<bundle id or exe>`. Append `@mix`, `@track` to limit where it
+//! goes (default both). Env: REPLAY=1, SECS=n, EXT=mov, HEIGHT=n (0 = native),
+//! FPS=n, SOFTWARE=1, SCREEN=<id>.
 use capture::sources::{AudioSource, SourceKind};
-use capture::{EncodeSettings, Mode, Recorder, SckRecorder, mixer::LiveAudio};
+use capture::{EncodeSettings, Mode, mixer::LiveAudio};
 
 fn main() -> anyhow::Result<()> {
     let sources: Vec<AudioSource> = std::env::args()
@@ -29,17 +30,22 @@ fn main() -> anyhow::Result<()> {
         .collect();
     let live = LiveAudio::new();
     let mode = if std::env::var("REPLAY").is_ok() { Mode::ReplayBuffer } else { Mode::Record };
-    let mut rec = SckRecorder::new(live.clone());
+    let mut rec = capture::default_recorder(live.clone());
+    let env = |k: &str| std::env::var(k).ok();
     rec.start(mode, &EncodeSettings {
-        output_dir: "/tmp/hc".into(),
-        container_ext: std::env::var("EXT").unwrap_or("mp4".into()),
-        fps: 60,
+        output_dir: std::env::temp_dir().join("hc"),
+        container_ext: env("EXT").unwrap_or("mp4".into()),
+        fps: env("FPS").and_then(|f| f.parse().ok()).unwrap_or(60),
         video_bitrate_kbps: 12000,
-        target_height: std::env::var("HEIGHT").ok().and_then(|h| h.parse().ok()).or(Some(720)),
+        target_height: match env("HEIGHT").and_then(|h| h.parse().ok()) {
+            Some(0) => None,
+            Some(h) => Some(h),
+            None => Some(720),
+        },
         keyframe_interval_secs: 2,
-        use_hardware: true,
+        use_hardware: env("SOFTWARE").is_none(),
         replay_seconds: 5,
-        screen_id: String::new(),
+        screen_id: env("SCREEN").unwrap_or_default(),
         sources: sources.clone(),
     })?;
     let secs: u64 = std::env::var("SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(4);

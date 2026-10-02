@@ -6,7 +6,7 @@
 //! Both are dotfiles so they stay out of the clip library; reopening the editor
 //! reads the sidecar back so every decision can be changed or reverted.
 //!
-//! Backed by the `ffmpeg`/`ffprobe` binaries.
+//! Backed by the `ffmpeg`/`ffprobe` binaries ([`ffmpeg`], [`ffprobe`]).
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -17,6 +17,35 @@ use serde::{Deserialize, Serialize};
 
 /// Sample rate audio is decoded at for preview playback and waveforms.
 pub const PREVIEW_RATE: u32 = 48_000;
+
+/// An `ffmpeg` command. See [`tool`].
+pub fn ffmpeg() -> Command {
+    tool("ffmpeg")
+}
+
+/// An `ffprobe` command. See [`tool`].
+pub fn ffprobe() -> Command {
+    tool("ffprobe")
+}
+
+/// A command for one of the ffmpeg tools: a copy shipped next to the app wins
+/// over the one on `PATH`. On Windows it runs without a console window (the
+/// app is a GUI program, so each run would otherwise flash one).
+pub fn tool(name: &str) -> Command {
+    let bundled = std::env::current_exe()
+        .ok()
+        .and_then(|exe| Some(exe.parent()?.join(name).with_extension(std::env::consts::EXE_EXTENSION)))
+        .filter(|p| p.is_file());
+    #[allow(unused_mut)]
+    let mut cmd = Command::new(bundled.as_deref().unwrap_or(Path::new(name)));
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
 
 /// Probed facts about a clip.
 #[derive(Debug, Clone)]
@@ -75,7 +104,7 @@ impl AudioStream {
 }
 
 pub fn probe(source: &Path) -> Result<ClipInfo> {
-    let out = Command::new("ffprobe")
+    let out = ffprobe()
         .args(["-v", "error", "-show_entries"])
         .arg("format=duration:format_tags=comment:stream=index,codec_type,width,height,avg_frame_rate,r_frame_rate:stream_tags=title,handler_name,name")
         .args(["-of", "json"])
@@ -303,8 +332,41 @@ pub fn load_edit(source: &Path) -> Option<Edit> {
 }
 
 pub fn save_edit(source: &Path, edit: &Edit) -> Result<()> {
-    std::fs::write(sidecar_path(source), serde_json::to_vec_pretty(edit)?)?;
+    use std::io::Write;
+    let path = sidecar_path(source);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    // Windows refuses to overwrite a hidden file unless the new one is hidden too.
+    #[cfg(windows)]
+    std::os::windows::fs::OpenOptionsExt::attributes(&mut options, FILE_ATTRIBUTE_HIDDEN);
+    options.open(&path)?.write_all(&serde_json::to_vec_pretty(edit)?)?;
     Ok(())
+}
+
+#[cfg(windows)]
+const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+
+/// Hide a dotfile on Windows, where the leading dot alone doesn't (on macOS
+/// and Linux it already does).
+fn hide(path: &Path) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        unsafe extern "system" {
+            fn GetFileAttributesW(name: *const u16) -> u32;
+            fn SetFileAttributesW(name: *const u16, attributes: u32) -> i32;
+        }
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+        // SAFETY: a NUL-terminated path that outlives both calls.
+        unsafe {
+            let current = GetFileAttributesW(wide.as_ptr());
+            if current != u32::MAX {
+                SetFileAttributesW(wide.as_ptr(), current | FILE_ATTRIBUTE_HIDDEN);
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = path;
 }
 
 /// Throw away an edit: the sidecar and the rendered file.
@@ -323,7 +385,7 @@ pub fn rendered_if_current(source: &Path) -> Option<PathBuf> {
 
 /// Decode one audio stream to interleaved stereo f32 at [`PREVIEW_RATE`].
 pub fn decode_audio(source: &Path, stream: usize) -> Result<Vec<f32>> {
-    let mut child = Command::new("ffmpeg")
+    let mut child = ffmpeg()
         .args(["-hide_banner", "-loglevel", "error", "-i"])
         .arg(source)
         .args(["-map", &format!("0:a:{stream}"), "-ac", "2", "-ar", &PREVIEW_RATE.to_string()])
@@ -359,7 +421,7 @@ fn frame(source: &Path, t: f64, width: u32, exact: bool) -> Result<Frame> {
     // Need the source size to know how many bytes come back.
     let (sw, sh) = video_size(source)?;
     let height = info_h(width, sw, sh);
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = ffmpeg();
     cmd.args(["-hide_banner", "-loglevel", "error"]);
     if !exact {
         cmd.arg("-noaccurate_seek");
@@ -381,7 +443,7 @@ fn frame(source: &Path, t: f64, width: u32, exact: bool) -> Result<Frame> {
 }
 
 fn video_size(source: &Path) -> Result<(u32, u32)> {
-    let out = Command::new("ffprobe")
+    let out = ffprobe()
         .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height"])
         .args(["-of", "csv=p=0:s=x"])
         .arg(source)
@@ -418,7 +480,7 @@ pub fn keyframe_strip(source: &Path, height: u32, mut on_frame: impl FnMut(f64, 
     for chunk in keys.chunks(per) {
         let (first, last) = (chunk[0], *chunk.last().unwrap());
         let times = chunk.to_vec();
-        let mut cmd = Command::new("ffmpeg");
+        let mut cmd = ffmpeg();
         cmd.args(["-hide_banner", "-loglevel", "error"]);
         if cfg!(target_os = "macos") {
             cmd.args(["-hwaccel", "videotoolbox"]);
@@ -466,7 +528,7 @@ pub fn keyframe_strip(source: &Path, height: u32, mut on_frame: impl FnMut(f64, 
 
 /// Presentation times of every keyframe, read from the container index.
 pub fn keyframe_times(source: &Path) -> Result<Vec<f64>> {
-    let out = Command::new("ffprobe")
+    let out = ffprobe()
         .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "packet=pts_time,flags", "-of", "csv=p=0"])
         .arg(source)
         .stdin(Stdio::null())
@@ -536,6 +598,9 @@ pub fn render_with_progress(
         let partial = hidden_sibling(dest, &format!(".rendering.{ext}"));
         mux_audio(source, info, edit, &video, &partial, &|f| progress(weights.video + f * (1.0 - weights.video)))?;
         std::fs::rename(&partial, dest)?;
+        if dest.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.')) {
+            hide(dest);
+        }
         progress(1.0);
         Ok(())
     })();
@@ -586,7 +651,7 @@ fn render_video(source: &Path, edit: &Edit, plan: &Plan, work: &Path, out: &Path
     let kbps = source_video_kbps(source).unwrap_or(20_000);
     let encode = |from: f64, to: f64, dest: &Path, progress: &dyn Fn(f32)| -> Result<()> {
         run_progress(
-            Command::new("ffmpeg")
+            ffmpeg()
                 .args(["-hide_banner", "-loglevel", "error", "-y"])
                 .args(["-ss", &format!("{from:.6}"), "-to", &format!("{to:.6}"), "-i"])
                 .arg(source)
@@ -614,7 +679,7 @@ fn render_video(source: &Path, edit: &Edit, plan: &Plan, work: &Path, out: &Path
         parts.push(path);
     }
     let path = work.join("mid.mp4");
-    run(Command::new("ffmpeg")
+    run(ffmpeg()
         .args(["-hide_banner", "-loglevel", "error", "-y"])
         .args(["-ss", &format!("{k1:.6}"), "-to", &format!("{k2:.6}"), "-i"])
         .arg(source)
@@ -631,7 +696,7 @@ fn render_video(source: &Path, edit: &Edit, plan: &Plan, work: &Path, out: &Path
     let list = work.join("parts.txt");
     let body: String = parts.iter().map(|p| format!("file '{}'\n", p.display())).collect();
     std::fs::write(&list, body)?;
-    run(Command::new("ffmpeg")
+    run(ffmpeg()
         .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "concat", "-safe", "0", "-i"])
         .arg(&list)
         .args(["-c", "copy"])
@@ -684,7 +749,7 @@ fn mux_audio(source: &Path, info: &ClipInfo, edit: &Edit, video: &Path, out: &Pa
         }
     }
 
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = ffmpeg();
     cmd.args(["-hide_banner", "-loglevel", "error", "-y", "-i"]).arg(video);
     cmd.args(["-ss", &format!("{:.6}", edit.start), "-t", &format!("{:.6}", edit.duration()), "-i"]).arg(source);
     cmd.args(["-map", "0:v:0", "-c:v", "copy"]);
@@ -753,7 +818,7 @@ fn run_progress(cmd: &mut Command, duration: f64, progress: &dyn Fn(f32)) -> Res
 
 /// Keyframe timestamps of the video stream.
 fn keyframes(source: &Path) -> Result<Vec<f64>> {
-    let out = Command::new("ffprobe")
+    let out = ffprobe()
         .args(["-v", "error", "-select_streams", "v:0", "-skip_frame", "nokey"])
         .args(["-show_entries", "frame=pts_time", "-of", "csv=p=0"])
         .arg(source)
@@ -765,19 +830,35 @@ fn keyframes(source: &Path) -> Result<Vec<f64>> {
 }
 
 fn is_h264(source: &Path) -> bool {
-    Command::new("ffprobe")
+    ffprobe()
         .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name", "-of", "csv=p=0"])
         .arg(source)
         .output()
         .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "h264")
 }
 
+/// The H.264 encoder for re-encoded cuts: the platform's hardware one on
+/// macOS; elsewhere x264 when this ffmpeg build has it (LGPL builds don't),
+/// else Media Foundation on Windows.
 fn video_encoder() -> &'static str {
-    if cfg!(target_os = "macos") { "h264_videotoolbox" } else { "libx264" }
+    static CHOSEN: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    CHOSEN.get_or_init(|| {
+        if cfg!(target_os = "macos") {
+            return "h264_videotoolbox";
+        }
+        let listed = ffmpeg()
+            .args(["-hide_banner", "-encoders"])
+            .stdin(Stdio::null())
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        let has = |name: &str| listed.split_whitespace().any(|w| w == name);
+        if !has("libx264") && cfg!(windows) && has("h264_mf") { "h264_mf" } else { "libx264" }
+    })
 }
 
 fn source_video_kbps(source: &Path) -> Option<u64> {
-    let out = Command::new("ffprobe")
+    let out = ffprobe()
         .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=bit_rate", "-of", "csv=p=0"])
         .arg(source)
         .output()
@@ -808,4 +889,36 @@ pub fn to_db(x: f32) -> f32 {
 /// dB → linear gain.
 pub fn from_db(db: f32) -> f32 {
     10f32.powf(db / 20.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Edits are saved again and again; renders replace the previous one. Both
+    /// must work when the old file is hidden (Windows).
+    #[test]
+    fn hidden_edit_files_can_be_replaced() {
+        let dir = std::env::temp_dir().join(format!("hc-media-hidden-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("clip.mp4");
+        let edit = Edit { start: 0.0, end: 1.0, tracks: Vec::new() };
+        save_edit(&clip, &edit).unwrap();
+        let again = Edit { start: 0.5, ..edit };
+        save_edit(&clip, &again).unwrap();
+        assert_eq!(load_edit(&clip).unwrap().start, 0.5);
+
+        let rendered = rendered_path(&clip);
+        for body in [b"one", b"two"] {
+            let partial = dir.join(".partial.mp4");
+            std::fs::write(&partial, body).unwrap();
+            std::fs::rename(&partial, &rendered).unwrap();
+            hide(&rendered);
+        }
+        assert_eq!(std::fs::read(&rendered).unwrap(), b"two");
+        revert(&clip);
+        assert!(!rendered.exists() && !sidecar_path(&clip).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

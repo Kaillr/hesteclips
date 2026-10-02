@@ -22,15 +22,10 @@ use objc2_core_media::{
 };
 
 use crate::mixer::RATE;
+pub use crate::writer::AacPacket;
 
 /// Frames per AAC packet.
 pub const AAC_FRAMES: usize = 1024;
-
-/// One encoded AAC packet and the frame (48 kHz sample index) it starts at.
-pub struct AacPacket {
-    pub data: Vec<u8>,
-    pub frame: i64,
-}
 
 /// Streaming stereo 48 kHz float → AAC-LC encoder.
 pub struct AacEncoder {

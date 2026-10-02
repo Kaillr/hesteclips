@@ -4,13 +4,15 @@
 //!   upload box, the desktop, an editor — a real OS file drag, so every app that
 //!   accepts dropped files accepts a clip.
 //! - **Copy**: put the file on the clipboard, then paste it anywhere (⌘V).
-//! - **Share sheet** (macOS): AirDrop, Messages, Mail, Notes, …
+//! - **Share sheet**: AirDrop, Messages, Mail, Notes, … on macOS; Nearby
+//!   Share, Mail and share-capable apps on Windows.
 //!
 //! All of these hand over the clip's *playable* file: the rendered edit when
 //! there is one, so what you share is what you see.
 
 use std::path::{Path, PathBuf};
 
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use raw_window_handle::HasWindowHandle;
 
 /// Start a native drag of `file` out of the window. The drag image is the clip's
@@ -42,7 +44,11 @@ pub fn copy_file(file: &Path) -> Result<(), String> {
 }
 
 /// Whether this platform has a system share sheet.
-pub const HAS_SHARE_SHEET: bool = cfg!(target_os = "macos");
+pub const HAS_SHARE_SHEET: bool = cfg!(any(target_os = "macos", target_os = "windows"));
+
+/// The share sheet's menu entry, naming what it offers on this platform.
+pub const SHARE_SHEET_LABEL: &str =
+    if cfg!(target_os = "macos") { "📤  AirDrop, Messages, Mail…" } else { "📤  Share (Nearby Share, Mail…)" };
 
 /// Open the macOS share sheet for `file`, anchored at `at` (window points from the
 /// top-left, as egui reports them).
@@ -73,7 +79,56 @@ pub fn share_sheet(frame: &eframe::Frame, file: &Path, at: egui::Pos2) -> Result
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
+/// Open the Windows Share UI for `file`. It's anchored by Windows, not at `at`.
+#[cfg(target_os = "windows")]
+pub fn share_sheet(frame: &eframe::Frame, file: &Path, _at: egui::Pos2) -> Result<(), String> {
+    use std::cell::Cell;
+
+    use raw_window_handle::RawWindowHandle;
+    use windows::ApplicationModel::DataTransfer::{DataRequestedEventArgs, DataTransferManager};
+    use windows::Foundation::TypedEventHandler;
+    use windows::Storage::{IStorageItem, StorageFile};
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::Shell::IDataTransferManagerInterop;
+    use windows::core::{HSTRING, Interface};
+
+    thread_local! {
+        /// The window's current DataRequested handler, replaced per share.
+        static HANDLER: Cell<Option<i64>> = const { Cell::new(None) };
+    }
+
+    let handle = frame.window_handle().map_err(|e| e.to_string())?;
+    let RawWindowHandle::Win32(h) = handle.as_raw() else {
+        return Err("not a Windows window".into());
+    };
+    let hwnd = HWND(h.hwnd.get() as *mut _);
+    let err = |e: windows::core::Error| e.message();
+    // Resolved up front: the request handler runs on this (UI) thread and
+    // mustn't block on file I/O.
+    let path = std::path::absolute(file).map_err(|e| e.to_string())?;
+    let file: StorageFile =
+        StorageFile::GetFileFromPathAsync(&HSTRING::from(path.as_os_str())).and_then(|op| op.join()).map_err(err)?;
+    let file = windows::core::AgileReference::new(&file).map_err(err)?;
+    let title = HSTRING::from(path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+
+    let interop = windows::core::factory::<DataTransferManager, IDataTransferManagerInterop>().map_err(err)?;
+    // SAFETY: `hwnd` is our live top-level window, and egui calls us on its thread.
+    let manager: DataTransferManager = unsafe { interop.GetForWindow(hwnd) }.map_err(err)?;
+    if let Some(token) = HANDLER.take() {
+        let _ = manager.RemoveDataRequested(token);
+    }
+    let handler = TypedEventHandler::<DataTransferManager, DataRequestedEventArgs>::new(move |_, args| {
+        let Some(args) = args.as_ref() else { return Ok(()) };
+        let data = args.Request()?.Data()?;
+        data.Properties()?.SetTitle(&title)?;
+        let item: IStorageItem = file.resolve()?.cast()?;
+        data.SetStorageItemsReadOnly(&windows_collections::IIterable::<IStorageItem>::from(vec![Some(item)]))
+    });
+    HANDLER.set(Some(manager.DataRequested(&handler).map_err(err)?));
+    unsafe { interop.ShowShareUIForWindow(hwnd) }.map_err(err)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub fn share_sheet(_frame: &eframe::Frame, _file: &Path, _at: egui::Pos2) -> Result<(), String> {
     Err("no share sheet on this platform".into())
 }

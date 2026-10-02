@@ -19,7 +19,7 @@ impl Encoder {
         match self {
             Encoder::Auto => "Auto (best hardware)",
             Encoder::Hardware => "Hardware",
-            Encoder::Software => "Software (x264)",
+            Encoder::Software => "Software (slower, uses the CPU)",
         }
     }
 }

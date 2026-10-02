@@ -8,7 +8,7 @@
 
 use std::io::Read;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
 
 /// Proxy frame width; enough for a crisp preview while dragging.
@@ -22,7 +22,7 @@ pub struct Proxy {
 impl Proxy {
     pub fn build(ctx: &egui::Context, source: &Path, fps: f64) -> Self {
         let frames = Arc::new(Mutex::new(Vec::new()));
-        let child = Command::new("ffmpeg")
+        let child = media::ffmpeg()
             .args(["-hide_banner", "-loglevel", "error", "-i"])
             .arg(source)
             // fps= pins one output frame per source frame index, even for VFR input.

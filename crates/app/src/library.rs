@@ -481,7 +481,7 @@ fn share_menu(ui: &mut egui::Ui, clip: &clips::Clip, anchor: Pos2) -> Option<Act
     if ui.button("📋  Copy clip").on_hover_text(format!("Then paste it into Discord, a chat or a folder ({paste})")).clicked() {
         action = Some(Action::Copy(file.clone()));
     }
-    if share::HAS_SHARE_SHEET && ui.button("📤  AirDrop, Messages, Mail…").clicked() {
+    if share::HAS_SHARE_SHEET && ui.button(share::SHARE_SHEET_LABEL).clicked() {
         action = Some(Action::ShareSheet(file.clone(), anchor));
     }
     if ui.button("☁  Upload to HesteFiles…").clicked() {

@@ -10,7 +10,7 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
@@ -333,7 +333,7 @@ impl FrameStream {
     fn start(ctx: &egui::Context, source: &Path, info: &ClipInfo, t: f64) -> std::io::Result<Self> {
         let w = PREVIEW_WIDTH;
         let h = (((w as f64) * info.height as f64 / info.width.max(1) as f64 / 2.0).round() as u32 * 2).max(2);
-        let mut child = Command::new("ffmpeg")
+        let mut child = media::ffmpeg()
             .args(["-hide_banner", "-loglevel", "error", "-ss", &format!("{t:.4}"), "-i"])
             .arg(source)
             .args(["-an", "-vf", &format!("scale={w}:{h}:flags=bilinear"), "-f", "rawvideo", "-pix_fmt", "rgba", "-"])

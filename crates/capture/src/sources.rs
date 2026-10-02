@@ -22,7 +22,8 @@ pub enum SourceKind {
     /// Everything the computer plays. With `exclude_app_sources`, apps that are
     /// also added as their own source are left out, so they aren't heard twice.
     Desktop { exclude_app_sources: bool },
-    /// One application (and its helper processes), by bundle id.
+    /// One application (and its helper processes), by bundle id on macOS or
+    /// executable name (`Discord.exe`) on Windows.
     App { bundle_id: String },
 }
 
@@ -79,9 +80,14 @@ pub(crate) struct AudioCapture {
     /// One per source, in the order given.
     pub feeds: Vec<Arc<SourceFeed>>,
     mics: Vec<cpal::Stream>,
-    #[cfg(target_os = "macos")]
-    system: Option<crate::sck::SystemAudio>,
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    system: Option<SystemAudio>,
 }
+
+#[cfg(target_os = "macos")]
+use crate::sck::SystemAudio;
+#[cfg(target_os = "windows")]
+use crate::win::SystemAudio;
 
 impl AudioCapture {
     /// Start every source. A source that can't start (unplugged mic, app not
@@ -93,7 +99,7 @@ impl AudioCapture {
             .map(|s| SourceFeed::new(native_rate(&s.kind), clock.clone()))
             .collect();
         let mut mics = Vec::new();
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         let mut system_sources = Vec::new();
         for (source, feed) in sources.iter().zip(&feeds) {
             let channel = live.channel(&source.id);
@@ -108,25 +114,25 @@ impl AudioCapture {
                         channel.set_status(SourceStatus::Unavailable);
                     }
                 },
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
                 _ => system_sources.push((source.clone(), feed.clone(), channel)),
-                #[cfg(not(target_os = "macos"))]
+                #[cfg(not(any(target_os = "macos", target_os = "windows")))]
                 _ => channel.set_status(SourceStatus::Unavailable),
             }
         }
-        #[cfg(target_os = "macos")]
-        let system = if system_sources.is_empty() { None } else { Some(crate::sck::SystemAudio::start(system_sources)?) };
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        let system = if system_sources.is_empty() { None } else { Some(SystemAudio::start(system_sources)?) };
         Ok(Self {
             feeds,
             mics,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             system,
         })
     }
 
     pub(crate) fn stop(mut self) {
         self.mics.clear();
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         if let Some(system) = self.system.take() {
             system.stop();
         }
@@ -217,13 +223,18 @@ pub(crate) fn mix_inputs(
         .collect()
 }
 
-/// Host time in seconds — the clock capture timestamps (CoreAudio, SCK) use.
+/// Host time in seconds — the clock capture timestamps use (CoreAudio and SCK
+/// on macOS; QueryPerformanceCounter for WGC and WASAPI on Windows).
 pub(crate) fn host_now() -> f64 {
     #[cfg(target_os = "macos")]
     {
         crate::sck::host_now()
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        crate::win::host_now()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         use std::sync::OnceLock;
         static START: OnceLock<std::time::Instant> = OnceLock::new();

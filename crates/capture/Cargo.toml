@@ -9,8 +9,8 @@ chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 cpal = "0.18.2"
 rubato = "5.0.1"
 
-# macOS-only: native ScreenCaptureKit backend. Windows/Linux use libobs (added later),
-# so these Apple-framework bindings must not be pulled in off-macOS.
+# macOS-only: native ScreenCaptureKit backend, so these Apple-framework bindings
+# must not be pulled in elsewhere.
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6.2"
 dispatch2 = "0.3.1"
@@ -26,6 +26,39 @@ objc2-core-video = { version = "0.3.2", features = ["CVBuffer", "CVImageBuffer",
 objc2-foundation = { version = "0.3.2", features = ["NSArray", "NSString", "NSError", "NSEnumerator", "NSObject", "NSURL"] }
 objc2-screen-capture-kit = { version = "0.3.2", features = ["SCShareableContent", "SCStream", "block2", "dispatch2", "objc2-core-media", "objc2-core-graphics"] }
 objc2-video-toolbox = { version = "0.3.2", features = ["VTCompressionSession", "VTCompressionProperties", "VTSession", "VTErrors", "objc2-core-media", "objc2-core-video"] }
+
+# Windows-only: Windows Graphics Capture + Media Foundation + WASAPI backend.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-core = "0.62"
+windows = { version = "0.62", features = [
+    "Foundation",
+    "Graphics_Capture",
+    "Graphics_DirectX",
+    "Graphics_DirectX_Direct3D11",
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_Media_Audio",
+    "Win32_Media_KernelStreaming",
+    "Win32_Media_MediaFoundation",
+    "Win32_Media_Multimedia",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Ole",
+    "Win32_System_Performance",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+    "Win32_System_WinRT",
+    "Win32_System_WinRT_Direct3D11",
+    "Win32_System_WinRT_Graphics_Capture",
+    "Win32_UI_HiDpi",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

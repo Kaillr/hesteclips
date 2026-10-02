@@ -139,9 +139,12 @@ pub fn reveal_in_file_manager(path: &Path) -> std::io::Result<()> {
     }
     #[cfg(target_os = "windows")]
     {
-        // `explorer /select,<path>` highlights the file in its folder.
+        // `explorer /select,"<path>"` highlights the file in its folder. Passed
+        // raw: Explorer doesn't understand the switch quoted as a whole, which is
+        // what normal argument quoting does to a path with spaces.
+        use std::os::windows::process::CommandExt;
         std::process::Command::new("explorer")
-            .arg(format!("/select,{}", path.display()))
+            .raw_arg(format!("/select,\"{}\"", std::path::absolute(path)?.display()))
             .spawn()?;
     }
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -245,7 +248,16 @@ pub fn open_in_default_app(path: &Path) -> std::io::Result<()> {
     }
     #[cfg(target_os = "windows")]
     {
-        std::process::Command::new("cmd").args(["/C", "start", ""]).arg(path).spawn()?;
+        use windows::Win32::UI::Shell::ShellExecuteW;
+        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+        use windows::core::{HSTRING, w};
+        let file = HSTRING::from(std::path::absolute(path)?.as_os_str());
+        // SAFETY: plain strings in, no window handle; returns a pseudo-HINSTANCE
+        // that's > 32 on success.
+        let result = unsafe { ShellExecuteW(None, w!("open"), &file, None, None, SW_SHOWNORMAL) };
+        if result.0 as isize <= 32 {
+            return Err(std::io::Error::other("no app is set up to play this file"));
+        }
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {

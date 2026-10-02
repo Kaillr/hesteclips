@@ -204,6 +204,10 @@ pub(crate) struct SourceFeed {
     rate: u32,
     clock: Arc<Clock>,
     st: Mutex<FeedState>,
+    /// Feeds summed into this one: a source made of several streams (on
+    /// Windows, one per captured process tree), each placed on the clock by
+    /// itself.
+    children: Mutex<Vec<Arc<SourceFeed>>>,
 }
 
 struct FeedState {
@@ -239,7 +243,21 @@ impl SourceFeed {
                 out_base: 0,
                 skip_out: 0,
             }),
+            children: Mutex::new(Vec::new()),
         })
+    }
+
+    /// A new feed (at `rate`) whose audio is added to this one's.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub(crate) fn add_child(&self, rate: u32) -> Arc<SourceFeed> {
+        let child = SourceFeed::new(rate, self.clock.clone());
+        self.children.lock().unwrap().push(child.clone());
+        child
+    }
+
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub(crate) fn remove_child(&self, child: &Arc<SourceFeed>) {
+        self.children.lock().unwrap().retain(|c| !Arc::ptr_eq(c, child));
     }
 
     /// Interleaved samples (`channels` per frame) whose first frame was captured
@@ -296,6 +314,13 @@ impl SourceFeed {
             // now is too late.
             st.skip_out += end - st.out_base;
             st.out_base = end;
+        }
+        drop(st);
+        for child in self.children.lock().unwrap().iter() {
+            for (a, c) in buf.iter_mut().zip(child.take(from, n)) {
+                a[0] += c[0];
+                a[1] += c[1];
+            }
         }
         buf
     }
@@ -510,6 +535,20 @@ mod tests {
         let out = feed.take(0, 40_000);
         let mid = &out[2000..38_000];
         assert!(mid.iter().all(|f| (f[0] - 0.5).abs() < 0.01), "resampled level holds");
+    }
+
+    #[test]
+    fn children_are_summed() {
+        let feed = SourceFeed::new(RATE, clock_at_zero());
+        let a = feed.add_child(RATE);
+        let b = feed.add_child(RATE);
+        a.push(1000.0, &vec![0.25; 960], 2);
+        b.push(1000.0, &vec![0.5; 960], 2);
+        assert!(feed.take(0, 480).iter().all(|f| (f[0] - 0.75).abs() < 1e-6));
+        feed.remove_child(&b);
+        b.push(1000.01, &vec![0.5; 960], 2);
+        a.push(1000.01, &vec![0.25; 960], 2);
+        assert!(feed.take(480, 480).iter().all(|f| (f[0] - 0.25).abs() < 1e-6));
     }
 
     #[test]

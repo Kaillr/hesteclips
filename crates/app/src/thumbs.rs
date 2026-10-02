@@ -8,7 +8,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
@@ -110,7 +110,7 @@ fn generate(key: u64, video: &Path) -> (Option<egui::ColorImage>, Option<Duratio
         // Skip a little way in: the very first frame of a capture is often black or a
         // half-drawn window. Short clips grab from the middle instead.
         let at = duration.map_or(0.0, |d| (d.as_secs_f64() * 0.5).min(1.0));
-        let _ = Command::new("ffmpeg")
+        let _ = media::ffmpeg()
             .args(["-hide_banner", "-loglevel", "error", "-y", "-ss", &format!("{at:.2}"), "-i"])
             .arg(video)
             .args(["-frames:v", "1", "-vf", &format!("scale={WIDTH}:-2"), "-q:v", "4"])
@@ -130,7 +130,7 @@ fn load(jpg: &Path) -> Option<egui::ColorImage> {
 }
 
 fn probe_duration(video: &Path) -> Option<Duration> {
-    let out = Command::new("ffprobe")
+    let out = media::ffprobe()
         .args(["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0"])
         .arg(video)
         .stdin(Stdio::null())

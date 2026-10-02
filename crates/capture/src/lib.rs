@@ -1,17 +1,21 @@
 //! Capture backend abstraction.
 //!
-//! macOS uses `sck` (ScreenCaptureKit + VideoToolbox; mics via cpal, mixed in
-//! `mixer`). Windows/Linux will get a libobs backend behind this same `Recorder`
-//! trait so the app never depends on which one is live; until then there is no
-//! recorder there.
+//! macOS uses `sck` (ScreenCaptureKit + VideoToolbox), Windows uses `win`
+//! (Windows Graphics Capture + Media Foundation + WASAPI), both behind the same
+//! `Recorder` trait so the app never depends on which one is live. Mics come
+//! from cpal everywhere and are mixed in `mixer`. Linux has no recorder yet.
 
 use std::path::PathBuf;
 
 #[cfg(target_os = "macos")]
 mod aac;
 pub mod audio;
+#[cfg(target_os = "macos")]
+mod avwriter;
 pub mod mixer;
 pub mod mp4meta;
+#[cfg(any(target_os = "windows", test))]
+mod mp4mux;
 pub mod output;
 pub mod sources;
 
@@ -19,11 +23,15 @@ pub mod sources;
 pub mod macos;
 #[cfg(target_os = "macos")]
 pub mod sck;
-#[cfg(target_os = "macos")]
+#[cfg(target_os = "windows")]
+pub mod win;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 mod writer;
 
 #[cfg(target_os = "macos")]
 pub use sck::SckRecorder;
+#[cfg(target_os = "windows")]
+pub use win::WinRecorder;
 
 /// The capture backend for this platform. `live` gets the meters and supplies
 /// each source's volume.
@@ -32,19 +40,23 @@ pub fn default_recorder(live: std::sync::Arc<mixer::LiveAudio>) -> Box<dyn Recor
     {
         Box::new(SckRecorder::new(live))
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        Box::new(WinRecorder::new(live))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = live;
         Box::new(Unsupported)
     }
 }
 
-/// Stand-in until the libobs backend exists, so the app runs (library, editor)
+/// Stand-in where there's no backend yet, so the app runs (library, editor)
 /// and says why capture won't start.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 struct Unsupported;
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 impl Recorder for Unsupported {
     fn start(&mut self, _: Mode, _: &EncodeSettings) -> anyhow::Result<()> {
         anyhow::bail!("recording isn't available on this platform yet")
@@ -66,7 +78,29 @@ pub fn list_screens() -> Vec<Device> {
     {
         macos::list_shareable().screens
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        win::list_screens()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        Vec::new()
+    }
+}
+
+/// Running apps the user could add as an audio source, sorted by name. Their
+/// ids go in `SourceKind::App` (a bundle id on macOS, an executable name on
+/// Windows).
+pub fn list_apps() -> Vec<Device> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::list_apps()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        win::list_apps()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         Vec::new()
     }
@@ -118,12 +152,12 @@ pub enum Mode {
 /// A capture device (screen, app, or audio device) as seen by the backend.
 #[derive(Debug, Clone)]
 pub struct Device {
-    /// Backend-specific id (display id, bundle id, device name).
+    /// Backend-specific id (display id, bundle id or executable, device name).
     pub id: String,
     pub name: String,
 }
 
-/// Displays and apps ScreenCaptureKit can capture.
+/// Displays and apps the backend can capture.
 #[derive(Debug, Clone, Default)]
 pub struct Devices {
     pub screens: Vec<Device>,
@@ -143,7 +177,8 @@ pub struct EncodeSettings {
     /// Downscale target height, or `None` to keep native resolution.
     pub target_height: Option<u32>,
     pub keyframe_interval_secs: u32,
-    /// Use a hardware encoder (VideoToolbox) vs. software (x264).
+    /// Use a hardware encoder (VideoToolbox, or the GPU's Media Foundation
+    /// encoder on Windows) vs. software.
     pub use_hardware: bool,
     pub replay_seconds: u32,
     /// Backend id of the screen to capture.
@@ -154,7 +189,7 @@ pub struct EncodeSettings {
     pub sources: Vec<sources::AudioSource>,
 }
 
-/// A capture backend. Implemented by `SckRecorder` (and, later, a libobs backend).
+/// A capture backend. Implemented by `SckRecorder` (macOS) and `WinRecorder` (Windows).
 pub trait Recorder {
     /// Begin capturing in the given mode with the given settings.
     fn start(&mut self, mode: Mode, settings: &EncodeSettings) -> anyhow::Result<()>;
