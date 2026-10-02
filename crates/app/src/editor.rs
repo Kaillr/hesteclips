@@ -720,7 +720,10 @@ impl Ready {
         }
 
         if resp.drag_started() {
-            if let Some(pos) = resp.interact_pointer_pos() {
+            // Hit-test where the button went down, not where the pointer is now: a
+            // drag only starts after a few pixels of movement, by which time a
+            // vertical drag has already left the thin volume line or keyframe.
+            if let Some(pos) = ui.input(|i| i.pointer.press_origin()).or(resp.interact_pointer_pos()) {
                 self.dragging = Some(hit(pos, self).unwrap_or(Drag::Playhead));
                 self.player.pause();
             }
@@ -741,7 +744,12 @@ impl Ready {
                     Drag::Line(i) => {
                         // Move the whole curve up/down by the drag distance.
                         let lane = lane_rects[i];
-                        let delta_db = -resp.drag_delta().y / lane.height() * (MAX_DB - MIN_DB);
+                        // On the first frame, include the movement before the drag registered.
+                        let dy = match ui.input(|i| i.pointer.press_origin()) {
+                            Some(origin) if resp.drag_started() => pos.y - origin.y,
+                            _ => resp.drag_delta().y,
+                        };
+                        let delta_db = -dy / lane.height() * (MAX_DB - MIN_DB);
                         let track = &mut self.edit.tracks[i];
                         if track.points.is_empty() {
                             track.gain = media::from_db((media::to_db(track.gain) + delta_db).clamp(MIN_DB, MAX_DB));
