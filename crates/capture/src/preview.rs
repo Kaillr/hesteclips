@@ -125,6 +125,20 @@ impl VideoPreview {
         }
     }
 
+    /// Change what the preview shows without restarting it, if the change
+    /// allows (a different list of games and apps). Returns whether it did.
+    pub fn update(&self, source: &VideoSource) -> bool {
+        #[cfg(target_os = "windows")]
+        {
+            self.inner.update(source)
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = source;
+            false
+        }
+    }
+
     /// Why the preview couldn't start, if it couldn't.
     pub fn error(&self) -> Option<String> {
         #[cfg(target_os = "windows")]

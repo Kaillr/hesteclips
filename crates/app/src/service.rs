@@ -15,6 +15,8 @@ use capture::{EncodeSettings, Mode};
 enum Cmd {
     Start(Mode, EncodeSettings),
     SaveClip,
+    /// Change what the running capture records, if it can without a restart.
+    UpdateVideo(capture::VideoSource),
     Stop,
     /// Stop, then signal once the file is finished (app being killed).
     StopAndAck(Sender<()>),
@@ -72,6 +74,9 @@ impl CaptureService {
                         Ok(path) => send(&evt_tx, Evt::Saved(path)),
                         Err(e) => send(&evt_tx, Evt::Error(e.to_string())),
                     },
+                    Cmd::UpdateVideo(video) => {
+                        recorder.update_video(&video);
+                    }
                     Cmd::Stop => {
                         match recorder.stop() {
                             Ok(Some(path)) => send(&evt_tx, Evt::Saved(path)),
@@ -99,6 +104,9 @@ impl CaptureService {
     }
     pub fn stop(&self) {
         self.send(Cmd::Stop);
+    }
+    pub fn update_video(&self, video: capture::VideoSource) {
+        self.send(Cmd::UpdateVideo(video));
     }
 
     fn send(&self, cmd: Cmd) {

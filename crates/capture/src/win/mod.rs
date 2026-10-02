@@ -151,6 +151,16 @@ impl Recorder for WinRecorder {
     fn is_running(&self) -> bool {
         self.session.is_some()
     }
+
+    fn update_video(&mut self, video: &VideoSource) -> bool {
+        match (video, self.session.as_ref().and_then(|s| s.apps.as_ref())) {
+            (VideoSource::Apps { ids }, Some(list)) => {
+                *list.lock().unwrap() = ids.clone();
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 impl Drop for WinRecorder {
@@ -183,6 +193,8 @@ const MIX_LATENCY: f64 = 0.3;
 /// lets every encoder flush into the writer before it closes the file.
 struct Session {
     video: Option<Video>,
+    /// The games and apps being followed, when recording apps.
+    apps: Option<AppList>,
     pacer: Option<(Arc<AtomicBool>, JoinHandle<()>)>,
     audio: Option<AudioCapture>,
     mixer: Option<(Arc<AtomicBool>, JoinHandle<()>)>,
@@ -213,7 +225,7 @@ impl Session {
         let writer_tx = writer.tx.clone();
 
         let mut session =
-            Self { video: None, pacer: None, audio: None, mixer: None, encoders: Vec::new(), writer_tx, writer: Some(writer) };
+            Self { video: None, apps: None, pacer: None, audio: None, mixer: None, encoders: Vec::new(), writer_tx, writer: Some(writer) };
         let started = (|| -> Result<()> {
             // One PCM channel + AAC thread per track, in layout order: the mix,
             // each own track, the rest.
@@ -243,6 +255,7 @@ impl Session {
             session.mixer = Some((stop, mixer));
 
             let encoder = h264::Encoder::start(&gpu, width, height, s, session.writer_tx.clone())?;
+            session.apps = picture_source.apps();
             let picture = picture_source.open(&gpu, canvas_w, canvas_h)?;
             let latest = picture.latest.clone();
             session.video = Some(picture.video);
@@ -288,8 +301,13 @@ impl Session {
 /// Where a session's picture comes from: a display, or an app's window.
 enum PictureSource {
     Screen(windows::Graphics::Capture::GraphicsCaptureItem),
-    Apps(Vec<String>),
+    /// The apps to follow, changeable while capturing.
+    Apps(AppList),
 }
+
+/// The games and apps a capture follows, shared with the thread following them
+/// so the list can change while it runs.
+type AppList = Arc<std::sync::Mutex<Vec<String>>>;
 
 /// A running capture and the texture it fills.
 struct Picture {
@@ -309,7 +327,7 @@ impl PictureSource {
             }
             VideoSource::Apps { ids } => {
                 let (_, w, h) = system::primary_monitor();
-                (PictureSource::Apps(ids.clone()), (w, h))
+                (PictureSource::Apps(Arc::new(std::sync::Mutex::new(ids.clone()))), (w, h))
             }
         })
     }
@@ -338,6 +356,14 @@ impl PictureSource {
         };
         Ok(Picture { video, latest })
     }
+
+    /// The app list, when following apps.
+    fn apps(&self) -> Option<AppList> {
+        match self {
+            PictureSource::Apps(list) => Some(list.clone()),
+            PictureSource::Screen(_) => None,
+        }
+    }
 }
 
 /// A capture made only for the preview (`crate::preview::VideoPreview`). Runs
@@ -346,6 +372,8 @@ impl PictureSource {
 pub(crate) struct PreviewCapture {
     stop: Arc<AtomicBool>,
     error: Arc<std::sync::Mutex<Option<String>>>,
+    /// The app list being followed, when previewing apps.
+    apps: Option<AppList>,
 }
 
 impl PreviewCapture {
@@ -354,11 +382,19 @@ impl PreviewCapture {
         let error = Arc::new(std::sync::Mutex::new(None));
         let (stop2, error2) = (stop.clone(), error.clone());
         let generation = crate::preview::new_producer();
+        let apps = match &source {
+            VideoSource::Apps { ids } => Some(Arc::new(std::sync::Mutex::new(ids.clone()))),
+            VideoSource::Screen { .. } => None,
+        };
+        let apps2 = apps.clone();
         thread::spawn(move || {
             system::com_init();
             let opened = (|| -> Result<(Picture, d3d::Previewer)> {
                 let gpu = d3d::Gpu::new()?;
-                let (source, (w, h)) = PictureSource::plan(&source)?;
+                let (mut source, (w, h)) = PictureSource::plan(&source)?;
+                if let (PictureSource::Apps(list), Some(shared)) = (&mut source, apps2) {
+                    *list = shared; // so `update` reaches the running follower
+                }
                 let picture = source.open(&gpu, w, h)?;
                 let (width, height) = output_size(w, h, target_height);
                 let preview = d3d::Previewer::new(&gpu, &picture.latest, width, height, fps, generation)?;
@@ -390,7 +426,17 @@ impl PreviewCapture {
             drop(preview);
             picture.video.stop();
         });
-        Self { stop, error }
+        Self { stop, error, apps }
+    }
+
+    pub(crate) fn update(&self, source: &VideoSource) -> bool {
+        match (source, &self.apps) {
+            (VideoSource::Apps { ids }, Some(list)) => {
+                *list.lock().unwrap() = ids.clone();
+                true
+            }
+            _ => false,
+        }
     }
 
     pub(crate) fn error(&self) -> Option<String> {
@@ -417,18 +463,28 @@ impl Video {
     /// How often to look at which app is in focus.
     const RESCAN: Duration = Duration::from_millis(100);
 
-    fn follow_apps(gpu: d3d::Gpu, latest: Arc<d3d::Latest>, apps: Vec<String>) -> Self {
+    fn follow_apps(gpu: d3d::Gpu, latest: Arc<d3d::Latest>, list: AppList) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
         let thread = thread::spawn(move || {
             system::com_init();
-            let listed = |exe: &str| apps.iter().find(|a| a.eq_ignore_ascii_case(exe)).cloned();
+            let mut apps: Vec<String> = Vec::new();
             // The listed app last in focus: recorded until another one is.
             let mut active: Option<String> = None;
             let mut current: Option<(windows::Win32::Foundation::HWND, String, d3d::Capture)> = None;
             // A window that couldn't be captured, so it's reported once.
             let mut failed = None;
             while !stop2.load(Ordering::Relaxed) {
+                // The list may have changed: forget apps that left it.
+                let now = list.lock().unwrap().clone();
+                if now != apps {
+                    apps = now;
+                    let still = |a: &String| apps.iter().any(|x| x.eq_ignore_ascii_case(a));
+                    if active.as_ref().is_some_and(|a| !still(a)) {
+                        active = None;
+                    }
+                }
+                let listed = |exe: &str| apps.iter().find(|a| a.eq_ignore_ascii_case(exe)).cloned();
                 let focused = system::foreground_app().and_then(|(h, exe, main)| Some((h, listed(&exe)?, main)));
                 if let Some((_, app, _)) = &focused {
                     active = Some(app.clone());

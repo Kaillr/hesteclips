@@ -234,4 +234,11 @@ pub trait Recorder {
 
     /// Whether a capture is currently running.
     fn is_running(&self) -> bool;
+
+    /// Change what the running capture records, without restarting it, if the
+    /// change allows (a different list of games and apps). Returns whether it
+    /// was applied; otherwise it takes effect on the next start.
+    fn update_video(&mut self, _video: &VideoSource) -> bool {
+        false
+    }
 }

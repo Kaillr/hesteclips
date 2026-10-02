@@ -7,7 +7,7 @@
 
 use egui::{Color32, RichText};
 
-use crate::settings::{self, AudioSourceCfg, CaptureApp, CaptureTarget, Container, Encoder, FPS_CHOICES, OutputResolution, ShortcutAction, SourceKind};
+use crate::settings::{self, Container, Encoder, FPS_CHOICES, OutputResolution, ShortcutAction};
 use crate::{App, RecState, reveal_label, shortcuts};
 
 /// Replay lengths offered as one-click choices (seconds).
@@ -43,11 +43,11 @@ impl App {
             RecState::Idle => {}
             RecState::Buffering => {
                 ui.add_space(12.0);
-                note(ui, "Stop the replay buffer to change the replay length, video and saving settings.");
+                note(ui, "Stop the replay buffer to change the replay length, video quality and saving settings.");
             }
             RecState::Recording => {
                 ui.add_space(12.0);
-                note(ui, "Stop recording to change the replay length, video and saving settings.");
+                note(ui, "Stop recording to change the replay length, video quality and saving settings.");
             }
         }
 
@@ -69,10 +69,10 @@ impl App {
             });
         });
 
-        section(ui, "Video", |ui| {
+        section(ui, "Video quality", |ui| {
+            ui.weak("What to record is chosen on the Sources page.");
+            ui.add_space(4.0);
             ui.add_enabled_ui(idle, |ui| {
-                self.capture_target(ui);
-                divider(ui);
                 row(ui, "Resolution", Some("Lower sizes make smaller files."), |ui| {
                     egui::ComboBox::from_id_salt("resolution").selected_text(self.settings.resolution.label()).show_ui(ui, |ui| {
                         for r in OutputResolution::ALL {
@@ -166,109 +166,6 @@ impl App {
         });
         ui.add_space(24.0);
         self.reset_dialog(ui.ctx());
-    }
-
-    /// "Record": the whole screen, or a list of games and apps.
-    fn capture_target(&mut self, ui: &mut egui::Ui) {
-        if capture::APP_CAPTURE {
-            row(ui, "Record", None, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    let apps = matches!(self.settings.capture, CaptureTarget::Apps { .. });
-                    if ui.selectable_label(!apps, "Whole screen").clicked() {
-                        self.settings.capture = CaptureTarget::Screen;
-                    }
-                    if ui.selectable_label(apps, "Games and apps").clicked() && !apps {
-                        self.settings.capture = CaptureTarget::Apps { apps: Vec::new() };
-                    }
-                });
-            });
-            divider(ui);
-        }
-        let apps = match &self.settings.capture {
-            CaptureTarget::Apps { apps } => apps.clone(),
-            _ => {
-                row(ui, "Screen", None, |ui| {
-                    let names: Vec<String> = self.screens.iter().map(|d| d.name.clone()).collect();
-                    let current = names.get(self.settings.display_index).cloned().unwrap_or_else(|| "Main display".to_owned());
-                    egui::ComboBox::from_id_salt("display").selected_text(current).truncate().show_ui(ui, |ui| {
-                        for (i, name) in names.iter().enumerate() {
-                            ui.selectable_value(&mut self.settings.display_index, i, name);
-                        }
-                    });
-                });
-                return;
-            }
-        };
-        let hint = "Records whichever of these you're using. Switch to something else and it keeps recording the last one. \
-                    Fitted to your main display's size; black while none is open.";
-        let mut list = apps.clone();
-        row(ui, "Games and apps", Some(hint), |ui| {
-            ui.vertical(|ui| {
-                if list.is_empty() {
-                    ui.weak("None yet. Add the games and apps to record.");
-                }
-                let mut remove = None;
-                for (i, app) in list.iter().enumerate() {
-                    ui.horizontal(|ui| {
-                        if ui.small_button("✕").on_hover_text("Stop recording this one").clicked() {
-                            remove = Some(i);
-                        }
-                        ui.label(&app.name).on_hover_text(&app.id);
-                    });
-                }
-                if let Some(i) = remove {
-                    list.remove(i);
-                }
-                ui.horizontal_wrapped(|ui| {
-                    let add = ui.menu_button("➕ Add", |ui| {
-                        ui.set_min_width(220.0);
-                        let mut any = false;
-                        egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-                            for app in self.windowed_apps.clone() {
-                                if list.iter().any(|a| a.id.eq_ignore_ascii_case(&app.id)) {
-                                    continue;
-                                }
-                                any = true;
-                                if ui.button(&app.name).on_hover_text(&app.id).clicked() {
-                                    list.push(CaptureApp { id: app.id, name: app.name });
-                                    ui.close();
-                                }
-                            }
-                        });
-                        if !any {
-                            ui.weak("No other apps with a window are open.");
-                        }
-                    });
-                    if add.response.clicked() {
-                        self.windowed_apps = capture::list_windowed_apps();
-                    }
-                    // Their sound usually belongs with their picture.
-                    let silent: Vec<CaptureApp> = list
-                        .iter()
-                        .filter(|a| {
-                            !self.settings.audio_sources.iter().any(
-                                |s| matches!(&s.kind, SourceKind::App { bundle_id, .. } if bundle_id.eq_ignore_ascii_case(&a.id)),
-                            )
-                        })
-                        .cloned()
-                        .collect();
-                    if !silent.is_empty() {
-                        let label = if silent.len() == 1 { format!("Also record {}'s sound", silent[0].name) } else { "Also record their sound".to_owned() };
-                        if ui.button(label).clicked() {
-                            for a in &silent {
-                                self.settings
-                                    .audio_sources
-                                    .push(AudioSourceCfg::new(&a.name, SourceKind::App { bundle_id: a.id.clone(), app_name: a.name.clone() }));
-                            }
-                            self.toast(if silent.len() == 1 { format!("Added {} to Sources", silent[0].name) } else { format!("Added {} apps to Sources", silent.len()) });
-                        }
-                    }
-                });
-            });
-        });
-        if list != apps {
-            self.settings.capture = CaptureTarget::Apps { apps: list };
-        }
     }
 
     fn advanced(&mut self, ui: &mut egui::Ui) {

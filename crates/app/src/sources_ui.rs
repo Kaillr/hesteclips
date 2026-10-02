@@ -13,7 +13,8 @@ use egui::{Color32, RichText, Sense, vec2};
 
 use crate::App;
 use crate::meter::{self, MeterState};
-use crate::settings::{AudioSourceCfg, SourceKind};
+use crate::library::ACCENT;
+use crate::settings::{AudioSourceCfg, CaptureApp, CaptureTarget, SourceKind};
 
 /// Fader range in dB.
 const FADER_MIN_DB: f32 = -60.0;
@@ -49,8 +50,13 @@ pub(crate) struct SourcesView {
     /// Preview frames shown in the current second, when it started, and the
     /// rate over the last full second.
     preview_rate: (u32, Option<Instant>, u32),
+    /// When the open apps were last checked, for the games-and-apps statuses.
+    apps_checked: Option<Instant>,
     renaming: Option<String>,
 }
+
+/// Why the whole-screen / games-and-apps switch is locked.
+const STOP_TO_SWITCH: &str = "Stop capturing to switch. The list of games and apps can change while you capture.";
 
 impl App {
     pub(crate) fn sources_page(&mut self, ui: &mut egui::Ui) {
@@ -97,7 +103,7 @@ impl App {
     fn sources_column(&mut self, ui: &mut egui::Ui, now: Instant, dt: f32) {
         ui.add_space(12.0);
         if capture::preview::AVAILABLE {
-            self.preview_panel(ui);
+            self.video_card(ui);
             ui.add_space(12.0);
         }
         // The mix first: it's what people hear, and where clipping matters most.
@@ -105,7 +111,7 @@ impl App {
         ui.add_space(18.0);
 
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Sources").size(16.0).strong());
+            ui.label(RichText::new("Audio sources").size(16.0).strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.small_button("⟳ Refresh devices").on_hover_text("Look again for microphones you've plugged in.").clicked() {
                     self.refresh_audio_devices();
@@ -215,102 +221,244 @@ impl App {
 
     /// The clip's mix: a big stereo meter with scale, peak readout, clip light,
     /// and the limiter with its gain-reduction meter.
-    /// What the recording shows, live: the screen or the app being recorded.
-    fn preview_panel(&mut self, ui: &mut egui::Ui) {
+    /// The video source: what to record (the whole screen, or games and apps
+    /// following focus), with a live preview of exactly what gets recorded.
+    fn video_card(&mut self, ui: &mut egui::Ui) {
         capture::preview::request();
         let frame = capture::preview::latest();
-        if let Some(f) = &frame {
-            if self.sources_view.preview.as_ref().is_none_or(|(_, seq)| *seq != f.seq) {
-                // Opaque, so it's already premultiplied: one copy, no per-pixel work.
-                let pixels: Vec<egui::Color32> = bytemuck::cast_slice(&f.rgba).to_vec();
-                let image = egui::ColorImage::new([f.width as usize, f.height as usize], pixels);
-                let (count, since, rate) = &mut self.sources_view.preview_rate;
-                *count += 1;
-                match since {
-                    Some(t) if t.elapsed() >= Duration::from_secs(1) => {
-                        *rate = *count;
-                        *count = 0;
-                        *since = Some(Instant::now());
-                    }
-                    None => *since = Some(Instant::now()),
-                    _ => {}
-                }
-                match &mut self.sources_view.preview {
-                    Some((tex, seq)) => {
-                        tex.set(image, egui::TextureOptions::LINEAR);
-                        *seq = f.seq;
-                    }
-                    None => {
-                        let tex = ui.ctx().load_texture("capture_preview", image, egui::TextureOptions::LINEAR);
-                        self.sources_view.preview = Some((tex, f.seq));
-                    }
-                }
-            }
+        self.update_preview_texture(ui.ctx(), frame.as_deref());
+        // Which listed apps are open, for their status; cheap, so every 2 s.
+        let apps_mode = matches!(self.settings.capture, CaptureTarget::Apps { .. });
+        if apps_mode && self.sources_view.apps_checked.is_none_or(|t| t.elapsed() > Duration::from_secs(2)) {
+            self.sources_view.apps_checked = Some(Instant::now());
+            self.windowed_apps = capture::list_windowed_apps();
         }
-        // What's being recorded: the display, or the app in focus right now.
-        let apps: Option<Vec<crate::settings::CaptureApp>> = match &self.settings.capture {
-            crate::settings::CaptureTarget::Apps { apps } => Some(apps.clone()),
-            _ => None,
-        };
-        let target = match &apps {
-            Some(apps) => {
-                let showing = frame.as_ref().and_then(|f| f.app.as_deref());
-                let name_of = |exe: &str| apps.iter().find(|a| a.id.eq_ignore_ascii_case(exe)).map_or_else(|| exe.to_owned(), |a| a.name.clone());
-                match showing {
-                    Some(exe) if !frame.as_ref().is_some_and(|f| f.waiting) => format!("Recording {}", name_of(exe)),
-                    _ if apps.is_empty() => "No games or apps chosen".to_owned(),
-                    _ => format!("{} games and apps", apps.len()),
-                }
-            }
-            None => self.screens.get(self.settings.display_index).map_or_else(|| "Main display".to_owned(), |d| d.name.clone()),
-        };
+        let idle = self.rec_state == crate::RecState::Idle;
+
         card(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("🖵 Video").size(16.0).strong())
-                    .on_hover_text("What your clips show. Change it in Settings → Video.");
+                ui.label(RichText::new("🖵 Video").size(16.0).strong());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if let Some(f) = &frame {
                         let rate = self.sources_view.preview_rate.2;
-                        ui.weak(format!("{}×{} · {rate} fps", f.width, f.height))
-                            .on_hover_text("The preview's size and how many frames it's showing per second. It can't show more than your display refreshes.");
-                        ui.weak("·");
+                        ui.weak(format!("{}×{} · {rate} fps", f.width, f.height)).on_hover_text(
+                            "What's recorded: its size, and how many frames the preview is showing per second \
+                             (it can't show more than your display refreshes). Change them in Settings → Video quality.",
+                        );
                     }
-                    ui.weak(&target);
                 });
             });
             ui.add_space(6.0);
-            // The picture, as wide as the card, but never taller than a third of
-            // the window so the sources stay in view.
-            let aspect = frame.as_ref().map_or(16.0 / 9.0, |f| f.width as f32 / f.height.max(1) as f32);
-            let max_h = (ui.ctx().content_rect().height() / 3.0).max(120.0);
-            let w = ui.available_width().min(max_h * aspect);
-            let size = egui::vec2(w, w / aspect);
-            ui.vertical_centered(|ui| {
-                let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
-                let p = ui.painter();
-                p.rect_filled(rect, 4.0, Color32::BLACK);
-                match (&self.sources_view.preview, &frame) {
-                    (Some((tex, _)), Some(_)) => {
-                        p.image(tex.id(), rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
-                    }
-                    _ => {
-                        let text = match self.video_preview.as_ref().and_then(|(_, p)| p.error()) {
-                            Some(e) => format!("No preview: {e}"),
-                            None => "Starting preview…".to_owned(),
+
+            // What to record. Switching kinds needs a fresh start, so it waits
+            // while capturing; the app list below changes live.
+            if capture::APP_CAPTURE {
+                ui.add_enabled_ui(idle, |ui| {
+                    ui.horizontal(|ui| {
+                        let screen = ui.selectable_label(!apps_mode, RichText::new("🖥  Whole screen").size(14.0));
+                        let apps = ui.selectable_label(apps_mode, RichText::new("🎮  Games and apps").size(14.0));
+                        if screen.on_hover_text("Everything on one display.").on_disabled_hover_text(STOP_TO_SWITCH).clicked() {
+                            self.settings.capture = CaptureTarget::Screen;
+                        }
+                        if apps
+                            .on_hover_text("Only the games and apps you pick, following whichever you're using.")
+                            .on_disabled_hover_text(STOP_TO_SWITCH)
+                            .clicked()
+                            && !apps_mode
+                        {
+                            self.settings.capture = CaptureTarget::Apps { apps: Vec::new() };
+                            self.windowed_apps = capture::list_windowed_apps();
+                        }
+                    });
+                });
+                ui.add_space(8.0);
+            }
+
+            self.preview_picture(ui, frame.as_deref());
+            ui.add_space(8.0);
+
+            match self.settings.capture.clone() {
+                CaptureTarget::Apps { apps } => self.app_list(ui, apps, frame.as_deref()),
+                _ => {
+                    ui.add_enabled_ui(idle, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Display");
+                            let names: Vec<String> = self.screens.iter().map(|d| d.name.clone()).collect();
+                            let current = names.get(self.settings.display_index).cloned().unwrap_or_else(|| "Main display".to_owned());
+                            egui::ComboBox::from_id_salt("display").selected_text(current).truncate().show_ui(ui, |ui| {
+                                for (i, name) in names.iter().enumerate() {
+                                    ui.selectable_value(&mut self.settings.display_index, i, name);
+                                }
+                            });
+                        })
+                        .response
+                        .on_disabled_hover_text("Stop capturing to switch displays.");
+                    });
+                }
+            }
+        });
+    }
+
+    fn update_preview_texture(&mut self, ctx: &egui::Context, frame: Option<&capture::preview::PreviewFrame>) {
+        let Some(f) = frame else { return };
+        if self.sources_view.preview.as_ref().is_some_and(|(_, seq)| *seq == f.seq) {
+            return;
+        }
+        // Opaque, so it's already premultiplied: one copy, no per-pixel work.
+        let pixels: Vec<egui::Color32> = bytemuck::cast_slice(&f.rgba).to_vec();
+        let image = egui::ColorImage::new([f.width as usize, f.height as usize], pixels);
+        let (count, since, rate) = &mut self.sources_view.preview_rate;
+        *count += 1;
+        match since {
+            Some(t) if t.elapsed() >= Duration::from_secs(1) => {
+                *rate = *count;
+                *count = 0;
+                *since = Some(Instant::now());
+            }
+            None => *since = Some(Instant::now()),
+            _ => {}
+        }
+        match &mut self.sources_view.preview {
+            Some((tex, seq)) => {
+                tex.set(image, egui::TextureOptions::LINEAR);
+                *seq = f.seq;
+            }
+            None => self.sources_view.preview = Some((ctx.load_texture("capture_preview", image, egui::TextureOptions::LINEAR), f.seq)),
+        }
+    }
+
+    /// The preview itself: as wide as the card, never taller than a third of
+    /// the window so the rest stays in view.
+    fn preview_picture(&self, ui: &mut egui::Ui, frame: Option<&capture::preview::PreviewFrame>) {
+        let aspect = frame.map_or(16.0 / 9.0, |f| f.width as f32 / f.height.max(1) as f32);
+        let max_h = (ui.ctx().content_rect().height() / 3.0).max(120.0);
+        let w = ui.available_width().min(max_h * aspect);
+        ui.vertical_centered(|ui| {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(w, w / aspect), Sense::hover());
+            let p = ui.painter();
+            p.rect_filled(rect, 4.0, Color32::BLACK);
+            let message = |text: &str| {
+                p.text(rect.center(), egui::Align2::CENTER_CENTER, text, egui::FontId::proportional(13.0), Color32::from_gray(170));
+            };
+            match (&self.sources_view.preview, frame) {
+                (Some((tex, _)), Some(f)) => {
+                    p.image(tex.id(), rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+                    if f.waiting {
+                        let text = match &self.settings.capture {
+                            CaptureTarget::Apps { apps } if apps.is_empty() => "Add a game or app below to start.".to_owned(),
+                            CaptureTarget::Apps { apps } if apps.len() == 1 => {
+                                format!("Waiting for {} to open. Clips are black until then.", apps[0].name)
+                            }
+                            _ => "Waiting for one of your games or apps to open. Clips are black until then.".to_owned(),
                         };
-                        p.text(rect.center(), egui::Align2::CENTER_CENTER, text, egui::FontId::proportional(13.0), Color32::from_gray(150));
+                        message(&text);
                     }
                 }
-                if frame.as_ref().is_some_and(|f| f.waiting) {
-                    let text = match &apps {
-                        Some(apps) if apps.is_empty() => "Add the games and apps to record in Settings → Video.".to_owned(),
-                        Some(apps) if apps.len() == 1 => format!("Waiting for {} to open. Clips are black until then.", apps[0].name),
-                        _ => "Waiting for one of your games or apps to open. Clips are black until then.".to_owned(),
-                    };
-                    p.text(rect.center(), egui::Align2::CENTER_CENTER, text, egui::FontId::proportional(13.0), Color32::from_gray(170));
+                _ => match self.video_preview.as_ref().and_then(|(_, p)| p.error()) {
+                    Some(e) => message(&format!("No preview: {e}")),
+                    None => message("Starting preview…"),
+                },
+            }
+        });
+    }
+
+    /// The games and apps to record: each with whether it's open (and which is
+    /// being recorded), a way to remove it, and a way to add more. Changes
+    /// apply right away, even while capturing.
+    fn app_list(&mut self, ui: &mut egui::Ui, apps: Vec<CaptureApp>, frame: Option<&capture::preview::PreviewFrame>) {
+        let showing = frame.filter(|f| !f.waiting).and_then(|f| f.app.clone());
+        let capturing = self.rec_state != crate::RecState::Idle;
+        let mut list = apps.clone();
+        if list.is_empty() {
+            ui.weak("Add the games you play, and any apps you want in your clips.");
+            ui.add_space(4.0);
+        }
+        let mut remove = None;
+        for (i, app) in list.iter().enumerate() {
+            let open = self.windowed_apps.iter().any(|a| a.id.eq_ignore_ascii_case(&app.id));
+            let active = showing.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(&app.id));
+            let (color, status) = if active {
+                (ACCENT, if capturing { "Recording now" } else { "In the preview" })
+            } else if open {
+                (meter::GREEN, "Open")
+            } else {
+                (ui.visuals().weak_text_color(), "Not open")
+            };
+            ui.horizontal(|ui| {
+                let (dot, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), Sense::hover());
+                ui.painter().circle_filled(dot.center(), 4.0, color);
+                ui.label(RichText::new(&app.name).strong()).on_hover_text(&app.id);
+                ui.label(RichText::new(status).size(12.0).color(if active { ACCENT } else { ui.visuals().weak_text_color() }));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("✕").on_hover_text(format!("Stop recording {}", app.name)).clicked() {
+                        remove = Some(i);
+                    }
+                });
+            });
+        }
+        if let Some(i) = remove {
+            list.remove(i);
+        }
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            let add = ui.menu_button("➕ Add game or app", |ui| {
+                ui.set_min_width(240.0);
+                ui.weak("Open apps with a window");
+                ui.separator();
+                let mut any = false;
+                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                    for app in self.windowed_apps.clone() {
+                        if list.iter().any(|a| a.id.eq_ignore_ascii_case(&app.id)) {
+                            continue;
+                        }
+                        any = true;
+                        if ui.button(&app.name).on_hover_text(&app.id).clicked() {
+                            list.push(CaptureApp { id: app.id, name: app.name });
+                            ui.close();
+                        }
+                    }
+                });
+                if !any {
+                    ui.weak("Nothing else is open. Start the game or app, then add it here.");
                 }
             });
+            if add.response.clicked() {
+                self.windowed_apps = capture::list_windowed_apps();
+            }
+            // Their sound usually belongs with their picture.
+            let silent: Vec<CaptureApp> = list
+                .iter()
+                .filter(|a| {
+                    !self
+                        .settings
+                        .audio_sources
+                        .iter()
+                        .any(|s| matches!(&s.kind, SourceKind::App { bundle_id, .. } if bundle_id.eq_ignore_ascii_case(&a.id)))
+                })
+                .cloned()
+                .collect();
+            if !silent.is_empty() {
+                let label = if silent.len() == 1 { format!("🔊 Also record {}'s sound", silent[0].name) } else { "🔊 Also record their sound".to_owned() };
+                if ui.button(label).on_hover_text("Adds them to the audio sources below.").clicked() {
+                    for a in &silent {
+                        self.settings
+                            .audio_sources
+                            .push(AudioSourceCfg::new(&a.name, SourceKind::App { bundle_id: a.id.clone(), app_name: a.name.clone() }));
+                    }
+                }
+            }
         });
+        if !list.is_empty() {
+            ui.add_space(2.0);
+            ui.label(
+                RichText::new("Records whichever of these you're using. While you're in another app, it keeps recording the last one.")
+                    .size(12.0)
+                    .weak(),
+            );
+        }
+        if list != apps {
+            self.settings.capture = CaptureTarget::Apps { apps: list };
+        }
     }
 
     fn master_strip(&mut self, ui: &mut egui::Ui, now: Instant, dt: f32) {
@@ -375,6 +523,12 @@ impl App {
         }
         // What a recording would be: same picture, size and frame rate.
         let wanted = (self.video_source(), self.settings.resolution.height(), self.settings.fps);
+        // A changed app list reaches the running preview without a restart.
+        if let Some((have, preview)) = &mut self.video_preview {
+            if *have != wanted && have.1 == wanted.1 && have.2 == wanted.2 && preview.update(&wanted.0) {
+                have.0 = wanted.0.clone();
+            }
+        }
         if self.video_preview.as_ref().is_none_or(|(w, _)| *w != wanted) {
             let (source, height, fps) = &wanted;
             // Both happen in the background: the old capture closes as the new

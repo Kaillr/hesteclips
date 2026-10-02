@@ -165,8 +165,11 @@ struct App {
     permission: capture::Permission,
     /// Screens detected by the capture backend.
     screens: Vec<capture::Device>,
-    /// Apps with a window, for the "A game or app" picker; listed when it opens.
+    /// Apps with a window, for the games-and-apps list: to add, and to show
+    /// which are open. Refreshed while the Sources page shows.
     pub(crate) windowed_apps: Vec<capture::Device>,
+    /// What the running capture records, to send it list changes live.
+    capturing_video: Option<capture::VideoSource>,
     /// System audio inputs/outputs (+ current OS defaults).
     audio: capture::audio::AudioDevices,
     /// Live per-source volume and meters, shared with the capture thread.
@@ -234,6 +237,7 @@ impl App {
             permission: capture::screen_permission(),
             screens: capture::list_screens(),
             windowed_apps: Vec::new(),
+            capturing_video: None,
             audio: capture::audio::list_audio_devices(),
             live_audio,
             level_monitor: None,
@@ -401,6 +405,7 @@ impl eframe::App for App {
         // stop the meters' capture, or macOS keeps showing its recording indicator.
         self.ensure_level_monitor();
         self.ensure_video_preview();
+        self.sync_capture_video();
 
         // The editor gets the whole window; capture keeps running underneath and the
         // hotkeys still work.
@@ -847,6 +852,7 @@ impl App {
 
     fn start_replay_buffer(&mut self) {
         self.refresh_audio_devices();
+        self.capturing_video = Some(self.video_source());
         // Optimistic state; a State/Error event confirms or corrects it.
         self.service.start(capture::Mode::ReplayBuffer, self.encode_settings());
         self.rec_state = RecState::Buffering;
@@ -855,6 +861,7 @@ impl App {
 
     fn start_recording(&mut self) {
         self.refresh_audio_devices();
+        self.capturing_video = Some(self.video_source());
         self.service.start(capture::Mode::Record, self.encode_settings());
         self.rec_state = RecState::Recording;
         self.rec_started = Some(Instant::now());
@@ -878,6 +885,21 @@ impl App {
         self.service.stop();
         self.rec_state = RecState::Idle;
         self.rec_started = None;
+    }
+
+    /// A changed list of games and apps reaches a running capture right away;
+    /// it starts following the new list without restarting.
+    fn sync_capture_video(&mut self) {
+        if self.rec_state == RecState::Idle {
+            self.capturing_video = None;
+            return;
+        }
+        let now = self.video_source();
+        let both_apps = matches!((&now, &self.capturing_video), (capture::VideoSource::Apps { .. }, Some(capture::VideoSource::Apps { .. })));
+        if both_apps && self.capturing_video.as_ref() != Some(&now) {
+            self.service.update_video(now.clone());
+            self.capturing_video = Some(now);
+        }
     }
 
     /// Drain capture-thread events each frame.
