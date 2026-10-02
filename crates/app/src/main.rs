@@ -369,6 +369,9 @@ impl eframe::App for App {
         self.pump_capture_events();
         self.cloud.poll();
         self.pump_renders();
+        // Every frame, not just while the Sources page draws: leaving the page must
+        // stop the meters' capture, or macOS keeps showing its recording indicator.
+        self.ensure_level_monitor();
 
         // The editor gets the whole window; capture keeps running underneath and the
         // hotkeys still work.

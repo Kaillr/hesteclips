@@ -70,7 +70,6 @@ pub(crate) struct SourcesView {
 
 impl App {
     pub(crate) fn sources_page(&mut self, ui: &mut egui::Ui) {
-        self.ensure_level_monitor();
         let now = Instant::now();
         let dt = self.sources_view.last_frame.map_or(0.0, |t| (now - t).as_secs_f32()).min(0.2);
         self.sources_view.last_frame = Some(now);
@@ -225,14 +224,16 @@ impl App {
 
     /// Run a level-only capture while this page is open and nothing is recording,
     /// so the meters work before you start; stop it otherwise. Restarts when the
-    /// sources change.
+    /// sources change. Called every frame from the app loop.
     pub(crate) fn ensure_level_monitor(&mut self) {
         let want = self.page == crate::Page::Sources && self.rec_state == crate::RecState::Idle;
-        let sources = self.capture_sources();
-        let current = self.level_monitor.as_ref().map(|(s, _)| s);
         if !want {
             self.level_monitor = None;
-        } else if current != Some(&sources) {
+            return;
+        }
+        let sources = self.capture_sources();
+        let current = self.level_monitor.as_ref().map(|(s, _)| s);
+        if current != Some(&sources) {
             self.level_monitor = None; // stop the old one before opening devices again
             match capture::sources::LevelMonitor::start(&sources, self.live_audio.clone()) {
                 Ok(m) => self.level_monitor = Some((sources, m)),
