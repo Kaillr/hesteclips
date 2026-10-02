@@ -21,6 +21,8 @@ const FADER_MAX_DB: f32 = 12.0;
 const METER_FLOOR_DB: f32 = -60.0;
 /// How long a peak marker / clip warning stays lit.
 const PEAK_HOLD: Duration = Duration::from_millis(1500);
+/// What `to_db` reports for silence.
+const SILENCE_DB: f32 = -120.0;
 const CLIP_HOLD: Duration = Duration::from_secs(3);
 
 const METER_GREEN: Color32 = Color32::from_rgb(70, 190, 110);
@@ -28,13 +30,21 @@ const METER_YELLOW: Color32 = Color32::from_rgb(230, 190, 60);
 const METER_RED: Color32 = Color32::from_rgb(230, 70, 60);
 
 /// Smoothed meter state for one source (or the mix), kept between frames.
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub(crate) struct MeterView {
     /// Displayed level (dB), falling smoothly.
     level_db: f32,
     peak_db: f32,
     peak_at: Option<Instant>,
     clipped_at: Option<Instant>,
+}
+
+impl Default for MeterView {
+    /// Silent. (A derived default would be 0 dB: a full meter that takes seconds
+    /// to fall.)
+    fn default() -> Self {
+        Self { level_db: SILENCE_DB, peak_db: SILENCE_DB, peak_at: None, clipped_at: None }
+    }
 }
 
 impl MeterView {
@@ -71,6 +81,17 @@ pub(crate) struct SourcesView {
 impl App {
     pub(crate) fn sources_page(&mut self, ui: &mut egui::Ui) {
         let now = Instant::now();
+        // Opening the page: start the meters from silence. Their last state is
+        // stale, and the peak held since the last read could be from minutes ago
+        // (meters keep collecting while a recording runs).
+        if self.sources_view.last_frame.is_none_or(|t| now - t > Duration::from_millis(500)) {
+            self.sources_view.meters.clear();
+            self.sources_view.master = MeterView::default();
+            for s in &self.settings.audio_sources {
+                self.live_audio.channel(&s.id).meter.take();
+            }
+            self.live_audio.master.take();
+        }
         let dt = self.sources_view.last_frame.map_or(0.0, |t| (now - t).as_secs_f32()).min(0.2);
         self.sources_view.last_frame = Some(now);
         // Meters move: keep repainting while this page is open.
@@ -459,7 +480,7 @@ fn format_db(db: f32) -> String {
 }
 
 fn to_db(x: f32) -> f32 {
-    if x <= 1e-6 { -120.0 } else { 20.0 * x.log10() }
+    if x <= 1e-6 { SILENCE_DB } else { 20.0 * x.log10() }
 }
 
 pub(crate) fn from_db(db: f32) -> f32 {
