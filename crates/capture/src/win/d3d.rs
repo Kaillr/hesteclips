@@ -248,25 +248,38 @@ impl Capture {
             let Some(pool) = pool.as_ref() else { return Ok(()) };
             let frame = pool.TryGetNextFrame()?;
             let content = frame.ContentSize()?;
-            let (cw, ch) = (content.Width.max(0) as u32, content.Height.max(0) as u32);
-            // The part of the frame to keep: a window's client area, else all of it.
-            let (x, y, w, h) = window2
-                .0
-                .and_then(super::system::client_area_in_capture)
-                .map(|(x, y, w, h)| (x.min(cw), y.min(ch), w.min(cw.saturating_sub(x)), h.min(ch.saturating_sub(y))))
-                .filter(|&(_, _, w, h)| w >= 2 && h >= 2)
-                .unwrap_or((0, 0, cw, ch));
-            let (w, h) = (w.min(latest2.width), h.min(latest2.height));
-            let copied = (|| -> windows::core::Result<()> {
+            let copied = (|| -> windows::core::Result<Option<(u32, u32)>> {
                 let access: IDirect3DDxgiInterfaceAccess = frame.Surface()?.cast()?;
                 let tex: ID3D11Texture2D = unsafe { access.GetInterface()? };
+                let mut desc = D3D11_TEXTURE2D_DESC::default();
+                unsafe { tex.GetDesc(&mut desc) };
+                let (cw, ch) = (content.Width.max(0) as u32, content.Height.max(0) as u32);
+                // The window just grew (restored from minimized, resized) and the
+                // pool's buffers haven't caught up: this frame's texture is smaller
+                // than its content. Copying the content's size would read past the
+                // texture (which crashes the driver), so skip it; the pool is
+                // resized below and the next frame is whole.
+                if cw > desc.Width || ch > desc.Height {
+                    return Ok(None);
+                }
+                // The part of the frame to keep: a window's client area, else all of it.
+                let (x, y, w, h) = window2
+                    .0
+                    .and_then(super::system::client_area_in_capture)
+                    .map(|(x, y, w, h)| (x.min(cw), y.min(ch), w.min(cw.saturating_sub(x)), h.min(ch.saturating_sub(y))))
+                    .filter(|&(_, _, w, h)| w >= 2 && h >= 2)
+                    .unwrap_or((0, 0, cw, ch));
+                let (w, h) = (w.min(latest2.width), h.min(latest2.height));
+                if w < 2 || h < 2 {
+                    return Ok(None);
+                }
                 let region = D3D11_BOX { left: x, top: y, front: 0, right: x + w, bottom: y + h, back: 1 };
                 unsafe { gpu2.context.CopySubresourceRegion(&latest2.texture, 0, 0, 0, 0, &tex, 0, Some(&region)) };
-                Ok(())
+                Ok(Some((w, h)))
             })();
             let _ = frame.Close();
-            if copied.is_ok() && w >= 2 && h >= 2 {
-                *latest2.content.lock().unwrap() = (w, h);
+            if let Ok(Some(size)) = copied {
+                *latest2.content.lock().unwrap() = size;
                 latest2.waiting.store(false, Ordering::Release);
                 latest2.has_frame.store(true, Ordering::Release);
             }
