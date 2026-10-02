@@ -116,7 +116,9 @@ impl App {
     pub(crate) fn library(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
         self.permission_banner(ui);
 
-        let placeholder = self.rec_state == RecState::Recording || self.saving;
+        // One card for a recording in progress, and one per clip still being written.
+        let placeholders = usize::from(self.rec_state == RecState::Recording) + self.saving;
+        let placeholder = placeholders > 0;
         let new_renders: Vec<usize> = (0..self.renders.len()).filter(|&i| self.renders[i].as_new).collect();
         if self.clips.is_empty() && !placeholder && new_renders.is_empty() {
             self.empty_state(ui);
@@ -135,7 +137,7 @@ impl App {
         let clips = self.clips.clone();
         let mut groups: Vec<(chrono::NaiveDate, Vec<Card>)> = Vec::new();
         let mut live: Vec<Card> = new_renders.into_iter().map(Card::NewRender).collect();
-        if placeholder {
+        for _ in 0..placeholders {
             live.insert(0, Card::Placeholder);
         }
         if !live.is_empty() {

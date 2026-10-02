@@ -130,23 +130,10 @@ impl Recorder for SckRecorder {
         Ok(())
     }
 
-    fn save_clip(&mut self) -> Result<PathBuf> {
+    fn save_clip(&mut self) -> Result<crate::PendingClip> {
         let session = self.session.as_ref().filter(|_| self.mode == Some(Mode::ReplayBuffer));
         let session = session.context("replay buffer is not running")?;
-        let out = self.output_dir.join(format!("clip_{}.{}", timestamp(), self.container_ext));
-        let partial = in_progress(&out);
-        let (done_tx, done_rx) = mpsc::channel();
-        session
-            .writer_tx
-            .send(writer::Command::SaveClip { out: partial.clone(), seconds: self.replay_seconds as f64, done: done_tx })
-            .map_err(|_| anyhow::anyhow!("the capture stopped unexpectedly"))?;
-        let result = done_rx.recv_timeout(Duration::from_secs(60)).map_err(|_| anyhow::anyhow!("saving the clip timed out"))?;
-        if let Err(e) = result {
-            let _ = std::fs::remove_file(&partial);
-            return Err(e);
-        }
-        std::fs::rename(&partial, &out).context("couldn't finish saving the clip")?;
-        Ok(out)
+        writer::request_clip(&session.writer_tx, &self.output_dir, &self.container_ext, self.replay_seconds as f64)
     }
 
     fn stop(&mut self) -> Result<Option<PathBuf>> {

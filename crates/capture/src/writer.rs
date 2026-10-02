@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 
 #[cfg(target_os = "macos")]
 pub(crate) use crate::avwriter::{FileWriter, Layout, VideoFrame};
@@ -43,6 +43,28 @@ pub(crate) enum Command {
     Media(Media),
     /// Replay buffer: write the last `seconds` to `out`, report the result.
     SaveClip { out: PathBuf, seconds: f64, done: Sender<Result<PathBuf>> },
+}
+
+/// Ask the replay writer behind `tx` for a clip of the last `seconds` in `dir`.
+/// The writer takes its snapshot as soon as it gets this, so the clip is of
+/// now; the returned clip finishes once the file is written.
+pub(crate) fn request_clip(tx: &Sender<Command>, dir: &Path, ext: &str, seconds: f64) -> Result<crate::PendingClip> {
+    let out = crate::output::new_clip_path(dir, ext);
+    let partial = crate::output::in_progress(&out);
+    let (done_tx, done_rx) = mpsc::channel();
+    tx.send(Command::SaveClip { out: partial.clone(), seconds, done: done_tx })
+        .map_err(|_| anyhow!("the capture stopped unexpectedly"))?;
+    Ok(crate::PendingClip::new(move || {
+        let result = done_rx
+            .recv_timeout(std::time::Duration::from_secs(300))
+            .map_err(|_| anyhow!("saving the clip timed out"))?;
+        if let Err(e) = result {
+            let _ = std::fs::remove_file(&partial);
+            return Err(e);
+        }
+        std::fs::rename(&partial, &out).context("couldn't finish saving the clip")?;
+        Ok(out)
+    }))
 }
 
 /// The writer thread. Dropping the sender ends it; `join` finishes the file.

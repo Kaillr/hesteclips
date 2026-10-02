@@ -63,7 +63,7 @@ impl Recorder for Unsupported {
     fn start(&mut self, _: Mode, _: &EncodeSettings) -> anyhow::Result<()> {
         anyhow::bail!("recording isn't available on this platform yet")
     }
-    fn save_clip(&mut self) -> anyhow::Result<PathBuf> {
+    fn save_clip(&mut self) -> anyhow::Result<PendingClip> {
         anyhow::bail!("recording isn't available on this platform yet")
     }
     fn stop(&mut self) -> anyhow::Result<Option<PathBuf>> {
@@ -239,13 +239,32 @@ pub struct EncodeSettings {
     pub sources: Vec<sources::AudioSource>,
 }
 
+/// A replay clip being saved: what it shows is settled, the file is still
+/// being written. [`PendingClip::finish`] waits for it (seconds, for a long
+/// buffer), so call it off the UI and capture threads.
+pub struct PendingClip(Box<dyn FnOnce() -> anyhow::Result<PathBuf> + Send>);
+
+impl PendingClip {
+    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+    pub(crate) fn new(finish: impl FnOnce() -> anyhow::Result<PathBuf> + Send + 'static) -> Self {
+        Self(Box::new(finish))
+    }
+
+    /// Wait for the clip to be written; its path.
+    pub fn finish(self) -> anyhow::Result<PathBuf> {
+        (self.0)()
+    }
+}
+
 /// A capture backend. Implemented by `SckRecorder` (macOS) and `WinRecorder` (Windows).
 pub trait Recorder {
     /// Begin capturing in the given mode with the given settings.
     fn start(&mut self, mode: Mode, settings: &EncodeSettings) -> anyhow::Result<()>;
 
-    /// In `ReplayBuffer` mode, flush the buffered window to a file and return its path.
-    fn save_clip(&mut self) -> anyhow::Result<PathBuf>;
+    /// In `ReplayBuffer` mode, save the buffered window as a clip. Its moment is
+    /// taken right away; the returned [`PendingClip`] finishes writing it,
+    /// which can take a while — so another can be saved meanwhile.
+    fn save_clip(&mut self) -> anyhow::Result<PendingClip>;
 
     /// Stop capturing. In `Record` mode, returns the finished file.
     fn stop(&mut self) -> anyhow::Result<Option<PathBuf>>;

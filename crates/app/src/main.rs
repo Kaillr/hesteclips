@@ -149,7 +149,9 @@ struct App {
     /// When the current recording/buffer started (for the live timer).
     rec_started: Option<Instant>,
     /// A replay clip is being written; shows a placeholder card until it lands.
-    saving: bool,
+    /// Clips being written: replay clips still saving, and a stopped recording
+    /// being finished. Each shows a placeholder card until it lands.
+    saving: usize,
     settings: RecordSettings,
     /// Last-saved settings JSON, to persist only when something changed.
     saved_settings: String,
@@ -235,7 +237,7 @@ impl App {
             page: Page::Clips,
             rec_state: RecState::Idle,
             rec_started: None,
-            saving: false,
+            saving: 0,
             settings,
             saved_settings,
             service: CaptureService::new(live_audio.clone()),
@@ -573,7 +575,13 @@ impl App {
         // The hint: the shortcut (drawn as keycaps) and what it does.
         let (live, color, title, hint_keys, hint) = match self.rec_state {
             RecState::Idle => (false, ui.visuals().weak_text_color(), "Not recording".to_owned(), self.shortcut_keys(A::ToggleBuffer), "starts the replay buffer".to_owned()),
-            RecState::Buffering if self.saving => (true, ACCENT, "Saving clip…".to_owned(), None, format!("The last {replay}")),
+            RecState::Buffering if self.saving > 0 => (
+                true,
+                ACCENT,
+                if self.saving > 1 { format!("Saving {} clips…", self.saving) } else { "Saving clip…".to_owned() },
+                self.shortcut_keys(A::SaveClip),
+                format!("saves another of the last {replay}"),
+            ),
             RecState::Buffering => (true, ACCENT, "Replay buffer on".to_owned(), self.shortcut_keys(A::SaveClip), format!("saves the last {replay}")),
             RecState::Recording => (true, REC_RED, format!("Recording  {}", thumbs::format_duration(elapsed)), self.shortcut_keys(A::ToggleRecord), "stops".to_owned()),
         };
@@ -640,7 +648,7 @@ impl App {
             }
             RecState::Buffering => {
                 if ui
-                    .add_enabled(!self.saving, button("💾  Save clip", Some(ACCENT)))
+                    .add(button("💾  Save clip", Some(ACCENT)))
                     .on_hover_text(self.shortcut_label(settings::ShortcutAction::SaveClip))
                     .clicked()
                 {
@@ -891,18 +899,19 @@ impl App {
     }
 
     fn save_clip(&mut self) {
-        if self.rec_state != RecState::Buffering || self.saving {
+        if self.rec_state != RecState::Buffering {
             return;
         }
-        // Runs on the capture thread; the Saved event lands the clip in the library.
+        // Its moment is taken at once; the Saved event lands it in the library.
+        // Another can be saved while it's still being written.
         self.service.save_clip();
-        self.saving = true;
+        self.saving += 1;
         self.page = Page::Clips;
     }
 
     fn stop(&mut self) {
         if self.rec_state == RecState::Recording {
-            self.saving = true; // finalizing the file
+            self.saving += 1; // finishing the file
         }
         self.service.stop();
         self.rec_state = RecState::Idle;
@@ -940,12 +949,11 @@ impl App {
                     }
                     self.rec_state = new;
                     if new == RecState::Idle {
-                        self.saving = false;
                         self.refresh_clips();
                     }
                 }
                 Evt::Saved(path) => {
-                    self.saving = false;
+                    self.saving = self.saving.saturating_sub(1);
                     self.toast(format!("Saved {}", file_name(&path)));
                     self.last_saved = Some((path, Instant::now()));
                     self.refresh_clips();
@@ -953,7 +961,7 @@ impl App {
                 Evt::Error(e) => {
                     // A start failure is followed by Evt::State(None); a save failure
                     // leaves us still buffering. So just surface the message.
-                    self.saving = false;
+                    self.saving = self.saving.saturating_sub(1);
                     self.toast_error(e);
                 }
             }

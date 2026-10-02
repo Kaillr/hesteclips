@@ -70,8 +70,16 @@ impl CaptureService {
                         }
                     },
                     // Save doesn't change capture state — still buffering afterwards.
+                    // The clip's moment is taken now; it's written on its own
+                    // thread, so this one is free for the next save at once.
                     Cmd::SaveClip => match recorder.save_clip() {
-                        Ok(path) => send(&evt_tx, Evt::Saved(path)),
+                        Ok(pending) => {
+                            let evt_tx = evt_tx.clone();
+                            thread::spawn(move || match pending.finish() {
+                                Ok(path) => send(&evt_tx, Evt::Saved(path)),
+                                Err(e) => send(&evt_tx, Evt::Error(e.to_string())),
+                            });
+                        }
                         Err(e) => send(&evt_tx, Evt::Error(e.to_string())),
                     },
                     Cmd::UpdateVideo(video) => {

@@ -10,6 +10,29 @@ pub fn in_progress(file: &Path) -> PathBuf {
     file.with_file_name(format!(".{name}"))
 }
 
+/// A name for a new replay clip in `dir`: `clip_<timestamp>.<ext>`, with
+/// `-2`, `-3`… when clips are saved within the same second (one may still be
+/// being written, so its file can't be relied on to exist yet).
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+pub(crate) fn new_clip_path(dir: &Path, ext: &str) -> PathBuf {
+    static LAST: std::sync::Mutex<Option<(String, u32)>> = std::sync::Mutex::new(None);
+    let ts = timestamp();
+    let mut last = LAST.lock().unwrap();
+    let mut n = match &*last {
+        Some((t, n)) if *t == ts => n + 1,
+        _ => 1,
+    };
+    loop {
+        let name = if n == 1 { format!("clip_{ts}.{ext}") } else { format!("clip_{ts}-{n}.{ext}") };
+        let path = dir.join(name);
+        if !path.exists() && !in_progress(&path).exists() {
+            *last = Some((ts, n));
+            return path;
+        }
+        n += 1;
+    }
+}
+
 /// Local timestamp for filenames, e.g. "2026-08-13_14-32-05".
 pub(crate) fn timestamp() -> String {
     chrono::Local::now().format("%Y-%m-%d_%H-%M-%S").to_string()
