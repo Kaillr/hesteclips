@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use egui::{Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
 
-use crate::{App, RecState, clips, share, thumbs};
+use crate::{App, RecState, clips, share, store, thumbs};
 
 const MIN_CARD_WIDTH: f32 = 220.0;
 const GAP: f32 = 14.0;
@@ -148,9 +148,8 @@ impl App {
             }
             Some(Action::Edit(p)) => self.open_editor(p),
             Some(Action::Rename(p)) => self.rename_clip(p),
-            Some(Action::Trash(p)) => match clips::move_to_trash(&p) {
+            Some(Action::Trash(p)) => match self.clips.iter().find(|c| c.path == p).map(|c| store::trash(c, &self.clips)).unwrap_or(Ok(())) {
                 Ok(()) => {
-                    media::revert(&p); // its edit sidecar + render go with it
                     self.toast(format!("Moved {} to the Trash", crate::file_name(&p)));
                     self.refresh_clips();
                 }
@@ -252,9 +251,7 @@ impl App {
             .is_some_and(|(p, at)| *p == clip.path && at.elapsed() < NEW_HIGHLIGHT);
 
         let ctx = ui.ctx().clone();
-        // An edited clip shows its edit: new first frame, new length.
-        let shown = clip.display();
-        let thumb = self.thumbs.get(&ctx, &shown);
+        let thumb = self.thumbs.get(&ctx, clip);
         let v = ui.visuals().clone();
         let p = ui.painter();
 
@@ -311,7 +308,7 @@ impl App {
         // --- Caption ---
         // Edited clips say so in words, in the accent colour, right where you read
         // the clip's details — not a dark chip lost on top of a busy thumbnail.
-        let edited = clip.has_edit && clip.rendered.is_some() && render.is_none();
+        let edited = clip.original.is_some() && render.is_none();
         let mut text_x = rect.left() + 2.0;
         let title_y = thumb_rect.bottom() + 6.0;
         if edited {
@@ -323,9 +320,10 @@ impl App {
         let ext = clip.path.extension().map(|e| e.to_string_lossy().to_uppercase()).unwrap_or_default();
         // "trimmed from 0:52" only when the length actually changed (an audio-only
         // edit keeps it). Probing the original is cached like any thumbnail.
-        let trimmed_from = if edited {
-            let _ = self.thumbs.get(&ctx, clip);
-            match (self.thumbs.duration_of(clip), self.thumbs.duration_of(&shown)) {
+        let original = clip.original.as_ref().filter(|_| edited).and_then(|p| clips::Clip::at(p));
+        let trimmed_from = if let Some(original) = &original {
+            let _ = self.thumbs.get(&ctx, original);
+            match (self.thumbs.duration_of(original), self.thumbs.duration_of(clip)) {
                 (Some(orig), Some(now)) if orig - now > 0.5 => Some(thumbs::format_duration(Duration::from_secs_f64(orig))),
                 _ => None,
             }
@@ -333,8 +331,8 @@ impl App {
             None
         };
         let detail = match trimmed_from {
-            Some(orig) => format!("{}  ·  {ext}  ·  trimmed from {orig}", shown.human_size()),
-            None => format!("{}  ·  {ext}", shown.human_size()),
+            Some(orig) => format!("{}  ·  {ext}  ·  trimmed from {orig}", clip.human_size()),
+            None => format!("{}  ·  {ext}", clip.human_size()),
         };
         let meta = p.layout_job(single_line(&detail, FontId::proportional(12.0), v.weak_text_color(), w - 4.0));
         p.galley(Pos2::new(rect.left() + 2.0, thumb_rect.bottom() + 24.0), meta, v.weak_text_color());
@@ -376,16 +374,16 @@ impl App {
         // hand it to the OS so the clip can be dropped into Discord, Finder, a
         // browser… (egui alone can't drag outside its own window).
         if resp.drag_started() && action.is_none() {
-            let preview = thumbs::cached_jpeg(&shown);
-            action = Some(Action::DragOut(clip.playable().to_path_buf(), preview));
+            let preview = thumbs::cached_jpeg(clip);
+            action = Some(Action::DragOut(clip.path.clone(), preview));
         }
         if resp.clicked() && action.is_none() {
-            action = Some(Action::Open(clip.playable().to_path_buf()));
+            action = Some(Action::Open(clip.path.clone()));
         }
         resp.context_menu(|ui| {
             ui.set_min_width(190.0);
             if ui.button("▶  Play").clicked() {
-                action = Some(Action::Open(clip.playable().to_path_buf()));
+                action = Some(Action::Open(clip.path.clone()));
             }
             if ui.button("✂  Edit…").clicked() {
                 action = Some(Action::Edit(clip.path.clone()));
@@ -474,7 +472,7 @@ impl App {
 /// The ways to get a clip out, shared by the Share button and the right-click
 /// menu. Ordered by how often people reach for them.
 fn share_menu(ui: &mut egui::Ui, clip: &clips::Clip, anchor: Pos2) -> Option<Action> {
-    let file = clip.playable().to_path_buf();
+    let file = clip.path.clone();
     let mut action = None;
     ui.set_min_width(230.0);
     let paste = if cfg!(target_os = "macos") { "⌘V" } else { "Ctrl+V" };

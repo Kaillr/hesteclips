@@ -1,10 +1,8 @@
 //! Non-destructive clip editing: probe, decode for preview, and render edits.
 //!
-//! An edit never touches the original recording. It's a small JSON sidecar next to
-//! the clip (`.clip_….mp4.edit.json`) holding the trim range and per-track gains,
-//! plus a rendered file (`.clip_….mp4.edited.mp4`) that's what you play and share.
-//! Both are dotfiles so they stay out of the clip library; reopening the editor
-//! reads the sidecar back so every decision can be changed or reverted.
+//! An edit never touches the original recording: it's an [`Edit`] (trim range and
+//! per-track volume) rendered into a new file. Where the original, the edit and
+//! the render live is the app's business; this crate only probes and renders.
 //!
 //! Backed by the `ffmpeg`/`ffprobe` binaries.
 
@@ -26,6 +24,8 @@ pub struct ClipInfo {
     pub width: u32,
     pub height: u32,
     pub audio: Vec<AudioStream>,
+    /// Permanent id from the clip tag, once the clip has one (see [`clip_tag`]).
+    pub id: Option<String>,
 }
 
 impl ClipInfo {
@@ -124,15 +124,9 @@ pub fn probe(source: &Path) -> Result<ClipInfo> {
 
     let p: Probe = serde_json::from_slice(&out.stdout).context("unexpected ffprobe output")?;
     let duration: f64 = p.format.duration.as_deref().and_then(|d| d.parse().ok()).unwrap_or(0.0);
-    // "hesteclips:mix=1,2": which audio streams make up the mix. Older recordings
-    // have no tag: every track after the mix was in it.
-    let mix_members: Option<Vec<usize>> = p
-        .format
-        .tags
-        .comment
-        .as_deref()
-        .and_then(|c| c.strip_prefix("hesteclips:mix="))
-        .map(|list| list.split(',').filter_map(|n| n.trim().parse().ok()).collect());
+    // Older recordings have no tag: every track after the mix was in it.
+    let tag = p.format.tags.comment.as_deref().map(parse_clip_tag).unwrap_or_default();
+    let mix_members = tag.mix;
     let video = p.streams.iter().find(|s| s.codec_type == "video").context("no video stream")?;
     let fps = [&video.avg_frame_rate, &video.r_frame_rate]
         .into_iter()
@@ -163,7 +157,50 @@ pub fn probe(source: &Path) -> Result<ClipInfo> {
         width: video.width.unwrap_or(0),
         height: video.height.unwrap_or(0),
         audio,
+        id: tag.id,
     })
+}
+
+/// What our file comment says about a clip.
+#[derive(Debug, Default, PartialEq)]
+pub struct ClipTag {
+    /// Audio streams that make up the mix (`0:a:N` indices).
+    pub mix: Option<Vec<usize>>,
+    /// Permanent id, tying the file to its assets (original, edit) wherever it's
+    /// moved or renamed.
+    pub id: Option<String>,
+}
+
+/// The file comment for a clip: `hesteclips:mix=1,2 id=3f9c…`. Recordings start
+/// with just the mix; the id is added the first time the clip is edited.
+pub fn clip_tag(mix: &[usize], id: Option<&str>) -> String {
+    let list: Vec<String> = mix.iter().map(|n| n.to_string()).collect();
+    let mut tag = format!("hesteclips:mix={}", list.join(","));
+    if let Some(id) = id {
+        tag += &format!(" id={id}");
+    }
+    tag
+}
+
+/// The clip tag of a render of `edit`: mix members in the output's own layout
+/// (track 1 is the new mix, then each source in order), so reopening the render
+/// starts with the same tracks muted.
+pub fn render_tag(edit: &Edit, id: Option<&str>) -> String {
+    let mix: Vec<usize> = edit.tracks.iter().enumerate().filter(|(_, t)| !t.muted).map(|(i, _)| i + 1).collect();
+    clip_tag(&mix, id)
+}
+
+pub fn parse_clip_tag(comment: &str) -> ClipTag {
+    let Some(rest) = comment.strip_prefix("hesteclips:") else { return ClipTag::default() };
+    let mut tag = ClipTag::default();
+    for field in rest.split_whitespace() {
+        if let Some(list) = field.strip_prefix("mix=") {
+            tag.mix = Some(list.split(',').filter_map(|n| n.trim().parse().ok()).collect());
+        } else if let Some(id) = field.strip_prefix("id=") {
+            tag.id = Some(id.to_owned()).filter(|id| !id.is_empty());
+        }
+    }
+    tag
 }
 
 fn parse_rate(r: &str) -> Option<f64> {
@@ -242,7 +279,7 @@ impl TrackEdit {
     }
 }
 
-/// Everything about how a clip has been edited. Saved as the sidecar.
+/// Everything about how a clip has been edited.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Edit {
     pub start: f64,
@@ -286,39 +323,6 @@ impl Edit {
 fn hidden_sibling(source: &Path, suffix: &str) -> PathBuf {
     let name = source.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     source.with_file_name(format!(".{name}{suffix}"))
-}
-
-pub fn sidecar_path(source: &Path) -> PathBuf {
-    hidden_sibling(source, ".edit.json")
-}
-
-/// The rendered edit. Same container as the source so it plays wherever it did.
-pub fn rendered_path(source: &Path) -> PathBuf {
-    let ext = source.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or("mp4".into());
-    hidden_sibling(source, &format!(".edited.{ext}"))
-}
-
-pub fn load_edit(source: &Path) -> Option<Edit> {
-    serde_json::from_slice(&std::fs::read(sidecar_path(source)).ok()?).ok()
-}
-
-pub fn save_edit(source: &Path, edit: &Edit) -> Result<()> {
-    std::fs::write(sidecar_path(source), serde_json::to_vec_pretty(edit)?)?;
-    Ok(())
-}
-
-/// Throw away an edit: the sidecar and the rendered file.
-pub fn revert(source: &Path) {
-    let _ = std::fs::remove_file(sidecar_path(source));
-    let _ = std::fs::remove_file(rendered_path(source));
-}
-
-/// The rendered edit if it exists and is up to date with the sidecar.
-pub fn rendered_if_current(source: &Path) -> Option<PathBuf> {
-    let rendered = rendered_path(source);
-    let r = std::fs::metadata(&rendered).ok()?.modified().ok()?;
-    let s = std::fs::metadata(sidecar_path(source)).ok()?.modified().ok()?;
-    (r >= s).then_some(rendered)
 }
 
 /// Decode one audio stream to interleaved stereo f32 at [`PREVIEW_RATE`].
@@ -484,21 +488,11 @@ pub fn keyframe_times(source: &Path) -> Result<Vec<f64>> {
     Ok(keys)
 }
 
-/// Render `edit` of `source` to its [`rendered_path`].
-///
-/// Video is re-encoded so the cut lands on the exact frame (a stream copy can
-/// only cut on keyframes). Output keeps our track layout: track 1 = the new mix
-/// of every unmuted source at its gain, then each source alone at its gain.
-pub fn render(source: &Path, info: &ClipInfo, edit: &Edit) -> Result<PathBuf> {
-    let dest = rendered_path(source);
-    render_to(source, info, edit, &dest)?;
-    Ok(dest)
-}
-
 /// Render `edit` of `source` to `dest` (written to a hidden partial first, so a
-/// half-finished file never appears under its real name).
-pub fn render_to(source: &Path, info: &ClipInfo, edit: &Edit, dest: &Path) -> Result<()> {
-    render_with_progress(source, info, edit, dest, |_| {})
+/// half-finished file never appears under its real name). `id` goes into the
+/// output's clip tag.
+pub fn render_to(source: &Path, info: &ClipInfo, edit: &Edit, dest: &Path, id: Option<&str>) -> Result<()> {
+    render_with_progress(source, info, edit, dest, id, |_| {})
 }
 
 /// Render with progress callbacks (0.0..=1.0).
@@ -513,6 +507,7 @@ pub fn render_with_progress(
     info: &ClipInfo,
     edit: &Edit,
     dest: &Path,
+    id: Option<&str>,
     progress: impl Fn(f32),
 ) -> Result<()> {
     let ext = dest.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or("mp4".into());
@@ -534,7 +529,7 @@ pub fn render_with_progress(
         // container. (Not `with_extension`, which would replace `.mp4` and could
         // eat into the name.)
         let partial = hidden_sibling(dest, &format!(".rendering.{ext}"));
-        mux_audio(source, info, edit, &video, &partial, &|f| progress(weights.video + f * (1.0 - weights.video)))?;
+        mux_audio(source, info, edit, id, &video, &partial, &|f| progress(weights.video + f * (1.0 - weights.video)))?;
         std::fs::rename(&partial, dest)?;
         progress(1.0);
         Ok(())
@@ -649,7 +644,7 @@ fn render_video(source: &Path, edit: &Edit, plan: &Plan, work: &Path, out: &Path
 
 /// Add the audio (new mix on track 1, then each source at its volume) to the
 /// rendered video, producing the final file.
-fn mux_audio(source: &Path, info: &ClipInfo, edit: &Edit, video: &Path, out: &Path, progress: &dyn Fn(f32)) -> Result<()> {
+fn mux_audio(source: &Path, info: &ClipInfo, edit: &Edit, id: Option<&str>, video: &Path, out: &Path, progress: &dyn Fn(f32)) -> Result<()> {
     let mut graph: Vec<String> = Vec::new();
     let mut mix_inputs: Vec<String> = Vec::new();
     let mut maps: Vec<String> = Vec::new();
@@ -695,6 +690,7 @@ fn mux_audio(source: &Path, info: &ClipInfo, edit: &Edit, video: &Path, out: &Pa
     cmd.args(["-hide_banner", "-loglevel", "error", "-y", "-i"]).arg(video);
     cmd.args(["-ss", &format!("{:.6}", edit.start), "-t", &format!("{:.6}", edit.duration()), "-i"]).arg(source);
     cmd.args(["-map", "0:v:0", "-c:v", "copy"]);
+    cmd.args(["-metadata", &format!("comment={}", render_tag(edit, id))]);
     if has_audio {
         cmd.args(["-filter_complex", &graph.join(";"), "-map", "[mix]"]);
         for m in &maps {
@@ -827,4 +823,19 @@ pub fn to_db(x: f32) -> f32 {
 /// dB → linear gain.
 pub fn from_db(db: f32) -> f32 {
     10f32.powf(db / 20.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clip_tags() {
+        assert_eq!(clip_tag(&[1, 2], None), "hesteclips:mix=1,2");
+        assert_eq!(clip_tag(&[1], Some("ab12")), "hesteclips:mix=1 id=ab12");
+        assert_eq!(parse_clip_tag("hesteclips:mix=1,2,3"), ClipTag { mix: Some(vec![1, 2, 3]), id: None });
+        assert_eq!(parse_clip_tag("hesteclips:mix=1 id=ab12"), ClipTag { mix: Some(vec![1]), id: Some("ab12".into()) });
+        assert_eq!(parse_clip_tag("hesteclips:mix="), ClipTag { mix: Some(vec![]), id: None });
+        assert_eq!(parse_clip_tag("made with something else"), ClipTag::default());
+    }
 }

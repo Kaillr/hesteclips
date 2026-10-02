@@ -6,8 +6,8 @@
 //! - **Copy**: put the file on the clipboard, then paste it anywhere (⌘V).
 //! - **Share sheet** (macOS): AirDrop, Messages, Mail, Notes, …
 //!
-//! All of these hand over the clip's *playable* file: the rendered edit when
-//! there is one, so what you share is what you see.
+//! All of these hand over the clip's file in the library, which is always the
+//! clip as it looks now (an edit replaces it), so what you share is what you see.
 
 use std::path::{Path, PathBuf};
 

@@ -19,6 +19,7 @@ mod settings;
 mod settings_ui;
 mod share;
 mod sources_ui;
+mod store;
 mod thumbs;
 
 use std::path::PathBuf;
@@ -188,6 +189,8 @@ impl App {
         let recovered = capture::output::recover_unfinished(&settings.output_dir);
         let saved_settings = settings.to_json();
         let clips = clips::scan(&settings.output_dir);
+        // Assets of clips deleted in Finder go to the Bin.
+        store::sweep_orphans(&settings.output_dir, &clips);
         let (hotkeys, hotkey_error) = match Hotkeys::setup() {
             Ok(h) => (Some(h), None),
             Err(e) => (None, Some(e.to_string())),
@@ -245,12 +248,13 @@ impl App {
             app.refresh_clips();
         }
         if let Some(clip) = std::env::var_os("HESTECLIPS_DEMO_RENDER").map(PathBuf::from) {
-            if let Ok(info) = media::probe(&clip) {
+            let target = store::EditTarget::of(&clip);
+            if let Ok(info) = media::probe(&target.source) {
                 let mut edit = media::Edit::new(&info);
                 edit.start = info.snap(info.duration * 0.1);
                 edit.end = info.snap(info.duration * 0.9);
-                app.start_render(clip.clone(), info.clone(), edit.clone(), None);
-                app.start_render(clip, info, edit, Some("Demo highlight".into()));
+                app.start_render(target.clone(), info.clone(), edit.clone(), None);
+                app.start_render(target, info, edit, Some("Demo highlight".into()));
             }
         }
         // `HESTECLIPS_DEMO_SHARE=<clip>` opens the HesteFiles upload dialog for a clip.
@@ -602,13 +606,15 @@ impl App {
         match ed.ui(ui) {
             editor::EditorOutcome::Stay => {}
             editor::EditorOutcome::Close => self.close_editor(),
-            editor::EditorOutcome::Reverted(source) => {
-                media::revert(&source);
-                self.toast("Reverted to the original clip");
+            editor::EditorOutcome::Reverted(target) => {
+                match store::revert(&target) {
+                    Ok(()) => self.toast("Reverted to the original clip"),
+                    Err(e) => self.toast_error(format!("Couldn't revert: {e}")),
+                }
                 self.close_editor();
             }
-            editor::EditorOutcome::Saved { source, info, edit, new_name } => {
-                self.start_render(source, info, edit, new_name);
+            editor::EditorOutcome::Saved { target, info, edit, new_name } => {
+                self.start_render(target, info, edit, new_name);
                 self.close_editor();
             }
         }
@@ -622,34 +628,35 @@ impl App {
 
     /// Render an edit in the background. `new_name`: save as a separate clip with
     /// that name instead of updating this clip's edit.
-    fn start_render(&mut self, source: PathBuf, info: media::ClipInfo, edit: media::Edit, new_name: Option<String>) {
-        let dest = match &new_name {
+    fn start_render(&mut self, target: store::EditTarget, info: media::ClipInfo, edit: media::Edit, new_name: Option<String>) {
+        let ext = target.clip.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or("mp4".into());
+        // In place: render into the clip's asset folder, then swap it in (see
+        // `store::commit_render`). As new: straight to the new file, no history.
+        let (dest, clip_id) = match &new_name {
             None => {
-                if let Err(e) = media::save_edit(&source, &edit) {
+                let clip_id = target.id.clone().unwrap_or_else(store::new_id);
+                let staged = store::staging_path(target.library(), &clip_id, &ext);
+                if let Err(e) = std::fs::create_dir_all(staged.parent().unwrap_or(target.library())) {
                     self.toast_error(format!("Couldn't save the edit: {e}"));
                     return;
                 }
-                media::rendered_path(&source)
+                (staged, Some(clip_id))
             }
-            Some(name) => {
-                let ext = source.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or("mp4".into());
-                let dir = source.parent().unwrap_or(std::path::Path::new("."));
-                match clips::path_for_name(dir, name, &ext, None) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        self.toast_error(e);
-                        return;
-                    }
+            Some(name) => match clips::path_for_name(target.library(), name, &ext, None) {
+                Ok(p) => (p, None),
+                Err(e) => {
+                    self.toast_error(e);
+                    return;
                 }
-            }
+            },
         };
         let id = self.next_render_id;
         self.next_render_id += 1;
         let progress = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         self.renders.push(RenderJob {
             id,
-            source: source.clone(),
-            dest: dest.clone(),
+            source: target.clip.clone(),
+            dest: if new_name.is_some() { dest.clone() } else { target.clip.clone() },
             as_new: new_name.is_some(),
             progress: progress.clone(),
         });
@@ -660,8 +667,18 @@ impl App {
                 progress.store(f.to_bits(), std::sync::atomic::Ordering::Relaxed);
                 ctx.request_repaint();
             };
-            let result = media::render_with_progress(&source, &info, &edit, &dest, report).map(|()| dest);
-            let _ = tx.send((id, result.map_err(|e| e.to_string())));
+            let rendered = media::render_with_progress(&target.source, &info, &edit, &dest, clip_id.as_deref(), report).map_err(|e| e.to_string());
+            let result = match &clip_id {
+                None => rendered.map(|()| dest),
+                Some(clip_id) => {
+                    let committed = rendered.and_then(|()| store::commit_render(&target, &dest, clip_id, &edit).map_err(|e| e.to_string()));
+                    if committed.is_err() {
+                        store::abandon_render(target.library(), clip_id, &dest);
+                    }
+                    committed.map(|()| target.clip.clone())
+                }
+            };
+            let _ = tx.send((id, result));
             ctx.request_repaint();
         });
         self.refresh_clips();
@@ -681,10 +698,6 @@ impl App {
                     }
                 }
                 Err(e) => {
-                    if !job.as_new {
-                        // The sidecar was written up front; without a render it's a lie.
-                        media::revert(&job.source);
-                    }
                     self.toast_error(format!("Couldn't save the edit: {e}"));
                 }
             }
@@ -696,7 +709,7 @@ impl App {
 /// A background render, shown in the library with a progress bar.
 pub(crate) struct RenderJob {
     id: u64,
-    /// The clip being edited.
+    /// The clip being edited, as named in the library.
     pub source: PathBuf,
     /// Where the result goes (the rendered edit, or the new clip).
     pub dest: PathBuf,

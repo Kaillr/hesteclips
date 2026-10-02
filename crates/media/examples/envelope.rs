@@ -9,7 +9,7 @@ fn main() -> anyhow::Result<()> {
     for t in [5.0, 6.0, 7.0, 8.0, 9.0] { print!("db_at({t})={:.1}  ", e.tracks[0].db_at(t)); }
     println!();
     let out = src.with_file_name("env_out.mp4");
-    media::render_to(&src, &info, &e, &out)?;
+    media::render_to(&src, &info, &e, &out, None)?;
     println!("rendered {:.2}s", media::probe(&out)?.duration);
     Ok(())
 }

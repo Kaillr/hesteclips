@@ -14,10 +14,10 @@ pub struct Clip {
     pub name: String,
     pub modified: SystemTime,
     pub size_bytes: u64,
-    /// The clip has a saved edit (trim / audio mix).
-    pub has_edit: bool,
-    /// The rendered edit, once it's up to date. Play/share this instead.
-    pub rendered: Option<PathBuf>,
+    /// Permanent id from the file's metadata, once the clip has been edited.
+    pub id: Option<String>,
+    /// The untouched recording, when this clip is an edit of it.
+    pub original: Option<PathBuf>,
 }
 
 impl Clip {
@@ -36,25 +36,18 @@ impl Clip {
         NaiveDateTime::parse_from_str(ts.get(..19)?, "%Y-%m-%d_%H-%M-%S").ok()
     }
 
-    /// What to play or share: the rendered edit if there is one, else the original.
-    pub fn playable(&self) -> &Path {
-        self.rendered.as_deref().unwrap_or(&self.path)
-    }
-
-    /// The file whose frames/duration the card should show.
-    pub fn display(&self) -> Clip {
-        match &self.rendered {
-            Some(r) => {
-                let meta = std::fs::metadata(r).ok();
-                Clip {
-                    path: r.clone(),
-                    modified: meta.as_ref().and_then(|m| m.modified().ok()).unwrap_or(self.modified),
-                    size_bytes: meta.map_or(self.size_bytes, |m| m.len()),
-                    ..self.clone()
-                }
-            }
-            None => self.clone(),
-        }
+    /// A file that isn't in the library listing (e.g. an edited clip's original),
+    /// for thumbnails and durations.
+    pub fn at(path: &Path) -> Option<Clip> {
+        let meta = std::fs::metadata(path).ok()?;
+        Some(Clip {
+            path: path.to_path_buf(),
+            name: path.file_name()?.to_string_lossy().into_owned(),
+            modified: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+            size_bytes: meta.len(),
+            id: None,
+            original: None,
+        })
     }
 
     pub fn day(&self) -> NaiveDate {
@@ -97,6 +90,8 @@ pub fn scan(dir: &Path) -> Vec<Clip> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
+    // Only edited clips have ids; skip reading metadata when nothing's been edited.
+    let any_edits = dir.join(crate::store::DIR).is_dir();
 
     let mut clips: Vec<Clip> = entries
         .flatten()
@@ -116,12 +111,14 @@ pub fn scan(dir: &Path) -> Vec<Clip> {
                 return None;
             }
             let meta = entry.metadata().ok()?;
+            let id = if any_edits { crate::store::read_id(&path) } else { None };
+            let original = id.as_deref().and_then(|id| crate::store::find_original(dir, id));
             Some(Clip {
                 name: path.file_name()?.to_string_lossy().into_owned(),
                 modified: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
                 size_bytes: meta.len(),
-                has_edit: media::sidecar_path(&path).exists(),
-                rendered: media::rendered_if_current(&path),
+                id,
+                original,
                 path,
             })
         })
@@ -218,23 +215,9 @@ pub fn path_for_name(dir: &Path, name: &str, ext: &str, current: Option<&Path>) 
     Ok(path)
 }
 
-/// Rename a clip, taking its saved edit (sidecar + rendered file) along.
+/// Rename a clip. Its edit follows by id, so only the file moves.
 pub fn rename(from: &Path, to: &Path) -> std::io::Result<()> {
-    std::fs::rename(from, to)?;
-    for (a, b) in [
-        (media::sidecar_path(from), media::sidecar_path(to)),
-        (media::rendered_path(from), media::rendered_path(to)),
-    ] {
-        if a.exists() {
-            let _ = std::fs::rename(a, b);
-        }
-    }
-    Ok(())
-}
-
-/// Move a clip to the OS trash (recoverable, so no confirmation needed).
-pub fn move_to_trash(path: &Path) -> Result<(), trash::Error> {
-    trash::delete(path)
+    std::fs::rename(from, to)
 }
 
 /// Open a file in the OS default application (video player).
@@ -268,14 +251,12 @@ mod tests {
     }
 
     #[test]
-    fn rename_validation_and_sidecars() {
+    fn rename_validation() {
         let dir = std::env::temp_dir().join(format!("hc-rename-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let a = dir.join("clip_2026-10-01_14-51-01.mp4");
         std::fs::write(&a, b"x").unwrap();
-        std::fs::write(media::sidecar_path(&a), b"{}").unwrap();
-        std::fs::write(media::rendered_path(&a), b"r").unwrap();
         std::fs::write(dir.join("Taken.mp4"), b"y").unwrap();
 
         assert!(path_for_name(&dir, "  ", "mp4", Some(&a)).is_err());
@@ -285,8 +266,6 @@ mod tests {
         let to = path_for_name(&dir, "Ace clutch", "mp4", Some(&a)).unwrap();
         rename(&a, &to).unwrap();
         assert!(to.exists() && !a.exists());
-        assert!(media::sidecar_path(&to).exists(), "edit moves with the clip");
-        assert!(media::rendered_path(&to).exists(), "render moves with the clip");
         // Renaming to its own name is allowed.
         assert!(path_for_name(&dir, "Ace clutch", "mp4", Some(&to)).is_ok());
         std::fs::remove_dir_all(&dir).unwrap();

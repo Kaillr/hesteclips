@@ -8,7 +8,7 @@ fn main() -> anyhow::Result<()> {
     if let Some(t) = e.tracks.first_mut() { t.points = vec![media::VolumePoint { t: a + 1.0, db: -20.0 }, media::VolumePoint { t: a + 3.0, db: 0.0 }]; }
     let out = std::env::temp_dir().join("smart_out.mp4");
     let t = std::time::Instant::now();
-    media::render_with_progress(&src, &info, &e, &out, |p| eprint!("{:.0}% ", p * 100.0))?;
+    media::render_with_progress(&src, &info, &e, &out, None, |p| eprint!("{:.0}% ", p * 100.0))?;
     eprintln!();
     let o = media::probe(&out)?;
     println!("{:.2}s render; out {:.4}s (want {:.4}); {} frames (want {}); audio {:?}",
