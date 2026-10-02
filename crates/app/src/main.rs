@@ -386,7 +386,8 @@ impl eframe::App for App {
                 .frame(
                     egui::Frame::new()
                         .fill(ui.visuals().panel_fill)
-                        .inner_margin(egui::Margin::symmetric(16, 10)),
+                        .inner_margin(egui::Margin::symmetric(16, 10))
+                        .stroke(egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color)),
                 )
                 .show(ui, |ui| self.capture_bar(ui));
         }
@@ -448,134 +449,153 @@ impl eframe::App for App {
     }
 }
 
-// --- Capture bar: status on the left, the actions that make sense right now on the right ---
+// --- Header: where you are on the left, capture status and actions on the right ---
 impl App {
     fn capture_bar(&mut self, ui: &mut egui::Ui) {
-        let elapsed = self.rec_started.map_or(Duration::ZERO, |t| t.elapsed());
+        // ⌘, opens Settings, as in every Mac app.
+        if !ui.ctx().egui_wants_keyboard_input() && ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Comma)) {
+            self.page = Page::Settings;
+        }
+        let compact = ui.available_width() < 820.0;
         ui.horizontal(|ui| {
             ui.set_min_height(36.0);
-
-            if matches!(self.page, Page::Settings | Page::Sources) {
-                if ui.button(RichText::new("‹ Clips").size(15.0)).clicked() {
-                    self.page = Page::Clips;
-                }
-                ui.add_space(6.0);
-                let title = if self.page == Page::Settings { "Settings" } else { "Sources" };
-                ui.label(RichText::new(title).size(18.0).strong());
-            } else {
-                let (filled, color, title, sub) = match self.rec_state {
-                    RecState::Idle => (
-                        false,
-                        ui.visuals().weak_text_color(),
-                        "Not recording".to_owned(),
-                        "Start the replay buffer to be ready for the next highlight".to_owned(),
-                    ),
-                    RecState::Buffering => (
-                        true,
-                        ACCENT,
-                        "Replay buffer on".to_owned(),
-                        format!(
-                            "{} saves the last {}",
-                            hotkey_label("F10"),
-                            thumbs::format_duration(Duration::from_secs(self.settings.replay_seconds.into()))
-                        ),
-                    ),
-                    RecState::Recording => (
-                        true,
-                        REC_RED,
-                        format!("Recording  {}", thumbs::format_duration(elapsed)),
-                        format!("{} to stop", hotkey_label("F9")),
-                    ),
-                };
-                // Painted rather than a text glyph so it renders identically everywhere.
-                let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
-                if filled {
-                    // Live: a soft pulse so it reads as "on" at a glance.
-                    let t = ui.input(|i| i.time);
-                    let halo = 0.25 + 0.2 * (t * 2.5).sin() as f32;
-                    ui.painter().circle_filled(rect.center(), 8.0, color.gamma_multiply(halo));
-                    ui.painter().circle_filled(rect.center(), 5.0, color);
-                } else {
-                    ui.painter().circle_stroke(rect.center(), 5.0, egui::Stroke::new(1.5, color));
-                }
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 0.0;
-                    ui.label(RichText::new(title).size(16.0).strong());
-                    ui.label(RichText::new(sub).size(12.0).weak());
-                });
-            }
-
+            self.nav_tabs(ui, compact);
+            ui.add_space(14.0);
+            self.capture_status(ui, compact);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if self.page == Page::Clips {
-                    if ui
-                        .add(egui::Button::new(RichText::new("⚙").size(18.0)).frame(false))
-                        .on_hover_text("Settings")
-                        .clicked()
-                    {
-                        self.page = Page::Settings;
-                    }
-                    if ui
-                        .add(egui::Button::new(RichText::new("🎤 Sources").size(14.0)).frame(false))
-                        .on_hover_text("What goes into your clips: mic, desktop sound, apps — with live levels")
-                        .clicked()
-                    {
-                        self.page = Page::Sources;
-                    }
-                    ui.add_space(8.0);
-                }
-                let big = |text: &str, fill: Option<Color32>| {
-                    let mut rt = RichText::new(text.to_owned()).size(15.0);
-                    if fill.is_some() {
-                        rt = rt.color(Color32::WHITE);
-                    }
-                    let mut b = egui::Button::new(rt).min_size(egui::vec2(0.0, 34.0)).corner_radius(8);
-                    if let Some(f) = fill {
-                        b = b.fill(f);
-                    }
-                    b
-                };
-                // Buttons are laid out right-to-left: primary action is rightmost.
-                match self.rec_state {
-                    RecState::Idle => {
-                        if ui
-                            .add(big("⏺  Start replay buffer", Some(ACCENT)))
-                            .on_hover_text(hotkey_label("F8"))
-                            .clicked()
-                        {
-                            self.start_replay_buffer();
-                        }
-                        if ui.add(big("Record", None)).on_hover_text(hotkey_label("F9")).clicked() {
-                            self.start_recording();
-                        }
-                    }
-                    RecState::Buffering => {
-                        if ui
-                            .add_enabled(!self.saving, big("💾  Save clip", Some(ACCENT)))
-                            .on_hover_text(hotkey_label("F10"))
-                            .clicked()
-                        {
-                            self.save_clip();
-                        }
-                        if ui.add(big("Stop", None)).on_hover_text(hotkey_label("F8")).clicked() {
-                            self.stop();
-                        }
-                    }
-                    RecState::Recording => {
-                        if ui
-                            .add(big("⏹  Stop recording", Some(REC_RED)))
-                            .on_hover_text(hotkey_label("F9"))
-                            .clicked()
-                        {
-                            self.stop();
-                        }
-                    }
-                }
+                self.capture_actions(ui, compact);
             });
         });
     }
 
-    /// Warn + guide when screen-recording permission is missing (macOS). Without it,
-    /// capture produces empty files, so we surface it up front instead of failing later.
+    /// Clips · Sources · Settings, as one segmented control. Icons only when narrow.
+    fn nav_tabs(&mut self, ui: &mut egui::Ui, compact: bool) {
+        let tabs = [
+            (Page::Clips, "🎬", "Clips", "Your clips".to_owned()),
+            (Page::Sources, "🎤", "Sources", "What goes into your clips: mic, desktop sound, apps, with live levels".to_owned()),
+            (Page::Settings, "⚙", "Settings", format!("Settings ({})", if cfg!(target_os = "macos") { "⌘," } else { "Ctrl+," })),
+        ];
+        let v = ui.visuals().clone();
+        egui::Frame::new()
+            .fill(v.extreme_bg_color)
+            .corner_radius(9)
+            .inner_margin(egui::Margin::same(3))
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                for (page, icon, label, tip) in tabs {
+                    // Painted, not an egui Button: a button grows a hover stroke,
+                    // which made the tabs change width under the pointer.
+                    let selected = self.page == page;
+                    let text = if compact { icon.to_owned() } else { format!("{icon}  {label}") };
+                    let galley = ui.painter().layout_no_wrap(text, egui::FontId::proportional(14.0), Color32::WHITE);
+                    let w = if compact { 34.0 } else { galley.size().x + 22.0 };
+                    let (rect, mut r) = ui.allocate_exact_size(egui::vec2(w, 28.0), egui::Sense::click());
+                    let color = if selected {
+                        v.strong_text_color()
+                    } else if r.hovered() {
+                        v.text_color()
+                    } else {
+                        v.weak_text_color()
+                    };
+                    if selected {
+                        ui.painter().rect_filled(rect, 7, v.widgets.active.weak_bg_fill);
+                    } else if r.hovered() {
+                        ui.painter().rect_filled(rect, 7, v.widgets.hovered.weak_bg_fill.gamma_multiply(0.5));
+                    }
+                    ui.painter().galley_with_override_text_color(rect.center() - galley.size() / 2.0, galley, color);
+                    if compact || page == Page::Settings {
+                        r = r.on_hover_text(tip);
+                    }
+                    if r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        self.page = page;
+                    }
+                }
+            });
+    }
+
+    /// What capture is doing: a dot and a short line, with the hotkey hint below
+    /// when there's room. Shown on every page so it's never a surprise.
+    fn capture_status(&self, ui: &mut egui::Ui, compact: bool) {
+        let elapsed = self.rec_started.map_or(Duration::ZERO, |t| t.elapsed());
+        let replay = thumbs::format_duration(Duration::from_secs(self.settings.replay_seconds.into()));
+        let (live, color, title, hint) = match self.rec_state {
+            RecState::Idle => (false, ui.visuals().weak_text_color(), "Not recording".to_owned(), format!("{} starts the replay buffer", hotkey_label("F8"))),
+            RecState::Buffering if self.saving => (true, ACCENT, "Saving clip…".to_owned(), format!("The last {replay}")),
+            RecState::Buffering => (true, ACCENT, "Replay buffer on".to_owned(), format!("{} saves the last {replay}", hotkey_label("F10"))),
+            RecState::Recording => (true, REC_RED, format!("Recording  {}", thumbs::format_duration(elapsed)), format!("{} stops", hotkey_label("F9"))),
+        };
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+            if live {
+                // A soft pulse so it reads as "on" at a glance.
+                let t = ui.input(|i| i.time);
+                let halo = 0.25 + 0.2 * (t * 2.5).sin() as f32;
+                ui.painter().circle_filled(rect.center(), 8.0, color.gamma_multiply(halo));
+                ui.painter().circle_filled(rect.center(), 5.0, color);
+            } else {
+                ui.painter().circle_stroke(rect.center(), 5.0, egui::Stroke::new(1.5, color));
+            }
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.label(RichText::new(&title).size(14.0).strong().color(if live { color } else { ui.visuals().text_color() }));
+                if !compact {
+                    ui.label(RichText::new(&hint).size(11.5).weak());
+                }
+            })
+            .response
+            .on_hover_text(&hint);
+        });
+    }
+
+    /// The one or two buttons that make sense right now; the primary one rightmost.
+    fn capture_actions(&mut self, ui: &mut egui::Ui, compact: bool) {
+        let button = |text: &str, fill: Option<Color32>| {
+            let mut rt = RichText::new(text.to_owned()).size(14.0);
+            if fill.is_some() {
+                rt = rt.color(Color32::WHITE);
+            }
+            let mut b = egui::Button::new(rt).min_size(egui::vec2(0.0, 32.0)).corner_radius(8);
+            if let Some(f) = fill {
+                b = b.fill(f);
+            }
+            b
+        };
+        match self.rec_state {
+            RecState::Idle => {
+                let start = if compact { "⏺  Replay buffer" } else { "⏺  Start replay buffer" };
+                if ui
+                    .add(button(start, Some(ACCENT)))
+                    .on_hover_text(format!("Keep the last {} ready to save ({})", thumbs::format_duration(Duration::from_secs(self.settings.replay_seconds.into())), hotkey_label("F8")))
+                    .clicked()
+                {
+                    self.start_replay_buffer();
+                }
+                if ui.add(button("Record", None)).on_hover_text(format!("Record until you stop ({})", hotkey_label("F9"))).clicked() {
+                    self.start_recording();
+                }
+            }
+            RecState::Buffering => {
+                if ui
+                    .add_enabled(!self.saving, button("💾  Save clip", Some(ACCENT)))
+                    .on_hover_text(hotkey_label("F10"))
+                    .clicked()
+                {
+                    self.save_clip();
+                }
+                if ui.add(button("Stop", None)).on_hover_text(format!("Stop the replay buffer ({})", hotkey_label("F8"))).clicked() {
+                    self.stop();
+                }
+            }
+            RecState::Recording => {
+                let stop = if compact { "⏹  Stop" } else { "⏹  Stop recording" };
+                if ui.add(button(stop, Some(REC_RED))).on_hover_text(hotkey_label("F9")).clicked() {
+                    self.stop();
+                }
+            }
+        }
+    }
+
     fn permission_banner(&mut self, ui: &mut egui::Ui) {
         if self.permission != capture::Permission::Denied {
             return;
