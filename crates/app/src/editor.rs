@@ -138,12 +138,19 @@ impl Editor {
         }
         match &mut self.state {
             State::Loading(_) => {
-                ui.centered_and_justified(|ui| {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label("Opening clip…");
-                    });
-                });
+                // A horizontal row fills the width and starts at the left, so
+                // size the spinner + label and place them in the middle ourselves.
+                let text = "Opening clip…";
+                let galley = ui.painter().layout_no_wrap(text.into(), egui::TextStyle::Body.resolve(ui.style()), ui.visuals().text_color());
+                let spinner = ui.spacing().interact_size.y;
+                let gap = ui.spacing().item_spacing.x;
+                let size = Vec2::new(spinner + gap + galley.size().x, spinner.max(galley.size().y));
+                let rect = Rect::from_center_size(ui.max_rect().center(), size);
+                ui.put(Rect::from_min_size(rect.min, Vec2::splat(spinner)), egui::Spinner::new().size(spinner));
+                ui.put(
+                    Rect::from_min_size(Pos2::new(rect.min.x + spinner + gap, rect.min.y), Vec2::new(galley.size().x, size.y)),
+                    egui::Label::new(text),
+                );
                 EditorOutcome::Stay
             }
             State::Failed(e) => {
