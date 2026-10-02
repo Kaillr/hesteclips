@@ -410,6 +410,12 @@ pub(crate) fn window_alive(hwnd: HWND) -> bool {
     unsafe { IsWindow(Some(hwnd)) }.as_bool()
 }
 
+/// The size any window on any display fits in: the widest display's width by
+/// the tallest display's height (a portrait monitor is taller than the main one).
+pub(crate) fn largest_display_box() -> (u32, u32) {
+    monitors().iter().fold((2, 2), |(w, h), m| (w.max(m.width), h.max(m.height)))
+}
+
 /// The main display and its size.
 pub(crate) fn primary_monitor() -> (HMONITOR, u32, u32) {
     monitor_with_size(unsafe { MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY) })

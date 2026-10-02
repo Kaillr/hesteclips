@@ -333,7 +333,18 @@ impl PictureSource {
     }
 
     fn open(self, gpu: &d3d::Gpu, width: u32, height: u32, fps: u32) -> Result<Picture> {
-        let latest = d3d::Latest::new(gpu, width, height)?;
+        // What's captured is copied 1:1 before it's scaled into the frame, so the
+        // copy must hold all of it. A display is its own size; an app's window
+        // can be on any display — on a portrait one, taller than the frame — so
+        // it gets room for a window on the biggest of them.
+        let (copy_w, copy_h) = match &self {
+            PictureSource::Screen(_) => (width, height),
+            PictureSource::Apps(_) => {
+                let (w, h) = system::largest_display_box();
+                (w.max(width), h.max(height))
+            }
+        };
+        let latest = d3d::Latest::new(gpu, copy_w, copy_h)?;
         let video = match self {
             PictureSource::Apps(ids) => {
                 // Black until one of the apps' windows shows up.
