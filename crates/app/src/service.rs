@@ -77,10 +77,16 @@ impl CaptureService {
                             let evt_tx = evt_tx.clone();
                             thread::spawn(move || match pending.finish() {
                                 Ok(path) => send(&evt_tx, Evt::Saved(path)),
-                                Err(e) => send(&evt_tx, Evt::Error(e.to_string())),
+                                Err(e) => {
+                                    eprintln!("saving a clip failed: {e:#}");
+                                    send(&evt_tx, Evt::Error(e.to_string()));
+                                }
                             });
                         }
-                        Err(e) => send(&evt_tx, Evt::Error(e.to_string())),
+                        Err(e) => {
+                            eprintln!("saving a clip failed: {e:#}");
+                            send(&evt_tx, Evt::Error(e.to_string()));
+                        }
                     },
                     Cmd::UpdateVideo(video) => {
                         recorder.update_video(&video);

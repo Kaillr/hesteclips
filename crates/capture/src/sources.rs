@@ -160,8 +160,18 @@ fn start_mic(name: &str, feed: Arc<SourceFeed>) -> Result<cpal::Stream> {
     let device = find_input(name).ok_or_else(|| anyhow::anyhow!("not connected"))?;
     let config = device.default_input_config()?;
     let channels = config.channels() as usize;
+    let mut stream_config = config.config();
+    // Room for 200 ms of backlog. By default the device's buffer holds only
+    // ~10-20 ms, so the reading thread being scheduled a little late (a game
+    // pinning the CPU) overflowed it and lost audio. It still wakes every
+    // ~10 ms, and every packet is placed by its timestamp, so this adds no delay.
+    let backlog = config.sample_rate() / 5;
+    stream_config.buffer_size = match config.buffer_size() {
+        cpal::SupportedBufferSize::Range { min, max } => cpal::BufferSize::Fixed(backlog.clamp(*min, *max)),
+        cpal::SupportedBufferSize::Unknown => cpal::BufferSize::Fixed(backlog),
+    };
     let stream = device.build_input_stream::<f32, _, _>(
-        config.config(),
+        stream_config,
         move |data, info| {
             let start = info.timestamp().capture.as_nanos() as f64 / 1e9;
             feed.push(start, data, channels);

@@ -33,6 +33,22 @@ pub(crate) fn new_clip_path(dir: &Path, ext: &str) -> PathBuf {
     }
 }
 
+/// Give a just-written file its real name. On Windows, an antivirus scan or the
+/// search indexer often opens a new file for a moment, and renaming it then
+/// fails ("access denied"): keep trying for a couple of seconds.
+pub(crate) fn finish_rename(from: &Path, to: &Path) -> std::io::Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        match std::fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(e) if std::time::Instant::now() < deadline && e.kind() == std::io::ErrorKind::PermissionDenied => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// Local timestamp for filenames, e.g. "2026-08-13_14-32-05".
 pub(crate) fn timestamp() -> String {
     chrono::Local::now().format("%Y-%m-%d_%H-%M-%S").to_string()

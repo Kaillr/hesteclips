@@ -62,7 +62,7 @@ pub(crate) fn request_clip(tx: &Sender<Command>, dir: &Path, ext: &str, seconds:
             let _ = std::fs::remove_file(&partial);
             return Err(e);
         }
-        std::fs::rename(&partial, &out).context("couldn't finish saving the clip")?;
+        crate::output::finish_rename(&partial, &out).context("couldn't finish saving the clip")?;
         Ok(out)
     }))
 }
@@ -148,20 +148,25 @@ struct Ring {
 impl Ring {
     fn push(&mut self, media: Media) {
         let t = media_time(&media);
+        let key = matches!(media, Media::Video { key: true, .. });
         self.items.push_back((t, media));
-        // Drop whole keyframe intervals from the front once the rest still covers
-        // `keep` — the ring must always start on a keyframe.
-        loop {
-            let newest = self.items.back().map_or(t, |(t, _)| *t);
-            let next_key = self.items.iter().skip(1).find_map(|(t, m)| matches!(m, Media::Video { key: true, .. }).then_some(*t));
-            match next_key {
-                Some(k) if newest - k >= self.keep => {
-                    while self.items.front().is_some_and(|(t, _)| *t < k) {
-                        self.items.pop_front();
-                    }
-                }
-                _ => break,
-            }
+        if !key {
+            return;
+        }
+        // Drop everything older than the newest keyframe that still has `keep`
+        // after it, so the ring always reaches back to a keyframe. By time, not
+        // position: items are in arrival order, which isn't time order — audio
+        // runs late, and when video stalls, audio newer than the next keyframe
+        // arrives before it. (Trimming by position then could never get past
+        // such a packet, and looped forever.) Once per keyframe keeps it cheap.
+        let cut = self
+            .items
+            .iter()
+            .filter(|(k, m)| matches!(m, Media::Video { key: true, .. }) && t - *k >= self.keep)
+            .map(|(k, _)| *k)
+            .fold(None, |a: Option<f64>, k| Some(a.map_or(k, |a| a.max(k))));
+        if let Some(cut) = cut {
+            self.items.retain(|(k, _)| *k >= cut - 1e-9);
         }
     }
 
@@ -255,5 +260,48 @@ impl Media {
                 Media::Audio { track: *track, packet: AacPacket { data: packet.data.clone(), frame: packet.frame } }
             }
         }
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn video(pts: f64, key: bool) -> Media {
+        let frame = crate::win::file::VideoFrame(Arc::new(crate::win::file::EncodedFrame { data: Arc::from(vec![0u8; 4]), config: None }));
+        Media::Video { frame, pts, key }
+    }
+
+    fn audio(t: f64) -> Media {
+        Media::Audio { track: 0, packet: AacPacket { data: vec![0; 4], frame: (t * RATE as f64) as i64 } }
+    }
+
+    /// Video stalls for a moment while audio keeps coming: an audio packet newer
+    /// than the next keyframe arrives before that keyframe. Trimming must still
+    /// finish (it used to loop forever, freezing saves and stopping).
+    #[test]
+    fn trimming_survives_audio_ahead_of_video() {
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done2 = done.clone();
+        let t = std::thread::spawn(move || {
+            let mut ring = Ring { items: VecDeque::new(), keep: 2.0 };
+            ring.push(video(0.0, true));
+            ring.push(audio(3.5)); // ahead of the stalled video
+            for k in 1..=10 {
+                ring.push(video(k as f64, true));
+            }
+            done2.store(true, std::sync::atomic::Ordering::SeqCst);
+            ring
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !done.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(std::time::Instant::now() < deadline, "trimming never finished");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let ring = t.join().unwrap();
+        // Only the last few seconds are kept, starting at a keyframe.
+        assert!(ring.items.len() <= 4, "kept {} items", ring.items.len());
+        assert!(ring.items.iter().all(|(t, _)| *t >= 8.0 - 1e-9));
     }
 }

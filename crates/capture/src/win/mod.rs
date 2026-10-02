@@ -133,7 +133,7 @@ impl Recorder for WinRecorder {
         if !partial.exists() {
             bail!("recording failed — nothing was written");
         }
-        std::fs::rename(&partial, &file).context("couldn't finish the recording")?;
+        crate::output::finish_rename(&partial, &file).context("couldn't finish the recording")?;
         Ok(Some(file))
     }
 
