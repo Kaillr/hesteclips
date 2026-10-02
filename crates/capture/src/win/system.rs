@@ -376,8 +376,6 @@ pub(crate) struct Foreground {
     pub exe: String,
     /// A main window (the kind [`find_app_window`] picks), not a dialog or popup.
     pub main: bool,
-    /// HesteClips itself.
-    pub own: bool,
 }
 
 pub(crate) fn foreground_app() -> Option<Foreground> {
@@ -390,7 +388,7 @@ pub(crate) fn foreground_app() -> Option<Foreground> {
         GetWindowThreadProcessId(hwnd, Some(&mut pid));
         let exe = exe_of(pid)?;
         let main = app_windows().iter().any(|(h, _)| *h == hwnd);
-        Some(Foreground { hwnd, exe, main, own: pid == std::process::id() })
+        Some(Foreground { hwnd, exe, main })
     }
 }
 
@@ -407,6 +405,17 @@ fn exe_of(pid: u32) -> Option<String> {
     map.entry(pid)
         .or_insert_with(|| image_path(pid).and_then(|p| Some(std::path::Path::new(&p).file_name()?.to_string_lossy().into_owned())))
         .clone()
+}
+
+/// Whether a window isn't showing: minimized, hidden, or cloaked (Windows
+/// hides it without minimizing, as on another virtual desktop). Its capture
+/// then delivers nothing new.
+pub(crate) fn window_hidden(hwnd: HWND) -> bool {
+    unsafe {
+        let mut cloaked = 0u32;
+        let _ = DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &mut cloaked as *mut _ as *mut _, 4);
+        IsIconic(hwnd).as_bool() || !IsWindowVisible(hwnd).as_bool() || cloaked != 0
+    }
 }
 
 /// Whether a window is minimized.

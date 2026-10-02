@@ -532,56 +532,63 @@ impl Video {
                 if let Some((_, app, _)) = &focused {
                     active = Some(app.clone());
                 }
-                // Tabbed out: something unlisted is in front. HesteClips itself
-                // doesn't count, so checking the preview doesn't change it.
-                let tabbed_out = config.away_when_unfocused && focused.is_none() && foreground.as_ref().is_some_and(|f| !f.own);
-                if tabbed_out {
-                    current = None; // no need to keep capturing what isn't shown
-                    show_away(&mut away_up);
-                } else {
-                    // Keep the window being recorded while it's still the active
-                    // app's, open, and shown (or focused): switching costs a
-                    // moment, and flipping between two of an app's windows would
-                    // flicker.
-                    let keep = current.as_ref().is_some_and(|(h, app, capture)| {
-                        Some(app) == active.as_ref()
-                            && !capture.is_closed()
-                            && system::window_alive(*h)
-                            && (focused.as_ref().is_none_or(|(f, _, main)| !main || f == h) && !system::window_minimized(*h)
-                                || focused.as_ref().is_some_and(|(f, _, _)| f == h))
-                    });
-                    if !keep {
-                        // What to record now: the focused window of a listed app,
-                        // else the active app's main window, else the first listed
-                        // app that's open.
-                        let target = focused
-                            .as_ref()
-                            .filter(|(_, _, main)| *main)
-                            .map(|(h, app, _)| (*h, app.clone()))
-                            .or_else(|| active.as_ref().and_then(|a| Some((system::find_app_window(a)?, a.clone()))))
-                            .or_else(|| config.ids.iter().find_map(|a| Some((system::find_app_window(a)?, a.clone()))));
-                        let same = current.as_ref().zip(target.as_ref()).is_some_and(|((h, ..), (t, _))| h == t);
-                        if !same {
-                            current = None;
-                            match target.filter(|(h, _)| failed != Some(*h)) {
-                                // Nothing listed is open.
-                                None => show_away(&mut away_up),
-                                Some((h, app)) => {
-                                    match d3d::window_item(h).and_then(|item| d3d::Capture::start(&gpu, &item, &latest, Some(h), fps)) {
-                                        Ok(capture) => {
-                                            latest.set_app(Some(app.clone()));
-                                            active = Some(app.clone());
-                                            current = Some((h, app, capture));
-                                            away_up = false;
-                                        }
-                                        Err(e) => {
-                                            eprintln!("can't record {app}'s window: {e:#}");
-                                            failed = Some(h);
-                                        }
+                // Keep the window being recorded while it's still the active
+                // app's, open, and shown (or focused): switching costs a moment,
+                // and flipping between two of an app's windows would flicker.
+                let keep = current.as_ref().is_some_and(|(h, app, capture)| {
+                    Some(app) == active.as_ref()
+                        && !capture.is_closed()
+                        && system::window_alive(*h)
+                        && (focused.as_ref().is_none_or(|(f, _, main)| !main || f == h) && !system::window_minimized(*h)
+                            || focused.as_ref().is_some_and(|(f, _, _)| f == h))
+                });
+                if !keep {
+                    // What to record now: the focused window of a listed app,
+                    // else the active app's main window, else the first listed
+                    // app that's open.
+                    let target = focused
+                        .as_ref()
+                        .filter(|(_, _, main)| *main)
+                        .map(|(h, app, _)| (*h, app.clone()))
+                        .or_else(|| active.as_ref().and_then(|a| Some((system::find_app_window(a)?, a.clone()))))
+                        .or_else(|| config.ids.iter().find_map(|a| Some((system::find_app_window(a)?, a.clone()))));
+                    let same = current.as_ref().zip(target.as_ref()).is_some_and(|((h, ..), (t, _))| h == t);
+                    if !same {
+                        current = None;
+                        match target.filter(|(h, _)| failed != Some(*h)) {
+                            // Nothing listed is open.
+                            None => show_away(&mut away_up),
+                            Some((h, app)) => {
+                                match d3d::window_item(h).and_then(|item| d3d::Capture::start(&gpu, &item, &latest, Some(h), fps)) {
+                                    Ok(capture) => {
+                                        latest.set_app(Some(app.clone()));
+                                        active = Some(app.clone());
+                                        current = Some((h, app, capture));
+                                        away_up = false;
+                                    }
+                                    Err(e) => {
+                                        eprintln!("can't record {app}'s window: {e:#}");
+                                        failed = Some(h);
                                     }
                                 }
                             }
                         }
+                    }
+                }
+                // Tabbed out: the recorded window isn't showing anymore
+                // (minimized, as games are when you alt-tab, or hidden). Just
+                // clicking elsewhere doesn't count: a window still on screen is
+                // still recorded. With the away screen off, the clip keeps its
+                // last picture.
+                if let Some((h, app, _)) = &current {
+                    if system::window_hidden(*h) {
+                        if config.away_when_unfocused {
+                            show_away(&mut away_up);
+                        }
+                    } else if away_up {
+                        // Showing again: its next frame replaces the away screen.
+                        latest.set_app(Some(app.clone()));
+                        away_up = false;
                     }
                 }
                 let until = Instant::now() + Self::RESCAN;

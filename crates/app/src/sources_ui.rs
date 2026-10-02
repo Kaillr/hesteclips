@@ -445,18 +445,19 @@ impl App {
             }
         });
         ui.add_space(6.0);
-        ui.checkbox(&mut away, "Show “Tabbed out” when you're in another app").on_hover_text(
-            "On: switching to anything not listed shows the HesteClips logo with “Tabbed out” in your clips. \
-             Off: it keeps recording the last game or app you used. Either way, that screen shows while none of them is open.",
+        ui.checkbox(&mut away, "Show \u{201c}Tabbed out\u{201d} when it's minimized").on_hover_text(
+            "When the game or app you were in stops showing (most games minimize when you alt-tab), \
+             clips show the HesteClips logo with \u{201c}Tabbed out\u{201d}. Off: they keep its last picture. \
+             A window that's still on screen keeps being recorded either way, \
+             and that screen also shows while none of them is open.",
         );
         if !list.is_empty() {
             ui.add_space(2.0);
-            let how = if away {
-                "Records whichever of these you're using, and “Tabbed out” while you're in anything else."
-            } else {
-                "Records whichever of these you're using. While you're in another app, it keeps recording the last one."
-            };
-            ui.label(RichText::new(how).size(12.0).weak());
+            ui.label(
+                RichText::new("Records the one you're using, and keeps recording it while you click into something else, as long as it's on screen.")
+                    .size(12.0)
+                    .weak(),
+            );
         }
         if list != apps || away != away_screen {
             self.settings.capture = CaptureTarget::Apps { apps: list, away_screen: away };

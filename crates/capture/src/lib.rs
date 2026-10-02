@@ -80,10 +80,12 @@ pub enum VideoSource {
     /// A whole display, by backend id (see [`list_screens`]).
     Screen { id: String },
     /// Games and apps, by executable name (see [`list_windowed_apps`]): records
-    /// whichever of them is in focus. While something else is, it shows the
-    /// away screen (`away_when_unfocused`) or keeps recording the last one.
-    /// Fitted into a frame the size of the main display. The away screen also
-    /// shows while none of them is open; each is picked up as soon as it opens.
+    /// whichever of them was last in focus, for as long as it's showing, even
+    /// while you click into something else. When it stops showing (minimized,
+    /// as games are when you alt-tab), it shows the away screen
+    /// (`away_when_unfocused`) or keeps its last picture. Fitted into a frame
+    /// the size of the main display. The away screen also shows while none of
+    /// them is open; each is picked up as soon as it opens.
     Apps { ids: Vec<String>, away_when_unfocused: bool },
 }
 
