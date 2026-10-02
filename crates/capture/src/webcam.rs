@@ -114,6 +114,21 @@ pub fn open_settings(device: &str, name: &str) {
     }
 }
 
+/// Keep this camera (device, format) open, or close it with `None`. Call it
+/// whenever the chosen webcam changes: a webcam stays open for as long as it's
+/// set up, previewed and recorded or not, because closing a camera can reset
+/// what was set in its own settings window. Doesn't wait.
+pub fn keep_open(want: Option<(String, Option<Format>)>) {
+    #[cfg(target_os = "windows")]
+    {
+        crate::win::keep_camera_open(want);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = want;
+    }
+}
+
 /// Cameras on this machine.
 pub fn list_cameras() -> Vec<Device> {
     #[cfg(target_os = "windows")]

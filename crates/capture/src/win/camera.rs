@@ -2,9 +2,10 @@
 //! camera sends (MJPEG, YUY2, NV12) into BGRA, which is uploaded to the GPU
 //! for the compositor (`d3d::Converter`).
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread::{self, JoinHandle};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use windows::Win32::Media::MediaFoundation::*;
@@ -56,68 +57,157 @@ fn string(a: &IMFActivate, key: &windows::core::GUID) -> Option<String> {
     }
 }
 
-/// A running camera, filling its own `Latest` texture.
-pub(crate) struct Camera {
-    pub latest: Arc<Latest>,
-    stop: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
+/// One frame from the camera: BGRA rows, top to bottom, no padding.
+pub(crate) struct Frame {
+    pub seq: u64,
+    pub width: u32,
+    pub height: u32,
+    pub bgra: Vec<u8>,
 }
 
-impl Camera {
-    /// Open camera `device` (a symbolic link) and start delivering frames.
-    /// Returns once its format is settled (the texture's size depends on it).
-    pub(crate) fn open(gpu: &Gpu, device: &str, format: Option<crate::webcam::Format>) -> Result<Self> {
-        set_status(Status::Opening);
-        let opened = (|| {
-            let (reader, width, height) = open_reader(device, format)?;
-            let latest = Latest::new(gpu, width, height)?;
-            Ok::<_, anyhow::Error>((reader, latest, width, height))
-        })();
-        let (reader, latest, width, height) = match opened {
-            Ok(o) => o,
-            Err(e) => {
-                set_status(Status::Unavailable(format!("{e:#}")));
-                return Err(e);
-            }
-        };
-        let stop = Arc::new(AtomicBool::new(false));
-        let (stop2, latest2) = (stop.clone(), latest.clone());
-        let reader = super::d3d::Shared(reader);
-        let thread = thread::spawn(move || {
-            com_init();
-            let reader = reader;
-            set_status(Status::Live { width, height });
-            let mut row_buf = Vec::new();
-            while !stop2.load(Ordering::Relaxed) {
-                let mut flags = 0u32;
-                let mut sample = None;
-                // Blocks until the camera's next frame.
-                if let Err(e) = unsafe { reader.0.ReadSample(STREAM, 0, None, Some(&mut flags), None, Some(&mut sample)) } {
-                    set_status(Status::Unavailable(e.message()));
-                    break;
-                }
-                if flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32 != 0 {
-                    set_status(Status::Unavailable("the camera stopped".into()));
-                    break;
-                }
-                if let Some(sample) = sample {
-                    if let Err(e) = upload(&sample, &latest2, width, height, &mut row_buf) {
-                        eprintln!("webcam frame: {e:#}");
-                    }
-                }
-            }
-        });
-        Ok(Self { latest, stop, thread: Some(thread) })
+/// The camera, kept open for as long as a webcam is set up — not just while
+/// something previews or records it. Closing a camera can reset what was set
+/// in its own settings window (exposure, focus…), and some, like the C922, do.
+/// Captures and previews take its newest frame ([`CameraFeed::latest`]) and
+/// upload it to their own GPU.
+pub(crate) struct CameraFeed {
+    pub device: String,
+    pub format: Option<crate::webcam::Format>,
+    frame: Mutex<Option<Arc<Frame>>>,
+    stop: AtomicBool,
+}
+
+/// The one open camera.
+static CURRENT: Mutex<Option<Arc<CameraFeed>>> = Mutex::new(None);
+
+impl CameraFeed {
+    pub(crate) fn latest(&self) -> Option<Arc<Frame>> {
+        self.frame.lock().unwrap().clone()
+    }
+
+    /// The open camera, if it's `device` in `format`.
+    pub(crate) fn current(device: &str, format: Option<crate::webcam::Format>) -> Option<Arc<CameraFeed>> {
+        CURRENT.lock().unwrap().clone().filter(|f| f.device == device && f.format == format)
     }
 }
 
-impl Drop for Camera {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
-        }
+/// Keep camera `want` (device, format) open, or none. Opening and closing
+/// happen in the background; asking for what's already open does nothing.
+pub fn keep_open(want: Option<(String, Option<crate::webcam::Format>)>) {
+    let mut current = CURRENT.lock().unwrap();
+    let same = match (&*current, &want) {
+        (Some(f), Some((d, fm))) => f.device == *d && f.format == *fm,
+        (None, None) => true,
+        _ => false,
+    };
+    if same {
+        return;
+    }
+    if let Some(old) = current.take() {
+        old.stop.store(true, Ordering::Relaxed); // its thread closes it
+    }
+    let Some((device, format)) = want else {
         set_status(Status::Off);
+        return;
+    };
+    let feed = Arc::new(CameraFeed { device, format, frame: Mutex::new(None), stop: AtomicBool::new(false) });
+    *current = Some(feed.clone());
+    thread::spawn(move || run(feed));
+}
+
+/// Open the camera and keep reading it until told to stop. If it can't be
+/// opened (unplugged, in use) or stops, try again every few seconds.
+fn run(feed: Arc<CameraFeed>) {
+    com_init();
+    let mut seq = 0u64;
+    while !feed.stop.load(Ordering::Relaxed) {
+        set_status(Status::Opening);
+        let (reader, width, height) = match open_reader(&feed.device, feed.format) {
+            Ok(r) => r,
+            Err(e) => {
+                set_status(Status::Unavailable(format!("{e:#}")));
+                wait_or_stop(&feed, Duration::from_secs(3));
+                continue;
+            }
+        };
+        set_status(Status::Live { width, height });
+        let mut rows = Vec::new();
+        while !feed.stop.load(Ordering::Relaxed) {
+            let mut flags = 0u32;
+            let mut sample = None;
+            // Blocks until the camera's next frame.
+            if let Err(e) = unsafe { reader.ReadSample(STREAM, 0, None, Some(&mut flags), None, Some(&mut sample)) } {
+                set_status(Status::Unavailable(e.message()));
+                break;
+            }
+            if flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32 != 0 {
+                set_status(Status::Unavailable("the camera stopped".into()));
+                break;
+            }
+            let Some(sample) = sample else { continue };
+            match read_frame(&sample, width, height, &mut rows) {
+                Ok(()) => {
+                    seq += 1;
+                    let bgra = std::mem::take(&mut rows);
+                    *feed.frame.lock().unwrap() = Some(Arc::new(Frame { seq, width, height, bgra }));
+                }
+                Err(e) => eprintln!("webcam frame: {e:#}"),
+            }
+        }
+        drop(reader);
+        if !feed.stop.load(Ordering::Relaxed) {
+            wait_or_stop(&feed, Duration::from_secs(3));
+        }
+    }
+}
+
+fn wait_or_stop(feed: &CameraFeed, d: Duration) {
+    let until = std::time::Instant::now() + d;
+    while std::time::Instant::now() < until && !feed.stop.load(Ordering::Relaxed) {
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// A capture's copy of the camera on its own GPU: the newest frame is uploaded
+/// each time it's asked for and the camera has a new one.
+pub(crate) struct CameraLayer {
+    feed: Arc<CameraFeed>,
+    pub latest: Arc<Latest>,
+    last: u64,
+}
+
+impl CameraLayer {
+    /// For webcam `w`, opening it if nothing has (the app keeps it open itself).
+    pub(crate) fn new(gpu: &Gpu, w: &crate::webcam::Webcam) -> Result<Self> {
+        let feed = match CameraFeed::current(&w.device, w.format) {
+            Some(f) => f,
+            None => {
+                keep_open(Some((w.device.clone(), w.format)));
+                CameraFeed::current(&w.device, w.format).context("the camera couldn't be opened")?
+            }
+        };
+        // The texture needs the picture's size: wait a moment for the first frame.
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let (width, height) = loop {
+            if let Some(f) = feed.latest() {
+                break (f.width, f.height);
+            }
+            if std::time::Instant::now() >= deadline {
+                break w.format.map_or((1920, 1080), |f| (f.width, f.height));
+            }
+            thread::sleep(Duration::from_millis(20));
+        };
+        Ok(Self { feed, latest: Latest::new(gpu, width, height)?, last: 0 })
+    }
+
+    /// Upload the camera's newest frame, if it has one we haven't.
+    pub(crate) fn pull(&mut self) {
+        if let Some(f) = self.feed.latest() {
+            if f.seq != self.last {
+                self.last = f.seq;
+                self.latest.upload_bgra(f.bgra.as_ptr(), f.width * 4, f.width, f.height);
+            }
+        }
     }
 }
 
@@ -188,25 +278,20 @@ fn open_reader(device: &str, format: Option<crate::webcam::Format>) -> Result<(I
     }
 }
 
-/// Copy one frame to the camera's texture.
-fn upload(sample: &IMFSample, latest: &Latest, width: u32, height: u32, rows: &mut Vec<u8>) -> Result<()> {
+/// One frame as tight BGRA rows, top to bottom, into `out`.
+fn read_frame(sample: &IMFSample, width: u32, height: u32, out: &mut Vec<u8>) -> Result<()> {
+    let row = width as usize * 4;
+    out.resize(row * height as usize, 0);
     unsafe {
         let buffer = sample.GetBufferByIndex(0)?;
-        let row = width as usize * 4;
         if let Ok(b2) = buffer.cast::<IMF2DBuffer>() {
             // A 2D buffer knows its pitch, which is negative for bottom-up RGB.
             let mut scan0 = std::ptr::null_mut();
             let mut pitch = 0i32;
             b2.Lock2D(&mut scan0, &mut pitch)?;
-            if pitch > 0 {
-                latest.upload_bgra(scan0, pitch as u32, width, height);
-            } else {
-                rows.resize(row * height as usize, 0);
-                for y in 0..height as usize {
-                    let src = scan0.offset(y as isize * pitch as isize);
-                    std::ptr::copy_nonoverlapping(src, rows[y * row..].as_mut_ptr(), row);
-                }
-                latest.upload_bgra(rows.as_ptr(), row as u32, width, height);
+            for y in 0..height as usize {
+                let src = scan0.offset(y as isize * pitch as isize);
+                std::ptr::copy_nonoverlapping(src, out[y * row..].as_mut_ptr(), row);
             }
             b2.Unlock2D()?;
         } else {
@@ -218,13 +303,11 @@ fn upload(sample: &IMFSample, latest: &Latest, width: u32, height: u32, rows: &m
                 bail!("short camera frame");
             }
             // MF's plain RGB32 is bottom-up.
-            rows.resize(row * height as usize, 0);
             for y in 0..height as usize {
                 let src = ptr.add((height as usize - 1 - y) * row);
-                std::ptr::copy_nonoverlapping(src, rows[y * row..].as_mut_ptr(), row);
+                std::ptr::copy_nonoverlapping(src, out[y * row..].as_mut_ptr(), row);
             }
             buffer.Unlock()?;
-            latest.upload_bgra(rows.as_ptr(), row as u32, width, height);
         }
     }
     Ok(())

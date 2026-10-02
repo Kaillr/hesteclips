@@ -180,6 +180,9 @@ struct App {
     /// takes effect at once. Mirrors `settings.webcam` every frame.
     webcam_placement: capture::webcam::SharedPlacement,
     pub(crate) webcam_view: webcam_ui::WebcamView,
+    /// The camera last asked to stay open (it stays open while a webcam is set
+    /// up, so its own settings don't reset).
+    kept_camera: Option<(String, Option<capture::webcam::Format>)>,
     /// System audio inputs/outputs (+ current OS defaults).
     audio: capture::audio::AudioDevices,
     /// Live per-source volume and meters, shared with the capture thread.
@@ -251,6 +254,7 @@ impl App {
             away_screen: away::screen(),
             webcam_placement: std::sync::Arc::new(std::sync::Mutex::new(capture::webcam::Placement::default_for(16.0 / 9.0, 16.0 / 9.0))),
             webcam_view: Default::default(),
+            kept_camera: None,
             audio: capture::audio::list_audio_devices(),
             live_audio,
             level_monitor: None,
@@ -430,6 +434,13 @@ impl eframe::App for App {
         self.sync_capture_video();
         if let Some(w) = &self.settings.webcam {
             *self.webcam_placement.lock().unwrap() = w.placement.into();
+        }
+        // Keep the webcam open whenever one is set up, previewed or recorded or
+        // not: closing a camera can reset its own settings.
+        let camera = self.webcam_source().map(|w| (w.device, w.format));
+        if camera != self.kept_camera {
+            capture::webcam::keep_open(camera.clone());
+            self.kept_camera = camera;
         }
 
         // The editor gets the whole window; capture keeps running underneath and the
