@@ -8,7 +8,7 @@
 //! Edits are non-destructive (see the `media` crate): Done saves the sidecar and
 //! renders the edited file in the background; the original is never touched.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::mpsc::{self, Receiver};
 
 use egui::{Align2, Color32, FontId, Key, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Vec2};
@@ -16,6 +16,7 @@ use media::{ClipInfo, Edit};
 
 use crate::library::{ACCENT, REC_RED};
 use crate::player::Player;
+use crate::store::{self, EditTarget};
 
 /// Filmstrip thumbnail height in pixels (the lane is 56 pt; 2× for Retina).
 const STRIP_HEIGHT: u32 = 112;
@@ -34,11 +35,10 @@ const HOT_YELLOW: Color32 = Color32::from_rgb(235, 200, 70);
 pub enum EditorOutcome {
     Stay,
     Close,
-    /// Saved: render `edit` of `source` in the background.
-    /// Saved: render `edit` of `source` in the background — as this clip's edit,
+    /// Saved: render `edit` of the clip in the background — as this clip's edit,
     /// or (`new_name`) as a separate new clip, leaving this clip as it was.
-    Saved { source: PathBuf, info: ClipInfo, edit: Edit, new_name: Option<String> },
-    Reverted(PathBuf),
+    Saved { target: EditTarget, info: ClipInfo, edit: Edit, new_name: Option<String> },
+    Reverted(EditTarget),
 }
 
 struct Loaded {
@@ -100,14 +100,17 @@ impl Meter {
 }
 
 pub struct Editor {
-    pub source: PathBuf,
+    target: EditTarget,
     state: State,
 }
 
 impl Editor {
-    pub fn open(ctx: &egui::Context, source: &Path) -> Self {
+    /// Edit the clip at `clip`. An edited clip is decoded from its original, so
+    /// every earlier decision can still be changed.
+    pub fn open(ctx: &egui::Context, clip: &Path) -> Self {
+        let target = EditTarget::of(clip);
         let (tx, rx) = mpsc::channel();
-        let src = source.to_path_buf();
+        let src = target.source.clone();
         let repaint = ctx.clone();
         std::thread::spawn(move || {
             let result = (|| -> Result<Loaded, String> {
@@ -124,26 +127,33 @@ impl Editor {
             let _ = tx.send(result);
             repaint.request_repaint();
         });
-        Self { source: source.to_path_buf(), state: State::Loading(rx) }
+        Self { target, state: State::Loading(rx) }
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui) -> EditorOutcome {
         if let State::Loading(rx) = &self.state {
             if let Ok(result) = rx.try_recv() {
                 self.state = match result {
-                    Ok(l) => State::Ready(Box::new(Ready::new(ui.ctx(), &self.source, l))),
+                    Ok(l) => State::Ready(Box::new(Ready::new(ui.ctx(), &self.target, l))),
                     Err(e) => State::Failed(e),
                 };
             }
         }
         match &mut self.state {
             State::Loading(_) => {
-                ui.centered_and_justified(|ui| {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label("Opening clip…");
-                    });
-                });
+                // A horizontal row fills the width and starts at the left, so
+                // size the spinner + label and place them in the middle ourselves.
+                let text = "Opening clip…";
+                let galley = ui.painter().layout_no_wrap(text.into(), egui::TextStyle::Body.resolve(ui.style()), ui.visuals().text_color());
+                let spinner = ui.spacing().interact_size.y;
+                let gap = ui.spacing().item_spacing.x;
+                let size = Vec2::new(spinner + gap + galley.size().x, spinner.max(galley.size().y));
+                let rect = Rect::from_center_size(ui.max_rect().center(), size);
+                ui.put(Rect::from_min_size(rect.min, Vec2::splat(spinner)), egui::Spinner::new().size(spinner));
+                ui.put(
+                    Rect::from_min_size(Pos2::new(rect.min.x + spinner + gap, rect.min.y), Vec2::new(galley.size().x, size.y)),
+                    egui::Label::new(text),
+                );
                 EditorOutcome::Stay
             }
             State::Failed(e) => {
@@ -157,14 +167,15 @@ impl Editor {
                 });
                 out
             }
-            State::Ready(r) => r.ui(ui, &self.source),
+            State::Ready(r) => r.ui(ui, &self.target),
         }
     }
 }
 
 impl Ready {
-    fn new(ctx: &egui::Context, source: &Path, l: Loaded) -> Self {
-        let mut edit = media::load_edit(source).unwrap_or_else(|| Edit::new(&l.info));
+    fn new(ctx: &egui::Context, target: &EditTarget, l: Loaded) -> Self {
+        let source = &target.source;
+        let mut edit = store::load_edit(target).unwrap_or_else(|| Edit::new(&l.info));
         // Sidecar from an older layout or a hand-edited file: make it fit.
         if edit.tracks.len() != l.pcm.len() {
             edit.tracks = Edit::new(&l.info).tracks;
@@ -201,7 +212,9 @@ impl Ready {
         }
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, source: &Path) -> EditorOutcome {
+    fn ui(&mut self, ui: &mut egui::Ui, target: &EditTarget) -> EditorOutcome {
+        // The clip as named in the library; decoding uses `target.source`.
+        let source = target.clip.as_path();
         let ctx = ui.ctx().clone();
         while let Ok((t, f)) = self.strip_rx.try_recv() {
             let img = egui::ColorImage::from_rgba_unmultiplied([f.width as usize, f.height as usize], &f.rgba);
@@ -248,7 +261,7 @@ impl Ready {
                     .corner_radius(8);
                 if ui.add(done).on_hover_text("Save the edit to this clip. The original recording is kept, so you can change it later.").clicked() {
                     self.player.pause();
-                    outcome = self.save(source, None);
+                    outcome = self.save(target, None);
                 }
                 // A real button, not hidden in a menu: keeping the original clip and
                 // making a second one is a common need (two highlights from one recording).
@@ -264,12 +277,12 @@ impl Ready {
                     let suggested = crate::clips::sanitize_name(&format!("{} (edit)", crate::clips::title_for_stem(&base)));
                     self.save_as = Some((suggested, None));
                 }
-                let has_saved_edit = media::load_edit(source).is_some();
+                let has_saved_edit = target.source != target.clip;
                 if (has_saved_edit || changed)
                     && ui.button(RichText::new("↺ Revert").size(14.0)).on_hover_text("Undo every edit and go back to the original recording").clicked()
                 {
                     self.player.pause();
-                    outcome = EditorOutcome::Reverted(source.to_path_buf());
+                    outcome = EditorOutcome::Reverted(target.clone());
                 }
                 if self.dirty() {
                     ui.weak("Unsaved changes");
@@ -382,7 +395,7 @@ impl Ready {
                     Ok(_) => {
                         let name = name.trim().to_owned();
                         self.save_as = None;
-                        outcome = self.save(source, Some(name));
+                        outcome = self.save(target, Some(name));
                     }
                     Err(e) => *err = Some(e),
                 }
@@ -400,7 +413,7 @@ impl Ready {
                 ui.horizontal(|ui| {
                     if ui.button("Save").clicked() {
                         self.player.pause();
-                        outcome = self.save(source, None);
+                        outcome = self.save(target, None);
                         self.confirm_discard = false;
                     }
                     if ui.button("Discard").clicked() {
@@ -424,17 +437,17 @@ impl Ready {
         !same_edit(&self.edit, &self.saved)
     }
 
-    fn save(&mut self, source: &Path, new_name: Option<String>) -> EditorOutcome {
+    fn save(&mut self, target: &EditTarget, new_name: Option<String>) -> EditorOutcome {
         if new_name.is_none() && self.edit.is_identity(&self.info) {
             // Nothing changed from the original — saving means "no edit".
-            return if media::load_edit(source).is_some() {
-                EditorOutcome::Reverted(source.to_path_buf())
+            return if target.source != target.clip {
+                EditorOutcome::Reverted(target.clone())
             } else {
                 EditorOutcome::Close
             };
         }
         self.saved = self.edit.clone();
-        EditorOutcome::Saved { source: source.to_path_buf(), info: self.info.clone(), edit: self.edit.clone(), new_name }
+        EditorOutcome::Saved { target: target.clone(), info: self.info.clone(), edit: self.edit.clone(), new_name }
     }
 
     fn keyboard(&mut self, ctx: &egui::Context) {
@@ -713,7 +726,10 @@ impl Ready {
         }
 
         if resp.drag_started() {
-            if let Some(pos) = resp.interact_pointer_pos() {
+            // Hit-test where the button went down, not where the pointer is now: a
+            // drag only starts after a few pixels of movement, by which time a
+            // vertical drag has already left the thin volume line or keyframe.
+            if let Some(pos) = ui.input(|i| i.pointer.press_origin()).or(resp.interact_pointer_pos()) {
                 self.dragging = Some(hit(pos, self).unwrap_or(Drag::Playhead));
                 self.player.pause();
             }
@@ -734,7 +750,12 @@ impl Ready {
                     Drag::Line(i) => {
                         // Move the whole curve up/down by the drag distance.
                         let lane = lane_rects[i];
-                        let delta_db = -resp.drag_delta().y / lane.height() * (MAX_DB - MIN_DB);
+                        // On the first frame, include the movement before the drag registered.
+                        let dy = match ui.input(|i| i.pointer.press_origin()) {
+                            Some(origin) if resp.drag_started() => pos.y - origin.y,
+                            _ => resp.drag_delta().y,
+                        };
+                        let delta_db = -dy / lane.height() * (MAX_DB - MIN_DB);
                         let track = &mut self.edit.tracks[i];
                         if track.points.is_empty() {
                             track.gain = media::from_db((media::to_db(track.gain) + delta_db).clamp(MIN_DB, MAX_DB));

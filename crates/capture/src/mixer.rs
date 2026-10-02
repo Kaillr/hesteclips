@@ -47,36 +47,73 @@ impl AtomicF32 {
     }
 }
 
+/// Left/right levels since the meter was last read, linear (1.0 = full scale).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Levels {
+    pub peak: [f32; 2],
+    pub rms: [f32; 2],
+}
+
+impl Levels {
+    pub fn max_peak(&self) -> f32 {
+        self.peak[0].max(self.peak[1])
+    }
+}
+
 /// A level meter, written by the audio thread and read by the UI.
 #[derive(Debug, Default)]
 pub struct Meter {
-    peak: AtomicF32,
-    rms: AtomicF32,
+    peak: [AtomicF32; 2],
+    /// Sum of squares per channel and frame count since the last read, plus the
+    /// RMS last handed out (for reads that land between two blocks).
+    energy: Mutex<Energy>,
+}
+
+#[derive(Debug, Default)]
+struct Energy {
+    sum: [f64; 2],
+    frames: usize,
+    last_rms: [f32; 2],
 }
 
 impl Meter {
-    /// Highest peak since the last call and the latest RMS, both linear (1.0 =
-    /// full scale). Taking the peak resets it, so no transient is missed between
-    /// UI frames.
-    pub fn take(&self) -> (f32, f32) {
-        (self.peak.swap(0.0), self.rms.load())
+    /// Levels since the last call. Taking resets them, so no transient is missed
+    /// between UI frames and the RMS covers everything in between.
+    pub fn take(&self) -> Levels {
+        let peak = [self.peak[0].swap(0.0), self.peak[1].swap(0.0)];
+        let mut e = self.energy.lock().unwrap();
+        if e.frames > 0 {
+            let n = e.frames as f64;
+            e.last_rms = [(e.sum[0] / n).sqrt() as f32, (e.sum[1] / n).sqrt() as f32];
+            e.sum = [0.0; 2];
+            e.frames = 0;
+        }
+        Levels { peak, rms: e.last_rms }
     }
 
     fn record(&self, block: &[[f32; 2]]) {
-        let mut peak = 0f32;
-        let mut sum = 0f64;
+        let mut peak = [0f32; 2];
+        let mut sum = [0f64; 2];
         for f in block {
-            peak = peak.max(f[0].abs()).max(f[1].abs());
-            sum += (f[0] * f[0] + f[1] * f[1]) as f64;
+            for c in 0..2 {
+                peak[c] = peak[c].max(f[c].abs());
+                sum[c] += (f[c] * f[c]) as f64;
+            }
         }
-        self.peak.fetch_max(peak);
-        let rms = if block.is_empty() { 0.0 } else { (sum / (block.len() * 2) as f64).sqrt() as f32 };
-        self.rms.store(rms);
+        for c in 0..2 {
+            self.peak[c].fetch_max(peak[c]);
+        }
+        let mut e = self.energy.lock().unwrap();
+        e.sum[0] += sum[0];
+        e.sum[1] += sum[1];
+        e.frames += block.len();
     }
 
     fn clear(&self) {
-        self.peak.store(0.0);
-        self.rms.store(0.0);
+        for p in &self.peak {
+            p.store(0.0);
+        }
+        *self.energy.lock().unwrap() = Energy::default();
     }
 }
 
@@ -98,12 +135,21 @@ pub struct Channel {
     gain: AtomicF32,
     muted: AtomicBool,
     status: AtomicU8,
+    /// After volume and mute: what goes into the clip.
     pub meter: Meter,
+    /// Before volume and mute: what the source delivers (shows a muted mic is live).
+    pub input: Meter,
 }
 
 impl Channel {
     fn new() -> Self {
-        Self { gain: AtomicF32::new(1.0), muted: AtomicBool::new(false), status: AtomicU8::new(0), meter: Meter::default() }
+        Self {
+            gain: AtomicF32::new(1.0),
+            muted: AtomicBool::new(false),
+            status: AtomicU8::new(0),
+            meter: Meter::default(),
+            input: Meter::default(),
+        }
     }
 
     /// Volume as linear gain (1.0 = unchanged). Takes effect immediately, even
@@ -136,6 +182,7 @@ impl Channel {
         self.status.store(v, Ordering::Relaxed);
         if s != SourceStatus::Live {
             self.meter.clear();
+            self.input.clear();
         }
     }
 }
@@ -416,6 +463,7 @@ pub(crate) fn spawn_mixer(
                     let mut rest = vec![[0f32; 2]; if rest_track.is_some() { n } else { 0 }];
                     for (input, gain) in inputs.iter().zip(gains.iter_mut()) {
                         let mut block = input.feed.take(*from, n);
+                        input.channel.input.record(&block);
                         // Ramp to the new volume across the block so fader moves don't click.
                         let target_gain = input.channel.effective_gain();
                         for (k, f) in block.iter_mut().enumerate() {

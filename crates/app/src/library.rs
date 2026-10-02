@@ -3,13 +3,18 @@
 //! Click a card to play it; hover for a Share button; right-click for everything
 //! else. While a capture is running a placeholder card stands in for the clip, so
 //! a half-written file never shows up as if it were finished.
+//!
+//! Selecting works like Photos and Finder: the check circle on a card, ⌘-click
+//! or Shift-click start a selection; while one is active a plain click toggles a
+//! card instead of playing it, and a bar on top acts on all of them.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use egui::{Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
 
-use crate::{App, RecState, clips, share, thumbs};
+use crate::{App, RecState, clips, share, store, thumbs};
 
 const MIN_CARD_WIDTH: f32 = 220.0;
 const GAP: f32 = 14.0;
@@ -29,6 +34,56 @@ pub(crate) struct Rename {
     focused: bool,
 }
 
+/// Clips picked for a bulk action.
+#[derive(Default)]
+pub(crate) struct Selection {
+    paths: HashSet<PathBuf>,
+    /// Last card clicked, where a Shift-click range starts.
+    anchor: Option<PathBuf>,
+}
+
+impl Selection {
+    pub fn is_empty(&self) -> bool {
+        self.paths.is_empty()
+    }
+
+    pub fn clear(&mut self) {
+        self.paths.clear();
+        self.anchor = None;
+    }
+
+    /// Forget clips that are gone (trashed, renamed, deleted in Finder).
+    pub fn retain(&mut self, clips: &[clips::Clip]) {
+        self.paths.retain(|p| clips.iter().any(|c| &c.path == p));
+        if self.anchor.as_ref().is_some_and(|a| !self.paths.contains(a)) {
+            self.anchor = None;
+        }
+    }
+
+    fn toggle(&mut self, path: &PathBuf) {
+        if !self.paths.remove(path) {
+            self.paths.insert(path.clone());
+        }
+        self.anchor = Some(path.clone());
+    }
+
+    /// Add every clip from the anchor to `path`, in library order.
+    fn extend_to(&mut self, path: &PathBuf, clips: &[clips::Clip]) {
+        let at = |p: &PathBuf| clips.iter().position(|c| &c.path == p);
+        match (self.anchor.as_ref().and_then(at), at(path)) {
+            (Some(a), Some(b)) => {
+                for c in &clips[a.min(b)..=a.max(b)] {
+                    self.paths.insert(c.path.clone());
+                }
+            }
+            _ => {
+                self.paths.insert(path.clone());
+                self.anchor = Some(path.clone());
+            }
+        }
+    }
+}
+
 enum Action {
     /// Drag the file out of the window (to another app / the desktop).
     DragOut(PathBuf, Option<PathBuf>),
@@ -41,6 +96,11 @@ enum Action {
     Reveal(PathBuf),
     Share(PathBuf),
     Trash(PathBuf),
+    /// Toggle a card's selection, or (`range`) select up to it from the anchor.
+    Select { path: PathBuf, range: bool },
+    SelectAll,
+    Deselect,
+    TrashSelected,
 }
 
 enum Card<'a> {
@@ -62,6 +122,13 @@ impl App {
             return;
         }
 
+        let mut action = self.selection_keys(ui);
+        if !self.selection.is_empty() {
+            if let Some(a) = self.selection_bar(ui) {
+                action = Some(a);
+            }
+        }
+
         // Group into days. The placeholder always belongs to today. Cards borrow a
         // snapshot so drawing them can still use `&mut self` (thumbnail cache).
         let clips = self.clips.clone();
@@ -81,7 +148,6 @@ impl App {
             }
         }
 
-        let mut action = None;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             let avail = ui.available_width();
             let cols = (((avail + GAP) / (MIN_CARD_WIDTH + GAP)).floor() as usize).max(1);
@@ -138,7 +204,7 @@ impl App {
                 }
             }
             Some(Action::Copy(p)) => match share::copy_file(&p) {
-                Ok(()) => self.toast("Copied — paste it into any app (⌘V)".replace("⌘V", if cfg!(target_os = "macos") { "⌘V" } else { "Ctrl+V" })),
+                Ok(()) => self.toast(format!("Copied — paste it into any app ({})", crate::hotkey_label_cmd("V"))),
                 Err(e) => self.toast_error(format!("Couldn't copy the clip: {e}")),
             },
             Some(Action::ShareSheet(p, at)) => {
@@ -148,16 +214,115 @@ impl App {
             }
             Some(Action::Edit(p)) => self.open_editor(p),
             Some(Action::Rename(p)) => self.rename_clip(p),
-            Some(Action::Trash(p)) => match clips::move_to_trash(&p) {
-                Ok(()) => {
-                    media::revert(&p); // its edit sidecar + render go with it
-                    self.toast(format!("Moved {} to the Trash", crate::file_name(&p)));
-                    self.refresh_clips();
+            Some(Action::Trash(p)) => self.trash_clips(&[p]),
+            Some(Action::Select { path, range }) => {
+                if range {
+                    self.selection.extend_to(&path, &self.clips);
+                } else {
+                    self.selection.toggle(&path);
                 }
-                Err(e) => self.toast_error(format!("Couldn't move to the Trash: {e}")),
-            },
+            }
+            Some(Action::SelectAll) => {
+                self.selection.paths = self.clips.iter().map(|c| c.path.clone()).collect();
+            }
+            Some(Action::Deselect) => self.selection.clear(),
+            Some(Action::TrashSelected) => {
+                // In library order, so the toast and any failure read naturally.
+                let paths: Vec<PathBuf> = self.clips.iter().filter(|c| self.selection.paths.contains(&c.path)).map(|c| c.path.clone()).collect();
+                self.trash_clips(&paths);
+            }
             None => {}
         }
+    }
+
+    /// ⌘A selects every clip, ⌘⌫ / Delete trashes the selection, Esc clears it.
+    fn selection_keys(&mut self, ui: &egui::Ui) -> Option<Action> {
+        if self.rename.is_some() || self.dialog.is_some() || ui.ctx().egui_wants_keyboard_input() {
+            return None;
+        }
+        let cmd = egui::Modifiers::COMMAND;
+        ui.ctx().input_mut(|i| {
+            if i.consume_key(cmd, egui::Key::A) {
+                Some(Action::SelectAll)
+            } else if self.selection.is_empty() {
+                None
+            } else if i.consume_key(cmd, egui::Key::Backspace) || i.consume_key(egui::Modifiers::NONE, egui::Key::Delete) {
+                Some(Action::TrashSelected)
+            } else if i.consume_key(egui::Modifiers::NONE, egui::Key::Escape) {
+                Some(Action::Deselect)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// The bar on top while clips are selected: how many, and what to do with them.
+    fn selection_bar(&self, ui: &mut egui::Ui) -> Option<Action> {
+        let mut action = None;
+        let n = self.selection.paths.len();
+        ui.add_space(8.0);
+        egui::Frame::new()
+            .fill(ACCENT.gamma_multiply(0.16))
+            .stroke(Stroke::new(1.0, ACCENT.gamma_multiply(0.6)))
+            .corner_radius(CornerRadius::same(RADIUS))
+            .inner_margin(egui::Margin::symmetric(12, 8))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(if n == 1 { "1 clip selected".to_owned() } else { format!("{n} clips selected") }).strong().size(15.0));
+                    ui.add_space(8.0);
+                    if n < self.clips.len() && ui.button("Select all").on_hover_text(crate::hotkey_label_cmd("A")).clicked() {
+                        action = Some(Action::SelectAll);
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let trash = egui::Button::new(egui::RichText::new("🗑  Move to Trash").color(Color32::WHITE)).fill(ui.visuals().error_fg_color);
+                        let key = if cfg!(target_os = "macos") { crate::hotkey_label_cmd("Delete") } else { "Delete".to_owned() };
+                        if ui.add(trash).on_hover_text(key).clicked() {
+                            action = Some(Action::TrashSelected);
+                        }
+                        if ui.button("Cancel").on_hover_text("Esc").clicked() {
+                            action = Some(Action::Deselect);
+                        }
+                    });
+                });
+            });
+        action
+    }
+
+    /// Move clips (and their edits) to the Bin. Clips with a save in progress are
+    /// left alone: their file is about to be replaced.
+    fn trash_clips(&mut self, paths: &[PathBuf]) {
+        let mut library = self.clips.clone();
+        let (mut moved, mut busy) = (Vec::new(), 0);
+        let mut error = None;
+        for path in paths {
+            let Some(i) = library.iter().position(|c| &c.path == path) else { continue };
+            if self.renders.iter().any(|j| &j.source == path) {
+                busy += 1;
+                continue;
+            }
+            // Trash against what's left, so duplicates sharing assets let go of them
+            // with the last copy.
+            let clip = library.remove(i);
+            match store::trash(&clip, &library) {
+                Ok(()) => moved.push(clip.path),
+                Err(e) => {
+                    library.insert(i, clip);
+                    error = Some(e.to_string());
+                }
+            }
+        }
+        if let Some(e) = error {
+            self.toast_error(format!("Couldn't move to the Trash: {e}"));
+        } else if busy > 0 {
+            self.toast_error("Clips that are still saving an edit were kept.");
+        } else if let [one] = moved.as_slice() {
+            self.toast(format!("Moved {} to the Trash", crate::file_name(one)));
+        } else if !moved.is_empty() {
+            self.toast(format!("Moved {} clips to the Trash", moved.len()));
+        }
+        self.selection.clear();
+        self.refresh_clips();
     }
 
     fn empty_state(&mut self, ui: &mut egui::Ui) {
@@ -170,13 +335,13 @@ impl App {
             let hint = match self.rec_state {
                 RecState::Buffering => format!(
                     "The replay buffer is running. Press {} or Save clip to keep the last {} seconds.",
-                    crate::hotkey_label("F10"),
+                    self.shortcut_label(crate::settings::ShortcutAction::SaveClip),
                     self.settings.replay_seconds
                 ),
                 RecState::Recording => "Recording… stop it to see your clip here.".to_owned(),
                 RecState::Idle => format!(
                     "Start the replay buffer and press {} whenever something worth keeping happens.",
-                    crate::hotkey_label("F10")
+                    self.shortcut_label(crate::settings::ShortcutAction::SaveClip)
                 ),
             };
             ui.weak(hint);
@@ -250,11 +415,11 @@ impl App {
             .last_saved
             .as_ref()
             .is_some_and(|(p, at)| *p == clip.path && at.elapsed() < NEW_HIGHLIGHT);
+        let selecting = !self.selection.is_empty();
+        let selected = self.selection.paths.contains(&clip.path);
 
         let ctx = ui.ctx().clone();
-        // An edited clip shows its edit: new first frame, new length.
-        let shown = clip.display();
-        let thumb = self.thumbs.get(&ctx, &shown);
+        let thumb = self.thumbs.get(&ctx, clip);
         let v = ui.visuals().clone();
         let p = ui.painter();
 
@@ -285,11 +450,14 @@ impl App {
             p.text(thumb_rect.center() + Vec2::new(0.0, 14.0), Align2::CENTER_CENTER, format!("Saving edit  {:.0}%", f * 100.0), FontId::proportional(14.0), Color32::WHITE);
             progress_bar(p, thumb_rect, f, ACCENT);
             ui.ctx().request_repaint();
-        } else if is_new {
+        } else if is_new && !selecting && !hovered {
             badge(p, thumb_rect.left_top() + Vec2::new(6.0, 6.0), Align2::LEFT_TOP, "NEW", ACCENT);
         }
+        if selected {
+            p.rect_filled(thumb_rect, RADIUS, ACCENT.gamma_multiply(0.22));
+        }
 
-        if hovered && render.is_none() {
+        if hovered && render.is_none() && !selecting {
             p.rect_filled(thumb_rect, RADIUS, Color32::from_black_alpha(70));
             let c = thumb_rect.center();
             p.circle_filled(c, 22.0, Color32::from_black_alpha(150));
@@ -299,7 +467,9 @@ impl App {
                 Stroke::NONE,
             ));
         }
-        let border = if is_new {
+        let border = if selected {
+            Stroke::new(3.0, ACCENT)
+        } else if is_new {
             Stroke::new(2.0, ACCENT)
         } else if hovered {
             Stroke::new(1.0, v.widgets.hovered.bg_stroke.color)
@@ -311,7 +481,7 @@ impl App {
         // --- Caption ---
         // Edited clips say so in words, in the accent colour, right where you read
         // the clip's details — not a dark chip lost on top of a busy thumbnail.
-        let edited = clip.has_edit && clip.rendered.is_some() && render.is_none();
+        let edited = clip.original.is_some() && render.is_none();
         let mut text_x = rect.left() + 2.0;
         let title_y = thumb_rect.bottom() + 6.0;
         if edited {
@@ -323,9 +493,10 @@ impl App {
         let ext = clip.path.extension().map(|e| e.to_string_lossy().to_uppercase()).unwrap_or_default();
         // "trimmed from 0:52" only when the length actually changed (an audio-only
         // edit keeps it). Probing the original is cached like any thumbnail.
-        let trimmed_from = if edited {
-            let _ = self.thumbs.get(&ctx, clip);
-            match (self.thumbs.duration_of(clip), self.thumbs.duration_of(&shown)) {
+        let original = clip.original.as_ref().filter(|_| edited).and_then(|p| clips::Clip::at(p));
+        let trimmed_from = if let Some(original) = &original {
+            let _ = self.thumbs.get(&ctx, original);
+            match (self.thumbs.duration_of(original), self.thumbs.duration_of(clip)) {
                 (Some(orig), Some(now)) if orig - now > 0.5 => Some(thumbs::format_duration(Duration::from_secs_f64(orig))),
                 _ => None,
             }
@@ -333,20 +504,32 @@ impl App {
             None
         };
         let detail = match trimmed_from {
-            Some(orig) => format!("{}  ·  {ext}  ·  trimmed from {orig}", shown.human_size()),
-            None => format!("{}  ·  {ext}", shown.human_size()),
+            Some(orig) => format!("{}  ·  {ext}  ·  trimmed from {orig}", clip.human_size()),
+            None => format!("{}  ·  {ext}", clip.human_size()),
         };
         let meta = p.layout_job(single_line(&detail, FontId::proportional(12.0), v.weak_text_color(), w - 4.0));
         p.galley(Pos2::new(rect.left() + 2.0, thumb_rect.bottom() + 24.0), meta, v.weak_text_color());
 
         let mut action = None;
+        let modifiers = ui.input(|i| i.modifiers);
+
+        // Check circle: always there while selecting, on hover otherwise.
+        if (hovered || selecting) && render.is_none() {
+            let check = Rect::from_min_size(thumb_rect.left_top() + Vec2::new(8.0, 8.0), Vec2::splat(24.0));
+            let r = ui.interact(check.expand(4.0), ui.id().with(("select", &clip.path)), Sense::click());
+            check_circle(ui.painter(), check.center(), selected, r.hovered());
+            let tip = if selected { "Deselect" } else { "Select" };
+            if r.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tip).clicked() {
+                action = Some(Action::Select { path: clip.path.clone(), range: modifiers.shift });
+            }
+        }
 
         // Hover shortcuts for the most common follow-ups.
         let share_rect = Rect::from_min_size(thumb_rect.right_top() + Vec2::new(-84.0, 6.0), Vec2::new(78.0, 26.0));
         let edit_rect = Rect::from_min_size(share_rect.left_top() - Vec2::new(70.0, 0.0), Vec2::new(64.0, 26.0));
         let share_id = ui.id().with(("share_menu", &clip.path));
         let menu_open = egui::Popup::is_id_open(ui.ctx(), share_id);
-        if (hovered || menu_open) && render.is_none() {
+        if (hovered || menu_open) && render.is_none() && !selecting {
             let overlay_button = |ui: &mut egui::Ui, rect: Rect, text: &str, fill: Color32| {
                 // A detached child Ui: `ui.put` would count as another item in the row
                 // and push the next card one gap to the right while hovered.
@@ -368,30 +551,48 @@ impl App {
             });
         }
 
-        let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(format!(
-            "{}\nClick to play · drag into any app to share",
-            clip.name
-        ));
+        let hint = if selecting { "Click to select" } else { "Click to play · drag into any app to share" };
+        let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(format!("{}\n{hint}", clip.name));
         // Once the pointer has moved a little with the button held, it's a drag:
         // hand it to the OS so the clip can be dropped into Discord, Finder, a
         // browser… (egui alone can't drag outside its own window).
-        if resp.drag_started() && action.is_none() {
-            let preview = thumbs::cached_jpeg(&shown);
-            action = Some(Action::DragOut(clip.playable().to_path_buf(), preview));
+        if resp.drag_started() && action.is_none() && !selecting {
+            let preview = thumbs::cached_jpeg(clip);
+            action = Some(Action::DragOut(clip.path.clone(), preview));
         }
-        if resp.clicked() && action.is_none() {
-            action = Some(Action::Open(clip.playable().to_path_buf()));
+        if resp.clicked() && action.is_none() && render.is_none() {
+            action = Some(if modifiers.shift && (selecting || modifiers.command) {
+                Action::Select { path: clip.path.clone(), range: true }
+            } else if selecting || modifiers.command {
+                Action::Select { path: clip.path.clone(), range: false }
+            } else {
+                Action::Open(clip.path.clone())
+            });
         }
+        let n = self.selection.paths.len();
         resp.context_menu(|ui| {
             ui.set_min_width(190.0);
+            // Right-clicking one of several selected clips acts on all of them.
+            if selected && n > 1 {
+                if ui.button(egui::RichText::new(format!("🗑  Move {n} clips to Trash")).color(v.error_fg_color)).clicked() {
+                    action = Some(Action::TrashSelected);
+                }
+                if ui.button("Deselect all").clicked() {
+                    action = Some(Action::Deselect);
+                }
+                return;
+            }
             if ui.button("▶  Play").clicked() {
-                action = Some(Action::Open(clip.playable().to_path_buf()));
+                action = Some(Action::Open(clip.path.clone()));
             }
             if ui.button("✂  Edit…").clicked() {
                 action = Some(Action::Edit(clip.path.clone()));
             }
             if ui.button("✏  Rename…").clicked() {
                 action = Some(Action::Rename(clip.path.clone()));
+            }
+            if !selected && ui.button("☑  Select").clicked() {
+                action = Some(Action::Select { path: clip.path.clone(), range: false });
             }
             ui.separator();
             if let Some(a) = share_menu(ui, clip, ui.ctx().pointer_latest_pos().unwrap_or_default()) {
@@ -474,10 +675,10 @@ impl App {
 /// The ways to get a clip out, shared by the Share button and the right-click
 /// menu. Ordered by how often people reach for them.
 fn share_menu(ui: &mut egui::Ui, clip: &clips::Clip, anchor: Pos2) -> Option<Action> {
-    let file = clip.playable().to_path_buf();
+    let file = clip.path.clone();
     let mut action = None;
     ui.set_min_width(230.0);
-    let paste = if cfg!(target_os = "macos") { "⌘V" } else { "Ctrl+V" };
+    let paste = crate::hotkey_label_cmd("V");
     if ui.button("📋  Copy clip").on_hover_text(format!("Then paste it into Discord, a chat or a folder ({paste})")).clicked() {
         action = Some(Action::Copy(file.clone()));
     }
@@ -505,6 +706,19 @@ fn edited_pill(p: &egui::Painter, at: Pos2) -> f32 {
     p.rect_filled(rect, 8, ACCENT);
     p.galley(rect.min + Vec2::new(6.0, 1.5), galley, Color32::WHITE);
     rect.width()
+}
+
+/// A card's selection circle: hollow when not selected, a filled check when it is.
+fn check_circle(p: &egui::Painter, c: Pos2, selected: bool, hovered: bool) {
+    if selected {
+        p.circle_filled(c, 12.0, ACCENT);
+        p.circle_stroke(c, 12.0, Stroke::new(1.5, Color32::WHITE));
+        let tick = vec![c + Vec2::new(-5.5, 0.5), c + Vec2::new(-1.5, 4.5), c + Vec2::new(6.0, -4.0)];
+        p.add(egui::Shape::line(tick, Stroke::new(2.2, Color32::WHITE)));
+    } else {
+        p.circle_filled(c, 12.0, Color32::from_black_alpha(if hovered { 140 } else { 90 }));
+        p.circle_stroke(c, 11.0, Stroke::new(1.8, Color32::WHITE));
+    }
 }
 
 /// Soft pulsing dot (the same "live" cue as the recording indicator).
@@ -545,4 +759,41 @@ fn single_line(text: &str, font: FontId, color: Color32, max_width: f32) -> egui
     let mut job = egui::text::LayoutJob::simple_singleline(text.to_owned(), font, color);
     job.wrap = egui::text::TextWrapping::truncate_at_width(max_width);
     job
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn clip(name: &str) -> clips::Clip {
+        clips::Clip {
+            path: PathBuf::from(name),
+            name: name.into(),
+            modified: std::time::SystemTime::UNIX_EPOCH,
+            size_bytes: 0,
+            id: None,
+            original: None,
+        }
+    }
+
+    #[test]
+    fn select_toggle_range_and_prune() {
+        let lib: Vec<_> = ["a", "b", "c", "d", "e"].map(clip).into();
+        let p = |n: &str| PathBuf::from(n);
+        let mut s = Selection::default();
+        s.toggle(&p("b"));
+        s.extend_to(&p("d"), &lib);
+        assert_eq!(s.paths, ["b", "c", "d"].map(p).into());
+        // Ranges work backwards too, and keep what's already selected.
+        s.toggle(&p("e"));
+        s.extend_to(&p("a"), &lib);
+        assert_eq!(s.paths.len(), 5);
+        s.toggle(&p("c"));
+        assert!(!s.paths.contains(&p("c")));
+        // Clips that vanish drop out of the selection.
+        s.retain(&lib[..2]);
+        assert_eq!(s.paths, ["a", "b"].map(p).into());
+        s.clear();
+        assert!(s.is_empty());
+    }
 }

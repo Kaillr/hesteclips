@@ -1,85 +1,117 @@
 //! The Settings page, grouped by what you're trying to do rather than by codec
 //! jargon. Changes apply (and save) immediately; there's no Save button.
+//!
+//! Each setting is a row: what it is (and a line on why you'd change it) on the
+//! left, the control on the right. In a narrow window the control moves under
+//! its label. Things that reset or remove live in their own section at the end.
 
-use egui::RichText;
+use egui::{Color32, RichText};
 
-use crate::settings::{self, Container, Encoder, FPS_CHOICES, OutputResolution, RateControl};
-use crate::{App, RecState, hotkey_label, reveal_label};
+use crate::settings::{self, Container, Encoder, FPS_CHOICES, OutputResolution, ShortcutAction};
+use crate::{App, RecState, reveal_label, shortcuts};
 
 /// Replay lengths offered as one-click choices (seconds).
 const REPLAY_CHOICES: [u32; 6] = [15, 30, 60, 120, 180, 300];
+/// The page's content column never gets wider than this.
+const MAX_WIDTH: f32 = 760.0;
+/// Below this content width, controls go under their labels.
+const NARROW: f32 = 560.0;
+/// Width of the label column in a wide row.
+const LABEL_W: f32 = 210.0;
 
 impl App {
     pub(crate) fn settings_page(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            ui.set_max_width(720.0);
-
-            if self.rec_state != RecState::Idle {
-                ui.add_space(8.0);
-                ui.weak("Changes apply the next time you start the buffer or a recording.");
-            }
-
-            section(ui, "Capture", |ui| {
-                form(ui, "capture", |ui| {
-                    ui.label("Screen");
-                    let names: Vec<String> = self.screens.iter().map(|d| d.name.clone()).collect();
-                    let current = names
-                        .get(self.settings.display_index)
-                        .cloned()
-                        .unwrap_or_else(|| "Main display".to_owned());
-                    egui::ComboBox::from_id_salt("display").selected_text(current).show_ui(ui, |ui| {
-                        for (i, name) in names.iter().enumerate() {
-                            ui.selectable_value(&mut self.settings.display_index, i, name);
-                        }
-                    });
-                    ui.end_row();
-
-                    ui.label("Replay length");
-                    ui.horizontal(|ui| {
-                        for secs in REPLAY_CHOICES {
-                            let label = if secs < 60 { format!("{secs}s") } else { format!("{} min", secs / 60) };
-                            ui.selectable_value(&mut self.settings.replay_seconds, secs, label);
-                        }
-                    })
-                    .response
-                    .on_hover_text("How far back Save clip reaches.");
-                    ui.end_row();
-
-                    ui.label("Quality");
-                    ui.horizontal(|ui| {
-                        egui::ComboBox::from_id_salt("resolution")
-                            .selected_text(self.settings.resolution.label())
-                            .show_ui(ui, |ui| {
-                                for r in OutputResolution::ALL {
-                                    ui.selectable_value(&mut self.settings.resolution, r, r.label());
-                                }
-                            });
-                        egui::ComboBox::from_id_salt("fps")
-                            .selected_text(format!("{} fps", self.settings.fps))
-                            .show_ui(ui, |ui| {
-                                for f in FPS_CHOICES {
-                                    ui.selectable_value(&mut self.settings.fps, f, format!("{f} fps"));
-                                }
-                            });
-                    });
-                    ui.end_row();
-
-                    ui.label("");
-                    ui.checkbox(&mut self.settings.auto_start_buffer, "Start the replay buffer when HesteClips opens");
-                    ui.end_row();
+            // Centred column that follows the window, up to a comfortable width.
+            let width = ui.available_width().min(MAX_WIDTH);
+            let pad = ((ui.available_width() - width) / 2.0).max(0.0);
+            ui.horizontal(|ui| {
+                ui.add_space(pad);
+                ui.vertical(|ui| {
+                    ui.set_width(width);
+                    self.settings_column(ui);
                 });
             });
+        });
+    }
 
-            section(ui, "Clips & storage", |ui| {
-                form(ui, "storage", |ui| {
-                    ui.label("Save clips to");
+    fn settings_column(&mut self, ui: &mut egui::Ui) {
+        if self.rec_state != RecState::Idle {
+            ui.add_space(12.0);
+            note(ui, "Capture is running. Changes apply the next time you start the buffer or a recording.");
+        }
+
+        section(ui, "Replay buffer", |ui| {
+            row(ui, "Length", Some("How far back Save clip reaches."), |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    for secs in REPLAY_CHOICES {
+                        let label = if secs < 60 { format!("{secs} s") } else { format!("{} min", secs / 60) };
+                        ui.selectable_value(&mut self.settings.replay_seconds, secs, label);
+                    }
+                });
+                let size = human_bytes(self.estimated_bytes(self.settings.replay_seconds as f64));
+                ui.weak(format!("A full clip is about {size}"))
+                    .on_hover_text(self.estimate_explainer());
+            });
+            divider(ui);
+            row(ui, "Start when HesteClips opens", Some("So you never miss a moment."), |ui| {
+                toggle(ui, &mut self.settings.auto_start_buffer);
+            });
+        });
+
+        section(ui, "Video", |ui| {
+            row(ui, "Screen", None, |ui| {
+                let names: Vec<String> = self.screens.iter().map(|d| d.name.clone()).collect();
+                let current = names.get(self.settings.display_index).cloned().unwrap_or_else(|| "Main display".to_owned());
+                egui::ComboBox::from_id_salt("display").selected_text(current).truncate().show_ui(ui, |ui| {
+                    for (i, name) in names.iter().enumerate() {
+                        ui.selectable_value(&mut self.settings.display_index, i, name);
+                    }
+                });
+            });
+            divider(ui);
+            row(ui, "Resolution", Some("Lower sizes make smaller files."), |ui| {
+                egui::ComboBox::from_id_salt("resolution").selected_text(self.settings.resolution.label()).show_ui(ui, |ui| {
+                    for r in OutputResolution::ALL {
+                        ui.selectable_value(&mut self.settings.resolution, r, r.label());
+                    }
+                });
+            });
+            divider(ui);
+            row(ui, "Frame rate", None, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    for f in FPS_CHOICES {
+                        ui.selectable_value(&mut self.settings.fps, f, format!("{f}"));
+                    }
+                    ui.weak("fps");
+                });
+            });
+            divider(ui);
+            row(ui, "Bitrate", Some("Higher keeps fast motion sharp and makes bigger files."), |ui| {
+                ui.add(egui::Slider::new(&mut self.settings.video_bitrate_mbps, 5..=150).suffix(" Mbps"));
+                let per_min = human_bytes(self.estimated_bytes(60.0));
+                ui.weak(format!("About {per_min} per minute"))
+                    .on_hover_text(self.estimate_explainer());
+            });
+            divider(ui);
+            egui::CollapsingHeader::new(RichText::new("Advanced").strong())
+                .id_salt("video_advanced")
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.weak("Tuned for clips already. Change these only if you know you need to.");
+                    ui.add_space(4.0);
+                    self.advanced(ui);
+                });
+        });
+
+        section(ui, "Saving", |ui| {
+            row(ui, "Clips folder", None, |ui| {
+                ui.vertical(|ui| {
+                    ui.add(egui::Label::new(RichText::new(self.settings.output_dir.display().to_string()).monospace().size(12.0)).truncate())
+                        .on_hover_text(self.settings.output_dir.display().to_string());
                     ui.horizontal(|ui| {
-                        ui.label(self.settings.output_dir.display().to_string());
                         if ui.button("Change…").clicked() {
-                            if let Some(dir) = rfd::FileDialog::new()
-                                .set_directory(&self.settings.output_dir)
-                                .pick_folder()
-                            {
+                            if let Some(dir) = rfd::FileDialog::new().set_directory(&self.settings.output_dir).pick_folder() {
                                 self.settings.output_dir = dir;
                                 self.refresh_clips();
                             }
@@ -89,87 +121,205 @@ impl App {
                             let _ = crate::clips::open_in_default_app(&self.settings.output_dir);
                         }
                     });
-                    ui.end_row();
-
-                    ui.label("File format");
-                    ui.horizontal(|ui| {
-                        for c in [Container::Mp4, Container::Mov] {
-                            ui.selectable_value(&mut self.settings.container, c, c.label());
-                        }
-                    });
-                    ui.end_row();
                 });
             });
-
-            section(ui, "HesteFiles", |ui| self.hestefiles_settings(ui));
-
-            section(ui, "Shortcuts", |ui| {
-                ui.weak("Work everywhere, even while a game has focus.");
-                ui.add_space(6.0);
-                form(ui, "shortcuts", |ui| {
-                    for (key, what) in [
-                        ("F10", "Save clip"),
-                        ("F8", "Start / stop replay buffer"),
-                        ("F9", "Start / stop recording"),
-                    ] {
-                        ui.label(RichText::new(hotkey_label(key)).monospace().strong());
-                        ui.label(what);
-                        ui.end_row();
+            divider(ui);
+            row(ui, "File format", Some("MP4 plays everywhere."), |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    for c in [Container::Mp4, Container::Mov] {
+                        ui.selectable_value(&mut self.settings.container, c, c.ext().to_uppercase()).on_hover_text(c.label());
                     }
                 });
-                if let Some(e) = &self.hotkey_error {
-                    ui.colored_label(ui.visuals().warn_fg_color, format!("Shortcuts are unavailable: {e}"));
+            });
+        });
+
+        section(ui, "Shortcuts", |ui| {
+            ui.weak("These work everywhere, even while a game has focus. Click one, then press the new keys.");
+            ui.add_space(4.0);
+            if let Err(e) = &self.hotkeys {
+                ui.colored_label(ui.visuals().warn_fg_color, format!("Shortcuts are unavailable: {e}"));
+            }
+            for (i, action) in ShortcutAction::ALL.into_iter().enumerate() {
+                if i > 0 {
+                    divider(ui);
+                }
+                row(ui, action.label(), None, |ui| self.shortcut_editor(ui, action));
+            }
+        });
+
+        section(ui, "HesteFiles", |ui| self.hestefiles_settings(ui));
+
+
+        section(ui, "Reset", |ui| {
+            row(ui, "Reset all settings", Some("Replay buffer, video, saving and shortcuts go back to their defaults. Your clips, clips folder, audio sources and HesteFiles account are kept."), |ui| {
+                if ui.button(RichText::new("Reset to defaults…").color(ui.visuals().error_fg_color)).clicked() {
+                    self.confirm_reset = true;
                 }
             });
-
-            ui.add_space(12.0);
-            egui::CollapsingHeader::new(RichText::new("Advanced encoding").strong())
-                .default_open(false)
-                .show(ui, |ui| self.advanced(ui));
-            ui.add_space(24.0);
         });
+        ui.add_space(24.0);
+        self.reset_dialog(ui.ctx());
     }
 
     fn advanced(&mut self, ui: &mut egui::Ui) {
-        ui.weak("The defaults are tuned for clips. Change these only if you know you need to.");
-        ui.add_space(6.0);
-        form(ui, "advanced", |ui| {
-            ui.label("Bitrate");
-            ui.add(egui::Slider::new(&mut self.settings.video_bitrate_mbps, 5..=150).suffix(" Mbps"));
-            ui.end_row();
-
-            ui.label("Encoder");
-            egui::ComboBox::from_id_salt("encoder")
-                .selected_text(self.settings.encoder.label())
-                .show_ui(ui, |ui| {
-                    for e in [Encoder::Auto, Encoder::Hardware, Encoder::Software] {
-                        ui.selectable_value(&mut self.settings.encoder, e, e.label());
-                    }
-                });
-            ui.end_row();
-
-            ui.label("Rate control");
-            egui::ComboBox::from_id_salt("rate_control")
-                .selected_text(self.settings.rate_control.label())
-                .show_ui(ui, |ui| {
-                    for rc in [RateControl::Cbr, RateControl::Cqp] {
-                        ui.selectable_value(&mut self.settings.rate_control, rc, rc.label());
-                    }
-                });
-            ui.end_row();
-
-            ui.label("Keyframe interval");
-            ui.add(egui::Slider::new(&mut self.settings.keyframe_interval_secs, 1..=10).suffix(" s"));
-            ui.end_row();
+        row(ui, "Encoder", Some("Hardware encoding barely touches your game's frame rate."), |ui| {
+            egui::ComboBox::from_id_salt("encoder").selected_text(self.settings.encoder.label()).show_ui(ui, |ui| {
+                for e in [Encoder::Auto, Encoder::Hardware, Encoder::Software] {
+                    ui.selectable_value(&mut self.settings.encoder, e, e.label());
+                }
+            });
         });
-        ui.add_space(6.0);
-        if ui.button("Reset all settings to defaults").clicked() {
-            // Your folder and your sources (on their own page) stay as they are.
-            let mut fresh = settings::RecordSettings::default();
-            fresh.output_dir = self.settings.output_dir.clone();
-            fresh.audio_sources = std::mem::take(&mut self.settings.audio_sources);
-            fresh.limiter = self.settings.limiter;
-            self.settings = fresh;
+
+        divider(ui);
+        row(ui, "Keyframe interval", Some("Shorter makes edits save faster and files a little bigger."), |ui| {
+            ui.add(egui::Slider::new(&mut self.settings.keyframe_interval_secs, 1..=10).suffix(" s"));
+        });
+    }
+
+    /// One shortcut: a button showing the keys (click to record new ones), and
+    /// buttons to turn it off or restore the default.
+    fn shortcut_editor(&mut self, ui: &mut egui::Ui, action: ShortcutAction) {
+        let listening = self.recording_shortcut.map(|(a, _)| a) == Some(action);
+        let current = self.settings.shortcuts.get(action).to_owned();
+        let default = settings::Shortcuts::default().get(action).to_owned();
+        ui.vertical(|ui| {
+            ui.horizontal(|ui| {
+                // A field showing the keys as keycaps; click it to record new ones.
+                let v = ui.visuals().clone();
+                let keys = shortcuts::keys(&current);
+                let frame = egui::Frame::new()
+                    .fill(if listening { crate::library::ACCENT.gamma_multiply(0.25) } else { v.extreme_bg_color })
+                    .stroke(egui::Stroke::new(1.0, if listening { crate::library::ACCENT } else { v.widgets.noninteractive.bg_stroke.color }))
+                    .corner_radius(6)
+                    .inner_margin(egui::Margin::symmetric(8, 4));
+                let field = frame.show(ui, |ui| {
+                    ui.set_min_size(egui::vec2(140.0, 24.0));
+                    ui.horizontal_centered(|ui| match (&keys, listening) {
+                        (_, true) => {
+                            ui.label(RichText::new("Press keys…").color(v.strong_text_color()));
+                        }
+                        (Some(k), false) => {
+                            shortcuts::keycaps(ui, k, 12.5);
+                        }
+                        (None, false) => {
+                            ui.weak("Off");
+                        }
+                    });
+                });
+                let tip = if listening { "Press the new shortcut. Esc cancels." } else { "Click, then press the new shortcut" };
+                let r = ui.interact(field.response.rect, ui.id().with(("shortcut", action.label())), egui::Sense::click());
+                if r.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tip).clicked() {
+                    self.recording_shortcut = if listening { None } else { Some((action, None)) };
+                }
+                if listening {
+                    if ui.button("Cancel").clicked() {
+                        self.recording_shortcut = None;
+                    }
+                } else {
+                    if !current.is_empty() && ui.small_button("Turn off").clicked() {
+                        self.settings.shortcuts.set(action, String::new());
+                    }
+                    if current != default && ui.small_button("Default").on_hover_text(shortcuts::label(&default)).clicked() {
+                        self.settings.shortcuts.set(action, default.clone());
+                    }
+                }
+            });
+            if listening {
+                self.listen_for_shortcut(ui, action);
+            }
+            let problem = match (listening, self.recording_shortcut.and_then(|(_, e)| e)) {
+                (true, Some(e)) => Some(e.to_owned()),
+                (false, _) => self.hotkeys.as_ref().ok().and_then(|h| h.error_for(action)).map(|e| format!("Not working: {e}.")),
+                _ => None,
+            };
+            if let Some(p) = problem {
+                ui.colored_label(ui.visuals().warn_fg_color, p);
+            }
+        });
+    }
+
+    /// While recording a shortcut: take the next key press (with its modifiers).
+    fn listen_for_shortcut(&mut self, ui: &mut egui::Ui, action: ShortcutAction) {
+        let pressed = ui.input_mut(|i| {
+            let mut found = None;
+            i.events.retain(|e| match e {
+                egui::Event::Key { key, pressed: true, modifiers, .. } if found.is_none() => {
+                    found = Some((*key, *modifiers));
+                    false
+                }
+                _ => true,
+            });
+            found
+        });
+        let Some((key, mods)) = pressed else { return };
+        if key == egui::Key::Escape && mods.is_none() {
+            self.recording_shortcut = None;
+            return;
+        }
+        match shortcuts::from_press(key, mods) {
+            Ok(text) => {
+                // Taking a shortcut another action uses moves it here.
+                for other in ShortcutAction::ALL {
+                    if other != action && self.settings.shortcuts.get(other) == text {
+                        self.settings.shortcuts.set(other, String::new());
+                    }
+                }
+                self.settings.shortcuts.set(action, text);
+                self.recording_shortcut = None;
+            }
+            Err(e) => self.recording_shortcut = Some((action, Some(e))),
+        }
+    }
+
+    /// Expected size of `secs` of capture: video at the target bitrate plus every
+    /// audio track the current sources record. The encoder aims for that bitrate
+    /// on average, spending less on a still screen and more on fast motion.
+    fn estimated_bytes(&self, secs: f64) -> f64 {
+        let tracks = capture::sources::track_layout(&self.capture_sources()).0.len() as f64;
+        let bits_per_s = self.settings.video_bitrate_mbps as f64 * 1e6 + tracks * capture::AUDIO_BITRATE as f64;
+        // ~1% for the container.
+        bits_per_s / 8.0 * secs * 1.01
+    }
+
+    fn estimate_explainer(&self) -> String {
+        let tracks = capture::sources::track_layout(&self.capture_sources()).0.len();
+        format!(
+            "Video at {} Mbps plus {tracks} audio track{} at {} kbps. A mostly still screen comes out smaller, fast motion a bit bigger.",
+            self.settings.video_bitrate_mbps,
+            if tracks == 1 { "" } else { "s" },
+            capture::AUDIO_BITRATE / 1000
+        )
+    }
+
+    fn reset_dialog(&mut self, ctx: &egui::Context) {
+        if !self.confirm_reset {
+            return;
+        }
+        let modal = egui::Modal::new(egui::Id::new("reset_settings")).show(ctx, |ui| {
+            ui.set_width(380.0);
+            ui.heading("Reset all settings?");
+            ui.add_space(4.0);
+            ui.label("Replay buffer, video, saving and shortcuts go back to their defaults.");
+            ui.weak("Your clips, clips folder, audio sources and HesteFiles account are kept.");
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                let reset = egui::Button::new(RichText::new("Reset").color(Color32::WHITE)).fill(ui.visuals().error_fg_color);
+                if ui.add(reset).clicked() {
+                    let mut fresh = settings::RecordSettings::default();
+                    fresh.output_dir = self.settings.output_dir.clone();
+                    fresh.audio_sources = std::mem::take(&mut self.settings.audio_sources);
+                    fresh.limiter = self.settings.limiter;
+                    self.settings = fresh;
+                    self.confirm_reset = false;
+                    self.toast("Settings reset to defaults");
+                }
+                if ui.button("Cancel").clicked() {
+                    self.confirm_reset = false;
+                }
+            });
+        });
+        if modal.should_close() {
+            self.confirm_reset = false;
         }
     }
 }
@@ -179,13 +329,96 @@ pub(crate) fn section(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui
     ui.add_space(18.0);
     ui.label(RichText::new(title).size(16.0).strong());
     ui.add_space(6.0);
-    egui::Frame::group(ui.style()).inner_margin(egui::Margin::same(12)).corner_radius(8).show(ui, |ui| {
+    card(ui, add);
+}
+
+fn card(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::group(ui.style()).inner_margin(egui::Margin::symmetric(14, 10)).corner_radius(8).show(ui, |ui| {
         ui.set_width(ui.available_width());
         add(ui);
     });
 }
 
-/// Two-column label/control grid.
-fn form(ui: &mut egui::Ui, id: &str, add: impl FnOnce(&mut egui::Ui)) {
-    egui::Grid::new(id).num_columns(2).spacing([20.0, 12.0]).min_col_width(110.0).show(ui, add);
+/// One setting: label (and hint) on the left, control on the right; stacked when
+/// the window is narrow.
+pub(crate) fn row(ui: &mut egui::Ui, label: &str, hint: Option<&str>, control: impl FnOnce(&mut egui::Ui)) {
+    let narrow = ui.available_width() < NARROW;
+    let labels = |ui: &mut egui::Ui| {
+        ui.label(RichText::new(label).strong());
+        if let Some(h) = hint {
+            ui.add(egui::Label::new(RichText::new(h).size(12.0).weak()).wrap());
+        }
+    };
+    ui.add_space(4.0);
+    if narrow {
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            labels(ui);
+        });
+        ui.add_space(4.0);
+        control(ui);
+    } else {
+        ui.horizontal_top(|ui| {
+            ui.allocate_ui_with_layout(egui::vec2(LABEL_W, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                ui.set_width(LABEL_W);
+                ui.add_space(3.0);
+                ui.spacing_mut().item_spacing.y = 2.0;
+                labels(ui);
+            });
+            ui.add_space(12.0);
+            // Controls are a little taller than a line of text; nudge the label
+            // column down so its first line sits level with the control.
+            ui.vertical(|ui| control(ui));
+        });
+    }
+    ui.add_space(4.0);
+}
+
+fn divider(ui: &mut egui::Ui) {
+    ui.add_space(2.0);
+    let r = ui.available_rect_before_wrap();
+    ui.painter().hline(r.x_range(), r.top(), egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color.gamma_multiply(0.6)));
+    ui.add_space(3.0);
+}
+
+fn note(ui: &mut egui::Ui, text: &str) {
+    egui::Frame::new()
+        .fill(ui.visuals().warn_fg_color.gamma_multiply(0.12))
+        .corner_radius(6)
+        .inner_margin(egui::Margin::symmetric(10, 6))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.colored_label(ui.visuals().warn_fg_color, text);
+        });
+}
+
+/// An on/off switch, like the system's.
+fn toggle(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
+    let size = egui::vec2(36.0, 20.0);
+    let (rect, mut resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    if resp.clicked() {
+        *on = !*on;
+        resp.mark_changed();
+    }
+    let t = ui.ctx().animate_bool_responsive(resp.id, *on);
+    let v = ui.visuals();
+    let fill = if *on { crate::library::ACCENT } else { v.widgets.inactive.bg_fill };
+    let r = rect.height() / 2.0;
+    ui.painter().rect_filled(rect, r, fill);
+    let x = egui::lerp((rect.left() + r)..=(rect.right() - r), t);
+    ui.painter().circle_filled(egui::pos2(x, rect.center().y), r - 3.0, Color32::WHITE);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// "48 MB", "1.2 GB".
+fn human_bytes(b: f64) -> String {
+    const MB: f64 = 1024.0 * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    if b >= GB {
+        format!("{:.1} GB", b / GB)
+    } else if b >= 10.0 * MB {
+        format!("{:.0} MB", b / MB)
+    } else {
+        format!("{:.1} MB", b / MB)
+    }
 }

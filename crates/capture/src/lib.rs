@@ -165,6 +165,9 @@ pub struct Devices {
     pub apps: Vec<Device>,
 }
 
+/// AAC bitrate per audio track, bits per second.
+pub const AUDIO_BITRATE: u32 = 192_000;
+
 /// Everything the backend needs to start a capture. The app builds this from its
 /// own richer `RecordSettings`.
 #[derive(Debug, Clone)]

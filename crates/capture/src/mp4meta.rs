@@ -6,6 +6,9 @@
 //! or shrinking the boxes around them and fixing chunk offsets when the media
 //! data comes after `moov` (fast-start files). When `moov` is at the end — long
 //! recordings — only the file's tail is rewritten.
+//!
+//! Also reads the file comment back ([`read_comment`]) without ffprobe, cheap
+//! enough to run over a whole library.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -52,6 +55,35 @@ pub fn name_tracks(path: &Path, video: &str, audio: &[String]) -> Result<()> {
     file.write_all(&rest)?;
     file.set_len(moov_at + new_moov.len() as u64 + rest.len() as u64)?;
     Ok(())
+}
+
+/// The file comment (`©cmt`), if any. Reads only the `moov` box, so it's fast on
+/// any size of file. Handles both layouts: MP4's `udta/meta/ilst/©cmt/data` and
+/// QuickTime's `udta/©cmt` (a short string record).
+pub fn read_comment(path: &Path) -> Option<String> {
+    let mut file = File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let (at, size) = find_top_level(&mut file, len, b"moov").ok()??;
+    let mut moov = vec![0u8; size as usize];
+    file.seek(SeekFrom::Start(at)).ok()?;
+    file.read_exact(&mut moov).ok()?;
+    let child = |body: &[u8], kind: &[u8; 4]| -> Option<Vec<u8>> {
+        children(body).ok()?.into_iter().find(|(k, _)| k == kind).map(|(_, b)| b[8..].to_vec())
+    };
+    let udta = child(&moov[8..], b"udta")?;
+    if let Some(meta) = child(&udta, b"meta") {
+        // `meta` is a full box (4 bytes of version/flags) in MP4, but QuickTime
+        // writers sometimes omit them: the first child is always `hdlr`.
+        let body = if meta.get(4..8) == Some(b"hdlr") { &meta[..] } else { meta.get(4..)? };
+        if let Some(data) = child(body, b"ilst").and_then(|ilst| child(&ilst, b"\xa9cmt")).and_then(|c| child(&c, b"data")) {
+            // type(4) locale(4) then the UTF-8 text.
+            return Some(String::from_utf8_lossy(data.get(8..)?).into_owned());
+        }
+    }
+    // QuickTime: length(2) language(2) then the text.
+    let cmt = child(&udta, b"\xa9cmt")?;
+    let n = u16::from_be_bytes(cmt.get(..2)?.try_into().ok()?) as usize;
+    Some(String::from_utf8_lossy(cmt.get(4..4 + n)?).into_owned())
 }
 
 fn find_top_level(file: &mut File, len: u64, want: &[u8; 4]) -> Result<Option<(u64, u64)>> {
@@ -240,6 +272,42 @@ mod tests {
             out.push((name, bytes[off]));
         }
         out
+    }
+
+    fn with_udta(udta: Vec<u8>) -> Vec<u8> {
+        let mut moov = trak(b"vide", "Video", 0);
+        moov.extend(make_box(b"udta", &udta));
+        let mut out = make_box(b"ftyp", b"isom");
+        out.extend(make_box(b"moov", &moov));
+        out
+    }
+
+    #[test]
+    fn reads_comment_in_both_layouts() {
+        let text = "hesteclips:mix=1 id=ab12";
+        // MP4 (ffmpeg, AVAssetWriter): udta/meta(full box)/hdlr+ilst/©cmt/data.
+        let mut data = vec![0, 0, 0, 1, 0, 0, 0, 0];
+        data.extend_from_slice(text.as_bytes());
+        let ilst = make_box(b"ilst", &make_box(b"\xa9cmt", &make_box(b"data", &data)));
+        let mut meta = vec![0u8; 4];
+        meta.extend(hdlr(b"mdir", ""));
+        meta.extend(ilst);
+        let mp4 = with_udta(make_box(b"meta", &meta));
+        // QuickTime (ffmpeg's mov muxer): udta/©cmt with a short string record.
+        let mut rec = (text.len() as u16).to_be_bytes().to_vec();
+        rec.extend_from_slice(&[0x55, 0xc4]);
+        rec.extend_from_slice(text.as_bytes());
+        let mov = with_udta(make_box(b"\xa9cmt", &rec));
+        for (name, bytes) in [("mp4", mp4), ("mov", mov)] {
+            let path = std::env::temp_dir().join(format!("hc-comment-{}.{name}", std::process::id()));
+            std::fs::write(&path, bytes).unwrap();
+            assert_eq!(read_comment(&path).as_deref(), Some(text), "{name}");
+            let _ = std::fs::remove_file(path);
+        }
+        let path = std::env::temp_dir().join(format!("hc-comment-none-{}.mp4", std::process::id()));
+        std::fs::write(&path, file(true)).unwrap();
+        assert_eq!(read_comment(&path), None);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

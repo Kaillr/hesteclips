@@ -73,8 +73,7 @@ use crate::avwriter::{SendFormat, SendSample};
 use crate::writer::{self, Layout, Media, Writer};
 use crate::{EncodeSettings, Mode, Recorder};
 
-/// AAC bitrate per audio track.
-const AUDIO_BITRATE: u32 = 192_000;
+use crate::AUDIO_BITRATE;
 
 pub struct SckRecorder {
     session: Option<Session>,

@@ -12,21 +12,23 @@ mod cloud;
 mod cloud_ui;
 mod editor;
 mod library;
+mod meter;
 mod player;
 mod proxy;
 mod service;
 mod settings;
 mod settings_ui;
 mod share;
+mod shortcuts;
 mod sources_ui;
+mod store;
 mod thumbs;
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
 use egui::{Color32, RichText};
-use global_hotkey::hotkey::{Code, HotKey, Modifiers};
-use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
+use global_hotkey::{GlobalHotKeyEvent, HotKeyState};
 use library::{ACCENT, REC_RED};
 use service::{CaptureService, Evt};
 use settings::{Encoder, RecordSettings, SourceKind};
@@ -39,9 +41,14 @@ fn main() -> eframe::Result<()> {
         std::process::exit(0);
     });
 
+    // Dev aid: `HESTECLIPS_WINDOW=WxH` opens at that size, to check layouts.
+    let size = std::env::var("HESTECLIPS_WINDOW")
+        .ok()
+        .and_then(|s| s.split_once('x').and_then(|(w, h)| Some([w.parse().ok()?, h.parse().ok()?])))
+        .unwrap_or([1040.0, 700.0]);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1040.0, 700.0])
+            .with_inner_size(size)
             .with_min_inner_size([560.0, 420.0])
             .with_title("HesteClips")
             .with_icon(app_icon()),
@@ -72,34 +79,6 @@ enum RecState {
     Recording,
 }
 
-/// Global hotkeys so you can control capture without leaving your game.
-/// The manager must stay alive for the bindings to keep working.
-struct Hotkeys {
-    _mgr: GlobalHotKeyManager,
-    buffer_id: u32,
-    record_id: u32,
-    save_id: u32,
-}
-
-impl Hotkeys {
-    /// Alt+F8 = toggle replay buffer, Alt+F9 = toggle recording, Alt+F10 = save clip.
-    fn setup() -> global_hotkey::Result<Self> {
-        let mgr = GlobalHotKeyManager::new()?;
-        let buffer = HotKey::new(Some(Modifiers::ALT), Code::F8);
-        let record = HotKey::new(Some(Modifiers::ALT), Code::F9);
-        let save = HotKey::new(Some(Modifiers::ALT), Code::F10);
-        mgr.register(buffer)?;
-        mgr.register(record)?;
-        mgr.register(save)?;
-        Ok(Self {
-            _mgr: mgr,
-            buffer_id: buffer.id(),
-            record_id: record.id(),
-            save_id: save.id(),
-        })
-    }
-}
-
 /// The app icon (`assets/icon.svg` rendered to PNG), shown in the Dock and taskbar
 /// while running. Release bundles use `assets/hesteclips.icns` instead.
 fn app_icon() -> egui::IconData {
@@ -109,10 +88,37 @@ fn app_icon() -> egui::IconData {
     egui::IconData { width: img.width(), height: img.height(), rgba: img.into_raw() }
 }
 
-/// "Option+F10" on macOS, "Alt+F10" elsewhere — the modifier's name on each OS.
-/// (Spelled out because egui's bundled font has no ⌥ glyph.)
-fn hotkey_label(key: &str) -> String {
-    if cfg!(target_os = "macos") { format!("Option+{key}") } else { format!("Alt+{key}") }
+impl App {
+    /// The shortcut for `action` as text ("Option + F10"), or "no shortcut".
+    pub(crate) fn shortcut_label(&self, action: settings::ShortcutAction) -> String {
+        shortcuts::keys(self.settings.shortcuts.get(action)).map_or_else(|| "no shortcut".into(), |k| k.join(" + "))
+    }
+
+    /// The shortcut for `action` as key names, for keycaps.
+    pub(crate) fn shortcut_keys(&self, action: settings::ShortcutAction) -> Option<Vec<String>> {
+        shortcuts::keys(self.settings.shortcuts.get(action))
+    }
+}
+
+/// egui's bundled fonts have no ⌘ ⌥ ⌃ ⇧ ⌫, which macOS writes every shortcut
+/// with. Use the system's symbol font as a fallback for those (it's only
+/// consulted for characters the bundled fonts lack).
+fn add_symbol_font(ctx: &egui::Context) {
+    #[cfg(target_os = "macos")]
+    if let Ok(bytes) = std::fs::read("/System/Library/Fonts/Apple Symbols.ttf") {
+        use egui::epaint::text::{FontInsert, FontPriority, InsertFontFamily};
+        let families = [egui::FontFamily::Proportional, egui::FontFamily::Monospace]
+            .map(|family| InsertFontFamily { family, priority: FontPriority::Lowest })
+            .to_vec();
+        ctx.add_font(FontInsert::new("apple-symbols", egui::FontData::from_owned(bytes), families));
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = ctx;
+}
+
+/// An in-app shortcut with the platform's command key, as text: "Cmd + A" / "Ctrl + A".
+fn hotkey_label_cmd(key: &str) -> String {
+    shortcuts::command(key).join(" + ")
 }
 
 /// What the OS calls its file manager.
@@ -146,8 +152,14 @@ struct App {
     /// Last-saved settings JSON, to persist only when something changed.
     saved_settings: String,
     service: CaptureService,
-    hotkeys: Option<Hotkeys>,
-    hotkey_error: Option<String>,
+    /// Global shortcuts, kept in step with `settings.shortcuts`. `Err` when the OS
+    /// refused shortcuts altogether.
+    pub(crate) hotkeys: Result<shortcuts::Registered, String>,
+    /// The Settings shortcut recorder: which action is listening for keys, and
+    /// the last problem with what was pressed.
+    pub(crate) recording_shortcut: Option<(settings::ShortcutAction, Option<&'static str>)>,
+    /// The "Reset all settings?" confirmation is open.
+    pub(crate) confirm_reset: bool,
     /// Screen-recording permission, re-checked each poll so the banner clears the
     /// moment the user grants it.
     permission: capture::Permission,
@@ -177,6 +189,8 @@ struct App {
     next_render_id: u64,
     /// Open "Rename clip" dialog.
     pub(crate) rename: Option<library::Rename>,
+    /// Clips selected in the library for a bulk action.
+    pub(crate) selection: library::Selection,
     /// Library auto-refresh: last folder poll + last-seen folder mtime.
     last_poll: Option<Instant>,
     dir_mtime: Option<SystemTime>,
@@ -184,14 +198,17 @@ struct App {
 
 impl App {
     fn new(ctx: egui::Context) -> Self {
+        add_symbol_font(&ctx);
         let settings = RecordSettings::load();
         let recovered = capture::output::recover_unfinished(&settings.output_dir);
         let saved_settings = settings.to_json();
         let clips = clips::scan(&settings.output_dir);
-        let (hotkeys, hotkey_error) = match Hotkeys::setup() {
-            Ok(h) => (Some(h), None),
-            Err(e) => (None, Some(e.to_string())),
-        };
+        // Assets of clips deleted in Finder go to the Bin.
+        store::sweep_orphans(&settings.output_dir, &clips);
+        let hotkeys = shortcuts::Registered::new().map_err(|e| e.to_string()).map(|mut h| {
+            h.sync(&settings.shortcuts);
+            h
+        });
         let (render_tx, render_rx) = std::sync::mpsc::channel();
         let live_audio = capture::mixer::LiveAudio::new();
         live_audio.set_limiter(settings.limiter);
@@ -207,7 +224,8 @@ impl App {
             saved_settings,
             service: CaptureService::new(live_audio.clone()),
             hotkeys,
-            hotkey_error,
+            recording_shortcut: None,
+            confirm_reset: false,
             permission: capture::screen_permission(),
             screens: capture::list_screens(),
             audio: capture::audio::list_audio_devices(),
@@ -226,6 +244,7 @@ impl App {
             render_rx,
             next_render_id: 0,
             rename: None,
+            selection: library::Selection::default(),
             last_poll: None,
             dir_mtime: None,
         };
@@ -245,12 +264,13 @@ impl App {
             app.refresh_clips();
         }
         if let Some(clip) = std::env::var_os("HESTECLIPS_DEMO_RENDER").map(PathBuf::from) {
-            if let Ok(info) = media::probe(&clip) {
+            let target = store::EditTarget::of(&clip);
+            if let Ok(info) = media::probe(&target.source) {
                 let mut edit = media::Edit::new(&info);
                 edit.start = info.snap(info.duration * 0.1);
                 edit.end = info.snap(info.duration * 0.9);
-                app.start_render(clip.clone(), info.clone(), edit.clone(), None);
-                app.start_render(clip, info, edit, Some("Demo highlight".into()));
+                app.start_render(target.clone(), info.clone(), edit.clone(), None);
+                app.start_render(target, info, edit, Some("Demo highlight".into()));
             }
         }
         // `HESTECLIPS_DEMO_SHARE=<clip>` opens the HesteFiles upload dialog for a clip.
@@ -265,6 +285,10 @@ impl App {
         if open_sources {
             app.page = Page::Sources;
         }
+        // `HESTECLIPS_OPEN_SETTINGS=1` opens on Settings.
+        if std::env::var_os("HESTECLIPS_OPEN_SETTINGS").is_some() {
+            app.page = Page::Settings;
+        }
         if !recovered.is_empty() {
             app.toast("Recovered a recording that was cut off last time");
         }
@@ -277,6 +301,7 @@ impl App {
 
     fn refresh_clips(&mut self) {
         self.clips = clips::scan(&self.settings.output_dir);
+        self.selection.retain(&self.clips);
     }
 
     fn toast(&mut self, text: impl Into<String>) {
@@ -336,26 +361,30 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
 
-        // Handle global hotkeys — these fire even while a game is focused.
-        let ids = self.hotkeys.as_ref().map(|h| (h.buffer_id, h.record_id, h.save_id));
-        if let Some((buffer_id, record_id, save_id)) = ids {
-            while let Ok(ev) = GlobalHotKeyEvent::receiver().try_recv() {
-                if ev.state != HotKeyState::Pressed {
-                    continue;
-                }
-                if ev.id == buffer_id {
-                    self.toggle_buffer();
-                } else if ev.id == record_id {
-                    self.toggle_record();
-                } else if ev.id == save_id {
-                    self.save_clip();
-                }
+        // Global shortcuts: these fire even while a game is focused. Paused while
+        // the Settings recorder listens, so pressing the current key rebinds it
+        // instead of starting a recording.
+        if let Ok(h) = &mut self.hotkeys {
+            h.sync(&self.settings.shortcuts);
+        }
+        while let Ok(ev) = GlobalHotKeyEvent::receiver().try_recv() {
+            if ev.state != HotKeyState::Pressed || self.recording_shortcut.is_some() {
+                continue;
+            }
+            match self.hotkeys.as_ref().ok().and_then(|h| h.action_for(ev.id)) {
+                Some(settings::ShortcutAction::ToggleBuffer) => self.toggle_buffer(),
+                Some(settings::ShortcutAction::ToggleRecord) => self.toggle_record(),
+                Some(settings::ShortcutAction::SaveClip) => self.save_clip(),
+                None => {}
             }
         }
 
         self.pump_capture_events();
         self.cloud.poll();
         self.pump_renders();
+        // Every frame, not just while the Sources page draws: leaving the page must
+        // stop the meters' capture, or macOS keeps showing its recording indicator.
+        self.ensure_level_monitor();
 
         // The editor gets the whole window; capture keeps running underneath and the
         // hotkeys still work.
@@ -364,7 +393,8 @@ impl eframe::App for App {
                 .frame(
                     egui::Frame::new()
                         .fill(ui.visuals().panel_fill)
-                        .inner_margin(egui::Margin::symmetric(16, 10)),
+                        .inner_margin(egui::Margin::symmetric(16, 10))
+                        .stroke(egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color)),
                 )
                 .show(ui, |ui| self.capture_bar(ui));
         }
@@ -426,134 +456,165 @@ impl eframe::App for App {
     }
 }
 
-// --- Capture bar: status on the left, the actions that make sense right now on the right ---
+// --- Header: where you are on the left, capture status and actions on the right ---
 impl App {
     fn capture_bar(&mut self, ui: &mut egui::Ui) {
-        let elapsed = self.rec_started.map_or(Duration::ZERO, |t| t.elapsed());
+        // ⌘, opens Settings, as in every Mac app.
+        if !ui.ctx().egui_wants_keyboard_input() && ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Comma)) {
+            self.page = Page::Settings;
+        }
+        let compact = ui.available_width() < 820.0;
         ui.horizontal(|ui| {
             ui.set_min_height(36.0);
-
-            if matches!(self.page, Page::Settings | Page::Sources) {
-                if ui.button(RichText::new("‹ Clips").size(15.0)).clicked() {
-                    self.page = Page::Clips;
-                }
-                ui.add_space(6.0);
-                let title = if self.page == Page::Settings { "Settings" } else { "Sources" };
-                ui.label(RichText::new(title).size(18.0).strong());
-            } else {
-                let (filled, color, title, sub) = match self.rec_state {
-                    RecState::Idle => (
-                        false,
-                        ui.visuals().weak_text_color(),
-                        "Not recording".to_owned(),
-                        "Start the replay buffer to be ready for the next highlight".to_owned(),
-                    ),
-                    RecState::Buffering => (
-                        true,
-                        ACCENT,
-                        "Replay buffer on".to_owned(),
-                        format!(
-                            "{} saves the last {}",
-                            hotkey_label("F10"),
-                            thumbs::format_duration(Duration::from_secs(self.settings.replay_seconds.into()))
-                        ),
-                    ),
-                    RecState::Recording => (
-                        true,
-                        REC_RED,
-                        format!("Recording  {}", thumbs::format_duration(elapsed)),
-                        format!("{} to stop", hotkey_label("F9")),
-                    ),
-                };
-                // Painted rather than a text glyph so it renders identically everywhere.
-                let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
-                if filled {
-                    // Live: a soft pulse so it reads as "on" at a glance.
-                    let t = ui.input(|i| i.time);
-                    let halo = 0.25 + 0.2 * (t * 2.5).sin() as f32;
-                    ui.painter().circle_filled(rect.center(), 8.0, color.gamma_multiply(halo));
-                    ui.painter().circle_filled(rect.center(), 5.0, color);
-                } else {
-                    ui.painter().circle_stroke(rect.center(), 5.0, egui::Stroke::new(1.5, color));
-                }
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 0.0;
-                    ui.label(RichText::new(title).size(16.0).strong());
-                    ui.label(RichText::new(sub).size(12.0).weak());
-                });
-            }
-
+            self.nav_tabs(ui, compact);
+            ui.add_space(14.0);
+            self.capture_status(ui, compact);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if self.page == Page::Clips {
-                    if ui
-                        .add(egui::Button::new(RichText::new("⚙").size(18.0)).frame(false))
-                        .on_hover_text("Settings")
-                        .clicked()
-                    {
-                        self.page = Page::Settings;
-                    }
-                    if ui
-                        .add(egui::Button::new(RichText::new("🎤 Sources").size(14.0)).frame(false))
-                        .on_hover_text("What goes into your clips: mic, desktop sound, apps — with live levels")
-                        .clicked()
-                    {
-                        self.page = Page::Sources;
-                    }
-                    ui.add_space(8.0);
-                }
-                let big = |text: &str, fill: Option<Color32>| {
-                    let mut rt = RichText::new(text.to_owned()).size(15.0);
-                    if fill.is_some() {
-                        rt = rt.color(Color32::WHITE);
-                    }
-                    let mut b = egui::Button::new(rt).min_size(egui::vec2(0.0, 34.0)).corner_radius(8);
-                    if let Some(f) = fill {
-                        b = b.fill(f);
-                    }
-                    b
-                };
-                // Buttons are laid out right-to-left: primary action is rightmost.
-                match self.rec_state {
-                    RecState::Idle => {
-                        if ui
-                            .add(big("⏺  Start replay buffer", Some(ACCENT)))
-                            .on_hover_text(hotkey_label("F8"))
-                            .clicked()
-                        {
-                            self.start_replay_buffer();
-                        }
-                        if ui.add(big("Record", None)).on_hover_text(hotkey_label("F9")).clicked() {
-                            self.start_recording();
-                        }
-                    }
-                    RecState::Buffering => {
-                        if ui
-                            .add_enabled(!self.saving, big("💾  Save clip", Some(ACCENT)))
-                            .on_hover_text(hotkey_label("F10"))
-                            .clicked()
-                        {
-                            self.save_clip();
-                        }
-                        if ui.add(big("Stop", None)).on_hover_text(hotkey_label("F8")).clicked() {
-                            self.stop();
-                        }
-                    }
-                    RecState::Recording => {
-                        if ui
-                            .add(big("⏹  Stop recording", Some(REC_RED)))
-                            .on_hover_text(hotkey_label("F9"))
-                            .clicked()
-                        {
-                            self.stop();
-                        }
-                    }
-                }
+                self.capture_actions(ui, compact);
             });
         });
     }
 
-    /// Warn + guide when screen-recording permission is missing (macOS). Without it,
-    /// capture produces empty files, so we surface it up front instead of failing later.
+    /// Clips · Sources · Settings, as one segmented control. Icons only when narrow.
+    fn nav_tabs(&mut self, ui: &mut egui::Ui, compact: bool) {
+        let tabs = [
+            (Page::Clips, "🎬", "Clips", "Your clips".to_owned()),
+            (Page::Sources, "🎤", "Sources", "What goes into your clips: mic, desktop sound, apps, with live levels".to_owned()),
+            (Page::Settings, "⚙", "Settings", format!("Settings ({})", hotkey_label_cmd(","))),
+        ];
+        let v = ui.visuals().clone();
+        egui::Frame::new()
+            .fill(v.extreme_bg_color)
+            .corner_radius(9)
+            .inner_margin(egui::Margin::same(3))
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                for (page, icon, label, tip) in tabs {
+                    // Painted, not an egui Button: a button grows a hover stroke,
+                    // which made the tabs change width under the pointer.
+                    let selected = self.page == page;
+                    let text = if compact { icon.to_owned() } else { format!("{icon}  {label}") };
+                    let galley = ui.painter().layout_no_wrap(text, egui::FontId::proportional(14.0), Color32::WHITE);
+                    let w = if compact { 34.0 } else { galley.size().x + 22.0 };
+                    let (rect, mut r) = ui.allocate_exact_size(egui::vec2(w, 28.0), egui::Sense::click());
+                    let color = if selected {
+                        v.strong_text_color()
+                    } else if r.hovered() {
+                        v.text_color()
+                    } else {
+                        v.weak_text_color()
+                    };
+                    if selected {
+                        ui.painter().rect_filled(rect, 7, v.widgets.active.weak_bg_fill);
+                    } else if r.hovered() {
+                        ui.painter().rect_filled(rect, 7, v.widgets.hovered.weak_bg_fill.gamma_multiply(0.5));
+                    }
+                    ui.painter().galley_with_override_text_color(rect.center() - galley.size() / 2.0, galley, color);
+                    if compact || page == Page::Settings {
+                        r = r.on_hover_text(tip);
+                    }
+                    if r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        self.page = page;
+                    }
+                }
+            });
+    }
+
+    /// What capture is doing: a dot and a short line, with the hotkey hint below
+    /// when there's room. Shown on every page so it's never a surprise.
+    fn capture_status(&self, ui: &mut egui::Ui, compact: bool) {
+        let elapsed = self.rec_started.map_or(Duration::ZERO, |t| t.elapsed());
+        let replay = thumbs::format_duration(Duration::from_secs(self.settings.replay_seconds.into()));
+        use settings::ShortcutAction as A;
+        // The hint: the shortcut (drawn as keycaps) and what it does.
+        let (live, color, title, hint_keys, hint) = match self.rec_state {
+            RecState::Idle => (false, ui.visuals().weak_text_color(), "Not recording".to_owned(), self.shortcut_keys(A::ToggleBuffer), "starts the replay buffer".to_owned()),
+            RecState::Buffering if self.saving => (true, ACCENT, "Saving clip…".to_owned(), None, format!("The last {replay}")),
+            RecState::Buffering => (true, ACCENT, "Replay buffer on".to_owned(), self.shortcut_keys(A::SaveClip), format!("saves the last {replay}")),
+            RecState::Recording => (true, REC_RED, format!("Recording  {}", thumbs::format_duration(elapsed)), self.shortcut_keys(A::ToggleRecord), "stops".to_owned()),
+        };
+        let tip = match &hint_keys {
+            Some(k) => format!("{} {hint}", k.join(" + ")),
+            None => hint.clone(),
+        };
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+            if live {
+                // A soft pulse so it reads as "on" at a glance.
+                let t = ui.input(|i| i.time);
+                let halo = 0.25 + 0.2 * (t * 2.5).sin() as f32;
+                ui.painter().circle_filled(rect.center(), 8.0, color.gamma_multiply(halo));
+                ui.painter().circle_filled(rect.center(), 5.0, color);
+            } else {
+                ui.painter().circle_stroke(rect.center(), 5.0, egui::Stroke::new(1.5, color));
+            }
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                ui.label(RichText::new(&title).size(14.0).strong().color(if live { color } else { ui.visuals().text_color() }));
+                if !compact {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 5.0;
+                        if let Some(k) = &hint_keys {
+                            shortcuts::keycaps(ui, k, 10.5);
+                        }
+                        ui.label(RichText::new(&hint).size(11.5).weak());
+                    });
+                }
+            })
+            .response
+            .on_hover_text(&tip);
+        });
+    }
+
+    /// The one or two buttons that make sense right now; the primary one rightmost.
+    fn capture_actions(&mut self, ui: &mut egui::Ui, compact: bool) {
+        let button = |text: &str, fill: Option<Color32>| {
+            let mut rt = RichText::new(text.to_owned()).size(14.0);
+            if fill.is_some() {
+                rt = rt.color(Color32::WHITE);
+            }
+            let mut b = egui::Button::new(rt).min_size(egui::vec2(0.0, 32.0)).corner_radius(8);
+            if let Some(f) = fill {
+                b = b.fill(f);
+            }
+            b
+        };
+        match self.rec_state {
+            RecState::Idle => {
+                let start = if compact { "⏺  Replay buffer" } else { "⏺  Start replay buffer" };
+                if ui
+                    .add(button(start, Some(ACCENT)))
+                    .on_hover_text(format!("Keep the last {} ready to save ({})", thumbs::format_duration(Duration::from_secs(self.settings.replay_seconds.into())), self.shortcut_label(settings::ShortcutAction::ToggleBuffer)))
+                    .clicked()
+                {
+                    self.start_replay_buffer();
+                }
+                if ui.add(button("Record", None)).on_hover_text(format!("Record until you stop ({})", self.shortcut_label(settings::ShortcutAction::ToggleRecord))).clicked() {
+                    self.start_recording();
+                }
+            }
+            RecState::Buffering => {
+                if ui
+                    .add_enabled(!self.saving, button("💾  Save clip", Some(ACCENT)))
+                    .on_hover_text(self.shortcut_label(settings::ShortcutAction::SaveClip))
+                    .clicked()
+                {
+                    self.save_clip();
+                }
+                if ui.add(button("Stop", None)).on_hover_text(format!("Stop the replay buffer ({})", self.shortcut_label(settings::ShortcutAction::ToggleBuffer))).clicked() {
+                    self.stop();
+                }
+            }
+            RecState::Recording => {
+                let stop = if compact { "⏹  Stop" } else { "⏹  Stop recording" };
+                if ui.add(button(stop, Some(REC_RED))).on_hover_text(self.shortcut_label(settings::ShortcutAction::ToggleRecord)).clicked() {
+                    self.stop();
+                }
+            }
+        }
+    }
+
     fn permission_banner(&mut self, ui: &mut egui::Ui) {
         if self.permission != capture::Permission::Denied {
             return;
@@ -602,13 +663,15 @@ impl App {
         match ed.ui(ui) {
             editor::EditorOutcome::Stay => {}
             editor::EditorOutcome::Close => self.close_editor(),
-            editor::EditorOutcome::Reverted(source) => {
-                media::revert(&source);
-                self.toast("Reverted to the original clip");
+            editor::EditorOutcome::Reverted(target) => {
+                match store::revert(&target) {
+                    Ok(()) => self.toast("Reverted to the original clip"),
+                    Err(e) => self.toast_error(format!("Couldn't revert: {e}")),
+                }
                 self.close_editor();
             }
-            editor::EditorOutcome::Saved { source, info, edit, new_name } => {
-                self.start_render(source, info, edit, new_name);
+            editor::EditorOutcome::Saved { target, info, edit, new_name } => {
+                self.start_render(target, info, edit, new_name);
                 self.close_editor();
             }
         }
@@ -622,34 +685,35 @@ impl App {
 
     /// Render an edit in the background. `new_name`: save as a separate clip with
     /// that name instead of updating this clip's edit.
-    fn start_render(&mut self, source: PathBuf, info: media::ClipInfo, edit: media::Edit, new_name: Option<String>) {
-        let dest = match &new_name {
+    fn start_render(&mut self, target: store::EditTarget, info: media::ClipInfo, edit: media::Edit, new_name: Option<String>) {
+        let ext = target.clip.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or("mp4".into());
+        // In place: render into the clip's asset folder, then swap it in (see
+        // `store::commit_render`). As new: straight to the new file, no history.
+        let (dest, clip_id) = match &new_name {
             None => {
-                if let Err(e) = media::save_edit(&source, &edit) {
+                let clip_id = target.id.clone().unwrap_or_else(store::new_id);
+                let staged = store::staging_path(target.library(), &clip_id, &ext);
+                if let Err(e) = store::create_assets_dir(target.library(), &clip_id) {
                     self.toast_error(format!("Couldn't save the edit: {e}"));
                     return;
                 }
-                media::rendered_path(&source)
+                (staged, Some(clip_id))
             }
-            Some(name) => {
-                let ext = source.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or("mp4".into());
-                let dir = source.parent().unwrap_or(std::path::Path::new("."));
-                match clips::path_for_name(dir, name, &ext, None) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        self.toast_error(e);
-                        return;
-                    }
+            Some(name) => match clips::path_for_name(target.library(), name, &ext, None) {
+                Ok(p) => (p, None),
+                Err(e) => {
+                    self.toast_error(e);
+                    return;
                 }
-            }
+            },
         };
         let id = self.next_render_id;
         self.next_render_id += 1;
         let progress = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         self.renders.push(RenderJob {
             id,
-            source: source.clone(),
-            dest: dest.clone(),
+            source: target.clip.clone(),
+            dest: if new_name.is_some() { dest.clone() } else { target.clip.clone() },
             as_new: new_name.is_some(),
             progress: progress.clone(),
         });
@@ -660,8 +724,18 @@ impl App {
                 progress.store(f.to_bits(), std::sync::atomic::Ordering::Relaxed);
                 ctx.request_repaint();
             };
-            let result = media::render_with_progress(&source, &info, &edit, &dest, report).map(|()| dest);
-            let _ = tx.send((id, result.map_err(|e| e.to_string())));
+            let rendered = media::render_with_progress(&target.source, &info, &edit, &dest, clip_id.as_deref(), report).map_err(|e| e.to_string());
+            let result = match &clip_id {
+                None => rendered.map(|()| dest),
+                Some(clip_id) => {
+                    let committed = rendered.and_then(|()| store::commit_render(&target, &dest, clip_id, &edit).map_err(|e| e.to_string()));
+                    if committed.is_err() {
+                        store::abandon_render(target.library(), clip_id, &dest);
+                    }
+                    committed.map(|()| target.clip.clone())
+                }
+            };
+            let _ = tx.send((id, result));
             ctx.request_repaint();
         });
         self.refresh_clips();
@@ -681,10 +755,6 @@ impl App {
                     }
                 }
                 Err(e) => {
-                    if !job.as_new {
-                        // The sidecar was written up front; without a render it's a lie.
-                        media::revert(&job.source);
-                    }
                     self.toast_error(format!("Couldn't save the edit: {e}"));
                 }
             }
@@ -696,7 +766,7 @@ impl App {
 /// A background render, shown in the library with a progress bar.
 pub(crate) struct RenderJob {
     id: u64,
-    /// The clip being edited.
+    /// The clip being edited, as named in the library.
     pub source: PathBuf,
     /// Where the result goes (the rendered edit, or the new clip).
     pub dest: PathBuf,

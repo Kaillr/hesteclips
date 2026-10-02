@@ -54,10 +54,10 @@ fn main() -> anyhow::Result<()> {
         let mut line = String::new();
         for s in &sources {
             let ch = live.channel(&s.id);
-            let (peak, _) = ch.meter.take();
+            let peak = ch.meter.take().max_peak();
             line += &format!("{}[{:?}] {:>6.1}dB  ", s.name, ch.status(), capture_db(peak));
         }
-        let (peak, _) = live.master.take();
+        let peak = live.master.take().max_peak();
         println!("{line}MIX {:>6.1}dB", capture_db(peak));
     }
     if mode == Mode::ReplayBuffer {
