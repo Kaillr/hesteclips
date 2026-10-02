@@ -199,9 +199,9 @@ pub(crate) fn window_item(window: HWND) -> Result<GraphicsCaptureItem> {
 }
 
 impl Capture {
-    /// Capture `item` into `latest`. For a window, only its client area is kept
-    /// (no title bar or borders).
-    pub(crate) fn start(gpu: &Gpu, item: &GraphicsCaptureItem, latest: &Arc<Latest>, window: Option<HWND>) -> Result<Self> {
+    /// Capture `item` into `latest`, at most `fps` × 4 times a second. For a
+    /// window, only its client area is kept (no title bar or borders).
+    pub(crate) fn start(gpu: &Gpu, item: &GraphicsCaptureItem, latest: &Arc<Latest>, window: Option<HWND>, fps: u32) -> Result<Self> {
         let size = item.Size()?;
         let dxgi: IDXGIDevice = gpu.device.cast()?;
         let winrt_device: IDirect3DDevice = unsafe { CreateDirect3D11DeviceFromDXGIDevice(&dxgi)? }.cast()?;
@@ -212,6 +212,14 @@ impl Capture {
         let _ = session.SetIsCursorCaptureEnabled(true);
         // Windows 11: no yellow "being captured" border.
         let _ = session.SetIsBorderRequired(false);
+        // Not every display refresh (540 a second on a 540 Hz monitor), just
+        // enough for the recording: less work for Windows' compositor, which
+        // games feel. Four times the recording rate: measured, Windows delivers
+        // well under the limit (at half a frame period a 60 fps recording got
+        // only 44 frames a second; at a quarter, 184). Windows 11 24H2 and
+        // later; ignored before.
+        let interval = 10_000_000 / (4 * fps.max(1) as i64);
+        let _ = session.SetMinUpdateInterval(windows::Foundation::TimeSpan { Duration: interval });
 
         let pool_size = Mutex::new(size);
         let latest2 = latest.clone();

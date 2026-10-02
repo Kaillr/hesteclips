@@ -256,7 +256,7 @@ impl Session {
 
             let encoder = h264::Encoder::start(&gpu, width, height, s, session.writer_tx.clone())?;
             session.apps = picture_source.apps();
-            let picture = picture_source.open(&gpu, canvas_w, canvas_h)?;
+            let picture = picture_source.open(&gpu, canvas_w, canvas_h, s.fps)?;
             let latest = picture.latest.clone();
             session.video = Some(picture.video);
             let converter = d3d::Converter::new(&gpu, &latest, &encoder.pool.textures, true, width, height, s.fps)?;
@@ -332,16 +332,16 @@ impl PictureSource {
         })
     }
 
-    fn open(self, gpu: &d3d::Gpu, width: u32, height: u32) -> Result<Picture> {
+    fn open(self, gpu: &d3d::Gpu, width: u32, height: u32, fps: u32) -> Result<Picture> {
         let latest = d3d::Latest::new(gpu, width, height)?;
         let video = match self {
             PictureSource::Apps(ids) => {
                 // Black until one of the apps' windows shows up.
                 latest.clear()?;
-                Video::follow_apps(gpu.clone(), latest.clone(), ids)
+                Video::follow_apps(gpu.clone(), latest.clone(), ids, fps)
             }
             PictureSource::Screen(item) => {
-                let video = Video::Screen { _capture: d3d::Capture::start(gpu, &item, &latest, None)? };
+                let video = Video::Screen { _capture: d3d::Capture::start(gpu, &item, &latest, None, fps)? };
                 // Wait for the first frame so a capture that can't see the screen
                 // fails here, visibly, instead of producing an empty file.
                 let deadline = Instant::now() + Duration::from_secs(3);
@@ -395,7 +395,7 @@ impl PreviewCapture {
                 if let (PictureSource::Apps(list), Some(shared)) = (&mut source, apps2) {
                     *list = shared; // so `update` reaches the running follower
                 }
-                let picture = source.open(&gpu, w, h)?;
+                let picture = source.open(&gpu, w, h, fps)?;
                 let (width, height) = output_size(w, h, target_height);
                 let preview = d3d::Previewer::new(&gpu, &picture.latest, width, height, fps, generation)?;
                 Ok((picture, preview))
@@ -463,7 +463,7 @@ impl Video {
     /// How often to look at which app is in focus.
     const RESCAN: Duration = Duration::from_millis(100);
 
-    fn follow_apps(gpu: d3d::Gpu, latest: Arc<d3d::Latest>, list: AppList) -> Self {
+    fn follow_apps(gpu: d3d::Gpu, latest: Arc<d3d::Latest>, list: AppList, fps: u32) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
         let thread = thread::spawn(move || {
@@ -521,7 +521,7 @@ impl Video {
                                 latest.set_app(None);
                             }
                             Some((h, app)) => {
-                                match d3d::window_item(h).and_then(|item| d3d::Capture::start(&gpu, &item, &latest, Some(h))) {
+                                match d3d::window_item(h).and_then(|item| d3d::Capture::start(&gpu, &item, &latest, Some(h), fps)) {
                                     Ok(capture) => {
                                         latest.set_app(Some(app.clone()));
                                         active = Some(app.clone());
