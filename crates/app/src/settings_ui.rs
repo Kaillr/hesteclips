@@ -7,7 +7,7 @@
 
 use egui::{Color32, RichText};
 
-use crate::settings::{self, Container, Encoder, FPS_CHOICES, OutputResolution, RateControl, ShortcutAction};
+use crate::settings::{self, Container, Encoder, FPS_CHOICES, OutputResolution, ShortcutAction};
 use crate::{App, RecState, reveal_label, shortcuts};
 
 /// Replay lengths offered as one-click choices (seconds).
@@ -49,6 +49,9 @@ impl App {
                         ui.selectable_value(&mut self.settings.replay_seconds, secs, label);
                     }
                 });
+                let size = human_bytes(self.estimated_bytes(self.settings.replay_seconds as f64));
+                ui.weak(format!("A full clip is about {size}"))
+                    .on_hover_text(self.estimate_explainer());
             });
             divider(ui);
             row(ui, "Start when HesteClips opens", Some("So you never miss a moment."), |ui| {
@@ -83,6 +86,22 @@ impl App {
                     ui.weak("fps");
                 });
             });
+            divider(ui);
+            row(ui, "Bitrate", Some("Higher keeps fast motion sharp and makes bigger files."), |ui| {
+                ui.add(egui::Slider::new(&mut self.settings.video_bitrate_mbps, 5..=150).suffix(" Mbps"));
+                let per_min = human_bytes(self.estimated_bytes(60.0));
+                ui.weak(format!("About {per_min} per minute"))
+                    .on_hover_text(self.estimate_explainer());
+            });
+            divider(ui);
+            egui::CollapsingHeader::new(RichText::new("Advanced").strong())
+                .id_salt("video_advanced")
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.weak("Tuned for clips already. Change these only if you know you need to.");
+                    ui.add_space(4.0);
+                    self.advanced(ui);
+                });
         });
 
         section(ui, "Saving", |ui| {
@@ -131,17 +150,8 @@ impl App {
         section(ui, "HesteFiles", |ui| self.hestefiles_settings(ui));
 
 
-        ui.add_space(18.0);
-        egui::CollapsingHeader::new(RichText::new("Advanced encoding").size(16.0).strong())
-            .default_open(false)
-            .show(ui, |ui| {
-                ui.weak("Tuned for clips already. Change these only if you know you need to.");
-                ui.add_space(6.0);
-                card(ui, |ui| self.advanced(ui));
-            });
-
         section(ui, "Reset", |ui| {
-            row(ui, "Reset all settings", Some("Capture, video, saving and shortcuts go back to their defaults. Your clips, clips folder, audio sources and HesteFiles account are kept."), |ui| {
+            row(ui, "Reset all settings", Some("Replay buffer, video, saving and shortcuts go back to their defaults. Your clips, clips folder, audio sources and HesteFiles account are kept."), |ui| {
                 if ui.button(RichText::new("Reset to defaults…").color(ui.visuals().error_fg_color)).clicked() {
                     self.confirm_reset = true;
                 }
@@ -152,11 +162,7 @@ impl App {
     }
 
     fn advanced(&mut self, ui: &mut egui::Ui) {
-        row(ui, "Bitrate", Some("Higher looks better in fast motion and makes bigger files."), |ui| {
-            ui.add(egui::Slider::new(&mut self.settings.video_bitrate_mbps, 5..=150).suffix(" Mbps"));
-        });
-        divider(ui);
-        row(ui, "Encoder", None, |ui| {
+        row(ui, "Encoder", Some("Hardware encoding barely touches your game's frame rate."), |ui| {
             egui::ComboBox::from_id_salt("encoder").selected_text(self.settings.encoder.label()).show_ui(ui, |ui| {
                 for e in [Encoder::Auto, Encoder::Hardware, Encoder::Software] {
                     ui.selectable_value(&mut self.settings.encoder, e, e.label());
@@ -164,14 +170,6 @@ impl App {
             });
         });
 
-        divider(ui);
-        row(ui, "Rate control", None, |ui| {
-            egui::ComboBox::from_id_salt("rate_control").selected_text(self.settings.rate_control.label()).show_ui(ui, |ui| {
-                for rc in [RateControl::Cbr, RateControl::Cqp] {
-                    ui.selectable_value(&mut self.settings.rate_control, rc, rc.label());
-                }
-            });
-        });
         divider(ui);
         row(ui, "Keyframe interval", Some("Shorter makes edits save faster and files a little bigger."), |ui| {
             ui.add(egui::Slider::new(&mut self.settings.keyframe_interval_secs, 1..=10).suffix(" s"));
@@ -273,6 +271,26 @@ impl App {
         }
     }
 
+    /// Expected size of `secs` of capture: video at the target bitrate plus every
+    /// audio track the current sources record. The encoder aims for that bitrate
+    /// on average, spending less on a still screen and more on fast motion.
+    fn estimated_bytes(&self, secs: f64) -> f64 {
+        let tracks = capture::sources::track_layout(&self.capture_sources()).0.len() as f64;
+        let bits_per_s = self.settings.video_bitrate_mbps as f64 * 1e6 + tracks * capture::AUDIO_BITRATE as f64;
+        // ~1% for the container.
+        bits_per_s / 8.0 * secs * 1.01
+    }
+
+    fn estimate_explainer(&self) -> String {
+        let tracks = capture::sources::track_layout(&self.capture_sources()).0.len();
+        format!(
+            "Video at {} Mbps plus {tracks} audio track{} at {} kbps. A mostly still screen comes out smaller, fast motion a bit bigger.",
+            self.settings.video_bitrate_mbps,
+            if tracks == 1 { "" } else { "s" },
+            capture::AUDIO_BITRATE / 1000
+        )
+    }
+
     fn reset_dialog(&mut self, ctx: &egui::Context) {
         if !self.confirm_reset {
             return;
@@ -281,7 +299,7 @@ impl App {
             ui.set_width(380.0);
             ui.heading("Reset all settings?");
             ui.add_space(4.0);
-            ui.label("Capture, video, saving, shortcuts and encoding go back to their defaults.");
+            ui.label("Replay buffer, video, saving and shortcuts go back to their defaults.");
             ui.weak("Your clips, clips folder, audio sources and HesteFiles account are kept.");
             ui.add_space(10.0);
             ui.horizontal(|ui| {
@@ -390,4 +408,17 @@ fn toggle(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
     let x = egui::lerp((rect.left() + r)..=(rect.right() - r), t);
     ui.painter().circle_filled(egui::pos2(x, rect.center().y), r - 3.0, Color32::WHITE);
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// "48 MB", "1.2 GB".
+fn human_bytes(b: f64) -> String {
+    const MB: f64 = 1024.0 * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    if b >= GB {
+        format!("{:.1} GB", b / GB)
+    } else if b >= 10.0 * MB {
+        format!("{:.0} MB", b / MB)
+    } else {
+        format!("{:.1} MB", b / MB)
+    }
 }

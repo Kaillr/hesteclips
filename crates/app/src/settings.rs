@@ -50,21 +50,14 @@ impl Container {
     }
 }
 
+/// Kept so saved settings still load; not offered in the UI, since the
+/// VideoToolbox encoder only does average-bitrate today.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RateControl {
     /// Constant bitrate — predictable file size, best for streaming/replay.
     Cbr,
     /// Constant quality — best quality per byte, variable size.
     Cqp,
-}
-
-impl RateControl {
-    pub fn label(self) -> &'static str {
-        match self {
-            RateControl::Cbr => "CBR (constant bitrate)",
-            RateControl::Cqp => "CQP (constant quality)",
-        }
-    }
 }
 
 /// Output resolution. `Native` records at the capture source's resolution;

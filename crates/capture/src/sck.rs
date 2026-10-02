@@ -72,8 +72,7 @@ use crate::sources::{AudioCapture, AudioSource, SourceKind, mix_inputs, track_la
 use crate::writer::{self, Layout, Media, SendFormat, SendSample, Writer};
 use crate::{EncodeSettings, Mode, Recorder};
 
-/// AAC bitrate per audio track.
-const AUDIO_BITRATE: u32 = 192_000;
+use crate::AUDIO_BITRATE;
 
 pub struct SckRecorder {
     session: Option<Session>,
