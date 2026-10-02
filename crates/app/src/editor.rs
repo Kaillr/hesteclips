@@ -438,6 +438,11 @@ impl Ready {
     }
 
     fn save(&mut self, target: &EditTarget, new_name: Option<String>) -> EditorOutcome {
+        // The clip already shows exactly this edit: nothing to render.
+        let has_saved_edit = target.source != target.clip;
+        if new_name.is_none() && has_saved_edit && !self.dirty() {
+            return EditorOutcome::Close;
+        }
         if new_name.is_none() && self.edit.is_identity(&self.info) {
             // Nothing changed from the original — saving means "no edit".
             return if target.source != target.clip {
