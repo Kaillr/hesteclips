@@ -18,6 +18,7 @@ pub mod mp4meta;
 mod mp4mux;
 pub mod output;
 pub mod preview;
+pub mod webcam;
 pub mod sources;
 
 #[cfg(target_os = "macos")]
@@ -230,6 +231,8 @@ pub struct EncodeSettings {
     /// Shown while recording games and apps and there's nothing to show (none
     /// is open, or you've tabbed out); black if `None`. Scaled to the frame.
     pub away_screen: Option<std::sync::Arc<StillImage>>,
+    /// A webcam drawn over the picture.
+    pub webcam: Option<webcam::Webcam>,
     /// Audio sources, in track order. Track 1 is the mix of every source with
     /// `in_mix` (so the file sounds right in any player); each source with
     /// `own_track` follows on its own track, for rebalancing later.

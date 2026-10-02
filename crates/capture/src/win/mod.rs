@@ -19,6 +19,7 @@
 //! WASAPI use: the first video frame is t=0.
 
 mod aac;
+mod camera;
 mod d3d;
 pub(crate) mod file;
 mod h264;
@@ -36,6 +37,7 @@ use anyhow::{Context, Result, bail};
 
 pub(crate) use loopback::SystemAudio;
 pub(crate) use system::host_now;
+pub use camera::list_cameras;
 pub use system::{list_apps, list_screens, list_windowed_apps};
 
 use crate::mixer::{self, Clock, LiveAudio};
@@ -193,6 +195,8 @@ const MIX_LATENCY: f64 = 0.3;
 /// lets every encoder flush into the writer before it closes the file.
 struct Session {
     video: Option<Video>,
+    /// The webcam drawn over the picture, if any.
+    camera: Option<camera::Camera>,
     /// The games and apps being followed, when recording apps.
     apps: Option<AppList>,
     pacer: Option<(Arc<AtomicBool>, JoinHandle<()>)>,
@@ -225,7 +229,7 @@ impl Session {
         let writer_tx = writer.tx.clone();
 
         let mut session =
-            Self { video: None, apps: None, pacer: None, audio: None, mixer: None, encoders: Vec::new(), writer_tx, writer: Some(writer) };
+            Self { video: None, camera: None, apps: None, pacer: None, audio: None, mixer: None, encoders: Vec::new(), writer_tx, writer: Some(writer) };
         let started = (|| -> Result<()> {
             // One PCM channel + AAC thread per track, in layout order: the mix,
             // each own track, the rest.
@@ -259,8 +263,18 @@ impl Session {
             let picture = picture_source.open(&gpu, canvas_w, canvas_h, s.fps, s.away_screen.clone())?;
             let latest = picture.latest.clone();
             session.video = Some(picture.video);
-            let converter = d3d::Converter::new(&gpu, &latest, &encoder.pool.textures, true, width, height, s.fps)?;
-            let preview = d3d::Previewer::new(&gpu, &latest, width, height, s.fps, crate::preview::new_producer())?;
+            // A webcam that can't open doesn't stop the recording: its status
+            // says why, and the picture goes on without it.
+            session.camera = s.webcam.as_ref().and_then(|w| match camera::Camera::open(&gpu, &w.device) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    eprintln!("webcam: {e:#}");
+                    None
+                }
+            });
+            let overlay = session.camera.as_ref().zip(s.webcam.as_ref()).map(|(c, w)| (&c.latest, w.placement.clone()));
+            let converter = d3d::Converter::new(&gpu, &latest, overlay.clone(), &encoder.pool.textures, true, width, height, s.fps)?;
+            let preview = d3d::Previewer::new(&gpu, &latest, overlay, width, height, s.fps, crate::preview::new_producer())?;
             session.pacer = Some(spawn_pacer(s.fps, latest, converter, encoder, preview, clock));
             Ok(())
         })();
@@ -281,6 +295,7 @@ impl Session {
         if let Some(video) = self.video.take() {
             video.stop();
         }
+        self.camera.take();
         if let Some(audio) = self.audio.take() {
             audio.stop();
         }
@@ -410,7 +425,13 @@ pub(crate) struct PreviewCapture {
 }
 
 impl PreviewCapture {
-    pub(crate) fn start(source: VideoSource, target_height: Option<u32>, fps: u32, away: Option<Arc<crate::StillImage>>) -> Self {
+    pub(crate) fn start(
+        source: VideoSource,
+        target_height: Option<u32>,
+        fps: u32,
+        away: Option<Arc<crate::StillImage>>,
+        webcam: Option<crate::webcam::Webcam>,
+    ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let error = Arc::new(std::sync::Mutex::new(None));
         let (stop2, error2) = (stop.clone(), error.clone());
@@ -419,7 +440,7 @@ impl PreviewCapture {
         let apps2 = apps.clone();
         thread::spawn(move || {
             system::com_init();
-            let opened = (|| -> Result<(Picture, d3d::Previewer)> {
+            let opened = (|| -> Result<(Picture, d3d::Previewer, Option<camera::Camera>)> {
                 let gpu = d3d::Gpu::new()?;
                 let (mut source, (w, h)) = PictureSource::plan(&source)?;
                 if let (PictureSource::Apps(list), Some(shared)) = (&mut source, apps2) {
@@ -427,10 +448,12 @@ impl PreviewCapture {
                 }
                 let picture = source.open(&gpu, w, h, fps, away)?;
                 let (width, height) = output_size(w, h, target_height);
-                let preview = d3d::Previewer::new(&gpu, &picture.latest, width, height, fps, generation)?;
-                Ok((picture, preview))
+                let cam = webcam.as_ref().and_then(|wc| camera::Camera::open(&gpu, &wc.device).ok());
+                let overlay = cam.as_ref().zip(webcam.as_ref()).map(|(c, wc)| (&c.latest, wc.placement.clone()));
+                let preview = d3d::Previewer::new(&gpu, &picture.latest, overlay, width, height, fps, generation)?;
+                Ok((picture, preview, cam))
             })();
-            let (picture, preview) = match opened {
+            let (picture, preview, cam) = match opened {
                 Ok(p) => p,
                 Err(e) => {
                     *error2.lock().unwrap() = Some(format!("{e:#}"));
@@ -454,6 +477,7 @@ impl PreviewCapture {
                 }
             }
             drop(preview);
+            drop(cam);
             picture.video.stop();
         });
         Self { stop, error, apps }

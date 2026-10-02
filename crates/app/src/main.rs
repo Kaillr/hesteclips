@@ -340,6 +340,7 @@ impl App {
             replay_seconds: self.settings.replay_seconds,
             video: self.video_source(),
             away_screen: Some(self.away_screen.clone()),
+            webcam: None,
             sources: self.capture_sources(),
         }
     }

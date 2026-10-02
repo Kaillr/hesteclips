@@ -112,20 +112,22 @@ pub struct VideoPreview {
 }
 
 impl VideoPreview {
-    /// `target_height`, `fps` and `away_screen` as in [`crate::EncodeSettings`].
+    /// `target_height`, `fps`, `away_screen` and `webcam` as in
+    /// [`crate::EncodeSettings`].
     pub fn start(
         source: &VideoSource,
         target_height: Option<u32>,
         fps: u32,
         away_screen: Option<std::sync::Arc<crate::StillImage>>,
+        webcam: Option<crate::webcam::Webcam>,
     ) -> Self {
         #[cfg(target_os = "windows")]
         {
-            Self { inner: crate::win::PreviewCapture::start(source.clone(), target_height, fps, away_screen) }
+            Self { inner: crate::win::PreviewCapture::start(source.clone(), target_height, fps, away_screen, webcam) }
         }
         #[cfg(not(target_os = "windows"))]
         {
-            let _ = (source, target_height, fps, away_screen);
+            let _ = (source, target_height, fps, away_screen, webcam);
             Self {}
         }
     }

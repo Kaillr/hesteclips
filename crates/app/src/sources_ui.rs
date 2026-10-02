@@ -536,7 +536,7 @@ impl App {
             let (source, height, fps) = &wanted;
             // Both happen in the background: the old capture closes as the new
             // one opens, and only the new one's frames are shown.
-            let preview = capture::preview::VideoPreview::start(source, *height, *fps, Some(self.away_screen.clone()));
+            let preview = capture::preview::VideoPreview::start(source, *height, *fps, Some(self.away_screen.clone()), None);
             self.video_preview = Some((wanted, preview));
         }
     }

@@ -54,6 +54,14 @@ fn main() -> anyhow::Result<()> {
             None => capture::VideoSource::Screen { id: env("SCREEN").unwrap_or_default() },
         },
         away_screen: None,
+        webcam: env("WEBCAM").map(|device| capture::webcam::Webcam {
+            device: if device.is_empty() || device == "1" {
+                capture::webcam::list_cameras().first().map(|c| c.id.clone()).unwrap_or_default()
+            } else {
+                device
+            },
+            placement: std::sync::Arc::new(std::sync::Mutex::new(capture::webcam::Placement::default_for(16.0 / 9.0, 16.0 / 9.0))),
+        }),
         sources: sources.clone(),
     })?;
     let secs: u64 = std::env::var("SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
