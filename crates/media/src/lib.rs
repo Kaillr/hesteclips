@@ -584,6 +584,11 @@ impl Weights {
 /// Video only, trimmed frame-exactly, into `out`. `progress` gets 0..=1.
 fn render_video(source: &Path, edit: &Edit, plan: &Plan, work: &Path, out: &Path, progress: &dyn Fn(f32)) -> Result<()> {
     let kbps = source_video_kbps(source).unwrap_or(20_000);
+    // Every part gets the source's timescale. Otherwise the muxer picks one per
+    // part (copied middle 1/19200, encoded edges 1/15360) and concat, which
+    // copies timestamps without rescaling, plays the middle at the wrong rate:
+    // a 60 fps trim came out as 48 fps with a fifth of its frames gone.
+    let timescale = source_timescale(source).unwrap_or(600).to_string();
     let encode = |from: f64, to: f64, dest: &Path, progress: &dyn Fn(f32)| -> Result<()> {
         run_progress(
             Command::new("ffmpeg")
@@ -593,6 +598,7 @@ fn render_video(source: &Path, edit: &Edit, plan: &Plan, work: &Path, out: &Path
                 .args(["-map", "0:v:0", "-an", "-c:v", video_encoder(), "-b:v", &format!("{kbps}k")])
                 // Same profile as our recordings so the segments can be joined.
                 .args(["-profile:v", "high", "-pix_fmt", "yuv420p"])
+                .args(["-video_track_timescale", &timescale])
                 .arg(dest),
             to - from,
             progress,
@@ -619,6 +625,7 @@ fn render_video(source: &Path, edit: &Edit, plan: &Plan, work: &Path, out: &Path
         .args(["-ss", &format!("{k1:.6}"), "-to", &format!("{k2:.6}"), "-i"])
         .arg(source)
         .args(["-map", "0:v:0", "-an", "-c", "copy", "-avoid_negative_ts", "make_zero"])
+        .args(["-video_track_timescale", &timescale])
         .arg(&path))?;
     parts.push(path);
     progress(w_head + w_mid);
@@ -774,6 +781,18 @@ fn is_h264(source: &Path) -> bool {
 
 fn video_encoder() -> &'static str {
     if cfg!(target_os = "macos") { "h264_videotoolbox" } else { "libx264" }
+}
+
+/// Ticks per second of the video track (the denominator of its time base).
+fn source_timescale(source: &Path) -> Option<u32> {
+    let out = Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=time_base", "-of", "csv=p=0"])
+        .arg(source)
+        .output()
+        .ok()?;
+    let tb = String::from_utf8_lossy(&out.stdout);
+    let (_, den) = tb.trim().split_once('/')?;
+    den.parse().ok().filter(|&d| d > 0)
 }
 
 fn source_video_kbps(source: &Path) -> Option<u64> {
