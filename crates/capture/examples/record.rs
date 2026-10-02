@@ -47,9 +47,13 @@ fn main() -> anyhow::Result<()> {
         use_hardware: env("SOFTWARE").is_none(),
         replay_seconds: 5,
         video: match env("APP") {
-            Some(ids) => capture::VideoSource::Apps { ids: ids.split(',').map(str::to_owned).collect() },
+            Some(ids) => capture::VideoSource::Apps {
+                ids: ids.split(',').map(str::to_owned).collect(),
+                away_when_unfocused: env("AWAY").is_some(),
+            },
             None => capture::VideoSource::Screen { id: env("SCREEN").unwrap_or_default() },
         },
+        away_screen: None,
         sources: sources.clone(),
     })?;
     let secs: u64 = std::env::var("SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(4);

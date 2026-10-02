@@ -153,9 +153,9 @@ impl Recorder for WinRecorder {
     }
 
     fn update_video(&mut self, video: &VideoSource) -> bool {
-        match (video, self.session.as_ref().and_then(|s| s.apps.as_ref())) {
-            (VideoSource::Apps { ids }, Some(list)) => {
-                *list.lock().unwrap() = ids.clone();
+        match (AppsConfig::of(video), self.session.as_ref().and_then(|s| s.apps.as_ref())) {
+            (Some(config), Some(list)) => {
+                *list.lock().unwrap() = config;
                 true
             }
             _ => false,
@@ -256,7 +256,7 @@ impl Session {
 
             let encoder = h264::Encoder::start(&gpu, width, height, s, session.writer_tx.clone())?;
             session.apps = picture_source.apps();
-            let picture = picture_source.open(&gpu, canvas_w, canvas_h, s.fps)?;
+            let picture = picture_source.open(&gpu, canvas_w, canvas_h, s.fps, s.away_screen.clone())?;
             let latest = picture.latest.clone();
             session.video = Some(picture.video);
             let converter = d3d::Converter::new(&gpu, &latest, &encoder.pool.textures, true, width, height, s.fps)?;
@@ -305,9 +305,27 @@ enum PictureSource {
     Apps(AppList),
 }
 
-/// The games and apps a capture follows, shared with the thread following them
-/// so the list can change while it runs.
-type AppList = Arc<std::sync::Mutex<Vec<String>>>;
+/// The games and apps a capture follows, and what to show while you're in
+/// something else.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct AppsConfig {
+    ids: Vec<String>,
+    away_when_unfocused: bool,
+}
+
+impl AppsConfig {
+    fn of(source: &VideoSource) -> Option<Self> {
+        match source {
+            VideoSource::Apps { ids, away_when_unfocused } => {
+                Some(Self { ids: ids.clone(), away_when_unfocused: *away_when_unfocused })
+            }
+            VideoSource::Screen { .. } => None,
+        }
+    }
+}
+
+/// Shared with the thread following the apps, so it can change while it runs.
+type AppList = Arc<std::sync::Mutex<AppsConfig>>;
 
 /// A running capture and the texture it fills.
 struct Picture {
@@ -325,14 +343,15 @@ impl PictureSource {
                 let size = item.Size()?;
                 (PictureSource::Screen(item), (size.Width.max(2) as u32, size.Height.max(2) as u32))
             }
-            VideoSource::Apps { ids } => {
+            VideoSource::Apps { .. } => {
                 let (_, w, h) = system::primary_monitor();
-                (PictureSource::Apps(Arc::new(std::sync::Mutex::new(ids.clone()))), (w, h))
+                let config = AppsConfig::of(source).unwrap_or_default();
+                (PictureSource::Apps(Arc::new(std::sync::Mutex::new(config))), (w, h))
             }
         })
     }
 
-    fn open(self, gpu: &d3d::Gpu, width: u32, height: u32, fps: u32) -> Result<Picture> {
+    fn open(self, gpu: &d3d::Gpu, width: u32, height: u32, fps: u32, away: Option<Arc<crate::StillImage>>) -> Result<Picture> {
         // What's captured is copied 1:1 before it's scaled into the frame, so the
         // copy must hold all of it. A display is its own size; an app's window
         // can be on any display — on a portrait one, taller than the frame — so
@@ -346,10 +365,13 @@ impl PictureSource {
         };
         let latest = d3d::Latest::new(gpu, copy_w, copy_h)?;
         let video = match self {
-            PictureSource::Apps(ids) => {
-                // Black until one of the apps' windows shows up.
-                latest.clear()?;
-                Video::follow_apps(gpu.clone(), latest.clone(), ids, fps)
+            PictureSource::Apps(list) => {
+                // The away screen until one of the apps' windows shows up.
+                match &away {
+                    Some(image) => latest.show_still(image)?,
+                    None => latest.clear()?,
+                }
+                Video::follow_apps(gpu.clone(), latest.clone(), list, fps, away)
             }
             PictureSource::Screen(item) => {
                 let video = Video::Screen { _capture: d3d::Capture::start(gpu, &item, &latest, None, fps)? };
@@ -388,15 +410,12 @@ pub(crate) struct PreviewCapture {
 }
 
 impl PreviewCapture {
-    pub(crate) fn start(source: VideoSource, target_height: Option<u32>, fps: u32) -> Self {
+    pub(crate) fn start(source: VideoSource, target_height: Option<u32>, fps: u32, away: Option<Arc<crate::StillImage>>) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let error = Arc::new(std::sync::Mutex::new(None));
         let (stop2, error2) = (stop.clone(), error.clone());
         let generation = crate::preview::new_producer();
-        let apps = match &source {
-            VideoSource::Apps { ids } => Some(Arc::new(std::sync::Mutex::new(ids.clone()))),
-            VideoSource::Screen { .. } => None,
-        };
+        let apps = AppsConfig::of(&source).map(|c| Arc::new(std::sync::Mutex::new(c)));
         let apps2 = apps.clone();
         thread::spawn(move || {
             system::com_init();
@@ -406,7 +425,7 @@ impl PreviewCapture {
                 if let (PictureSource::Apps(list), Some(shared)) = (&mut source, apps2) {
                     *list = shared; // so `update` reaches the running follower
                 }
-                let picture = source.open(&gpu, w, h, fps)?;
+                let picture = source.open(&gpu, w, h, fps, away)?;
                 let (width, height) = output_size(w, h, target_height);
                 let preview = d3d::Previewer::new(&gpu, &picture.latest, width, height, fps, generation)?;
                 Ok((picture, preview))
@@ -441,9 +460,9 @@ impl PreviewCapture {
     }
 
     pub(crate) fn update(&self, source: &VideoSource) -> bool {
-        match (source, &self.apps) {
-            (VideoSource::Apps { ids }, Some(list)) => {
-                *list.lock().unwrap() = ids.clone();
+        match (AppsConfig::of(source), &self.apps) {
+            (Some(config), Some(list)) => {
+                *list.lock().unwrap() = config;
                 true
             }
             _ => false,
@@ -474,73 +493,91 @@ impl Video {
     /// How often to look at which app is in focus.
     const RESCAN: Duration = Duration::from_millis(100);
 
-    fn follow_apps(gpu: d3d::Gpu, latest: Arc<d3d::Latest>, list: AppList, fps: u32) -> Self {
+    fn follow_apps(gpu: d3d::Gpu, latest: Arc<d3d::Latest>, list: AppList, fps: u32, away: Option<Arc<crate::StillImage>>) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
         let thread = thread::spawn(move || {
             system::com_init();
-            let mut apps: Vec<String> = Vec::new();
+            let mut config = AppsConfig::default();
             // The listed app last in focus: recorded until another one is.
             let mut active: Option<String> = None;
             let mut current: Option<(windows::Win32::Foundation::HWND, String, d3d::Capture)> = None;
             // A window that couldn't be captured, so it's reported once.
             let mut failed = None;
+            // The away screen is up (so it's uploaded once, not every tick).
+            let mut away_up = false;
+            let show_away = |away_up: &mut bool| {
+                if !*away_up {
+                    let _ = match &away {
+                        Some(image) => latest.show_still(image),
+                        None => latest.clear(),
+                    };
+                    latest.set_app(None);
+                    *away_up = true;
+                }
+            };
             while !stop2.load(Ordering::Relaxed) {
                 // The list may have changed: forget apps that left it.
                 let now = list.lock().unwrap().clone();
-                if now != apps {
-                    apps = now;
-                    let still = |a: &String| apps.iter().any(|x| x.eq_ignore_ascii_case(a));
+                if now != config {
+                    config = now;
+                    let still = |a: &String| config.ids.iter().any(|x| x.eq_ignore_ascii_case(a));
                     if active.as_ref().is_some_and(|a| !still(a)) {
                         active = None;
                     }
                 }
-                let listed = |exe: &str| apps.iter().find(|a| a.eq_ignore_ascii_case(exe)).cloned();
-                let focused = system::foreground_app().and_then(|(h, exe, main)| Some((h, listed(&exe)?, main)));
+                let listed = |exe: &str| config.ids.iter().find(|a| a.eq_ignore_ascii_case(exe)).cloned();
+                let foreground = system::foreground_app();
+                let focused = foreground.as_ref().and_then(|f| Some((f.hwnd, listed(&f.exe)?, f.main)));
                 if let Some((_, app, _)) = &focused {
                     active = Some(app.clone());
                 }
-                // Keep the window being recorded while it's still the active
-                // app's, open, and shown (or focused): switching costs a moment,
-                // and flipping between two of an app's windows would flicker.
-                let keep = current.as_ref().is_some_and(|(h, app, capture)| {
-                    Some(app) == active.as_ref()
-                        && !capture.is_closed()
-                        && system::window_alive(*h)
-                        && (focused.as_ref().is_none_or(|(f, _, main)| !main || f == h) && !system::window_minimized(*h)
-                            || focused.as_ref().is_some_and(|(f, _, _)| f == h))
-                });
-                if !keep {
-                    // What to record now: the focused window of a listed app, else
-                    // the active app's main window, else the first listed app
-                    // that's open.
-                    let target = focused
-                        .as_ref()
-                        .filter(|(_, _, main)| *main)
-                        .map(|(h, app, _)| (*h, app.clone()))
-                        .or_else(|| active.as_ref().and_then(|a| Some((system::find_app_window(a)?, a.clone()))))
-                        .or_else(|| apps.iter().find_map(|a| Some((system::find_app_window(a)?, a.clone()))));
-                    let same = current.as_ref().zip(target.as_ref()).is_some_and(|((h, ..), (t, _))| h == t);
-                    if !same {
-                        current = None;
-                        match target.filter(|(h, _)| failed != Some(*h)) {
-                            None => {
-                                // Nothing listed is open: black until something is.
-                                if !latest.waiting() {
-                                    let _ = latest.clear();
-                                }
-                                latest.set_app(None);
-                            }
-                            Some((h, app)) => {
-                                match d3d::window_item(h).and_then(|item| d3d::Capture::start(&gpu, &item, &latest, Some(h), fps)) {
-                                    Ok(capture) => {
-                                        latest.set_app(Some(app.clone()));
-                                        active = Some(app.clone());
-                                        current = Some((h, app, capture));
-                                    }
-                                    Err(e) => {
-                                        eprintln!("can't record {app}'s window: {e:#}");
-                                        failed = Some(h);
+                // Tabbed out: something unlisted is in front. HesteClips itself
+                // doesn't count, so checking the preview doesn't change it.
+                let tabbed_out = config.away_when_unfocused && focused.is_none() && foreground.as_ref().is_some_and(|f| !f.own);
+                if tabbed_out {
+                    current = None; // no need to keep capturing what isn't shown
+                    show_away(&mut away_up);
+                } else {
+                    // Keep the window being recorded while it's still the active
+                    // app's, open, and shown (or focused): switching costs a
+                    // moment, and flipping between two of an app's windows would
+                    // flicker.
+                    let keep = current.as_ref().is_some_and(|(h, app, capture)| {
+                        Some(app) == active.as_ref()
+                            && !capture.is_closed()
+                            && system::window_alive(*h)
+                            && (focused.as_ref().is_none_or(|(f, _, main)| !main || f == h) && !system::window_minimized(*h)
+                                || focused.as_ref().is_some_and(|(f, _, _)| f == h))
+                    });
+                    if !keep {
+                        // What to record now: the focused window of a listed app,
+                        // else the active app's main window, else the first listed
+                        // app that's open.
+                        let target = focused
+                            .as_ref()
+                            .filter(|(_, _, main)| *main)
+                            .map(|(h, app, _)| (*h, app.clone()))
+                            .or_else(|| active.as_ref().and_then(|a| Some((system::find_app_window(a)?, a.clone()))))
+                            .or_else(|| config.ids.iter().find_map(|a| Some((system::find_app_window(a)?, a.clone()))));
+                        let same = current.as_ref().zip(target.as_ref()).is_some_and(|((h, ..), (t, _))| h == t);
+                        if !same {
+                            current = None;
+                            match target.filter(|(h, _)| failed != Some(*h)) {
+                                // Nothing listed is open.
+                                None => show_away(&mut away_up),
+                                Some((h, app)) => {
+                                    match d3d::window_item(h).and_then(|item| d3d::Capture::start(&gpu, &item, &latest, Some(h), fps)) {
+                                        Ok(capture) => {
+                                            latest.set_app(Some(app.clone()));
+                                            active = Some(app.clone());
+                                            current = Some((h, app, capture));
+                                            away_up = false;
+                                        }
+                                        Err(e) => {
+                                            eprintln!("can't record {app}'s window: {e:#}");
+                                            failed = Some(h);
+                                        }
                                     }
                                 }
                             }

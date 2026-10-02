@@ -80,10 +80,20 @@ pub enum VideoSource {
     /// A whole display, by backend id (see [`list_screens`]).
     Screen { id: String },
     /// Games and apps, by executable name (see [`list_windowed_apps`]): records
-    /// whichever of them is in focus, and keeps recording the last one while
-    /// something else is. Fitted into a frame the size of the main display.
-    /// Black while none of them is open; each is picked up as soon as it opens.
-    Apps { ids: Vec<String> },
+    /// whichever of them is in focus. While something else is, it shows the
+    /// away screen (`away_when_unfocused`) or keeps recording the last one.
+    /// Fitted into a frame the size of the main display. The away screen also
+    /// shows while none of them is open; each is picked up as soon as it opens.
+    Apps { ids: Vec<String>, away_when_unfocused: bool },
+}
+
+/// A still picture shown instead of an app (see [`EncodeSettings::away_screen`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StillImage {
+    pub width: u32,
+    pub height: u32,
+    /// Rows top to bottom, 4 bytes per pixel in B, G, R, A order, opaque.
+    pub bgra: Vec<u8>,
 }
 
 /// Whether this platform can record games and apps ([`VideoSource::Apps`]).
@@ -215,6 +225,9 @@ pub struct EncodeSettings {
     pub replay_seconds: u32,
     /// What the video shows.
     pub video: VideoSource,
+    /// Shown while recording games and apps and there's nothing to show (none
+    /// is open, or you've tabbed out); black if `None`. Scaled to the frame.
+    pub away_screen: Option<std::sync::Arc<StillImage>>,
     /// Audio sources, in track order. Track 1 is the mix of every source with
     /// `in_mix` (so the file sounds right in any player); each source with
     /// `own_track` follows on its own track, for rebalancing later.

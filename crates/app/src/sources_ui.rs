@@ -266,7 +266,7 @@ impl App {
                             .clicked()
                             && !apps_mode
                         {
-                            self.settings.capture = CaptureTarget::Apps { apps: Vec::new() };
+                            self.settings.capture = CaptureTarget::Apps { apps: Vec::new(), away_screen: true };
                             self.windowed_apps = capture::list_windowed_apps();
                         }
                     });
@@ -278,7 +278,7 @@ impl App {
             ui.add_space(8.0);
 
             match self.settings.capture.clone() {
-                CaptureTarget::Apps { apps } => self.app_list(ui, apps, frame.as_deref()),
+                CaptureTarget::Apps { apps, away_screen } => self.app_list(ui, apps, away_screen, frame.as_deref()),
                 _ => {
                     ui.add_enabled_ui(idle, |ui| {
                         ui.horizontal(|ui| {
@@ -343,15 +343,10 @@ impl App {
             match (&self.sources_view.preview, frame) {
                 (Some((tex, _)), Some(f)) => {
                     p.image(tex.id(), rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
-                    if f.waiting {
-                        let text = match &self.settings.capture {
-                            CaptureTarget::Apps { apps } if apps.is_empty() => "Add a game or app below to start.".to_owned(),
-                            CaptureTarget::Apps { apps } if apps.len() == 1 => {
-                                format!("Waiting for {} to open. Clips are black until then.", apps[0].name)
-                            }
-                            _ => "Waiting for one of your games or apps to open. Clips are black until then.".to_owned(),
-                        };
-                        message(&text);
+                    if f.waiting && matches!(&self.settings.capture, CaptureTarget::Apps { apps, .. } if apps.is_empty()) {
+                        let band = egui::Rect::from_center_size(rect.center_bottom() - egui::vec2(0.0, 22.0), egui::vec2(rect.width(), 28.0));
+                        p.rect_filled(band, 0.0, Color32::from_black_alpha(180));
+                        p.text(band.center(), egui::Align2::CENTER_CENTER, "Add a game or app below to start.", egui::FontId::proportional(13.0), Color32::from_gray(220));
                     }
                 }
                 _ => match self.video_preview.as_ref().and_then(|(_, p)| p.error()) {
@@ -365,10 +360,11 @@ impl App {
     /// The games and apps to record: each with whether it's open (and which is
     /// being recorded), a way to remove it, and a way to add more. Changes
     /// apply right away, even while capturing.
-    fn app_list(&mut self, ui: &mut egui::Ui, apps: Vec<CaptureApp>, frame: Option<&capture::preview::PreviewFrame>) {
+    fn app_list(&mut self, ui: &mut egui::Ui, apps: Vec<CaptureApp>, away_screen: bool, frame: Option<&capture::preview::PreviewFrame>) {
         let showing = frame.filter(|f| !f.waiting).and_then(|f| f.app.clone());
         let capturing = self.rec_state != crate::RecState::Idle;
         let mut list = apps.clone();
+        let mut away = away_screen;
         if list.is_empty() {
             ui.weak("Add the games you play, and any apps you want in your clips.");
             ui.add_space(4.0);
@@ -448,16 +444,22 @@ impl App {
                 }
             }
         });
+        ui.add_space(6.0);
+        ui.checkbox(&mut away, "Show “Tabbed out” when you're in another app").on_hover_text(
+            "On: switching to anything not listed shows the HesteClips logo with “Tabbed out” in your clips. \
+             Off: it keeps recording the last game or app you used. Either way, that screen shows while none of them is open.",
+        );
         if !list.is_empty() {
             ui.add_space(2.0);
-            ui.label(
-                RichText::new("Records whichever of these you're using. While you're in another app, it keeps recording the last one.")
-                    .size(12.0)
-                    .weak(),
-            );
+            let how = if away {
+                "Records whichever of these you're using, and “Tabbed out” while you're in anything else."
+            } else {
+                "Records whichever of these you're using. While you're in another app, it keeps recording the last one."
+            };
+            ui.label(RichText::new(how).size(12.0).weak());
         }
-        if list != apps {
-            self.settings.capture = CaptureTarget::Apps { apps: list };
+        if list != apps || away != away_screen {
+            self.settings.capture = CaptureTarget::Apps { apps: list, away_screen: away };
         }
     }
 
@@ -533,7 +535,7 @@ impl App {
             let (source, height, fps) = &wanted;
             // Both happen in the background: the old capture closes as the new
             // one opens, and only the new one's frames are shown.
-            let preview = capture::preview::VideoPreview::start(source, *height, *fps);
+            let preview = capture::preview::VideoPreview::start(source, *height, *fps, Some(self.away_screen.clone()));
             self.video_preview = Some((wanted, preview));
         }
     }

@@ -109,8 +109,13 @@ pub enum CaptureTarget {
     #[default]
     Screen,
     /// Games and apps: whichever is in focus is recorded (see
-    /// `capture::VideoSource::Apps`).
-    Apps { apps: Vec<CaptureApp> },
+    /// `capture::VideoSource::Apps`). With `away_screen`, tabbing out to
+    /// anything else shows the away screen instead of the last one.
+    Apps {
+        apps: Vec<CaptureApp>,
+        #[serde(default = "yes")]
+        away_screen: bool,
+    },
     /// One app, from before several could be chosen; read only, turned into
     /// `Apps` on load.
     App { id: String, name: String },
@@ -387,7 +392,7 @@ impl RecordSettings {
     /// A single chosen app (from before several could be) becomes a list of one.
     fn upgrade_capture(&mut self) {
         if let CaptureTarget::App { id, name } = &self.capture {
-            self.capture = CaptureTarget::Apps { apps: vec![CaptureApp { id: id.clone(), name: name.clone() }] };
+            self.capture = CaptureTarget::Apps { apps: vec![CaptureApp { id: id.clone(), name: name.clone() }], away_screen: true };
         }
     }
 
@@ -416,7 +421,10 @@ mod tests {
             serde_json::from_str(r#"{"fps": 144, "capture": {"type": "app", "id": "game.exe", "name": "Game"}}"#).unwrap();
         s.upgrade_capture();
         assert_eq!(s.fps, 144, "the rest of the settings survive");
-        assert_eq!(s.capture, CaptureTarget::Apps { apps: vec![CaptureApp { id: "game.exe".into(), name: "Game".into() }] });
+        assert_eq!(
+            s.capture,
+            CaptureTarget::Apps { apps: vec![CaptureApp { id: "game.exe".into(), name: "Game".into() }], away_screen: true }
+        );
         let round: RecordSettings = serde_json::from_str(&s.to_json()).unwrap();
         assert_eq!(round.capture, s.capture);
     }

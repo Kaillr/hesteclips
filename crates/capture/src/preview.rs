@@ -31,8 +31,8 @@ pub struct PreviewFrame {
     pub rgba: Vec<u8>,
     /// Increases with every new frame, to notice changes cheaply.
     pub seq: u64,
-    /// Nothing to show yet: none of the recorded apps is open, so the picture
-    /// (and the recording) is black.
+    /// No app is being shown: none of the recorded apps is open, or you've
+    /// tabbed out — the picture (and the recording) is the away screen.
     pub waiting: bool,
     /// When recording games and apps: the one being recorded (its executable).
     pub app: Option<String>,
@@ -112,15 +112,20 @@ pub struct VideoPreview {
 }
 
 impl VideoPreview {
-    /// `target_height` and `fps` as in [`crate::EncodeSettings`].
-    pub fn start(source: &VideoSource, target_height: Option<u32>, fps: u32) -> Self {
+    /// `target_height`, `fps` and `away_screen` as in [`crate::EncodeSettings`].
+    pub fn start(
+        source: &VideoSource,
+        target_height: Option<u32>,
+        fps: u32,
+        away_screen: Option<std::sync::Arc<crate::StillImage>>,
+    ) -> Self {
         #[cfg(target_os = "windows")]
         {
-            Self { inner: crate::win::PreviewCapture::start(source.clone(), target_height, fps) }
+            Self { inner: crate::win::PreviewCapture::start(source.clone(), target_height, fps, away_screen) }
         }
         #[cfg(not(target_os = "windows"))]
         {
-            let _ = (source, target_height, fps);
+            let _ = (source, target_height, fps, away_screen);
             Self {}
         }
     }

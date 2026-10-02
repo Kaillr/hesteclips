@@ -7,6 +7,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // no console window on release Windows
 
+mod away;
 mod clips;
 mod cloud;
 mod cloud_ui;
@@ -170,6 +171,8 @@ struct App {
     pub(crate) windowed_apps: Vec<capture::Device>,
     /// What the running capture records, to send it list changes live.
     capturing_video: Option<capture::VideoSource>,
+    /// Shown instead of a game or app while you're tabbed out.
+    pub(crate) away_screen: std::sync::Arc<capture::StillImage>,
     /// System audio inputs/outputs (+ current OS defaults).
     audio: capture::audio::AudioDevices,
     /// Live per-source volume and meters, shared with the capture thread.
@@ -238,6 +241,7 @@ impl App {
             screens: capture::list_screens(),
             windowed_apps: Vec::new(),
             capturing_video: None,
+            away_screen: away::screen(),
             audio: capture::audio::list_audio_devices(),
             live_audio,
             level_monitor: None,
@@ -335,6 +339,7 @@ impl App {
             use_hardware: self.settings.encoder != Encoder::Software,
             replay_seconds: self.settings.replay_seconds,
             video: self.video_source(),
+            away_screen: Some(self.away_screen.clone()),
             sources: self.capture_sources(),
         }
     }
@@ -342,9 +347,10 @@ impl App {
     /// What the video shows, for the capture backend.
     pub(crate) fn video_source(&self) -> capture::VideoSource {
         match &self.settings.capture {
-            settings::CaptureTarget::Apps { apps } if capture::APP_CAPTURE => {
-                capture::VideoSource::Apps { ids: apps.iter().map(|a| a.id.clone()).collect() }
-            }
+            settings::CaptureTarget::Apps { apps, away_screen } if capture::APP_CAPTURE => capture::VideoSource::Apps {
+                ids: apps.iter().map(|a| a.id.clone()).collect(),
+                away_when_unfocused: *away_screen,
+            },
             _ => capture::VideoSource::Screen {
                 id: self.screens.get(self.settings.display_index).map(|d| d.id.clone()).unwrap_or_else(|| "0".to_owned()),
             },

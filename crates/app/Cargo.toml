@@ -9,6 +9,7 @@ name = "hesteclips"
 path = "src/main.rs"
 
 [dependencies]
+ab_glyph = "0.2"
 bytemuck = "1"
 capture = { path = "../capture" }
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
@@ -18,6 +19,7 @@ ctrlc = { version = "3.5.2", features = ["termination"] }
 dirs = "6.0.0"
 drag = "2"
 eframe = "0.36.1"
+epaint_default_fonts = "0.36"
 egui = "0.36.1"
 global-hotkey = "0.8.0"
 hestefiles = { version = "0.1.0", path = "../hestefiles" }

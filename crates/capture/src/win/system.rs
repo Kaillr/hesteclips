@@ -369,9 +369,18 @@ pub(crate) fn find_app_window(exe: &str) -> Option<HWND> {
     best.map(|(_, _, h)| h)
 }
 
-/// The window in focus, its app's executable, and whether it's a main window
-/// (the kind [`find_app_window`] picks) rather than a dialog or popup.
-pub(crate) fn foreground_app() -> Option<(HWND, String, bool)> {
+/// The window in focus.
+pub(crate) struct Foreground {
+    pub hwnd: HWND,
+    /// Its app's executable.
+    pub exe: String,
+    /// A main window (the kind [`find_app_window`] picks), not a dialog or popup.
+    pub main: bool,
+    /// HesteClips itself.
+    pub own: bool,
+}
+
+pub(crate) fn foreground_app() -> Option<Foreground> {
     unsafe {
         let hwnd = GetForegroundWindow();
         if hwnd.is_invalid() {
@@ -381,7 +390,7 @@ pub(crate) fn foreground_app() -> Option<(HWND, String, bool)> {
         GetWindowThreadProcessId(hwnd, Some(&mut pid));
         let exe = exe_of(pid)?;
         let main = app_windows().iter().any(|(h, _)| *h == hwnd);
-        Some((hwnd, exe, main))
+        Some(Foreground { hwnd, exe, main, own: pid == std::process::id() })
     }
 }
 

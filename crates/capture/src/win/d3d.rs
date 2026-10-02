@@ -154,7 +154,23 @@ impl Latest {
         *self.content.lock().unwrap()
     }
 
-    /// Show black (an app that isn't open), as a full-size frame.
+    /// Show a still picture (the away screen), fitted to the frame like a
+    /// window. Black if it doesn't fit (a display smaller than the picture).
+    pub(crate) fn show_still(&self, image: &crate::StillImage) -> Result<()> {
+        if image.width > self.width || image.height > self.height || image.bgra.len() < (image.width * image.height * 4) as usize {
+            return self.clear();
+        }
+        let region = D3D11_BOX { left: 0, top: 0, front: 0, right: image.width, bottom: image.height, back: 1 };
+        unsafe {
+            self.gpu.context.UpdateSubresource(&self.texture, 0, Some(&region), image.bgra.as_ptr().cast(), image.width * 4, 0);
+        }
+        *self.content.lock().unwrap() = (image.width, image.height);
+        self.waiting.store(true, Ordering::Release);
+        self.has_frame.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Show black, as a full-size frame.
     pub(crate) fn clear(&self) -> Result<()> {
         unsafe {
             let mut view = None;
