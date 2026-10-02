@@ -60,6 +60,7 @@ fn main() -> anyhow::Result<()> {
             } else {
                 device
             },
+            format: None,
             placement: std::sync::Arc::new(std::sync::Mutex::new(capture::webcam::Placement::default_for(16.0 / 9.0, 16.0 / 9.0))),
         }),
         sources: sources.clone(),

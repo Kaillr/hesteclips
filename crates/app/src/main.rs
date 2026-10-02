@@ -187,7 +187,7 @@ struct App {
     level_monitor: Option<(Vec<capture::sources::AudioSource>, capture::sources::LevelMonitor)>,
     /// Preview-only capture while the Sources page is open and nothing records,
     /// with the source, height and frame rate it was started for.
-    pub(crate) video_preview: Option<((capture::VideoSource, Option<u32>, u32, Option<String>), capture::preview::VideoPreview)>,
+    pub(crate) video_preview: Option<((capture::VideoSource, Option<u32>, u32, Option<capture::webcam::Webcam>), capture::preview::VideoPreview)>,
     sources_view: sources_ui::SourcesView,
     clips: Vec<clips::Clip>,
     thumbs: thumbs::Thumbs,
@@ -356,7 +356,7 @@ impl App {
     /// The webcam, for the capture backend.
     pub(crate) fn webcam_source(&self) -> Option<capture::webcam::Webcam> {
         let w = self.settings.webcam.as_ref().filter(|_| capture::webcam::AVAILABLE)?;
-        Some(capture::webcam::Webcam { device: w.id.clone(), placement: self.webcam_placement.clone() })
+        Some(capture::webcam::Webcam { device: w.id.clone(), format: w.format.map(Into::into), placement: self.webcam_placement.clone() })
     }
 
     pub(crate) fn video_source(&self) -> capture::VideoSource {

@@ -128,7 +128,31 @@ pub struct WebcamCfg {
     pub id: String,
     /// What to call it while it isn't connected.
     pub name: String,
+    /// The format to open it in; `None` picks the best.
+    #[serde(default)]
+    pub format: Option<FormatCfg>,
     pub placement: PlacementCfg,
+}
+
+/// A camera format: see `capture::webcam::Format`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FormatCfg {
+    pub width: u32,
+    pub height: u32,
+    pub fps_num: u32,
+    pub fps_den: u32,
+}
+
+impl From<FormatCfg> for capture::webcam::Format {
+    fn from(f: FormatCfg) -> Self {
+        Self { width: f.width, height: f.height, fps_num: f.fps_num, fps_den: f.fps_den }
+    }
+}
+
+impl From<capture::webcam::Format> for FormatCfg {
+    fn from(f: capture::webcam::Format) -> Self {
+        Self { width: f.width, height: f.height, fps_num: f.fps_num, fps_den: f.fps_den }
+    }
 }
 
 /// Where the webcam sits: see `capture::webcam::Placement`.
@@ -140,17 +164,21 @@ pub struct PlacementCfg {
     pub h: f32,
     #[serde(default)]
     pub crop: [f32; 4],
+    #[serde(default)]
+    pub flip_h: bool,
+    #[serde(default)]
+    pub flip_v: bool,
 }
 
 impl From<PlacementCfg> for capture::webcam::Placement {
     fn from(p: PlacementCfg) -> Self {
-        Self { x: p.x, y: p.y, w: p.w, h: p.h, crop: p.crop }
+        Self { x: p.x, y: p.y, w: p.w, h: p.h, crop: p.crop, flip_h: p.flip_h, flip_v: p.flip_v }
     }
 }
 
 impl From<capture::webcam::Placement> for PlacementCfg {
     fn from(p: capture::webcam::Placement) -> Self {
-        Self { x: p.x, y: p.y, w: p.w, h: p.h, crop: p.crop }
+        Self { x: p.x, y: p.y, w: p.w, h: p.h, crop: p.crop, flip_h: p.flip_h, flip_v: p.flip_v }
     }
 }
 

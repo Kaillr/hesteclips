@@ -535,7 +535,7 @@ impl App {
         }
         // What a recording would be: same picture, size and frame rate.
         let webcam = self.webcam_source();
-        let wanted = (self.video_source(), self.settings.resolution.height(), self.settings.fps, webcam.as_ref().map(|w| w.device.clone()));
+        let wanted = (self.video_source(), self.settings.resolution.height(), self.settings.fps, webcam.clone());
         // A changed app list reaches the running preview without a restart.
         if let Some((have, preview)) = &mut self.video_preview {
             if *have != wanted && (&have.1, have.2, &have.3) == (&wanted.1, wanted.2, &wanted.3) && preview.update(&wanted.0) {

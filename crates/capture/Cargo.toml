@@ -43,6 +43,7 @@ windows = { version = "0.62", features = [
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
     "Win32_Media_Audio",
+    "Win32_Media_DirectShow",
     "Win32_Media_KernelStreaming",
     "Win32_Media_MediaFoundation",
     "Win32_Media_Multimedia",
@@ -63,3 +64,4 @@ windows = { version = "0.62", features = [
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+

@@ -37,7 +37,7 @@ use anyhow::{Context, Result, bail};
 
 pub(crate) use loopback::SystemAudio;
 pub(crate) use system::host_now;
-pub use camera::list_cameras;
+pub use camera::{list_cameras, open_camera_settings};
 pub use system::{list_apps, list_screens, list_windowed_apps};
 
 use crate::mixer::{self, Clock, LiveAudio};
@@ -265,7 +265,7 @@ impl Session {
             session.video = Some(picture.video);
             // A webcam that can't open doesn't stop the recording: its status
             // says why, and the picture goes on without it.
-            session.camera = s.webcam.as_ref().and_then(|w| match camera::Camera::open(&gpu, &w.device) {
+            session.camera = s.webcam.as_ref().and_then(|w| match camera::Camera::open(&gpu, &w.device, w.format) {
                 Ok(c) => Some(c),
                 Err(e) => {
                     eprintln!("webcam: {e:#}");
@@ -448,7 +448,7 @@ impl PreviewCapture {
                 }
                 let picture = source.open(&gpu, w, h, fps, away)?;
                 let (width, height) = output_size(w, h, target_height);
-                let cam = webcam.as_ref().and_then(|wc| camera::Camera::open(&gpu, &wc.device).ok());
+                let cam = webcam.as_ref().and_then(|wc| camera::Camera::open(&gpu, &wc.device, wc.format).ok());
                 let overlay = cam.as_ref().zip(webcam.as_ref()).map(|(c, wc)| (&c.latest, wc.placement.clone()));
                 let preview = d3d::Previewer::new(&gpu, &picture.latest, overlay, width, height, fps, generation)?;
                 Ok((picture, preview, cam))

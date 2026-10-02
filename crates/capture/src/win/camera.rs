@@ -66,10 +66,10 @@ pub(crate) struct Camera {
 impl Camera {
     /// Open camera `device` (a symbolic link) and start delivering frames.
     /// Returns once its format is settled (the texture's size depends on it).
-    pub(crate) fn open(gpu: &Gpu, device: &str) -> Result<Self> {
+    pub(crate) fn open(gpu: &Gpu, device: &str, format: Option<crate::webcam::Format>) -> Result<Self> {
         set_status(Status::Opening);
         let opened = (|| {
-            let (reader, width, height) = open_reader(device)?;
+            let (reader, width, height) = open_reader(device, format)?;
             let latest = Latest::new(gpu, width, height)?;
             Ok::<_, anyhow::Error>((reader, latest, width, height))
         })();
@@ -121,8 +121,9 @@ impl Drop for Camera {
     }
 }
 
-/// A source reader for `device` delivering BGRA at the format we chose.
-fn open_reader(device: &str) -> Result<(IMFSourceReader, u32, u32)> {
+/// A source reader for `device` delivering BGRA, in `format` if the camera
+/// offers it, else the best one. Also publishes the formats it offers.
+fn open_reader(device: &str, format: Option<crate::webcam::Format>) -> Result<(IMFSourceReader, u32, u32)> {
     com_init();
     super::system::mf_startup()?;
     let activate = devices()
@@ -138,9 +139,9 @@ fn open_reader(device: &str) -> Result<(IMFSourceReader, u32, u32)> {
         attrs.SetUINT32(&MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, 1)?;
         let reader = MFCreateSourceReaderFromMediaSource(&source, &attrs)?;
 
-        // The camera's own format: the biggest picture up to 1080p that does at
-        // least 30 fps (choosing one yourself comes later).
-        let mut best: Option<(u64, u32, IMFMediaType, u32, u32)> = None;
+        // Every format the camera offers. Without a choice (or if the chosen one
+        // is gone), the biggest picture up to 1080p that does at least 30 fps.
+        let mut offered: Vec<(crate::webcam::Format, IMFMediaType)> = Vec::new();
         for i in 0.. {
             let t = match reader.GetNativeMediaType(STREAM, i) {
                 Ok(t) => t,
@@ -148,22 +149,34 @@ fn open_reader(device: &str) -> Result<(IMFSourceReader, u32, u32)> {
                 Err(e) => return Err(e.into()),
             };
             let size = t.GetUINT64(&MF_MT_FRAME_SIZE).unwrap_or(0);
-            let (w, h) = ((size >> 32) as u32, size as u32);
             let rate = t.GetUINT64(&MF_MT_FRAME_RATE).unwrap_or(0);
-            let fps = if rate as u32 == 0 { 0 } else { ((rate >> 32) as u32) / (rate as u32) };
-            if w == 0 || h == 0 || w * h > 1920 * 1080 {
-                continue;
-            }
-            let area = w as u64 * h as u64;
-            let good = fps >= 30;
-            // Good beats bad, then bigger, then faster.
-            let key = (good as u64) << 62 | area << 16 | fps.min(0xFFFF) as u64;
-            if best.as_ref().is_none_or(|b| key > b.0) {
-                best = Some((key, fps, t, w, h));
+            let f = crate::webcam::Format {
+                width: (size >> 32) as u32,
+                height: size as u32,
+                fps_num: (rate >> 32) as u32,
+                fps_den: (rate as u32).max(1),
+            };
+            if f.width > 0 && f.height > 0 && f.fps_num > 0 {
+                offered.push((f, t));
             }
         }
-        let (_, _, native, width, height) = best.context("the camera offers no usable format")?;
-        reader.SetCurrentMediaType(STREAM, None, &native)?;
+        let mut list: Vec<crate::webcam::Format> = offered.iter().map(|(f, _)| *f).collect();
+        list.sort_by(|a, b| (b.width * b.height, b.fps()).partial_cmp(&(a.width * a.height, a.fps())).unwrap());
+        // The same size and rate comes once per pixel format (MJPEG, YUY2, NV12),
+        // sometimes as a different fraction (30/1, 10000000/333333): one entry
+        // per thing you'd tell apart.
+        list.dedup_by(|a, b| a.label() == b.label());
+        crate::webcam::set_formats(device, list);
+        let auto_key = |f: &crate::webcam::Format| {
+            let fits = f.width * f.height <= 1920 * 1080;
+            (fits && f.fps() >= 29.5, fits, f.width * f.height, (f.fps() * 100.0) as u32)
+        };
+        let chosen = format
+            .and_then(|want| offered.iter().find(|(f, _)| *f == want).or_else(|| offered.iter().find(|(f, _)| f.label() == want.label())))
+            .or_else(|| offered.iter().max_by_key(|(f, _)| auto_key(f)));
+        let (chosen, native) = chosen.context("the camera offers no usable format")?;
+        let (width, height) = (chosen.width, chosen.height);
+        reader.SetCurrentMediaType(STREAM, None, native)?;
 
         let out = MFCreateMediaType()?;
         out.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
@@ -215,4 +228,77 @@ fn upload(sample: &IMFSample, latest: &Latest, width: u32, height: u32, rows: &m
         }
     }
     Ok(())
+}
+
+/// The camera's own settings window, through its DirectShow filter's property
+/// pages (what OBS's "Configure Video" opens). Runs on its own thread, which
+/// the window's message loop needs to itself.
+pub fn open_camera_settings(device: String, name: String) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Media::DirectShow::{IBaseFilter, ICreateDevEnum};
+    use windows::Win32::System::Com::StructuredStorage::IPropertyBag;
+    use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, IMoniker};
+    use windows::Win32::System::Ole::{ISpecifyPropertyPages, OleCreatePropertyFrame};
+    use windows::Win32::System::Variant::VARIANT;
+    use windows::core::{HSTRING, IUnknown, w};
+
+    thread::spawn(move || {
+        // Property pages are windows: this thread is a single-threaded apartment.
+        let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        let result = (|| -> Result<()> {
+            unsafe {
+                let devices: ICreateDevEnum = CoCreateInstance(&CLSID_SystemDeviceEnum, None, CLSCTX_INPROC_SERVER)?;
+                let mut monikers = None;
+                devices.CreateClassEnumerator(&CLSID_VideoInputDeviceCategory, &mut monikers, 0)?;
+                let monikers = monikers.context("no cameras")?;
+                let read = |bag: &IPropertyBag, key: windows::core::PCWSTR| -> Option<String> {
+                    let mut v = VARIANT::default();
+                    bag.Read(key, &mut v, None).ok()?;
+                    Some((*v.Anonymous.Anonymous).Anonymous.bstrVal.to_string())
+                };
+                // The camera whose device path is our id (or, failing that, its name).
+                let mut by_name = None;
+                let mut found = None;
+                loop {
+                    let mut one = [None];
+                    if monikers.Next(&mut one, None).is_err() {
+                        break;
+                    }
+                    let Some(moniker): Option<IMoniker> = one[0].take() else { break };
+                    let Ok(bag) = moniker.BindToStorage::<_, _, IPropertyBag>(None, None) else { continue };
+                    if read(&bag, w!("DevicePath")).is_some_and(|p| p.eq_ignore_ascii_case(&device)) {
+                        found = Some(moniker);
+                        break;
+                    }
+                    if by_name.is_none() && read(&bag, w!("FriendlyName")).as_deref() == Some(name.as_str()) {
+                        by_name = Some(moniker);
+                    }
+                }
+                let moniker = found.or(by_name).context("the camera isn't connected")?;
+                let filter: IBaseFilter = moniker.BindToObject(None, None)?;
+                let pages: ISpecifyPropertyPages = filter.cast().context("this camera has no settings window")?;
+                let list = pages.GetPages()?;
+                let unknown: Option<IUnknown> = Some(filter.cast()?);
+                let shown = OleCreatePropertyFrame(
+                    HWND::default(),
+                    0,
+                    0,
+                    &HSTRING::from(name.as_str()),
+                    1,
+                    &unknown,
+                    list.cElems,
+                    list.pElems,
+                    0,
+                    None,
+                    None,
+                );
+                CoTaskMemFree(Some(list.pElems as *const _));
+                shown?;
+            }
+            Ok(())
+        })();
+        if let Err(e) = result {
+            eprintln!("camera settings: {e:#}");
+        }
+    });
 }

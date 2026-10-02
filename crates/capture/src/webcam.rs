@@ -23,8 +23,12 @@ pub struct Placement {
     pub w: f32,
     pub h: f32,
     /// How much of the camera's picture is cut off at each side: left, top,
-    /// right, bottom, as fractions of its width or height.
+    /// right, bottom, as fractions of its width or height (the camera's own
+    /// sides, before any flip).
     pub crop: [f32; 4],
+    /// Mirrored left to right, and upside down.
+    pub flip_h: bool,
+    pub flip_v: bool,
 }
 
 impl Placement {
@@ -35,25 +39,78 @@ impl Placement {
         let h = w * frame_aspect / camera_aspect;
         let margin_x = 0.02;
         let margin_y = margin_x * frame_aspect;
-        Self { x: 1.0 - w - margin_x, y: 1.0 - h - margin_y, w, h, crop: [0.0; 4] }
+        Self { x: 1.0 - w - margin_x, y: 1.0 - h - margin_y, w, h, crop: [0.0; 4], flip_h: false, flip_v: false }
     }
 }
 
 /// Placement shared between the app and a running capture.
 pub type SharedPlacement = Arc<Mutex<Placement>>;
 
+/// A picture size and rate a camera can deliver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Format {
+    pub width: u32,
+    pub height: u32,
+    /// Frames per second, as a ratio (29.97 is 30000/1001).
+    pub fps_num: u32,
+    pub fps_den: u32,
+}
+
+impl Format {
+    pub fn fps(&self) -> f32 {
+        self.fps_num as f32 / self.fps_den.max(1) as f32
+    }
+
+    /// "1920×1080 · 30 fps".
+    pub fn label(&self) -> String {
+        let fps = self.fps();
+        let fps = if (fps - fps.round()).abs() < 0.05 { format!("{}", fps.round()) } else { format!("{fps:.2}") };
+        format!("{}×{} · {fps} fps", self.width, self.height)
+    }
+}
+
 /// A webcam to draw over the recording.
 #[derive(Debug, Clone)]
 pub struct Webcam {
     /// Backend id from [`list_cameras`].
     pub device: String,
+    /// The format to open it in, or `None` for the best one (the biggest up to
+    /// 1080p that does at least 30 fps).
+    pub format: Option<Format>,
     pub placement: SharedPlacement,
 }
 
 impl PartialEq for Webcam {
-    /// Same camera; where it sits changes live and doesn't count.
+    /// Same camera in the same format; where it sits changes live and doesn't count.
     fn eq(&self, other: &Self) -> bool {
-        self.device == other.device
+        self.device == other.device && self.format == other.format
+    }
+}
+
+static FORMATS: Mutex<Option<(String, Vec<Format>)>> = Mutex::new(None);
+
+/// The formats camera `device` offers, biggest first — known once it has
+/// been opened (the preview opens it).
+pub fn formats(device: &str) -> Vec<Format> {
+    FORMATS.lock().unwrap().as_ref().filter(|(d, _)| d == device).map(|(_, f)| f.clone()).unwrap_or_default()
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) fn set_formats(device: &str, formats: Vec<Format>) {
+    *FORMATS.lock().unwrap() = Some((device.to_owned(), formats));
+}
+
+/// Open the camera's own settings window (exposure, focus, white balance…, as
+/// its driver offers them). Changes apply to the camera straight away, in
+/// every app. Returns at once; the window runs by itself.
+pub fn open_settings(device: &str, name: &str) {
+    #[cfg(target_os = "windows")]
+    {
+        crate::win::open_camera_settings(device.to_owned(), name.to_owned());
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (device, name);
     }
 }
 

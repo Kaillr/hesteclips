@@ -441,8 +441,11 @@ impl Layer {
 
     /// Draw `source_rect` of the picture into `dest` of target `slot`, leaving
     /// the rest of the target as it is (only `target` is written).
-    fn draw(&self, video: &ID3D11VideoContext, slot: usize, source_rect: RECT, dest: RECT, target: RECT) -> windows::core::Result<()> {
+    fn draw(&self, video: &ID3D11VideoContext, slot: usize, source_rect: RECT, dest: RECT, target: RECT, mirror: (bool, bool)) -> windows::core::Result<()> {
         unsafe {
+            if let Ok(video1) = video.cast::<ID3D11VideoContext1>() {
+                video1.VideoProcessorSetStreamMirror(&self.processor, 0, mirror.0 || mirror.1, mirror.0, mirror.1);
+            }
             video.VideoProcessorSetOutputTargetRect(&self.processor, true, Some(&target));
             video.VideoProcessorSetStreamSourceRect(&self.processor, 0, true, Some(&source_rect));
             video.VideoProcessorSetStreamDestRect(&self.processor, 0, true, Some(&dest));
@@ -496,13 +499,13 @@ impl Converter {
         let (x, y, w, h) = fit(cw, ch, self.width, self.height);
         let dest = RECT { left: x as i32, top: y as i32, right: (x + w) as i32, bottom: (y + h) as i32 };
         let full = RECT { left: 0, top: 0, right: self.width as i32, bottom: self.height as i32 };
-        let result = self.base.draw(&self.video, slot, source, dest, full).context("couldn't convert a screen frame");
+        let result = self.base.draw(&self.video, slot, source, dest, full, (false, false)).context("couldn't convert a screen frame");
         if result.is_ok() {
             if let Some((layer, placement)) = &self.overlay {
                 if layer.source.has_frame() {
                     let p = *placement.lock().unwrap();
                     if let Some((source, dest)) = overlay_rects(p, layer.source.content(), self.width, self.height) {
-                        if let Err(e) = layer.draw(&self.video, slot, source, dest, dest) {
+                        if let Err(e) = layer.draw(&self.video, slot, source, dest, dest, (p.flip_h, p.flip_v)) {
                             eprintln!("couldn't draw the webcam: {e}");
                         }
                     }
@@ -516,38 +519,28 @@ impl Converter {
 
 /// Where the webcam's picture comes from and goes, in pixels, for a frame of
 /// `width`×`height`: its crop, and its box clipped to the frame (cutting the
-/// same share off the picture). None if nothing of it is in the frame.
+/// same share off the picture — from the other side when it's flipped, as the
+/// mirror is applied after). None if nothing of it is in the frame.
 fn overlay_rects(p: crate::webcam::Placement, (cw, ch): (u32, u32), width: u32, height: u32) -> Option<(RECT, RECT)> {
     let (fw, fh) = (width as f32, height as f32);
-    // The cropped picture, in camera pixels.
+    // One axis: the visible part of the box [d0, d1] within [0, size], and the
+    // matching part of the cropped picture [s0, s1].
+    let axis = |d0: f32, d1: f32, size: f32, s0: f32, s1: f32, flip: bool| -> Option<(f32, f32, f32, f32)> {
+        if d1 - d0 < 1.0 || s1 - s0 < 1.0 {
+            return None;
+        }
+        let (v0, v1) = (d0.max(0.0), d1.min(size));
+        if v1 - v0 < 1.0 {
+            return None;
+        }
+        let (t0, t1) = ((v0 - d0) / (d1 - d0), (v1 - d0) / (d1 - d0));
+        let span = s1 - s0;
+        let (a, b) = if flip { (s1 - t1 * span, s1 - t0 * span) } else { (s0 + t0 * span, s0 + t1 * span) };
+        Some((v0, v1, a, b))
+    };
     let [cl, ct, cr, cb] = p.crop;
-    let (mut sx0, mut sy0) = (cl * cw as f32, ct * ch as f32);
-    let (mut sx1, mut sy1) = ((1.0 - cr) * cw as f32, (1.0 - cb) * ch as f32);
-    // Its box, in frame pixels.
-    let (mut dx0, mut dy0) = (p.x * fw, p.y * fh);
-    let (mut dx1, mut dy1) = ((p.x + p.w) * fw, (p.y + p.h) * fh);
-    if sx1 - sx0 < 1.0 || sy1 - sy0 < 1.0 || dx1 - dx0 < 1.0 || dy1 - dy0 < 1.0 {
-        return None;
-    }
-    // Clip to the frame, taking the same share off the picture.
-    let sx = (sx1 - sx0) / (dx1 - dx0);
-    let sy = (sy1 - sy0) / (dy1 - dy0);
-    if dx0 < 0.0 {
-        sx0 -= dx0 * sx;
-        dx0 = 0.0;
-    }
-    if dy0 < 0.0 {
-        sy0 -= dy0 * sy;
-        dy0 = 0.0;
-    }
-    if dx1 > fw {
-        sx1 -= (dx1 - fw) * sx;
-        dx1 = fw;
-    }
-    if dy1 > fh {
-        sy1 -= (dy1 - fh) * sy;
-        dy1 = fh;
-    }
+    let (dx0, dx1, sx0, sx1) = axis(p.x * fw, (p.x + p.w) * fw, fw, cl * cw as f32, (1.0 - cr) * cw as f32, p.flip_h)?;
+    let (dy0, dy1, sy0, sy1) = axis(p.y * fh, (p.y + p.h) * fh, fh, ct * ch as f32, (1.0 - cb) * ch as f32, p.flip_v)?;
     let r = |a: f32, b: f32, c: f32, d: f32| RECT { left: a.round() as i32, top: b.round() as i32, right: c.round() as i32, bottom: d.round() as i32 };
     let (source, dest) = (r(sx0, sy0, sx1, sy1), r(dx0, dy0, dx1, dy1));
     (dest.right - dest.left >= 2 && dest.bottom - dest.top >= 2 && source.right > source.left && source.bottom > source.top).then_some((source, dest))
@@ -721,7 +714,7 @@ mod overlay_tests {
 
     #[test]
     fn webcam_box_in_frame() {
-        let p = Placement { x: 0.75, y: 0.5, w: 0.25, h: 0.25, crop: [0.0; 4] };
+        let p = Placement { x: 0.75, y: 0.5, w: 0.25, h: 0.25, crop: [0.0; 4], flip_h: false, flip_v: false };
         let (s, d) = overlay_rects(p, (1280, 720), 1920, 1080).unwrap();
         assert_eq!((s.left, s.top, s.right, s.bottom), (0, 0, 1280, 720));
         assert_eq!((d.left, d.top, d.right, d.bottom), (1440, 540, 1920, 810));
@@ -730,11 +723,15 @@ mod overlay_tests {
     #[test]
     fn crop_and_clip_take_the_same_share() {
         // Half off the right edge, with the left quarter of the camera cropped.
-        let p = Placement { x: 0.875, y: 0.0, w: 0.25, h: 0.25, crop: [0.25, 0.0, 0.0, 0.0] };
+        let p = Placement { x: 0.875, y: 0.0, w: 0.25, h: 0.25, crop: [0.25, 0.0, 0.0, 0.0], flip_h: false, flip_v: false };
         let (s, d) = overlay_rects(p, (1280, 720), 1920, 1080).unwrap();
         assert_eq!((d.left, d.right), (1680, 1920));
         // Visible camera is 320..1280; half of it shows.
         assert_eq!((s.left, s.right), (320, 800));
         assert!(overlay_rects(Placement { x: 1.2, ..p }, (1280, 720), 1920, 1080).is_none());
+        // Flipped, the frame's right edge cuts the camera's left side instead:
+        // the visible half is the crop's left half, 320..800 → mirrored → 800..1280.
+        let (s, _) = overlay_rects(Placement { flip_h: true, ..p }, (1280, 720), 1920, 1080).unwrap();
+        assert_eq!((s.left, s.right), (800, 1280));
     }
 }
