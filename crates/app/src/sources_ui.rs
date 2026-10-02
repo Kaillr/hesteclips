@@ -360,7 +360,9 @@ fn source_card(
                 .show_value(false)
                 .clamping(egui::SliderClamping::Always);
             let r = ui.add(slider).on_hover_text("Volume (gain). Double-click to reset to 0 dB.");
-            if r.double_clicked() {
+            // A slider only senses drags, so it never reports a double-click itself.
+            let double = ui.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary));
+            if double && r.hovered() {
                 source.volume_db = 0.0;
             }
             // Type an exact value: drag or double-click the number.
