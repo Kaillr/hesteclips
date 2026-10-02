@@ -12,6 +12,7 @@ mod cloud;
 mod cloud_ui;
 mod editor;
 mod library;
+mod meter;
 mod player;
 mod proxy;
 mod service;
@@ -40,9 +41,14 @@ fn main() -> eframe::Result<()> {
         std::process::exit(0);
     });
 
+    // Dev aid: `HESTECLIPS_WINDOW=WxH` opens at that size, to check layouts.
+    let size = std::env::var("HESTECLIPS_WINDOW")
+        .ok()
+        .and_then(|s| s.split_once('x').and_then(|(w, h)| Some([w.parse().ok()?, h.parse().ok()?])))
+        .unwrap_or([1040.0, 700.0]);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1040.0, 700.0])
+            .with_inner_size(size)
             .with_min_inner_size([560.0, 420.0])
             .with_title("HesteClips")
             .with_icon(app_icon()),

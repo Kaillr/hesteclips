@@ -9,68 +9,37 @@
 use std::time::{Duration, Instant};
 
 use capture::mixer::{Channel, SourceStatus};
-use egui::{Color32, Rect, RichText, Sense, Stroke, vec2};
+use egui::{Color32, RichText, Sense, vec2};
 
 use crate::App;
+use crate::meter::{self, MeterState};
 use crate::settings::{AudioSourceCfg, SourceKind};
 
 /// Fader range in dB.
 const FADER_MIN_DB: f32 = -60.0;
 const FADER_MAX_DB: f32 = 12.0;
-/// Meter range in dBFS.
-const METER_FLOOR_DB: f32 = -60.0;
-/// How long a peak marker / clip warning stays lit.
-const PEAK_HOLD: Duration = Duration::from_millis(1500);
-/// What `to_db` reports for silence.
-const SILENCE_DB: f32 = -120.0;
-const CLIP_HOLD: Duration = Duration::from_secs(3);
+/// How long the "limiting" note stays after the limiter last worked.
+const LIMIT_HOLD: Duration = Duration::from_secs(3);
+/// Below this content width, a source's controls stack under its meter.
+const NARROW: f32 = 620.0;
+/// The page's content column never gets wider than this.
+const MAX_WIDTH: f32 = 880.0;
 
-const METER_GREEN: Color32 = Color32::from_rgb(70, 190, 110);
-const METER_YELLOW: Color32 = Color32::from_rgb(230, 190, 60);
-const METER_RED: Color32 = Color32::from_rgb(230, 70, 60);
-
-/// Smoothed meter state for one source (or the mix), kept between frames.
-#[derive(Clone)]
-pub(crate) struct MeterView {
-    /// Displayed level (dB), falling smoothly.
-    level_db: f32,
-    peak_db: f32,
-    peak_at: Option<Instant>,
-    clipped_at: Option<Instant>,
-}
-
-impl Default for MeterView {
-    /// Silent. (A derived default would be 0 dB: a full meter that takes seconds
-    /// to fall.)
-    fn default() -> Self {
-        Self { level_db: SILENCE_DB, peak_db: SILENCE_DB, peak_at: None, clipped_at: None }
-    }
-}
-
-impl MeterView {
-    fn update(&mut self, peak: f32, now: Instant, dt: f32) {
-        let db = to_db(peak);
-        // Instant rise, ~20 dB/s fall: readable without hiding transients.
-        self.level_db = if db > self.level_db { db } else { (self.level_db - 20.0 * dt).max(db) };
-        if db >= self.peak_db || self.peak_at.is_none_or(|t| now - t > PEAK_HOLD) {
-            self.peak_db = db;
-            self.peak_at = Some(now);
-        }
-        if peak >= 0.999 {
-            self.clipped_at = Some(now);
-        }
-    }
-
-    fn clipping(&self, now: Instant) -> bool {
-        self.clipped_at.is_some_and(|t| now - t < CLIP_HOLD)
-    }
+/// Meters for one source: what it delivers (before volume) and what goes into
+/// the clip (after volume and mute).
+#[derive(Default, Clone)]
+struct SourceMeters {
+    input: MeterState,
+    output: MeterState,
 }
 
 /// UI state for the Sources page.
 #[derive(Default)]
 pub(crate) struct SourcesView {
-    meters: std::collections::HashMap<String, MeterView>,
-    master: MeterView,
+    meters: std::collections::HashMap<String, SourceMeters>,
+    master: MeterState,
+    /// Limiter gain reduction shown, dB (falls smoothly), and when it last worked.
+    reduction_db: f32,
     limiting_at: Option<Instant>,
     last_frame: Option<Instant>,
     /// Running apps for the "Add app" menu, refreshed when it opens.
@@ -86,79 +55,102 @@ impl App {
         // (meters keep collecting while a recording runs).
         if self.sources_view.last_frame.is_none_or(|t| now - t > Duration::from_millis(500)) {
             self.sources_view.meters.clear();
-            self.sources_view.master = MeterView::default();
+            self.sources_view.master = MeterState::default();
             for s in &self.settings.audio_sources {
-                self.live_audio.channel(&s.id).meter.take();
+                let ch = self.live_audio.channel(&s.id);
+                ch.meter.take();
+                ch.input.take();
             }
             self.live_audio.master.take();
+            self.live_audio.take_reduction_db();
         }
         let dt = self.sources_view.last_frame.map_or(0.0, |t| (now - t).as_secs_f32()).min(0.2);
         self.sources_view.last_frame = Some(now);
         // Meters move: keep repainting while this page is open.
-        ui.ctx().request_repaint_after(Duration::from_millis(33));
+        ui.ctx().request_repaint_after(Duration::from_millis(16));
 
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            ui.set_max_width(760.0);
-            ui.add_space(12.0);
-            ui.label(RichText::new("Audio").size(16.0).strong());
-            ui.weak("Set levels here before you play; the meters are live.");
-            ui.add_space(8.0);
-
-            let mut remove = None;
-            let mut move_up = None;
-            let n = self.settings.audio_sources.len();
-            for i in 0..n {
-                let channel = self.live_audio.channel(&self.settings.audio_sources[i].id);
-                let (peak, _) = channel.meter.take();
-                let id = self.settings.audio_sources[i].id.clone();
-                let view = self.sources_view.meters.entry(id).or_default();
-                view.update(peak, now, dt);
-                let view = view.clone();
-                let has_app_sources = self.settings.audio_sources.iter().any(|s| matches!(s.kind, SourceKind::App { .. }));
-                let action = source_card(
-                    ui,
-                    &mut self.settings.audio_sources[i],
-                    &channel,
-                    &view,
-                    now,
-                    &self.audio,
-                    has_app_sources,
-                    &mut self.sources_view.renaming,
-                );
-                match action {
-                    CardAction::Remove => remove = Some(i),
-                    CardAction::MoveUp if i > 0 => move_up = Some(i),
-                    _ => {}
-                }
-                // Volume applies live, even mid-recording.
-                let s = &self.settings.audio_sources[i];
-                channel.set_volume(from_db(s.volume_db), s.muted);
-                ui.add_space(6.0);
-            }
-            if let Some(i) = remove {
-                self.settings.audio_sources.remove(i);
-            }
-            if let Some(i) = move_up {
-                self.settings.audio_sources.swap(i, i - 1);
-            }
-
-            ui.add_space(4.0);
-            self.add_source_buttons(ui);
-
-            ui.add_space(16.0);
-            self.master_meter(ui, now, dt);
-
-            if self.rec_state != crate::RecState::Idle {
-                ui.add_space(10.0);
-                ui.weak("Volume changes apply right away. Adding or removing sources applies the next time you start the buffer or a recording.");
-            }
+            // Centred column that follows the window, up to a comfortable width.
+            let width = ui.available_width().min(MAX_WIDTH);
+            let pad = ((ui.available_width() - width) / 2.0).max(0.0);
+            ui.horizontal(|ui| {
+                ui.add_space(pad);
+                ui.vertical(|ui| {
+                    ui.set_width(width);
+                    self.sources_column(ui, now, dt);
+                });
+            });
         });
         self.live_audio.set_limiter(self.settings.limiter);
     }
 
-    fn add_source_buttons(&mut self, ui: &mut egui::Ui) {
+    fn sources_column(&mut self, ui: &mut egui::Ui, now: Instant, dt: f32) {
+        ui.add_space(12.0);
+        // The mix first: it's what people hear, and where clipping matters most.
+        self.master_strip(ui, now, dt);
+        ui.add_space(18.0);
+
         ui.horizontal(|ui| {
-            if ui.button("➕ Microphone").clicked() {
+            ui.label(RichText::new("Sources").size(16.0).strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("⟳ Refresh devices").on_hover_text("Look again for microphones you've plugged in.").clicked() {
+                    self.refresh_audio_devices();
+                }
+            });
+        });
+        ui.weak("Aim for speech peaking around -12 dB and staying out of the red.");
+        ui.add_space(8.0);
+
+        let mut remove = None;
+        let mut move_up = None;
+        let n = self.settings.audio_sources.len();
+        let has_app_sources = self.settings.audio_sources.iter().any(|s| matches!(s.kind, SourceKind::App { .. }));
+        for i in 0..n {
+            let channel = self.live_audio.channel(&self.settings.audio_sources[i].id);
+            let id = self.settings.audio_sources[i].id.clone();
+            let meters = self.sources_view.meters.entry(id).or_default();
+            meters.input.update(channel.input.take(), now, dt);
+            meters.output.update(channel.meter.take(), now, dt);
+            let action = source_card(
+                ui,
+                &mut self.settings.audio_sources[i],
+                &channel,
+                meters,
+                &self.audio,
+                has_app_sources,
+                &mut self.sources_view.renaming,
+            );
+            match action {
+                CardAction::Remove => remove = Some(i),
+                CardAction::MoveUp if i > 0 => move_up = Some(i),
+                _ => {}
+            }
+            // Volume applies live, even mid-recording.
+            let s = &self.settings.audio_sources[i];
+            channel.set_volume(from_db(s.volume_db), s.muted);
+            ui.add_space(8.0);
+        }
+        if let Some(i) = remove {
+            self.settings.audio_sources.remove(i);
+        }
+        if let Some(i) = move_up {
+            self.settings.audio_sources.swap(i, i - 1);
+        }
+
+        self.add_source_buttons(ui);
+
+        if self.rec_state != crate::RecState::Idle {
+            ui.add_space(10.0);
+            ui.weak("Volume changes apply right away. Adding or removing sources applies the next time you start the buffer or a recording.");
+        }
+        ui.add_space(16.0);
+    }
+
+    fn add_source_buttons(&mut self, ui: &mut egui::Ui) {
+        // Wraps onto two lines in a narrow window.
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Add").strong());
+            if ui.button("🎤 Microphone").clicked() {
                 let n = self.settings.audio_sources.iter().filter(|s| matches!(s.kind, SourceKind::Microphone { .. })).count();
                 let name = if n == 0 { "Microphone".to_owned() } else { format!("Microphone {}", n + 1) };
                 self.settings.audio_sources.push(AudioSourceCfg::new(
@@ -166,7 +158,7 @@ impl App {
                     SourceKind::Microphone { device: capture::audio::DEFAULT_DEVICE.into() },
                 ));
             }
-            let menu = ui.menu_button("➕ App", |ui| {
+            let menu = ui.menu_button("🎮 App", |ui| {
                 ui.set_min_width(240.0);
                 ui.weak("Record one app on its own — a game, Discord, music.");
                 ui.separator();
@@ -199,47 +191,61 @@ impl App {
                 self.sources_view.apps = list_apps();
             }
             let has_desktop = self.settings.audio_sources.iter().any(|s| matches!(s.kind, SourceKind::Desktop { .. }));
-            if !has_desktop && ui.button("➕ Desktop sound").clicked() {
+            if !has_desktop && ui.button("🖥 Desktop sound").clicked() {
                 self.settings
                     .audio_sources
                     .push(AudioSourceCfg::new("Desktop", SourceKind::Desktop { exclude_apps: true }));
             }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("⟳ Refresh devices").clicked() {
-                    self.refresh_audio_devices();
-                }
-            });
         });
     }
 
-    fn master_meter(&mut self, ui: &mut egui::Ui, now: Instant, dt: f32) {
-        let (peak, _) = self.live_audio.master.take();
-        self.sources_view.master.update(peak, now, dt);
-        if self.live_audio.take_reduction_db() > 0.5 {
-            self.sources_view.limiting_at = Some(now);
+    /// The clip's mix: a big stereo meter with scale, peak readout, clip light,
+    /// and the limiter with its gain-reduction meter.
+    fn master_strip(&mut self, ui: &mut egui::Ui, now: Instant, dt: f32) {
+        let view = &mut self.sources_view;
+        view.master.update(self.live_audio.master.take(), now, dt);
+        let reduction = self.live_audio.take_reduction_db();
+        view.reduction_db = if reduction > view.reduction_db { reduction } else { (view.reduction_db - 12.0 * dt).max(reduction) };
+        if reduction > 0.5 {
+            view.limiting_at = Some(now);
         }
-        let limiting = self.sources_view.limiting_at.is_some_and(|t| now - t < CLIP_HOLD);
-        let view = self.sources_view.master.clone();
+        let limiting = self.settings.limiter && view.limiting_at.is_some_and(|t| now - t < LIMIT_HOLD);
         card(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("🔊 Clip audio").size(15.0).strong())
-                    .on_hover_text("Everything marked \"In the clip\", mixed — what people hear when you share a clip.");
+                ui.label(RichText::new("🔊 Clip mix").size(16.0).strong())
+                    .on_hover_text("Every source marked \"In the clip\", mixed: what people hear when you share a clip.");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.checkbox(&mut self.settings.limiter, "Prevent clipping")
-                        .on_hover_text("Turns the mix down for a moment when sources add up too loud, instead of distorting.");
+                    meter::fixed_label(ui, 64.0, &format!("{} dB", view.master.readout()), view.master.readout_color(ui.visuals()), "Highest peak in the last 3 seconds (dBFS)");
+                    ui.weak("Peak");
                 });
             });
-            meter(ui, &view, now, true);
-            let hint = if view.clipping(now) {
-                Some((METER_RED, "Too loud — turn some sources down."))
-            } else if limiting {
-                Some((METER_YELLOW, "Loud peaks are being held back. Turn sources down a little for the cleanest sound."))
-            } else {
-                None
-            };
-            if let Some((color, text)) = hint {
-                ui.colored_label(color, text);
+            ui.add_space(4.0);
+            let style = meter::Style { bar_h: 12.0, gap: 3.0, scale: true, dimmed: false };
+            if meter::stereo(ui, egui::Id::new("master_meter"), &view.master, &style) {
+                view.master.reset_clip();
             }
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.checkbox(&mut self.settings.limiter, "Limiter")
+                    .on_hover_text("Turns the mix down for a moment when sources add up too loud, instead of distorting. Ceiling -1 dBFS.");
+                if self.settings.limiter {
+                    meter::reduction(ui, view.reduction_db, 90.0)
+                        .on_hover_text("How much the limiter is turning the mix down right now (0–12 dB).");
+                    let gr = if view.reduction_db >= 0.1 { format!("-{:.1} dB", view.reduction_db) } else { "0.0 dB".to_owned() };
+                    ui.label(RichText::new(gr).monospace().size(12.0));
+                }
+                let note = if view.master.clipped() {
+                    Some((meter::RED, "Clipped: turn some sources down."))
+                } else if limiting {
+                    Some((meter::YELLOW, "Limiting: turn sources down a little for the cleanest sound."))
+                } else {
+                    None
+                };
+                if let Some((color, text)) = note {
+                    ui.add_space(8.0);
+                    ui.colored_label(color, text);
+                }
+            });
         });
     }
 
@@ -270,106 +276,151 @@ enum CardAction {
     MoveUp,
 }
 
-#[allow(clippy::too_many_arguments)]
 fn source_card(
     ui: &mut egui::Ui,
     source: &mut AudioSourceCfg,
     channel: &Channel,
-    view: &MeterView,
-    now: Instant,
+    meters: &mut SourceMeters,
     devices: &capture::audio::AudioDevices,
     has_app_sources: bool,
     renaming: &mut Option<String>,
 ) -> CardAction {
     let mut action = CardAction::None;
     card(ui, |ui| {
-        {
-            // --- Header: on/off, name, what it captures, status, menu ---
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut source.enabled, "").on_hover_text(if source.enabled { "Turn off" } else { "Turn on" });
-                if renaming.as_deref() == Some(source.id.as_str()) {
-                    let r = ui.add(egui::TextEdit::singleline(&mut source.name).desired_width(180.0));
-                    r.request_focus();
-                    if r.lost_focus() {
-                        *renaming = None;
-                    }
-                } else {
-                    let r = ui.add(egui::Label::new(RichText::new(format!("{} {}", source.icon(), source.name)).size(15.0).strong()).sense(Sense::click()));
-                    if r.on_hover_text("Double-click to rename").double_clicked() {
-                        *renaming = Some(source.id.clone());
-                    }
+        let narrow = ui.available_width() < NARROW;
+        // --- Header: on/off, name, status · what it captures, menu ---
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut source.enabled, "").on_hover_text(if source.enabled { "Turn off" } else { "Turn on" });
+            if renaming.as_deref() == Some(source.id.as_str()) {
+                let r = ui.add(egui::TextEdit::singleline(&mut source.name).desired_width(160.0));
+                r.request_focus();
+                if r.lost_focus() {
+                    *renaming = None;
                 }
-                if source.enabled {
-                    status_badge(ui, channel.status());
+            } else {
+                let title = RichText::new(format!("{} {}", source.icon(), source.name)).size(15.0).strong();
+                let title = if source.enabled { title } else { title.weak() };
+                let r = ui.add(egui::Label::new(title).truncate().sense(Sense::click()));
+                if r.on_hover_text("Double-click to rename").double_clicked() {
+                    *renaming = Some(source.id.clone());
                 }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.menu_button(RichText::new("…").size(16.0), |ui| {
-                        if ui.button("Rename").clicked() {
-                            *renaming = Some(source.id.clone());
-                            ui.close();
-                        }
-                        if ui.button("Move up").clicked() {
-                            action = CardAction::MoveUp;
-                            ui.close();
-                        }
-                        ui.separator();
-                        if ui.button("Remove").clicked() {
-                            action = CardAction::Remove;
-                            ui.close();
-                        }
-                    });
-                    source_picker(ui, source, devices);
-                });
-            });
+            }
             if source.enabled {
-            // --- Meter + fader + mute ---
-            ui.horizontal(|ui| {
-                let mute_label = if source.muted { "🔇" } else { "🔊" };
-                if ui
-                    .add(egui::Button::new(mute_label).selected(source.muted).min_size(vec2(28.0, 24.0)))
-                    .on_hover_text(if source.muted { "Unmute" } else { "Mute" })
-                    .clicked()
-                {
-                    source.muted = !source.muted;
+                status_badge(ui, channel.status());
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.menu_button(RichText::new("…").size(16.0), |ui| {
+                    if ui.button("Rename").clicked() {
+                        *renaming = Some(source.id.clone());
+                        ui.close();
+                    }
+                    if ui.button("Move up").clicked() {
+                        action = CardAction::MoveUp;
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui.button("Remove").clicked() {
+                        action = CardAction::Remove;
+                        ui.close();
+                    }
+                });
+                if !narrow {
+                    source_picker(ui, source, devices, 220.0);
                 }
-                // Fixed widths so every card lines up, whatever its value label.
-                let fader_w = 220.0;
-                let meter_w = (ui.available_width() - fader_w - 90.0).max(120.0);
-                ui.allocate_ui(vec2(meter_w, 24.0), |ui| meter(ui, view, now, false));
-                ui.spacing_mut().slider_width = fader_w;
-                let slider = egui::Slider::new(&mut source.volume_db, FADER_MIN_DB..=FADER_MAX_DB)
-                    .show_value(false)
-                    .clamping(egui::SliderClamping::Always);
-                let r = ui.add(slider).on_hover_text("Volume. Double-click to reset.");
-                if r.double_clicked() {
-                    source.volume_db = 0.0;
-                }
-                ui.add_sized(vec2(70.0, 20.0), egui::Label::new(RichText::new(format_db(source.volume_db)).monospace()));
             });
+        });
+        if narrow {
+            source_picker(ui, source, devices, ui.available_width().min(320.0));
+        }
+        if !source.enabled {
+            return;
+        }
+        ui.add_space(4.0);
 
-            // --- Where it goes, in plain words ---
+        // --- Meter, then mute + fader + value; side by side when there's room ---
+        let id = egui::Id::new(("source_meter", source.id.as_str()));
+        let draw_meter = |ui: &mut egui::Ui, meters: &mut SourceMeters, muted: bool| {
+            // Muted: show what the source delivers, dimmed, so you can see the mic
+            // is live without it being recorded. Otherwise what goes into the clip.
+            let state = if muted { &mut meters.input } else { &mut meters.output };
+            let style = meter::Style { bar_h: 6.0, gap: 2.0, scale: false, dimmed: muted };
+            if meter::stereo(ui, id, state, &style) {
+                state.reset_clip();
+            }
+        };
+        let controls = |ui: &mut egui::Ui, source: &mut AudioSourceCfg, fader_w: f32| {
+            let mute = egui::Button::new(RichText::new("M").strong().color(if source.muted { Color32::BLACK } else { ui.visuals().text_color() }))
+                .fill(if source.muted { meter::YELLOW } else { ui.visuals().widgets.inactive.weak_bg_fill })
+                .min_size(vec2(26.0, 22.0));
+            if ui.add(mute).on_hover_text(if source.muted { "Unmute" } else { "Mute: keep the source but record silence" }).clicked() {
+                source.muted = !source.muted;
+            }
+            ui.spacing_mut().slider_width = fader_w;
+            let slider = egui::Slider::new(&mut source.volume_db, FADER_MIN_DB..=FADER_MAX_DB)
+                .show_value(false)
+                .clamping(egui::SliderClamping::Always);
+            let r = ui.add(slider).on_hover_text("Volume (gain). Double-click to reset to 0 dB.");
+            if r.double_clicked() {
+                source.volume_db = 0.0;
+            }
+            // Type an exact value: drag or double-click the number.
+            ui.add(
+                egui::DragValue::new(&mut source.volume_db)
+                    .range(FADER_MIN_DB..=FADER_MAX_DB)
+                    .speed(0.1)
+                    .fixed_decimals(1)
+                    .custom_formatter(|v, _| if v <= (FADER_MIN_DB + 0.05) as f64 { "-∞".to_owned() } else { format!("{v:+.1}") })
+                    .suffix(" dB"),
+            )
+            .on_hover_text("Drag or click to type a value");
+        };
+        let readout = |ui: &mut egui::Ui, meters: &SourceMeters, muted: bool| {
+            let state = if muted { &meters.input } else { &meters.output };
+            meter::fixed_label(ui, 46.0, &state.readout(), state.readout_color(ui.visuals()), "Highest peak in the last 3 seconds (dBFS)");
+        };
+        if narrow {
             ui.horizontal(|ui| {
-                ui.checkbox(&mut source.in_mix, "In the clip")
-                    .on_hover_text("Part of what your clips sound like when you play or share them.");
-                ui.checkbox(&mut source.own_track, "Separate track for editing")
-                    .on_hover_text("Also kept on its own, so you can change its volume later in the editor.");
-                if let SourceKind::Desktop { exclude_apps } = &mut source.kind {
-                    ui.add_enabled(has_app_sources, egui::Checkbox::new(exclude_apps, "Leave out apps added below"))
-                        .on_hover_text("Apps you add as their own source won't also be heard here, so nothing plays twice.")
-                        .on_disabled_hover_text("Add an app as its own source to use this.");
-                }
+                let w = ui.available_width() - 46.0 - ui.spacing().item_spacing.x;
+                ui.allocate_ui(vec2(w, 14.0), |ui| draw_meter(ui, meters, source.muted));
+                readout(ui, meters, source.muted);
             });
-            if !source.in_mix && !source.own_track {
-                ui.colored_label(ui.visuals().warn_fg_color, "This source isn't recorded anywhere — tick at least one box.");
+            ui.horizontal(|ui| {
+                let fader_w = (ui.available_width() - 26.0 - 90.0 - 2.0 * ui.spacing().item_spacing.x).max(80.0);
+                controls(ui, source, fader_w);
+            });
+        } else {
+            ui.horizontal(|ui| {
+                let controls_w = 26.0 + 180.0 + 84.0 + 3.0 * ui.spacing().item_spacing.x;
+                let w = ui.available_width() - controls_w - 46.0 - 12.0 - 2.0 * ui.spacing().item_spacing.x;
+                ui.allocate_ui(vec2(w, 14.0), |ui| draw_meter(ui, meters, source.muted));
+                readout(ui, meters, source.muted);
+                ui.add_space(12.0);
+                controls(ui, source, 180.0);
+            });
+        }
+
+        // --- Where it goes, in plain words ---
+        ui.add_space(2.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.checkbox(&mut source.in_mix, "In the clip")
+                .on_hover_text("Part of what your clips sound like when you play or share them.");
+            ui.checkbox(&mut source.own_track, "Separate track for editing")
+                .on_hover_text("Also kept on its own, so you can change its volume later in the editor.");
+            if let SourceKind::Desktop { exclude_apps } = &mut source.kind {
+                ui.add_enabled(has_app_sources, egui::Checkbox::new(exclude_apps, "Leave out apps added below"))
+                    .on_hover_text("Apps you add as their own source won't also be heard here, so nothing plays twice.")
+                    .on_disabled_hover_text("Add an app as its own source to use this.");
             }
-            }
+        });
+        if !source.in_mix && !source.own_track {
+            ui.colored_label(ui.visuals().warn_fg_color, "This source isn't recorded anywhere: tick at least one box.");
         }
     });
     action
 }
 
 /// What a source captures: the device dropdown for mics, the app name for apps.
-fn source_picker(ui: &mut egui::Ui, source: &mut AudioSourceCfg, audio: &capture::audio::AudioDevices) {
+fn source_picker(ui: &mut egui::Ui, source: &mut AudioSourceCfg, audio: &capture::audio::AudioDevices, width: f32) {
     use capture::audio::DEFAULT_DEVICE;
     match &mut source.kind {
         SourceKind::Microphone { device } => {
@@ -385,7 +436,8 @@ fn source_picker(ui: &mut egui::Ui, source: &mut AudioSourceCfg, audio: &capture
                 format!("{device} (disconnected)")
             };
             egui::ComboBox::from_id_salt(("mic", source.id.as_str()))
-                .width(230.0)
+                .width(width)
+                .truncate()
                 .selected_text(selected)
                 .show_ui(ui, |ui| {
                     ui.selectable_value(device, DEFAULT_DEVICE.to_owned(), default_label);
@@ -415,47 +467,6 @@ fn status_badge(ui: &mut egui::Ui, status: SourceStatus) {
     ui.label(RichText::new(text).size(12.0).color(color)).on_hover_text(tip);
 }
 
-/// A horizontal level meter: green → yellow → red, a held peak line, and a
-/// clip light on the right.
-fn meter(ui: &mut egui::Ui, view: &MeterView, now: Instant, big: bool) {
-    let h = if big { 18.0 } else { 10.0 };
-    let w = ui.available_width();
-    let (rect, _) = ui.allocate_exact_size(vec2(w, if big { 34.0 } else { 24.0 }), Sense::hover());
-    let clip_w = 10.0;
-    let bar = Rect::from_min_size(rect.left_center() - vec2(0.0, h / 2.0), vec2(w - clip_w - 4.0, h));
-    let p = ui.painter();
-    p.rect_filled(bar, 3.0, ui.visuals().extreme_bg_color);
-    let x_of = |db: f32| bar.left() + bar.width() * ((db - METER_FLOOR_DB) / -METER_FLOOR_DB).clamp(0.0, 1.0);
-    let lvl_x = x_of(view.level_db);
-    // Zones: green up to -18 dB, yellow to -6, red above.
-    for (from, to, color) in [(METER_FLOOR_DB, -18.0, METER_GREEN), (-18.0, -6.0, METER_YELLOW), (-6.0, 0.0, METER_RED)] {
-        let (x0, x1) = (x_of(from), x_of(to).min(lvl_x));
-        if x1 > x0 {
-            p.rect_filled(Rect::from_x_y_ranges(x0..=x1, bar.y_range()), 2.0, color);
-        }
-    }
-    if view.peak_db > METER_FLOOR_DB {
-        let x = x_of(view.peak_db);
-        p.line_segment([egui::pos2(x, bar.top()), egui::pos2(x, bar.bottom())], Stroke::new(2.0, ui.visuals().strong_text_color()));
-    }
-    if big {
-        // dB scale under the mix meter.
-        for db in [-48.0, -36.0, -24.0, -12.0, -6.0, 0.0] {
-            let x = x_of(db);
-            p.text(
-                egui::pos2(x, bar.bottom() + 2.0),
-                egui::Align2::CENTER_TOP,
-                format!("{db:.0}"),
-                egui::FontId::proportional(10.0),
-                ui.visuals().weak_text_color(),
-            );
-        }
-    }
-    let clip = Rect::from_min_size(egui::pos2(bar.right() + 4.0, bar.top()), vec2(clip_w, h));
-    let lit = view.clipping(now);
-    p.rect_filled(clip, 2.0, if lit { METER_RED } else { ui.visuals().extreme_bg_color });
-}
-
 /// A rounded panel around one source.
 fn card(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::group(ui.style()).inner_margin(egui::Margin::same(12)).corner_radius(8).show(ui, |ui| {
@@ -473,14 +484,6 @@ fn list_apps() -> Vec<capture::Device> {
     {
         Vec::new()
     }
-}
-
-fn format_db(db: f32) -> String {
-    if db <= FADER_MIN_DB + 0.05 { "  -∞ dB".to_owned() } else { format!("{db:+5.1} dB") }
-}
-
-fn to_db(x: f32) -> f32 {
-    if x <= 1e-6 { SILENCE_DB } else { 20.0 * x.log10() }
 }
 
 pub(crate) fn from_db(db: f32) -> f32 {
