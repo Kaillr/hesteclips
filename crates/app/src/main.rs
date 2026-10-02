@@ -9,6 +9,7 @@
 
 mod away;
 mod clips;
+mod webcam_ui;
 mod cloud;
 mod cloud_ui;
 mod editor;
@@ -173,6 +174,10 @@ struct App {
     capturing_video: Option<capture::VideoSource>,
     /// Shown instead of a game or app while you're tabbed out.
     pub(crate) away_screen: std::sync::Arc<capture::StillImage>,
+    /// Where the webcam sits, shared with a running capture so dragging it
+    /// takes effect at once. Mirrors `settings.webcam` every frame.
+    webcam_placement: capture::webcam::SharedPlacement,
+    pub(crate) webcam_view: webcam_ui::WebcamView,
     /// System audio inputs/outputs (+ current OS defaults).
     audio: capture::audio::AudioDevices,
     /// Live per-source volume and meters, shared with the capture thread.
@@ -182,7 +187,7 @@ struct App {
     level_monitor: Option<(Vec<capture::sources::AudioSource>, capture::sources::LevelMonitor)>,
     /// Preview-only capture while the Sources page is open and nothing records,
     /// with the source, height and frame rate it was started for.
-    pub(crate) video_preview: Option<((capture::VideoSource, Option<u32>, u32), capture::preview::VideoPreview)>,
+    pub(crate) video_preview: Option<((capture::VideoSource, Option<u32>, u32, Option<String>), capture::preview::VideoPreview)>,
     sources_view: sources_ui::SourcesView,
     clips: Vec<clips::Clip>,
     thumbs: thumbs::Thumbs,
@@ -242,6 +247,8 @@ impl App {
             windowed_apps: Vec::new(),
             capturing_video: None,
             away_screen: away::screen(),
+            webcam_placement: std::sync::Arc::new(std::sync::Mutex::new(capture::webcam::Placement::default_for(16.0 / 9.0, 16.0 / 9.0))),
+            webcam_view: Default::default(),
             audio: capture::audio::list_audio_devices(),
             live_audio,
             level_monitor: None,
@@ -340,12 +347,18 @@ impl App {
             replay_seconds: self.settings.replay_seconds,
             video: self.video_source(),
             away_screen: Some(self.away_screen.clone()),
-            webcam: None,
+            webcam: self.webcam_source(),
             sources: self.capture_sources(),
         }
     }
 
     /// What the video shows, for the capture backend.
+    /// The webcam, for the capture backend.
+    pub(crate) fn webcam_source(&self) -> Option<capture::webcam::Webcam> {
+        let w = self.settings.webcam.as_ref().filter(|_| capture::webcam::AVAILABLE)?;
+        Some(capture::webcam::Webcam { device: w.id.clone(), placement: self.webcam_placement.clone() })
+    }
+
     pub(crate) fn video_source(&self) -> capture::VideoSource {
         match &self.settings.capture {
             settings::CaptureTarget::Apps { apps, away_screen } if capture::APP_CAPTURE => capture::VideoSource::Apps {
@@ -413,6 +426,9 @@ impl eframe::App for App {
         self.ensure_level_monitor();
         self.ensure_video_preview();
         self.sync_capture_video();
+        if let Some(w) = &self.settings.webcam {
+            *self.webcam_placement.lock().unwrap() = w.placement.into();
+        }
 
         // The editor gets the whole window; capture keeps running underneath and the
         // hotkeys still work.

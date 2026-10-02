@@ -296,6 +296,12 @@ impl App {
                     });
                 }
             }
+            if capture::webcam::AVAILABLE {
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(2.0);
+                self.webcam_row(ui, frame.as_deref());
+            }
         });
     }
 
@@ -329,12 +335,12 @@ impl App {
 
     /// The preview itself: as wide as the card, never taller than a third of
     /// the window so the rest stays in view.
-    fn preview_picture(&self, ui: &mut egui::Ui, frame: Option<&capture::preview::PreviewFrame>) {
+    fn preview_picture(&mut self, ui: &mut egui::Ui, frame: Option<&capture::preview::PreviewFrame>) {
         let aspect = frame.map_or(16.0 / 9.0, |f| f.width as f32 / f.height.max(1) as f32);
         let max_h = (ui.ctx().content_rect().height() / 3.0).max(120.0);
         let w = ui.available_width().min(max_h * aspect);
         ui.vertical_centered(|ui| {
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(w, w / aspect), Sense::hover());
+            let (rect, response) = ui.allocate_exact_size(egui::vec2(w, w / aspect), Sense::click_and_drag());
             let p = ui.painter();
             p.rect_filled(rect, 4.0, Color32::BLACK);
             let message = |text: &str| {
@@ -353,6 +359,9 @@ impl App {
                     Some(e) => message(&format!("No preview: {e}")),
                     None => message("Starting preview…"),
                 },
+            }
+            if self.settings.webcam.is_some() && frame.is_some() {
+                self.webcam_on_preview(ui, rect, &response);
             }
         });
     }
@@ -525,18 +534,19 @@ impl App {
             return;
         }
         // What a recording would be: same picture, size and frame rate.
-        let wanted = (self.video_source(), self.settings.resolution.height(), self.settings.fps);
+        let webcam = self.webcam_source();
+        let wanted = (self.video_source(), self.settings.resolution.height(), self.settings.fps, webcam.as_ref().map(|w| w.device.clone()));
         // A changed app list reaches the running preview without a restart.
         if let Some((have, preview)) = &mut self.video_preview {
-            if *have != wanted && have.1 == wanted.1 && have.2 == wanted.2 && preview.update(&wanted.0) {
+            if *have != wanted && (&have.1, have.2, &have.3) == (&wanted.1, wanted.2, &wanted.3) && preview.update(&wanted.0) {
                 have.0 = wanted.0.clone();
             }
         }
         if self.video_preview.as_ref().is_none_or(|(w, _)| *w != wanted) {
-            let (source, height, fps) = &wanted;
+            let (source, height, fps, _) = &wanted;
             // Both happen in the background: the old capture closes as the new
             // one opens, and only the new one's frames are shown.
-            let preview = capture::preview::VideoPreview::start(source, *height, *fps, Some(self.away_screen.clone()), None);
+            let preview = capture::preview::VideoPreview::start(source, *height, *fps, Some(self.away_screen.clone()), webcam);
             self.video_preview = Some((wanted, preview));
         }
     }

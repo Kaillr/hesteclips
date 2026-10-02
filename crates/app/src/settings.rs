@@ -121,6 +121,39 @@ pub enum CaptureTarget {
     App { id: String, name: String },
 }
 
+/// A webcam drawn over the recording.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WebcamCfg {
+    /// Backend id (`capture::webcam::list_cameras`).
+    pub id: String,
+    /// What to call it while it isn't connected.
+    pub name: String,
+    pub placement: PlacementCfg,
+}
+
+/// Where the webcam sits: see `capture::webcam::Placement`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PlacementCfg {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    #[serde(default)]
+    pub crop: [f32; 4],
+}
+
+impl From<PlacementCfg> for capture::webcam::Placement {
+    fn from(p: PlacementCfg) -> Self {
+        Self { x: p.x, y: p.y, w: p.w, h: p.h, crop: p.crop }
+    }
+}
+
+impl From<capture::webcam::Placement> for PlacementCfg {
+    fn from(p: capture::webcam::Placement) -> Self {
+        Self { x: p.x, y: p.y, w: p.w, h: p.h, crop: p.crop }
+    }
+}
+
 /// A game or app to record, by executable. `name` is what to call it while it
 /// isn't running.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -249,6 +282,8 @@ pub struct RecordSettings {
     // --- Common (always visible on the Settings tab) ---
     /// What the video shows: a whole display or one app's window.
     pub capture: CaptureTarget,
+    /// A webcam over the picture, if any.
+    pub webcam: Option<WebcamCfg>,
     /// Index into the runtime-detected display list.
     pub display_index: usize,
     pub fps: u32,
@@ -284,6 +319,7 @@ impl Default for RecordSettings {
     fn default() -> Self {
         Self {
             capture: CaptureTarget::Screen,
+            webcam: None,
             display_index: 0,
             fps: 60,
             resolution: OutputResolution::Native,
