@@ -865,7 +865,6 @@ impl App {
         self.service.start(capture::Mode::Record, self.encode_settings());
         self.rec_state = RecState::Recording;
         self.rec_started = Some(Instant::now());
-        self.page = Page::Clips;
     }
 
     fn save_clip(&mut self) {
