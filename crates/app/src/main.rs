@@ -381,6 +381,7 @@ impl eframe::App for App {
 
         self.pump_capture_events();
         self.cloud.poll();
+        self.pump_uploads();
         self.pump_renders();
         // Every frame, not just while the Sources page draws: leaving the page must
         // stop the meters' capture, or macOS keeps showing its recording indicator.
@@ -739,6 +740,21 @@ impl App {
             ctx.request_repaint();
         });
         self.refresh_clips();
+    }
+
+    /// Tell the user how background uploads ended.
+    fn pump_uploads(&mut self) {
+        for done in self.cloud.take_finished() {
+            match done {
+                cloud::UploadDone::Uploaded { clip, to } => {
+                    self.toast(format!("Uploaded {} to {}", file_name(&clip), to.display()));
+                }
+                cloud::UploadDone::Failed { clip, error } => {
+                    self.toast_error(format!("Couldn't upload {}: {error}", file_name(&clip)));
+                }
+                cloud::UploadDone::Cancelled { clip } => self.toast(format!("Upload of {} cancelled", file_name(&clip))),
+            }
+        }
     }
 
     fn pump_renders(&mut self) {

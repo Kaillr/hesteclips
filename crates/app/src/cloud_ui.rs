@@ -158,17 +158,13 @@ impl App {
         (keep_open && !resp.should_close()).then_some(Dialog::PickDefaultFolder)
     }
 
-    /// Preview only: lets you pick a destination, but uploading isn't wired up yet
-    /// (the HesteFiles API has no upload endpoint).
     /// Upload a clip to HesteFiles.
     ///
     /// The common case is one decision: the destination is already your clips
     /// folder, so the dialog reads "Upload <clip> to <folder>" with one button.
     /// Picking somewhere else is a small "Change" link that expands the folder
-    /// browser in place — no radio buttons to puzzle over.
-    ///
-    /// Upload itself isn't possible yet (the HesteFiles API is read-only), so the
-    /// button is shown disabled with an explanation.
+    /// browser in place — no radio buttons to puzzle over. Upload closes the
+    /// dialog; the clip's card shows the progress.
     fn share_dialog(&mut self, ctx: &egui::Context, mut share: ShareDialog) -> Option<ShareDialog> {
         let mut keep_open = true;
         let resp = egui::Modal::new(egui::Id::new("share_clip")).show(ctx, |ui| {
@@ -229,21 +225,26 @@ impl App {
                 ShareTarget::Custom => self.cloud.browser_selection(),
             };
             ui.add_space(12.0);
+            let busy = self.cloud.upload_for(&share.clip).is_some();
             ui.horizontal(|ui| {
-                // Uploading needs an upload endpoint the HesteFiles API doesn't have
-                // yet; keep the button so the flow is visible, but disabled.
                 let upload = egui::Button::new(egui::RichText::new("☁  Upload").color(egui::Color32::WHITE))
                     .fill(crate::library::ACCENT)
                     .min_size(egui::vec2(96.0, 28.0));
-                ui.add_enabled(false, upload)
-                    .on_disabled_hover_text("Coming soon — HesteFiles doesn't accept uploads from apps yet.");
+                let r = ui
+                    .add_enabled(destination.is_some() && !busy, upload)
+                    .on_disabled_hover_text(if busy { "This clip is already uploading." } else { "Choose a folder you can save into." });
+                if r.clicked() {
+                    if let Some(to) = destination.clone() {
+                        self.cloud.upload(share.clip.clone(), to);
+                        keep_open = false;
+                    }
+                }
                 if ui.button("Cancel").clicked() {
                     keep_open = false;
                 }
-                let _ = destination;
             });
             ui.add_space(4.0);
-            ui.weak("Uploading is coming soon. For now, drag the clip into the HesteFiles website or use Copy clip.");
+            ui.weak("If a file with this name is already there, HesteFiles keeps both.");
         });
         (keep_open && !resp.should_close()).then_some(share)
     }
