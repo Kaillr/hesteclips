@@ -204,7 +204,7 @@ impl App {
                 }
             }
             Some(Action::Copy(p)) => match share::copy_file(&p) {
-                Ok(()) => self.toast("Copied — paste it into any app (⌘V)".replace("⌘V", if cfg!(target_os = "macos") { "⌘V" } else { "Ctrl+V" })),
+                Ok(()) => self.toast(format!("Copied — paste it into any app ({})", crate::hotkey_label_cmd("V"))),
                 Err(e) => self.toast_error(format!("Couldn't copy the clip: {e}")),
             },
             Some(Action::ShareSheet(p, at)) => {
@@ -276,7 +276,7 @@ impl App {
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let trash = egui::Button::new(egui::RichText::new("🗑  Move to Trash").color(Color32::WHITE)).fill(ui.visuals().error_fg_color);
-                        let key = if cfg!(target_os = "macos") { "⌘⌫" } else { "Delete" };
+                        let key = if cfg!(target_os = "macos") { crate::hotkey_label_cmd("Delete") } else { "Delete".to_owned() };
                         if ui.add(trash).on_hover_text(key).clicked() {
                             action = Some(Action::TrashSelected);
                         }
@@ -335,13 +335,13 @@ impl App {
             let hint = match self.rec_state {
                 RecState::Buffering => format!(
                     "The replay buffer is running. Press {} or Save clip to keep the last {} seconds.",
-                    crate::hotkey_label("F10"),
+                    self.shortcut_label(crate::settings::ShortcutAction::SaveClip),
                     self.settings.replay_seconds
                 ),
                 RecState::Recording => "Recording… stop it to see your clip here.".to_owned(),
                 RecState::Idle => format!(
                     "Start the replay buffer and press {} whenever something worth keeping happens.",
-                    crate::hotkey_label("F10")
+                    self.shortcut_label(crate::settings::ShortcutAction::SaveClip)
                 ),
             };
             ui.weak(hint);
@@ -678,7 +678,7 @@ fn share_menu(ui: &mut egui::Ui, clip: &clips::Clip, anchor: Pos2) -> Option<Act
     let file = clip.path.clone();
     let mut action = None;
     ui.set_min_width(230.0);
-    let paste = if cfg!(target_os = "macos") { "⌘V" } else { "Ctrl+V" };
+    let paste = crate::hotkey_label_cmd("V");
     if ui.button("📋  Copy clip").on_hover_text(format!("Then paste it into Discord, a chat or a folder ({paste})")).clicked() {
         action = Some(Action::Copy(file.clone()));
     }

@@ -19,6 +19,7 @@ mod service;
 mod settings;
 mod settings_ui;
 mod share;
+mod shortcuts;
 mod sources_ui;
 mod store;
 mod thumbs;
@@ -27,8 +28,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
 use egui::{Color32, RichText};
-use global_hotkey::hotkey::{Code, HotKey, Modifiers};
-use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
+use global_hotkey::{GlobalHotKeyEvent, HotKeyState};
 use library::{ACCENT, REC_RED};
 use service::{CaptureService, Evt};
 use settings::{Encoder, RecordSettings, SourceKind};
@@ -79,34 +79,6 @@ enum RecState {
     Recording,
 }
 
-/// Global hotkeys so you can control capture without leaving your game.
-/// The manager must stay alive for the bindings to keep working.
-struct Hotkeys {
-    _mgr: GlobalHotKeyManager,
-    buffer_id: u32,
-    record_id: u32,
-    save_id: u32,
-}
-
-impl Hotkeys {
-    /// Alt+F8 = toggle replay buffer, Alt+F9 = toggle recording, Alt+F10 = save clip.
-    fn setup() -> global_hotkey::Result<Self> {
-        let mgr = GlobalHotKeyManager::new()?;
-        let buffer = HotKey::new(Some(Modifiers::ALT), Code::F8);
-        let record = HotKey::new(Some(Modifiers::ALT), Code::F9);
-        let save = HotKey::new(Some(Modifiers::ALT), Code::F10);
-        mgr.register(buffer)?;
-        mgr.register(record)?;
-        mgr.register(save)?;
-        Ok(Self {
-            _mgr: mgr,
-            buffer_id: buffer.id(),
-            record_id: record.id(),
-            save_id: save.id(),
-        })
-    }
-}
-
 /// The app icon (`assets/icon.svg` rendered to PNG), shown in the Dock and taskbar
 /// while running. Release bundles use `assets/hesteclips.icns` instead.
 fn app_icon() -> egui::IconData {
@@ -116,15 +88,37 @@ fn app_icon() -> egui::IconData {
     egui::IconData { width: img.width(), height: img.height(), rgba: img.into_raw() }
 }
 
-/// "Option+F10" on macOS, "Alt+F10" elsewhere — the modifier's name on each OS.
-/// (Spelled out because egui's bundled font has no ⌥ glyph.)
-fn hotkey_label(key: &str) -> String {
-    if cfg!(target_os = "macos") { format!("Option+{key}") } else { format!("Alt+{key}") }
+impl App {
+    /// The shortcut for `action` as text ("Option + F10"), or "no shortcut".
+    pub(crate) fn shortcut_label(&self, action: settings::ShortcutAction) -> String {
+        shortcuts::keys(self.settings.shortcuts.get(action)).map_or_else(|| "no shortcut".into(), |k| k.join(" + "))
+    }
+
+    /// The shortcut for `action` as key names, for keycaps.
+    pub(crate) fn shortcut_keys(&self, action: settings::ShortcutAction) -> Option<Vec<String>> {
+        shortcuts::keys(self.settings.shortcuts.get(action))
+    }
 }
 
-/// An in-app shortcut with the platform's command key, e.g. "⌘A" / "Ctrl+A".
+/// egui's bundled fonts have no ⌘ ⌥ ⌃ ⇧ ⌫, which macOS writes every shortcut
+/// with. Use the system's symbol font as a fallback for those (it's only
+/// consulted for characters the bundled fonts lack).
+fn add_symbol_font(ctx: &egui::Context) {
+    #[cfg(target_os = "macos")]
+    if let Ok(bytes) = std::fs::read("/System/Library/Fonts/Apple Symbols.ttf") {
+        use egui::epaint::text::{FontInsert, FontPriority, InsertFontFamily};
+        let families = [egui::FontFamily::Proportional, egui::FontFamily::Monospace]
+            .map(|family| InsertFontFamily { family, priority: FontPriority::Lowest })
+            .to_vec();
+        ctx.add_font(FontInsert::new("apple-symbols", egui::FontData::from_owned(bytes), families));
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = ctx;
+}
+
+/// An in-app shortcut with the platform's command key, as text: "Cmd + A" / "Ctrl + A".
 fn hotkey_label_cmd(key: &str) -> String {
-    if cfg!(target_os = "macos") { format!("⌘{key}") } else { format!("Ctrl+{key}") }
+    shortcuts::command(key).join(" + ")
 }
 
 /// What the OS calls its file manager.
@@ -158,8 +152,14 @@ struct App {
     /// Last-saved settings JSON, to persist only when something changed.
     saved_settings: String,
     service: CaptureService,
-    hotkeys: Option<Hotkeys>,
-    hotkey_error: Option<String>,
+    /// Global shortcuts, kept in step with `settings.shortcuts`. `Err` when the OS
+    /// refused shortcuts altogether.
+    pub(crate) hotkeys: Result<shortcuts::Registered, String>,
+    /// The Settings shortcut recorder: which action is listening for keys, and
+    /// the last problem with what was pressed.
+    pub(crate) recording_shortcut: Option<(settings::ShortcutAction, Option<&'static str>)>,
+    /// The "Reset all settings?" confirmation is open.
+    pub(crate) confirm_reset: bool,
     /// Screen-recording permission, re-checked each poll so the banner clears the
     /// moment the user grants it.
     permission: capture::Permission,
@@ -198,16 +198,17 @@ struct App {
 
 impl App {
     fn new(ctx: egui::Context) -> Self {
+        add_symbol_font(&ctx);
         let settings = RecordSettings::load();
         let recovered = capture::output::recover_unfinished(&settings.output_dir);
         let saved_settings = settings.to_json();
         let clips = clips::scan(&settings.output_dir);
         // Assets of clips deleted in Finder go to the Bin.
         store::sweep_orphans(&settings.output_dir, &clips);
-        let (hotkeys, hotkey_error) = match Hotkeys::setup() {
-            Ok(h) => (Some(h), None),
-            Err(e) => (None, Some(e.to_string())),
-        };
+        let hotkeys = shortcuts::Registered::new().map_err(|e| e.to_string()).map(|mut h| {
+            h.sync(&settings.shortcuts);
+            h
+        });
         let (render_tx, render_rx) = std::sync::mpsc::channel();
         let live_audio = capture::mixer::LiveAudio::new();
         live_audio.set_limiter(settings.limiter);
@@ -223,7 +224,8 @@ impl App {
             saved_settings,
             service: CaptureService::new(live_audio.clone()),
             hotkeys,
-            hotkey_error,
+            recording_shortcut: None,
+            confirm_reset: false,
             permission: capture::screen_permission(),
             screens: capture::list_screens(),
             audio: capture::audio::list_audio_devices(),
@@ -282,6 +284,10 @@ impl App {
         let open_sources = std::env::var_os("HESTECLIPS_OPEN_SOURCES").is_some();
         if open_sources {
             app.page = Page::Sources;
+        }
+        // `HESTECLIPS_OPEN_SETTINGS=1` opens on Settings.
+        if std::env::var_os("HESTECLIPS_OPEN_SETTINGS").is_some() {
+            app.page = Page::Settings;
         }
         if !recovered.is_empty() {
             app.toast("Recovered a recording that was cut off last time");
@@ -355,20 +361,21 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
 
-        // Handle global hotkeys — these fire even while a game is focused.
-        let ids = self.hotkeys.as_ref().map(|h| (h.buffer_id, h.record_id, h.save_id));
-        if let Some((buffer_id, record_id, save_id)) = ids {
-            while let Ok(ev) = GlobalHotKeyEvent::receiver().try_recv() {
-                if ev.state != HotKeyState::Pressed {
-                    continue;
-                }
-                if ev.id == buffer_id {
-                    self.toggle_buffer();
-                } else if ev.id == record_id {
-                    self.toggle_record();
-                } else if ev.id == save_id {
-                    self.save_clip();
-                }
+        // Global shortcuts: these fire even while a game is focused. Paused while
+        // the Settings recorder listens, so pressing the current key rebinds it
+        // instead of starting a recording.
+        if let Ok(h) = &mut self.hotkeys {
+            h.sync(&self.settings.shortcuts);
+        }
+        while let Ok(ev) = GlobalHotKeyEvent::receiver().try_recv() {
+            if ev.state != HotKeyState::Pressed || self.recording_shortcut.is_some() {
+                continue;
+            }
+            match self.hotkeys.as_ref().ok().and_then(|h| h.action_for(ev.id)) {
+                Some(settings::ShortcutAction::ToggleBuffer) => self.toggle_buffer(),
+                Some(settings::ShortcutAction::ToggleRecord) => self.toggle_record(),
+                Some(settings::ShortcutAction::SaveClip) => self.save_clip(),
+                None => {}
             }
         }
 
@@ -473,7 +480,7 @@ impl App {
         let tabs = [
             (Page::Clips, "🎬", "Clips", "Your clips".to_owned()),
             (Page::Sources, "🎤", "Sources", "What goes into your clips: mic, desktop sound, apps, with live levels".to_owned()),
-            (Page::Settings, "⚙", "Settings", format!("Settings ({})", if cfg!(target_os = "macos") { "⌘," } else { "Ctrl+," })),
+            (Page::Settings, "⚙", "Settings", format!("Settings ({})", hotkey_label_cmd(","))),
         ];
         let v = ui.visuals().clone();
         egui::Frame::new()
@@ -518,11 +525,17 @@ impl App {
     fn capture_status(&self, ui: &mut egui::Ui, compact: bool) {
         let elapsed = self.rec_started.map_or(Duration::ZERO, |t| t.elapsed());
         let replay = thumbs::format_duration(Duration::from_secs(self.settings.replay_seconds.into()));
-        let (live, color, title, hint) = match self.rec_state {
-            RecState::Idle => (false, ui.visuals().weak_text_color(), "Not recording".to_owned(), format!("{} starts the replay buffer", hotkey_label("F8"))),
-            RecState::Buffering if self.saving => (true, ACCENT, "Saving clip…".to_owned(), format!("The last {replay}")),
-            RecState::Buffering => (true, ACCENT, "Replay buffer on".to_owned(), format!("{} saves the last {replay}", hotkey_label("F10"))),
-            RecState::Recording => (true, REC_RED, format!("Recording  {}", thumbs::format_duration(elapsed)), format!("{} stops", hotkey_label("F9"))),
+        use settings::ShortcutAction as A;
+        // The hint: the shortcut (drawn as keycaps) and what it does.
+        let (live, color, title, hint_keys, hint) = match self.rec_state {
+            RecState::Idle => (false, ui.visuals().weak_text_color(), "Not recording".to_owned(), self.shortcut_keys(A::ToggleBuffer), "starts the replay buffer".to_owned()),
+            RecState::Buffering if self.saving => (true, ACCENT, "Saving clip…".to_owned(), None, format!("The last {replay}")),
+            RecState::Buffering => (true, ACCENT, "Replay buffer on".to_owned(), self.shortcut_keys(A::SaveClip), format!("saves the last {replay}")),
+            RecState::Recording => (true, REC_RED, format!("Recording  {}", thumbs::format_duration(elapsed)), self.shortcut_keys(A::ToggleRecord), "stops".to_owned()),
+        };
+        let tip = match &hint_keys {
+            Some(k) => format!("{} {hint}", k.join(" + ")),
+            None => hint.clone(),
         };
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
@@ -537,14 +550,20 @@ impl App {
                 ui.painter().circle_stroke(rect.center(), 5.0, egui::Stroke::new(1.5, color));
             }
             ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.spacing_mut().item_spacing.y = 2.0;
                 ui.label(RichText::new(&title).size(14.0).strong().color(if live { color } else { ui.visuals().text_color() }));
                 if !compact {
-                    ui.label(RichText::new(&hint).size(11.5).weak());
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 5.0;
+                        if let Some(k) = &hint_keys {
+                            shortcuts::keycaps(ui, k, 10.5);
+                        }
+                        ui.label(RichText::new(&hint).size(11.5).weak());
+                    });
                 }
             })
             .response
-            .on_hover_text(&hint);
+            .on_hover_text(&tip);
         });
     }
 
@@ -566,30 +585,30 @@ impl App {
                 let start = if compact { "⏺  Replay buffer" } else { "⏺  Start replay buffer" };
                 if ui
                     .add(button(start, Some(ACCENT)))
-                    .on_hover_text(format!("Keep the last {} ready to save ({})", thumbs::format_duration(Duration::from_secs(self.settings.replay_seconds.into())), hotkey_label("F8")))
+                    .on_hover_text(format!("Keep the last {} ready to save ({})", thumbs::format_duration(Duration::from_secs(self.settings.replay_seconds.into())), self.shortcut_label(settings::ShortcutAction::ToggleBuffer)))
                     .clicked()
                 {
                     self.start_replay_buffer();
                 }
-                if ui.add(button("Record", None)).on_hover_text(format!("Record until you stop ({})", hotkey_label("F9"))).clicked() {
+                if ui.add(button("Record", None)).on_hover_text(format!("Record until you stop ({})", self.shortcut_label(settings::ShortcutAction::ToggleRecord))).clicked() {
                     self.start_recording();
                 }
             }
             RecState::Buffering => {
                 if ui
                     .add_enabled(!self.saving, button("💾  Save clip", Some(ACCENT)))
-                    .on_hover_text(hotkey_label("F10"))
+                    .on_hover_text(self.shortcut_label(settings::ShortcutAction::SaveClip))
                     .clicked()
                 {
                     self.save_clip();
                 }
-                if ui.add(button("Stop", None)).on_hover_text(format!("Stop the replay buffer ({})", hotkey_label("F8"))).clicked() {
+                if ui.add(button("Stop", None)).on_hover_text(format!("Stop the replay buffer ({})", self.shortcut_label(settings::ShortcutAction::ToggleBuffer))).clicked() {
                     self.stop();
                 }
             }
             RecState::Recording => {
                 let stop = if compact { "⏹  Stop" } else { "⏹  Stop recording" };
-                if ui.add(button(stop, Some(REC_RED))).on_hover_text(hotkey_label("F9")).clicked() {
+                if ui.add(button(stop, Some(REC_RED))).on_hover_text(self.shortcut_label(settings::ShortcutAction::ToggleRecord)).clicked() {
                     self.stop();
                 }
             }

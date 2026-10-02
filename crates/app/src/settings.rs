@@ -249,6 +249,9 @@ pub struct RecordSettings {
     pub audio_sources: Vec<AudioSourceCfg>,
     /// Keep the clip's mix from clipping when sources add up too loud.
     pub limiter: bool,
+
+    // --- Shortcuts ---
+    pub shortcuts: Shortcuts,
     /// Pre-sources audio list; migrated into `audio_sources` on load.
     #[serde(skip_serializing)]
     audio_tracks: Option<Vec<LegacyAudioTrack>>,
@@ -271,7 +274,61 @@ impl Default for RecordSettings {
             output_dir: default_output_dir(),
             audio_sources: default_sources(),
             limiter: true,
+            shortcuts: Shortcuts::default(),
             audio_tracks: None,
+        }
+    }
+}
+
+/// The global shortcuts, as `global_hotkey` strings ("alt+F10"). Empty = off.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Shortcuts {
+    pub save_clip: String,
+    pub toggle_buffer: String,
+    pub toggle_record: String,
+}
+
+impl Default for Shortcuts {
+    fn default() -> Self {
+        Self { save_clip: "alt+F10".into(), toggle_buffer: "alt+F8".into(), toggle_record: "alt+F9".into() }
+    }
+}
+
+/// One of the actions a global shortcut can trigger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShortcutAction {
+    SaveClip,
+    ToggleBuffer,
+    ToggleRecord,
+}
+
+impl ShortcutAction {
+    pub const ALL: [ShortcutAction; 3] = [ShortcutAction::SaveClip, ShortcutAction::ToggleBuffer, ShortcutAction::ToggleRecord];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ShortcutAction::SaveClip => "Save clip",
+            ShortcutAction::ToggleBuffer => "Start / stop replay buffer",
+            ShortcutAction::ToggleRecord => "Start / stop recording",
+        }
+    }
+}
+
+impl Shortcuts {
+    pub fn get(&self, a: ShortcutAction) -> &str {
+        match a {
+            ShortcutAction::SaveClip => &self.save_clip,
+            ShortcutAction::ToggleBuffer => &self.toggle_buffer,
+            ShortcutAction::ToggleRecord => &self.toggle_record,
+        }
+    }
+
+    pub fn set(&mut self, a: ShortcutAction, value: String) {
+        match a {
+            ShortcutAction::SaveClip => self.save_clip = value,
+            ShortcutAction::ToggleBuffer => self.toggle_buffer = value,
+            ShortcutAction::ToggleRecord => self.toggle_record = value,
         }
     }
 }
