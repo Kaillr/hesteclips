@@ -9,8 +9,14 @@ use image::{Rgba, RgbaImage, imageops};
 
 const WIDTH: u32 = 1920;
 const HEIGHT: u32 = 1080;
-const BACKGROUND: Rgba<u8> = Rgba([20, 20, 22, 255]);
+const BACKGROUND: Rgba<u8> = Rgba([0, 0, 0, 255]);
 const LOGO: u32 = 300;
+/// Where the white artwork sits inside the icon (its tile is black, so on
+/// black only the artwork shows), as fractions of the icon's height.
+const ART_TOP: f32 = 245.0 / 1024.0;
+const ART_BOTTOM: f32 = 738.0 / 1024.0;
+/// From the bottom of the artwork to the top of the lettering.
+const GAP: f32 = 38.0;
 const TEXT: &str = "Tabbed out";
 const TEXT_PX: f32 = 72.0;
 const TEXT_COLOR: [u8; 3] = [235, 235, 238];
@@ -19,26 +25,43 @@ const TEXT_COLOR: [u8; 3] = [235, 235, 238];
 pub fn screen() -> Arc<capture::StillImage> {
     let mut img = RgbaImage::from_pixel(WIDTH, HEIGHT, BACKGROUND);
 
-    // Logo and text centred together, a little above the middle.
+    // The visible artwork and the lettering, centred together as one group.
     let font = FontRef::try_from_slice(epaint_default_fonts::UBUNTU_LIGHT).expect("bundled font is valid");
-    let scaled = font.as_scaled(PxScale::from(TEXT_PX));
-    let text_h = (scaled.ascent() - scaled.descent()).ceil() as u32;
-    let gap = 36;
-    let top = (HEIGHT - (LOGO + gap + text_h)) / 2 - 20;
+    let (ink_top, ink_height) = ink_extent(&font, TEXT);
+    let art_height = (ART_BOTTOM - ART_TOP) * LOGO as f32;
+    let group_top = (HEIGHT as f32 - (art_height + GAP + ink_height)) / 2.0;
+    let logo_top = (group_top - ART_TOP * LOGO as f32).round();
+    let text_top = (group_top + art_height + GAP - ink_top).round();
 
     let logo = image::load_from_memory_with_format(include_bytes!("../assets/icon-1024.png"), image::ImageFormat::Png)
         .expect("bundled icon is a valid PNG")
         .to_rgba8();
     let logo = imageops::resize(&logo, LOGO, LOGO, imageops::FilterType::Lanczos3);
-    imageops::overlay(&mut img, &logo, ((WIDTH - LOGO) / 2) as i64, top as i64);
+    imageops::overlay(&mut img, &logo, ((WIDTH - LOGO) / 2) as i64, logo_top as i64);
 
-    draw_text(&mut img, &font, TEXT, WIDTH / 2, top + LOGO + gap);
+    draw_text(&mut img, &font, TEXT, WIDTH / 2, text_top as u32);
 
     let bgra = img.pixels().flat_map(|p| [p[2], p[1], p[0], 255]).collect();
     Arc::new(capture::StillImage { width: WIDTH, height: HEIGHT, bgra })
 }
 
-/// One line of text, horizontally centred on `center_x`, its top at `top`.
+/// Where a line's ink starts below the top of its line box, and how tall it is
+/// (letters, not the font's full ascent and descent).
+fn ink_extent(font: &FontRef, text: &str) -> (f32, f32) {
+    let scaled = font.as_scaled(PxScale::from(TEXT_PX));
+    let (mut top, mut bottom) = (f32::MAX, f32::MIN);
+    for c in text.chars() {
+        let glyph = font.glyph_id(c).with_scale_and_position(TEXT_PX, point(0.0, scaled.ascent()));
+        if let Some(outline) = font.outline_glyph(glyph) {
+            let b = outline.px_bounds();
+            top = top.min(b.min.y);
+            bottom = bottom.max(b.max.y);
+        }
+    }
+    if top > bottom { (0.0, TEXT_PX) } else { (top, bottom - top) }
+}
+
+/// One line of text, horizontally centred on `center_x`, its line box's top at `top`.
 fn draw_text(img: &mut RgbaImage, font: &FontRef, text: &str, center_x: u32, top: u32) {
     let scaled = font.as_scaled(PxScale::from(TEXT_PX));
     let mut glyphs = Vec::new();
