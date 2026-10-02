@@ -116,6 +116,11 @@ fn hotkey_label(key: &str) -> String {
     if cfg!(target_os = "macos") { format!("Option+{key}") } else { format!("Alt+{key}") }
 }
 
+/// An in-app shortcut with the platform's command key, e.g. "⌘A" / "Ctrl+A".
+fn hotkey_label_cmd(key: &str) -> String {
+    if cfg!(target_os = "macos") { format!("⌘{key}") } else { format!("Ctrl+{key}") }
+}
+
 /// What the OS calls its file manager.
 fn reveal_label() -> &'static str {
     if cfg!(target_os = "macos") {
@@ -178,6 +183,8 @@ struct App {
     next_render_id: u64,
     /// Open "Rename clip" dialog.
     pub(crate) rename: Option<library::Rename>,
+    /// Clips selected in the library for a bulk action.
+    pub(crate) selection: library::Selection,
     /// Library auto-refresh: last folder poll + last-seen folder mtime.
     last_poll: Option<Instant>,
     dir_mtime: Option<SystemTime>,
@@ -229,6 +236,7 @@ impl App {
             render_rx,
             next_render_id: 0,
             rename: None,
+            selection: library::Selection::default(),
             last_poll: None,
             dir_mtime: None,
         };
@@ -281,6 +289,7 @@ impl App {
 
     fn refresh_clips(&mut self) {
         self.clips = clips::scan(&self.settings.output_dir);
+        self.selection.retain(&self.clips);
     }
 
     fn toast(&mut self, text: impl Into<String>) {
