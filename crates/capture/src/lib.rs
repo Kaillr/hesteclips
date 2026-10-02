@@ -17,6 +17,7 @@ pub mod mp4meta;
 #[cfg(any(target_os = "windows", test))]
 mod mp4mux;
 pub mod output;
+pub mod preview;
 pub mod sources;
 
 #[cfg(target_os = "macos")]
@@ -72,7 +73,35 @@ impl Recorder for Unsupported {
     }
 }
 
-/// Screens the backend can capture; their ids go in `EncodeSettings::screen_id`.
+/// What a recording's video shows. This is the bottom layer of the picture;
+/// overlays (a webcam) will go on top of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VideoSource {
+    /// A whole display, by backend id (see [`list_screens`]).
+    Screen { id: String },
+    /// Games and apps, by executable name (see [`list_windowed_apps`]): records
+    /// whichever of them is in focus, and keeps recording the last one while
+    /// something else is. Fitted into a frame the size of the main display.
+    /// Black while none of them is open; each is picked up as soon as it opens.
+    Apps { ids: Vec<String> },
+}
+
+/// Whether this platform can record games and apps ([`VideoSource::Apps`]).
+pub const APP_CAPTURE: bool = cfg!(target_os = "windows");
+
+/// Running apps with a window, for [`VideoSource::Apps`], sorted by name.
+pub fn list_windowed_apps() -> Vec<Device> {
+    #[cfg(target_os = "windows")]
+    {
+        win::list_windowed_apps()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Vec::new()
+    }
+}
+
+/// Screens the backend can capture; their ids go in [`VideoSource::Screen`].
 pub fn list_screens() -> Vec<Device> {
     #[cfg(target_os = "macos")]
     {
@@ -184,8 +213,8 @@ pub struct EncodeSettings {
     /// encoder on Windows) vs. software.
     pub use_hardware: bool,
     pub replay_seconds: u32,
-    /// Backend id of the screen to capture.
-    pub screen_id: String,
+    /// What the video shows.
+    pub video: VideoSource,
     /// Audio sources, in track order. Track 1 is the mix of every source with
     /// `in_mix` (so the file sounds right in any player); each source with
     /// `own_track` follows on its own track, for rebalancing later.

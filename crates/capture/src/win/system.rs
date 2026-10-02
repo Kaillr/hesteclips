@@ -16,7 +16,7 @@ use windows::Win32::Media::Audio::{
 };
 use windows::Win32::Media::MediaFoundation::{MF_VERSION, MFSTARTUP_FULL, MFStartup};
 use windows::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
-use windows::Win32::System::Com::{CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx};
+use windows::Win32::System::Com::{CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoIncrementMTAUsage, CoInitializeEx};
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
@@ -24,9 +24,12 @@ use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerforma
 use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
+use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute};
+use windows::Win32::Graphics::Gdi::ClientToScreen;
+use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetThreadDpiAwarenessContext};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GW_OWNER, GWL_EXSTYLE, GetWindow, GetWindowLongW, GetWindowTextLengthW, GetWindowThreadProcessId,
-    IsWindowVisible, WS_EX_TOOLWINDOW,
+    EnumWindows, GW_OWNER, GWL_EXSTYLE, GetClientRect, GetWindow, GetWindowLongW, GetWindowRect, GetWindowTextLengthW,
+    GetForegroundWindow, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, WS_EX_TOOLWINDOW,
 };
 use windows::core::{BOOL, Interface, PCWSTR};
 
@@ -34,7 +37,17 @@ use crate::Device;
 
 /// Join the multithreaded COM apartment (if this thread isn't in one already —
 /// a UI thread stays in its single-threaded one, which works just as well).
+///
+/// The apartment is also kept alive for the whole process. Otherwise it's torn
+/// down whenever its last thread ends (a preview or meters capture stopping),
+/// which invalidates the WinRT factories windows-rs caches process-wide — the
+/// next capture would crash using one.
 pub(crate) fn com_init() {
+    static KEEP_MTA: OnceLock<()> = OnceLock::new();
+    KEEP_MTA.get_or_init(|| {
+        // The cookie is never released: the apartment lives until exit.
+        let _ = unsafe { CoIncrementMTAUsage() };
+    });
     let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
 }
 
@@ -259,27 +272,52 @@ const NOT_APPS: [&str; 9] = [
     "ShellHost.exe",
 ];
 
-/// Apps the user could add as an audio source: processes with a real window
-/// or an audio session, by executable, named by their file description.
-pub fn list_apps() -> Vec<Device> {
-    com_init();
+/// Top-level windows a person would call "the app's window": visible,
+/// unowned, titled, not a tool window, and not cloaked (hidden by Windows
+/// without being minimized: suspended Store apps, other virtual desktops).
+fn app_windows() -> Vec<(HWND, u32)> {
     unsafe extern "system" fn collect(hwnd: HWND, out: LPARAM) -> BOOL {
-        let out = unsafe { &mut *(out.0 as *mut Vec<u32>) };
+        let out = unsafe { &mut *(out.0 as *mut Vec<(HWND, u32)>) };
         unsafe {
             let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
             let owned = GetWindow(hwnd, GW_OWNER).is_ok_and(|o| !o.is_invalid());
-            if IsWindowVisible(hwnd).as_bool() && !owned && ex_style & WS_EX_TOOLWINDOW.0 == 0 && GetWindowTextLengthW(hwnd) > 0 {
+            let mut cloaked = 0u32;
+            let _ = DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &mut cloaked as *mut _ as *mut _, 4);
+            if IsWindowVisible(hwnd).as_bool()
+                && !owned
+                && cloaked == 0
+                && ex_style & WS_EX_TOOLWINDOW.0 == 0
+                && GetWindowTextLengthW(hwnd) > 0
+            {
                 let mut pid = 0;
                 GetWindowThreadProcessId(hwnd, Some(&mut pid));
-                out.push(pid);
+                out.push((hwnd, pid));
             }
         }
         true.into()
     }
-    let mut pids: Vec<u32> = Vec::new();
-    let _ = unsafe { EnumWindows(Some(collect), LPARAM(&mut pids as *mut _ as isize)) };
-    pids.extend(audio_session_pids());
+    let mut out = Vec::new();
+    let _ = unsafe { EnumWindows(Some(collect), LPARAM(&mut out as *mut _ as isize)) };
+    out
+}
 
+/// Apps the user could add as an audio source: processes with a real window
+/// or an audio session, by executable, named by their file description.
+pub fn list_apps() -> Vec<Device> {
+    com_init();
+    let mut pids: Vec<u32> = app_windows().into_iter().map(|(_, pid)| pid).collect();
+    pids.extend(audio_session_pids());
+    apps_of(pids)
+}
+
+/// Apps whose window can be recorded ([`crate::VideoSource::Apps`]).
+pub fn list_windowed_apps() -> Vec<Device> {
+    apps_of(app_windows().into_iter().map(|(_, pid)| pid).collect())
+}
+
+/// Processes as apps: by executable, named by their file description, without
+/// shell processes or HesteClips itself, sorted by name.
+fn apps_of(pids: Vec<u32>) -> Vec<Device> {
     let own = std::process::id();
     let mut seen = std::collections::HashSet::new();
     let mut apps: Vec<Device> = pids
@@ -302,6 +340,112 @@ pub fn list_apps() -> Vec<Device> {
     apps
 }
 
+// ---------------------------------------------------------------------------
+// App windows to record
+// ---------------------------------------------------------------------------
+
+/// The window to record for an app: its biggest window that isn't minimized,
+/// else its biggest window at all (a minimized game keeps its last picture).
+pub(crate) fn find_app_window(exe: &str) -> Option<HWND> {
+    let mut exes: HashMap<u32, Option<String>> = HashMap::new();
+    let mut best: Option<(bool, i64, HWND)> = None;
+    for (hwnd, pid) in app_windows() {
+        let matches = exes
+            .entry(pid)
+            .or_insert_with(|| image_path(pid).and_then(|p| Some(std::path::Path::new(&p).file_name()?.to_string_lossy().into_owned())))
+            .as_deref()
+            .is_some_and(|e| e.eq_ignore_ascii_case(exe));
+        if !matches {
+            continue;
+        }
+        let shown = !unsafe { IsIconic(hwnd) }.as_bool();
+        let mut r = RECT::default();
+        let _ = unsafe { GetWindowRect(hwnd, &mut r) };
+        let area = (r.right - r.left) as i64 * (r.bottom - r.top) as i64;
+        if best.is_none_or(|(s, a, _)| (shown, area) > (s, a)) {
+            best = Some((shown, area, hwnd));
+        }
+    }
+    best.map(|(_, _, h)| h)
+}
+
+/// The window in focus, its app's executable, and whether it's a main window
+/// (the kind [`find_app_window`] picks) rather than a dialog or popup.
+pub(crate) fn foreground_app() -> Option<(HWND, String, bool)> {
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.is_invalid() {
+            return None;
+        }
+        let mut pid = 0;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        let exe = exe_of(pid)?;
+        let main = app_windows().iter().any(|(h, _)| *h == hwnd);
+        Some((hwnd, exe, main))
+    }
+}
+
+/// A process's executable name, cached (asked ten times a second for the
+/// focused window).
+fn exe_of(pid: u32) -> Option<String> {
+    static CACHE: std::sync::Mutex<Option<(std::time::Instant, HashMap<u32, Option<String>>)>> = std::sync::Mutex::new(None);
+    let mut cache = CACHE.lock().unwrap();
+    // Pids get reused: forget everything now and then.
+    if cache.as_ref().is_none_or(|(t, _)| t.elapsed() > std::time::Duration::from_secs(10)) {
+        *cache = Some((std::time::Instant::now(), HashMap::new()));
+    }
+    let map = &mut cache.as_mut().unwrap().1;
+    map.entry(pid)
+        .or_insert_with(|| image_path(pid).and_then(|p| Some(std::path::Path::new(&p).file_name()?.to_string_lossy().into_owned())))
+        .clone()
+}
+
+/// Whether a window is minimized.
+pub(crate) fn window_minimized(hwnd: HWND) -> bool {
+    unsafe { IsIconic(hwnd) }.as_bool()
+}
+
+/// Whether a window still exists.
+pub(crate) fn window_alive(hwnd: HWND) -> bool {
+    unsafe { IsWindow(Some(hwnd)) }.as_bool()
+}
+
+/// The main display and its size.
+pub(crate) fn primary_monitor() -> (HMONITOR, u32, u32) {
+    monitor_with_size(unsafe { MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY) })
+}
+
+fn monitor_with_size(handle: HMONITOR) -> (HMONITOR, u32, u32) {
+    let (w, h) = monitors().into_iter().find(|m| m.handle == handle).map_or((1920, 1080), |m| (m.width, m.height));
+    (handle, w, h)
+}
+
+/// Where a window's client area (the picture, without title bar and borders)
+/// sits inside a capture of the whole window, in pixels: (x, y, width, height).
+/// WGC captures the window's visible frame bounds, which is the origin here.
+pub(crate) fn client_area_in_capture(hwnd: HWND) -> Option<(u32, u32, u32, u32)> {
+    unsafe {
+        // Physical pixels whatever this thread's DPI awareness, so client and
+        // frame coordinates agree with each other and with the captured image.
+        let previous = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        let result = (|| {
+            let mut frame = RECT::default();
+            DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &mut frame as *mut _ as *mut _, std::mem::size_of::<RECT>() as u32).ok()?;
+            let mut client = RECT::default();
+            GetClientRect(hwnd, &mut client).ok()?;
+            let mut origin = POINT::default();
+            if !ClientToScreen(hwnd, &mut origin).as_bool() {
+                return None;
+            }
+            let x = (origin.x - frame.left).max(0) as u32;
+            let y = (origin.y - frame.top).max(0) as u32;
+            Some((x, y, client.right.max(0) as u32, client.bottom.max(0) as u32))
+        })();
+        SetThreadDpiAwarenessContext(previous);
+        result
+    }
+}
+
 /// Full path of a process's executable.
 fn image_path(pid: u32) -> Option<String> {
     unsafe {
@@ -315,8 +459,19 @@ fn image_path(pid: u32) -> Option<String> {
 }
 
 /// The "File description" from an executable's version info — what Task
-/// Manager shows ("Discord", "Spotify"), unlike the exe name.
+/// Manager shows ("Discord", "Spotify"), unlike the exe name. Cached: reading
+/// it from disk for every app each time a list opens is slow.
 fn file_description(path: &str) -> Option<String> {
+    static CACHE: std::sync::Mutex<Option<HashMap<String, Option<String>>>> = std::sync::Mutex::new(None);
+    if let Some(known) = CACHE.lock().unwrap().get_or_insert_with(HashMap::new).get(path) {
+        return known.clone();
+    }
+    let found = read_file_description(path);
+    CACHE.lock().unwrap().get_or_insert_with(HashMap::new).insert(path.to_owned(), found.clone());
+    found
+}
+
+fn read_file_description(path: &str) -> Option<String> {
     let wide: Vec<u16> = path.encode_utf16().chain([0]).collect();
     unsafe {
         let size = GetFileVersionInfoSizeW(PCWSTR(wide.as_ptr()), None);

@@ -7,7 +7,7 @@
 
 use egui::{Color32, RichText};
 
-use crate::settings::{self, Container, Encoder, FPS_CHOICES, OutputResolution, ShortcutAction};
+use crate::settings::{self, AudioSourceCfg, CaptureApp, CaptureTarget, Container, Encoder, FPS_CHOICES, OutputResolution, ShortcutAction, SourceKind};
 use crate::{App, RecState, reveal_label, shortcuts};
 
 /// Replay lengths offered as one-click choices (seconds).
@@ -36,19 +36,29 @@ impl App {
     }
 
     fn settings_column(&mut self, ui: &mut egui::Ui) {
-        if self.rec_state != RecState::Idle {
-            ui.add_space(12.0);
-            note(ui, "Capture is running. Changes apply the next time you start the buffer or a recording.");
+        // Capture settings are read when the buffer or a recording starts, so
+        // they're locked while one runs rather than silently not applying.
+        let idle = self.rec_state == RecState::Idle;
+        match self.rec_state {
+            RecState::Idle => {}
+            RecState::Buffering => {
+                ui.add_space(12.0);
+                note(ui, "Stop the replay buffer to change the replay length, video and saving settings.");
+            }
+            RecState::Recording => {
+                ui.add_space(12.0);
+                note(ui, "Stop recording to change the replay length, video and saving settings.");
+            }
         }
 
         section(ui, "Replay buffer", |ui| {
             row(ui, "Length", Some("How far back Save clip reaches."), |ui| {
-                ui.horizontal_wrapped(|ui| {
+                ui.add_enabled_ui(idle, |ui| ui.horizontal_wrapped(|ui| {
                     for secs in REPLAY_CHOICES {
                         let label = if secs < 60 { format!("{secs} s") } else { format!("{} min", secs / 60) };
                         ui.selectable_value(&mut self.settings.replay_seconds, secs, label);
                     }
-                });
+                }));
                 let size = human_bytes(self.estimated_bytes(self.settings.replay_seconds as f64));
                 ui.weak(format!("A full clip is about {size}"))
                     .on_hover_text(self.estimate_explainer());
@@ -60,75 +70,71 @@ impl App {
         });
 
         section(ui, "Video", |ui| {
-            row(ui, "Screen", None, |ui| {
-                let names: Vec<String> = self.screens.iter().map(|d| d.name.clone()).collect();
-                let current = names.get(self.settings.display_index).cloned().unwrap_or_else(|| "Main display".to_owned());
-                egui::ComboBox::from_id_salt("display").selected_text(current).truncate().show_ui(ui, |ui| {
-                    for (i, name) in names.iter().enumerate() {
-                        ui.selectable_value(&mut self.settings.display_index, i, name);
-                    }
-                });
-            });
-            divider(ui);
-            row(ui, "Resolution", Some("Lower sizes make smaller files."), |ui| {
-                egui::ComboBox::from_id_salt("resolution").selected_text(self.settings.resolution.label()).show_ui(ui, |ui| {
-                    for r in OutputResolution::ALL {
-                        ui.selectable_value(&mut self.settings.resolution, r, r.label());
-                    }
-                });
-            });
-            divider(ui);
-            row(ui, "Frame rate", None, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    for f in FPS_CHOICES {
-                        ui.selectable_value(&mut self.settings.fps, f, format!("{f}"));
-                    }
-                    ui.weak("fps");
-                });
-            });
-            divider(ui);
-            row(ui, "Bitrate", Some("Higher keeps fast motion sharp and makes bigger files."), |ui| {
-                ui.add(egui::Slider::new(&mut self.settings.video_bitrate_mbps, 5..=150).suffix(" Mbps"));
-                let per_min = human_bytes(self.estimated_bytes(60.0));
-                ui.weak(format!("About {per_min} per minute"))
-                    .on_hover_text(self.estimate_explainer());
-            });
-            divider(ui);
-            egui::CollapsingHeader::new(RichText::new("Advanced").strong())
-                .id_salt("video_advanced")
-                .default_open(false)
-                .show(ui, |ui| {
-                    ui.weak("Tuned for clips already. Change these only if you know you need to.");
-                    ui.add_space(4.0);
-                    self.advanced(ui);
-                });
-        });
-
-        section(ui, "Saving", |ui| {
-            row(ui, "Clips folder", None, |ui| {
-                ui.vertical(|ui| {
-                    ui.add(egui::Label::new(RichText::new(self.settings.output_dir.display().to_string()).monospace().size(12.0)).truncate())
-                        .on_hover_text(self.settings.output_dir.display().to_string());
-                    ui.horizontal(|ui| {
-                        if ui.button("Change…").clicked() {
-                            if let Some(dir) = rfd::FileDialog::new().set_directory(&self.settings.output_dir).pick_folder() {
-                                self.settings.output_dir = dir;
-                                self.refresh_clips();
-                            }
-                        }
-                        if ui.button(reveal_label()).clicked() {
-                            let _ = std::fs::create_dir_all(&self.settings.output_dir);
-                            let _ = crate::clips::open_in_default_app(&self.settings.output_dir);
+            ui.add_enabled_ui(idle, |ui| {
+                self.capture_target(ui);
+                divider(ui);
+                row(ui, "Resolution", Some("Lower sizes make smaller files."), |ui| {
+                    egui::ComboBox::from_id_salt("resolution").selected_text(self.settings.resolution.label()).show_ui(ui, |ui| {
+                        for r in OutputResolution::ALL {
+                            ui.selectable_value(&mut self.settings.resolution, r, r.label());
                         }
                     });
                 });
+                divider(ui);
+                row(ui, "Frame rate", None, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        for f in FPS_CHOICES {
+                            ui.selectable_value(&mut self.settings.fps, f, format!("{f}"));
+                        }
+                        ui.weak("fps");
+                    });
+                });
+                divider(ui);
+                row(ui, "Bitrate", Some("Higher keeps fast motion sharp and makes bigger files."), |ui| {
+                    ui.add(egui::Slider::new(&mut self.settings.video_bitrate_mbps, 5..=150).suffix(" Mbps"));
+                    let per_min = human_bytes(self.estimated_bytes(60.0));
+                    ui.weak(format!("About {per_min} per minute"))
+                        .on_hover_text(self.estimate_explainer());
+                });
+                divider(ui);
+                egui::CollapsingHeader::new(RichText::new("Advanced").strong())
+                    .id_salt("video_advanced")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        ui.weak("Tuned for clips already. Change these only if you know you need to.");
+                        ui.add_space(4.0);
+                        self.advanced(ui);
+                    });
             });
-            divider(ui);
-            row(ui, "File format", Some("MP4 plays everywhere."), |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    for c in [Container::Mp4, Container::Mov] {
-                        ui.selectable_value(&mut self.settings.container, c, c.ext().to_uppercase()).on_hover_text(c.label());
-                    }
+        });
+
+        section(ui, "Saving", |ui| {
+            ui.add_enabled_ui(idle, |ui| {
+                row(ui, "Clips folder", None, |ui| {
+                    ui.vertical(|ui| {
+                        ui.add(egui::Label::new(RichText::new(self.settings.output_dir.display().to_string()).monospace().size(12.0)).truncate())
+                            .on_hover_text(self.settings.output_dir.display().to_string());
+                        ui.horizontal(|ui| {
+                            if ui.button("Change…").clicked() {
+                                if let Some(dir) = rfd::FileDialog::new().set_directory(&self.settings.output_dir).pick_folder() {
+                                    self.settings.output_dir = dir;
+                                    self.refresh_clips();
+                                }
+                            }
+                            if ui.button(reveal_label()).clicked() {
+                                let _ = std::fs::create_dir_all(&self.settings.output_dir);
+                                let _ = crate::clips::open_in_default_app(&self.settings.output_dir);
+                            }
+                        });
+                    });
+                });
+                divider(ui);
+                row(ui, "File format", Some("MP4 plays everywhere."), |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        for c in [Container::Mp4, Container::Mov] {
+                            ui.selectable_value(&mut self.settings.container, c, c.ext().to_uppercase()).on_hover_text(c.label());
+                        }
+                    });
                 });
             });
         });
@@ -152,13 +158,117 @@ impl App {
 
         section(ui, "Reset", |ui| {
             row(ui, "Reset all settings", Some("Replay buffer, video, saving and shortcuts go back to their defaults. Your clips, clips folder, audio sources and HesteFiles account are kept."), |ui| {
-                if ui.button(RichText::new("Reset to defaults…").color(ui.visuals().error_fg_color)).clicked() {
+                let reset = egui::Button::new(RichText::new("Reset to defaults…").color(ui.visuals().error_fg_color));
+                if ui.add_enabled(idle, reset).on_disabled_hover_text("Stop capturing first").clicked() {
                     self.confirm_reset = true;
                 }
             });
         });
         ui.add_space(24.0);
         self.reset_dialog(ui.ctx());
+    }
+
+    /// "Record": the whole screen, or a list of games and apps.
+    fn capture_target(&mut self, ui: &mut egui::Ui) {
+        if capture::APP_CAPTURE {
+            row(ui, "Record", None, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    let apps = matches!(self.settings.capture, CaptureTarget::Apps { .. });
+                    if ui.selectable_label(!apps, "Whole screen").clicked() {
+                        self.settings.capture = CaptureTarget::Screen;
+                    }
+                    if ui.selectable_label(apps, "Games and apps").clicked() && !apps {
+                        self.settings.capture = CaptureTarget::Apps { apps: Vec::new() };
+                    }
+                });
+            });
+            divider(ui);
+        }
+        let apps = match &self.settings.capture {
+            CaptureTarget::Apps { apps } => apps.clone(),
+            _ => {
+                row(ui, "Screen", None, |ui| {
+                    let names: Vec<String> = self.screens.iter().map(|d| d.name.clone()).collect();
+                    let current = names.get(self.settings.display_index).cloned().unwrap_or_else(|| "Main display".to_owned());
+                    egui::ComboBox::from_id_salt("display").selected_text(current).truncate().show_ui(ui, |ui| {
+                        for (i, name) in names.iter().enumerate() {
+                            ui.selectable_value(&mut self.settings.display_index, i, name);
+                        }
+                    });
+                });
+                return;
+            }
+        };
+        let hint = "Records whichever of these you're using. Switch to something else and it keeps recording the last one. \
+                    Fitted to your main display's size; black while none is open.";
+        let mut list = apps.clone();
+        row(ui, "Games and apps", Some(hint), |ui| {
+            ui.vertical(|ui| {
+                if list.is_empty() {
+                    ui.weak("None yet. Add the games and apps to record.");
+                }
+                let mut remove = None;
+                for (i, app) in list.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        if ui.small_button("✕").on_hover_text("Stop recording this one").clicked() {
+                            remove = Some(i);
+                        }
+                        ui.label(&app.name).on_hover_text(&app.id);
+                    });
+                }
+                if let Some(i) = remove {
+                    list.remove(i);
+                }
+                ui.horizontal_wrapped(|ui| {
+                    let add = ui.menu_button("➕ Add", |ui| {
+                        ui.set_min_width(220.0);
+                        let mut any = false;
+                        egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                            for app in self.windowed_apps.clone() {
+                                if list.iter().any(|a| a.id.eq_ignore_ascii_case(&app.id)) {
+                                    continue;
+                                }
+                                any = true;
+                                if ui.button(&app.name).on_hover_text(&app.id).clicked() {
+                                    list.push(CaptureApp { id: app.id, name: app.name });
+                                    ui.close();
+                                }
+                            }
+                        });
+                        if !any {
+                            ui.weak("No other apps with a window are open.");
+                        }
+                    });
+                    if add.response.clicked() {
+                        self.windowed_apps = capture::list_windowed_apps();
+                    }
+                    // Their sound usually belongs with their picture.
+                    let silent: Vec<CaptureApp> = list
+                        .iter()
+                        .filter(|a| {
+                            !self.settings.audio_sources.iter().any(
+                                |s| matches!(&s.kind, SourceKind::App { bundle_id, .. } if bundle_id.eq_ignore_ascii_case(&a.id)),
+                            )
+                        })
+                        .cloned()
+                        .collect();
+                    if !silent.is_empty() {
+                        let label = if silent.len() == 1 { format!("Also record {}'s sound", silent[0].name) } else { "Also record their sound".to_owned() };
+                        if ui.button(label).clicked() {
+                            for a in &silent {
+                                self.settings
+                                    .audio_sources
+                                    .push(AudioSourceCfg::new(&a.name, SourceKind::App { bundle_id: a.id.clone(), app_name: a.name.clone() }));
+                            }
+                            self.toast(if silent.len() == 1 { format!("Added {} to Sources", silent[0].name) } else { format!("Added {} apps to Sources", silent.len()) });
+                        }
+                    }
+                });
+            });
+        });
+        if list != apps {
+            self.settings.capture = CaptureTarget::Apps { apps: list };
+        }
     }
 
     fn advanced(&mut self, ui: &mut egui::Ui) {

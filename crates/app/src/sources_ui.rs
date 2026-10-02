@@ -44,6 +44,11 @@ pub(crate) struct SourcesView {
     last_frame: Option<Instant>,
     /// Running apps for the "Add app" menu, refreshed when it opens.
     apps: Vec<capture::Device>,
+    /// The preview picture, and which frame it shows.
+    preview: Option<(egui::TextureHandle, u64)>,
+    /// Preview frames shown in the current second, when it started, and the
+    /// rate over the last full second.
+    preview_rate: (u32, Option<Instant>, u32),
     renaming: Option<String>,
 }
 
@@ -66,8 +71,13 @@ impl App {
         }
         let dt = self.sources_view.last_frame.map_or(0.0, |t| (now - t).as_secs_f32()).min(0.2);
         self.sources_view.last_frame = Some(now);
-        // Meters move: keep repainting while this page is open.
-        ui.ctx().request_repaint_after(Duration::from_millis(16));
+        // Meters and the preview move: keep repainting while this page is open —
+        // every display refresh when there's a preview to keep up with.
+        if capture::preview::AVAILABLE {
+            ui.ctx().request_repaint();
+        } else {
+            ui.ctx().request_repaint_after(Duration::from_millis(16));
+        }
 
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             // Centred column that follows the window, up to a comfortable width.
@@ -86,6 +96,10 @@ impl App {
 
     fn sources_column(&mut self, ui: &mut egui::Ui, now: Instant, dt: f32) {
         ui.add_space(12.0);
+        if capture::preview::AVAILABLE {
+            self.preview_panel(ui);
+            ui.add_space(12.0);
+        }
         // The mix first: it's what people hear, and where clipping matters most.
         self.master_strip(ui, now, dt);
         ui.add_space(18.0);
@@ -201,6 +215,104 @@ impl App {
 
     /// The clip's mix: a big stereo meter with scale, peak readout, clip light,
     /// and the limiter with its gain-reduction meter.
+    /// What the recording shows, live: the screen or the app being recorded.
+    fn preview_panel(&mut self, ui: &mut egui::Ui) {
+        capture::preview::request();
+        let frame = capture::preview::latest();
+        if let Some(f) = &frame {
+            if self.sources_view.preview.as_ref().is_none_or(|(_, seq)| *seq != f.seq) {
+                // Opaque, so it's already premultiplied: one copy, no per-pixel work.
+                let pixels: Vec<egui::Color32> = bytemuck::cast_slice(&f.rgba).to_vec();
+                let image = egui::ColorImage::new([f.width as usize, f.height as usize], pixels);
+                let (count, since, rate) = &mut self.sources_view.preview_rate;
+                *count += 1;
+                match since {
+                    Some(t) if t.elapsed() >= Duration::from_secs(1) => {
+                        *rate = *count;
+                        *count = 0;
+                        *since = Some(Instant::now());
+                    }
+                    None => *since = Some(Instant::now()),
+                    _ => {}
+                }
+                match &mut self.sources_view.preview {
+                    Some((tex, seq)) => {
+                        tex.set(image, egui::TextureOptions::LINEAR);
+                        *seq = f.seq;
+                    }
+                    None => {
+                        let tex = ui.ctx().load_texture("capture_preview", image, egui::TextureOptions::LINEAR);
+                        self.sources_view.preview = Some((tex, f.seq));
+                    }
+                }
+            }
+        }
+        // What's being recorded: the display, or the app in focus right now.
+        let apps: Option<Vec<crate::settings::CaptureApp>> = match &self.settings.capture {
+            crate::settings::CaptureTarget::Apps { apps } => Some(apps.clone()),
+            _ => None,
+        };
+        let target = match &apps {
+            Some(apps) => {
+                let showing = frame.as_ref().and_then(|f| f.app.as_deref());
+                let name_of = |exe: &str| apps.iter().find(|a| a.id.eq_ignore_ascii_case(exe)).map_or_else(|| exe.to_owned(), |a| a.name.clone());
+                match showing {
+                    Some(exe) if !frame.as_ref().is_some_and(|f| f.waiting) => format!("Recording {}", name_of(exe)),
+                    _ if apps.is_empty() => "No games or apps chosen".to_owned(),
+                    _ => format!("{} games and apps", apps.len()),
+                }
+            }
+            None => self.screens.get(self.settings.display_index).map_or_else(|| "Main display".to_owned(), |d| d.name.clone()),
+        };
+        card(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("🖵 Video").size(16.0).strong())
+                    .on_hover_text("What your clips show. Change it in Settings → Video.");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if let Some(f) = &frame {
+                        let rate = self.sources_view.preview_rate.2;
+                        ui.weak(format!("{}×{} · {rate} fps", f.width, f.height))
+                            .on_hover_text("The preview's size and how many frames it's showing per second. It can't show more than your display refreshes.");
+                        ui.weak("·");
+                    }
+                    ui.weak(&target);
+                });
+            });
+            ui.add_space(6.0);
+            // The picture, as wide as the card, but never taller than a third of
+            // the window so the sources stay in view.
+            let aspect = frame.as_ref().map_or(16.0 / 9.0, |f| f.width as f32 / f.height.max(1) as f32);
+            let max_h = (ui.ctx().content_rect().height() / 3.0).max(120.0);
+            let w = ui.available_width().min(max_h * aspect);
+            let size = egui::vec2(w, w / aspect);
+            ui.vertical_centered(|ui| {
+                let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+                let p = ui.painter();
+                p.rect_filled(rect, 4.0, Color32::BLACK);
+                match (&self.sources_view.preview, &frame) {
+                    (Some((tex, _)), Some(_)) => {
+                        p.image(tex.id(), rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+                    }
+                    _ => {
+                        let text = match self.video_preview.as_ref().and_then(|(_, p)| p.error()) {
+                            Some(e) => format!("No preview: {e}"),
+                            None => "Starting preview…".to_owned(),
+                        };
+                        p.text(rect.center(), egui::Align2::CENTER_CENTER, text, egui::FontId::proportional(13.0), Color32::from_gray(150));
+                    }
+                }
+                if frame.as_ref().is_some_and(|f| f.waiting) {
+                    let text = match &apps {
+                        Some(apps) if apps.is_empty() => "Add the games and apps to record in Settings → Video.".to_owned(),
+                        Some(apps) if apps.len() == 1 => format!("Waiting for {} to open. Clips are black until then.", apps[0].name),
+                        _ => "Waiting for one of your games or apps to open. Clips are black until then.".to_owned(),
+                    };
+                    p.text(rect.center(), egui::Align2::CENTER_CENTER, text, egui::FontId::proportional(13.0), Color32::from_gray(170));
+                }
+            });
+        });
+    }
+
     fn master_strip(&mut self, ui: &mut egui::Ui, now: Instant, dt: f32) {
         let view = &mut self.sources_view;
         view.master.update(self.live_audio.master.take(), now, dt);
@@ -252,6 +364,26 @@ impl App {
     /// Run a level-only capture while this page is open and nothing is recording,
     /// so the meters work before you start; stop it otherwise. Restarts when the
     /// sources change. Called every frame from the app loop.
+    /// Like the meters' capture: a preview-only video capture while this page is
+    /// open and nothing records (a running capture feeds the preview itself).
+    /// Restarts when what to record changes.
+    pub(crate) fn ensure_video_preview(&mut self) {
+        let want = capture::preview::AVAILABLE && self.page == crate::Page::Sources && self.rec_state == crate::RecState::Idle;
+        if !want {
+            self.video_preview = None;
+            return;
+        }
+        // What a recording would be: same picture, size and frame rate.
+        let wanted = (self.video_source(), self.settings.resolution.height(), self.settings.fps);
+        if self.video_preview.as_ref().is_none_or(|(w, _)| *w != wanted) {
+            let (source, height, fps) = &wanted;
+            // Both happen in the background: the old capture closes as the new
+            // one opens, and only the new one's frames are shown.
+            let preview = capture::preview::VideoPreview::start(source, *height, *fps);
+            self.video_preview = Some((wanted, preview));
+        }
+    }
+
     pub(crate) fn ensure_level_monitor(&mut self) {
         let want = self.page == crate::Page::Sources && self.rec_state == crate::RecState::Idle;
         if !want {

@@ -165,6 +165,8 @@ struct App {
     permission: capture::Permission,
     /// Screens detected by the capture backend.
     screens: Vec<capture::Device>,
+    /// Apps with a window, for the "A game or app" picker; listed when it opens.
+    pub(crate) windowed_apps: Vec<capture::Device>,
     /// System audio inputs/outputs (+ current OS defaults).
     audio: capture::audio::AudioDevices,
     /// Live per-source volume and meters, shared with the capture thread.
@@ -172,6 +174,9 @@ struct App {
     /// Meters-only capture while the Sources page is open and nothing records,
     /// with the sources it was started for.
     level_monitor: Option<(Vec<capture::sources::AudioSource>, capture::sources::LevelMonitor)>,
+    /// Preview-only capture while the Sources page is open and nothing records,
+    /// with the source, height and frame rate it was started for.
+    pub(crate) video_preview: Option<((capture::VideoSource, Option<u32>, u32), capture::preview::VideoPreview)>,
     sources_view: sources_ui::SourcesView,
     clips: Vec<clips::Clip>,
     thumbs: thumbs::Thumbs,
@@ -228,9 +233,11 @@ impl App {
             confirm_reset: false,
             permission: capture::screen_permission(),
             screens: capture::list_screens(),
+            windowed_apps: Vec::new(),
             audio: capture::audio::list_audio_devices(),
             live_audio,
             level_monitor: None,
+            video_preview: None,
             sources_view: Default::default(),
             clips,
             thumbs: thumbs::Thumbs::new(ctx.clone()),
@@ -314,11 +321,6 @@ impl App {
 
     /// Translate the UI's `RecordSettings` into the backend's `EncodeSettings`.
     fn encode_settings(&self) -> capture::EncodeSettings {
-        let screen_id = self
-            .screens
-            .get(self.settings.display_index)
-            .map(|d| d.id.clone())
-            .unwrap_or_else(|| "0".to_owned());
         capture::EncodeSettings {
             output_dir: self.settings.output_dir.clone(),
             container_ext: self.settings.container.ext().to_owned(),
@@ -328,8 +330,20 @@ impl App {
             keyframe_interval_secs: self.settings.keyframe_interval_secs,
             use_hardware: self.settings.encoder != Encoder::Software,
             replay_seconds: self.settings.replay_seconds,
-            screen_id,
+            video: self.video_source(),
             sources: self.capture_sources(),
+        }
+    }
+
+    /// What the video shows, for the capture backend.
+    pub(crate) fn video_source(&self) -> capture::VideoSource {
+        match &self.settings.capture {
+            settings::CaptureTarget::Apps { apps } if capture::APP_CAPTURE => {
+                capture::VideoSource::Apps { ids: apps.iter().map(|a| a.id.clone()).collect() }
+            }
+            _ => capture::VideoSource::Screen {
+                id: self.screens.get(self.settings.display_index).map(|d| d.id.clone()).unwrap_or_else(|| "0".to_owned()),
+            },
         }
     }
 
@@ -386,6 +400,7 @@ impl eframe::App for App {
         // Every frame, not just while the Sources page draws: leaving the page must
         // stop the meters' capture, or macOS keeps showing its recording indicator.
         self.ensure_level_monitor();
+        self.ensure_video_preview();
 
         // The editor gets the whole window; capture keeps running underneath and the
         // hotkeys still work.

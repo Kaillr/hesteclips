@@ -1,12 +1,12 @@
 //! Native Windows capture backend: Windows Graphics Capture + Media Foundation +
 //! WASAPI, all in-process — no external tools.
 //!
-//! - **Video**: WGC delivers the monitor as BGRA textures on the GPU (`d3d`). A
-//!   pacer thread converts the newest one to NV12 at the output size with the
-//!   GPU's video processor and hands it to a Media Foundation H.264 encoder
-//!   (`h264`) at exactly `fps`, so the output is constant frame rate even when
-//!   the screen is static and WGC sends nothing. Frames never leave the GPU
-//!   unless the software encoder is used.
+//! - **Video**: WGC delivers the monitor, or one app's window, as BGRA textures
+//!   on the GPU (`d3d`). A pacer thread converts the newest one to NV12 at the
+//!   output size with the GPU's video processor and hands it to a Media
+//!   Foundation H.264 encoder (`h264`) at exactly `fps`, so the output is
+//!   constant frame rate even when the screen is static and WGC sends nothing.
+//!   Frames never leave the GPU unless the software encoder is used.
 //! - **Desktop and app audio**: WASAPI process loopback (`loopback`). **Mics**
 //!   use cpal.
 //! - **Mixing** happens in Rust (`crate::mixer`), which also drives the live
@@ -36,14 +36,14 @@ use anyhow::{Context, Result, bail};
 
 pub(crate) use loopback::SystemAudio;
 pub(crate) use system::host_now;
-pub use system::{list_apps, list_screens};
+pub use system::{list_apps, list_screens, list_windowed_apps};
 
 use crate::mixer::{self, Clock, LiveAudio};
 use crate::mp4mux::Spec;
 use crate::output::{in_progress, timestamp};
 use crate::sources::{AudioCapture, mix_inputs, track_layout};
 use crate::writer::{self, Media, Writer};
-use crate::{EncodeSettings, Mode, Recorder};
+use crate::{EncodeSettings, Mode, Recorder, VideoSource};
 use aac::AacEncoder;
 use file::Layout;
 
@@ -182,7 +182,7 @@ const MIX_LATENCY: f64 = 0.3;
 /// Everything a running capture owns. Torn down in `finish` in an order that
 /// lets every encoder flush into the writer before it closes the file.
 struct Session {
-    capture: Option<d3d::Capture>,
+    video: Option<Video>,
     pacer: Option<(Arc<AtomicBool>, JoinHandle<()>)>,
     audio: Option<AudioCapture>,
     mixer: Option<(Arc<AtomicBool>, JoinHandle<()>)>,
@@ -197,9 +197,8 @@ impl Session {
         system::com_init();
         system::mf_startup()?;
         let gpu = d3d::Gpu::new()?;
-        let item = d3d::capture_item(system::find_monitor(&s.screen_id))?;
-        let native = item.Size()?;
-        let (width, height) = output_size(native.Width.max(2) as u32, native.Height.max(2) as u32, s.target_height);
+        let (picture_source, (canvas_w, canvas_h)) = PictureSource::plan(&s.video)?;
+        let (width, height) = output_size(canvas_w, canvas_h, s.target_height);
         let clock = Arc::new(Clock::default());
 
         let (titles, comment, has_rest) = track_layout(&s.sources);
@@ -214,7 +213,7 @@ impl Session {
         let writer_tx = writer.tx.clone();
 
         let mut session =
-            Self { capture: None, pacer: None, audio: None, mixer: None, encoders: Vec::new(), writer_tx, writer: Some(writer) };
+            Self { video: None, pacer: None, audio: None, mixer: None, encoders: Vec::new(), writer_tx, writer: Some(writer) };
         let started = (|| -> Result<()> {
             // One PCM channel + AAC thread per track, in layout order: the mix,
             // each own track, the rest.
@@ -244,21 +243,12 @@ impl Session {
             session.mixer = Some((stop, mixer));
 
             let encoder = h264::Encoder::start(&gpu, width, height, s, session.writer_tx.clone())?;
-            let capture = d3d::Capture::start(&gpu, &item)?;
-            let converter = d3d::Converter::new(&gpu, &capture.latest, &encoder.pool, width, height, s.fps)?;
-            let latest = capture.latest.clone();
-            session.capture = Some(capture);
-
-            // Wait for the first frame so a capture that can't see the screen fails
-            // here, visibly, instead of producing an empty file.
-            let deadline = Instant::now() + Duration::from_secs(3);
-            while !latest.has_frame() {
-                if Instant::now() >= deadline {
-                    bail!("the screen isn't delivering frames");
-                }
-                thread::sleep(Duration::from_millis(10));
-            }
-            session.pacer = Some(spawn_pacer(s.fps, latest, converter, encoder, clock));
+            let picture = picture_source.open(&gpu, canvas_w, canvas_h)?;
+            let latest = picture.latest.clone();
+            session.video = Some(picture.video);
+            let converter = d3d::Converter::new(&gpu, &latest, &encoder.pool.textures, true, width, height, s.fps)?;
+            let preview = d3d::Previewer::new(&gpu, &latest, width, height, s.fps, crate::preview::new_producer())?;
+            session.pacer = Some(spawn_pacer(s.fps, latest, converter, encoder, preview, clock));
             Ok(())
         })();
         if let Err(e) = started {
@@ -275,7 +265,9 @@ impl Session {
             stop.store(true, Ordering::Relaxed);
             let _ = handle.join();
         }
-        self.capture.take();
+        if let Some(video) = self.video.take() {
+            video.stop();
+        }
         if let Some(audio) = self.audio.take() {
             audio.stop();
         }
@@ -290,6 +282,218 @@ impl Session {
         }
         drop(self.writer_tx);
         self.writer.take().map_or(Ok(()), Writer::join)
+    }
+}
+
+/// Where a session's picture comes from: a display, or an app's window.
+enum PictureSource {
+    Screen(windows::Graphics::Capture::GraphicsCaptureItem),
+    Apps(Vec<String>),
+}
+
+/// A running capture and the texture it fills.
+struct Picture {
+    video: Video,
+    latest: Arc<d3d::Latest>,
+}
+
+impl PictureSource {
+    /// The source, and the frame size: the display's — for apps, the main
+    /// display's — so it can't change mid-file, whatever the windows do.
+    fn plan(source: &VideoSource) -> Result<(Self, (u32, u32))> {
+        Ok(match source {
+            VideoSource::Screen { id } => {
+                let item = d3d::monitor_item(system::find_monitor(id))?;
+                let size = item.Size()?;
+                (PictureSource::Screen(item), (size.Width.max(2) as u32, size.Height.max(2) as u32))
+            }
+            VideoSource::Apps { ids } => {
+                let (_, w, h) = system::primary_monitor();
+                (PictureSource::Apps(ids.clone()), (w, h))
+            }
+        })
+    }
+
+    fn open(self, gpu: &d3d::Gpu, width: u32, height: u32) -> Result<Picture> {
+        let latest = d3d::Latest::new(gpu, width, height)?;
+        let video = match self {
+            PictureSource::Apps(ids) => {
+                // Black until one of the apps' windows shows up.
+                latest.clear()?;
+                Video::follow_apps(gpu.clone(), latest.clone(), ids)
+            }
+            PictureSource::Screen(item) => {
+                let video = Video::Screen { _capture: d3d::Capture::start(gpu, &item, &latest, None)? };
+                // Wait for the first frame so a capture that can't see the screen
+                // fails here, visibly, instead of producing an empty file.
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while !latest.has_frame() {
+                    if Instant::now() >= deadline {
+                        bail!("the screen isn't delivering frames");
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                video
+            }
+        };
+        Ok(Picture { video, latest })
+    }
+}
+
+/// A capture made only for the preview (`crate::preview::VideoPreview`). Runs
+/// entirely on its own thread: starting doesn't wait for the capture to open,
+/// and dropping doesn't wait for it to close.
+pub(crate) struct PreviewCapture {
+    stop: Arc<AtomicBool>,
+    error: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+impl PreviewCapture {
+    pub(crate) fn start(source: VideoSource, target_height: Option<u32>, fps: u32) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let error = Arc::new(std::sync::Mutex::new(None));
+        let (stop2, error2) = (stop.clone(), error.clone());
+        let generation = crate::preview::new_producer();
+        thread::spawn(move || {
+            system::com_init();
+            let opened = (|| -> Result<(Picture, d3d::Previewer)> {
+                let gpu = d3d::Gpu::new()?;
+                let (source, (w, h)) = PictureSource::plan(&source)?;
+                let picture = source.open(&gpu, w, h)?;
+                let (width, height) = output_size(w, h, target_height);
+                let preview = d3d::Previewer::new(&gpu, &picture.latest, width, height, fps, generation)?;
+                Ok((picture, preview))
+            })();
+            let (picture, preview) = match opened {
+                Ok(p) => p,
+                Err(e) => {
+                    *error2.lock().unwrap() = Some(format!("{e:#}"));
+                    return;
+                }
+            };
+            // Paced like the recording would be.
+            let every = 1.0 / fps.max(1) as f64;
+            let t0 = host_now();
+            let mut n = 0u64;
+            while !stop2.load(Ordering::Relaxed) {
+                if let Err(e) = preview.submit() {
+                    eprintln!("preview: {e:#}");
+                }
+                n += 1;
+                let wait = t0 + n as f64 * every - host_now();
+                if wait > 0.0 {
+                    thread::sleep(Duration::from_secs_f64(wait));
+                } else if wait < -0.5 {
+                    n = ((host_now() - t0) / every) as u64; // fell far behind: skip ahead
+                }
+            }
+            drop(preview);
+            picture.video.stop();
+        });
+        Self { stop, error }
+    }
+
+    pub(crate) fn error(&self) -> Option<String> {
+        self.error.lock().unwrap().clone()
+    }
+}
+
+impl Drop for PreviewCapture {
+    /// Tell the thread to stop; it closes the capture by itself.
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Keeps the picture coming: one capture of a display, or the windows of a set
+/// of apps, following focus between them and each as it closes and reopens.
+enum Video {
+    /// Held to keep the capture running.
+    Screen { _capture: d3d::Capture },
+    App { stop: Arc<AtomicBool>, thread: JoinHandle<()> },
+}
+
+impl Video {
+    /// How often to look at which app is in focus.
+    const RESCAN: Duration = Duration::from_millis(100);
+
+    fn follow_apps(gpu: d3d::Gpu, latest: Arc<d3d::Latest>, apps: Vec<String>) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let thread = thread::spawn(move || {
+            system::com_init();
+            let listed = |exe: &str| apps.iter().find(|a| a.eq_ignore_ascii_case(exe)).cloned();
+            // The listed app last in focus: recorded until another one is.
+            let mut active: Option<String> = None;
+            let mut current: Option<(windows::Win32::Foundation::HWND, String, d3d::Capture)> = None;
+            // A window that couldn't be captured, so it's reported once.
+            let mut failed = None;
+            while !stop2.load(Ordering::Relaxed) {
+                let focused = system::foreground_app().and_then(|(h, exe, main)| Some((h, listed(&exe)?, main)));
+                if let Some((_, app, _)) = &focused {
+                    active = Some(app.clone());
+                }
+                // Keep the window being recorded while it's still the active
+                // app's, open, and shown (or focused): switching costs a moment,
+                // and flipping between two of an app's windows would flicker.
+                let keep = current.as_ref().is_some_and(|(h, app, capture)| {
+                    Some(app) == active.as_ref()
+                        && !capture.is_closed()
+                        && system::window_alive(*h)
+                        && (focused.as_ref().is_none_or(|(f, _, main)| !main || f == h) && !system::window_minimized(*h)
+                            || focused.as_ref().is_some_and(|(f, _, _)| f == h))
+                });
+                if !keep {
+                    // What to record now: the focused window of a listed app, else
+                    // the active app's main window, else the first listed app
+                    // that's open.
+                    let target = focused
+                        .as_ref()
+                        .filter(|(_, _, main)| *main)
+                        .map(|(h, app, _)| (*h, app.clone()))
+                        .or_else(|| active.as_ref().and_then(|a| Some((system::find_app_window(a)?, a.clone()))))
+                        .or_else(|| apps.iter().find_map(|a| Some((system::find_app_window(a)?, a.clone()))));
+                    let same = current.as_ref().zip(target.as_ref()).is_some_and(|((h, ..), (t, _))| h == t);
+                    if !same {
+                        current = None;
+                        match target.filter(|(h, _)| failed != Some(*h)) {
+                            None => {
+                                // Nothing listed is open: black until something is.
+                                if !latest.waiting() {
+                                    let _ = latest.clear();
+                                }
+                                latest.set_app(None);
+                            }
+                            Some((h, app)) => {
+                                match d3d::window_item(h).and_then(|item| d3d::Capture::start(&gpu, &item, &latest, Some(h))) {
+                                    Ok(capture) => {
+                                        latest.set_app(Some(app.clone()));
+                                        active = Some(app.clone());
+                                        current = Some((h, app, capture));
+                                    }
+                                    Err(e) => {
+                                        eprintln!("can't record {app}'s window: {e:#}");
+                                        failed = Some(h);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                let until = Instant::now() + Self::RESCAN;
+                while Instant::now() < until && !stop2.load(Ordering::Relaxed) {
+                    thread::sleep(Duration::from_millis(20));
+                }
+            }
+        });
+        Video::App { stop, thread }
+    }
+
+    fn stop(self) {
+        if let Video::App { stop, thread } = self {
+            stop.store(true, Ordering::Relaxed);
+            let _ = thread.join();
+        }
     }
 }
 
@@ -329,6 +533,7 @@ fn spawn_pacer(
     latest: Arc<d3d::Latest>,
     converter: d3d::Converter,
     encoder: h264::Encoder,
+    preview: d3d::Previewer,
     clock: Arc<Clock>,
 ) -> (Arc<AtomicBool>, JoinHandle<()>) {
     let stop = Arc::new(AtomicBool::new(false));
@@ -339,6 +544,7 @@ fn spawn_pacer(
         clock.set(t0);
         let mut next: i64 = 0;
         let mut dropped = 0u64;
+
         while !stop2.load(Ordering::Relaxed) {
             let now = host_now();
             let due = ((now - t0) * fps_f) as i64;
@@ -366,6 +572,10 @@ fn spawn_pacer(
                 }
                 next += 1;
                 burst += 1;
+            }
+            // The Sources page is showing the preview: hand it this picture too.
+            if let Err(e) = preview.submit() {
+                eprintln!("preview: {e:#}");
             }
             let wake = t0 + next as f64 / fps_f;
             let wait = wake - host_now();

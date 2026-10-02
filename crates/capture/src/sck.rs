@@ -221,7 +221,11 @@ struct Session {
 impl Session {
     fn start(s: &EncodeSettings, target: Target, live: &Arc<LiveAudio>) -> Result<Self> {
         let content = shareable_content()?;
-        let display = pick_display(&content, &s.screen_id).context("no display to capture")?;
+        let screen_id = match &s.video {
+            crate::VideoSource::Screen { id } => id.as_str(),
+            crate::VideoSource::Apps { .. } => bail!("recording games and apps isn't available on macOS yet"),
+        };
+        let display = pick_display(&content, screen_id).context("no display to capture")?;
         let (width, height) = output_size(&display, s.target_height);
         let clock = Arc::new(Clock::default());
 

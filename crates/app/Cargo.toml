@@ -9,6 +9,7 @@ name = "hesteclips"
 path = "src/main.rs"
 
 [dependencies]
+bytemuck = "1"
 capture = { path = "../capture" }
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 clipboard-rs = { version = "0.3", default-features = false }

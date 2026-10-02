@@ -101,6 +101,29 @@ impl OutputResolution {
     ];
 }
 
+/// What the video shows.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CaptureTarget {
+    /// The display chosen by `display_index`.
+    #[default]
+    Screen,
+    /// Games and apps: whichever is in focus is recorded (see
+    /// `capture::VideoSource::Apps`).
+    Apps { apps: Vec<CaptureApp> },
+    /// One app, from before several could be chosen; read only, turned into
+    /// `Apps` on load.
+    App { id: String, name: String },
+}
+
+/// A game or app to record, by executable. `name` is what to call it while it
+/// isn't running.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptureApp {
+    pub id: String,
+    pub name: String,
+}
+
 /// Where an audio source's sound comes from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -219,6 +242,8 @@ fn migrate(old: &[LegacyAudioTrack]) -> Vec<AudioSourceCfg> {
 #[serde(default)]
 pub struct RecordSettings {
     // --- Common (always visible on the Settings tab) ---
+    /// What the video shows: a whole display or one app's window.
+    pub capture: CaptureTarget,
     /// Index into the runtime-detected display list.
     pub display_index: usize,
     pub fps: u32,
@@ -253,6 +278,7 @@ pub struct RecordSettings {
 impl Default for RecordSettings {
     fn default() -> Self {
         Self {
+            capture: CaptureTarget::Screen,
             display_index: 0,
             fps: 60,
             resolution: OutputResolution::Native,
@@ -349,12 +375,20 @@ impl RecordSettings {
             .and_then(|p| std::fs::read(p).ok())
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
+        s.upgrade_capture();
         if let Some(old) = s.audio_tracks.take() {
             s.audio_sources = migrate(&old);
             // Persist now: sources get fresh ids, and their volumes key on them.
             Self::save_json(&s.to_json());
         }
         s
+    }
+
+    /// A single chosen app (from before several could be) becomes a list of one.
+    fn upgrade_capture(&mut self) {
+        if let CaptureTarget::App { id, name } = &self.capture {
+            self.capture = CaptureTarget::Apps { apps: vec![CaptureApp { id: id.clone(), name: name.clone() }] };
+        }
     }
 
     /// Serialized form, used both to save and to detect changes cheaply.
@@ -369,5 +403,21 @@ impl RecordSettings {
             }
             let _ = std::fs::write(path, json);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn single_app_setting_becomes_a_list() {
+        let mut s: RecordSettings =
+            serde_json::from_str(r#"{"fps": 144, "capture": {"type": "app", "id": "game.exe", "name": "Game"}}"#).unwrap();
+        s.upgrade_capture();
+        assert_eq!(s.fps, 144, "the rest of the settings survive");
+        assert_eq!(s.capture, CaptureTarget::Apps { apps: vec![CaptureApp { id: "game.exe".into(), name: "Game".into() }] });
+        let round: RecordSettings = serde_json::from_str(&s.to_json()).unwrap();
+        assert_eq!(round.capture, s.capture);
     }
 }

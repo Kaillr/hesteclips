@@ -3,7 +3,8 @@
 //! Args are sources: `mic:<device>`, `desktop`, `desktop-excl` (desktop minus app
 //! sources), `app:<bundle id or exe>`. Append `@mix`, `@track` to limit where it
 //! goes (default both). Env: REPLAY=1, SECS=n, EXT=mov, HEIGHT=n (0 = native),
-//! FPS=n, SOFTWARE=1, SCREEN=<id>.
+//! FPS=n, SOFTWARE=1, SCREEN=<id>, APP=<exe>[,<exe>…] (record those apps' windows,
+//! following focus).
 use capture::sources::{AudioSource, SourceKind};
 use capture::{EncodeSettings, Mode, mixer::LiveAudio};
 
@@ -45,7 +46,10 @@ fn main() -> anyhow::Result<()> {
         keyframe_interval_secs: 2,
         use_hardware: env("SOFTWARE").is_none(),
         replay_seconds: 5,
-        screen_id: env("SCREEN").unwrap_or_default(),
+        video: match env("APP") {
+            Some(ids) => capture::VideoSource::Apps { ids: ids.split(',').map(str::to_owned).collect() },
+            None => capture::VideoSource::Screen { id: env("SCREEN").unwrap_or_default() },
+        },
         sources: sources.clone(),
     })?;
     let secs: u64 = std::env::var("SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
