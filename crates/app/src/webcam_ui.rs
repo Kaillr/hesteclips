@@ -387,9 +387,12 @@ impl App {
                 .or_else(|| bx.expand(2.0).contains(at).then_some(Handle::Move))
         };
 
+        // A drag only starts once the pointer has moved a little, so what was
+        // grabbed is judged by where the button went down, not where it is now.
         if response.drag_started() {
-            if let Some(h) = response.interact_pointer_pos().and_then(hit) {
-                self.webcam_view.drag = Some((h, response.interact_pointer_pos().unwrap(), p));
+            let origin = ui.input(|i| i.pointer.press_origin()).or(response.interact_pointer_pos());
+            if let Some((h, at)) = origin.and_then(|at| hit(at).map(|h| (h, at))) {
+                self.webcam_view.drag = Some((h, at, p));
             }
         }
         if let Some((handle, from, start)) = self.webcam_view.drag {
@@ -417,9 +420,11 @@ impl App {
         let painter = ui.painter_at(frame_rect);
         let cropping = modifiers.alt;
         let color = if cropping { CROP } else { ACCENT };
-        let active = self.webcam_view.drag.is_some() || pointer.is_some_and(|at| frame_rect.contains(at));
-        painter.rect_stroke(bx, 0.0, Stroke::new(if active { 2.0 } else { 1.0 }, color.gamma_multiply(if active { 1.0 } else { 0.6 })), egui::StrokeKind::Middle);
+        // Outlined only while it's held or the pointer is over it.
+        let bx_hit = |at: Pos2| Handle::ALL.iter().any(|h| h.pos(bx).distance(at) <= HANDLE) || bx.expand(2.0).contains(at);
+        let active = self.webcam_view.drag.is_some() || pointer.is_some_and(|at| frame_rect.contains(at) && bx_hit(at));
         if active {
+            painter.rect_stroke(bx, 0.0, Stroke::new(2.0, color), egui::StrokeKind::Middle);
             for h in Handle::ALL {
                 let c = h.pos(bx);
                 let r = Rect::from_center_size(c, vec2(HANDLE, HANDLE));
