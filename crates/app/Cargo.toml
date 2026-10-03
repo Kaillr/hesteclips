@@ -33,6 +33,10 @@ serde_json = "1.0.151"
 trash = "5"
 uuid = { version = "1", features = ["v4"] }
 
+# Windows-only: drawing decoded frames straight from the GPU (gpu_frames.rs).
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Direct3D12"] }
+
 # macOS-only: the system share sheet (AirDrop, Messages, Mail, …).
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.4"

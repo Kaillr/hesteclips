@@ -78,6 +78,13 @@ pub struct Player {
     pub audio_error: Option<String>,
     /// Latest frame for display.
     texture: Option<egui::TextureHandle>,
+    /// What's on screen and its size: `texture`, or a frame on the GPU.
+    display: Option<(egui::TextureId, egui::Vec2)>,
+    /// The GPU frame on screen, held so its texture isn't reused meanwhile.
+    on_screen: Option<Picture>,
+    /// GPU frames opened for drawing (see `gpu_frames.rs`).
+    #[cfg(windows)]
+    gpu_frames: crate::gpu_frames::Frames,
     shown_frame: Option<u64>,
     decoder: Option<FrameStream>,
     still_tx: Sender<(u64, f64)>,
@@ -139,6 +146,10 @@ impl Player {
             _stream: stream,
             audio_error,
             texture: None,
+            display: None,
+            on_screen: None,
+            #[cfg(windows)]
+            gpu_frames: Default::default(),
             shown_frame: None,
             decoder: None,
             still_tx,
@@ -237,10 +248,11 @@ impl Player {
 
     /// Bring the displayed frame in line with the clock. Call once per UI frame.
     /// `scrubbing`: the user is dragging, so favour instant proxy frames.
-    pub fn update(&mut self, ctx: &egui::Context, scrubbing: bool) -> Option<&egui::TextureHandle> {
+    /// Returns what to draw: an egui texture and its size.
+    pub fn update(&mut self, ctx: &egui::Context, scrubbing: bool) -> Option<(egui::TextureId, egui::Vec2)> {
         if self.hw().is_some() {
             self.update_hw(ctx, scrubbing);
-            return self.texture.as_ref();
+            return self.display;
         }
         let t = self.time();
         let want = self.info.frame_index(t);
@@ -289,7 +301,7 @@ impl Player {
                 }
             }
         }
-        self.texture.as_ref()
+        self.display
     }
 
     /// [`Self::update`] with the hardware decoder.
@@ -346,7 +358,18 @@ impl Player {
     fn show_picture(&mut self, ctx: &egui::Context, p: Picture) {
         let idx = p.index;
         #[cfg(windows)]
-        self.set_texture(ctx, crate::video::to_image(p));
+        {
+            // On the GPU: draw its texture as it is.
+            let on_gpu = p.gpu.as_ref().and_then(|s| self.gpu_frames.texture(s, p.width, p.height));
+            match on_gpu {
+                Some(id) => {
+                    self.display = Some((id, egui::vec2(p.width as f32, p.height as f32)));
+                    self.on_screen = Some(p);
+                }
+                None if p.rgba.is_empty() => {}
+                None => self.set_texture(ctx, crate::video::to_image(p)),
+            }
+        }
         #[cfg(not(windows))]
         let _ = (ctx, p);
         self.shown_frame = Some(idx);
@@ -365,6 +388,8 @@ impl Player {
             Some(tex) => tex.set(img, egui::TextureOptions::LINEAR),
             None => self.texture = Some(ctx.load_texture("preview", img, egui::TextureOptions::LINEAR)),
         }
+        self.display = self.texture.as_ref().map(|t| (t.id(), t.size_vec2()));
+        self.on_screen = None;
     }
 }
 

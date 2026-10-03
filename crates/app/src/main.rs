@@ -28,6 +28,8 @@ mod sources_ui;
 mod store;
 mod thumbs;
 #[cfg(windows)]
+mod gpu_frames;
+#[cfg(windows)]
 mod video;
 mod viewer;
 mod waveform;
@@ -60,14 +62,35 @@ fn main() -> eframe::Result<()> {
             .with_min_inner_size([560.0, 420.0])
             .with_title("HesteClips")
             .with_icon(app_icon()),
+        wgpu_options: wgpu_options(),
         ..Default::default()
     };
 
     eframe::run_native(
         "HesteClips",
         options,
-        Box::new(|cc| Ok(Box::new(App::new(cc.egui_ctx.clone())))),
+        Box::new(|cc| {
+            #[cfg(windows)]
+            gpu_frames::init(cc.wgpu_render_state.as_ref());
+            Ok(Box::new(App::new(cc.egui_ctx.clone())))
+        }),
     )
+}
+
+/// The renderer's setup. On Windows, D3D12, so decoded video frames can be
+/// shared with it straight from the GPU (`gpu_frames.rs`); wgpu's default
+/// pick could be Vulkan, which can't open them as simply.
+/// `HESTECLIPS_WGPU_BACKEND` (e.g. "vulkan") overrides it, to compare.
+fn wgpu_options() -> eframe::egui_wgpu::WgpuConfiguration {
+    let mut options = eframe::egui_wgpu::WgpuConfiguration::default();
+    #[cfg(windows)]
+    if let eframe::egui_wgpu::WgpuSetup::CreateNew(new) = &mut options.wgpu_setup {
+        new.instance_descriptor.backends = match std::env::var("HESTECLIPS_WGPU_BACKEND") {
+            Ok(b) => eframe::wgpu::Backends::from_comma_list(&b),
+            Err(_) => eframe::wgpu::Backends::DX12,
+        };
+    }
+    options
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

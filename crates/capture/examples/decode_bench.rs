@@ -8,7 +8,7 @@ fn main() -> anyhow::Result<()> {
     let width: u32 = std::env::args().nth(2).and_then(|w| w.parse().ok()).unwrap_or(1280);
 
     let t = Instant::now();
-    let mut d = capture::win::decode::Decoder::open(&path, width)?;
+    let mut d = capture::win::decode::Decoder::open(&path, width, None)?;
     println!("open {}x{} at {} fps: {:?}", d.width, d.height, d.fps, t.elapsed());
 
     let t = Instant::now();
@@ -35,7 +35,7 @@ fn main() -> anyhow::Result<()> {
     // SEEKDUMP=<index>:<file>: that frame (reached by seeking), to check it's the right picture.
     if let Some(spec) = std::env::var("SEEKDUMP").ok() {
         let (i, out) = spec.split_once(':').expect("index:file");
-        let mut fresh = capture::win::decode::Decoder::open(&path, width)?;
+        let mut fresh = capture::win::decode::Decoder::open(&path, width, None)?;
         let i: u64 = i.parse()?;
         // NOSEEK=1: get there by decoding every frame from the start.
         let p = if std::env::var_os("NOSEEK").is_some() {

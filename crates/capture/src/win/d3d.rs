@@ -42,12 +42,31 @@ unsafe impl Sync for Gpu {}
 
 impl Gpu {
     pub(crate) fn new() -> Result<Self> {
+        Self::create(None)
+    }
+
+    /// On the graphics card with this LUID (to share textures with another
+    /// API's device on it), else the default one.
+    pub(crate) fn on_adapter(luid: u64) -> Result<Self> {
+        use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter, IDXGIFactory1};
+        let adapter = unsafe {
+            let factory: IDXGIFactory1 = CreateDXGIFactory1()?;
+            (0..)
+                .map_while(|i| factory.EnumAdapters1(i).ok())
+                .find(|a| a.GetDesc1().is_ok_and(|d| ((d.AdapterLuid.HighPart as u32 as u64) << 32 | d.AdapterLuid.LowPart as u64) == luid))
+        };
+        Self::create(adapter.and_then(|a| a.cast::<IDXGIAdapter>().ok()))
+    }
+
+    fn create(adapter: Option<windows::Win32::Graphics::Dxgi::IDXGIAdapter>) -> Result<Self> {
         let mut device = None;
         let mut context = None;
+        // A specific adapter needs the "unknown" driver type.
+        let driver = if adapter.is_some() { windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN } else { D3D_DRIVER_TYPE_HARDWARE };
         unsafe {
             D3D11CreateDevice(
-                None,
-                D3D_DRIVER_TYPE_HARDWARE,
+                adapter.as_ref(),
+                driver,
                 HMODULE::default(),
                 D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
                 None,
@@ -67,6 +86,28 @@ impl Gpu {
             }
         }
         Ok(Self { device, context })
+    }
+
+    /// Wait until the GPU has finished everything submitted so far.
+    pub(crate) fn wait_idle(&self) -> Result<()> {
+        unsafe {
+            let desc = D3D11_QUERY_DESC { Query: D3D11_QUERY_EVENT, MiscFlags: 0 };
+            let mut query = None;
+            self.device.CreateQuery(&desc, Some(&mut query))?;
+            let query = query.context("no query")?;
+            self.context.End(&query);
+            self.context.Flush();
+            let mut done = 0i32;
+            let start = std::time::Instant::now();
+            // S_FALSE (not done yet) is a success too: the flag says when it's done.
+            while self.context.GetData(&query, Some(&mut done as *mut i32 as *mut _), 4, 0).is_err() || done == 0 {
+                if start.elapsed() > std::time::Duration::from_secs(1) {
+                    bail!("the graphics card didn't finish");
+                }
+                std::thread::yield_now();
+            }
+        }
+        Ok(())
     }
 
     /// The adapter's LUID, to pick the hardware encoder on the same GPU.

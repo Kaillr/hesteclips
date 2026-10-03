@@ -253,11 +253,10 @@ impl Ready {
         let preview_h = (ui.available_height() - controls_h).max(160.0);
         let (preview, preview_resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), preview_h), Sense::click());
         ui.painter().rect_filled(preview, 8, Color32::BLACK);
-        if let Some(tex) = self.player.update(&ctx, scrubbing) {
-            let size = tex.size_vec2();
+        if let Some((tex, size)) = self.player.update(&ctx, scrubbing) {
             let scale = (preview.width() / size.x).min(preview.height() / size.y);
             let r = Rect::from_center_size(preview.center(), size * scale);
-            egui::Image::from_texture((tex.id(), r.size())).paint_at(ui, r);
+            egui::Image::from_texture((tex, r.size())).paint_at(ui, r);
         }
         let preview_resp = preview_resp.on_hover_cursor(egui::CursorIcon::PointingHand);
         if preview_resp.double_clicked() {

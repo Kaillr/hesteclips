@@ -304,11 +304,10 @@ impl Ready {
         let (preview_rect, preview_resp) =
             ui.allocate_exact_size(Vec2::new(ui.available_width(), preview_h), Sense::click());
         ui.painter().rect_filled(preview_rect, 8, Color32::BLACK);
-        if let Some(tex) = self.player.update(&ctx, self.dragging.is_some()) {
-            let size = tex.size_vec2();
+        if let Some((tex, size)) = self.player.update(&ctx, self.dragging.is_some()) {
             let scale = (preview_rect.width() / size.x).min(preview_rect.height() / size.y);
             let r = Rect::from_center_size(preview_rect.center(), size * scale);
-            egui::Image::from_texture((tex.id(), r.size())).paint_at(ui, r);
+            egui::Image::from_texture((tex, r.size())).paint_at(ui, r);
         } else {
             ui.painter().text(preview_rect.center(), Align2::CENTER_CENTER, "…", FontId::proportional(24.0), Color32::GRAY);
         }

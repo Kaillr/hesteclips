@@ -52,7 +52,19 @@ impl Video {
         let state = Arc::new(Mutex::new(State::default()));
         let (path, shared, ctx) = (path.to_path_buf(), state.clone(), ctx.clone());
         std::thread::spawn(move || {
-            let mut dec = match Decoder::open(&path, width) {
+            // Frames straight to the screen when the renderer can take them;
+            // copied back as RGBA otherwise.
+            let on_gpu = crate::gpu_frames::share_luid().and_then(|luid| {
+                Decoder::open(&path, width, Some(luid)).inspect_err(|e| eprintln!("sharing decoded frames isn't possible, copying them: {e:#}")).ok()
+            });
+            if std::env::var_os("HESTECLIPS_DEBUG_VIDEO").is_some() {
+                eprintln!("video: decoded frames {}", if on_gpu.is_some() { "drawn from the GPU" } else { "copied to the CPU" });
+            }
+            let opened = match on_gpu {
+                Some(d) => Ok(d),
+                None => Decoder::open(&path, width, None),
+            };
+            let mut dec = match opened {
                 Ok(d) => d,
                 Err(e) => {
                     eprintln!("hardware decoder unavailable, using ffmpeg: {e:#}");
@@ -199,8 +211,8 @@ impl Video {
     }
 }
 
-/// A decoded picture as an egui image, without touching each pixel (they're
-/// opaque RGBA already, the same bytes egui keeps).
+/// A decoded picture (one that came back to the CPU) as an egui image, without
+/// touching each pixel: they're opaque RGBA already, the same bytes egui keeps.
 pub fn to_image(p: Picture) -> egui::ColorImage {
     let pixels: Vec<egui::Color32> = bytemuck::cast_slice(&p.rgba).to_vec();
     egui::ColorImage::new([p.width as usize, p.height as usize], pixels)
