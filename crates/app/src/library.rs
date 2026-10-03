@@ -421,6 +421,10 @@ impl App {
         // click_and_drag: a click plays, a drag pulls the file out of the window.
         let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, thumb_h + CAPTION_HEIGHT), Sense::click_and_drag());
         let thumb_rect = Rect::from_min_size(rect.min, Vec2::new(w, thumb_h));
+        if self.reveal_clip.as_ref() == Some(&clip.path) {
+            ui.scroll_to_rect(rect, Some(egui::Align::Center));
+            self.reveal_clip = None;
+        }
         let hovered = ui.rect_contains_pointer(rect);
         let is_new = self
             .last_saved

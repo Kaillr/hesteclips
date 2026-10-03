@@ -169,6 +169,8 @@ struct App {
     pub(crate) recording_shortcut: Option<(settings::ShortcutAction, Option<&'static str>)>,
     /// The "Reset all settings?" confirmation is open.
     pub(crate) confirm_reset: bool,
+    /// Scroll the library to this clip next time it's shown.
+    pub(crate) reveal_clip: Option<PathBuf>,
     /// Adding a custom clip-saved sound failed: why.
     pub(crate) sound_error: Option<String>,
     /// Screen-recording permission, re-checked each poll so the banner clears the
@@ -257,6 +259,7 @@ impl App {
             recording_shortcut: None,
             confirm_reset: false,
             sound_error: None,
+            reveal_clip: None,
             permission: capture::screen_permission(),
             screens: capture::list_screens(),
             windowed_apps: Vec::new(),
@@ -461,6 +464,7 @@ impl eframe::App for App {
         // Left the viewer some other way (a hotkey that shows the library): stop it.
         if self.page != Page::View && self.viewer.is_some() {
             self.viewer = None;
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
         }
 
         // The editor and viewer get the whole window; capture keeps running
@@ -746,18 +750,29 @@ impl App {
             self.page = Page::Clips;
             return;
         };
-        match v.ui(ui) {
+        // Neighbours in the library's order (newest first), to step through.
+        let at = self.clips.iter().position(|c| c.path == v.clip());
+        let nav = viewer::Nav {
+            newer: at.and_then(|i| i.checked_sub(1)).map(|i| self.clips[i].path.clone()),
+            older: at.and_then(|i| self.clips.get(i + 1)).map(|c| c.path.clone()),
+            position: at.map(|i| (i + 1, self.clips.len())),
+        };
+        match v.ui(ui, &nav) {
             viewer::ViewerOutcome::Stay => {}
             viewer::ViewerOutcome::Close => {
+                // Back in the library, bring the clip just watched into view.
+                self.reveal_clip = Some(v.clip().to_path_buf());
                 self.viewer = None; // drops the player: stops audio and decoders
                 self.page = Page::Clips;
             }
             viewer::ViewerOutcome::Edit => {
                 let clip = v.clip().to_path_buf();
+                self.reveal_clip = Some(clip.clone());
                 self.viewer = None;
                 self.page = Page::Clips;
                 self.open_editor(clip);
             }
+            viewer::ViewerOutcome::Open(clip) => self.viewer = Some(viewer::Viewer::open(&self.ctx(), &clip)),
         }
     }
 

@@ -9,6 +9,10 @@
 //!
 //! It plays the clip as it's shared: the saved edit if there is one, and the
 //! mix (track 1).
+//!
+//! Up/Down (or the arrows in the header) step to the next clip in the library
+//! without going back to it, and F, double-click or ⛶ go fullscreen, so a
+//! session's clips can be reviewed one after another.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
@@ -32,6 +36,17 @@ pub enum ViewerOutcome {
     Stay,
     Close,
     Edit,
+    /// Show this clip instead (the next or previous one).
+    Open(PathBuf),
+}
+
+/// Where this clip sits in the library, for stepping through clips.
+#[derive(Default)]
+pub struct Nav {
+    pub newer: Option<PathBuf>,
+    pub older: Option<PathBuf>,
+    /// This clip's place (from 1) and how many there are.
+    pub position: Option<(usize, usize)>,
 }
 
 struct Loaded {
@@ -93,7 +108,7 @@ impl Viewer {
         &self.clip
     }
 
-    pub fn ui(&mut self, ui: &mut egui::Ui) -> ViewerOutcome {
+    pub fn ui(&mut self, ui: &mut egui::Ui, nav: &Nav) -> ViewerOutcome {
         if let State::Loading(rx) = &self.state {
             if let Ok(result) = rx.try_recv() {
                 self.state = match result {
@@ -102,7 +117,8 @@ impl Viewer {
                 };
             }
         }
-        let mut out = self.header(ui);
+        let ctx = ui.ctx().clone();
+        let mut out = if is_fullscreen(&ctx) { ViewerOutcome::Stay } else { self.header(ui, nav) };
         match &mut self.state {
             State::Loading(_) => {
                 let rect = ui.available_rect_before_wrap();
@@ -116,18 +132,39 @@ impl Viewer {
             }
             State::Ready(r) => r.ui(ui),
         }
-        if ui.ctx().input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape)) {
-            out = ViewerOutcome::Close;
+        if !ctx.egui_wants_keyboard_input() {
+            let none = egui::Modifiers::NONE;
+            let (esc, up, down, f) = ctx.input_mut(|i| {
+                (i.consume_key(none, Key::Escape), i.consume_key(none, Key::ArrowUp), i.consume_key(none, Key::ArrowDown), i.consume_key(none, Key::F))
+            });
+            if esc {
+                // Out of fullscreen first; out of the viewer after that.
+                if is_fullscreen(&ctx) {
+                    set_fullscreen(&ctx, false);
+                } else {
+                    out = ViewerOutcome::Close;
+                }
+            }
+            let step = if up { nav.newer.as_ref() } else if down { nav.older.as_ref() } else { None };
+            if let Some(p) = step {
+                out = ViewerOutcome::Open(p.clone());
+            }
+            if f {
+                set_fullscreen(&ctx, !is_fullscreen(&ctx));
+            }
         }
-        if matches!(out, ViewerOutcome::Close | ViewerOutcome::Edit) {
+        if !matches!(out, ViewerOutcome::Stay) {
             if let State::Ready(r) = &mut self.state {
                 r.player.pause();
             }
         }
+        if matches!(out, ViewerOutcome::Close | ViewerOutcome::Edit) {
+            set_fullscreen(&ctx, false);
+        }
         out
     }
 
-    fn header(&mut self, ui: &mut egui::Ui) -> ViewerOutcome {
+    fn header(&mut self, ui: &mut egui::Ui, nav: &Nav) -> ViewerOutcome {
         let mut out = ViewerOutcome::Stay;
         ui.add_space(4.0);
         ui.horizontal(|ui| {
@@ -136,7 +173,19 @@ impl Viewer {
             }
             ui.add_space(6.0);
             let stem = self.clip.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-            ui.label(RichText::new(crate::clips::title_for_stem(&stem)).size(18.0).strong());
+            ui.add(egui::Label::new(RichText::new(crate::clips::title_for_stem(&stem)).size(18.0).strong()).truncate());
+            ui.add_space(10.0);
+            // Step through the library without leaving the viewer.
+            let step = |s: &str| egui::Button::new(RichText::new(s).size(14.0)).min_size(Vec2::new(30.0, 26.0)).corner_radius(6);
+            if ui.add_enabled(nav.newer.is_some(), step("⏶")).on_hover_text("Newer clip  (Up)").clicked() {
+                out = nav.newer.clone().map_or(ViewerOutcome::Stay, ViewerOutcome::Open);
+            }
+            if ui.add_enabled(nav.older.is_some(), step("⏷")).on_hover_text("Older clip  (Down)").clicked() {
+                out = nav.older.clone().map_or(ViewerOutcome::Stay, ViewerOutcome::Open);
+            }
+            if let Some((i, n)) = nav.position {
+                ui.weak(format!("{i} of {n}"));
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let edit = egui::Button::new(RichText::new("✂ Edit").size(14.0).color(Color32::WHITE))
                     .fill(ACCENT)
@@ -216,7 +265,12 @@ impl Ready {
             let r = Rect::from_center_size(preview.center(), size * scale);
             egui::Image::from_texture((tex.id(), r.size())).paint_at(ui, r);
         }
-        if preview_resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+        let preview_resp = preview_resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+        if preview_resp.double_clicked() {
+            // The first click of the two already toggled playing: undo that.
+            self.toggle_play();
+            set_fullscreen(&ctx, !is_fullscreen(&ctx));
+        } else if preview_resp.clicked() {
             self.toggle_play();
         }
 
@@ -257,6 +311,12 @@ impl Ready {
             ui.weak(format!("/ {}", clock(self.info.duration)));
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let full = is_fullscreen(ui.ctx());
+                let fs = egui::Button::new(RichText::new("⛶").size(16.0)).min_size(Vec2::new(32.0, 28.0)).corner_radius(6).selected(full);
+                if ui.add(fs).on_hover_text(if full { "Exit fullscreen  (F or Esc)" } else { "Fullscreen  (F, or double-click the picture)" }).clicked() {
+                    set_fullscreen(ui.ctx(), !full);
+                }
+                ui.add_space(8.0);
                 let mut changed = false;
                 let slider = egui::Slider::new(&mut self.volume, 0.0..=1.0).show_value(false);
                 changed |= ui.add_sized(Vec2::new(100.0, 20.0), slider).on_hover_text("Volume").changed();
@@ -456,6 +516,16 @@ impl Ready {
             self.player.seek(0.0);
         }
         self.play();
+    }
+}
+
+fn is_fullscreen(ctx: &egui::Context) -> bool {
+    ctx.input(|i| i.viewport().fullscreen.unwrap_or(false))
+}
+
+fn set_fullscreen(ctx: &egui::Context, on: bool) {
+    if is_fullscreen(ctx) != on {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(on));
     }
 }
 
