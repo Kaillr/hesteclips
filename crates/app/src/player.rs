@@ -67,7 +67,7 @@ pub fn uptime() -> f64 {
 }
 
 /// Play waits at most this long for its first frame before the sound starts anyway.
-const START_WAIT: std::time::Duration = std::time::Duration::from_millis(300);
+const START_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Preview frames are decoded at this width; plenty for an in-app viewer.
 pub const PREVIEW_WIDTH: u32 = 1280;
@@ -124,6 +124,8 @@ pub struct Player {
     video_playing: bool,
     /// When play was last pressed, until its first frame shows (debug log).
     played_at: Option<std::time::Instant>,
+    /// When the full-quality frame was last asked for (debug log).
+    asked_at: Option<std::time::Instant>,
     /// Frames shown while playing, per second (debug log).
     shown_count: Option<(std::time::Instant, u32)>,
 }
@@ -187,6 +189,7 @@ impl Player {
             video_playing: false,
             played_at: None,
             shown_count: None,
+            asked_at: None,
         }
     }
 
@@ -280,7 +283,7 @@ impl Player {
     /// Returns what to draw: an egui texture and its size.
     pub fn update(&mut self, ctx: &egui::Context, scrubbing: bool) -> Option<(egui::TextureId, egui::Vec2)> {
         if self.hw().is_some() {
-            self.update_hw(ctx, scrubbing);
+            self.update_hw(ctx);
             return self.display;
         }
         let t = self.time();
@@ -321,6 +324,8 @@ impl Player {
                         self.set_texture(ctx, img);
                         self.shown_frame = Some(want);
                         self.showing_proxy = true;
+                        // Coming back to a frame sharpened before asks again.
+                        self.still_wanted = None;
                     }
                 }
                 // Once the drag stops, sharpen to the full-quality exact frame.
@@ -334,7 +339,7 @@ impl Player {
     }
 
     /// [`Self::update`] with the hardware decoder.
-    fn update_hw(&mut self, ctx: &egui::Context, scrubbing: bool) {
+    fn update_hw(&mut self, ctx: &egui::Context) {
         let Some(v) = self.video.as_ref() else { return };
         let want = self.info.frame_index(self.time());
         // Waiting to start: the sound goes once the first frame is here.
@@ -364,10 +369,14 @@ impl Player {
             self.still_wanted = None;
         }
         if let Some(p) = v.take_exact(want) {
+            if let Some(at) = self.asked_at.take() {
+                trace!("sharp frame {} {:.0} ms after asking", p.index, at.elapsed().as_secs_f64() * 1000.0);
+            }
             self.show_picture(ctx, p);
         }
-        if self.shown_frame != Some(want) || (!scrubbing && self.showing_proxy) {
-            // While dragging, the proxy frame right away (every mouse move).
+        let sharp = self.shown_frame == Some(want) && !self.showing_proxy;
+        if !sharp {
+            // The small proxy frame right away (every mouse move while scrubbing)…
             if self.shown_frame != Some(want) {
                 if let Some(img) = self.proxy.frame(want) {
                     self.set_texture(ctx, img);
@@ -375,10 +384,13 @@ impl Player {
                     self.showing_proxy = true;
                 }
             }
-            // Once the drag stops, the exact frame (and the next few, for play).
+            // …and the full-quality frame as soon as the decoder has it, also
+            // mid-scrub: it keeps up with slow scrubs, and in fast ones only the
+            // newest request is decoded. Asked once per frame wanted.
             let v = self.video.as_ref().expect("checked above");
-            if !scrubbing && self.still_wanted != Some(want) {
+            if self.still_wanted != Some(want) {
                 self.still_wanted = Some(want);
+                self.asked_at = Some(std::time::Instant::now());
                 v.show(want);
             }
         }
