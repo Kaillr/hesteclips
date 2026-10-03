@@ -46,6 +46,26 @@ impl Video {
     fn has(&self, _: u64) -> bool { match *self {} }
 }
 
+/// `HESTECLIPS_DEBUG_VIDEO=1`: log what playback does, with times.
+fn debug() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("HESTECLIPS_DEBUG_VIDEO").is_some())
+}
+
+macro_rules! trace {
+    ($($arg:tt)*) => {
+        if debug() {
+            eprintln!("{:>8.3} player: {}", crate::player::uptime(), format!($($arg)*));
+        }
+    };
+}
+
+/// Seconds since the app started, for debug logs.
+pub fn uptime() -> f64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_secs_f64()
+}
+
 /// Play waits at most this long for its first frame before the sound starts anyway.
 const START_WAIT: std::time::Duration = std::time::Duration::from_millis(300);
 
@@ -102,6 +122,10 @@ pub struct Player {
     pending_start: Option<std::time::Instant>,
     /// The decoder was told to play (to tell it to stop when playback ends).
     video_playing: bool,
+    /// When play was last pressed, until its first frame shows (debug log).
+    played_at: Option<std::time::Instant>,
+    /// Frames shown while playing, per second (debug log).
+    shown_count: Option<(std::time::Instant, u32)>,
 }
 
 impl Player {
@@ -161,6 +185,8 @@ impl Player {
             video: open_video(ctx, source, info_fps),
             pending_start: None,
             video_playing: false,
+            played_at: None,
+            shown_count: None,
         }
     }
 
@@ -196,6 +222,8 @@ impl Player {
 
     /// Play from the current position until `until` seconds.
     pub fn play(&mut self, until: f64) {
+        trace!("play at frame {} (showing {:?}{})", self.info.frame_index(self.time()), self.shown_frame, if self.showing_proxy { ", proxy" } else { "" });
+        self.played_at = Some(std::time::Instant::now());
         self.shared.end.store((until * PREVIEW_RATE as f64) as u64, Ordering::Relaxed);
         if let Some(v) = self.hw() {
             // Showing the frame under the playhead already: carry on from the
@@ -251,7 +279,6 @@ impl Player {
     /// `scrubbing`: the user is dragging, so favour instant proxy frames.
     /// Returns what to draw: an egui texture and its size.
     pub fn update(&mut self, ctx: &egui::Context, scrubbing: bool) -> Option<(egui::TextureId, egui::Vec2)> {
-        self.proxy.set_busy(self.is_playing());
         if self.hw().is_some() {
             self.update_hw(ctx, scrubbing);
             return self.display;
@@ -313,6 +340,7 @@ impl Player {
         // Waiting to start: the sound goes once the first frame is here.
         if let Some(since) = self.pending_start {
             if v.has(want) || since.elapsed() >= START_WAIT {
+                trace!("sound starts after {:.0} ms (frame ready: {})", since.elapsed().as_secs_f64() * 1000.0, v.has(want));
                 self.pending_start = None;
                 self.shared.playing.store(true, Ordering::Relaxed);
             }
@@ -359,6 +387,17 @@ impl Player {
     #[cfg_attr(not(windows), allow(dead_code))]
     fn show_picture(&mut self, ctx: &egui::Context, p: Picture) {
         let idx = p.index;
+        if let Some(at) = self.played_at.take() {
+            trace!("first frame after play: {idx}, {:.0} ms after pressing", at.elapsed().as_secs_f64() * 1000.0);
+        }
+        if debug() && self.sound_playing() {
+            let (since, n) = self.shown_count.get_or_insert((std::time::Instant::now(), 0));
+            *n += 1;
+            if since.elapsed().as_secs_f64() >= 1.0 {
+                trace!("playing: {n} frames shown in the last second (proxy {} ready)", self.proxy.ready());
+                self.shown_count = None;
+            }
+        }
         #[cfg(windows)]
         {
             // On the GPU: draw its texture as it is.
@@ -417,13 +456,24 @@ fn start_audio(shared: Arc<Shared>, pcm: Arc<Vec<Vec<f32>>>) -> Result<cpal::Str
     let step = PREVIEW_RATE as f64 / out_rate;
     let mut frac = 0.0f64;
     let n_tracks = pcm.len();
+    let mut was_playing = false;
+    trace!("audio output: {} Hz, {} channels, buffer {:?}", out_rate, channels, supported.buffer_size());
 
     let stream = device
         .build_output_stream::<f32, _, _>(
             config,
-            move |out: &mut [f32], _| {
+            move |out: &mut [f32], info: &cpal::OutputCallbackInfo| {
                 out.fill(0.0);
-                if !shared.playing.load(Ordering::Relaxed) {
+                let playing = shared.playing.load(Ordering::Relaxed);
+                if playing != was_playing {
+                    was_playing = playing;
+                    if playing {
+                        let ts = info.timestamp();
+                        let latency = ts.playback.duration_since(ts.callback);
+                        trace!("audio callback plays ({} frames per callback, heard {:?} later)", out.len() / channels.max(1), latency);
+                    }
+                }
+                if !playing {
                     // Silence: report zero so meters fall and the UI can stop redrawing.
                     if let Ok(mut m) = shared.mix.try_lock() {
                         m.track_levels.iter_mut().for_each(|l| *l = (0.0, 0.0));
