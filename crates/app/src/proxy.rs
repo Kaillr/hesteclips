@@ -331,3 +331,37 @@ mod speed {
         assert!(px[0].abs_diff(200) <= 3 && px[1].abs_diff(60) <= 3 && px[2].abs_diff(30) <= 3);
     }
 }
+
+#[cfg(test)]
+mod formats {
+    /// JPEG vs PNG vs raw for a proxy frame: `PROXY_FRAME=<640x360 rgba file>
+    /// cargo test --release -p hesteclips proxy_formats -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn proxy_formats() {
+        let Some(path) = std::env::var_os("PROXY_FRAME") else { return };
+        let rgba = std::fs::read(path).unwrap();
+        let (w, h) = (640u32, 360u32);
+        let time = |f: &mut dyn FnMut()| {
+            let t = std::time::Instant::now();
+            for _ in 0..50 {
+                f();
+            }
+            t.elapsed().as_secs_f64() * 1000.0 / 50.0
+        };
+        let jpeg = media::encode_jpeg(&rgba, w as u16, h as u16, 75).unwrap();
+        let enc_j = time(&mut || drop(media::encode_jpeg(&rgba, w as u16, h as u16, 75)));
+        let dec_j = time(&mut || drop(image::load_from_memory_with_format(&jpeg, image::ImageFormat::Jpeg).unwrap().to_rgba8()));
+        let img = image::RgbaImage::from_raw(w, h, rgba.clone()).unwrap();
+        let mut png = Vec::new();
+        let enc_p = time(&mut || {
+            png.clear();
+            img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+        });
+        let dec_p = time(&mut || drop(image::load_from_memory_with_format(&png, image::ImageFormat::Png).unwrap().to_rgba8()));
+        let mb = |b: usize| b as f64 * 7013.0 / 1e6;
+        println!("raw : {:>4} KB/frame -> {:>5.0} MB for a 2-min clip", rgba.len() / 1024, mb(rgba.len()));
+        println!("jpeg: {:>4} KB/frame -> {:>5.0} MB, encode {enc_j:.1} ms, decode {dec_j:.1} ms", jpeg.len() / 1024, mb(jpeg.len()));
+        println!("png : {:>4} KB/frame -> {:>5.0} MB, encode {enc_p:.1} ms, decode {dec_p:.1} ms", png.len() / 1024, mb(png.len()));
+    }
+}
