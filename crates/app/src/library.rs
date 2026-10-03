@@ -92,6 +92,8 @@ enum Action {
     ShareSheet(PathBuf, Pos2),
     Rename(PathBuf),
     Open(PathBuf),
+    /// Play it in the OS default video player instead.
+    OpenExternal(PathBuf),
     Edit(PathBuf),
     Reveal(PathBuf),
     Share(PathBuf),
@@ -187,7 +189,8 @@ impl App {
         });
 
         match action {
-            Some(Action::Open(p)) => {
+            Some(Action::Open(p)) => self.open_viewer(p),
+            Some(Action::OpenExternal(p)) => {
                 if let Err(e) = clips::open_in_default_app(&p) {
                     self.toast_error(format!("Couldn't open the clip: {e}"));
                 }
@@ -385,7 +388,7 @@ impl App {
             let thumb_rect = Rect::from_min_size(rect.min, Vec2::new(w, w * 9.0 / 16.0));
             let ctx = ui.ctx().clone();
             if let Some(tex) = self.thumbs.get(&ctx, &src).and_then(|t| t.texture.clone()) {
-                let uv = crop_uv(tex.size_vec2(), thumb_rect.size());
+                let uv = crate::filmstrip::crop_uv(tex.size_vec2(), thumb_rect.size());
                 egui::Image::from_texture((tex.id(), thumb_rect.size())).uv(uv).corner_radius(RADIUS).paint_at(ui, thumb_rect);
             }
             let p = ui.painter();
@@ -434,7 +437,7 @@ impl App {
         // --- Thumbnail (cropped to 16:9 so every card lines up) ---
         match thumb.and_then(|t| t.texture.as_ref()) {
             Some(tex) => {
-                let uv = crop_uv(tex.size_vec2(), thumb_rect.size());
+                let uv = crate::filmstrip::crop_uv(tex.size_vec2(), thumb_rect.size());
                 egui::Image::from_texture((tex.id(), thumb_rect.size()))
                     .uv(uv)
                     .corner_radius(RADIUS)
@@ -601,6 +604,9 @@ impl App {
             if ui.button("▶  Play").clicked() {
                 action = Some(Action::Open(clip.path.clone()));
             }
+            if ui.button("↗  Open in default player").clicked() {
+                action = Some(Action::OpenExternal(clip.path.clone()));
+            }
             if ui.button("✂  Edit…").clicked() {
                 action = Some(Action::Edit(clip.path.clone()));
             }
@@ -754,18 +760,6 @@ fn progress_bar(p: &egui::Painter, thumb: Rect, f: f32, color: Color32) {
     p.rect_filled(track, 3, Color32::from_white_alpha(30));
     let fill = Rect::from_min_max(track.min, Pos2::new(track.left() + track.width() * f.clamp(0.0, 1.0), track.bottom()));
     p.rect_filled(fill, 3, color);
-}
-
-/// UV rect that center-crops a texture of `tex` size to fill `target`'s aspect.
-fn crop_uv(tex: Vec2, target: Vec2) -> Rect {
-    let (ta, ra) = (tex.x / tex.y, target.x / target.y);
-    if ta > ra {
-        let w = ra / ta;
-        Rect::from_min_max(Pos2::new((1.0 - w) / 2.0, 0.0), Pos2::new((1.0 + w) / 2.0, 1.0))
-    } else {
-        let h = ta / ra;
-        Rect::from_min_max(Pos2::new(0.0, (1.0 - h) / 2.0), Pos2::new(1.0, (1.0 + h) / 2.0))
-    }
 }
 
 fn badge(p: &egui::Painter, pos: Pos2, anchor: Align2, text: &str, fill: Color32) {

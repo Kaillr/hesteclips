@@ -433,11 +433,24 @@ fn video_size(source: &Path) -> Result<(u32, u32)> {
 /// keyframe decodes on its own. The clip is split into a few time ranges decoded
 /// in parallel with the hardware decoder, so the whole strip fills in at once
 /// rather than left to right.
-pub fn keyframe_strip(source: &Path, height: u32, mut on_frame: impl FnMut(f64, Frame) -> bool) -> Result<()> {
+///
+/// At most about `max` keyframes become thumbnails, spread evenly over the clip;
+/// `on_keys` gets their times before any is decoded, so a timeline can lay out
+/// every cell once and fill each in when its own picture arrives, never showing
+/// a stand-in that changes later.
+pub fn keyframe_strip(
+    source: &Path,
+    height: u32,
+    max: usize,
+    on_keys: impl FnOnce(&[f64]),
+    mut on_frame: impl FnMut(f64, Frame) -> bool,
+) -> Result<()> {
     let keys = keyframe_times(source)?;
     if keys.is_empty() {
         bail!("no keyframes");
     }
+    let wanted = spread(&keys, max);
+    on_keys(&wanted);
     let (sw, sh) = video_size(source)?;
     // Even width, aspect kept.
     let width = (((height as f64) * sw as f64 / sh.max(1) as f64 / 2.0).round() as u32 * 2).max(2);
@@ -451,15 +464,19 @@ pub fn keyframe_strip(source: &Path, height: u32, mut on_frame: impl FnMut(f64, 
     for chunk in keys.chunks(per) {
         let (first, last) = (chunk[0], *chunk.last().unwrap());
         let times = chunk.to_vec();
+        let wanted = wanted.clone();
         let mut cmd = ffmpeg();
         cmd.args(["-hide_banner", "-loglevel", "error"]);
         if cfg!(target_os = "macos") {
             cmd.args(["-hwaccel", "videotoolbox"]);
         }
         let mut child = cmd
-            .args(["-skip_frame", "nokey", "-noaccurate_seek", "-ss", &format!("{:.4}", (first - 0.01).max(0.0))])
+            // Seeking lands on the last keyframe at or before the time, so aim just
+            // past this range's first one: aiming before it would start a keyframe
+            // early and label every picture with the next one's time.
+            .args(["-skip_frame", "nokey", "-noaccurate_seek", "-ss", &format!("{:.4}", first + 0.001)])
             // A little past the last keyframe so it's included, but not the next range's first.
-            .args(["-t", &format!("{:.4}", last - first + 0.02), "-i"])
+            .args(["-t", &format!("{:.4}", last - first + 0.01), "-i"])
             .arg(source)
             .args(["-an", "-vf", &format!("scale={width}:{height}:flags=bilinear"), "-fps_mode", "passthrough"])
             .args(["-f", "rawvideo", "-pix_fmt", "rgba", "-"])
@@ -473,7 +490,10 @@ pub fn keyframe_strip(source: &Path, height: u32, mut on_frame: impl FnMut(f64, 
         std::thread::spawn(move || {
             for t in times {
                 let mut rgba = vec![0u8; frame_bytes];
-                if out.read_exact(&mut rgba).is_err() || tx.send((t, Frame { width, height, rgba })).is_err() {
+                if out.read_exact(&mut rgba).is_err() {
+                    break;
+                }
+                if wanted.binary_search_by(|k| k.total_cmp(&t)).is_ok() && tx.send((t, Frame { width, height, rgba })).is_err() {
                     break;
                 }
             }
@@ -495,6 +515,20 @@ pub fn keyframe_strip(source: &Path, height: u32, mut on_frame: impl FnMut(f64, 
         let _ = c.wait();
     }
     Ok(())
+}
+
+/// About `max` of `keys` (sorted), evenly spread: each at least 1/`max` of the
+/// span after the one before. Always keeps the first.
+fn spread(keys: &[f64], max: usize) -> Vec<f64> {
+    let span = keys.last().unwrap_or(&0.0) - keys.first().unwrap_or(&0.0);
+    let gap = span / max.max(1) as f64;
+    let mut out: Vec<f64> = Vec::new();
+    for &k in keys {
+        if out.last().is_none_or(|l| k - l >= gap) {
+            out.push(k);
+        }
+    }
+    out
 }
 
 /// Presentation times of every keyframe, read from the container index.

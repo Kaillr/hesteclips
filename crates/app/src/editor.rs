@@ -15,11 +15,10 @@ use egui::{Align2, Color32, FontId, Key, Pos2, Rect, RichText, Sense, Stroke, St
 use media::{ClipInfo, Edit};
 
 use crate::library::{ACCENT, REC_RED};
+use crate::filmstrip::Filmstrip;
 use crate::player::Player;
 use crate::store::{self, EditTarget};
 
-/// Filmstrip thumbnail height in pixels (the lane is 56 pt; 2× for Retina).
-const STRIP_HEIGHT: u32 = 112;
 /// Waveform resolution: peak buckets across the full clip.
 const WAVE_BUCKETS: usize = 600;
 /// Gain slider range in dB.
@@ -61,9 +60,7 @@ struct Ready {
     /// What was last saved, to know whether there are unsaved changes.
     saved: Edit,
     waves: Vec<Vec<f32>>,
-    /// Keyframe thumbnails, sorted by time, as they arrive.
-    strip: Vec<(f64, egui::TextureHandle)>,
-    strip_rx: Receiver<(f64, media::Frame)>,
+    strip: Filmstrip,
     /// Smoothed meter values (peak, rms) per track, then master; and peak holds.
     meters: Vec<Meter>,
     master: Meter,
@@ -186,24 +183,13 @@ impl Ready {
         let mut player = Player::new(ctx, source, l.info.clone(), l.pcm, gains);
         player.seek(edit.start);
 
-        // Filmstrip: every keyframe, decoded in parallel; cells fill in as they arrive.
-        let (tx, strip_rx) = mpsc::channel();
-        let (src, repaint) = (source.to_path_buf(), ctx.clone());
-        std::thread::spawn(move || {
-            let _ = media::keyframe_strip(&src, STRIP_HEIGHT, |t, f| {
-                repaint.request_repaint();
-                tx.send((t, f)).is_ok() // stops decoding if the editor closed
-            });
-        });
-
         Self {
             info: l.info,
             player,
             saved: edit.clone(),
             edit,
             waves: l.waves,
-            strip: Vec::new(),
-            strip_rx,
+            strip: Filmstrip::build(ctx, source),
             meters: vec![Meter::default(); n],
             master: Meter::default(),
             dragging: None,
@@ -216,13 +202,6 @@ impl Ready {
         // The clip as named in the library; decoding uses `target.source`.
         let source = target.clip.as_path();
         let ctx = ui.ctx().clone();
-        while let Ok((t, f)) = self.strip_rx.try_recv() {
-            let img = egui::ColorImage::from_rgba_unmultiplied([f.width as usize, f.height as usize], &f.rgba);
-            let tex = ctx.load_texture(format!("strip{t:.3}"), img, egui::TextureOptions::LINEAR);
-            let at = self.strip.partition_point(|(k, _)| *k < t);
-            self.strip.insert(at, (t, tex));
-        }
-
         self.keyboard(&ctx);
         self.player.set_mix(self.edit.tracks.clone());
 
@@ -586,28 +565,7 @@ impl Ready {
         let video = Rect::from_min_size(Pos2::new(lanes.left(), ruler.bottom()), Vec2::new(lanes.width(), video_h));
         lane_header(&p, &v, Rect::from_min_max(Pos2::new(outer.left(), video.top()), Pos2::new(lanes.left() - 6.0, video.bottom())), "🎬 Video", None);
         p.rect_filled(video, 4, v.extreme_bg_color);
-        // As many uncropped thumbnails as fit; each cell shows the keyframe nearest
-        // its middle (so the strip is complete early, then sharpens in time).
-        if let Some((_, first)) = self.strip.first() {
-            let aspect = first.size_vec2().x / first.size_vec2().y;
-            let cells = ((video.width() / (video_h * aspect)).ceil() as usize).max(1);
-            let cell_w = video.width() / cells as f32;
-            let painter = ui.painter_at(video);
-            for i in 0..cells {
-                let t = dur * (i as f64 + 0.5) / cells as f64;
-                let at = self.strip.partition_point(|(k, _)| *k < t);
-                let near = [at.checked_sub(1), Some(at)]
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|j| self.strip.get(j))
-                    .min_by(|a, b| (a.0 - t).abs().total_cmp(&(b.0 - t).abs()));
-                if let Some((_, tex)) = near {
-                    let cell = Rect::from_min_size(Pos2::new(video.left() + i as f32 * cell_w, video.top()), Vec2::new(cell_w, video_h));
-                    let uv = crop_uv(tex.size_vec2(), cell.size());
-                    painter.image(tex.id(), cell, uv, Color32::WHITE);
-                }
-            }
-        }
+        self.strip.paint(ui, video, dur);
         // Scrub-proxy progress: a thin bar until every frame is scrubbable.
         let prog = self.player.proxy_progress();
         if prog < 1.0 {
@@ -1017,16 +975,4 @@ fn zone(lin: f32) -> Color32 {
 fn frame_code(frame: u64, total: u64) -> String {
     let width = total.max(1).to_string().len();
     format!("{frame:0width$}")
-}
-
-/// UV rect that center-crops a texture of `tex` size to fill `target`'s aspect.
-fn crop_uv(tex: Vec2, target: Vec2) -> Rect {
-    let (ta, ra) = (tex.x / tex.y, target.x / target.y);
-    if ta > ra {
-        let w = ra / ta;
-        Rect::from_min_max(Pos2::new((1.0 - w) / 2.0, 0.0), Pos2::new((1.0 + w) / 2.0, 1.0))
-    } else {
-        let h = ta / ra;
-        Rect::from_min_max(Pos2::new(0.0, (1.0 - h) / 2.0), Pos2::new(1.0, (1.0 + h) / 2.0))
-    }
 }

@@ -145,6 +145,11 @@ impl Player {
         (self.proxy.ready() as f64 / total).min(1.0) as f32
     }
 
+    /// The small scrub frame `idx`, if it's been built yet (for hover previews).
+    pub fn proxy_frame(&self, idx: u64) -> Option<egui::ColorImage> {
+        self.proxy.frame(idx)
+    }
+
     pub fn set_mix(&self, gains: Vec<TrackEdit>) {
         if let Ok(mut m) = self.shared.mix.lock() {
             m.tracks = gains;

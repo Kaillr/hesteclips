@@ -13,6 +13,7 @@ mod webcam_ui;
 mod cloud;
 mod cloud_ui;
 mod editor;
+mod filmstrip;
 mod library;
 mod meter;
 mod player;
@@ -25,6 +26,7 @@ mod shortcuts;
 mod sources_ui;
 mod store;
 mod thumbs;
+mod viewer;
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
@@ -70,6 +72,7 @@ pub(crate) enum Page {
     Sources,
     Settings,
     Edit,
+    View,
 }
 
 /// What capture is currently doing. Replay buffer and manual recording are mutually
@@ -203,6 +206,7 @@ struct App {
     dialog: Option<cloud_ui::Dialog>,
     toast: Option<Toast>,
     editor: Option<editor::Editor>,
+    viewer: Option<viewer::Viewer>,
     /// Edits being rendered in the background, with live progress.
     pub(crate) renders: Vec<RenderJob>,
     render_tx: std::sync::mpsc::Sender<(u64, Result<PathBuf, String>)>,
@@ -267,6 +271,7 @@ impl App {
             dialog: None,
             toast: None,
             editor: None,
+            viewer: None,
             renders: Vec::new(),
             render_tx,
             render_rx,
@@ -281,6 +286,10 @@ impl App {
         if let Some(clip) = std::env::var_os("HESTECLIPS_OPEN_EDITOR") {
             app.settings.auto_start_buffer = false;
             app.open_editor(PathBuf::from(clip));
+        }
+        if let Some(clip) = std::env::var_os("HESTECLIPS_OPEN_VIEWER") {
+            app.settings.auto_start_buffer = false;
+            app.open_viewer(PathBuf::from(clip));
         }
         // Dev aid: `HESTECLIPS_DEMO_RENDER=<clip>` shows the library with a save
         // in progress (that clip's edit + a "save as new"), to check the progress UI.
@@ -443,9 +452,14 @@ impl eframe::App for App {
             self.kept_camera = camera;
         }
 
-        // The editor gets the whole window; capture keeps running underneath and the
-        // hotkeys still work.
-        if self.page != Page::Edit {
+        // Left the viewer some other way (a hotkey that shows the library): stop it.
+        if self.page != Page::View && self.viewer.is_some() {
+            self.viewer = None;
+        }
+
+        // The editor and viewer get the whole window; capture keeps running
+        // underneath and the hotkeys still work.
+        if !matches!(self.page, Page::Edit | Page::View) {
             egui::Panel::top("capture_bar")
                 .frame(
                     egui::Frame::new()
@@ -477,6 +491,7 @@ impl eframe::App for App {
                 Page::Sources => self.sources_page(ui),
                 Page::Settings => self.settings_page(ui),
                 Page::Edit => self.editor_page(ui),
+                Page::View => self.viewer_page(ui),
             });
 
         self.dialogs(&ctx);
@@ -712,6 +727,32 @@ impl App {
         }
         self.editor = Some(editor::Editor::open(&self.ctx(), &clip));
         self.page = Page::Edit;
+    }
+
+    /// Play a clip in the app's own viewer.
+    pub(crate) fn open_viewer(&mut self, clip: PathBuf) {
+        self.viewer = Some(viewer::Viewer::open(&self.ctx(), &clip));
+        self.page = Page::View;
+    }
+
+    fn viewer_page(&mut self, ui: &mut egui::Ui) {
+        let Some(v) = &mut self.viewer else {
+            self.page = Page::Clips;
+            return;
+        };
+        match v.ui(ui) {
+            viewer::ViewerOutcome::Stay => {}
+            viewer::ViewerOutcome::Close => {
+                self.viewer = None; // drops the player: stops audio and decoders
+                self.page = Page::Clips;
+            }
+            viewer::ViewerOutcome::Edit => {
+                let clip = v.clip().to_path_buf();
+                self.viewer = None;
+                self.page = Page::Clips;
+                self.open_editor(clip);
+            }
+        }
     }
 
     fn ctx(&self) -> egui::Context {

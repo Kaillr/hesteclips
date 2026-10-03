@@ -4,7 +4,7 @@ fn main() -> anyhow::Result<()> {
     let t = std::time::Instant::now();
     let mut n = 0;
     let mut first = None;
-    media::keyframe_strip(&src, 112, |time, f| {
+    media::keyframe_strip(&src, 112, 160, |keys| println!("{} thumbnails", keys.len()), |time, f| {
         n += 1;
         first.get_or_insert(t.elapsed());
         assert_eq!(f.rgba.len(), (f.width * f.height * 4) as usize);
