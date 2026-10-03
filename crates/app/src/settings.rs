@@ -340,6 +340,9 @@ pub struct RecordSettings {
     pub shortcuts: Shortcuts,
     /// The sound played when a clip is saved.
     pub save_sound: SaveSound,
+    /// The editor's preview height, as a share of the window (the timeline
+    /// gets the rest), as last dragged.
+    pub editor_preview_share: f32,
     /// Pre-sources audio list; migrated into `audio_sources` on load.
     #[serde(skip_serializing)]
     audio_tracks: Option<Vec<LegacyAudioTrack>>,
@@ -366,6 +369,7 @@ impl Default for RecordSettings {
             limiter: true,
             shortcuts: Shortcuts::default(),
             save_sound: SaveSound::default(),
+            editor_preview_share: 0.5,
             audio_tracks: None,
         }
     }

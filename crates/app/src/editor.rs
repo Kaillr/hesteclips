@@ -21,6 +21,13 @@ use crate::waveform::Waveform;
 use crate::store::{self, EditTarget};
 
 const WAVE_BLUE: Color32 = Color32::from_rgb(70, 130, 220);
+/// Timeline geometry, in points.
+const RULER_H: f32 = 22.0;
+const VIDEO_H: f32 = 56.0;
+const AUDIO_H: f32 = 64.0;
+const MASTER_H: f32 = 26.0;
+const DIVIDER_H: f32 = 12.0;
+const MIN_PREVIEW_H: f32 = 120.0;
 /// Deepest timeline zoom: this many frames across.
 const MIN_VIEW_FRAMES: f64 = 24.0;
 /// Gain slider range in dB.
@@ -69,6 +76,8 @@ struct Ready {
     dragging: Option<Drag>,
     /// Was playing when a playhead or trim drag began: carry on after it.
     resume: bool,
+    /// How far the audio tracks are scrolled up when they don't all fit.
+    lane_scroll: f32,
     /// The part of the clip the timeline shows: start and length, in seconds.
     /// The whole clip until you zoom in.
     view: (f64, f64),
@@ -106,12 +115,14 @@ impl Meter {
 pub struct Editor {
     target: EditTarget,
     state: State,
+    /// How much of the height the preview gets; the timeline has the rest.
+    preview_share: f32,
 }
 
 impl Editor {
     /// Edit the clip at `clip`. An edited clip is decoded from its original, so
     /// every earlier decision can still be changed.
-    pub fn open(ctx: &egui::Context, clip: &Path) -> Self {
+    pub fn open(ctx: &egui::Context, clip: &Path, preview_share: f32) -> Self {
         let target = EditTarget::of(clip);
         let (tx, rx) = mpsc::channel();
         let src = target.source.clone();
@@ -131,7 +142,12 @@ impl Editor {
             let _ = tx.send(result);
             repaint.request_repaint();
         });
-        Self { target, state: State::Loading(rx) }
+        Self { target, state: State::Loading(rx), preview_share }
+    }
+
+    /// The preview's share of the height, as last dragged (to remember it).
+    pub fn preview_share(&self) -> f32 {
+        self.preview_share
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui) -> EditorOutcome {
@@ -171,7 +187,7 @@ impl Editor {
                 });
                 out
             }
-            State::Ready(r) => r.ui(ui, &self.target),
+            State::Ready(r) => r.ui(ui, &self.target, &mut self.preview_share),
         }
     }
 }
@@ -202,13 +218,14 @@ impl Ready {
             master: Meter::default(),
             dragging: None,
             resume: false,
+            lane_scroll: 0.0,
             view: (0.0, full),
             confirm_discard: false,
             save_as: None,
         }
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, target: &EditTarget) -> EditorOutcome {
+    fn ui(&mut self, ui: &mut egui::Ui, target: &EditTarget, preview_share: &mut f32) -> EditorOutcome {
         // The clip as named in the library; decoding uses `target.source`.
         let source = target.clip.as_path();
         let ctx = ui.ctx().clone();
@@ -281,9 +298,11 @@ impl Ready {
         ui.add_space(6.0);
 
         // --- Preview: everything left over after the fixed-height controls below ---
-        let tracks_h = self.edit.tracks.len() as f32 * 66.0;
-        let controls_h = 40.0 + 22.0 + 56.0 + tracks_h + 40.0 + 30.0;
-        let preview_h = (ui.available_height() - controls_h).max(140.0);
+        // The divider under it sets the split; the timeline always keeps room for
+        // the ruler, the video lane and one audio track (the rest scroll).
+        let total = ui.available_height();
+        let below_min = DIVIDER_H + 6.0 + 30.0 + 6.0 + RULER_H + VIDEO_H + 2.0 + AUDIO_H + 6.0 + MASTER_H;
+        let preview_h = (total * *preview_share).min(total - below_min).max(MIN_PREVIEW_H);
         let (preview_rect, preview_resp) =
             ui.allocate_exact_size(Vec2::new(ui.available_width(), preview_h), Sense::click());
         ui.painter().rect_filled(preview_rect, 8, Color32::BLACK);
@@ -298,6 +317,7 @@ impl Ready {
         if preview_resp.clicked() {
             self.toggle_play();
         }
+        divider(ui, preview_h, total, preview_share);
 
         // --- Transport ---
         ui.add_space(6.0);
@@ -504,14 +524,14 @@ impl Ready {
     /// Ctrl+scroll (or pinch) over the timeline zooms around the pointer; plain
     /// scrolling pans once zoomed in. While playing, the view pages along to
     /// keep the playhead in sight.
-    fn zoom_and_pan(&mut self, ui: &egui::Ui, lanes: Rect, dur: f64) {
+    fn zoom_and_pan(&mut self, ui: &egui::Ui, lanes: Rect, dur: f64, vertical_taken: bool) {
         if let Some(pos) = ui.ctx().pointer_hover_pos().filter(|p| lanes.contains(*p)) {
             let (zoom, scroll) = ui.input(|i| (i.zoom_delta(), i.smooth_scroll_delta));
             let frac = ((pos.x - lanes.left()) / lanes.width()).clamp(0.0, 1.0) as f64;
             if zoom != 1.0 {
                 self.zoom(zoom as f64, frac);
             } else if self.view.1 < dur {
-                let px = -(scroll.x + scroll.y);
+                let px = -(scroll.x + if vertical_taken { 0.0 } else { scroll.y });
                 self.view.0 += px as f64 / lanes.width() as f64 * self.view.1;
             }
         }
@@ -594,13 +614,17 @@ impl Ready {
     fn timeline(&mut self, ui: &mut egui::Ui) {
         let header_w = 132.0;
         let meter_w = 14.0;
-        let ruler_h = 22.0;
-        let video_h = 56.0;
-        let audio_h = 64.0;
+        let (ruler_h, video_h, audio_h) = (RULER_H, VIDEO_H, AUDIO_H);
         let n_audio = self.edit.tracks.len();
-        let total_h = ruler_h + video_h + n_audio as f32 * (audio_h + 2.0) + 4.0;
+        let lanes_h = n_audio as f32 * (audio_h + 2.0);
+        // As tall as it needs, up to what's left above the master meter; the
+        // audio tracks scroll inside whatever height that leaves them.
+        let room = (ui.available_height() - MASTER_H - 6.0).max(ruler_h + video_h + 2.0 + audio_h);
+        let total_h = (ruler_h + video_h + 2.0 + lanes_h).min(room);
 
         let (outer, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), total_h), Sense::hover());
+        let audio_view = Rect::from_x_y_ranges(outer.x_range(), outer.top() + ruler_h + video_h + 2.0..=outer.bottom());
+        let max_scroll = (lanes_h - 2.0 - audio_view.height()).max(0.0);
         let lanes_x = outer.left() + header_w..=outer.right() - meter_w - 8.0;
         let lanes = Rect::from_x_y_ranges(lanes_x.clone(), outer.y_range());
         let v = ui.visuals().clone();
@@ -608,7 +632,14 @@ impl Ready {
 
         let dur = self.info.duration.max(1e-6);
         let fd = self.info.frame_duration();
-        self.zoom_and_pan(ui, lanes, dur);
+        // The wheel over the audio tracks scrolls them when they don't all fit;
+        // sideways (Shift+wheel, trackpad) still pans the timeline.
+        let over_audio = ui.ctx().pointer_hover_pos().is_some_and(|p| audio_view.contains(p));
+        if over_audio && max_scroll > 0.0 {
+            self.lane_scroll -= ui.input(|i| i.smooth_scroll_delta.y);
+        }
+        self.lane_scroll = self.lane_scroll.clamp(0.0, max_scroll);
+        self.zoom_and_pan(ui, lanes, dur, over_audio && max_scroll > 0.0);
         let (v0, span) = self.view;
         let x_of = |t: f64| lanes.left() + ((t - v0) / span) as f32 * lanes.width();
         let t_of = |x: f32| (v0 + ((x - lanes.left()) / lanes.width()).clamp(0.0, 1.0) as f64 * span).clamp(0.0, dur);
@@ -660,28 +691,46 @@ impl Ready {
         }
 
         // --- Audio lanes ---
+        // Scrolled lanes are clipped to the space under the video lane.
+        let ap = ui.painter_at(audio_view);
+        let alp = ui.painter_at(lanes.intersect(audio_view));
         let mut lane_rects = Vec::new();
         let labels: Vec<String> = self.info.source_tracks().iter().map(|a| a.label()).collect();
-        let mut y = video.bottom() + 2.0;
+        let mut y = audio_view.top() - self.lane_scroll;
         for i in 0..n_audio {
             let lane = Rect::from_min_size(Pos2::new(lanes.left(), y), Vec2::new(lanes.width(), audio_h));
             lane_rects.push(lane);
             y += audio_h + 2.0;
+            if !lane.intersects(audio_view) {
+                continue;
+            }
             let track = &self.edit.tracks[i];
-            p.rect_filled(lane, 4, v.extreme_bg_color);
-            // Waveform drawn with the volume curve applied: what you'll hear.
+            ap.rect_filled(lane, 4, v.extreme_bg_color);
             // Drawn with the volume curve applied: what you'll hear.
             if let Some(w) = self.waves.get(i) {
                 let base = if track.muted { Color32::from_gray(90) } else { WAVE_BLUE };
-                w.paint(&lp, lane, (v0, span), |t| track.gain_at(t), |_, _| base);
+                w.paint(&alp, lane, (v0, span), |t| track.gain_at(t), |_, _| base);
             }
-            draw_envelope(&lp, lane, track, dur, x_of);
+            draw_envelope(&alp, lane, track, dur, x_of);
             let meter = Rect::from_min_size(Pos2::new(outer.right() - meter_w, lane.top()), Vec2::new(meter_w - 4.0, audio_h));
-            draw_vmeter(&p, &v, meter, self.meters.get(i).copied().unwrap_or_default());
+            draw_vmeter(&ap, &v, meter, self.meters.get(i).copied().unwrap_or_default());
+        }
+        // Scrollbar, between the lanes and their meters, when they don't all fit.
+        if max_scroll > 0.0 {
+            let track = Rect::from_x_y_ranges(lanes.right() + 2.0..=lanes.right() + 6.0, audio_view.y_range());
+            let view_h = audio_view.height();
+            let thumb_h = (view_h / (lanes_h - 2.0) * view_h).max(24.0);
+            let thumb_y = track.top() + self.lane_scroll / max_scroll * (view_h - thumb_h);
+            let bar = ui.interact(track.expand2(Vec2::new(3.0, 0.0)), ui.id().with("lane_scrollbar"), Sense::drag());
+            if bar.dragged() {
+                self.lane_scroll = (self.lane_scroll + bar.drag_delta().y / (view_h - thumb_h).max(1.0) * max_scroll).clamp(0.0, max_scroll);
+            }
+            let alpha = if bar.hovered() || bar.dragged() { 160 } else { 90 };
+            p.rect_filled(Rect::from_x_y_ranges(track.x_range(), thumb_y..=thumb_y + thumb_h), 2, Color32::from_white_alpha(alpha));
         }
 
         // --- Trim shading + handles + playhead across all lanes ---
-        let body = Rect::from_x_y_ranges(lanes_x, video.top()..=y - 2.0);
+        let body = Rect::from_x_y_ranges(lanes_x, video.top()..=(y - 2.0).min(audio_view.bottom()));
         let (xi, xo) = (x_of(self.edit.start), x_of(self.edit.end));
         let shade = Color32::from_black_alpha(160);
         lp.rect_filled(Rect::from_min_max(body.min, Pos2::new(xi, body.bottom())), 0, shade);
@@ -715,6 +764,9 @@ impl Ready {
 
         // --- Lane headers (drawn after the shading so they stay readable) ---
         for (i, lane) in lane_rects.iter().enumerate() {
+            if !lane.intersects(audio_view) {
+                continue;
+            }
             let head = Rect::from_min_max(Pos2::new(outer.left(), lane.top()), Pos2::new(lanes.left() - 6.0, lane.bottom()));
             let track = &mut self.edit.tracks[i];
             let name = labels.get(i).cloned().unwrap_or_default();
@@ -725,9 +777,14 @@ impl Ready {
             } else {
                 format!("{} keyframes", track.points.len())
             };
-            lane_header(&p, &v, head, &format!("🔊 {name}"), Some(&db_text));
-            // Detached child Uis so these overlay buttons don't affect layout.
-            let mut put = |rect: Rect, b: egui::Button| ui.new_child(egui::UiBuilder::new().max_rect(rect)).add_sized(rect.size(), b);
+            lane_header(&ap, &v, head, &format!("🔊 {name}"), Some(&db_text));
+            // Detached child Uis so these overlay buttons don't affect layout,
+            // clipped like the lanes when scrolled partly out of view.
+            let mut put = |rect: Rect, b: egui::Button| {
+                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+                child.set_clip_rect(child.clip_rect().intersect(audio_view));
+                if rect.intersects(audio_view) { child.add_sized(rect.size(), b) } else { child.allocate_response(Vec2::ZERO, Sense::hover()) }
+            };
             let mute_rect = Rect::from_min_size(Pos2::new(head.left() + 4.0, head.bottom() - 25.0), Vec2::new(28.0, 21.0));
             let mute = put(mute_rect, egui::Button::new(if track.muted { "🔇" } else { "M" }).selected(track.muted));
             if mute.on_hover_text(if track.muted { "Unmute" } else { "Mute" }).clicked() {
@@ -755,7 +812,7 @@ impl Ready {
                 return Some(Drag::Out);
             }
             for (i, lane) in lane_rects.iter().enumerate() {
-                if !lane.contains(pos) {
+                if !lane.contains(pos) || !audio_view.contains(pos) {
                     continue;
                 }
                 let track = &this.edit.tracks[i];
@@ -780,7 +837,7 @@ impl Ready {
             // Hover readout: frame number at the pointer, and the volume on a lane.
             let t = self.info.snap(t_of(pos.x));
             let mut tip = format!("Frame {}", self.info.frame_index(t));
-            if let Some(i) = lane_rects.iter().position(|l| l.contains(pos)) {
+            if let Some(i) = lane_rects.iter().position(|l| l.contains(pos) && audio_view.contains(pos)) {
                 tip += &format!("  ·  {:+.1} dB", self.edit.tracks[i].db_at(t));
             }
             p.text(Pos2::new(pos.x + 10.0, ruler.top() + 2.0), Align2::LEFT_TOP, tip, FontId::proportional(11.0), v.text_color());
@@ -871,7 +928,7 @@ impl Ready {
 
         if resp.double_clicked() {
             if let Some(pos) = resp.interact_pointer_pos() {
-                if let Some(i) = lane_rects.iter().position(|l| l.contains(pos)) {
+                if let Some(i) = lane_rects.iter().position(|l| l.contains(pos) && audio_view.contains(pos)) {
                     // Add a keyframe on the curve at this time (keeps the sound unchanged
                     // until it's dragged). The first one adopts the track's flat level.
                     let t = self.info.snap(t_of(pos.x));
@@ -924,7 +981,7 @@ impl Ready {
             };
             ui.label(RichText::new(txt).size(12.0).color(color));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.weak("Ctrl+scroll to zoom, scroll to pan · drag the yellow line to set volume · double-click to add a keyframe · right-click one to remove it");
+                ui.weak("Ctrl+scroll to zoom, Shift+scroll to pan · drag the yellow line to set volume · double-click to add a keyframe · right-click one to remove it");
             });
         });
     }
@@ -939,6 +996,20 @@ enum Drag {
     Line(usize),
     /// Keyframe k of track i.
     Point(usize, usize),
+}
+
+/// The bar between the preview and the timeline: drag it to give either more
+/// room. `share` is the preview's fraction of `total`.
+fn divider(ui: &mut egui::Ui, preview_h: f32, total: f32, share: &mut f32) {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), DIVIDER_H), Sense::drag());
+    let resp = resp.on_hover_cursor(egui::CursorIcon::ResizeVertical).on_hover_text("Drag to resize the preview and the timeline");
+    if resp.dragged() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+        *share = ((preview_h + resp.drag_delta().y) / total.max(1.0)).clamp(0.1, 0.95);
+    }
+    let active = resp.hovered() || resp.dragged();
+    let grip = Rect::from_center_size(rect.center(), Vec2::new(44.0, 4.0));
+    ui.painter().rect_filled(grip, 2, Color32::from_white_alpha(if active { 150 } else { 50 }));
 }
 
 /// Volume lanes map MIN_DB..MAX_DB to bottom..top (0 dB sits ~70% up).
