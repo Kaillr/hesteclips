@@ -23,6 +23,7 @@ mod settings;
 mod settings_ui;
 mod share;
 mod shortcuts;
+mod sound;
 mod sources_ui;
 mod store;
 mod thumbs;
@@ -167,6 +168,8 @@ struct App {
     pub(crate) recording_shortcut: Option<(settings::ShortcutAction, Option<&'static str>)>,
     /// The "Reset all settings?" confirmation is open.
     pub(crate) confirm_reset: bool,
+    /// Adding a custom clip-saved sound failed: why.
+    pub(crate) sound_error: Option<String>,
     /// Screen-recording permission, re-checked each poll so the banner clears the
     /// moment the user grants it.
     permission: capture::Permission,
@@ -225,6 +228,7 @@ impl App {
     fn new(ctx: egui::Context) -> Self {
         add_symbol_font(&ctx);
         let settings = RecordSettings::load();
+        sound::preload(&settings.save_sound.sound);
         let recovered = capture::output::recover_unfinished(&settings.output_dir);
         let saved_settings = settings.to_json();
         let clips = clips::scan(&settings.output_dir);
@@ -251,6 +255,7 @@ impl App {
             hotkeys,
             recording_shortcut: None,
             confirm_reset: false,
+            sound_error: None,
             permission: capture::screen_permission(),
             screens: capture::list_screens(),
             windowed_apps: Vec::new(),
@@ -957,6 +962,7 @@ impl App {
         // Its moment is taken at once; the Saved event lands it in the library.
         // Another can be saved while it's still being written.
         self.service.save_clip();
+        sound::play_saved(&self.settings.save_sound);
         self.saving += 1;
         self.page = Page::Clips;
     }

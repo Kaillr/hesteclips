@@ -338,6 +338,8 @@ pub struct RecordSettings {
 
     // --- Shortcuts ---
     pub shortcuts: Shortcuts,
+    /// The sound played when a clip is saved.
+    pub save_sound: SaveSound,
     /// Pre-sources audio list; migrated into `audio_sources` on load.
     #[serde(skip_serializing)]
     audio_tracks: Option<Vec<LegacyAudioTrack>>,
@@ -363,9 +365,35 @@ impl Default for RecordSettings {
             audio_sources: default_sources(),
             limiter: true,
             shortcuts: Shortcuts::default(),
+            save_sound: SaveSound::default(),
             audio_tracks: None,
         }
     }
+}
+
+/// The sound played when a clip is saved (see `sound.rs`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SaveSound {
+    pub enabled: bool,
+    /// A built-in sound's id, or `file:<path>` for one of `custom`.
+    pub sound: String,
+    /// 0..=1, applied on a curve (see `sound::gain`).
+    pub volume: f32,
+    /// Sounds you've added, copied into HesteClips' own folder.
+    pub custom: Vec<CustomSound>,
+}
+
+impl Default for SaveSound {
+    fn default() -> Self {
+        Self { enabled: true, sound: "silverfish".into(), volume: 0.6, custom: Vec::new() }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CustomSound {
+    pub name: String,
+    pub file: PathBuf,
 }
 
 /// The global shortcuts, as `global_hotkey` strings ("alt+F10"). Empty = off.

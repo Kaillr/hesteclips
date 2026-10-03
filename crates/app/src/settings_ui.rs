@@ -139,6 +139,8 @@ impl App {
             });
         });
 
+        section(ui, "Sound", |ui| self.sound_settings(ui));
+
         section(ui, "Shortcuts", |ui| {
             ui.weak("These work everywhere, even while a game has focus. Click one, then press the new keys.");
             ui.add_space(4.0);
@@ -166,6 +168,78 @@ impl App {
         });
         ui.add_space(24.0);
         self.reset_dialog(ui.ctx());
+    }
+
+    /// The clip-saved sound: on/off, which one (built-in or your own), volume,
+    /// each with a way to hear it.
+    fn sound_settings(&mut self, ui: &mut egui::Ui) {
+        let cfg = &mut self.settings.save_sound;
+        row(ui, "Play a sound when a clip is saved", Some("So you know it worked without leaving the game. It's never recorded into your clips."), |ui| {
+            toggle(ui, &mut cfg.enabled);
+        });
+        divider(ui);
+        ui.add_enabled_ui(cfg.enabled, |ui| {
+            row(ui, "Sound", None, |ui| {
+                ui.vertical(|ui| {
+                    let mut remove = None;
+                    let volume = cfg.volume;
+                    let mut choice = |ui: &mut egui::Ui, id: String, name: &str| -> bool {
+                        let mut gone = false;
+                        ui.horizontal(|ui| {
+                            if ui.add(egui::Button::new("▶").min_size(egui::vec2(26.0, 0.0))).on_hover_text("Hear it").clicked() {
+                                crate::sound::play(&id, volume);
+                            }
+                            if ui.radio(cfg.sound == id, name).clicked() {
+                                cfg.sound = id.clone();
+                                crate::sound::preload(&id);
+                            }
+                            gone = id.starts_with("file:") && ui.small_button("✕").on_hover_text("Remove this sound").clicked();
+                        });
+                        gone
+                    };
+                    for (id, name) in crate::sound::BUILTIN {
+                        choice(ui, id.to_owned(), name);
+                    }
+                    for (i, c) in cfg.custom.clone().iter().enumerate() {
+                        if choice(ui, crate::sound::id_of(c), &c.name) {
+                            remove = Some(i);
+                        }
+                    }
+                    if let Some(i) = remove {
+                        let gone = cfg.custom.remove(i);
+                        if cfg.sound == crate::sound::id_of(&gone) {
+                            cfg.sound = crate::settings::SaveSound::default().sound;
+                        }
+                        crate::sound::remove_custom(&gone);
+                    }
+                    if ui.button("Add your own…").on_hover_text("Any audio file: MP3, WAV, OGG, FLAC…").clicked() {
+                        let picked = rfd::FileDialog::new()
+                            .add_filter("Audio", &["mp3", "wav", "ogg", "oga", "opus", "flac", "m4a", "aac", "wma"])
+                            .pick_file();
+                        if let Some(path) = picked {
+                            match crate::sound::add_custom(&path, &cfg.custom) {
+                                Ok(c) => {
+                                    cfg.sound = crate::sound::id_of(&c);
+                                    crate::sound::play(&cfg.sound, cfg.volume);
+                                    cfg.custom.push(c);
+                                }
+                                Err(e) => self.sound_error = Some(e),
+                            }
+                        }
+                    }
+                    if let Some(e) = &self.sound_error {
+                        ui.colored_label(ui.visuals().error_fg_color, e);
+                    }
+                });
+            });
+            divider(ui);
+            row(ui, "Volume", Some("Let go of the slider to hear it."), |ui| {
+                let slider = ui.add(egui::Slider::new(&mut cfg.volume, 0.0..=1.0).custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
+                if slider.drag_stopped() || (slider.changed() && !slider.dragged()) {
+                    crate::sound::play(&cfg.sound, cfg.volume);
+                }
+            });
+        });
     }
 
     fn advanced(&mut self, ui: &mut egui::Ui) {
@@ -316,6 +390,7 @@ impl App {
                     fresh.output_dir = self.settings.output_dir.clone();
                     fresh.audio_sources = std::mem::take(&mut self.settings.audio_sources);
                     fresh.limiter = self.settings.limiter;
+                    fresh.save_sound.custom = std::mem::take(&mut self.settings.save_sound.custom);
                     self.settings = fresh;
                     self.confirm_reset = false;
                     self.toast("Settings reset to defaults");
