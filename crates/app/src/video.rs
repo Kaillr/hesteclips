@@ -47,7 +47,8 @@ pub struct Video {
 
 impl Video {
     /// Start opening `path` in the background, decoding `width` wide.
-    pub fn open(ctx: &egui::Context, path: &Path, width: u32) -> Self {
+    /// Frames are numbered at `fps` (the clip's, as the app counts them).
+    pub fn open(ctx: &egui::Context, path: &Path, width: u32, fps: f64) -> Self {
         let (tx, rx) = mpsc::channel::<Cmd>();
         let state = Arc::new(Mutex::new(State::default()));
         let (path, shared, ctx) = (path.to_path_buf(), state.clone(), ctx.clone());
@@ -65,7 +66,10 @@ impl Video {
                 None => Decoder::open(&path, width, None),
             };
             let mut dec = match opened {
-                Ok(d) => d,
+                Ok(mut d) => {
+                    d.set_fps(fps);
+                    d
+                }
                 Err(e) => {
                     eprintln!("hardware decoder unavailable, using ffmpeg: {e:#}");
                     shared.lock().unwrap().failed = true;

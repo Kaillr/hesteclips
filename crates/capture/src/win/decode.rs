@@ -197,6 +197,14 @@ impl Decoder {
         }
     }
 
+    /// Number frames on this rate's grid instead of the file's own (to match
+    /// how the app counts them, from ffprobe's average rate).
+    pub fn set_fps(&mut self, fps: f64) {
+        if fps > 0.0 {
+            self.fps = fps;
+        }
+    }
+
     /// Frame `index`, exactly: decoded forward from where the reader is when
     /// that's close, else from the keyframe before it. `None` past the end.
     pub fn frame(&mut self, index: u64) -> Result<Option<Picture>> {
@@ -239,7 +247,9 @@ impl Decoder {
             self.next_index = None;
             return Ok(None);
         };
-        let index = (((time - self.offset) as f64 / UNITS) * self.fps).round().max(0.0) as u64;
+        // The frame whose slot on the grid contains this time, rounding down
+        // like the app does (a frame a hair early still counts as its own).
+        let index = (((time - self.offset) as f64 / UNITS) * self.fps + 1e-6).floor().max(0.0) as u64;
         self.next_index = Some(index + 1);
         Ok(Some((index, sample)))
     }

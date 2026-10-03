@@ -157,7 +157,7 @@ impl Player {
             still_wanted: None,
             proxy: Proxy::build(ctx, source, info_fps),
             showing_proxy: false,
-            video: open_video(ctx, source),
+            video: open_video(ctx, source, info_fps),
             pending_start: None,
             video_playing: false,
         }
@@ -395,12 +395,12 @@ impl Player {
 
 /// The hardware decoder for `source`, on Windows (unless
 /// `HESTECLIPS_NO_HW_DECODE` is set, to compare with the ffmpeg path).
-fn open_video(ctx: &egui::Context, source: &Path) -> Option<Video> {
+fn open_video(ctx: &egui::Context, source: &Path, fps: f64) -> Option<Video> {
     #[cfg(windows)]
     if std::env::var_os("HESTECLIPS_NO_HW_DECODE").is_none() {
-        return Some(Video::open(ctx, source, PREVIEW_WIDTH));
+        return Some(Video::open(ctx, source, PREVIEW_WIDTH, fps));
     }
-    let _ = (ctx, source);
+    let _ = (ctx, source, fps);
     None
 }
 
