@@ -295,12 +295,12 @@ impl Ready {
         let t_of = |x: f32| ((x - outer.left()) / outer.width()).clamp(0.0, 1.0) as f64 * dur;
 
         p.rect_filled(video, 4, v.extreme_bg_color);
-        self.strip.paint(ui, video, dur);
+        self.strip.paint(ui, video, 0.0, dur);
         p.rect_filled(audio, 4, v.extreme_bg_color);
         draw_levels(&p, audio, &self.levels, dur);
 
         // Already-played part of the levels, lightly marked, so where you are reads at a glance.
-        let xp = x_of(self.player.time());
+        let xp = x_of(self.info.snap(self.player.time()));
         p.rect_filled(Rect::from_min_max(audio.min, Pos2::new(xp, audio.bottom())), 4, Color32::from_white_alpha(10));
 
         // Scrub proxy still building: a thin bar until every frame is scrubbable.

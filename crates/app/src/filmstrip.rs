@@ -54,20 +54,27 @@ impl Filmstrip {
         Self { rx, keys: Vec::new(), thumbs: Vec::new(), aspect: None }
     }
 
-    /// Paint into `lane`, which spans `0..dur` seconds.
-    pub fn paint(&mut self, ui: &egui::Ui, lane: Rect, dur: f64) {
+    /// Paint into `lane`, which shows `from..to` seconds of the clip.
+    pub fn paint(&mut self, ui: &egui::Ui, lane: Rect, from: f64, to: f64) {
         self.receive(ui.ctx());
         let Some(aspect) = self.aspect else { return };
+        let span = (to - from).max(1e-6);
         // As many uncropped thumbnails as fit; each cell shows the chosen keyframe
-        // nearest its middle, or nothing until that one has arrived.
-        let cells = ((lane.width() / (lane.height() * aspect)).ceil() as usize).max(1);
-        let cell_w = lane.width() / cells as f32;
+        // nearest its middle, or nothing until that one has arrived. Cells sit on
+        // a fixed grid in clip time, so panning a zoomed timeline slides them
+        // along rather than changing what each one shows.
+        let fit = ((lane.width() / (lane.height() * aspect)).ceil() as f64).max(1.0);
+        let cell_t = span / fit;
+        let x_of = |t: f64| lane.left() + ((t - from) / span) as f32 * lane.width();
         let painter = ui.painter_at(lane);
-        for i in 0..cells {
-            let t = dur * (i as f64 + 0.5) / cells as f64;
-            let Some(tex) = self.nearest(t).and_then(|k| self.thumbs[k].as_ref()) else { continue };
-            let cell = Rect::from_min_size(Pos2::new(lane.left() + i as f32 * cell_w, lane.top()), Vec2::new(cell_w, lane.height()));
-            painter.image(tex.id(), cell, crop_uv(tex.size_vec2(), cell.size()), Color32::WHITE);
+        let mut k = (from / cell_t).floor();
+        while k * cell_t < to {
+            let (t0, t1) = (k * cell_t, (k + 1.0) * cell_t);
+            if let Some(tex) = self.nearest((t0 + t1) / 2.0).and_then(|i| self.thumbs[i].as_ref()) {
+                let cell = Rect::from_x_y_ranges(x_of(t0)..=x_of(t1), lane.y_range());
+                painter.image(tex.id(), cell, crop_uv(tex.size_vec2(), cell.size()), Color32::WHITE);
+            }
+            k += 1.0;
         }
     }
 

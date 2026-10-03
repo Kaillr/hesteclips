@@ -19,8 +19,10 @@ use crate::filmstrip::Filmstrip;
 use crate::player::Player;
 use crate::store::{self, EditTarget};
 
-/// Waveform resolution: peak buckets across the full clip.
-const WAVE_BUCKETS: usize = 600;
+/// Waveform resolution: one peak per this many seconds, fine enough to zoom in on.
+const WAVE_STEP: f64 = 0.005;
+/// Deepest timeline zoom: this many frames across.
+const MIN_VIEW_FRAMES: f64 = 24.0;
 /// Gain slider range in dB.
 const MIN_DB: f32 = -30.0;
 const MAX_DB: f32 = 12.0;
@@ -65,6 +67,11 @@ struct Ready {
     meters: Vec<Meter>,
     master: Meter,
     dragging: Option<Drag>,
+    /// Was playing when a playhead or trim drag began: carry on after it.
+    resume: bool,
+    /// The part of the clip the timeline shows: start and length, in seconds.
+    /// The whole clip until you zoom in.
+    view: (f64, f64),
     confirm_discard: bool,
     /// "Save as new clip" dialog: the name being typed, and any problem with it.
     save_as: Option<(String, Option<String>)>,
@@ -183,6 +190,7 @@ impl Ready {
         let mut player = Player::new(ctx, source, l.info.clone(), l.pcm, gains);
         player.seek(edit.start);
 
+        let full = l.info.duration.max(1e-6);
         Self {
             info: l.info,
             player,
@@ -193,6 +201,8 @@ impl Ready {
             meters: vec![Meter::default(); n],
             master: Meter::default(),
             dragging: None,
+            resume: false,
+            view: (0.0, full),
             confirm_discard: false,
             save_as: None,
         }
@@ -438,6 +448,22 @@ impl Ready {
         if ctx.egui_wants_keyboard_input() {
             return;
         }
+        let (zoom_in, zoom_out, fit) = ctx.input_mut(|inp| {
+            (
+                inp.consume_key(egui::Modifiers::NONE, Key::Equals) || inp.consume_key(egui::Modifiers::NONE, Key::Plus),
+                inp.consume_key(egui::Modifiers::NONE, Key::Minus),
+                inp.consume_key(egui::Modifiers::NONE, Key::Backslash),
+            )
+        });
+        if zoom_in {
+            self.zoom_at_playhead(2.0);
+        }
+        if zoom_out {
+            self.zoom_at_playhead(0.5);
+        }
+        if fit {
+            self.view = (0.0, self.info.duration.max(1e-6));
+        }
         let (space, left, right, i, o, home, end, shift) = ctx.input_mut(|inp| {
             (
                 inp.consume_key(egui::Modifiers::NONE, Key::Space),
@@ -473,6 +499,53 @@ impl Ready {
         if end {
             self.player.seek((self.edit.end - self.info.frame_duration()).max(self.edit.start));
         }
+    }
+
+    /// Ctrl+scroll (or pinch) over the timeline zooms around the pointer; plain
+    /// scrolling pans once zoomed in. While playing, the view pages along to
+    /// keep the playhead in sight.
+    fn zoom_and_pan(&mut self, ui: &egui::Ui, lanes: Rect, dur: f64) {
+        if let Some(pos) = ui.ctx().pointer_hover_pos().filter(|p| lanes.contains(*p)) {
+            let (zoom, scroll) = ui.input(|i| (i.zoom_delta(), i.smooth_scroll_delta));
+            let frac = ((pos.x - lanes.left()) / lanes.width()).clamp(0.0, 1.0) as f64;
+            if zoom != 1.0 {
+                self.zoom(zoom as f64, frac);
+            } else if self.view.1 < dur {
+                let px = -(scroll.x + scroll.y);
+                self.view.0 += px as f64 / lanes.width() as f64 * self.view.1;
+            }
+        }
+        if self.player.is_playing() {
+            let t = self.player.time();
+            if t < self.view.0 || t > self.view.0 + self.view.1 {
+                self.view.0 = t - self.view.1 * 0.05;
+            }
+        }
+        self.view.1 = self.view.1.clamp(self.min_span(), dur);
+        self.view.0 = self.view.0.clamp(0.0, (dur - self.view.1).max(0.0));
+    }
+
+    /// Zoom by `factor` (> 1 = closer), keeping the time at `frac` across the
+    /// timeline where it is.
+    fn zoom(&mut self, factor: f64, frac: f64) {
+        let (v0, span) = self.view;
+        let at = v0 + frac * span;
+        let new = (span / factor).clamp(self.min_span(), self.info.duration.max(1e-6));
+        self.view = (at - frac * new, new);
+    }
+
+    fn min_span(&self) -> f64 {
+        (MIN_VIEW_FRAMES * self.info.frame_duration()).min(self.info.duration.max(1e-6))
+    }
+
+    /// Zoom around the playhead if it's in view, else around the middle.
+    fn zoom_at_playhead(&mut self, factor: f64) {
+        let (v0, span) = self.view;
+        let frac = (self.player.time() - v0) / span;
+        let frac = if (0.0..=1.0).contains(&frac) { frac } else { 0.5 };
+        self.zoom(factor, frac);
+        let dur = self.info.duration.max(1e-6);
+        self.view.0 = self.view.0.clamp(0.0, (dur - self.view.1).max(0.0));
     }
 
     fn toggle_play(&mut self) {
@@ -534,38 +607,50 @@ impl Ready {
         let p = ui.painter_at(outer);
 
         let dur = self.info.duration.max(1e-6);
-        let x_of = |t: f64| lanes.left() + (t / dur) as f32 * lanes.width();
-        let t_of = |x: f32| ((x - lanes.left()) / lanes.width()).clamp(0.0, 1.0) as f64 * dur;
         let fd = self.info.frame_duration();
+        self.zoom_and_pan(ui, lanes, dur);
+        let (v0, span) = self.view;
+        let x_of = |t: f64| lanes.left() + ((t - v0) / span) as f32 * lanes.width();
+        let t_of = |x: f32| (v0 + ((x - lanes.left()) / lanes.width()).clamp(0.0, 1.0) as f64 * span).clamp(0.0, dur);
+        // Everything on the time axis is clipped to the lanes, so a zoomed-in
+        // timeline never draws into the headers or meters.
+        let lp = ui.painter_at(lanes);
 
         // --- Ruler: frame numbers, ticks every N frames depending on zoom ---
         let ruler = Rect::from_min_size(Pos2::new(lanes.left(), outer.top()), Vec2::new(lanes.width(), ruler_h));
-        let total_frames = (dur * self.info.fps).round().max(1.0);
-        let px_per_frame = lanes.width() as f64 / total_frames;
-        let step = [1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1200.0, 3000.0]
+        let px_per_frame = lanes.width() as f64 / (span * self.info.fps);
+        let step = [1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1200.0, 3000.0]
             .into_iter()
             .find(|s| s * px_per_frame >= 70.0)
             .unwrap_or(6000.0);
-        let mut f = 0.0;
-        while f <= total_frames {
-            let x = lanes.left() + (f * px_per_frame) as f32;
-            p.vline(x, ruler.bottom() - 6.0..=ruler.bottom(), Stroke::new(1.0, v.weak_text_color()));
-            p.text(Pos2::new(x + 3.0, ruler.top() + 2.0), Align2::LEFT_TOP, format!("{}", f as u64), FontId::monospace(10.5), v.weak_text_color());
+        let last_frame = ((v0 + span) * self.info.fps).ceil();
+        let mut f = (v0 * self.info.fps / step).floor() * step;
+        while f <= last_frame {
+            let x = x_of(f / self.info.fps);
+            lp.vline(x, ruler.bottom() - 6.0..=ruler.bottom(), Stroke::new(1.0, v.weak_text_color()));
+            lp.text(Pos2::new(x + 3.0, ruler.top() + 2.0), Align2::LEFT_TOP, format!("{}", f as u64), FontId::monospace(10.5), v.weak_text_color());
             // Minor ticks.
-            for k in 1..5 {
-                let xm = x + (step * px_per_frame) as f32 * k as f32 / 5.0;
-                if xm < lanes.right() {
-                    p.vline(xm, ruler.bottom() - 3.0..=ruler.bottom(), Stroke::new(1.0, v.weak_text_color().gamma_multiply(0.5)));
-                }
+            let minor = if step >= 5.0 { 5 } else { step as usize };
+            for k in 1..minor {
+                let xm = x + (step * px_per_frame) as f32 * k as f32 / minor as f32;
+                lp.vline(xm, ruler.bottom() - 3.0..=ruler.bottom(), Stroke::new(1.0, v.weak_text_color().gamma_multiply(0.5)));
             }
             f += step;
+        }
+        // Zoomed in: which part of the clip is showing, along the top of the ruler.
+        if span < dur - 1e-9 {
+            let track = Rect::from_min_size(ruler.min, Vec2::new(ruler.width(), 3.0));
+            lp.rect_filled(track, 1, Color32::from_white_alpha(20));
+            let a = track.left() + (v0 / dur) as f32 * track.width();
+            let b = track.left() + ((v0 + span) / dur) as f32 * track.width();
+            lp.rect_filled(Rect::from_x_y_ranges(a..=b.max(a + 4.0), track.y_range()), 1, Color32::from_white_alpha(110));
         }
 
         // --- Video lane ---
         let video = Rect::from_min_size(Pos2::new(lanes.left(), ruler.bottom()), Vec2::new(lanes.width(), video_h));
         lane_header(&p, &v, Rect::from_min_max(Pos2::new(outer.left(), video.top()), Pos2::new(lanes.left() - 6.0, video.bottom())), "🎬 Video", None);
         p.rect_filled(video, 4, v.extreme_bg_color);
-        self.strip.paint(ui, video, dur);
+        self.strip.paint(ui, video, v0, v0 + span);
         // Scrub-proxy progress: a thin bar until every frame is scrubbable.
         let prog = self.player.proxy_progress();
         if prog < 1.0 {
@@ -585,8 +670,8 @@ impl Ready {
             let track = &self.edit.tracks[i];
             p.rect_filled(lane, 4, v.extreme_bg_color);
             // Waveform drawn with the volume curve applied: what you'll hear.
-            draw_wave(&p, lane, self.waves.get(i).map(Vec::as_slice).unwrap_or(&[]), dur, |t| track.gain_at(t), track.muted);
-            draw_envelope(&p, lane, track, dur, x_of);
+            draw_wave(&lp, lane, self.waves.get(i).map(Vec::as_slice).unwrap_or(&[]), (v0, span), |t| track.gain_at(t), track.muted);
+            draw_envelope(&lp, lane, track, dur, x_of);
             let meter = Rect::from_min_size(Pos2::new(outer.right() - meter_w, lane.top()), Vec2::new(meter_w - 4.0, audio_h));
             draw_vmeter(&p, &v, meter, self.meters.get(i).copied().unwrap_or_default());
         }
@@ -595,22 +680,31 @@ impl Ready {
         let body = Rect::from_x_y_ranges(lanes_x, video.top()..=y - 2.0);
         let (xi, xo) = (x_of(self.edit.start), x_of(self.edit.end));
         let shade = Color32::from_black_alpha(160);
-        p.rect_filled(Rect::from_min_max(body.min, Pos2::new(xi, body.bottom())), 0, shade);
-        p.rect_filled(Rect::from_min_max(Pos2::new(xo, body.top()), body.max), 0, shade);
+        lp.rect_filled(Rect::from_min_max(body.min, Pos2::new(xi, body.bottom())), 0, shade);
+        lp.rect_filled(Rect::from_min_max(Pos2::new(xo, body.top()), body.max), 0, shade);
         let handle_w = 10.0;
         let in_handle = Rect::from_min_max(Pos2::new(xi, body.top()), Pos2::new(xi + handle_w, video.bottom()));
         let out_handle = Rect::from_min_max(Pos2::new(xo - handle_w, body.top()), Pos2::new(xo, video.bottom()));
-        p.rect_stroke(Rect::from_min_max(Pos2::new(xi, video.top()), Pos2::new(xo, video.bottom())), 3, Stroke::new(2.5, HOT_YELLOW), StrokeKind::Inside);
-        p.vline(xi, body.y_range(), Stroke::new(1.5, HOT_YELLOW));
-        p.vline(xo, body.y_range(), Stroke::new(1.5, HOT_YELLOW));
+        lp.rect_stroke(Rect::from_min_max(Pos2::new(xi, video.top()), Pos2::new(xo, video.bottom())), 3, Stroke::new(2.5, HOT_YELLOW), StrokeKind::Inside);
+        lp.vline(xi, body.y_range(), Stroke::new(1.5, HOT_YELLOW));
+        lp.vline(xo, body.y_range(), Stroke::new(1.5, HOT_YELLOW));
         for h in [in_handle, out_handle] {
-            p.rect_filled(h, 2, HOT_YELLOW);
-            p.vline(h.center().x, h.center().y - 7.0..=h.center().y + 7.0, Stroke::new(2.0, Color32::from_black_alpha(160)));
+            lp.rect_filled(h, 2, HOT_YELLOW);
+            lp.vline(h.center().x, h.center().y - 7.0..=h.center().y + 7.0, Stroke::new(2.0, Color32::from_black_alpha(160)));
         }
-        let xp = x_of(self.player.time());
-        p.vline(xp, ruler.top()..=body.bottom(), Stroke::new(1.5, Color32::WHITE));
-        p.add(egui::Shape::convex_polygon(
-            vec![Pos2::new(xp - 6.0, ruler.top()), Pos2::new(xp + 6.0, ruler.top()), Pos2::new(xp, ruler.top() + 8.0)],
+        // Playhead on the start of the frame showing, with that frame's width
+        // marked (Premiere-style) once zoomed in far enough to see it.
+        let frame_start = self.info.snap(self.player.time());
+        let xp = x_of(frame_start);
+        let frame_w = x_of(frame_start + fd) - xp;
+        if frame_w >= 3.0 {
+            lp.rect_filled(Rect::from_x_y_ranges(xp..=xp + frame_w, ruler.y_range()), 0, Color32::from_white_alpha(70));
+            lp.rect_filled(Rect::from_x_y_ranges(xp..=xp + frame_w, body.y_range()), 0, Color32::from_white_alpha(16));
+        }
+        lp.vline(xp, ruler.top()..=body.bottom(), Stroke::new(1.5, Color32::WHITE));
+        let head = xp + frame_w.max(0.0) / 2.0;
+        lp.add(egui::Shape::convex_polygon(
+            vec![Pos2::new(head - 6.0, ruler.top()), Pos2::new(head + 6.0, ruler.top()), Pos2::new(head, ruler.top() + 8.0)],
             Color32::WHITE,
             Stroke::NONE,
         ));
@@ -693,11 +787,25 @@ impl Ready {
             // drag only starts after a few pixels of movement, by which time a
             // vertical drag has already left the thin volume line or keyframe.
             if let Some(pos) = ui.input(|i| i.pointer.press_origin()).or(resp.interact_pointer_pos()) {
-                self.dragging = Some(hit(pos, self).unwrap_or(Drag::Playhead));
-                self.player.pause();
+                let d = hit(pos, self).unwrap_or(Drag::Playhead);
+                self.dragging = Some(d);
+                // Moving the playhead or a trim pauses while you drag and carries on
+                // after; shaping the volume never interrupts playback.
+                if matches!(d, Drag::In | Drag::Out | Drag::Playhead) {
+                    self.resume = self.player.is_playing();
+                    self.player.pause();
+                }
             }
         }
         if let (Some(pos), Some(d)) = (resp.interact_pointer_pos(), self.dragging) {
+            // Dragging the playhead or a trim past either end scrolls a zoomed timeline.
+            if matches!(d, Drag::In | Drag::Out | Drag::Playhead) && resp.dragged() {
+                let over = if pos.x > lanes.right() { pos.x - lanes.right() } else if pos.x < lanes.left() { pos.x - lanes.left() } else { 0.0 };
+                if over != 0.0 {
+                    self.view.0 = (self.view.0 + (over / lanes.width()) as f64 * self.view.1 * 0.1).clamp(0.0, (dur - self.view.1).max(0.0));
+                    ui.ctx().request_repaint();
+                }
+            }
             if resp.dragged() || resp.drag_started() {
                 let t = self.info.snap(t_of(pos.x));
                 match d {
@@ -736,7 +844,9 @@ impl Ready {
                         let hi = track.points.get(k + 1).map_or(self.info.duration, |n| n.t - fd);
                         track.points[k].t = t.clamp(lo, hi.max(lo));
                         track.points[k].db = db_of_y(lane, pos.y);
-                        self.player.seek(track.points[k].t + 1e-6);
+                        if !self.player.is_playing() {
+                            self.player.seek(track.points[k].t + 1e-6);
+                        }
                     }
                 }
             }
@@ -750,6 +860,9 @@ impl Ready {
                 }
             }
             self.dragging = None;
+            if std::mem::take(&mut self.resume) && self.player.time() < self.edit.end - fd {
+                self.player.play(self.edit.end);
+            }
         }
 
         if resp.double_clicked() {
@@ -770,8 +883,8 @@ impl Ready {
                 }
             }
         } else if resp.clicked() {
+            // Jump there; playing carries on from the new spot.
             if let Some(pos) = resp.interact_pointer_pos() {
-                self.player.pause();
                 self.player.seek(self.info.snap(t_of(pos.x)) + 1e-6);
             }
         }
@@ -807,7 +920,7 @@ impl Ready {
             };
             ui.label(RichText::new(txt).size(12.0).color(color));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.weak("Drag the yellow line to set volume · double-click to add a keyframe · right-click a keyframe to remove it");
+                ui.weak("Ctrl+scroll to zoom, scroll to pan · drag the yellow line to set volume · double-click to add a keyframe · right-click one to remove it");
             });
         });
     }
@@ -862,22 +975,15 @@ fn same_edit(a: &Edit, b: &Edit) -> bool {
         })
 }
 
-/// Peak per bucket across the whole track (interleaved stereo input).
+/// Peak per [`WAVE_STEP`] of the track (interleaved stereo input).
 fn waveform(samples: &[f32]) -> Vec<f32> {
-    let frames = samples.len() / 2;
-    if frames == 0 {
-        return Vec::new();
-    }
-    let per = frames.div_ceil(WAVE_BUCKETS).max(1);
-    samples
-        .chunks(per * 2)
-        .map(|c| c.iter().fold(0.0f32, |m, s| m.max(s.abs())))
-        .collect()
+    let per = ((media::PREVIEW_RATE as f64 * WAVE_STEP) as usize).max(1) * 2;
+    samples.chunks(per).map(|c| c.iter().fold(0.0f32, |m, s| m.max(s.abs()))).collect()
 }
 
-/// Mirrored waveform, dB-scaled (like the meters) so quiet audio is still
-/// visible, with the volume curve applied.
-fn draw_wave(p: &egui::Painter, lane: Rect, wave: &[f32], dur: f64, gain_at: impl Fn(f64) -> f32, muted: bool) {
+/// Mirrored waveform of the `(start, span)` seconds in view, dB-scaled (like
+/// the meters) so quiet audio is still visible, with the volume curve applied.
+fn draw_wave(p: &egui::Painter, lane: Rect, wave: &[f32], (from, span): (f64, f64), gain_at: impl Fn(f64) -> f32, muted: bool) {
     if wave.is_empty() {
         return;
     }
@@ -887,11 +993,17 @@ fn draw_wave(p: &egui::Painter, lane: Rect, wave: &[f32], dur: f64, gain_at: imp
     let height_of = |a: f32| ((media::to_db(a) - METER_FLOOR) / -METER_FLOOR).clamp(0.0, 1.0);
     let cols = lane.width().max(1.0) as usize;
     let base = if muted { Color32::from_gray(90) } else { Color32::from_rgb(70, 130, 220) };
+    let per_col = span / cols as f64;
     for c in 0..cols {
-        let frac = c as f64 / cols as f64;
-        let a = wave[((frac * n as f64) as usize).min(n - 1)] * gain_at(frac * dur);
-        let h = (height_of(a) * half).max(0.5);
-        let color = if a >= 0.999 { REC_RED } else { base };
+        let t0 = from + c as f64 * per_col;
+        let a = (t0 / WAVE_STEP) as usize;
+        let b = (((t0 + per_col) / WAVE_STEP).ceil() as usize).max(a + 1).min(n);
+        if a >= b {
+            continue;
+        }
+        let peak = wave[a..b].iter().fold(0.0f32, |m, x| m.max(*x)) * gain_at(t0 + per_col / 2.0);
+        let h = (height_of(peak) * half).max(0.5);
+        let color = if peak >= 0.999 { REC_RED } else { base };
         p.vline(lane.left() + c as f32 + 0.5, mid - h..=mid + h, Stroke::new(1.0, color));
     }
 }
@@ -901,11 +1013,11 @@ fn draw_envelope(p: &egui::Painter, lane: Rect, track: &media::TrackEdit, dur: f
     let color = if track.muted { Color32::from_gray(120) } else { HOT_YELLOW };
     // Faint 0 dB reference line.
     p.hline(lane.x_range(), y_of_db(lane, 0.0), Stroke::new(1.0, Color32::from_white_alpha(25)));
-    let mut pts = vec![Pos2::new(lane.left(), y_of_db(lane, track.db_at(0.0)))];
+    let mut pts = vec![Pos2::new(x_of(0.0), y_of_db(lane, track.db_at(0.0)))];
     for pt in &track.points {
         pts.push(Pos2::new(x_of(pt.t), y_of_db(lane, pt.db)));
     }
-    pts.push(Pos2::new(lane.right(), y_of_db(lane, track.db_at(dur))));
+    pts.push(Pos2::new(x_of(dur), y_of_db(lane, track.db_at(dur))));
     p.add(egui::Shape::line(pts, Stroke::new(1.5, color)));
     for pt in &track.points {
         let c = Pos2::new(x_of(pt.t), y_of_db(lane, pt.db));
