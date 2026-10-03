@@ -21,6 +21,28 @@ pub fn ffmpeg() -> Command {
     tool("ffmpeg")
 }
 
+/// An `ffmpeg` for background work (scrub frames, thumbnails): at lower CPU
+/// priority, so playback and the game always come first.
+pub fn ffmpeg_background() -> Command {
+    let mut cmd = tool("ffmpeg");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+        cmd.creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS);
+    }
+    #[cfg(unix)]
+    {
+        // `nice` in front of it: the same, without unsafe pre-exec hooks.
+        let program = cmd.get_program().to_owned();
+        let mut niced = Command::new("nice");
+        niced.args(["-n", "10"]).arg(program);
+        cmd = niced;
+    }
+    cmd
+}
+
 /// An `ffprobe` command. See [`tool`].
 pub fn ffprobe() -> Command {
     tool("ffprobe")
@@ -517,7 +539,7 @@ pub fn keyframe_strip(
         let (first, last) = (chunk[0], *chunk.last().unwrap());
         let times = chunk.to_vec();
         let wanted = wanted.clone();
-        let mut cmd = ffmpeg();
+        let mut cmd = ffmpeg_background();
         cmd.args(["-hide_banner", "-loglevel", "error"]);
         if cfg!(target_os = "macos") {
             cmd.args(["-hwaccel", "videotoolbox"]);

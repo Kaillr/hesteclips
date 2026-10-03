@@ -22,7 +22,7 @@ pub struct Proxy {
 impl Proxy {
     pub fn build(ctx: &egui::Context, source: &Path, fps: f64) -> Self {
         let frames = Arc::new(Mutex::new(Vec::new()));
-        let child = media::ffmpeg()
+        let child = media::ffmpeg_background()
             .args(["-hide_banner", "-loglevel", "error", "-i"])
             .arg(source)
             // fps= pins one output frame per source frame index, even for VFR input.

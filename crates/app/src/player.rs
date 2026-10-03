@@ -4,9 +4,13 @@
 //! and mixed live in the cpal callback at the current gains, so moving a slider is
 //! heard instantly. The playhead is however many samples the callback has played.
 //!
-//! Video follows the clock: an ffmpeg process streams scaled RGBA frames from the
-//! playhead onward, and the UI shows whichever decoded frame matches the clock.
-//! When paused or scrubbing, single exact frames are decoded on demand instead.
+//! Video follows the clock. On Windows it comes from the in-process hardware
+//! decoder (`video.rs`), which keeps the next frames decoded so play starts at
+//! once; if that can't open a file (or elsewhere), an ffmpeg process streams
+//! scaled RGBA frames from the playhead onward, and single exact frames are
+//! decoded on demand when paused. Either way the UI shows whichever decoded
+//! frame matches the clock. While scrubbing, frames come from the in-memory
+//! proxy (`proxy.rs`).
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -19,6 +23,31 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use media::{ClipInfo, PREVIEW_RATE, TrackEdit};
 
 use crate::proxy::Proxy;
+#[cfg(windows)]
+use capture::win::decode::Picture;
+#[cfg(windows)]
+use crate::video::Video;
+#[cfg(not(windows))]
+struct Picture {
+    index: u64,
+}
+
+/// Elsewhere there's no in-process decoder yet: a type with no values.
+#[cfg(not(windows))]
+enum Video {}
+#[cfg(not(windows))]
+impl Video {
+    fn failed(&self) -> bool { match *self {} }
+    fn show(&self, _: u64) { match *self {} }
+    fn play(&self, _: u64) { match *self {} }
+    fn pause(&self) { match *self {} }
+    fn take_exact(&self, _: u64) -> Option<Picture> { match *self {} }
+    fn take_upto(&self, _: u64) -> Option<Picture> { match *self {} }
+    fn has(&self, _: u64) -> bool { match *self {} }
+}
+
+/// Play waits at most this long for its first frame before the sound starts anyway.
+const START_WAIT: std::time::Duration = std::time::Duration::from_millis(300);
 
 /// Preview frames are decoded at this width; plenty for an in-app viewer.
 pub const PREVIEW_WIDTH: u32 = 1280;
@@ -59,6 +88,13 @@ pub struct Player {
     proxy: Proxy,
     /// Showing a proxy frame; swap in the sharp frame once the drag settles.
     showing_proxy: bool,
+    /// The hardware decoder, while it works.
+    video: Option<Video>,
+    /// Play was pressed; the sound starts with the first frame (or after
+    /// [`START_WAIT`]), so picture and sound start together.
+    pending_start: Option<std::time::Instant>,
+    /// The decoder was told to play (to tell it to stop when playback ends).
+    video_playing: bool,
 }
 
 impl Player {
@@ -110,6 +146,9 @@ impl Player {
             still_wanted: None,
             proxy: Proxy::build(ctx, source, info_fps),
             showing_proxy: false,
+            video: open_video(ctx, source),
+            pending_start: None,
+            video_playing: false,
         }
     }
 
@@ -117,8 +156,18 @@ impl Player {
         self.shared.pos.load(Ordering::Relaxed) as f64 / PREVIEW_RATE as f64
     }
 
+    /// Playing, or about to (waiting for the first frame).
     pub fn is_playing(&self) -> bool {
+        self.sound_playing() || self.pending_start.is_some()
+    }
+
+    fn sound_playing(&self) -> bool {
         self.shared.playing.load(Ordering::Relaxed)
+    }
+
+    /// The hardware decoder, unless it's failed (then the ffmpeg path runs).
+    fn hw(&self) -> Option<&Video> {
+        self.video.as_ref().filter(|v| !v.failed())
     }
 
     /// Jump to `t` (seconds). Keeps playing if it was.
@@ -126,17 +175,39 @@ impl Player {
         let t = t.clamp(0.0, self.info.duration);
         self.shared.pos.store((t * PREVIEW_RATE as f64) as u64, Ordering::Relaxed);
         self.decoder = None; // restarts from the new position if playing
+        if self.is_playing() {
+            if let Some(v) = self.hw() {
+                v.play(self.info.frame_index(t));
+            }
+        }
     }
 
     /// Play from the current position until `until` seconds.
     pub fn play(&mut self, until: f64) {
         self.shared.end.store((until * PREVIEW_RATE as f64) as u64, Ordering::Relaxed);
+        if let Some(v) = self.hw() {
+            // Showing the frame under the playhead already: carry on from the
+            // next, which was decoded while paused. Otherwise wait for this one.
+            let want = self.info.frame_index(self.time());
+            let showing = self.shown_frame == Some(want) && !self.showing_proxy;
+            v.play(if showing { want + 1 } else { want });
+            self.video_playing = true;
+            if !showing {
+                self.pending_start = Some(std::time::Instant::now());
+                return;
+            }
+        }
         self.shared.playing.store(true, Ordering::Relaxed);
     }
 
     pub fn pause(&mut self) {
         self.shared.playing.store(false, Ordering::Relaxed);
+        self.pending_start = None;
         self.decoder = None;
+        if let Some(v) = self.hw() {
+            v.pause();
+        }
+        self.video_playing = false;
     }
 
     /// Fraction of the scrub proxy that's built (0..=1).
@@ -167,6 +238,10 @@ impl Player {
     /// Bring the displayed frame in line with the clock. Call once per UI frame.
     /// `scrubbing`: the user is dragging, so favour instant proxy frames.
     pub fn update(&mut self, ctx: &egui::Context, scrubbing: bool) -> Option<&egui::TextureHandle> {
+        if self.hw().is_some() {
+            self.update_hw(ctx, scrubbing);
+            return self.texture.as_ref();
+        }
         let t = self.time();
         let want = self.info.frame_index(t);
 
@@ -217,6 +292,67 @@ impl Player {
         self.texture.as_ref()
     }
 
+    /// [`Self::update`] with the hardware decoder.
+    fn update_hw(&mut self, ctx: &egui::Context, scrubbing: bool) {
+        let Some(v) = self.video.as_ref() else { return };
+        let want = self.info.frame_index(self.time());
+        // Waiting to start: the sound goes once the first frame is here.
+        if let Some(since) = self.pending_start {
+            if v.has(want) || since.elapsed() >= START_WAIT {
+                self.pending_start = None;
+                self.shared.playing.store(true, Ordering::Relaxed);
+            }
+            if let Some(p) = v.take_upto(want) {
+                self.show_picture(ctx, p);
+            }
+            ctx.request_repaint();
+            return;
+        }
+        if self.sound_playing() {
+            if let Some(p) = v.take_upto(want) {
+                self.show_picture(ctx, p);
+            }
+            ctx.request_repaint();
+            return;
+        }
+        // Stopped by itself at the out point: so does the decoder.
+        if self.video_playing {
+            v.pause();
+            self.video_playing = false;
+            self.still_wanted = None;
+        }
+        if let Some(p) = v.take_exact(want) {
+            self.show_picture(ctx, p);
+        }
+        if self.shown_frame != Some(want) || (!scrubbing && self.showing_proxy) {
+            // While dragging, the proxy frame right away (every mouse move).
+            if self.shown_frame != Some(want) {
+                if let Some(img) = self.proxy.frame(want) {
+                    self.set_texture(ctx, img);
+                    self.shown_frame = Some(want);
+                    self.showing_proxy = true;
+                }
+            }
+            // Once the drag stops, the exact frame (and the next few, for play).
+            let v = self.video.as_ref().expect("checked above");
+            if !scrubbing && self.still_wanted != Some(want) {
+                self.still_wanted = Some(want);
+                v.show(want);
+            }
+        }
+    }
+
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn show_picture(&mut self, ctx: &egui::Context, p: Picture) {
+        let idx = p.index;
+        #[cfg(windows)]
+        self.set_texture(ctx, crate::video::to_image(p));
+        #[cfg(not(windows))]
+        let _ = (ctx, p);
+        self.shown_frame = Some(idx);
+        self.showing_proxy = false;
+    }
+
     fn show(&mut self, ctx: &egui::Context, idx: u64, frame: media::Frame) {
         let img = egui::ColorImage::from_rgba_unmultiplied([frame.width as usize, frame.height as usize], &frame.rgba);
         self.set_texture(ctx, img);
@@ -230,6 +366,17 @@ impl Player {
             None => self.texture = Some(ctx.load_texture("preview", img, egui::TextureOptions::LINEAR)),
         }
     }
+}
+
+/// The hardware decoder for `source`, on Windows (unless
+/// `HESTECLIPS_NO_HW_DECODE` is set, to compare with the ffmpeg path).
+fn open_video(ctx: &egui::Context, source: &Path) -> Option<Video> {
+    #[cfg(windows)]
+    if std::env::var_os("HESTECLIPS_NO_HW_DECODE").is_none() {
+        return Some(Video::open(ctx, source, PREVIEW_WIDTH));
+    }
+    let _ = (ctx, source);
+    None
 }
 
 /// Opens the default output device and mixes the tracks into it.

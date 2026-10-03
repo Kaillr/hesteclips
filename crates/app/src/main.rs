@@ -27,6 +27,8 @@ mod sound;
 mod sources_ui;
 mod store;
 mod thumbs;
+#[cfg(windows)]
+mod video;
 mod viewer;
 mod waveform;
 

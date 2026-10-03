@@ -1,0 +1,322 @@
+//! Video decoding for playback, in-process: Media Foundation's source reader
+//! with the GPU's hardware decoder, then our own D3D11 video processor pass
+//! that scales the NV12 frame and converts it to full-range RGBA. One reader
+//! stays open per clip, so playing, seeking and stepping never start anything
+//! new (an ffmpeg process per play took 120-500 ms to show its first frame;
+//! this takes a few ms per frame in order).
+//!
+//! The source reader's own video processing ("advanced video processing")
+//! isn't used: it re-times frames to an even rate (clip length / frame
+//! count), so in a recording with dropped frames every timestamp drifts,
+//! by 50 frames at 30 s in one real clip. The decoder's own output keeps the
+//! file's timestamps.
+//!
+//! Frames are numbered by time from the start of the clip (as the editor and
+//! the scrub proxy count them). Media Foundation shifts every timestamp by the
+//! stream's reordering delay (B-frames), so the first frame's time is zero.
+
+use std::collections::HashMap;
+use std::path::Path;
+
+use anyhow::{Context, Result, bail};
+use windows::Win32::Foundation::RECT;
+use windows::Win32::Graphics::Direct3D11::*;
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, DXGI_COLOR_SPACE_TYPE, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P601,
+    DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_RATIONAL,
+};
+use windows::Win32::Media::MediaFoundation::*;
+use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
+use windows::core::{GUID, HSTRING, Interface};
+
+use super::d3d::Gpu;
+use super::system::{com_init, mf_startup};
+
+const STREAM: u32 = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
+/// Media Foundation's time unit: 100 ns.
+const UNITS: f64 = 10_000_000.0;
+/// Further ahead than this, seeking beats decoding forward: a seek costs
+/// ~55 ms plus decoding from the keyframe (~1.6 ms a frame), so past ~60
+/// frames (1 s at 60 fps) it's the cheaper way on average.
+const MAX_SKIP: u64 = 60;
+
+/// A decoded picture: RGBA rows, top to bottom, no padding, opaque.
+pub struct Picture {
+    /// Frame number from the start of the clip.
+    pub index: u64,
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+pub struct Decoder {
+    reader: IMFSourceReader,
+    _manager: IMFDXGIDeviceManager,
+    gpu: Gpu,
+    /// Output size.
+    pub width: u32,
+    pub height: u32,
+    pub fps: f64,
+    convert: Convert,
+    /// Media Foundation's time of frame 0.
+    offset: i64,
+    /// The frame the next read returns, when known (none after a seek).
+    next_index: Option<u64>,
+    /// A frame already read but not yet handed out.
+    peeked: Option<(u64, IMFSample)>,
+}
+
+// The reader is used from one thread at a time, which owns the decoder.
+unsafe impl Send for Decoder {}
+
+impl Decoder {
+    /// Open `path`, decoding to `width` wide (height keeps the aspect, even).
+    pub fn open(path: &Path, width: u32) -> Result<Self> {
+        com_init();
+        mf_startup()?;
+        let gpu = Gpu::new()?;
+        unsafe {
+            let mut token = 0u32;
+            let mut manager = None;
+            MFCreateDXGIDeviceManager(&mut token, &mut manager)?;
+            let manager = manager.context("no device manager")?;
+            manager.ResetDevice(&gpu.device, token)?;
+
+            let mut attrs = None;
+            MFCreateAttributes(&mut attrs, 3)?;
+            let attrs = attrs.context("no attributes")?;
+            attrs.SetUnknown(&MF_SOURCE_READER_D3D_MANAGER, &manager)?;
+            attrs.SetUINT32(&MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1)?;
+            let reader = MFCreateSourceReaderFromURL(&HSTRING::from(path.as_os_str()), &attrs).context("couldn't open the video")?;
+            reader.SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS.0 as u32, false)?;
+            reader.SetStreamSelection(STREAM, true)?;
+
+            let native = reader.GetNativeMediaType(STREAM, 0)?;
+            let size = native.GetUINT64(&MF_MT_FRAME_SIZE)?;
+            let (sw, sh) = ((size >> 32) as u32, size as u32);
+            let rate = native.GetUINT64(&MF_MT_FRAME_RATE).unwrap_or(60 << 32 | 1);
+            let fps = (rate >> 32) as f64 / (rate as u32).max(1) as f64;
+            let height = (((width as f64) * sh as f64 / sw.max(1) as f64 / 2.0).round() as u32 * 2).max(2);
+            // SD video is usually BT.601; everything else BT.709.
+            let bt601 = native.GetUINT32(&MF_MT_YUV_MATRIX).ok() == Some(MFVideoTransferMatrix_BT601.0 as u32);
+
+            // The decoder's own output: NV12 textures on the GPU, with the file's times.
+            let out = MFCreateMediaType()?;
+            out.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
+            out.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12)?;
+            reader.SetCurrentMediaType(STREAM, None, &out).context("the video can't be decoded to NV12")?;
+
+            let convert = Convert::new(&gpu, (sw, sh), (width, height), fps, bt601)?;
+            let mut d = Self { reader, _manager: manager, gpu, width, height, fps, convert, offset: 0, next_index: None, peeked: None };
+            // The first frame's time is frame 0's; keep the frame for the first read.
+            let (time, sample) = d.read_sample()?.context("the video has no frames")?;
+            d.offset = time;
+            d.peeked = Some((0, sample));
+            d.next_index = Some(0);
+            Ok(d)
+        }
+    }
+
+    /// Frame `index`, exactly: decoded forward from where the reader is when
+    /// that's close, else from the keyframe before it. `None` past the end.
+    pub fn frame(&mut self, index: u64) -> Result<Option<Picture>> {
+        let near = self.next_index.is_some_and(|n| n <= index && index - n <= MAX_SKIP);
+        if !near {
+            self.seek(index)?;
+        }
+        loop {
+            let Some((i, sample)) = self.read()? else { return Ok(None) };
+            if i >= index {
+                return self.picture(i, &sample).map(Some);
+            }
+        }
+    }
+
+    /// The frame after the last one read, with its pixels. `None` at the end.
+    pub fn next(&mut self) -> Result<Option<Picture>> {
+        match self.read()? {
+            Some((i, sample)) => self.picture(i, &sample).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    fn seek(&mut self, index: u64) -> Result<()> {
+        self.peeked = None;
+        self.next_index = None;
+        let t = (index as f64 / self.fps * UNITS) as i64 + self.offset;
+        let pos = PROPVARIANT::from(t);
+        unsafe { self.reader.SetCurrentPosition(&GUID::zeroed(), &pos)? };
+        Ok(())
+    }
+
+    /// The next sample in presentation order, numbered.
+    fn read(&mut self) -> Result<Option<(u64, IMFSample)>> {
+        if let Some(p) = self.peeked.take() {
+            self.next_index = Some(p.0 + 1);
+            return Ok(Some(p));
+        }
+        let Some((time, sample)) = self.read_sample()? else {
+            self.next_index = None;
+            return Ok(None);
+        };
+        let index = (((time - self.offset) as f64 / UNITS) * self.fps).round().max(0.0) as u64;
+        self.next_index = Some(index + 1);
+        Ok(Some((index, sample)))
+    }
+
+    fn read_sample(&mut self) -> Result<Option<(i64, IMFSample)>> {
+        loop {
+            let mut flags = 0u32;
+            let mut time = 0i64;
+            let mut sample = None;
+            unsafe { self.reader.ReadSample(STREAM, 0, None, Some(&mut flags), Some(&mut time), Some(&mut sample))? };
+            if flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32 != 0 {
+                return Ok(None);
+            }
+            if let Some(s) = sample {
+                return Ok(Some((time, s)));
+            }
+        }
+    }
+
+    /// Convert a decoded frame and copy it off the GPU.
+    fn picture(&mut self, index: u64, sample: &IMFSample) -> Result<Picture> {
+        let (texture, slice) = unsafe {
+            let buffer = sample.GetBufferByIndex(0)?;
+            let dxgi: IMFDXGIBuffer = buffer.cast().context("the decoder didn't give a GPU frame")?;
+            let mut texture: Option<ID3D11Texture2D> = None;
+            dxgi.GetResource(&ID3D11Texture2D::IID, &mut texture as *mut _ as *mut _)?;
+            (texture.context("no texture")?, dxgi.GetSubresourceIndex()?)
+        };
+        self.convert.run(&self.gpu, &texture, slice)?;
+        let rgba = self.convert.read(&self.gpu)?;
+        Ok(Picture { index, width: self.width, height: self.height, rgba })
+    }
+}
+
+/// The GPU pass from a decoded NV12 frame to RGBA at the output size, and the
+/// staging texture it's read back through.
+struct Convert {
+    video: ID3D11VideoContext,
+    vdev: ID3D11VideoDevice,
+    enumerator: ID3D11VideoProcessorEnumerator,
+    processor: ID3D11VideoProcessor,
+    target: ID3D11Texture2D,
+    output: ID3D11VideoProcessorOutputView,
+    staging: ID3D11Texture2D,
+    /// Input views by decoder texture and array slice (the decoder cycles
+    /// through a fixed set of surfaces).
+    inputs: HashMap<(usize, u32), ID3D11VideoProcessorInputView>,
+    source: (u32, u32),
+    size: (u32, u32),
+}
+
+impl Convert {
+    fn new(gpu: &Gpu, source: (u32, u32), size: (u32, u32), fps: f64, bt601: bool) -> Result<Self> {
+        let vdev: ID3D11VideoDevice = gpu.device.cast().context("the graphics card has no video processor")?;
+        let video: ID3D11VideoContext = gpu.context.cast()?;
+        let rate = DXGI_RATIONAL { Numerator: fps.round().max(1.0) as u32, Denominator: 1 };
+        let desc = D3D11_VIDEO_PROCESSOR_CONTENT_DESC {
+            InputFrameFormat: D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+            InputFrameRate: rate,
+            InputWidth: source.0,
+            InputHeight: source.1,
+            OutputFrameRate: rate,
+            OutputWidth: size.0,
+            OutputHeight: size.1,
+            Usage: D3D11_VIDEO_USAGE_OPTIMAL_QUALITY,
+        };
+        unsafe {
+            let enumerator = vdev.CreateVideoProcessorEnumerator(&desc)?;
+            let processor = vdev.CreateVideoProcessor(&enumerator, 0)?;
+            let target = gpu.texture(size.0, size.1, DXGI_FORMAT_R8G8B8A8_UNORM, D3D11_BIND_RENDER_TARGET.0 as u32, D3D11_USAGE_DEFAULT, 0)?;
+            let staging = gpu.texture(size.0, size.1, DXGI_FORMAT_R8G8B8A8_UNORM, 0, D3D11_USAGE_STAGING, D3D11_CPU_ACCESS_READ.0 as u32)?;
+            let out_desc = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
+                ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
+                Anonymous: D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 { Texture2D: D3D11_TEX2D_VPOV { MipSlice: 0 } },
+            };
+            let mut output = None;
+            vdev.CreateVideoProcessorOutputView(&target, &enumerator, &out_desc, Some(&mut output))?;
+
+            // Studio-range YCbCr in, full-range RGB out: what the file says it
+            // is, and what the screen wants.
+            let in_space: DXGI_COLOR_SPACE_TYPE = if bt601 { DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P601 } else { DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709 };
+            let video1: ID3D11VideoContext1 = video.cast().context("the graphics card's video processor is too old")?;
+            video1.VideoProcessorSetStreamColorSpace1(&processor, 0, in_space);
+            video1.VideoProcessorSetOutputColorSpace1(&processor, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
+            let src = RECT { left: 0, top: 0, right: source.0 as i32, bottom: source.1 as i32 };
+            let dst = RECT { left: 0, top: 0, right: size.0 as i32, bottom: size.1 as i32 };
+            video.VideoProcessorSetStreamFrameFormat(&processor, 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
+            video.VideoProcessorSetStreamSourceRect(&processor, 0, true, Some(&src));
+            video.VideoProcessorSetStreamDestRect(&processor, 0, true, Some(&dst));
+            video.VideoProcessorSetOutputTargetRect(&processor, true, Some(&dst));
+            video.VideoProcessorSetStreamAutoProcessingMode(&processor, 0, false);
+            video.VideoProcessorSetOutputAlphaFillMode(&processor, D3D11_VIDEO_PROCESSOR_ALPHA_FILL_MODE_OPAQUE, 0);
+            Ok(Self { video, vdev, enumerator, processor, target, output: output.context("no output view")?, staging, inputs: HashMap::new(), source, size })
+        }
+    }
+
+    /// Convert array slice `slice` of the decoder's `texture` into the target.
+    fn run(&mut self, _gpu: &Gpu, texture: &ID3D11Texture2D, slice: u32) -> Result<()> {
+        let key = (texture.as_raw() as usize, slice);
+        if !self.inputs.contains_key(&key) {
+            let desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
+                FourCC: 0,
+                ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
+                Anonymous: D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0 { Texture2D: D3D11_TEX2D_VPIV { MipSlice: 0, ArraySlice: slice } },
+            };
+            let mut view = None;
+            unsafe { self.vdev.CreateVideoProcessorInputView(texture, &self.enumerator, &desc, Some(&mut view))? };
+            // A new decoder (after some seeks) means new surfaces: drop stale views.
+            if self.inputs.len() > 64 {
+                self.inputs.clear();
+            }
+            self.inputs.insert(key, view.context("no input view")?);
+        }
+        let input = self.inputs[&key].clone();
+        let stream = D3D11_VIDEO_PROCESSOR_STREAM {
+            Enable: true.into(),
+            OutputIndex: 0,
+            InputFrameOrField: 0,
+            PastFrames: 0,
+            FutureFrames: 0,
+            ppPastSurfaces: std::ptr::null_mut(),
+            pInputSurface: std::mem::ManuallyDrop::new(Some(input)),
+            ppFutureSurfaces: std::ptr::null_mut(),
+            ppPastSurfacesRight: std::ptr::null_mut(),
+            pInputSurfaceRight: std::mem::ManuallyDrop::new(None),
+            ppFutureSurfacesRight: std::ptr::null_mut(),
+        };
+        let mut streams = [stream];
+        let result = unsafe { self.video.VideoProcessorBlt(&self.processor, &self.output, 0, &streams) };
+        unsafe { std::mem::ManuallyDrop::drop(&mut streams[0].pInputSurface) };
+        result?;
+        let _ = self.source;
+        Ok(())
+    }
+
+    /// The target's pixels: tight RGBA rows.
+    fn read(&self, gpu: &Gpu) -> Result<Vec<u8>> {
+        let (w, h) = self.size;
+        let row = w as usize * 4;
+        let mut rgba = vec![0u8; row * h as usize];
+        unsafe {
+            gpu.context.CopyResource(&self.staging, &self.target);
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            gpu.context.Map(&self.staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
+            let src = mapped.pData as *const u8;
+            if mapped.RowPitch as usize == row {
+                std::ptr::copy_nonoverlapping(src, rgba.as_mut_ptr(), rgba.len());
+            } else {
+                for y in 0..h as usize {
+                    std::ptr::copy_nonoverlapping(src.add(y * mapped.RowPitch as usize), rgba[y * row..].as_mut_ptr(), row);
+                }
+            }
+            gpu.context.Unmap(&self.staging, 0);
+        }
+        if rgba.is_empty() {
+            bail!("empty frame");
+        }
+        Ok(rgba)
+    }
+}

@@ -110,7 +110,7 @@ fn generate(key: u64, video: &Path) -> (Option<egui::ColorImage>, Option<Duratio
         // Skip a little way in: the very first frame of a capture is often black or a
         // half-drawn window. Short clips grab from the middle instead.
         let at = duration.map_or(0.0, |d| (d.as_secs_f64() * 0.5).min(1.0));
-        let _ = media::ffmpeg()
+        let _ = media::ffmpeg_background()
             .args(["-hide_banner", "-loglevel", "error", "-y", "-ss", &format!("{at:.2}"), "-i"])
             .arg(video)
             .args(["-frames:v", "1", "-vf", &format!("scale={WIDTH}:-2"), "-q:v", "4"])
