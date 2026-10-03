@@ -269,10 +269,13 @@ impl TrackEdit {
             _ if t <= pts[0].t => pts[0].db,
             _ if t >= pts[pts.len() - 1].t => pts[pts.len() - 1].db,
             _ => {
+                // Ramps follow the fader, so a fade from silence sounds even
+                // instead of staying inaudible for most of its length.
                 let i = pts.partition_point(|p| p.t <= t);
                 let (a, b) = (pts[i - 1], pts[i]);
                 let f = ((t - a.t) / (b.t - a.t).max(1e-9)) as f32;
-                a.db + (b.db - a.db) * f
+                let (pa, pb) = (fader_pos(a.db), fader_pos(b.db));
+                fader_db(pa + (pb - pa) * f)
             }
         }
     }
@@ -295,8 +298,22 @@ impl TrackEdit {
         if self.points.is_empty() {
             return format!("{:.5}", self.gain);
         }
-        // Nested if(): piecewise-linear dB, converted to linear gain.
-        let pts: Vec<(f64, f32)> = self.points.iter().map(|p| (p.t - start, p.db)).collect();
+        // Nested if(): piecewise-linear dB, converted to linear gain. Ramps follow
+        // the fader (see `db_at`): straight in dB down to -30 dB; one that dips
+        // below is split into short straight pieces that track the curve.
+        let mut pts: Vec<(f64, f32)> = Vec::new();
+        for (i, p) in self.points.iter().enumerate() {
+            if let Some(prev) = i.checked_sub(1).map(|j| self.points[j]) {
+                if prev.db.min(p.db) < -30.0 {
+                    const PIECES: usize = 8;
+                    for k in 1..PIECES {
+                        let t = prev.t + (p.t - prev.t) * k as f64 / PIECES as f64;
+                        pts.push((t - start, self.db_at(t)));
+                    }
+                }
+            }
+            pts.push((p.t - start, p.db));
+        }
         let mut db = format!("{:.3}", pts[pts.len() - 1].1);
         for w in pts.windows(2).rev() {
             let ((t0, d0), (t1, d1)) = (w[0], w[1]);
@@ -304,8 +321,43 @@ impl TrackEdit {
             db = format!("if(lt(t,{t1:.4}),{seg},{db})");
         }
         db = format!("if(lt(t,{:.4}),{:.3},{db})", pts[0].0, pts[0].1);
-        format!("pow(10,({db})/20)")
+        // At the bottom of the fader: true silence, not just very quiet.
+        format!("if(lte({db},{SILENT_DB}),0,pow(10,({db})/20))")
     }
+}
+
+/// Volume this low is silence (shown as −∞): the bottom of the fader.
+pub const SILENT_DB: f32 = -96.0;
+/// The top of the fader.
+pub const FADER_MAX_DB: f32 = 24.0;
+/// The fader law, as (position 0..=1, dB) points with straight lines in dB
+/// between them: like a mixing desk, the top three quarters are even in dB
+/// (equal distance sounds like an equal step louder, 0 dB about two thirds
+/// up), and the bottom quarter tapers through −30 and −60 down to silence.
+const FADER: [(f32, f32); 4] = [(0.0, SILENT_DB), (0.08, -60.0), (0.25, -30.0), (1.0, FADER_MAX_DB)];
+
+/// Fader position (0..=1) for a volume in dB.
+pub fn fader_pos(db: f32) -> f32 {
+    let db = db.clamp(SILENT_DB, FADER_MAX_DB);
+    for w in FADER.windows(2) {
+        let ((p0, d0), (p1, d1)) = (w[0], w[1]);
+        if db <= d1 {
+            return p0 + (db - d0) / (d1 - d0) * (p1 - p0);
+        }
+    }
+    1.0
+}
+
+/// Volume in dB at fader position `pos` (0..=1).
+pub fn fader_db(pos: f32) -> f32 {
+    let pos = pos.clamp(0.0, 1.0);
+    for w in FADER.windows(2) {
+        let ((p0, d0), (p1, d1)) = (w[0], w[1]);
+        if pos <= p1 {
+            return d0 + (pos - p0) / (p1 - p0) * (d1 - d0);
+        }
+    }
+    FADER_MAX_DB
 }
 
 /// Everything about how a clip has been edited.
@@ -896,17 +948,50 @@ pub fn levels(samples: &[f32]) -> (f32, f32) {
 
 /// Linear amplitude → dBFS (floored at -90).
 pub fn to_db(x: f32) -> f32 {
-    if x <= 1e-5 { -90.0 } else { 20.0 * x.log10() }
+    if x <= 1.6e-5 { SILENT_DB } else { 20.0 * x.log10() }
 }
 
 /// dB → linear gain.
 pub fn from_db(db: f32) -> f32 {
-    10f32.powf(db / 20.0)
+    if db <= SILENT_DB { 0.0 } else { 10f32.powf(db / 20.0) }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fader_law() {
+        for db in [SILENT_DB, -60.0, -45.0, -30.0, -6.0, 0.0, 12.0, FADER_MAX_DB] {
+            assert!((fader_db(fader_pos(db)) - db).abs() < 1e-3, "{db}");
+        }
+        assert_eq!(fader_pos(SILENT_DB), 0.0);
+        assert_eq!(fader_pos(FADER_MAX_DB), 1.0);
+        // Even in dB above -30: each 6 dB is the same distance.
+        let step = |a: f32| fader_pos(a + 6.0) - fader_pos(a);
+        assert!((step(-24.0) - step(12.0)).abs() < 1e-5);
+        assert!((fader_pos(0.0) - 0.667).abs() < 0.01, "0 dB about two thirds up");
+        assert_eq!(from_db(SILENT_DB), 0.0);
+    }
+
+    #[test]
+    fn fades_from_silence_follow_the_fader() {
+        let track = TrackEdit {
+            index: 0,
+            gain: 1.0,
+            muted: false,
+            points: vec![VolumePoint { t: 0.0, db: SILENT_DB }, VolumePoint { t: 1.0, db: 0.0 }],
+        };
+        // Halfway through the fade is halfway along the fader, not -48 dB.
+        let mid = track.db_at(0.5);
+        assert!((fader_pos(mid) - fader_pos(0.0) / 2.0).abs() < 1e-4, "{mid}");
+        assert!(mid > -40.0);
+        assert_eq!(track.gain_at(0.0), 0.0);
+        // The render expression is pieced along the curve and silent at the start.
+        let expr = track.volume_expr(0.0);
+        assert!(expr.starts_with("if(lte("), "{expr}");
+        assert!(expr.matches("lt(t,").count() >= 8, "{expr}");
+    }
 
     #[test]
     fn clip_tags() {

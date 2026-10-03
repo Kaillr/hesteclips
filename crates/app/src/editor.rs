@@ -31,8 +31,6 @@ const MIN_PREVIEW_H: f32 = 120.0;
 /// Deepest timeline zoom: this many frames across.
 const MIN_VIEW_FRAMES: f64 = 24.0;
 /// Gain slider range in dB.
-const MIN_DB: f32 = -30.0;
-const MAX_DB: f32 = 12.0;
 /// Meter scale floor in dB.
 const METER_FLOOR: f32 = -60.0;
 /// Meter colours: healthy / hot / clipping.
@@ -773,7 +771,7 @@ impl Ready {
             let db_text = if track.muted {
                 "Muted".to_owned()
             } else if track.points.is_empty() {
-                format!("{:+.1} dB", media::to_db(track.gain))
+                db_label(media::to_db(track.gain))
             } else {
                 format!("{} keyframes", track.points.len())
             };
@@ -838,7 +836,7 @@ impl Ready {
             let t = self.info.snap(t_of(pos.x));
             let mut tip = format!("Frame {}", self.info.frame_index(t));
             if let Some(i) = lane_rects.iter().position(|l| l.contains(pos) && audio_view.contains(pos)) {
-                tip += &format!("  ·  {:+.1} dB", self.edit.tracks[i].db_at(t));
+                tip += &format!("  ·  {}", db_label(self.edit.tracks[i].db_at(t)));
             }
             p.text(Pos2::new(pos.x + 10.0, ruler.top() + 2.0), Align2::LEFT_TOP, tip, FontId::proportional(11.0), v.text_color());
         }
@@ -887,13 +885,15 @@ impl Ready {
                             Some(origin) if resp.drag_started() => pos.y - origin.y,
                             _ => resp.drag_delta().y,
                         };
-                        let delta_db = -dy / lane.height() * (MAX_DB - MIN_DB);
+                        // Moves along the fader, so it follows the pointer exactly.
+                        let delta = -dy / (lane.height() - 8.0);
+                        let shift = |db: f32| media::fader_db(media::fader_pos(db) + delta);
                         let track = &mut self.edit.tracks[i];
                         if track.points.is_empty() {
-                            track.gain = media::from_db((media::to_db(track.gain) + delta_db).clamp(MIN_DB, MAX_DB));
+                            track.gain = media::from_db(shift(media::to_db(track.gain)));
                         } else {
                             for pt in &mut track.points {
-                                pt.db = (pt.db + delta_db).clamp(MIN_DB, MAX_DB);
+                                pt.db = shift(pt.db);
                             }
                         }
                     }
@@ -916,7 +916,7 @@ impl Ready {
             // Snap a whole-track level to 0 dB when it lands close, so "unchanged" is easy.
             if let Some(Drag::Line(i)) = self.dragging {
                 let track = &mut self.edit.tracks[i];
-                if track.points.is_empty() && media::to_db(track.gain).abs() < 0.75 {
+                if track.points.is_empty() && media::to_db(track.gain).abs() < 2.0 {
                     track.gain = 1.0;
                 }
             }
@@ -1012,17 +1012,30 @@ fn divider(ui: &mut egui::Ui, preview_h: f32, total: f32, share: &mut f32) {
     ui.painter().rect_filled(grip, 2, Color32::from_white_alpha(if active { 150 } else { 50 }));
 }
 
-/// Volume lanes map MIN_DB..MAX_DB to bottom..top (0 dB sits ~70% up).
+/// Volume lanes are a fader (`media::fader_pos`): silence at the bottom,
+/// +24 dB at the top, 0 dB about two thirds up.
 fn y_of_db(lane: Rect, db: f32) -> f32 {
-    let f = (db.clamp(MIN_DB, MAX_DB) - MIN_DB) / (MAX_DB - MIN_DB);
-    lane.bottom() - 4.0 - f * (lane.height() - 8.0)
+    lane.bottom() - 4.0 - media::fader_pos(db) * (lane.height() - 8.0)
+}
+
+/// "+3.0 dB", "−12.5 dB", "−∞ dB".
+fn db_label(db: f32) -> String {
+    if db <= media::SILENT_DB {
+        "−∞ dB".to_owned()
+    } else if db < -0.05 {
+        format!("−{:.1} dB", -db)
+    } else {
+        format!("+{:.1} dB", db.max(0.0))
+    }
 }
 
 fn db_of_y(lane: Rect, y: f32) -> f32 {
+    // Detents a few pixels wide at 0 dB (unchanged) and at the bottom (silent).
+    if (y - y_of_db(lane, 0.0)).abs() <= 3.0 {
+        return 0.0;
+    }
     let f = (lane.bottom() - 4.0 - y) / (lane.height() - 8.0);
-    let db = MIN_DB + f.clamp(0.0, 1.0) * (MAX_DB - MIN_DB);
-    // Gentle detent at 0 dB.
-    if db.abs() < 0.75 { 0.0 } else { db }
+    if f <= 0.02 { media::SILENT_DB } else { media::fader_db(f) }
 }
 
 fn lane_header(p: &egui::Painter, v: &egui::Visuals, rect: Rect, title: &str, sub: Option<&str>) {

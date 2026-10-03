@@ -13,11 +13,19 @@ fn main() -> anyhow::Result<()> {
     edit.start = info.snap(1.0 + 7.0 / info.fps);
     edit.end = info.snap(3.0);
     edit.tracks[0].gain = media::from_db(-6.0);
+    // The second source fades up from silence: exercises the fader-curve expression.
+    if let Some(t) = edit.tracks.get_mut(1) {
+        t.points = vec![media::VolumePoint { t: 1.5, db: media::SILENT_DB }, media::VolumePoint { t: 2.5, db: 0.0 }];
+    }
     let out = std::env::temp_dir().join("hc_edit_test.mp4");
     let t = std::time::Instant::now();
     media::render_to(&src, &info, &edit, &out, Some("test-id"))?;
     let o = media::probe(&out)?;
     println!("rendered in {:?}: dur={:.4} (want {:.4}) frames≈{:.1} id={:?} audio={:?}", t.elapsed(), o.duration, edit.duration(), o.duration * o.fps, o.id, o.audio.iter().map(|a| a.label()).collect::<Vec<_>>());
-    std::fs::remove_file(out)?;
+    if std::env::var_os("KEEP").is_some() {
+        println!("kept {}", out.display());
+    } else {
+        std::fs::remove_file(out)?;
+    }
     Ok(())
 }
