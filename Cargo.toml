@@ -13,6 +13,17 @@ repository = "https://github.com/Kaillr/hesteclips"
 [profile.dev.package."*"]
 opt-level = 2
 
+# Our crates with per-frame work (decoding, pixels, JPEG) are optimized in
+# debug builds too: they change rarely, and unoptimized they're several times
+# slower (the scrub proxy took 30 s instead of 8 for a 2-minute clip). Generic
+# code from dependencies is compiled in the crate that uses it, so heavy
+# generic calls (like the JPEG encoder) live here, not in the app.
+[profile.dev.package.capture]
+opt-level = 2
+
+[profile.dev.package.media]
+opt-level = 2
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

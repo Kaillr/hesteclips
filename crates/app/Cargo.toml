@@ -24,7 +24,6 @@ egui = "0.36.1"
 global-hotkey = "0.8.0"
 hestefiles = { version = "0.1.0", path = "../hestefiles" }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
-jpeg-encoder = { version = "0.6", features = ["simd"] }
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
 media = { path = "../media" }
 raw-window-handle = "0.6"

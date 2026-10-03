@@ -2088,7 +2088,6 @@ dependencies = [
  "global-hotkey",
  "hestefiles",
  "image",
- "jpeg-encoder",
  "keyring",
  "media",
  "objc2 0.6.4",
@@ -2545,6 +2544,7 @@ name = "media"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "jpeg-encoder",
  "serde",
  "serde_json",
 ]

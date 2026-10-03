@@ -13,6 +13,13 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+/// RGBA pixels (`width` x `height`, alpha ignored) as a JPEG.
+pub fn encode_jpeg(rgba: &[u8], width: u16, height: u16, quality: u8) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(64 * 1024);
+    jpeg_encoder::Encoder::new(&mut out, quality).encode(rgba, width, height, jpeg_encoder::ColorType::Rgba).ok()?;
+    Some(out)
+}
+
 /// Sample rate audio is decoded at for preview playback and waveforms.
 pub const PREVIEW_RATE: u32 = 48_000;
 

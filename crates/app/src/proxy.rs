@@ -7,8 +7,9 @@
 //! scrubbable almost immediately.
 //!
 //! On Windows the pass uses the GPU's video decoder (`capture::win::decode`)
-//! and the CPU only compresses the small frames, on one low-priority thread,
-//! and slows down while the clip plays so playback keeps the decoder. It used
+//! and the CPU only compresses the small frames, on low-priority threads, at
+//! full speed even while the clip plays (playback still gets every frame:
+//! tested; slowing down left most of a long clip unscrubbable for a minute). It used
 //! to be an ffmpeg process decoding every full-size frame in software on every
 //! core, which is still the fallback (and elsewhere).
 
@@ -31,8 +32,6 @@ type Jpeg = Arc<[u8]>;
 pub struct Proxy {
     frames: Arc<Mutex<Vec<Jpeg>>>,
     child: Option<Child>,
-    /// The clip is playing: build slowly, playback needs the decoder.
-    busy: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
 }
 
@@ -40,12 +39,12 @@ impl Proxy {
     /// Every one of the `total` frames of `source`, numbered at `fps`.
     pub fn build(ctx: &egui::Context, source: &Path, fps: f64, total: usize) -> Self {
         let frames = Arc::new(Mutex::new(Vec::new()));
-        let (busy, stop) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let stop = Arc::new(AtomicBool::new(false));
         #[cfg(windows)]
         if std::env::var_os("HESTECLIPS_NO_HW_DECODE").is_none() {
-            let started = hw::build(ctx, source, fps, total, &frames, &busy, &stop);
+            let started = hw::build(ctx, source, fps, total, &frames, &stop);
             if started {
-                return Self { frames, child: None, busy, stop };
+                return Self { frames, child: None, stop };
             }
         }
         let _ = total;
@@ -65,12 +64,7 @@ impl Proxy {
             let (frames, ctx) = (frames.clone(), ctx.clone());
             std::thread::spawn(move || split_jpegs(stdout, &frames, &ctx));
         }
-        Self { frames, child, busy, stop }
-    }
-
-    /// The clip is playing (true) or not: building yields to playback.
-    pub fn set_busy(&self, playing: bool) {
-        self.busy.store(playing, Ordering::Relaxed);
+        Self { frames, child, stop }
     }
 
     /// How many frames are ready (they arrive in order).
@@ -142,18 +136,16 @@ fn split_jpegs(mut r: impl Read, frames: &Mutex<Vec<Jpeg>>, ctx: &egui::Context)
 mod hw {
     use super::*;
     use std::sync::mpsc;
-    use std::time::Duration;
 
     use capture::win::decode::{Decoder, Picture};
 
-    /// While the clip plays, at most this many proxy frames a second: enough
-    /// to keep going, little enough to leave playback the decoder.
-    const PLAYING_FPS: f64 = 90.0;
-    /// Threads compressing frames: enough to keep up with the decoder.
-    const ENCODERS: usize = 3;
+
+    /// Threads compressing frames (the slow part, ~2-5 ms a frame): enough to
+    /// get near the decoder's ~900 fps.
+    const ENCODERS: usize = 4;
 
     /// Start building; false if the decoder can't open the clip.
-    pub fn build(ctx: &egui::Context, source: &Path, fps: f64, total: usize, frames: &Arc<Mutex<Vec<Jpeg>>>, busy: &Arc<AtomicBool>, stop: &Arc<AtomicBool>) -> bool {
+    pub fn build(ctx: &egui::Context, source: &Path, fps: f64, total: usize, frames: &Arc<Mutex<Vec<Jpeg>>>, stop: &Arc<AtomicBool>) -> bool {
         // Open here, so a clip the decoder can't read falls back to ffmpeg.
         let mut dec = match Decoder::open(source, WIDTH, None) {
             Ok(d) => d,
@@ -166,14 +158,11 @@ mod hw {
         // Decoding on one thread, compressing on a few (it's the slower part),
         // then put back in order on another.
         let (tx, jobs) = mpsc::sync_channel::<(u64, Picture)>(ENCODERS * 2);
-        let (busy_d, stop_d) = (busy.clone(), stop.clone());
+        let stop_d = stop.clone();
         std::thread::spawn(move || {
             lower_priority();
             let mut seq = 0u64;
             while !stop_d.load(Ordering::Relaxed) {
-                if busy_d.load(Ordering::Relaxed) {
-                    std::thread::sleep(Duration::from_secs_f64(1.0 / PLAYING_FPS));
-                }
                 match dec.next() {
                     Ok(Some(p)) => {
                         if tx.send((seq, p)).is_err() {
@@ -263,10 +252,7 @@ mod hw {
     }
 
     fn encode(p: &Picture) -> Option<Jpeg> {
-        let mut out = Vec::with_capacity(48 * 1024);
-        let enc = jpeg_encoder::Encoder::new(&mut out, QUALITY);
-        enc.encode(&p.rgba, p.width as u16, p.height as u16, jpeg_encoder::ColorType::Rgba).ok()?;
-        Some(Arc::from(out))
+        media::encode_jpeg(&p.rgba, p.width as u16, p.height as u16, QUALITY).map(Arc::from)
     }
 
     /// This thread yields to the game, the app and playback.
@@ -332,16 +318,13 @@ mod speed {
             let t = std::time::Instant::now();
             let mut size = 0;
             for _ in 0..100 {
-                let mut out = Vec::new();
-                jpeg_encoder::Encoder::new(&mut out, q).encode(&rgba, w, h, jpeg_encoder::ColorType::Rgba).unwrap();
-                size = out.len();
+                size = media::encode_jpeg(&rgba, w, h, q).unwrap().len();
             }
             println!("q{q}: {:.2} ms/frame, {} KB", t.elapsed().as_secs_f64() * 10.0, size / 1024);
         }
         // Colours survive the round trip (encoder in, `image` out, as scrubbing does).
         let flat: Vec<u8> = (0..w as usize * h as usize).flat_map(|_| [200u8, 60, 30, 255]).collect();
-        let mut out = Vec::new();
-        jpeg_encoder::Encoder::new(&mut out, 75).encode(&flat, w, h, jpeg_encoder::ColorType::Rgba).unwrap();
+        let out = media::encode_jpeg(&flat, w, h, 75).unwrap();
         let back = image::load_from_memory_with_format(&out, image::ImageFormat::Jpeg).unwrap().to_rgba8();
         let px = back.get_pixel(320, 180).0;
         println!("flat (200,60,30) comes back as {px:?}");
