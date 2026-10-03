@@ -104,7 +104,9 @@ impl Gpu {
                 if start.elapsed() > std::time::Duration::from_secs(1) {
                     bail!("the graphics card didn't finish");
                 }
-                std::thread::yield_now();
+                // A frame's conversion takes a millisecond or two: sleep in short
+                // steps rather than spin a core waiting for it.
+                std::thread::sleep(std::time::Duration::from_micros(250));
             }
         }
         Ok(())
