@@ -247,8 +247,12 @@ impl Player {
         self.shared.playing.store(false, Ordering::Relaxed);
         self.pending_start = None;
         self.decoder = None;
-        if let Some(v) = self.hw() {
-            v.pause();
+        // Only when it was playing: the decoder acts on its newest command, so
+        // a needless pause right after asking for a frame would cancel that.
+        if self.video_playing {
+            if let Some(v) = self.hw() {
+                v.pause();
+            }
         }
         self.video_playing = false;
     }

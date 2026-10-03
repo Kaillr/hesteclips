@@ -29,6 +29,9 @@ use crate::waveform::Waveform;
 
 /// Scrolling keeps showing quick proxy frames until it's been still this long.
 const SCROLL_SETTLE: Duration = Duration::from_millis(200);
+/// Wheel scrubbing eases out with this time constant: ~95% of a notch is
+/// applied within three of these.
+const SCROLL_EASE: f32 = 0.05;
 /// Arrow keys jump this far.
 const JUMP: f64 = 5.0;
 
@@ -77,6 +80,17 @@ struct Ready {
     dragging: Option<bool>,
     /// Last scroll-scrub, and whether it was playing before scrolling began.
     scrolled: Option<(Instant, bool)>,
+    /// Wheel movement not yet applied, in points: eased out over the next
+    /// frames (see [`SCROLL_EASE`]).
+    scroll_left: f32,
+    /// Where the wheel has taken the playhead, unsnapped: the glide's last
+    /// small steps add up instead of each being rounded back to its frame.
+    scroll_to: Option<f64>,
+    /// The screen's frame time while gliding, for the first frame of a glide
+    /// (whose time since the last frame is just how long the app sat idle).
+    glide_dt: f32,
+    /// The previous frame was gliding.
+    gliding: bool,
     /// Hover preview: the frame shown and its texture.
     hover: Option<(u64, egui::TextureHandle)>,
     volume: f32,
@@ -216,6 +230,10 @@ impl Ready {
             wave: l.wave,
             dragging: None,
             scrolled: None,
+            scroll_left: 0.0,
+            scroll_to: None,
+            glide_dt: 1.0 / 60.0,
+            gliding: false,
             hover: None,
             volume: volume.0,
             muted: volume.1,
@@ -238,6 +256,7 @@ impl Ready {
         if let Some((at, was_playing)) = self.scrolled {
             if at.elapsed() >= SCROLL_SETTLE {
                 self.scrolled = None;
+                self.scroll_to = None;
                 if was_playing {
                     self.play();
                 }
@@ -275,9 +294,31 @@ impl Ready {
         // Scroll over the picture or the timeline to scrub through the clip.
         let pointer = ctx.pointer_hover_pos();
         if pointer.is_some_and(|p| preview.contains(p) || outer.contains(p)) {
-            let d = ctx.input(|i| i.smooth_scroll_delta);
             // Down or left (towards you, or swiping left) goes forward, like reading on.
-            let px = -(d.x + d.y);
+            let d = wheel_points(&ctx);
+            self.scroll_left += -(d.x + d.y);
+        }
+        // Eased here rather than with egui's smoothing, which assumes the time
+        // since the last frame has passed: after a moment of not redrawing, it
+        // applied 90% of a wheel notch in one frame. Each frame takes the same
+        // share of what's left, at a steady pace, so a notch glides and slows.
+        let was_gliding = std::mem::replace(&mut self.gliding, self.scroll_left != 0.0);
+        if self.scroll_left != 0.0 {
+            let dt = if was_gliding {
+                let dt = ctx.input(|i| i.unstable_dt).min(0.05);
+                self.glide_dt = dt;
+                dt
+            } else {
+                // Sat idle: the time since the last frame says nothing. The
+                // glide's frame time, or less if the app has been busy drawing.
+                ctx.input(|i| i.unstable_dt).min(self.glide_dt)
+            };
+            let mut px = self.scroll_left * (1.0 - (-dt / SCROLL_EASE).exp());
+            if self.scroll_left.abs() < 0.5 {
+                px = self.scroll_left;
+            }
+            self.scroll_left -= px;
+            ctx.request_repaint();
             if px.abs() > 0.0 {
                 let was = match self.scrolled {
                     Some((_, was)) => was,
@@ -285,7 +326,10 @@ impl Ready {
                 };
                 self.player.pause();
                 let dt = px as f64 / outer.width().max(1.0) as f64 * self.info.duration;
-                self.seek(self.player.time() + dt);
+                let to = self.scroll_to.unwrap_or_else(|| self.player.time()) + dt;
+                let to = to.clamp(0.0, self.info.duration);
+                self.scroll_to = Some(to);
+                self.seek(to);
                 self.scrolled = Some((Instant::now(), was));
             }
         }
@@ -520,6 +564,24 @@ fn set_fullscreen(ctx: &egui::Context, on: bool) {
     if is_fullscreen(ctx) != on {
         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(on));
     }
+}
+
+/// This frame's mouse wheel and trackpad movement in points, unsmoothed.
+fn wheel_points(ctx: &egui::Context) -> Vec2 {
+    let line = ctx.options(|o| o.input_options.line_scroll_speed);
+    let page = ctx.content_rect().height();
+    ctx.input(|i| {
+        i.raw.events.iter().fold(Vec2::ZERO, |sum, e| match e {
+            egui::Event::MouseWheel { unit, delta, .. } => {
+                sum + match unit {
+                    egui::MouseWheelUnit::Point => *delta,
+                    egui::MouseWheelUnit::Line => *delta * line,
+                    egui::MouseWheelUnit::Page => *delta * page,
+                }
+            }
+            _ => sum,
+        })
+    })
 }
 
 fn volume_id() -> egui::Id {

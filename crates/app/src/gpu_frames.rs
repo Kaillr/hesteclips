@@ -53,10 +53,14 @@ impl Frames {
             return Some(*id);
         }
         let rs = RENDER.get()?;
+        let started = std::time::Instant::now();
         let texture = unsafe { open(rs, s.handle(), width, height) }.inspect_err(|e| eprintln!("sharing a frame failed: {e}")).ok()?;
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let id = rs.renderer.write().register_native_texture(&rs.device, &view, wgpu::FilterMode::Linear);
         self.opened.insert(s.key(), (texture, id));
+        if std::env::var_os("HESTECLIPS_DEBUG_VIDEO").is_some() {
+            eprintln!("{:>8.3} gpu frames: opened texture {:?} in {:.1} ms ({} open)", crate::player::uptime(), s.key(), started.elapsed().as_secs_f64() * 1000.0, self.opened.len());
+        }
         Some(id)
     }
 }
