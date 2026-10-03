@@ -753,8 +753,8 @@ impl App {
         // Neighbours in the library's order (newest first), to step through.
         let at = self.clips.iter().position(|c| c.path == v.clip());
         let nav = viewer::Nav {
-            newer: at.and_then(|i| i.checked_sub(1)).map(|i| self.clips[i].path.clone()),
-            older: at.and_then(|i| self.clips.get(i + 1)).map(|c| c.path.clone()),
+            previous: at.and_then(|i| i.checked_sub(1)).map(|i| self.clips[i].path.clone()),
+            next: at.and_then(|i| self.clips.get(i + 1)).map(|c| c.path.clone()),
             position: at.map(|i| (i + 1, self.clips.len())),
         };
         match v.ui(ui, &nav) {

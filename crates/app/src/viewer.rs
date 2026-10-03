@@ -10,7 +10,7 @@
 //! It plays the clip as it's shared: the saved edit if there is one, and the
 //! mix (track 1).
 //!
-//! Up/Down (or the arrows in the header) step to the next clip in the library
+//! Previous clip / Next clip (P / N) step through the library in its order
 //! without going back to it, and F, double-click or ⛶ go fullscreen, so a
 //! session's clips can be reviewed one after another.
 
@@ -43,8 +43,9 @@ pub enum ViewerOutcome {
 /// Where this clip sits in the library, for stepping through clips.
 #[derive(Default)]
 pub struct Nav {
-    pub newer: Option<PathBuf>,
-    pub older: Option<PathBuf>,
+    /// The clips before and after this one in the library.
+    pub previous: Option<PathBuf>,
+    pub next: Option<PathBuf>,
     /// This clip's place (from 1) and how many there are.
     pub position: Option<(usize, usize)>,
 }
@@ -134,8 +135,8 @@ impl Viewer {
         }
         if !ctx.egui_wants_keyboard_input() {
             let none = egui::Modifiers::NONE;
-            let (esc, up, down, f) = ctx.input_mut(|i| {
-                (i.consume_key(none, Key::Escape), i.consume_key(none, Key::ArrowUp), i.consume_key(none, Key::ArrowDown), i.consume_key(none, Key::F))
+            let (esc, prev, next, f) = ctx.input_mut(|i| {
+                (i.consume_key(none, Key::Escape), i.consume_key(none, Key::P), i.consume_key(none, Key::N), i.consume_key(none, Key::F))
             });
             if esc {
                 // Out of fullscreen first; out of the viewer after that.
@@ -145,7 +146,7 @@ impl Viewer {
                     out = ViewerOutcome::Close;
                 }
             }
-            let step = if up { nav.newer.as_ref() } else if down { nav.older.as_ref() } else { None };
+            let step = if prev { nav.previous.as_ref() } else if next { nav.next.as_ref() } else { None };
             if let Some(p) = step {
                 out = ViewerOutcome::Open(p.clone());
             }
@@ -176,12 +177,12 @@ impl Viewer {
             ui.add(egui::Label::new(RichText::new(crate::clips::title_for_stem(&stem)).size(18.0).strong()).truncate());
             ui.add_space(10.0);
             // Step through the library without leaving the viewer.
-            let step = |s: &str| egui::Button::new(RichText::new(s).size(14.0)).min_size(Vec2::new(30.0, 26.0)).corner_radius(6);
-            if ui.add_enabled(nav.newer.is_some(), step("⏶")).on_hover_text("Newer clip  (Up)").clicked() {
-                out = nav.newer.clone().map_or(ViewerOutcome::Stay, ViewerOutcome::Open);
+            let step = |s: &str| egui::Button::new(RichText::new(s).size(14.0)).min_size(Vec2::new(0.0, 28.0)).corner_radius(6);
+            if ui.add_enabled(nav.previous.is_some(), step("‹ Previous clip")).on_hover_text("P").clicked() {
+                out = nav.previous.clone().map_or(ViewerOutcome::Stay, ViewerOutcome::Open);
             }
-            if ui.add_enabled(nav.older.is_some(), step("⏷")).on_hover_text("Older clip  (Down)").clicked() {
-                out = nav.older.clone().map_or(ViewerOutcome::Stay, ViewerOutcome::Open);
+            if ui.add_enabled(nav.next.is_some(), step("Next clip ›")).on_hover_text("N").clicked() {
+                out = nav.next.clone().map_or(ViewerOutcome::Stay, ViewerOutcome::Open);
             }
             if let Some((i, n)) = nav.position {
                 ui.weak(format!("{i} of {n}"));
@@ -193,13 +194,6 @@ impl Viewer {
                     .corner_radius(8);
                 if ui.add(edit).on_hover_text("Trim it and adjust its audio").clicked() {
                     out = ViewerOutcome::Edit;
-                }
-                let other = egui::Button::new(RichText::new("↗").size(15.0)).min_size(Vec2::new(30.0, 30.0)).corner_radius(8);
-                if ui.add(other).on_hover_text("Open in your default video player").clicked() {
-                    if let State::Ready(r) = &mut self.state {
-                        r.player.pause();
-                    }
-                    let _ = crate::clips::open_in_default_app(&self.clip);
                 }
             });
         });
