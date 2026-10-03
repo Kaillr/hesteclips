@@ -28,6 +28,7 @@ mod sources_ui;
 mod store;
 mod thumbs;
 mod viewer;
+mod waveform;
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};

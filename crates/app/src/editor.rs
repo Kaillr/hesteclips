@@ -17,10 +17,10 @@ use media::{ClipInfo, Edit};
 use crate::library::{ACCENT, REC_RED};
 use crate::filmstrip::Filmstrip;
 use crate::player::Player;
+use crate::waveform::Waveform;
 use crate::store::{self, EditTarget};
 
-/// Waveform resolution: one peak per this many seconds, fine enough to zoom in on.
-const WAVE_STEP: f64 = 0.005;
+const WAVE_BLUE: Color32 = Color32::from_rgb(70, 130, 220);
 /// Deepest timeline zoom: this many frames across.
 const MIN_VIEW_FRAMES: f64 = 24.0;
 /// Gain slider range in dB.
@@ -45,8 +45,8 @@ pub enum EditorOutcome {
 struct Loaded {
     info: ClipInfo,
     pcm: Vec<Vec<f32>>,
-    /// Per source track: peak per bucket, for the waveform.
-    waves: Vec<Vec<f32>>,
+    /// Per source track, for drawing.
+    waves: Vec<Waveform>,
 }
 
 enum State {
@@ -61,7 +61,7 @@ struct Ready {
     edit: Edit,
     /// What was last saved, to know whether there are unsaved changes.
     saved: Edit,
-    waves: Vec<Vec<f32>>,
+    waves: Vec<Waveform>,
     strip: Filmstrip,
     /// Smoothed meter values (peak, rms) per track, then master; and peak holds.
     meters: Vec<Meter>,
@@ -123,7 +123,7 @@ impl Editor {
                 let mut waves = Vec::new();
                 for track in info.source_tracks() {
                     let samples = media::decode_audio(&src, track.index).map_err(|e| e.to_string())?;
-                    waves.push(waveform(&samples));
+                    waves.push(Waveform::new(&samples, media::PREVIEW_RATE));
                     pcm.push(samples);
                 }
                 Ok(Loaded { info, pcm, waves })
@@ -650,7 +650,7 @@ impl Ready {
         let video = Rect::from_min_size(Pos2::new(lanes.left(), ruler.bottom()), Vec2::new(lanes.width(), video_h));
         lane_header(&p, &v, Rect::from_min_max(Pos2::new(outer.left(), video.top()), Pos2::new(lanes.left() - 6.0, video.bottom())), "🎬 Video", None);
         p.rect_filled(video, 4, v.extreme_bg_color);
-        self.strip.paint(ui, video, v0, v0 + span);
+        self.strip.paint(ui, video, v0, v0 + span, dur);
         // Scrub-proxy progress: a thin bar until every frame is scrubbable.
         let prog = self.player.proxy_progress();
         if prog < 1.0 {
@@ -670,7 +670,11 @@ impl Ready {
             let track = &self.edit.tracks[i];
             p.rect_filled(lane, 4, v.extreme_bg_color);
             // Waveform drawn with the volume curve applied: what you'll hear.
-            draw_wave(&lp, lane, self.waves.get(i).map(Vec::as_slice).unwrap_or(&[]), (v0, span), |t| track.gain_at(t), track.muted);
+            // Drawn with the volume curve applied: what you'll hear.
+            if let Some(w) = self.waves.get(i) {
+                let base = if track.muted { Color32::from_gray(90) } else { WAVE_BLUE };
+                w.paint(&lp, lane, (v0, span), |t| track.gain_at(t), |_, _| base);
+            }
             draw_envelope(&lp, lane, track, dur, x_of);
             let meter = Rect::from_min_size(Pos2::new(outer.right() - meter_w, lane.top()), Vec2::new(meter_w - 4.0, audio_h));
             draw_vmeter(&p, &v, meter, self.meters.get(i).copied().unwrap_or_default());
@@ -973,39 +977,6 @@ fn same_edit(a: &Edit, b: &Edit) -> bool {
         && a.tracks.iter().zip(&b.tracks).all(|(x, y)| {
             x.muted == y.muted && (x.gain - y.gain).abs() < 1e-4 && x.points == y.points
         })
-}
-
-/// Peak per [`WAVE_STEP`] of the track (interleaved stereo input).
-fn waveform(samples: &[f32]) -> Vec<f32> {
-    let per = ((media::PREVIEW_RATE as f64 * WAVE_STEP) as usize).max(1) * 2;
-    samples.chunks(per).map(|c| c.iter().fold(0.0f32, |m, s| m.max(s.abs()))).collect()
-}
-
-/// Mirrored waveform of the `(start, span)` seconds in view, dB-scaled (like
-/// the meters) so quiet audio is still visible, with the volume curve applied.
-fn draw_wave(p: &egui::Painter, lane: Rect, wave: &[f32], (from, span): (f64, f64), gain_at: impl Fn(f64) -> f32, muted: bool) {
-    if wave.is_empty() {
-        return;
-    }
-    let mid = lane.center().y;
-    let half = lane.height() / 2.0 - 3.0;
-    let n = wave.len();
-    let height_of = |a: f32| ((media::to_db(a) - METER_FLOOR) / -METER_FLOOR).clamp(0.0, 1.0);
-    let cols = lane.width().max(1.0) as usize;
-    let base = if muted { Color32::from_gray(90) } else { Color32::from_rgb(70, 130, 220) };
-    let per_col = span / cols as f64;
-    for c in 0..cols {
-        let t0 = from + c as f64 * per_col;
-        let a = (t0 / WAVE_STEP) as usize;
-        let b = (((t0 + per_col) / WAVE_STEP).ceil() as usize).max(a + 1).min(n);
-        if a >= b {
-            continue;
-        }
-        let peak = wave[a..b].iter().fold(0.0f32, |m, x| m.max(*x)) * gain_at(t0 + per_col / 2.0);
-        let h = (height_of(peak) * half).max(0.5);
-        let color = if peak >= 0.999 { REC_RED } else { base };
-        p.vline(lane.left() + c as f32 + 0.5, mid - h..=mid + h, Stroke::new(1.0, color));
-    }
 }
 
 /// The volume "rubber band": a yellow line at the track's level, with keyframes.

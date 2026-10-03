@@ -2,10 +2,13 @@
 //! editor and the viewer.
 //!
 //! Which keyframes become thumbnails is decided before any is decoded (see
-//! `media::keyframe_strip`), so each cell knows its picture from the start and
-//! appears once, when that picture arrives. Cells never show a nearby stand-in
-//! that's swapped out as better ones come in: that flickered for seconds and
-//! re-uploaded textures every frame.
+//! `media::keyframe_strip`), so each picture appears once, when it arrives,
+//! never as a stand-in swapped out later (that flickered for seconds).
+//!
+//! Every picture is pinned to the moment it shows: it starts at its keyframe's
+//! time and repeats until the next one drawn. Zooming and panning move the
+//! pictures with the timeline instead of re-dealing them into cells, so the
+//! eye can follow them.
 
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver};
@@ -54,27 +57,41 @@ impl Filmstrip {
         Self { rx, keys: Vec::new(), thumbs: Vec::new(), aspect: None }
     }
 
-    /// Paint into `lane`, which shows `from..to` seconds of the clip.
-    pub fn paint(&mut self, ui: &egui::Ui, lane: Rect, from: f64, to: f64) {
+    /// Paint into `lane`, which shows `from..to` seconds of a clip `dur` long.
+    pub fn paint(&mut self, ui: &egui::Ui, lane: Rect, from: f64, to: f64, dur: f64) {
         self.receive(ui.ctx());
         let Some(aspect) = self.aspect else { return };
         let span = (to - from).max(1e-6);
-        // As many uncropped thumbnails as fit; each cell shows the chosen keyframe
-        // nearest its middle, or nothing until that one has arrived. Cells sit on
-        // a fixed grid in clip time, so panning a zoomed timeline slides them
-        // along rather than changing what each one shows.
-        let fit = ((lane.width() / (lane.height() * aspect)).ceil() as f64).max(1.0);
-        let cell_t = span / fit;
         let x_of = |t: f64| lane.left() + ((t - from) / span) as f32 * lane.width();
-        let painter = ui.painter_at(lane);
-        let mut k = (from / cell_t).floor();
-        while k * cell_t < to {
-            let (t0, t1) = (k * cell_t, (k + 1.0) * cell_t);
-            if let Some(tex) = self.nearest((t0 + t1) / 2.0).and_then(|i| self.thumbs[i].as_ref()) {
-                let cell = Rect::from_x_y_ranges(x_of(t0)..=x_of(t1), lane.y_range());
-                painter.image(tex.id(), cell, crop_uv(tex.size_vec2(), cell.size()), Color32::WHITE);
+        let w = lane.height() * aspect;
+        // Pictures closer together than one thumbnail's width: keep the first,
+        // skip the rest. Decided in clip time, so panning never changes which.
+        let min_gap = w as f64 / lane.width() as f64 * span;
+        let mut shown: Vec<usize> = Vec::new();
+        for (i, k) in self.keys.iter().enumerate() {
+            if shown.last().is_none_or(|&j| k - self.keys[j] >= min_gap * 0.999) {
+                shown.push(i);
             }
-            k += 1.0;
+        }
+        let painter = ui.painter_at(lane);
+        for (n, &i) in shown.iter().enumerate() {
+            let start = x_of(self.keys[i]);
+            let end = shown.get(n + 1).map_or(x_of(dur), |&j| x_of(self.keys[j]));
+            if end < lane.left() || start > lane.right() {
+                continue;
+            }
+            let Some(tex) = self.thumbs[i].as_ref() else { continue };
+            // Repeat it until the next picture, cutting the last copy short.
+            let mut x = start;
+            while x < end.min(lane.right()) {
+                let cw = w.min(end - x);
+                if x + cw >= lane.left() {
+                    let cell = Rect::from_x_y_ranges(x..=x + cw, lane.y_range());
+                    let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(cw / w, 1.0));
+                    painter.image(tex.id(), cell, uv, Color32::WHITE);
+                }
+                x += w;
+            }
         }
     }
 

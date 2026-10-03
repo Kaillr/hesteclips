@@ -21,11 +21,8 @@ use crate::filmstrip::Filmstrip;
 use crate::library::ACCENT;
 use crate::meter;
 use crate::player::Player;
+use crate::waveform::Waveform;
 
-/// Audio level resolution: one peak/RMS pair per this many seconds.
-const LEVEL_STEP: f64 = 0.02;
-/// The level lane's scale floor, dBFS.
-const LEVEL_FLOOR: f32 = -60.0;
 /// Scrolling keeps showing quick proxy frames until it's been still this long.
 const SCROLL_SETTLE: Duration = Duration::from_millis(200);
 /// Arrow keys jump this far.
@@ -40,8 +37,8 @@ pub enum ViewerOutcome {
 struct Loaded {
     info: ClipInfo,
     pcm: Vec<f32>,
-    /// Peak and RMS per [`LEVEL_STEP`] of the mix.
-    levels: Vec<(f32, f32)>,
+    /// The mix, for the timeline.
+    wave: Waveform,
 }
 
 enum State {
@@ -59,7 +56,7 @@ struct Ready {
     info: ClipInfo,
     player: Player,
     strip: Filmstrip,
-    levels: Vec<(f32, f32)>,
+    wave: Waveform,
     /// Dragging on the timeline, and whether it was playing when the drag began.
     dragging: Option<bool>,
     /// Last scroll-scrub, and whether it was playing before scrolling began.
@@ -83,8 +80,8 @@ impl Viewer {
                     Some(a) => media::decode_audio(&src, a.index).map_err(|e| e.to_string())?,
                     None => Vec::new(),
                 };
-                let levels = levels(&pcm);
-                Ok(Loaded { info, pcm, levels })
+                let wave = Waveform::new(&pcm, media::PREVIEW_RATE);
+                Ok(Loaded { info, pcm, wave })
             })();
             let _ = tx.send(result);
             repaint.request_repaint();
@@ -173,7 +170,7 @@ impl Ready {
             strip: Filmstrip::build(ctx, clip),
             info: l.info,
             player,
-            levels: l.levels,
+            wave: l.wave,
             dragging: None,
             scrolled: None,
             hover: None,
@@ -295,9 +292,14 @@ impl Ready {
         let t_of = |x: f32| ((x - outer.left()) / outer.width()).clamp(0.0, 1.0) as f64 * dur;
 
         p.rect_filled(video, 4, v.extreme_bg_color);
-        self.strip.paint(ui, video, 0.0, dur);
+        self.strip.paint(ui, video, 0.0, dur, dur);
         p.rect_filled(audio, 4, v.extreme_bg_color);
-        draw_levels(&p, audio, &self.levels, dur);
+        if self.wave.is_empty() {
+            p.text(audio.center(), Align2::CENTER_CENTER, "No sound", FontId::proportional(12.0), Color32::from_gray(110));
+        } else {
+            // Coloured like the meters, so loud moments stand out.
+            self.wave.paint(&ui.painter_at(audio), audio, (0.0, dur), |_| 1.0, |_, rms| zone(meter::to_db(rms)));
+        }
 
         // Already-played part of the levels, lightly marked, so where you are reads at a glance.
         let xp = x_of(self.info.snap(self.player.time()));
@@ -461,53 +463,14 @@ fn volume_id() -> egui::Id {
     egui::Id::new("viewer_volume")
 }
 
-/// Peak and RMS of every [`LEVEL_STEP`] of interleaved stereo at the preview rate.
-fn levels(pcm: &[f32]) -> Vec<(f32, f32)> {
-    let per = ((media::PREVIEW_RATE as f64 * LEVEL_STEP) as usize).max(1) * 2;
-    pcm.chunks(per)
-        .map(|c| {
-            let peak = c.iter().fold(0.0f32, |m, s| m.max(s.abs()));
-            let rms = (c.iter().map(|s| (*s as f64).powi(2)).sum::<f64>() / c.len() as f64).sqrt() as f32;
-            (peak, rms)
-        })
-        .collect()
-}
-
-/// The mix's loudness over time, like a level meter laid along the timeline:
-/// a faint bar to the peak and a solid one to the average, coloured by the same
-/// zones as the meters (green, yellow from -18 dB, red from -6 dB), so loud
-/// moments stand out.
-fn draw_levels(p: &egui::Painter, lane: Rect, levels: &[(f32, f32)], dur: f64) {
-    if levels.is_empty() {
-        p.text(lane.center(), Align2::CENTER_CENTER, "No sound", FontId::proportional(12.0), Color32::from_gray(110));
-        return;
-    }
-    let inner = lane.shrink2(Vec2::new(0.0, 3.0));
-    let y_of = |db: f32| inner.bottom() - ((db - LEVEL_FLOOR) / -LEVEL_FLOOR).clamp(0.0, 1.0) * inner.height();
-    let zones = [(LEVEL_FLOOR, -18.0, meter::GREEN), (-18.0, -6.0, meter::YELLOW), (-6.0, 0.0, meter::RED)];
-    // Solid from the bottom up to `db`, split at the zone marks.
-    let column = |x: f32, db: f32, alpha: f32| {
-        for (lo, hi, color) in zones {
-            if db <= lo {
-                break;
-            }
-            let (y0, y1) = (y_of(lo), y_of(db.min(hi)));
-            p.vline(x, y1..=y0, Stroke::new(1.0, color.gamma_multiply(alpha)));
-        }
-    };
-    let n = levels.len();
-    let per_px = n as f64 / lane.width().max(1.0) as f64;
-    let covered = (n as f64 * LEVEL_STEP / dur).min(1.0);
-    for c in 0..(lane.width() * covered as f32) as usize {
-        let a = ((c as f64 * per_px) as usize).min(n - 1);
-        let b = (((c + 1) as f64 * per_px) as usize).clamp(a + 1, n);
-        let (peak, rms) = levels[a..b].iter().fold((0.0f32, 0.0f32), |(p, r), l| (p.max(l.0), r.max(l.1)));
-        let x = lane.left() + c as f32 + 0.5;
-        column(x, meter::to_db(peak), 0.35);
-        column(x, meter::to_db(rms), 0.9);
-    }
-    for db in [-18.0, -6.0] {
-        p.hline(lane.x_range(), y_of(db), Stroke::new(1.0, Color32::from_white_alpha(18)));
+/// Meter colour for a loudness (RMS): green, yellow from -18 dB, red from -6 dB.
+fn zone(db: f32) -> Color32 {
+    if db >= -6.0 {
+        meter::RED
+    } else if db >= -18.0 {
+        meter::YELLOW
+    } else {
+        meter::GREEN
     }
 }
 
