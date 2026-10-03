@@ -210,7 +210,7 @@ impl Ready {
         // Opened to watch: start right away.
         player.play(l.info.duration);
         let r = Self {
-            strip: Filmstrip::build(ctx, clip),
+            strip: Filmstrip::build(ctx, clip, &l.info),
             info: l.info,
             player,
             wave: l.wave,

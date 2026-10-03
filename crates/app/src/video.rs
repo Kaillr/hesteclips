@@ -17,6 +17,35 @@ use std::time::Duration;
 
 use capture::win::decode::{Decoder, Picture};
 
+/// Decodes someone is waiting to see (a paused frame, filmstrip pictures).
+/// While any runs, background decoding (the scrub proxy) waits: they share
+/// the GPU's video decoder, and a full-speed proxy left the filmstrip
+/// loading for seconds.
+static URGENT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Marks an urgent decode for as long as it lives.
+pub struct Urgent(());
+
+impl Urgent {
+    pub fn begin() -> Self {
+        URGENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self(())
+    }
+}
+
+impl Drop for Urgent {
+    fn drop(&mut self) {
+        URGENT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Background decoding: wait while anything urgent decodes.
+pub fn yield_to_urgent() {
+    while URGENT.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
 /// Frames kept decoded after the one shown, while paused.
 const AHEAD_PAUSED: usize = 4;
 /// Frames kept decoded ahead of the clock, while playing.
@@ -126,10 +155,13 @@ impl Video {
                             };
                             let pic = match have {
                                 Some(p) => Some(p),
-                                None => match dec.frame(i) {
-                                    Ok(p) => p,
-                                    Err(e) => return fail(&format!("{e:#}")),
-                                },
+                                None => {
+                                    let _urgent = Urgent::begin();
+                                    match dec.frame(i) {
+                                        Ok(p) => p,
+                                        Err(e) => return fail(&format!("{e:#}")),
+                                    }
+                                }
                             };
                             let mut s = shared.lock().unwrap();
                             next = s.ahead.back().map_or(i + 1, |p| p.index + 1);

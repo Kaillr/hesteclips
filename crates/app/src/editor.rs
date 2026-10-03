@@ -205,13 +205,14 @@ impl Ready {
         player.seek(edit.start);
 
         let full = l.info.duration.max(1e-6);
+        let strip = Filmstrip::build(ctx, source, &l.info);
         Self {
             info: l.info,
             player,
             saved: edit.clone(),
             edit,
             waves: l.waves,
-            strip: Filmstrip::build(ctx, source),
+            strip,
             meters: vec![Meter::default(); n],
             master: Meter::default(),
             dragging: None,

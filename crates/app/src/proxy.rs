@@ -163,6 +163,7 @@ mod hw {
             lower_priority();
             let mut seq = 0u64;
             while !stop_d.load(Ordering::Relaxed) {
+                crate::video::yield_to_urgent();
                 match dec.next() {
                     Ok(Some(p)) => {
                         if tx.send((seq, p)).is_err() {
