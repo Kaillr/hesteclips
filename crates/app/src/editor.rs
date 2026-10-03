@@ -128,12 +128,25 @@ impl Editor {
         std::thread::spawn(move || {
             let result = (|| -> Result<Loaded, String> {
                 let info = media::probe(&src).map_err(|e| e.to_string())?;
+                // Every track at once: each is its own ffmpeg.
+                let jobs: Vec<_> = info
+                    .source_tracks()
+                    .iter()
+                    .map(|track| {
+                        let (src, index) = (src.clone(), track.index);
+                        std::thread::spawn(move || {
+                            let samples = media::decode_audio(&src, index).map_err(|e| e.to_string())?;
+                            let wave = Waveform::new(&samples, media::PREVIEW_RATE);
+                            Ok::<_, String>((samples, wave))
+                        })
+                    })
+                    .collect();
                 let mut pcm = Vec::new();
                 let mut waves = Vec::new();
-                for track in info.source_tracks() {
-                    let samples = media::decode_audio(&src, track.index).map_err(|e| e.to_string())?;
-                    waves.push(Waveform::new(&samples, media::PREVIEW_RATE));
+                for job in jobs {
+                    let (samples, wave) = job.join().map_err(|_| "decoding the audio failed".to_owned())??;
                     pcm.push(samples);
+                    waves.push(wave);
                 }
                 Ok(Loaded { info, pcm, waves })
             })();

@@ -62,19 +62,7 @@ impl Waveform {
     /// From interleaved stereo at `rate` Hz (channels are combined: peaks from
     /// either side, loudness from both).
     pub fn new(stereo: &[f32], rate: u32) -> Self {
-        let base: Vec<Bucket> = stereo
-            .chunks(BASE * 2)
-            .map(|c| {
-                let mut b = Bucket::EMPTY;
-                for s in c {
-                    b.min = b.min.min(*s);
-                    b.max = b.max.max(*s);
-                    b.ms += s * s;
-                }
-                b.ms /= c.len().max(1) as f32;
-                b
-            })
-            .collect();
+        let base: Vec<Bucket> = media::sample_peaks(stereo, BASE * 2).into_iter().map(|[min, max, ms]| Bucket { min, max, ms }).collect();
         let mut levels = vec![base];
         while levels.last().is_some_and(|l| l.len() > 1) {
             let next = levels.last().unwrap().chunks(FACTOR).map(Bucket::merge).collect();

@@ -13,6 +13,24 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+/// Min, max and mean square of every `per` samples: the per-sample pass of a
+/// waveform, here so it runs optimized even in debug builds (millions of
+/// samples per track).
+pub fn sample_peaks(samples: &[f32], per: usize) -> Vec<[f32; 3]> {
+    samples
+        .chunks(per.max(1))
+        .map(|c| {
+            let (mut lo, mut hi, mut sq) = (f32::MAX, f32::MIN, 0.0f32);
+            for &s in c {
+                lo = lo.min(s);
+                hi = hi.max(s);
+                sq += s * s;
+            }
+            [lo, hi, sq / c.len() as f32]
+        })
+        .collect()
+}
+
 /// RGBA pixels (`width` x `height`, alpha ignored) as a JPEG.
 pub fn encode_jpeg(rgba: &[u8], width: u16, height: u16, quality: u8) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(64 * 1024);
