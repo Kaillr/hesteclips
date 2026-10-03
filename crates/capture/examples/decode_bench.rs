@@ -11,6 +11,18 @@ fn main() -> anyhow::Result<()> {
     let mut d = capture::win::decode::Decoder::open(&path, width, None)?;
     println!("open {}x{} at {} fps: {:?}", d.width, d.height, d.fps, t.elapsed());
 
+    // FULL=1: decode every frame (as the scrub proxy does) and report.
+    if std::env::var_os("FULL").is_some() {
+        let t = Instant::now();
+        let mut n = 0u64;
+        let mut copied = 0usize;
+        while let Some(p) = d.next()? {
+            n += 1;
+            copied += p.rgba.len();
+        }
+        println!("all {n} frames: {:?} ({:.0} fps), {} MB copied back", t.elapsed(), n as f64 / t.elapsed().as_secs_f64(), copied / 1_000_000);
+        return Ok(());
+    }
     let t = Instant::now();
     let first = d.next()?.expect("a frame");
     println!("frame {} after {:?}, alpha {}", first.index, t.elapsed(), first.rgba[3]);

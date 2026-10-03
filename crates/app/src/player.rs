@@ -139,6 +139,7 @@ impl Player {
         });
 
         let info_fps = info.fps;
+        let total_frames = (info.duration * info_fps).floor() as usize;
         Self {
             source: source.to_path_buf(),
             info,
@@ -155,7 +156,7 @@ impl Player {
             still_tx,
             still_rx,
             still_wanted: None,
-            proxy: Proxy::build(ctx, source, info_fps),
+            proxy: Proxy::build(ctx, source, info_fps, total_frames),
             showing_proxy: false,
             video: open_video(ctx, source, info_fps),
             pending_start: None,
@@ -250,6 +251,7 @@ impl Player {
     /// `scrubbing`: the user is dragging, so favour instant proxy frames.
     /// Returns what to draw: an egui texture and its size.
     pub fn update(&mut self, ctx: &egui::Context, scrubbing: bool) -> Option<(egui::TextureId, egui::Vec2)> {
+        self.proxy.set_busy(self.is_playing());
         if self.hw().is_some() {
             self.update_hw(ctx, scrubbing);
             return self.display;
