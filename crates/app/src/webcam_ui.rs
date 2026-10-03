@@ -418,13 +418,23 @@ impl App {
         let p: Placement = self.settings.webcam.as_ref().map_or(p, |c| c.placement.into());
         let bx = Rect::from_min_max(to_screen(p.x, p.y), to_screen(p.x + p.w, p.y + p.h));
         let painter = ui.painter_at(frame_rect);
-        let cropping = modifiers.alt;
-        let color = if cropping { CROP } else { ACCENT };
+        // The handles turn green while Alt is held (they'll crop); each side of
+        // the box is green only if it's cropped.
+        let color = if modifiers.alt { CROP } else { ACCENT };
         // Outlined only while it's held or the pointer is over it.
         let bx_hit = |at: Pos2| Handle::ALL.iter().any(|h| h.pos(bx).distance(at) <= HANDLE) || bx.expand(2.0).contains(at);
         let active = self.webcam_view.drag.is_some() || pointer.is_some_and(|at| frame_rect.contains(at) && bx_hit(at));
         if active {
-            painter.rect_stroke(bx, 0.0, Stroke::new(2.0, color), egui::StrokeKind::Middle);
+            // The camera's own sides, as they show: a mirrored picture's left is
+            // the camera's right.
+            let [cl, ct, cr, cb] = p.crop.map(|c| c > 0.0);
+            let (left, right) = if p.flip_h { (cr, cl) } else { (cl, cr) };
+            let (top, bottom) = if p.flip_v { (cb, ct) } else { (ct, cb) };
+            let side = |cropped: bool| Stroke::new(2.0, if cropped { CROP } else { ACCENT });
+            painter.line_segment([bx.left_top(), bx.right_top()], side(top));
+            painter.line_segment([bx.left_bottom(), bx.right_bottom()], side(bottom));
+            painter.line_segment([bx.left_top(), bx.left_bottom()], side(left));
+            painter.line_segment([bx.right_top(), bx.right_bottom()], side(right));
             for h in Handle::ALL {
                 let c = h.pos(bx);
                 let r = Rect::from_center_size(c, vec2(HANDLE, HANDLE));
