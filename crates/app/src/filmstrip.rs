@@ -35,9 +35,7 @@ impl Filmstrip {
     pub fn build(ctx: &egui::Context, source: &Path, info: &ClipInfo) -> Self {
         #[cfg(windows)]
         if std::env::var_os("HESTECLIPS_NO_HW_DECODE").is_none() {
-            if let Some(e) = exact::Exact::open(ctx, source, info) {
-                return Self::Exact(e);
-            }
+            return Self::Exact(exact::Exact::open(ctx, source, info));
         }
         let _ = info;
         Self::Keys(Keys::build(ctx, source))
@@ -45,6 +43,13 @@ impl Filmstrip {
 
     /// Paint into `lane`, which shows `from..to` seconds of a clip `dur` long.
     pub fn paint(&mut self, ui: &egui::Ui, lane: Rect, from: f64, to: f64, dur: f64) {
+        // The decoder couldn't open the clip: keyframes instead.
+        #[cfg(windows)]
+        if let Self::Exact(e) = self {
+            if e.failed() {
+                *self = Self::Keys(Keys::build(ui.ctx(), &e.source));
+            }
+        }
         match self {
             #[cfg(windows)]
             Self::Exact(e) => e.paint(ui, lane, from, to, dur),
@@ -91,6 +96,9 @@ mod exact {
     const CACHE: usize = 800;
 
     pub struct Exact {
+        pub source: std::path::PathBuf,
+        /// The decoder couldn't open the clip.
+        failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
         /// Frame numbers wanted next (newest list wins).
         want_tx: Sender<Vec<u64>>,
         got_rx: Receiver<(u64, Picture)>,
@@ -107,16 +115,27 @@ mod exact {
     }
 
     impl Exact {
-        pub fn open(ctx: &egui::Context, source: &Path, info: &ClipInfo) -> Option<Self> {
+        pub fn open(ctx: &egui::Context, source: &Path, info: &ClipInfo) -> Self {
             let aspect = info.width.max(1) as f32 / info.height.max(1) as f32;
             let width = (((HEIGHT as f32 * aspect) / 2.0).round() as u32 * 2).max(2);
-            let mut dec = Decoder::open(source, width, None).inspect_err(|e| eprintln!("filmstrip: hardware decoder unavailable, using keyframes: {e:#}")).ok()?;
-            dec.set_fps(info.fps);
             let (want_tx, want_rx) = mpsc::channel::<Vec<u64>>();
             let (got_tx, got_rx) = mpsc::channel();
             let repaint = ctx.clone();
+            let failed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (path, fps, failed_t) = (source.to_path_buf(), info.fps, failed.clone());
             std::thread::spawn(move || {
                 lower_priority();
+                // Opened here, not on the UI thread: it takes a few hundred ms.
+                let mut dec = match Decoder::open(&path, width, None) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        eprintln!("filmstrip: hardware decoder unavailable, using keyframes: {e:#}");
+                        failed_t.store(true, std::sync::atomic::Ordering::Relaxed);
+                        repaint.request_repaint();
+                        return;
+                    }
+                };
+                dec.set_fps(fps);
                 // Wait for a list; work through it, switching to a newer one
                 // the moment it arrives.
                 let Ok(mut list) = want_rx.recv() else { return };
@@ -158,7 +177,11 @@ mod exact {
                 }
             });
             let last_frame = ((info.duration * info.fps).floor() as u64).saturating_sub(1);
-            Some(Self { want_tx, got_rx, thumbs: BTreeMap::new(), last_asked: Vec::new(), fps: info.fps.max(1.0), last_frame, aspect, tick: 0 })
+            Self { source: source.to_path_buf(), failed, want_tx, got_rx, thumbs: BTreeMap::new(), last_asked: Vec::new(), fps: info.fps.max(1.0), last_frame, aspect, tick: 0 }
+        }
+
+        pub fn failed(&self) -> bool {
+            self.failed.load(std::sync::atomic::Ordering::Relaxed)
         }
 
         pub fn paint(&mut self, ui: &egui::Ui, lane: Rect, from: f64, to: f64, dur: f64) {

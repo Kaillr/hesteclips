@@ -31,40 +31,35 @@ type Jpeg = Arc<[u8]>;
 
 pub struct Proxy {
     frames: Arc<Mutex<Vec<Jpeg>>>,
-    child: Option<Child>,
+    /// The ffmpeg pass, when that's the way it's built.
+    child: Arc<Mutex<Option<Child>>>,
     stop: Arc<AtomicBool>,
 }
 
 impl Proxy {
     /// Every one of the `total` frames of `source`, numbered at `fps`.
     pub fn build(ctx: &egui::Context, source: &Path, fps: f64, total: usize) -> Self {
-        let frames = Arc::new(Mutex::new(Vec::new()));
-        let stop = Arc::new(AtomicBool::new(false));
-        #[cfg(windows)]
-        if std::env::var_os("HESTECLIPS_NO_HW_DECODE").is_none() {
-            let started = hw::build(ctx, source, fps, total, &frames, &stop);
-            if started {
-                return Self { frames, child: None, stop };
+        let proxy = Self { frames: Arc::new(Mutex::new(Vec::new())), child: Arc::new(Mutex::new(None)), stop: Arc::new(AtomicBool::new(false)) };
+        let (frames, child, stop) = (proxy.frames.clone(), proxy.child.clone(), proxy.stop.clone());
+        let (ctx, source) = (ctx.clone(), source.to_path_buf());
+        // Opening a decoder takes a few hundred ms: not on the UI thread.
+        std::thread::spawn(move || {
+            #[cfg(windows)]
+            if std::env::var_os("HESTECLIPS_NO_HW_DECODE").is_none() && hw::build(&ctx, &source, fps, total, &frames, &stop) {
+                return;
             }
-        }
-        let _ = total;
-        let child = media::ffmpeg_background()
-            .args(["-hide_banner", "-loglevel", "error", "-i"])
-            .arg(source)
-            // fps= pins one output frame per source frame index, even for VFR input.
-            .args(["-an", "-vf", &format!("fps={fps},scale={WIDTH}:-2:flags=bilinear")])
-            .args(["-c:v", "mjpeg", "-q:v", "6", "-f", "image2pipe", "-"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .ok();
-        let mut child = child;
-        if let Some(stdout) = child.as_mut().and_then(|c| c.stdout.take()) {
-            let (frames, ctx) = (frames.clone(), ctx.clone());
-            std::thread::spawn(move || split_jpegs(stdout, &frames, &ctx));
-        }
-        Self { frames, child, stop }
+            let _ = total;
+            let mut slot = child.lock().unwrap();
+            *slot = start_ffmpeg(&ctx, &source, fps, &frames);
+            // Closed while it started: the drop already ran, so stop it here.
+            if stop.load(Ordering::Relaxed) {
+                if let Some(mut c) = slot.take() {
+                    let _ = c.kill();
+                    let _ = c.wait();
+                }
+            }
+        });
+        proxy
     }
 
     /// How many frames are ready (they arrive in order).
@@ -80,10 +75,29 @@ impl Proxy {
     }
 }
 
+/// The ffmpeg pass: every frame decoded in software, as an MJPEG stream.
+fn start_ffmpeg(ctx: &egui::Context, source: &Path, fps: f64, frames: &Arc<Mutex<Vec<Jpeg>>>) -> Option<Child> {
+    let mut child = media::ffmpeg_background()
+        .args(["-hide_banner", "-loglevel", "error", "-i"])
+        .arg(source)
+        // fps= pins one output frame per source frame index, even for VFR input.
+        .args(["-an", "-vf", &format!("fps={fps},scale={WIDTH}:-2:flags=bilinear")])
+        .args(["-c:v", "mjpeg", "-q:v", "6", "-f", "image2pipe", "-"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let stdout = child.stdout.take()?;
+    let (frames, ctx) = (frames.clone(), ctx.clone());
+    std::thread::spawn(move || split_jpegs(stdout, &frames, &ctx));
+    Some(child)
+}
+
 impl Drop for Proxy {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        if let Some(mut c) = self.child.take() {
+        if let Some(mut c) = self.child.lock().unwrap().take() {
             let _ = c.kill();
             let _ = c.wait();
         }
