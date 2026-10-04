@@ -607,7 +607,10 @@ fn open_video(ctx: &egui::Context, source: &Path, fps: f64) -> Option<Video> {
 /// The sound while scrubbing a paused clip, at its own pitch whatever the
 /// speed (WSOLA): every [`Scrub::HOP`] it takes a [`Scrub::GRAIN`]-long slice
 /// from where the playhead is right then, shifted by up to [`Scrub::SEARCH`]
-/// to line up with how the last slice goes on, and cross-fades it in. Moving
+/// to line up with how the last slice goes on, and cross-fades it in, the
+/// fade's curves chosen by how alike the two are so the loudness holds (a
+/// plain fade between unalike slices dips in the middle: at 67 dips a second
+/// that sounded soft and buzzy). Moving
 /// faster than real time skips through, slower overlaps; a jump just takes
 /// the next slice from the new place. With the playhead still for
 /// [`Scrub::STILL`] it fades out (else one slice would repeat as a buzz).
@@ -617,7 +620,7 @@ struct Scrub {
     rate: f64,
     /// Where the last slice started (source frames), if sounding.
     prev: Option<usize>,
-    /// The fading-out half of the last slice, to overlap with the next.
+    /// The second half of the last slice (unfaded), to overlap with the next.
     tail: Vec<(f32, f32)>,
     /// Made, not yet played (source rate).
     made: std::collections::VecDeque<(f32, f32)>,
@@ -639,13 +642,14 @@ struct Scrub {
 }
 
 impl Scrub {
-    /// Slice length (source frames): 30 ms, long enough to hear a sound as
+    // Starting values, to tune by ear.
+    /// Slice length (source frames): 40 ms, long enough to hear a sound as
     /// itself, short enough to follow the playhead.
-    const GRAIN: usize = 1440;
-    /// A new slice every half slice (15 ms), overlapping the last.
+    const GRAIN: usize = 1920;
+    /// A new slice every half slice (20 ms), overlapping the last.
     const HOP: usize = Self::GRAIN / 2;
-    /// How far a slice may shift (each way) to line up: 5 ms.
-    const SEARCH: usize = 240;
+    /// How far a slice may shift (each way) to line up: 7.5 ms.
+    const SEARCH: usize = 360;
     /// Samples compared when lining up.
     const MATCH: usize = 360;
     /// Fade out once the playhead has been still this long (s).
@@ -740,14 +744,29 @@ impl Scrub {
         };
         let tracks_n = pcm.len();
         self.track_peak.resize(tracks_n, 0.0);
+        // How alike the overlapping halves are (correlation, 0..1): alike
+        // ones add up in step, unalike ones only in power, so the fade curves
+        // are scaled to keep the loudness either way.
+        let rho = if self.prev.is_some() {
+            let (mut ab, mut aa, mut bb) = (0.0f64, 0.0f64, 0.0f64);
+            for k in (0..Self::HOP).step_by(2) {
+                let (l, r) = self.sample(pcm, start + k);
+                let (x, y) = ((self.tail[k].0 + self.tail[k].1) as f64, (l + r) as f64);
+                ab += x * y;
+                aa += x * x;
+                bb += y * y;
+            }
+            if aa > 1e-12 && bb > 1e-12 { (ab / (aa * bb).sqrt()).clamp(0.0, 1.0) as f32 } else { 1.0 }
+        } else {
+            1.0
+        };
         for k in 0..Self::HOP {
             let (l, r) = self.sample(pcm, start + k);
-            let w = self.window[k];
+            let (fade_in, fade_out) = (self.window[k], self.window[Self::HOP + k]);
+            let norm = 1.0 / (fade_in * fade_in + fade_out * fade_out + 2.0 * rho * fade_in * fade_out).sqrt().max(1e-3);
             let t = self.tail[k];
-            self.made.push_back((t.0 + l * w, t.1 + r * w));
-            let (l2, r2) = self.sample(pcm, start + Self::HOP + k);
-            let w2 = self.window[Self::HOP + k];
-            self.tail[k] = (l2 * w2, r2 * w2);
+            self.made.push_back(((t.0 * fade_out + l * fade_in) * norm, (t.1 * fade_out + r * fade_in) * norm));
+            self.tail[k] = self.sample(pcm, start + Self::HOP + k);
         }
         for (t, track) in pcm.iter().enumerate() {
             let g = self.gains.get(t).copied().unwrap_or(1.0);
@@ -1076,6 +1095,42 @@ mod tests {
         }
         let hz = pitch(&out);
         assert!((hz - 880.0).abs() < 30.0, "after the jump: {hz:.0} Hz");
+    }
+
+    /// Noise (like game sound: no two slices alike), stereo, at the source rate.
+    fn noise(secs: f64) -> Vec<f32> {
+        let mut x = 12345u32;
+        (0..(secs * PREVIEW_RATE as f64) as usize * 2)
+            .map(|_| {
+                x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+                (x >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+            })
+            .collect()
+    }
+
+    /// RMS of `x`, and how much the RMS of 5 ms stretches varies (std / mean).
+    fn loudness(x: &[f32]) -> (f64, f64) {
+        let rms = |v: &[f32]| (v.iter().map(|&s| (s as f64).powi(2)).sum::<f64>() / v.len() as f64).sqrt();
+        let blocks: Vec<f64> = x.chunks(240).filter(|c| c.len() == 240).map(rms).collect();
+        let mean = blocks.iter().sum::<f64>() / blocks.len() as f64;
+        let var = blocks.iter().map(|b| (b - mean).powi(2)).sum::<f64>() / blocks.len() as f64;
+        (rms(x), var.sqrt() / mean)
+    }
+
+    #[test]
+    fn scrubbing_keeps_the_loudness_steady() {
+        let src = noise(20.0);
+        let left: Vec<f32> = src.chunks(2).map(|f| f[0]).collect();
+        let (in_rms, in_flutter) = loudness(&left[..48_000]);
+        let pcm = vec![src];
+        for speed in [0.5, 1.0, 2.0, 4.0, -1.0] {
+            let out = scrub(&pcm, speed, 1.5, 5.0 * PREVIEW_RATE as f64);
+            let (rms, flutter) = loudness(&out[24_000..]);
+            let db = 20.0 * (rms / in_rms).log10();
+            eprintln!("{speed}x: {db:+.2} dB, flutter {flutter:.3} (source {in_flutter:.3})");
+            assert!(db.abs() < 1.0, "at {speed}x the loudness is off by {db:.2} dB");
+            assert!(flutter < in_flutter * 1.5, "at {speed}x the loudness flutters ({flutter:.3} vs the source's {in_flutter:.3})");
+        }
     }
 
     #[test]
