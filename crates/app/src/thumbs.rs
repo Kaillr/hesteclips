@@ -1,8 +1,9 @@
 //! Clip preview images.
 //!
-//! A frame is grabbed with ffmpeg on a background worker, cached as a JPEG under
-//! the OS cache dir (keyed by path + mtime + size, so a replaced file gets a fresh
-//! thumbnail), then uploaded to the GPU once and reused every frame.
+//! A frame is grabbed with ffmpeg on a few background workers, cached as a JPEG
+//! (and the clip's duration beside it) under the OS cache dir, keyed by path +
+//! mtime + size so a replaced file gets a fresh thumbnail. A cached clip starts
+//! no process at all. Each picture is uploaded to the GPU once and reused.
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
@@ -10,6 +11,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::clips::Clip;
@@ -42,17 +44,24 @@ impl Thumbs {
         let (job_tx, job_rx) = mpsc::channel::<(u64, PathBuf)>();
         let (done_tx, done_rx) = mpsc::channel::<Done>();
         let app_ctx = ctx.clone();
-        // One worker: thumbnails stream in newest-first (the order they're requested)
-        // without a burst of ffmpeg processes competing with an active capture.
-        std::thread::spawn(move || {
-            while let Ok((key, path)) = job_rx.recv() {
-                let (image, duration) = generate(key, &path);
-                if done_tx.send(Done { key, image, duration }).is_err() {
-                    break;
+        // A few workers sharing one queue: thumbnails still arrive roughly
+        // newest-first (the order they're requested). Each ffmpeg runs at low
+        // priority and is mostly process start-up, so a capture isn't starved.
+        let workers = std::thread::available_parallelism().map_or(2, |n| n.get() / 3).clamp(2, 4);
+        let job_rx = Arc::new(Mutex::new(job_rx));
+        for _ in 0..workers {
+            let (job_rx, done_tx, ctx) = (job_rx.clone(), done_tx.clone(), ctx.clone());
+            std::thread::spawn(move || {
+                loop {
+                    let Ok((key, path)) = job_rx.lock().unwrap().recv() else { break };
+                    let (image, duration) = generate(key, &path);
+                    if done_tx.send(Done { key, image, duration }).is_err() {
+                        break;
+                    }
+                    ctx.request_repaint();
                 }
-                ctx.request_repaint();
-            }
-        });
+            });
+        }
         Self { ctx: app_ctx, ready: HashMap::new(), pending: HashSet::new(), job_tx, done_rx }
     }
 
@@ -103,8 +112,20 @@ fn cache_dir() -> PathBuf {
 }
 
 fn generate(key: u64, video: &Path) -> (Option<egui::ColorImage>, Option<Duration>) {
-    let duration = probe_duration(video);
     let jpg = cache_dir().join(format!("{key:016x}.jpg"));
+    let dur_file = cache_dir().join(format!("{key:016x}.dur"));
+    let cached = std::fs::read_to_string(&dur_file).ok().and_then(|s| s.trim().parse::<f64>().ok());
+    let duration = match cached {
+        Some(secs) => Some(Duration::from_secs_f64(secs)),
+        None => {
+            let d = probe_duration(video);
+            if let Some(d) = d {
+                let _ = std::fs::create_dir_all(cache_dir());
+                let _ = std::fs::write(&dur_file, d.as_secs_f64().to_string());
+            }
+            d
+        }
+    };
     if !jpg.exists() {
         let _ = std::fs::create_dir_all(cache_dir());
         // Skip a little way in: the very first frame of a capture is often black or a
