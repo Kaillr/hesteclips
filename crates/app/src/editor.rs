@@ -76,6 +76,9 @@ struct Ready {
     resume: bool,
     /// How far the audio tracks are scrolled up when they don't all fit.
     lane_scroll: f32,
+    /// Wheel scrolling and Ctrl+wheel zoom, eased out over a few frames.
+    glide: crate::wheel::Glide,
+    zoom_glide: crate::wheel::Glide,
     /// The part of the clip the timeline shows: start and length, in seconds.
     /// The whole clip until you zoom in.
     view: (f64, f64),
@@ -231,6 +234,8 @@ impl Ready {
             dragging: None,
             resume: false,
             lane_scroll: 0.0,
+            glide: Default::default(),
+            zoom_glide: Default::default(),
             view: (0.0, full),
             confirm_discard: false,
             save_as: None,
@@ -532,19 +537,16 @@ impl Ready {
         }
     }
 
-    /// Ctrl+scroll (or pinch) over the timeline zooms around the pointer; plain
-    /// scrolling pans once zoomed in. While playing, the view pages along to
-    /// keep the playhead in sight.
-    fn zoom_and_pan(&mut self, ui: &egui::Ui, lanes: Rect, dur: f64, vertical_taken: bool) {
-        if let Some(pos) = ui.ctx().pointer_hover_pos().filter(|p| lanes.contains(*p)) {
-            let (zoom, scroll) = ui.input(|i| (i.zoom_delta(), i.smooth_scroll_delta));
-            let frac = ((pos.x - lanes.left()) / lanes.width()).clamp(0.0, 1.0) as f64;
-            if zoom != 1.0 {
-                self.zoom(zoom as f64, frac);
-            } else if self.view.1 < dur {
-                let px = -(scroll.x + if vertical_taken { 0.0 } else { scroll.y });
-                self.view.0 += px as f64 / lanes.width() as f64 * self.view.1;
-            }
+    /// Ctrl+scroll (or pinch) zooms around the pointer by `zoom`; scrolling
+    /// pans by `pan` points once zoomed in. While playing, the view pages
+    /// along to keep the playhead in sight.
+    fn zoom_and_pan(&mut self, lanes: Rect, dur: f64, pointer: Option<Pos2>, pan: f32, zoom: f32) {
+        if zoom != 1.0 {
+            let frac = pointer.map_or(0.5, |p| ((p.x - lanes.left()) / lanes.width()).clamp(0.0, 1.0) as f64);
+            self.zoom(zoom as f64, frac);
+        }
+        if pan != 0.0 && self.view.1 < dur {
+            self.view.0 += pan as f64 / lanes.width() as f64 * self.view.1;
         }
         if self.player.is_playing() {
             let t = self.player.time();
@@ -645,12 +647,21 @@ impl Ready {
         let fd = self.info.frame_duration();
         // The wheel over the audio tracks scrolls them when they don't all fit;
         // sideways (Shift+wheel, trackpad) still pans the timeline.
-        let over_audio = ui.ctx().pointer_hover_pos().is_some_and(|p| audio_view.contains(p));
-        if over_audio && max_scroll > 0.0 {
-            self.lane_scroll -= ui.input(|i| i.smooth_scroll_delta.y);
+        // Wheel input glides (see `wheel.rs`): read raw, eased here.
+        let ctx = ui.ctx().clone();
+        let pointer = ctx.pointer_hover_pos();
+        let input = if pointer.is_some_and(|p| outer.contains(p)) { crate::wheel::read(&ctx) } else { crate::wheel::Input { pinch: 1.0, ..Default::default() } };
+        let scroll = self.glide.step(&ctx, input.scroll);
+        let zoom_pts = self.zoom_glide.step1(&ctx, input.zoom);
+        let zoom = (ctx.options(|o| o.input_options.scroll_zoom_speed) * zoom_pts).exp() * input.pinch;
+        let over_audio = pointer.is_some_and(|p| audio_view.contains(p));
+        let lanes_take_vertical = over_audio && max_scroll > 0.0;
+        if lanes_take_vertical {
+            self.lane_scroll -= scroll.y;
         }
         self.lane_scroll = self.lane_scroll.clamp(0.0, max_scroll);
-        self.zoom_and_pan(ui, lanes, dur, over_audio && max_scroll > 0.0);
+        let pan = -(scroll.x + if lanes_take_vertical { 0.0 } else { scroll.y });
+        self.zoom_and_pan(lanes, dur, pointer, pan, zoom);
         let (v0, span) = self.view;
         let x_of = |t: f64| lanes.left() + ((t - v0) / span) as f32 * lanes.width();
         let t_of = |x: f32| (v0 + ((x - lanes.left()) / lanes.width()).clamp(0.0, 1.0) as f64 * span).clamp(0.0, dur);

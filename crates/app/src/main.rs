@@ -33,6 +33,7 @@ mod gpu_frames;
 mod video;
 mod viewer;
 mod waveform;
+mod wheel;
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
