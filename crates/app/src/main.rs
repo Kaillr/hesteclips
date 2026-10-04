@@ -186,6 +186,10 @@ struct App {
     settings: RecordSettings,
     /// Last-saved settings JSON, to persist only when something changed.
     saved_settings: String,
+    /// False when launched through a dev hook (`HESTECLIPS_OPEN_*`, `_DEMO_*`,
+    /// `_LIBRARY`): a test instance next to the real one must never write its
+    /// settings over the real ones.
+    persist_settings: bool,
     service: CaptureService,
     /// Global shortcuts, kept in step with `settings.shortcuts`. `Err` when the OS
     /// refused shortcuts altogether.
@@ -280,6 +284,10 @@ impl App {
             saving: 0,
             settings,
             saved_settings,
+            persist_settings: !std::env::vars_os().any(|(k, _)| {
+                let k = k.to_string_lossy();
+                ["HESTECLIPS_OPEN_", "HESTECLIPS_DEMO_", "HESTECLIPS_LIBRARY"].iter().any(|p| k.starts_with(p))
+            }),
             service: CaptureService::new(live_audio.clone()),
             hotkeys,
             recording_shortcut: None,
@@ -332,7 +340,6 @@ impl App {
         if let Some(dir) = std::env::var_os("HESTECLIPS_LIBRARY") {
             app.settings.auto_start_buffer = false;
             app.settings.output_dir = PathBuf::from(dir);
-            app.saved_settings = app.settings.to_json(); // never persist the scratch dir
             app.refresh_clips();
         }
         if let Some(clip) = std::env::var_os("HESTECLIPS_DEMO_RENDER").map(PathBuf::from) {
@@ -555,7 +562,7 @@ impl eframe::App for App {
             }
             // Persist settings as they change; no Save button to forget.
             let json = self.settings.to_json();
-            if json != self.saved_settings {
+            if json != self.saved_settings && self.persist_settings {
                 RecordSettings::save_json(&json);
                 self.saved_settings = json;
             }
