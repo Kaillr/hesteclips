@@ -330,6 +330,8 @@ pub struct RecordSettings {
     pub auto_start_buffer: bool,
     /// Download new versions in the background and install them on quit.
     pub auto_update: bool,
+    /// Show what you're clipping on your Discord profile (Rich Presence).
+    pub discord_presence: bool,
 
     // --- Advanced (collapsible; sane defaults) ---
     pub encoder: Encoder,
@@ -375,6 +377,7 @@ impl Default for RecordSettings {
             replay_seconds: 60,
             auto_start_buffer: true,
             auto_update: true,
+            discord_presence: false,
             encoder: Encoder::Auto,
             container: Container::Mp4,
             rate_control: RateControl::Cbr,

@@ -41,7 +41,7 @@ use anyhow::{Context, Result, bail};
 pub(crate) use loopback::SystemAudio;
 pub(crate) use system::host_now;
 pub use camera::{keep_open as keep_camera_open, list_cameras, open_camera_settings};
-pub use system::{list_apps, list_screens, list_windowed_apps};
+pub use system::{foreground_exe, list_apps, list_screens, list_windowed_apps};
 
 use crate::mixer::{self, Clock, LiveAudio};
 use crate::mp4mux::Spec;

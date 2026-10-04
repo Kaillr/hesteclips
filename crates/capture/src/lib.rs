@@ -114,6 +114,18 @@ pub fn list_windowed_apps() -> Vec<Device> {
     }
 }
 
+/// The executable of the app in focus (`osu!.exe`), where the platform can tell.
+pub fn foreground_exe() -> Option<String> {
+    #[cfg(target_os = "windows")]
+    {
+        win::foreground_exe()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        None
+    }
+}
+
 /// Screens the backend can capture; their ids go in [`VideoSource::Screen`].
 pub fn list_screens() -> Vec<Device> {
     #[cfg(target_os = "macos")]

@@ -315,6 +315,11 @@ pub fn list_windowed_apps() -> Vec<Device> {
     apps_of(app_windows().into_iter().map(|(_, pid)| pid).collect())
 }
 
+/// The executable of the app in focus (`osu!.exe`).
+pub fn foreground_exe() -> Option<String> {
+    foreground_app().map(|f| f.exe)
+}
+
 /// Processes as apps: by executable, named by their file description, without
 /// shell processes or HesteClips itself, sorted by name.
 fn apps_of(pids: Vec<u32>) -> Vec<Device> {

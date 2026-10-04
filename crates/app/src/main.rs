@@ -12,6 +12,7 @@ mod clips;
 mod webcam_ui;
 mod cloud;
 mod cloud_ui;
+mod discord;
 mod editor;
 mod filmstrip;
 mod library;
@@ -269,6 +270,12 @@ struct App {
     last_poll: Option<Instant>,
     dir_mtime: Option<SystemTime>,
     pub(crate) updater: update::Updater,
+    pub(crate) presence: discord::Presence,
+    /// The game being clipped, for Discord: its executable, and when we last
+    /// checked it's still open.
+    clipped_game: Option<(String, Instant)>,
+    /// When the current capture started, as Discord's "elapsed" timer counts.
+    presence_since: Option<SystemTime>,
 }
 
 impl App {
@@ -339,6 +346,9 @@ impl App {
             last_poll: None,
             dir_mtime: None,
             updater,
+            presence: discord::Presence::new(),
+            clipped_game: None,
+            presence_since: None,
         };
         // Dev aid: `HESTECLIPS_OPEN_EDITOR=<clip>` opens the editor at launch, so the
         // editor can be checked without clicking through the library.
@@ -584,6 +594,7 @@ impl eframe::App for App {
                 self.dir_mtime = mtime;
                 self.refresh_clips();
             }
+            self.update_presence();
             // Persist settings as they change; no Save button to forget.
             let json = self.settings.to_json();
             if json != self.saved_settings && self.persist_settings {
@@ -771,6 +782,49 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Discord shows what's being clipped while capture runs (when turned on).
+    /// The game is the last one in focus: one from the games-and-apps list, or
+    /// while recording the screen, any game Discord knows.
+    fn update_presence(&mut self) {
+        if !self.settings.discord_presence || self.rec_state == RecState::Idle {
+            self.presence_since = None;
+            self.clipped_game = None;
+            self.presence.set(None);
+            return;
+        }
+        let apps = match &self.settings.capture {
+            settings::CaptureTarget::Apps { apps, .. } => Some(apps),
+            _ => None,
+        };
+        if let Some(exe) = capture::foreground_exe() {
+            let clipped = match apps {
+                Some(apps) => apps.iter().any(|a| a.id.eq_ignore_ascii_case(&exe)),
+                None => discord::known_game(&exe).is_some(),
+            };
+            if clipped {
+                self.clipped_game = Some((exe, Instant::now()));
+            }
+        }
+        // Not in focus for a while: is it still open?
+        if let Some((exe, checked)) = &mut self.clipped_game
+            && checked.elapsed() > Duration::from_secs(5)
+        {
+            if capture::list_windowed_apps().iter().any(|a| a.id.eq_ignore_ascii_case(exe)) {
+                *checked = Instant::now();
+            } else {
+                self.clipped_game = None;
+            }
+        }
+        let game = self.clipped_game.as_ref().and_then(|(exe, _)| {
+            discord::known_game(exe).or_else(|| {
+                let app = apps?.iter().find(|a| a.id.eq_ignore_ascii_case(exe))?;
+                Some(discord::Game { name: app.name.clone(), icon: None })
+            })
+        });
+        let since = *self.presence_since.get_or_insert_with(SystemTime::now);
+        self.presence.set(Some(discord::Status { recording: self.rec_state == RecState::Recording, game, since }));
     }
 
     /// "Update ready", once a new version is downloaded: restarts into it. It

@@ -157,6 +157,23 @@ impl App {
 
         section(ui, "HesteFiles", |ui| self.hestefiles_settings(ui));
 
+        section(ui, "Discord", |ui| {
+            let hint = "While the replay buffer or a recording runs, your Discord profile shows what you're clipping, like \"Clipping osu!\". Needs the Discord app running on this computer.";
+            row(ui, "Show on Discord", Some(hint), |ui| {
+                ui.horizontal(|ui| {
+                    toggle(ui, &mut self.settings.discord_presence);
+                    if self.settings.discord_presence && self.rec_state != RecState::Idle {
+                        ui.add_space(6.0);
+                        if self.presence.connected() {
+                            ui.weak("Showing on Discord");
+                        } else {
+                            ui.weak("Discord isn't running");
+                        }
+                    }
+                });
+            });
+        });
+
         section(ui, "Updates", |ui| self.update_settings(ui));
 
 
