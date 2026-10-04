@@ -520,8 +520,15 @@ impl eframe::App for App {
             }
         }
 
+        // The viewer in fullscreen: the picture from edge to edge.
+        let edge_to_edge = self.page == Page::View && ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+        let central = if edge_to_edge {
+            egui::Frame::NONE.fill(egui::Color32::BLACK)
+        } else {
+            egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin::symmetric(16, 4))
+        };
         egui::CentralPanel::default()
-            .frame(egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin::symmetric(16, 4)))
+            .frame(central)
             .show(ui, |ui| match self.page {
                 Page::Clips => self.library(ui, frame),
                 Page::Sources => self.sources_page(ui),

@@ -77,6 +77,8 @@ struct Ready {
     dragging: Option<bool>,
     /// Last scroll-scrub, and whether it was playing before scrolling began.
     scrolled: Option<(Instant, bool)>,
+    /// When the mouse last moved, scrolled or clicked (fullscreen controls).
+    last_activity: Instant,
     /// Wheel movement, eased out over the next frames.
     glide: crate::wheel::Glide,
     /// Where the wheel has taken the playhead, unsnapped: the glide's last
@@ -227,6 +229,7 @@ impl Ready {
             dragging: None,
             scrolled: None,
             glide: Default::default(),
+            last_activity: Instant::now(),
             scroll_to: None,
             hover: None,
             volume: volume.0,
@@ -260,12 +263,15 @@ impl Ready {
         }
         let scrubbing = self.dragging.is_some() || self.scrolled.is_some();
 
-        // --- Picture: everything above the timeline and controls ---
+        let full = is_fullscreen(&ctx);
+
+        // --- Picture: everything above the timeline and controls; in
+        // fullscreen the whole screen, with the controls over it ---
         let timeline_h = 52.0 + 2.0 + 40.0;
         let controls_h = 8.0 + timeline_h + 8.0 + 34.0 + 6.0;
-        let preview_h = (ui.available_height() - controls_h).max(160.0);
+        let preview_h = if full { ui.available_height() } else { (ui.available_height() - controls_h).max(160.0) };
         let (preview, preview_resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), preview_h), Sense::click());
-        ui.painter().rect_filled(preview, 8, Color32::BLACK);
+        ui.painter().rect_filled(preview, if full { 0 } else { 8 }, Color32::BLACK);
         if let Some(size) = self.player.update(&ctx, scrubbing) {
             let scale = (preview.width() / size.x).min(preview.height() / size.y);
             // On whole screen pixels: a half-pixel offset alone blurs text.
@@ -274,7 +280,47 @@ impl Ready {
             let r = Rect::from_min_size(((r.min.to_vec2() * ppp).round() / ppp).to_pos2(), r.size());
             self.player.paint(ui, r);
         }
-        let preview_resp = preview_resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+
+        let mut timeline_w = preview.width();
+        if full {
+            // Over the bottom of the picture while the mouse moves (and a few
+            // seconds after) or rests on them; hidden otherwise, cursor too,
+            // paused or not (a paused frame is often for a screenshot).
+            let bar = Rect::from_min_max(egui::pos2(preview.left(), preview.bottom() - controls_h - 24.0), preview.max);
+            let shown = self.controls_shown(&ctx, bar);
+            if shown > 0.0 {
+                // Clear at the top, near-black within 40 points: readable over
+                // any picture.
+                let shade = |a: f32| Color32::from_black_alpha((a * shown) as u8);
+                let mid = bar.top() + 40.0;
+                let fade = egui::Mesh {
+                    indices: vec![0, 1, 2, 2, 1, 3, 2, 3, 4, 4, 3, 5],
+                    vertices: [
+                        (bar.left_top(), 0.0),
+                        (bar.right_top(), 0.0),
+                        (egui::pos2(bar.left(), mid), 190.0),
+                        (egui::pos2(bar.right(), mid), 190.0),
+                        (bar.left_bottom(), 225.0),
+                        (bar.right_bottom(), 225.0),
+                    ]
+                    .into_iter()
+                    .map(|(pos, a)| egui::epaint::Vertex { pos, uv: egui::epaint::WHITE_UV, color: shade(a) })
+                    .collect(),
+                    texture_id: Default::default(),
+                };
+                ui.painter().add(fade);
+                let area = Rect::from_min_max(egui::pos2(bar.left() + 20.0, bar.top() + 24.0), egui::pos2(bar.right() - 20.0, bar.bottom()));
+                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(area));
+                child.multiply_opacity(shown);
+                timeline_w = self.controls(&mut child, preview, timeline_h);
+            } else if pointer_over(&ctx, preview) {
+                ctx.set_cursor_icon(egui::CursorIcon::None);
+            }
+        } else {
+            timeline_w = self.controls(ui, preview, timeline_h);
+        }
+
+        let preview_resp = preview_resp.on_hover_cursor(if full { egui::CursorIcon::Default } else { egui::CursorIcon::PointingHand });
         if preview_resp.double_clicked() {
             // The first click of the two already toggled playing: undo that.
             self.toggle_play();
@@ -283,14 +329,9 @@ impl Ready {
             self.toggle_play();
         }
 
-        // --- Timeline ---
-        ui.add_space(8.0);
-        let (outer, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), timeline_h), Sense::click_and_drag());
-        self.timeline(ui, outer, &resp, preview);
-
-        // Scroll over the picture or the timeline to scrub through the clip.
-        let pointer = ctx.pointer_hover_pos();
-        let over = pointer.is_some_and(|p| preview.contains(p) || outer.contains(p));
+        // Scroll over the picture (or the timeline, over or under it) to
+        // scrub through the clip.
+        let over = pointer_over(&ctx, preview) || ctx.pointer_hover_pos().is_some_and(|p| p.y > preview.bottom());
         let mut input = if over { crate::wheel::read(&ctx).scroll } else { Vec2::ZERO };
         input.y += dev_wheel();
         // Down or left (towards you, or swiping left) goes forward, like reading on.
@@ -302,19 +343,47 @@ impl Ready {
                 None => self.player.is_playing(),
             };
             self.player.pause();
-            let dt = px as f64 / outer.width().max(1.0) as f64 * self.info.duration;
+            let dt = px as f64 / timeline_w.max(1.0) as f64 * self.info.duration;
             // Unsnapped, so the glide's last small steps add up.
             let to = (self.scroll_to.unwrap_or_else(|| self.player.time()) + dt).clamp(0.0, self.info.duration);
             self.scroll_to = Some(to);
             self.seek(to);
             self.scrolled = Some((Instant::now(), was));
         }
+        if let Some(e) = &self.player.audio_error {
+            ui.colored_label(ui.visuals().warn_fg_color, format!("No sound: {e}"));
+        }
+    }
 
-        // --- Transport ---
+    /// How visible the fullscreen controls are (0..=1, fading): shown while
+    /// the mouse moves, clicks or scrolls and for a few seconds after, while
+    /// the pointer rests on them (`bar`), and while dragging on the timeline.
+    fn controls_shown(&mut self, ctx: &egui::Context, bar: Rect) -> f32 {
+        const LINGER: Duration = Duration::from_millis(2500);
+        let active = ctx.input(|i| {
+            i.pointer.delta() != Vec2::ZERO || i.pointer.any_down() || i.raw.events.iter().any(|e| matches!(e, egui::Event::MouseWheel { .. }))
+        });
+        if active {
+            self.last_activity = Instant::now();
+        }
+        let visible = self.last_activity.elapsed() < LINGER || pointer_over(ctx, bar) || self.dragging.is_some();
+        if visible {
+            ctx.request_repaint_after(LINGER.saturating_sub(self.last_activity.elapsed()) + Duration::from_millis(20));
+        }
+        ctx.animate_bool_with_time(egui::Id::new("viewer_controls"), visible, 0.2)
+    }
+
+    /// The timeline and the play / time / volume row, from the top of `ui`.
+    /// Returns the timeline's width (wheel scrubbing scales by it).
+    fn controls(&mut self, ui: &mut egui::Ui, preview: Rect, timeline_h: f32) -> f32 {
+        ui.add_space(8.0);
+        let (outer, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), timeline_h), Sense::click_and_drag());
+        self.timeline(ui, outer, &resp, preview);
+
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             ui.set_min_height(34.0);
-            let label = if self.player.is_playing() { "⏸" } else { "▶" };
+            let label = if self.player.is_playing() { "\u{23f8}" } else { "\u{25b6}" };
             let play = egui::Button::new(RichText::new(label).size(18.0)).min_size(Vec2::new(44.0, 32.0)).corner_radius(8);
             if ui.add(play).on_hover_text("Play / pause  (Space)").clicked() {
                 self.toggle_play();
@@ -325,7 +394,7 @@ impl Ready {
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let full = is_fullscreen(ui.ctx());
-                let fs = egui::Button::new(RichText::new("⛶").size(16.0)).min_size(Vec2::new(32.0, 28.0)).corner_radius(6).selected(full);
+                let fs = egui::Button::new(RichText::new("\u{26f6}").size(16.0)).min_size(Vec2::new(32.0, 28.0)).corner_radius(6).selected(full);
                 if ui.add(fs).on_hover_text(if full { "Exit fullscreen  (F or Esc)" } else { "Fullscreen  (F, or double-click the picture)" }).clicked() {
                     set_fullscreen(ui.ctx(), !full);
                 }
@@ -333,7 +402,7 @@ impl Ready {
                 let mut changed = false;
                 let slider = egui::Slider::new(&mut self.volume, 0.0..=1.0).show_value(false);
                 changed |= ui.add_sized(Vec2::new(100.0, 20.0), slider).on_hover_text("Volume").changed();
-                let icon = if self.muted || self.volume == 0.0 { "🔇" } else { "🔊" };
+                let icon = if self.muted || self.volume == 0.0 { "\u{1f507}" } else { "\u{1f50a}" };
                 if ui.add(egui::Button::new(icon).frame(false)).on_hover_text(if self.muted { "Unmute  (M)" } else { "Mute  (M)" }).clicked() {
                     self.muted = !self.muted;
                     changed = true;
@@ -345,12 +414,10 @@ impl Ready {
                     self.apply_volume(ui.ctx());
                 }
                 ui.add_space(12.0);
-                ui.weak("Scroll to scrub · arrow keys jump 5 s · , and . step one frame");
+                ui.weak("Scroll to scrub \u{b7} arrow keys jump 5 s \u{b7} , and . step one frame");
             });
         });
-        if let Some(e) = &self.player.audio_error {
-            ui.colored_label(ui.visuals().warn_fg_color, format!("No sound: {e}"));
-        }
+        outer.width()
     }
 
     /// Filmstrip over the audio levels, with the playhead through both. Hover to
@@ -557,6 +624,10 @@ fn dev_wheel() -> f32 {
     let due: f32 = plan.iter().filter(|(t, _)| *t <= now).map(|(_, d)| *d).sum();
     plan.retain(|(t, _)| *t > now);
     due
+}
+
+fn pointer_over(ctx: &egui::Context, rect: Rect) -> bool {
+    ctx.pointer_hover_pos().is_some_and(|p| rect.contains(p))
 }
 
 fn volume_id() -> egui::Id {
