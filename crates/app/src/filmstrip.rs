@@ -1,14 +1,15 @@
 //! The timeline's filmstrip, shared by the editor and the viewer.
 //!
-//! Every picture covers the stretch of the timeline closest to the frame it
-//! shows, so the middle of a thumbnail is exactly where its frame is: put the
-//! playhead there and the preview shows the same picture.
+//! Every picture shows the frame in the middle of the stretch it covers, so
+//! the middle of a thumbnail is exactly where its frame is: put the playhead
+//! there and the preview shows the same picture. Its full height always
+//! shows (only the sides are trimmed, by at most a fifth).
 //!
-//! On Windows the pictures are exact frames from the GPU's video decoder,
-//! on an even grid that halves or doubles as the timeline zooms: grid points
-//! stay put while panning, and each zoom level's frames include the coarser
-//! level's, so zooming in reuses what's there. A picture not decoded yet
-//! shows the nearest one that is, then its own (once, a few ms later).
+//! On Windows the pictures are exact frames from the GPU's video decoder, in
+//! stretches of a fixed number of frames laid end to end from the clip's
+//! start (the last one to its end), as many frames as fit a thumbnail at
+//! this zoom: they stay put while panning. A picture not decoded yet shows
+//! the nearest one that is, then its own (once, a few ms later).
 //!
 //! Elsewhere (or if the decoder can't open the clip) the pictures are the
 //! clip's keyframes, from `media::keyframe_strip`: the ones to show are
@@ -69,6 +70,9 @@ impl Filmstrip {
 
 /// Paint pictures over their stretches of time (`start..end`, which have
 /// the picture's frame in the middle), center-cropped to fill them.
+/// The whole picture's height always shows: a stretch narrower than the
+/// picture shows its middle (the sides trimmed), a wider one shows it whole,
+/// centered.
 fn paint_cells(ui: &egui::Ui, lane: Rect, from: f64, to: f64, cells: &[(f64, f64, Option<&egui::TextureHandle>)]) {
     let span = (to - from).max(1e-6);
     let x_of = |t: f64| lane.left() + ((t - from) / span) as f32 * lane.width();
@@ -79,7 +83,14 @@ fn paint_cells(ui: &egui::Ui, lane: Rect, from: f64, to: f64, cells: &[(f64, f64
         if cell.right() < lane.left() || cell.left() > lane.right() || cell.width() < 0.5 {
             continue;
         }
-        painter.image(tex.id(), cell, crop_uv(tex.size_vec2(), cell.size()), Color32::WHITE);
+        let size = tex.size_vec2();
+        let natural = lane.height() * size.x / size.y.max(1.0);
+        if cell.width() > natural {
+            let rect = Rect::from_center_size(cell.center(), egui::vec2(natural, lane.height()));
+            painter.image(tex.id(), rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+        } else {
+            painter.image(tex.id(), cell, crop_uv(size, cell.size()), Color32::WHITE);
+        }
     }
 }
 
@@ -189,21 +200,24 @@ mod exact {
             self.receive(ui.ctx());
             self.tick += 1;
             let span = (to - from).max(1e-6);
-            // The grid step (in frames) closest to one thumbnail's width, from
-            // 1, 2, 3, 4, 6, 8, 12, 16…: pictures are cropped by at most ~20%,
-            // and most steps' frames are shared with the next coarser ones.
+            // Stretches of `step` frames laid end to end from the start, each
+            // showing the frame in its middle; the last runs to the clip's end.
+            // The step is the widest of 1, 2, 3, 4, 5, 6, 7, 8, 10, 12… frames
+            // not wider than a thumbnail, so only the sides are ever trimmed.
             let thumb = (lane.height() * self.aspect) as f64 / lane.width().max(1.0) as f64 * span * self.fps;
             let step = grid_step(thumb);
+            let frames = self.last_frame + 1;
             let first = ((from * self.fps) as u64 / step).saturating_sub(1);
             let last = ((to * self.fps) as u64 / step + 1).min(self.last_frame / step);
             let mut cells = Vec::new();
             let mut missing = Vec::new();
             for k in first..=last {
-                let i = k * step;
+                let (a, b) = (k * step, ((k + 1) * step).min(frames));
+                let i = (a + (b - a) / 2).min(self.last_frame);
                 if !self.thumbs.contains_key(&i) {
                     missing.push(i);
                 }
-                cells.push(i);
+                cells.push((a, b, i));
             }
             // Always exactly what's missing now: the decoder drops a list the
             // moment a newer one comes (zoomed or panned away).
@@ -212,18 +226,16 @@ mod exact {
                 let _ = self.want_tx.send(missing);
             }
             let tick = self.tick;
-            for i in &cells {
+            for (_, _, i) in &cells {
                 if let Some(entry) = self.thumbs.get_mut(i) {
                     entry.1 = tick;
                 }
             }
-            // Each picture over the grid step around its frame.
-            let half = step as f64 / self.fps / 2.0;
             let drawn: Vec<_> = cells
                 .iter()
-                .map(|&i| {
-                    let t = i as f64 / self.fps;
-                    ((t - half).max(0.0), (t + half).min(dur), self.nearest(i))
+                .map(|&(a, b, i)| {
+                    let end = if b >= frames { dur } else { b as f64 / self.fps };
+                    (a as f64 / self.fps, end, self.nearest(i))
                 })
                 .collect();
             paint_cells(ui, lane, from, to, &drawn);
@@ -262,18 +274,17 @@ mod exact {
         }
     }
 
-    /// The step from 1, 2, 3, 4, 6, 8, 12… (frames) nearest `frames` on a log scale.
+    /// The widest step from 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16… (frames) that's at
+    /// most `frames` (at least 1): neighbours differ by 25% or less, so a
+    /// picture's sides are trimmed by at most a fifth.
     pub(super) fn grid_step(frames: f64) -> u64 {
         let mut best = 1u64;
         let mut s = 1u64;
-        while s < 1 << 40 {
-            for c in [s, s * 3 / 2] {
-                if c >= 1 && ((c as f64).ln() - frames.max(1.0).ln()).abs() < ((best as f64).ln() - frames.max(1.0).ln()).abs() {
-                    best = c;
+        while (s as f64) <= frames && s < 1 << 40 {
+            for c in [s, s * 5 / 4, s * 3 / 2, s * 7 / 4] {
+                if c as f64 <= frames {
+                    best = best.max(c);
                 }
-            }
-            if s as f64 > frames * 2.0 {
-                break;
             }
             s *= 2;
         }
@@ -387,15 +398,15 @@ impl Keys {
 #[cfg(all(test, windows))]
 mod tests {
     #[test]
-    fn grid_steps_stay_close_to_a_thumbnail() {
+    fn grid_steps_never_wider_than_a_thumbnail() {
         use super::exact::grid_step;
+        assert_eq!(grid_step(0.4), 1);
         assert_eq!(grid_step(1.0), 1);
+        assert_eq!(grid_step(5.9), 5);
         assert_eq!(grid_step(100.0), 96);
-        // Never more than ~22% from a thumbnail's width (above 3 frames: under
-        // that there are only whole frames to pick from).
         for f in (3..2000).map(|n| n as f64 * 1.37) {
             let s = grid_step(f) as f64;
-            assert!(s / f < 1.23 && f / s < 1.23, "{f} -> {s}");
+            assert!(s <= f && f / s < 1.26, "{f} -> {s}");
         }
     }
 }
