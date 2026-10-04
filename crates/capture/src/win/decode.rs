@@ -48,8 +48,12 @@ const UNITS: f64 = 10_000_000.0;
 /// frames (1 s at 60 fps) it's the cheaper way on average.
 const MAX_SKIP: u64 = 60;
 
-/// Shareable textures decoded frames are drawn into (see [`Surfaces`]).
-const POOL: usize = 24;
+/// Shareable textures decoded frames are drawn into (see [`Surfaces`]): as
+/// many as fit in [`POOL_BYTES`], within these bounds. Frames are full
+/// resolution: 24 at 1440p is ~350 MB; 4K gets 16 (~530 MB).
+const POOL_MIN: usize = 16;
+const POOL_MAX: usize = 24;
+const POOL_BYTES: u64 = 512 << 20;
 
 /// A decoded picture, opaque RGBA: in `rgba` (rows top to bottom, no
 /// padding), or on the GPU in `gpu` (and `rgba` is empty).
@@ -137,11 +141,8 @@ pub struct Decoder {
     convert: Convert,
     /// Frames stay on the GPU, in these.
     pool: Option<Arc<Surfaces>>,
-    /// The video's own size, its colour matrix, and whether frames are shared
-    /// (to rebuild the output at another size).
+    /// The video's own size.
     source: (u32, u32),
-    bt601: bool,
-    shared: bool,
     /// Media Foundation's time of frame 0.
     offset: i64,
     /// The frame the next read returns, when known (none after a seek).
@@ -210,8 +211,6 @@ impl Decoder {
                 convert,
                 pool,
                 source: (sw, sh),
-                bt601,
-                shared: share_on.is_some(),
                 offset: 0,
                 next_index: None,
                 peeked: None,
@@ -225,22 +224,14 @@ impl Decoder {
         }
     }
 
+    /// How many frames can be out at once (on the GPU), if shared.
+    pub fn pool_size(&self) -> Option<usize> {
+        self.pool.as_ref().map(|p| p.textures.len())
+    }
+
     /// The video's own size.
     pub fn source_size(&self) -> (u32, u32) {
         self.source
-    }
-
-    /// Decode to `width` wide from now on (height keeps the aspect). Frames
-    /// already handed out keep their own size and textures.
-    pub fn resize(&mut self, width: u32) -> Result<()> {
-        let width = (width.min(self.source.0).max(2) / 2) * 2;
-        if width == self.width {
-            return Ok(());
-        }
-        let height = even_height(width, self.source);
-        let (pool, convert) = outputs(&self.gpu, self.shared, self.source, (width, height), self.fps, self.bt601)?;
-        (self.pool, self.convert, self.width, self.height) = (pool, convert, width, height);
-        Ok(())
     }
 
     /// Number frames on this rate's grid instead of the file's own (to match
@@ -394,9 +385,10 @@ fn outputs(gpu: &Gpu, shared: bool, source: (u32, u32), size: (u32, u32), fps: f
 /// The shared textures for a pool.
 fn surfaces(gpu: &Gpu, width: u32, height: u32) -> Result<Surfaces> {
     static NEXT: AtomicUsize = AtomicUsize::new(1);
+    let count = (POOL_BYTES / (width as u64 * height as u64 * 4).max(1)).clamp(POOL_MIN as u64, POOL_MAX as u64) as usize;
     let mut textures = Vec::new();
     let mut handles = Vec::new();
-    for _ in 0..POOL {
+    for _ in 0..count {
         let desc = D3D11_TEXTURE2D_DESC {
             Width: width,
             Height: height,
@@ -435,7 +427,7 @@ fn surfaces(gpu: &Gpu, width: u32, height: u32) -> Result<Surfaces> {
         id: NEXT.fetch_add(1, Ordering::Relaxed),
         textures,
         handles,
-        free: Mutex::new((0..POOL).collect()),
+        free: Mutex::new((0..count).collect()),
         fence,
         fence_value: std::sync::atomic::AtomicU64::new(0),
     })

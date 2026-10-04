@@ -67,6 +67,25 @@ pub fn uptime() -> f64 {
     START.get_or_init(std::time::Instant::now).elapsed().as_secs_f64()
 }
 
+/// What's on screen, with its size in pixels.
+enum Display {
+    /// An uploaded image: scrub proxy frames, frames that came back to the CPU.
+    Image(egui::TextureId, egui::Vec2),
+    /// A decoded frame on the GPU, drawn with the sharp filter.
+    #[cfg(windows)]
+    Gpu(crate::gpu_frames::Shown, egui::Vec2),
+}
+
+impl Display {
+    fn size(&self) -> egui::Vec2 {
+        match self {
+            Display::Image(_, s) => *s,
+            #[cfg(windows)]
+            Display::Gpu(_, s) => *s,
+        }
+    }
+}
+
 /// Play waits at most this long for its first frame before the sound starts anyway.
 const START_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
 
@@ -99,8 +118,8 @@ pub struct Player {
     pub audio_error: Option<String>,
     /// Latest frame for display.
     texture: Option<egui::TextureHandle>,
-    /// What's on screen and its size: `texture`, or a frame on the GPU.
-    display: Option<(egui::TextureId, egui::Vec2)>,
+    /// What's on screen.
+    display: Option<Display>,
     /// The GPU frame on screen, held so its texture isn't reused meanwhile.
     on_screen: Option<Picture>,
     /// GPU frames just taken off screen, held a few more frames: the GPU may
@@ -126,11 +145,6 @@ pub struct Player {
     pending_start: Option<std::time::Instant>,
     /// The decoder was told to play (to tell it to stop when playback ends).
     video_playing: bool,
-    /// The width the picture is drawn at (physical pixels), and since when;
-    /// the decoder follows once it has held still a moment.
-    display_width: Option<(u32, std::time::Instant)>,
-    /// The width the decoder was last asked for.
-    decode_width: u32,
     /// When play was last pressed, until its first frame shows (debug log).
     played_at: Option<std::time::Instant>,
     /// When the full-quality frame was last asked for (debug log).
@@ -198,8 +212,6 @@ impl Player {
             pending_start: None,
             video_playing: false,
             played_at: None,
-            display_width: None,
-            decode_width: 0,
             shown_count: None,
             asked_at: None,
         }
@@ -269,38 +281,6 @@ impl Player {
         self.video_playing = false;
     }
 
-    /// The picture is drawn `width` physical pixels wide: decode at that size
-    /// (up to the video's own), so it's shown 1:1, never scaled up. Call each
-    /// frame; a new size is applied once it's held for a moment (not on every
-    /// step of a window resize), the first one at once.
-    pub fn set_display_width(&mut self, width: u32) {
-        const SETTLE: std::time::Duration = std::time::Duration::from_millis(250);
-        let width = width.clamp(64, self.info.width.max(64)) / 2 * 2;
-        if self.display_width.is_none_or(|(w, _)| w != width) {
-            self.display_width = Some((width, std::time::Instant::now()));
-        }
-        let Some((w, since)) = self.display_width else { return };
-        if w == self.decode_width || (self.decode_width != 0 && since.elapsed() < SETTLE) {
-            return;
-        }
-        let first = self.decode_width == 0;
-        self.decode_width = w;
-        let Some(v) = self.hw() else { return };
-        v.set_width(w);
-        trace!("decoding at {w} px wide");
-        if first {
-            return; // before anything's shown: the decoder starts at this size
-        }
-        // Get the current frame (or playback) at the new size.
-        let want = self.info.frame_index(self.time());
-        if self.sound_playing() {
-            v.play(want);
-        } else {
-            self.still_wanted = None;
-            self.showing_proxy = true; // the frame on screen is the old size: replace it
-        }
-    }
-
     /// Fraction of the scrub proxy that's built (0..=1).
     pub fn proxy_progress(&self) -> f32 {
         let total = (self.info.duration * self.info.fps).floor().max(1.0);
@@ -328,11 +308,12 @@ impl Player {
 
     /// Bring the displayed frame in line with the clock. Call once per UI frame.
     /// `scrubbing`: the user is dragging, so favour instant proxy frames.
-    /// Returns what to draw: an egui texture and its size.
-    pub fn update(&mut self, ctx: &egui::Context, scrubbing: bool) -> Option<(egui::TextureId, egui::Vec2)> {
+    /// Returns the size of what's on screen (in pixels, to fit it); draw it
+    /// with [`Self::paint`].
+    pub fn update(&mut self, ctx: &egui::Context, scrubbing: bool) -> Option<egui::Vec2> {
         if self.hw().is_some() {
             self.update_hw(ctx, scrubbing);
-            return self.display;
+            return self.display.as_ref().map(Display::size);
         }
         let t = self.time();
         let want = self.info.frame_index(t);
@@ -383,7 +364,18 @@ impl Player {
                 }
             }
         }
-        self.display
+        self.display.as_ref().map(Display::size)
+    }
+
+    /// Draw the picture into `rect`: a decoded frame through the sharp
+    /// filter (`gpu_frames.rs`), anything else as an image.
+    pub fn paint(&self, ui: &egui::Ui, rect: egui::Rect) {
+        match &self.display {
+            Some(Display::Image(id, _)) => egui::Image::from_texture((*id, rect.size())).paint_at(ui, rect),
+            #[cfg(windows)]
+            Some(Display::Gpu(shown, _)) => shown.paint(ui, rect),
+            None => {}
+        }
     }
 
     /// [`Self::update`] with the hardware decoder.
@@ -483,10 +475,10 @@ impl Player {
         #[cfg(windows)]
         {
             // On the GPU: draw its texture as it is.
-            let on_gpu = p.gpu.as_ref().and_then(|s| self.gpu_frames.texture(s, p.width, p.height));
+            let on_gpu = p.gpu.as_ref().and_then(|s| self.gpu_frames.show(s, p.width, p.height));
             match on_gpu {
-                Some(id) => {
-                    self.display = Some((id, egui::vec2(p.width as f32, p.height as f32)));
+                Some(shown) => {
+                    self.display = Some(Display::Gpu(shown, egui::vec2(p.width as f32, p.height as f32)));
                     self.retire(ctx, Some(p));
                 }
                 None if p.rgba.is_empty() => {}
@@ -526,7 +518,7 @@ impl Player {
             Some(tex) => tex.set(img, egui::TextureOptions::LINEAR),
             None => self.texture = Some(ctx.load_texture("preview", img, egui::TextureOptions::LINEAR)),
         }
-        self.display = self.texture.as_ref().map(|t| (t.id(), t.size_vec2()));
+        self.display = self.texture.as_ref().map(|t| Display::Image(t.id(), t.size_vec2()));
         self.retire(ctx, None);
     }
 }
@@ -536,7 +528,7 @@ impl Player {
 fn open_video(ctx: &egui::Context, source: &Path, fps: f64) -> Option<Video> {
     #[cfg(windows)]
     if std::env::var_os("HESTECLIPS_NO_HW_DECODE").is_none() {
-        return Some(Video::open(ctx, source, PREVIEW_WIDTH, fps));
+        return Some(Video::open(ctx, source, fps));
     }
     let _ = (ctx, source, fps);
     None

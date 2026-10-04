@@ -266,16 +266,13 @@ impl Ready {
         let preview_h = (ui.available_height() - controls_h).max(160.0);
         let (preview, preview_resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), preview_h), Sense::click());
         ui.painter().rect_filled(preview, 8, Color32::BLACK);
-        // Decode at the size it's drawn at, up to the video's own.
-        let aspect = self.info.width.max(1) as f32 / self.info.height.max(1) as f32;
-        self.player.set_display_width((preview.width().min(preview.height() * aspect) * ctx.pixels_per_point()).round() as u32);
-        if let Some((tex, size)) = self.player.update(&ctx, scrubbing) {
+        if let Some(size) = self.player.update(&ctx, scrubbing) {
             let scale = (preview.width() / size.x).min(preview.height() / size.y);
             // On whole screen pixels: a half-pixel offset alone blurs text.
             let ppp = ctx.pixels_per_point();
             let r = Rect::from_center_size(preview.center(), size * scale);
             let r = Rect::from_min_size(((r.min.to_vec2() * ppp).round() / ppp).to_pos2(), r.size());
-            egui::Image::from_texture((tex, r.size())).paint_at(ui, r);
+            self.player.paint(ui, r);
         }
         let preview_resp = preview_resp.on_hover_cursor(egui::CursorIcon::PointingHand);
         if preview_resp.double_clicked() {

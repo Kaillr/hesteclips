@@ -68,9 +68,6 @@ struct State {
     exact: Option<(u64, Picture)>,
     /// Opening failed or the decoder broke: use another way.
     failed: bool,
-    /// The width to decode at (0: as opened), set from the size the picture
-    /// is drawn at.
-    width: u32,
     /// When the decoder opened (play waits for its first frame until then).
     opened: Option<std::time::Instant>,
     /// Bumped each time `play` throws the queue away (playing from somewhere
@@ -85,9 +82,10 @@ pub struct Video {
 }
 
 impl Video {
-    /// Start opening `path` in the background, decoding `width` wide.
-    /// Frames are numbered at `fps` (the clip's, as the app counts them).
-    pub fn open(ctx: &egui::Context, path: &Path, width: u32, fps: f64) -> Self {
+    /// Start opening `path` in the background.
+    /// Frames are decoded at the video's own resolution and numbered at
+    /// `fps` (the clip's, as the app counts them).
+    pub fn open(ctx: &egui::Context, path: &Path, fps: f64) -> Self {
         let (tx, rx) = mpsc::channel::<Cmd>();
         let state = Arc::new(Mutex::new(State::default()));
         let (path, shared, ctx) = (path.to_path_buf(), state.clone(), ctx.clone());
@@ -95,14 +93,14 @@ impl Video {
             // Frames straight to the screen when the renderer can take them;
             // copied back as RGBA otherwise.
             let on_gpu = crate::gpu_frames::share_luid().and_then(|luid| {
-                Decoder::open(&path, width, Some(luid)).inspect_err(|e| eprintln!("sharing decoded frames isn't possible, copying them: {e:#}")).ok()
+                Decoder::open(&path, u32::MAX, Some(luid)).inspect_err(|e| eprintln!("sharing decoded frames isn't possible, copying them: {e:#}")).ok()
             });
             if std::env::var_os("HESTECLIPS_DEBUG_VIDEO").is_some() {
                 eprintln!("video: decoded frames {}", if on_gpu.is_some() { "drawn from the GPU" } else { "copied to the CPU" });
             }
             let opened = match on_gpu {
                 Some(d) => Ok(d),
-                None => Decoder::open(&path, width, None),
+                None => Decoder::open(&path, u32::MAX, None),
             };
             let mut dec = match opened {
                 Ok(mut d) => {
@@ -131,13 +129,16 @@ impl Video {
             // frame showing at the gap is the one before it, so the same
             // number came back every time.)
             let mut positioned = false;
+            // Leave pool textures for the frame on screen, the ones just taken
+            // off it, and the paused answer.
+            let ahead_playing = dec.pool_size().map_or(AHEAD_PLAYING, |n| AHEAD_PLAYING.min(n.saturating_sub(8)).max(AHEAD_PAUSED));
             // The queue generation this worker is filling (see `State::generation`).
             let mut generation = 0u64;
             let mut at_end = false;
             loop {
                 let room = {
                     let s = shared.lock().unwrap();
-                    !at_end && s.ahead.len() < if playing { AHEAD_PLAYING } else { AHEAD_PAUSED }
+                    !at_end && s.ahead.len() < if playing { ahead_playing } else { AHEAD_PAUSED }
                 };
                 // Busy: just check for news. Full and playing: wait for the clock
                 // to take frames. Full and paused: sleep until told something.
@@ -155,20 +156,6 @@ impl Video {
                         Err(_) => return,
                     }
                 };
-                // A new size: frames from now on are decoded at it. What's queued
-                // is dropped; the player asks for the frame it wants again.
-                let width = shared.lock().unwrap().width;
-                if width != 0 && width.min(dec.source_size().0) / 2 * 2 != dec.width {
-                    if let Err(e) = dec.resize(width) {
-                        return fail(&format!("{e:#}"));
-                    }
-                    let mut s = shared.lock().unwrap();
-                    s.ahead.clear();
-                    s.exact = None;
-                    s.generation += 1;
-                    generation = s.generation;
-                    positioned = false;
-                }
                 if let Some(mut cmd) = cmd {
                     while let Ok(newer) = rx.try_recv() {
                         cmd = newer;
@@ -275,13 +262,6 @@ impl Video {
             }
         }
         let _ = self.tx.send(Cmd::Play(i));
-    }
-
-    /// Decode at `width` from now on (the picture's size on screen). Follow
-    /// it with `play` or `show`: that's what gets the frame at the new size
-    /// (and wakes the worker if it's idle).
-    pub fn set_width(&self, width: u32) {
-        self.state.lock().unwrap().width = width;
     }
 
     /// How long ago the decoder opened, once it has.
