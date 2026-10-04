@@ -1,0 +1,17 @@
+{
+  "branches": ["main"],
+  "tagFormat": "v${version}",
+  "plugins": [
+    "@semantic-release/commit-analyzer",
+    "@semantic-release/release-notes-generator",
+    ["@semantic-release/exec", {
+      "prepareCmd": "pwsh -NoProfile -File scripts/release.ps1 -Version ${nextRelease.version}"
+    }],
+    ["@semantic-release/github", {
+      "assets": [{ "path": "Releases/*" }],
+      "successComment": false,
+      "failComment": false,
+      "releasedLabels": false
+    }]
+  ]
+}

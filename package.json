@@ -1,0 +1,9 @@
+{
+  "name": "hesteclips-release",
+  "private": true,
+  "description": "Release tooling only (semantic-release); the app is Rust.",
+  "devDependencies": {
+    "@semantic-release/exec": "^7.1.0",
+    "semantic-release": "^25.0.9"
+  }
+}

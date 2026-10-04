@@ -30,7 +30,11 @@
 | Windows 10 2004+ / 11 | ✅ Recording (Windows Graphics Capture), editing and library all work |
 | Linux | 📋 Planned (PipeWire) |
 
-## Requirements
+## Install
+
+**Windows:** download `HesteClips-win-Setup.exe` from the [latest release](https://github.com/Kaillr/hesteclips/releases/latest) and run it. It installs for your user only (no admin prompt), ffmpeg included. Updates download in the background and install when you quit; turn that off in *Settings → Updates*.
+
+## Requirements (building from source)
 
 - macOS 13 (Ventura) or later, or Windows 10 version 2004 or later (Windows 11 recommended — it hides the yellow capture border)
 - [ffmpeg](https://ffmpeg.org) on your `PATH` (or next to the app) — used by the editor, thumbnails and playback (`brew install ffmpeg` / `winget install Gyan.FFmpeg`)
@@ -70,3 +74,7 @@ Hotkeys work while other apps (and games) are focused. On Windows and Linux use 
 | `crates/capture` | Screen and audio capture, mixing, encoding and file writing |
 | `crates/media` | Probing, preview decoding and rendering edits |
 | `crates/hestefiles` | Optional cloud sharing to HesteFiles |
+
+## Releasing
+
+Releases are cut by hand: *Actions → Release → Run workflow* on `main`. [semantic-release](https://semantic-release.gitbook.io) picks the version from the [Conventional Commits](https://www.conventionalcommits.org) since the last tag — `fix:` → patch, `feat:` → minor, `feat!:` or a `BREAKING CHANGE:` footer → major; `chore:`, `docs:`, `refactor:`, `ci:` and the like don't release on their own. `scripts/release.ps1` builds the app, bundles ffmpeg and packs it with [Velopack](https://velopack.io) into the installer and the (delta) update packages the installed app updates from.

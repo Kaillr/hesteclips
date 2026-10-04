@@ -328,6 +328,8 @@ pub struct RecordSettings {
     pub replay_seconds: u32,
     /// Start the replay buffer as soon as the app opens, so you never miss a moment.
     pub auto_start_buffer: bool,
+    /// Download new versions in the background and install them on quit.
+    pub auto_update: bool,
 
     // --- Advanced (collapsible; sane defaults) ---
     pub encoder: Encoder,
@@ -372,6 +374,7 @@ impl Default for RecordSettings {
 
             replay_seconds: 60,
             auto_start_buffer: true,
+            auto_update: true,
             encoder: Encoder::Auto,
             container: Container::Mp4,
             rate_control: RateControl::Cbr,

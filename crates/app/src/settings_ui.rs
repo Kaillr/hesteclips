@@ -157,6 +157,8 @@ impl App {
 
         section(ui, "HesteFiles", |ui| self.hestefiles_settings(ui));
 
+        section(ui, "Updates", |ui| self.update_settings(ui));
+
 
         section(ui, "Reset", |ui| {
             row(ui, "Reset all settings", Some("Replay buffer, video, saving and shortcuts go back to their defaults. Your clips, clips folder, audio sources and HesteFiles account are kept."), |ui| {
@@ -168,6 +170,50 @@ impl App {
         });
         ui.add_space(24.0);
         self.reset_dialog(ui.ctx());
+    }
+
+    /// Which version this is, what the updater is up to, and whether it runs on its own.
+    fn update_settings(&mut self, ui: &mut egui::Ui) {
+        use crate::update::Status;
+        let status = self.updater.status();
+        let line = match &status {
+            Status::Unavailable => "Development build: updates only come to the installed app.".to_owned(),
+            Status::Idle => String::new(),
+            Status::Checking => "Checking for updates…".to_owned(),
+            Status::Downloading(p) => format!("Downloading an update… {p}%"),
+            Status::UpToDate => "You have the latest version.".to_owned(),
+            Status::Ready(v) => format!("Version {v} is ready and installs when you quit HesteClips."),
+            Status::Failed(e) => e.clone(),
+        };
+        row(ui, &format!("HesteClips {}", self.updater.version()), (!line.is_empty()).then_some(line.as_str()), |ui| {
+            ui.horizontal(|ui| {
+                match status {
+                    Status::Ready(_) => {
+                        let recording = self.rec_state == RecState::Recording;
+                        let restart = ui
+                            .add_enabled(!recording, egui::Button::new("Restart now"))
+                            .on_disabled_hover_text("Finish your recording first");
+                        if restart.clicked() && self.updater.install_on_exit(true) {
+                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    }
+                    Status::Unavailable => {}
+                    _ => {
+                        let busy = matches!(status, Status::Checking | Status::Downloading(_));
+                        if ui.add_enabled(!busy, egui::Button::new("Check for updates")).clicked() {
+                            self.updater.check();
+                        }
+                    }
+                }
+                if ui.link("What's new").clicked() {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(format!("{}/releases", crate::update::REPO)));
+                }
+            });
+        });
+        divider(ui);
+        row(ui, "Update automatically", Some("New versions download in the background and install when you quit — never in the middle of a game or recording."), |ui| {
+            toggle(ui, &mut self.settings.auto_update);
+        });
     }
 
     /// The clip-saved sound: on/off, which one (built-in or your own), volume,

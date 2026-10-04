@@ -27,6 +27,7 @@ mod sound;
 mod sources_ui;
 mod store;
 mod thumbs;
+mod update;
 #[cfg(windows)]
 mod gpu_frames;
 #[cfg(windows)]
@@ -45,6 +46,12 @@ use service::{CaptureService, Evt};
 use settings::{Encoder, RecordSettings, SourceKind};
 
 fn main() -> eframe::Result<()> {
+    // The installer's hooks (install, update, uninstall) run the app with special
+    // arguments and exit here; a downloaded update left uninstalled is put in
+    // place now. Does nothing in a development build.
+    #[cfg(windows)]
+    velopack::VelopackApp::build().run();
+
     // Killed from outside (Ctrl+C, SIGTERM, logout): stop capture and finish the
     // file before exiting, since destructors don't run on a signal.
     let _ = ctrlc::set_handler(|| {
@@ -255,6 +262,7 @@ struct App {
     /// Library auto-refresh: last folder poll + last-seen folder mtime.
     last_poll: Option<Instant>,
     dir_mtime: Option<SystemTime>,
+    pub(crate) updater: update::Updater,
 }
 
 impl App {
@@ -277,6 +285,7 @@ impl App {
         for s in &settings.audio_sources {
             live_audio.channel(&s.id).set_volume(sources_ui::from_db(s.volume_db), s.muted);
         }
+        let updater = update::Updater::new(ctx.clone(), settings.auto_update);
         let mut app = Self {
             page: Page::Clips,
             rec_state: RecState::Idle,
@@ -323,6 +332,7 @@ impl App {
             selection: library::Selection::default(),
             last_poll: None,
             dir_mtime: None,
+            updater,
         };
         // Dev aid: `HESTECLIPS_OPEN_EDITOR=<clip>` opens the editor at launch, so the
         // editor can be checked without clicking through the library.
@@ -480,6 +490,7 @@ impl eframe::App for App {
         }
 
         self.pump_capture_events();
+        self.updater.set_auto(self.settings.auto_update);
         self.cloud.poll();
         self.pump_uploads();
         self.pump_renders();
@@ -583,6 +594,11 @@ impl eframe::App for App {
             ctx.request_repaint_after(Duration::from_millis(300));
         }
     }
+
+    fn on_exit(&mut self) {
+        // A downloaded update goes in once we're gone: the next launch is the new version.
+        self.updater.install_on_exit(false);
+    }
 }
 
 // --- Header: where you are on the left, capture status and actions on the right ---
@@ -600,6 +616,7 @@ impl App {
             self.capture_status(ui, compact);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 self.capture_actions(ui, compact);
+                self.update_button(ui, compact);
             });
         });
     }
@@ -747,6 +764,36 @@ impl App {
                     self.stop();
                 }
             }
+        }
+    }
+
+    /// "Update ready", once a new version is downloaded: restarts into it. It
+    /// installs on quit anyway, so this is only for the impatient — and never
+    /// cuts a recording short.
+    fn update_button(&mut self, ui: &mut egui::Ui, compact: bool) {
+        let update::Status::Ready(version) = self.updater.status() else {
+            return;
+        };
+        ui.add_space(6.0);
+        let text = if compact { "⬆" } else { "⬆  Update ready" };
+        let button = egui::Button::new(RichText::new(text).size(13.0).color(ACCENT))
+            .fill(ACCENT.gamma_multiply(0.15))
+            .stroke(egui::Stroke::NONE)
+            .min_size(egui::vec2(0.0, 28.0))
+            .corner_radius(14);
+        let recording = self.rec_state == RecState::Recording;
+        let tip = if self.rec_state == RecState::Buffering {
+            let after = if self.settings.auto_start_buffer { "starts again, empty" } else { "stops" };
+            format!("HesteClips {version} is ready. Click to restart into it now (the replay buffer {after}), or it installs when you quit.")
+        } else {
+            format!("HesteClips {version} is ready. Click to restart into it now, or it installs when you quit.")
+        };
+        let r = ui
+            .add_enabled(!recording, button)
+            .on_hover_text(tip)
+            .on_disabled_hover_text(format!("HesteClips {version} is ready. It installs when you quit, or restart once your recording is done."));
+        if r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() && self.updater.install_on_exit(true) {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
 

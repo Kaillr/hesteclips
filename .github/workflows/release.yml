@@ -1,0 +1,44 @@
+# Release: run by hand (Actions → Release → Run workflow) on main.
+# semantic-release reads the commits since the last tag (feat: → minor,
+# fix: → patch, BREAKING CHANGE → major), builds the Windows installer and
+# update packages (scripts/release.ps1), tags vX.Y.Z and publishes the GitHub
+# release the installed apps update from. No release-worthy commits → nothing.
+name: Release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency: release
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # all tags and commits, to work out the version
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 9.0.x
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Same version as the velopack crate in crates/app/Cargo.toml.
+      - run: dotnet tool install -g vpk --version 1.2.161
+
+      - run: npm ci
+
+      - run: npx semantic-release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
