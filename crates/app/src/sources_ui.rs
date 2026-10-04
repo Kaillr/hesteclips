@@ -258,7 +258,10 @@ impl App {
                         let screen = ui.selectable_label(!apps_mode, RichText::new("🖥  Whole screen").size(14.0));
                         let apps = ui.selectable_label(apps_mode, RichText::new("🎮  Games and apps").size(14.0));
                         if screen.on_hover_text("Everything on one display.").on_disabled_hover_text(STOP_TO_SWITCH).clicked() {
-                            self.settings.capture = CaptureTarget::Screen;
+                            let apps = std::mem::replace(&mut self.settings.capture, CaptureTarget::Screen);
+                            if matches!(apps, CaptureTarget::Apps { .. }) {
+                                self.settings.idle_apps = Some(apps);
+                            }
                         }
                         if apps
                             .on_hover_text("Only the games and apps you pick, following whichever you're using.")
@@ -266,7 +269,11 @@ impl App {
                             .clicked()
                             && !apps_mode
                         {
-                            self.settings.capture = CaptureTarget::Apps { apps: Vec::new(), away_screen: true };
+                            self.settings.capture = self
+                                .settings
+                                .idle_apps
+                                .take()
+                                .unwrap_or(CaptureTarget::Apps { apps: Vec::new(), away_screen: true });
                             self.windowed_apps = capture::list_windowed_apps();
                         }
                     });

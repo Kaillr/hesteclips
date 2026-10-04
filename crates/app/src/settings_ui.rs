@@ -381,7 +381,7 @@ impl App {
             ui.heading("Reset all settings?");
             ui.add_space(4.0);
             ui.label("Replay buffer, video, saving and shortcuts go back to their defaults.");
-            ui.weak("Your clips, clips folder, audio sources and HesteFiles account are kept.");
+            ui.weak("Your clips, clips folder, sources and HesteFiles account are kept.");
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 let reset = egui::Button::new(RichText::new("Reset").color(Color32::WHITE)).fill(ui.visuals().error_fg_color);
@@ -389,6 +389,10 @@ impl App {
                     let mut fresh = settings::RecordSettings::default();
                     fresh.output_dir = self.settings.output_dir.clone();
                     fresh.audio_sources = std::mem::take(&mut self.settings.audio_sources);
+                    fresh.capture = std::mem::take(&mut self.settings.capture);
+                    fresh.idle_apps = self.settings.idle_apps.take();
+                    fresh.webcam = self.settings.webcam.take();
+                    fresh.display_index = self.settings.display_index;
                     fresh.limiter = self.settings.limiter;
                     fresh.save_sound.custom = std::mem::take(&mut self.settings.save_sound.custom);
                     self.settings = fresh;

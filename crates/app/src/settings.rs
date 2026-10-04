@@ -310,6 +310,9 @@ pub struct RecordSettings {
     // --- Common (always visible on the Settings tab) ---
     /// What the video shows: a whole display or one app's window.
     pub capture: CaptureTarget,
+    /// The games and apps list while the whole screen is recorded, so
+    /// switching back to games and apps brings it back.
+    pub idle_apps: Option<CaptureTarget>,
     /// A webcam over the picture, if any.
     pub webcam: Option<WebcamCfg>,
     /// Index into the runtime-detected display list.
@@ -356,6 +359,7 @@ impl Default for RecordSettings {
     fn default() -> Self {
         Self {
             capture: CaptureTarget::Screen,
+            idle_apps: None,
             webcam: None,
             display_index: 0,
             fps: 60,
