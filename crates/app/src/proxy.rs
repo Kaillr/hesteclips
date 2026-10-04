@@ -160,6 +160,10 @@ mod hw {
 
     /// Start building; false if the decoder can't open the clip.
     pub fn build(ctx: &egui::Context, source: &Path, fps: f64, total: usize, frames: &Arc<Mutex<Vec<Jpeg>>>, stop: &Arc<AtomicBool>) -> bool {
+        let debug = std::env::var_os("HESTECLIPS_DEBUG_VIDEO").is_some();
+        if debug {
+            eprintln!("{:>8.3} scrub proxy: opening the decoder", crate::player::uptime());
+        }
         // Open here, so a clip the decoder can't read falls back to ffmpeg.
         let mut dec = match Decoder::open(source, WIDTH, None) {
             Ok(d) => d,
@@ -169,6 +173,9 @@ mod hw {
             }
         };
         dec.set_fps(fps);
+        if debug {
+            eprintln!("{:>8.3} scrub proxy: decoder open", crate::player::uptime());
+        }
         // Decoding on one thread, compressing on a few (it's the slower part),
         // then put back in order on another.
         let (tx, jobs) = mpsc::sync_channel::<(u64, Picture)>(ENCODERS * 2);
@@ -225,6 +232,9 @@ mod hw {
                 while let Some((index, jpeg)) = waiting.remove(&next_seq) {
                     next_seq += 1;
                     let Some(jpeg) = jpeg else { continue };
+                    if debug && last.is_none() {
+                        eprintln!("{:>8.3} scrub proxy: first frame in", crate::player::uptime());
+                    }
                     place(&mut frames.lock().unwrap(), last.as_ref(), index as usize, &jpeg);
                     last = Some(jpeg);
                 }
@@ -378,5 +388,35 @@ mod formats {
         println!("raw : {:>4} KB/frame -> {:>5.0} MB for a 2-min clip", rgba.len() / 1024, mb(rgba.len()));
         println!("jpeg: {:>4} KB/frame -> {:>5.0} MB, encode {enc_j:.1} ms, decode {dec_j:.1} ms", jpeg.len() / 1024, mb(jpeg.len()));
         println!("png : {:>4} KB/frame -> {:>5.0} MB, encode {enc_p:.1} ms, decode {dec_p:.1} ms", png.len() / 1024, mb(png.len()));
+    }
+}
+
+#[cfg(test)]
+mod quality {
+    /// Size and colour error of proxy JPEGs: `PROXY_DIR=<dir with f640/f960/f1280.raw>
+    /// cargo test --release -p hesteclips proxy_quality -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn proxy_quality() {
+        let Some(dir) = std::env::var_os("PROXY_DIR") else { return };
+        for (w, h) in [(640u32, 360u32), (960, 540), (1280, 720)] {
+            let rgba = std::fs::read(std::path::Path::new(&dir).join(format!("f{w}.raw"))).unwrap();
+            for q in [75u8, 85, 90, 95] {
+                let t = std::time::Instant::now();
+                let jpeg = media::encode_jpeg(&rgba, w as u16, h as u16, q).unwrap();
+                let enc = t.elapsed().as_secs_f64() * 1000.0;
+                let back = image::load_from_memory_with_format(&jpeg, image::ImageFormat::Jpeg).unwrap().to_rgba8();
+                let (mut sum, mut max) = (0u64, 0u8);
+                for (a, b) in rgba.chunks_exact(4).zip(back.as_raw().chunks_exact(4)) {
+                    for c in 0..3 {
+                        let d = a[c].abs_diff(b[c]);
+                        sum += d as u64;
+                        max = max.max(d);
+                    }
+                }
+                let mean = sum as f64 / (w * h * 3) as f64;
+                println!("{w}x{h} q{q}: {:>4} KB ({:>5.0} MB per 2-min clip), encode {enc:.1} ms, colour error mean {mean:.2} max {max}", jpeg.len() / 1024, jpeg.len() as f64 * 7200.0 / 1e6);
+            }
+        }
     }
 }

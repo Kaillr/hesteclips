@@ -150,11 +150,12 @@ mod exact {
                             Err(TryRecvError::Disconnected) => return,
                             Err(TryRecvError::Empty) => {}
                         }
-                        let urgent = crate::video::Urgent::begin();
                         let got = dec.frame(i);
-                        drop(urgent);
                         match got {
                             Ok(Some(p)) => {
+                                if std::env::var_os("HESTECLIPS_DEBUG_VIDEO").is_some() {
+                                    eprintln!("{:>8.3} filmstrip: frame {i}", crate::player::uptime());
+                                }
                                 if got_tx.send((i, p)).is_err() {
                                     return;
                                 }
