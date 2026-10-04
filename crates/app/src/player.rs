@@ -291,7 +291,7 @@ impl Player {
     /// Returns what to draw: an egui texture and its size.
     pub fn update(&mut self, ctx: &egui::Context, scrubbing: bool) -> Option<(egui::TextureId, egui::Vec2)> {
         if self.hw().is_some() {
-            self.update_hw(ctx);
+            self.update_hw(ctx, scrubbing);
             return self.display;
         }
         let t = self.time();
@@ -347,7 +347,8 @@ impl Player {
     }
 
     /// [`Self::update`] with the hardware decoder.
-    fn update_hw(&mut self, ctx: &egui::Context) {
+    /// `scrubbing`: a drag or wheel scrub is under way (proxy frames only).
+    fn update_hw(&mut self, ctx: &egui::Context, scrubbing: bool) {
         let Some(v) = self.video.as_ref() else { return };
         let want = self.info.frame_index(self.time());
         // Waiting to start: the sound goes once the first frame is here.
@@ -364,6 +365,15 @@ impl Player {
             return;
         }
         if self.sound_playing() {
+            if debug() {
+                static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+                let mut last = LAST.lock().unwrap();
+                if last.is_none_or(|t| t.elapsed().as_secs_f64() >= 1.0) {
+                    *last = Some(std::time::Instant::now());
+                    #[cfg(windows)]
+                    trace!("playing: want {want}, showing {:?}, ahead {:?}", self.shown_frame, v.ahead_info());
+                }
+            }
             if let Some(p) = v.take_upto(want) {
                 self.show_picture(ctx, p);
             }
@@ -395,11 +405,10 @@ impl Player {
                     self.showing_proxy = true;
                 }
             }
-            // …and the full-quality frame as soon as the decoder has it, also
-            // mid-scrub: it keeps up with slow scrubs, and in fast ones only the
-            // newest request is decoded. Asked once per frame wanted.
+            // …and the full-quality frame once the scrub has stopped (the mouse
+            // let go, the wheel settled). Asked once per frame wanted.
             let v = self.video.as_ref().expect("checked above");
-            if self.still_wanted != Some(want) {
+            if !scrubbing && self.still_wanted != Some(want) {
                 self.still_wanted = Some(want);
                 self.asked_at = Some(std::time::Instant::now());
                 v.show(want);
@@ -413,11 +422,13 @@ impl Player {
         if let Some(at) = self.played_at.take() {
             trace!("first frame after play: {idx}, {:.0} ms after pressing", at.elapsed().as_secs_f64() * 1000.0);
         }
-        if debug() && self.sound_playing() {
+        // Counts frames that change the picture, not frames handed over.
+        if debug() && self.sound_playing() && self.shown_frame != Some(idx) {
+            let (now, ready) = (self.time(), self.proxy.ready());
             let (since, n) = self.shown_count.get_or_insert((std::time::Instant::now(), 0));
             *n += 1;
             if since.elapsed().as_secs_f64() >= 1.0 {
-                trace!("playing: {n} frames shown in the last second (proxy {} ready)", self.proxy.ready());
+                trace!("playing: {n} new frames in the last second, now {idx} at {now:.2} s (proxy {ready} ready)");
                 self.shown_count = None;
             }
         }
