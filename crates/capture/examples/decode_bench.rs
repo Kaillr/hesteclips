@@ -7,6 +7,36 @@ fn main() -> anyhow::Result<()> {
     let path = std::path::PathBuf::from(std::env::args().nth(1).expect("clip path"));
     let width: u32 = std::env::args().nth(2).and_then(|w| w.parse().ok()).unwrap_or(1280);
 
+    // PAR=n: n decoders jumping to different keyframes at once (as a scrub
+    // through unbuilt frames does), for total jumps per second.
+    if let Some(n) = std::env::var("PAR").ok().and_then(|n| n.parse::<usize>().ok()) {
+        const JUMPS: usize = 40;
+        let mut decoders = Vec::new();
+        for _ in 0..n {
+            decoders.push(capture::win::decode::Decoder::open(&path, width, None)?);
+        }
+        let t = Instant::now();
+        let threads: Vec<_> = decoders
+            .into_iter()
+            .enumerate()
+            .map(|(k, mut d)| {
+                std::thread::spawn(move || {
+                    // Keyframes far apart, never the same for two decoders.
+                    for j in 0..JUMPS {
+                        let target = ((j * n + k) * 240 % 17_000) as u64;
+                        d.frame(target).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for th in threads {
+            th.join().unwrap();
+        }
+        let s = t.elapsed().as_secs_f64();
+        println!("{n} decoders: {} jumps in {s:.2} s = {:.0} jumps/s ({:.0} ms each)", n * JUMPS, (n * JUMPS) as f64 / s, s * 1000.0 / JUMPS as f64);
+        return Ok(());
+    }
+
     let t = Instant::now();
     let mut d = capture::win::decode::Decoder::open(&path, width, None)?;
     println!("open {}x{} at {} fps: {:?}", d.width, d.height, d.fps, t.elapsed());
