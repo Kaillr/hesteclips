@@ -162,6 +162,9 @@ pub struct Player {
     proxy: Proxy,
     /// Showing a proxy frame; swap in the sharp frame once the drag settles.
     showing_proxy: bool,
+    /// While scrubbing where the proxy isn't built yet: the nearest frame
+    /// that is, on screen in place of the one wanted.
+    stand_in: Option<u64>,
     /// The hardware decoder, while it works.
     video: Option<Video>,
     /// Play was pressed; the sound starts with the first frame (or after
@@ -232,6 +235,7 @@ impl Player {
             still_wanted: None,
             proxy: Proxy::build(ctx, source, info_fps, total_frames),
             showing_proxy: false,
+            stand_in: None,
             video: open_video(ctx, source, info_fps),
             pending_start: None,
             video_playing: false,
@@ -383,8 +387,11 @@ impl Player {
                         self.set_texture(ctx, img);
                         self.shown_frame = Some(want);
                         self.showing_proxy = true;
+                        self.stand_in = None;
                         // Coming back to a frame sharpened before asks again.
                         self.still_wanted = None;
+                    } else if scrubbing {
+                        self.show_stand_in(ctx, want);
                     }
                 }
                 // Once the drag stops, sharpen to the full-quality exact frame.
@@ -472,6 +479,9 @@ impl Player {
                     self.set_texture(ctx, img);
                     self.shown_frame = Some(want);
                     self.showing_proxy = true;
+                    self.stand_in = None;
+                } else if scrubbing {
+                    self.show_stand_in(ctx, want);
                 }
             }
             // …and the full-quality frame once the scrub has stopped (the mouse
@@ -522,6 +532,25 @@ impl Player {
         let _ = (ctx, p);
         self.shown_frame = Some(idx);
         self.showing_proxy = false;
+        self.stand_in = None;
+    }
+
+    /// Scrubbing where frame `want` isn't built yet: the nearest built frame
+    /// within 10 s instead, so the picture keeps following (the frame itself
+    /// replaces it as soon as it's built, and the sharp one once you stop).
+    fn show_stand_in(&mut self, ctx: &egui::Context, want: u64) {
+        let within = (self.info.fps * 10.0).round().max(1.0) as u64;
+        let Some(i) = self.proxy.nearest(want, within) else { return };
+        if self.stand_in == Some(i) {
+            return;
+        }
+        if let Some(img) = self.proxy.frame(i) {
+            self.set_texture(ctx, img);
+            self.shown_frame = None;
+            self.showing_proxy = true;
+            self.stand_in = Some(i);
+            trace!("scrubbing: frame {want} not built, showing {i}");
+        }
     }
 
     fn show(&mut self, ctx: &egui::Context, idx: u64, frame: media::Frame) {
@@ -529,6 +558,7 @@ impl Player {
         self.set_texture(ctx, img);
         self.shown_frame = Some(idx);
         self.showing_proxy = false;
+        self.stand_in = None;
     }
 
     /// Put `next` on screen (or nothing), keeping the frame it replaces for a

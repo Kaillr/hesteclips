@@ -125,6 +125,22 @@ impl Proxy {
         self.focus.store(idx, Ordering::Relaxed);
     }
 
+    /// The built frame nearest `idx`, at most `within` frames away (ties go
+    /// to the earlier one): a stand-in while `idx` itself isn't built yet.
+    pub fn nearest(&self, idx: u64, within: u64) -> Option<u64> {
+        let f = self.frames.lock().ok()?;
+        let built = |i: u64| f.frames.get(i as usize).is_some_and(Option::is_some);
+        (0..=within).find_map(|d| {
+            if idx >= d && built(idx - d) {
+                Some(idx - d)
+            } else if built(idx + d) {
+                Some(idx + d)
+            } else {
+                None
+            }
+        })
+    }
+
     /// Decode proxy frame `idx`, if it's been built yet.
     pub fn frame(&self, idx: u64) -> Option<egui::ColorImage> {
         let jpeg = self.frames.lock().ok()?.frames.get(idx as usize)?.clone()?;
@@ -288,6 +304,18 @@ mod hw {
                     if stop_d.load(Ordering::Relaxed) {
                         break 'chunks;
                     }
+                    // Scrubbed off into a part not built yet: go there now,
+                    // leaving this chunk for later. The frame just sent stays:
+                    // a chunk's first is a keyframe (quick to decode), so a
+                    // fast scrub still leaves one every chunk or so to show.
+                    let now_at = (focus.load(Ordering::Relaxed) as usize).min(total.saturating_sub(1)) / CHUNK;
+                    if now_at != c && !built[now_at] {
+                        if debug {
+                            eprintln!("{:>8.3} scrub proxy: left frames {start}..{end} for {}", crate::player::uptime(), now_at * CHUNK);
+                        }
+                        carry = None;
+                        continue 'chunks;
+                    }
                     got = dec.next();
                 }
                 built[c] = true;
@@ -368,8 +396,9 @@ mod hw {
         true
     }
 
-    /// Frames per chunk: built one at a time, nearest the player first.
-    /// 2 s at 60 fps: switching to where you scrub takes a fraction of that.
+    /// Frames per chunk: built one at a time, nearest the player first; one
+    /// left half-built when the player moves to another not built yet.
+    /// 2 s at 60 fps (a keyframe at the start of each, as clips are recorded).
     const CHUNK: usize = 120;
 
     enum Job {
