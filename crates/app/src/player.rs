@@ -345,6 +345,9 @@ impl Player {
     /// with [`Self::paint`].
     pub fn update(&mut self, ctx: &egui::Context, scrubbing: bool) -> Option<egui::Vec2> {
         self.proxy.set_focus(self.info.frame_index(self.time()));
+        if scrubbing && self.proxy_progress() < 1.0 {
+            crate::video::scrubbing();
+        }
         if self.hw().is_some() {
             self.update_hw(ctx, scrubbing);
             return self.display.as_ref().map(Display::size);

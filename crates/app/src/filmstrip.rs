@@ -161,6 +161,7 @@ mod exact {
                             Err(TryRecvError::Disconnected) => return,
                             Err(TryRecvError::Empty) => {}
                         }
+                        crate::video::yield_to_scrub();
                         let got = dec.frame(i);
                         match got {
                             Ok(Some(p)) => {

@@ -72,6 +72,15 @@ fn main() -> anyhow::Result<()> {
         println!("dumped frame {}", p.index);
         return Ok(());
     }
+    // SEEKS=a,b,c: time reaching each of these frames, in that order.
+    if let Some(list) = std::env::var("SEEKS").ok() {
+        for target in list.split(',').filter_map(|s| s.trim().parse::<u64>().ok()) {
+            let t = Instant::now();
+            let p = d.frame(target)?;
+            println!("frame {target}: got {:?} in {:?}", p.map(|p| p.index), t.elapsed());
+        }
+        return Ok(());
+    }
     // Exact frames: forward nearby, far, backwards.
     for target in [400u64, 430, 1855, 735, 6000, 6001] {
         let t = Instant::now();

@@ -278,10 +278,14 @@ mod hw {
                 if debug {
                     eprintln!("{:>8.3} scrub proxy: building frames {start}..{end}", crate::player::uptime());
                 }
+                let asked = std::time::Instant::now();
                 let first = match carry.take() {
                     Some(p) if (start..end).contains(&(p.index as usize)) => Ok(Some(p)),
                     _ => dec.frame(start as u64),
                 };
+                if debug {
+                    eprintln!("{:>8.3} scrub proxy: first frame of {start} decoded in {:.0} ms", crate::player::uptime(), asked.elapsed().as_secs_f64() * 1000.0);
+                }
                 let mut got = first;
                 loop {
                     crate::video::yield_to_urgent();
@@ -357,6 +361,7 @@ mod hw {
                 if stop.load(Ordering::Relaxed) {
                     return;
                 }
+                let mut urgent_repaint = false;
                 waiting.insert(seq, out);
                 while let Some(out) = waiting.remove(&next_seq) {
                     next_seq += 1;
@@ -370,6 +375,11 @@ mod hw {
                     let mut store = frames.lock().unwrap();
                     match out {
                         Done::Frame { index, jpeg: Some(jpeg), .. } => {
+                            // A chunk's first frame: often all a scrub gets
+                            // from it, so show it now.
+                            if index == start {
+                                urgent_repaint = true;
+                            }
                             if debug && first {
                                 eprintln!("{:>8.3} scrub proxy: first frame in", crate::player::uptime());
                                 first = false;
@@ -380,9 +390,13 @@ mod hw {
                         Done::End { .. } => c.end(&mut store),
                     }
                 }
-                if last_repaint.elapsed().as_millis() > 100 {
+                // Otherwise at most every 100 ms, but always within it (a
+                // frame arriving while the mouse rests still gets shown).
+                if urgent_repaint || last_repaint.elapsed().as_millis() > 100 {
                     ctx.request_repaint();
                     last_repaint = std::time::Instant::now();
+                } else {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
                 }
             }
             if debug {

@@ -46,6 +46,26 @@ pub fn yield_to_urgent() {
     }
 }
 
+/// Until when a scrub through unbuilt scrub frames is under way (ms since
+/// `player::uptime`'s start): the filmstrip's decoder waits meanwhile. Two
+/// decoders at once made each scrub proxy seek 3-4× slower (130-170 ms, not
+/// 30-45), so a fast scrub found almost nothing to show.
+static SCRUB_UNTIL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A scrub needs the scrub proxy's decoder: keep other decoding off it for
+/// the next moment (renewed every UI frame while scrubbing).
+pub fn scrubbing() {
+    let until = (crate::player::uptime() * 1000.0) as u64 + 250;
+    SCRUB_UNTIL_MS.fetch_max(until, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Thumbnail decoding: wait while a scrub is under way.
+pub fn yield_to_scrub() {
+    while ((crate::player::uptime() * 1000.0) as u64) < SCRUB_UNTIL_MS.load(std::sync::atomic::Ordering::Relaxed) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// Frames kept decoded after the one shown, while paused.
 const AHEAD_PAUSED: usize = 4;
 /// Frames kept decoded ahead of the clock, while playing.
