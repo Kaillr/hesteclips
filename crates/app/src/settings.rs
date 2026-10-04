@@ -343,6 +343,10 @@ pub struct RecordSettings {
     /// The editor's preview height, as a share of the window (the timeline
     /// gets the rest), as last dragged.
     pub editor_preview_share: f32,
+    /// The clip player's volume (0..=1 on its slider) and mute, as last set,
+    /// so a clip never opens at full blast after you'd turned it down.
+    pub player_volume: f32,
+    pub player_muted: bool,
     /// Pre-sources audio list; migrated into `audio_sources` on load.
     #[serde(skip_serializing)]
     audio_tracks: Option<Vec<LegacyAudioTrack>>,
@@ -370,6 +374,8 @@ impl Default for RecordSettings {
             shortcuts: Shortcuts::default(),
             save_sound: SaveSound::default(),
             editor_preview_share: 0.5,
+            player_volume: 1.0,
+            player_muted: false,
             audio_tracks: None,
         }
     }

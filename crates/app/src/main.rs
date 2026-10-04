@@ -774,6 +774,9 @@ impl App {
 
     /// Play a clip in the app's own viewer.
     pub(crate) fn open_viewer(&mut self, clip: PathBuf) {
+        if viewer::volume(&self.ctx()).is_none() {
+            viewer::set_volume(&self.ctx(), (self.settings.player_volume.clamp(0.0, 1.0), self.settings.player_muted));
+        }
         self.viewer = Some(viewer::Viewer::open(&self.ctx(), &clip));
         self.page = Page::View;
     }
@@ -790,7 +793,11 @@ impl App {
             next: at.and_then(|i| self.clips.get(i + 1)).map(|c| c.path.clone()),
             position: at.map(|i| (i + 1, self.clips.len())),
         };
-        match v.ui(ui, &nav) {
+        let outcome = v.ui(ui, &nav);
+        if let Some((volume, muted)) = viewer::volume(ui.ctx()) {
+            (self.settings.player_volume, self.settings.player_muted) = (volume, muted);
+        }
+        match outcome {
             viewer::ViewerOutcome::Stay => {}
             viewer::ViewerOutcome::Close => {
                 // Back in the library, bring the clip just watched into view.

@@ -211,7 +211,7 @@ impl Viewer {
 
 impl Ready {
     fn new(ctx: &egui::Context, clip: &Path, l: Loaded) -> Self {
-        let volume = ctx.data(|d| d.get_temp::<(f32, bool)>(volume_id())).unwrap_or((1.0, false));
+        let volume = volume(ctx).unwrap_or((1.0, false));
         let tracks = if l.pcm.is_empty() { Vec::new() } else { vec![l.pcm] };
         let mut player = Player::new(ctx, clip, l.info.clone(), tracks, Vec::new());
         // Dev aid: `HESTECLIPS_START_AT=<seconds>` starts there (to check a
@@ -242,7 +242,7 @@ impl Ready {
     fn apply_volume(&self, ctx: &egui::Context) {
         let gain = if self.muted { 0.0 } else { self.volume * self.volume }; // a squared slider feels even
         self.player.set_mix(vec![TrackEdit { index: 0, gain, muted: false, points: Vec::new() }]);
-        ctx.data_mut(|d| d.insert_temp(volume_id(), (self.volume, self.muted)));
+        set_volume(ctx, (self.volume, self.muted));
     }
 
     fn ui(&mut self, ui: &mut egui::Ui) {
@@ -624,6 +624,15 @@ fn dev_wheel() -> f32 {
 
 fn pointer_over(ctx: &egui::Context, rect: Rect) -> bool {
     ctx.pointer_hover_pos().is_some_and(|p| rect.contains(p))
+}
+
+/// The player's volume and mute, as last set (shared by every clip opened).
+pub fn volume(ctx: &egui::Context) -> Option<(f32, bool)> {
+    ctx.data(|d| d.get_temp::<(f32, bool)>(volume_id()))
+}
+
+pub fn set_volume(ctx: &egui::Context, volume: (f32, bool)) {
+    ctx.data_mut(|d| d.insert_temp(volume_id(), volume));
 }
 
 fn volume_id() -> egui::Id {
