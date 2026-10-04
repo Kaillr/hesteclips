@@ -126,6 +126,11 @@ pub struct Player {
     pending_start: Option<std::time::Instant>,
     /// The decoder was told to play (to tell it to stop when playback ends).
     video_playing: bool,
+    /// The width the picture is drawn at (physical pixels), and since when;
+    /// the decoder follows once it has held still a moment.
+    display_width: Option<(u32, std::time::Instant)>,
+    /// The width the decoder was last asked for.
+    decode_width: u32,
     /// When play was last pressed, until its first frame shows (debug log).
     played_at: Option<std::time::Instant>,
     /// When the full-quality frame was last asked for (debug log).
@@ -193,6 +198,8 @@ impl Player {
             pending_start: None,
             video_playing: false,
             played_at: None,
+            display_width: None,
+            decode_width: 0,
             shown_count: None,
             asked_at: None,
         }
@@ -260,6 +267,38 @@ impl Player {
             }
         }
         self.video_playing = false;
+    }
+
+    /// The picture is drawn `width` physical pixels wide: decode at that size
+    /// (up to the video's own), so it's shown 1:1, never scaled up. Call each
+    /// frame; a new size is applied once it's held for a moment (not on every
+    /// step of a window resize), the first one at once.
+    pub fn set_display_width(&mut self, width: u32) {
+        const SETTLE: std::time::Duration = std::time::Duration::from_millis(250);
+        let width = width.clamp(64, self.info.width.max(64)) / 2 * 2;
+        if self.display_width.is_none_or(|(w, _)| w != width) {
+            self.display_width = Some((width, std::time::Instant::now()));
+        }
+        let Some((w, since)) = self.display_width else { return };
+        if w == self.decode_width || (self.decode_width != 0 && since.elapsed() < SETTLE) {
+            return;
+        }
+        let first = self.decode_width == 0;
+        self.decode_width = w;
+        let Some(v) = self.hw() else { return };
+        v.set_width(w);
+        trace!("decoding at {w} px wide");
+        if first {
+            return; // before anything's shown: the decoder starts at this size
+        }
+        // Get the current frame (or playback) at the new size.
+        let want = self.info.frame_index(self.time());
+        if self.sound_playing() {
+            v.play(want);
+        } else {
+            self.still_wanted = None;
+            self.showing_proxy = true; // the frame on screen is the old size: replace it
+        }
     }
 
     /// Fraction of the scrub proxy that's built (0..=1).

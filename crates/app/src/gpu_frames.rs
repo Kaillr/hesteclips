@@ -46,6 +46,8 @@ pub struct Frames {
     opened: HashMap<(usize, usize), (wgpu::Texture, egui::TextureId)>,
     /// Each pool's shared fence, opened on D3D12.
     fences: HashMap<usize, ID3D12Fence>,
+    /// Pools seen, oldest first: a new one comes with each change of size.
+    pools: Vec<usize>,
 }
 
 impl Frames {
@@ -55,6 +57,7 @@ impl Frames {
     /// held before: another, older frame).
     pub fn texture(&mut self, s: &Surface, width: u32, height: u32) -> Option<egui::TextureId> {
         let rs = RENDER.get()?;
+        self.forget_old_pools(rs, s.key().0);
         self.wait_for(rs, s);
         if let Some((_, id)) = self.opened.get(&s.key()) {
             return Some(*id);
@@ -72,6 +75,27 @@ impl Frames {
 }
 
 impl Frames {
+    /// Keep the current pool's textures and the one before it (its frames can
+    /// still be on screen for a moment); free older ones.
+    fn forget_old_pools(&mut self, rs: &RenderState, pool: usize) {
+        if self.pools.contains(&pool) {
+            return;
+        }
+        self.pools.push(pool);
+        while self.pools.len() > 2 {
+            let old = self.pools.remove(0);
+            self.fences.remove(&old);
+            let mut renderer = rs.renderer.write();
+            self.opened.retain(|(p, _), (texture, id)| {
+                if *p == old {
+                    renderer.free_texture(id);
+                    texture.destroy();
+                }
+                *p != old
+            });
+        }
+    }
+
     /// Have the renderer's next submit wait on GPU for `s` to be written.
     fn wait_for(&mut self, rs: &RenderState, s: &Surface) {
         let Some((handle, value)) = s.fence() else { return };

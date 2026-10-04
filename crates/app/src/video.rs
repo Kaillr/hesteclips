@@ -68,6 +68,9 @@ struct State {
     exact: Option<(u64, Picture)>,
     /// Opening failed or the decoder broke: use another way.
     failed: bool,
+    /// The width to decode at (0: as opened), set from the size the picture
+    /// is drawn at.
+    width: u32,
     /// When the decoder opened (play waits for its first frame until then).
     opened: Option<std::time::Instant>,
     /// Bumped each time `play` throws the queue away (playing from somewhere
@@ -152,6 +155,20 @@ impl Video {
                         Err(_) => return,
                     }
                 };
+                // A new size: frames from now on are decoded at it. What's queued
+                // is dropped; the player asks for the frame it wants again.
+                let width = shared.lock().unwrap().width;
+                if width != 0 && width.min(dec.source_size().0) / 2 * 2 != dec.width {
+                    if let Err(e) = dec.resize(width) {
+                        return fail(&format!("{e:#}"));
+                    }
+                    let mut s = shared.lock().unwrap();
+                    s.ahead.clear();
+                    s.exact = None;
+                    s.generation += 1;
+                    generation = s.generation;
+                    positioned = false;
+                }
                 if let Some(mut cmd) = cmd {
                     while let Ok(newer) = rx.try_recv() {
                         cmd = newer;
@@ -258,6 +275,13 @@ impl Video {
             }
         }
         let _ = self.tx.send(Cmd::Play(i));
+    }
+
+    /// Decode at `width` from now on (the picture's size on screen). Follow
+    /// it with `play` or `show`: that's what gets the frame at the new size
+    /// (and wakes the worker if it's idle).
+    pub fn set_width(&self, width: u32) {
+        self.state.lock().unwrap().width = width;
     }
 
     /// How long ago the decoder opened, once it has.

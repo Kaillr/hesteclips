@@ -137,6 +137,11 @@ pub struct Decoder {
     convert: Convert,
     /// Frames stay on the GPU, in these.
     pool: Option<Arc<Surfaces>>,
+    /// The video's own size, its colour matrix, and whether frames are shared
+    /// (to rebuild the output at another size).
+    source: (u32, u32),
+    bt601: bool,
+    shared: bool,
     /// Media Foundation's time of frame 0.
     offset: i64,
     /// The frame the next read returns, when known (none after a seek).
@@ -183,7 +188,8 @@ impl Decoder {
             let (sw, sh) = ((size >> 32) as u32, size as u32);
             let rate = native.GetUINT64(&MF_MT_FRAME_RATE).unwrap_or(60 << 32 | 1);
             let fps = (rate >> 32) as f64 / (rate as u32).max(1) as f64;
-            let height = (((width as f64) * sh as f64 / sw.max(1) as f64 / 2.0).round() as u32 * 2).max(2);
+            let width = width.min(sw).max(2) / 2 * 2;
+            let height = even_height(width, (sw, sh));
             // SD video is usually BT.601; everything else BT.709.
             let bt601 = native.GetUINT32(&MF_MT_YUV_MATRIX).ok() == Some(MFVideoTransferMatrix_BT601.0 as u32);
 
@@ -193,16 +199,23 @@ impl Decoder {
             out.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12)?;
             reader.SetCurrentMediaType(STREAM, None, &out).context("the video can't be decoded to NV12")?;
 
-            let pool = match share_on {
-                Some(_) => Some(Arc::new(surfaces(&gpu, width, height)?)),
-                None => None,
+            let (pool, convert) = outputs(&gpu, share_on.is_some(), (sw, sh), (width, height), fps, bt601)?;
+            let mut d = Self {
+                reader,
+                _manager: manager,
+                gpu,
+                width,
+                height,
+                fps,
+                convert,
+                pool,
+                source: (sw, sh),
+                bt601,
+                shared: share_on.is_some(),
+                offset: 0,
+                next_index: None,
+                peeked: None,
             };
-            let targets: Vec<ID3D11Texture2D> = match &pool {
-                Some(p) => p.textures.clone(),
-                None => vec![gpu.texture(width, height, DXGI_FORMAT_R8G8B8A8_UNORM, D3D11_BIND_RENDER_TARGET.0 as u32, D3D11_USAGE_DEFAULT, 0)?],
-            };
-            let convert = Convert::new(&gpu, (sw, sh), (width, height), fps, bt601, targets)?;
-            let mut d = Self { reader, _manager: manager, gpu, width, height, fps, convert, pool, offset: 0, next_index: None, peeked: None };
             // The first frame's time is frame 0's; keep the frame for the first read.
             let (time, sample) = d.read_sample()?.context("the video has no frames")?;
             d.offset = time;
@@ -210,6 +223,24 @@ impl Decoder {
             d.next_index = Some(0);
             Ok(d)
         }
+    }
+
+    /// The video's own size.
+    pub fn source_size(&self) -> (u32, u32) {
+        self.source
+    }
+
+    /// Decode to `width` wide from now on (height keeps the aspect). Frames
+    /// already handed out keep their own size and textures.
+    pub fn resize(&mut self, width: u32) -> Result<()> {
+        let width = (width.min(self.source.0).max(2) / 2) * 2;
+        if width == self.width {
+            return Ok(());
+        }
+        let height = even_height(width, self.source);
+        let (pool, convert) = outputs(&self.gpu, self.shared, self.source, (width, height), self.fps, self.bt601)?;
+        (self.pool, self.convert, self.width, self.height) = (pool, convert, width, height);
+        Ok(())
     }
 
     /// Number frames on this rate's grid instead of the file's own (to match
@@ -341,6 +372,23 @@ impl Decoder {
         let surface = Surface { pool, slot, ready };
         Ok(Picture { index, width: self.width, height: self.height, rgba: Vec::new(), gpu: Some(surface) })
     }
+}
+
+/// Height for `width` keeping `source`'s aspect, even.
+fn even_height(width: u32, source: (u32, u32)) -> u32 {
+    (((width as f64) * source.1 as f64 / source.0.max(1) as f64 / 2.0).round() as u32 * 2).max(2)
+}
+
+/// What frames are drawn into at `size` (a shared pool, or one texture read
+/// back) and the conversion pass into them.
+fn outputs(gpu: &Gpu, shared: bool, source: (u32, u32), size: (u32, u32), fps: f64, bt601: bool) -> Result<(Option<Arc<Surfaces>>, Convert)> {
+    let pool = if shared { Some(Arc::new(surfaces(gpu, size.0, size.1)?)) } else { None };
+    let targets: Vec<ID3D11Texture2D> = match &pool {
+        Some(p) => p.textures.clone(),
+        None => vec![gpu.texture(size.0, size.1, DXGI_FORMAT_R8G8B8A8_UNORM, D3D11_BIND_RENDER_TARGET.0 as u32, D3D11_USAGE_DEFAULT, 0)?],
+    };
+    let convert = Convert::new(gpu, source, size, fps, bt601, targets)?;
+    Ok((pool, convert))
 }
 
 /// The shared textures for a pool.

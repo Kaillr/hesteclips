@@ -323,9 +323,15 @@ impl Ready {
         let (preview_rect, preview_resp) =
             ui.allocate_exact_size(Vec2::new(ui.available_width(), preview_h), Sense::click());
         ui.painter().rect_filled(preview_rect, 8, Color32::BLACK);
+        // Decode at the size it's drawn at, up to the video's own.
+        let aspect = self.info.width.max(1) as f32 / self.info.height.max(1) as f32;
+        self.player.set_display_width((preview_rect.width().min(preview_rect.height() * aspect) * ctx.pixels_per_point()).round() as u32);
         if let Some((tex, size)) = self.player.update(&ctx, self.dragging.is_some()) {
             let scale = (preview_rect.width() / size.x).min(preview_rect.height() / size.y);
+            // On whole screen pixels: a half-pixel offset alone blurs text.
+            let ppp = ctx.pixels_per_point();
             let r = Rect::from_center_size(preview_rect.center(), size * scale);
+            let r = Rect::from_min_size(((r.min.to_vec2() * ppp).round() / ppp).to_pos2(), r.size());
             egui::Image::from_texture((tex, r.size())).paint_at(ui, r);
         } else {
             ui.painter().text(preview_rect.center(), Align2::CENTER_CENTER, "…", FontId::proportional(24.0), Color32::GRAY);
