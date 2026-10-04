@@ -404,10 +404,13 @@ impl Player {
             if debug() {
                 static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
                 let mut last = LAST.lock().unwrap();
+                static PASSES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                let passes = PASSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 if last.is_none_or(|t| t.elapsed().as_secs_f64() >= 1.0) {
                     *last = Some(std::time::Instant::now());
+                    PASSES.store(0, std::sync::atomic::Ordering::Relaxed);
                     #[cfg(windows)]
-                    trace!("playing: want {want}, showing {:?}, ahead {:?}", self.shown_frame, v.ahead_info());
+                    trace!("playing: want {want}, showing {:?}, ahead {:?}, {passes} redraws/s, last frame {:.1} ms", self.shown_frame, v.ahead_info(), ctx.input(|i| i.unstable_dt) * 1000.0);
                 }
             }
             if let Some(p) = v.take_upto(want) {

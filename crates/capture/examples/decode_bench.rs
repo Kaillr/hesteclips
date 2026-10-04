@@ -11,6 +11,14 @@ fn main() -> anyhow::Result<()> {
     let mut d = capture::win::decode::Decoder::open(&path, width, None)?;
     println!("open {}x{} at {} fps: {:?}", d.width, d.height, d.fps, t.elapsed());
 
+    // INDICES=n: the first n frames' numbers, to check none repeat or skip.
+    if let Some(n) = std::env::var("INDICES").ok().and_then(|n| n.parse::<usize>().ok()) {
+        let got: Vec<u64> = (0..n).filter_map(|_| d.next().ok().flatten().map(|p| p.index)).collect();
+        let repeats = got.windows(2).filter(|w| w[1] == w[0]).count();
+        let skips = got.windows(2).filter(|w| w[1] > w[0] + 1).count();
+        println!("{n} frames: {repeats} repeated numbers, {skips} skipped; first: {:?}", &got[..got.len().min(16)]);
+        return Ok(());
+    }
     // FULL=1: decode every frame (as the scrub proxy does) and report.
     if std::env::var_os("FULL").is_some() {
         let t = Instant::now();

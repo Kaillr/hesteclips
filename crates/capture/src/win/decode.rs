@@ -296,8 +296,11 @@ impl Decoder {
             return Ok(None);
         };
         // The frame whose slot on the grid contains this time, rounding down
-        // like the app does (a frame a hair early still counts as its own).
-        let index = (((time - self.offset) as f64 / UNITS) * self.fps + 1e-6).floor().max(0.0) as u64;
+        // like the app does. Times are in whole 100 ns units, so a frame at
+        // exactly k/60 s reads a hair early: allow a thousandth of a frame,
+        // or every third frame of a 60 fps clip takes the previous one's
+        // number (and the next number is skipped: judder).
+        let index = (((time - self.offset) as f64 / UNITS) * self.fps + 1e-3).floor().max(0.0) as u64;
         self.next_index = Some(index + 1);
         Ok(Some((index, sample)))
     }
