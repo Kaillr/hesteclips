@@ -94,18 +94,13 @@ impl Frames {
             return;
         }
         self.pools.push(pool);
+        let _ = rs;
         while self.pools.len() > 2 {
             let old = self.pools.remove(0);
             self.fences.remove(&old);
-            if let Some(scaler) = rs.renderer.write().callback_resources.get_mut::<Scaler>() {
-                scaler.groups.retain(|(p, _), _| *p != old);
-            }
-            self.opened.retain(|(p, _), (texture, _)| {
-                if *p == old {
-                    texture.destroy();
-                }
-                *p != old
-            });
+            // Dropped, not destroyed: a frame drawn this pass may still use
+            // one; wgpu frees each once nothing does.
+            self.opened.retain(|(p, _), _| *p != old);
         }
     }
 
@@ -134,14 +129,14 @@ impl Frames {
 }
 
 impl Drop for Frames {
+    /// Forget this player's bind groups so its textures are freed now, not
+    /// when the next clip draws. Nothing is destroyed outright: a frame drawn
+    /// this pass makes its own again if it still needs one.
     fn drop(&mut self) {
         if let Some(rs) = RENDER.get() {
             if let Some(scaler) = rs.renderer.write().callback_resources.get_mut::<Scaler>() {
                 scaler.groups.retain(|(p, _), _| !self.pools.contains(p));
             }
-        }
-        for (_, (texture, _)) in self.opened.drain() {
-            texture.destroy();
         }
     }
 }
@@ -172,11 +167,12 @@ unsafe fn open(rs: &RenderState, handle: isize, width: u32, height: u32) -> Resu
 }
 
 /// The filter's pipeline and a bind group per frame texture, kept in egui's
-/// callback resources.
+/// callback resources. Bind groups not drawn for a while are dropped (they
+/// hold their textures: a closed clip's frames are freed with them).
 struct Scaler {
     pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
-    groups: HashMap<(usize, usize), wgpu::BindGroup>,
+    groups: HashMap<(usize, usize), (wgpu::BindGroup, std::time::Instant)>,
 }
 
 /// Draws a frame with the filter, as an egui paint callback.
@@ -196,20 +192,24 @@ impl CallbackTrait for Draw {
             resources.insert(Scaler::new(device, rs.target_format));
         }
         let scaler = resources.get_mut::<Scaler>().expect("just made");
-        if !scaler.groups.contains_key(&self.0.key) {
+        let now = std::time::Instant::now();
+        scaler.groups.retain(|_, (_, used)| now.duration_since(*used).as_secs() < 2);
+        if let Some((_, used)) = scaler.groups.get_mut(&self.0.key) {
+            *used = now;
+        } else {
             let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("decoded frame"),
                 layout: &scaler.layout,
                 entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&self.0.view) }],
             });
-            scaler.groups.insert(self.0.key, group);
+            scaler.groups.insert(self.0.key, (group, now));
         }
         Vec::new()
     }
 
     fn paint(&self, _info: egui::PaintCallbackInfo, pass: &mut wgpu::RenderPass<'static>, resources: &CallbackResources) {
         let Some(scaler) = resources.get::<Scaler>() else { return };
-        let Some(group) = scaler.groups.get(&self.0.key) else { return };
+        let Some((group, _)) = scaler.groups.get(&self.0.key) else { return };
         pass.set_pipeline(&scaler.pipeline);
         pass.set_bind_group(0, group, &[]);
         pass.draw(0..3, 0..1);
