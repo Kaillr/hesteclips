@@ -49,9 +49,31 @@ fn main() -> anyhow::Result<()> {
         D3D11CreateDevice(&adapter, D3D_DRIVER_TYPE_UNKNOWN, Default::default(), D3D11_CREATE_DEVICE_BGRA_SUPPORT, None, D3D11_SDK_VERSION, Some(&mut device), None, Some(&mut context))?;
         let (device, context) = (device.unwrap(), context.unwrap());
         let output1: IDXGIOutput1 = output.cast()?;
-        let mut dupl = output1.DuplicateOutput(&device)?;
+        // NEW=1: DuplicateOutput1, accepting the formats a fullscreen game
+        // may scan out in (the old call only takes 8-bit BGRA, and loses
+        // the duplication over and over when a game uses another).
+        let new = std::env::var_os("NEW").is_some();
+        if new {
+            use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
+            let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        }
+        let formats = [
+            DXGI_FORMAT_B8G8R8A8_UNORM,
+            windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
+            windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R10G10B10A2_UNORM,
+            windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
+        ];
+        let duplicate = || -> windows::core::Result<IDXGIOutputDuplication> {
+            if new {
+                let o5: IDXGIOutput5 = output.cast()?;
+                o5.DuplicateOutput1(&device, 0, &formats)
+            } else {
+                output1.DuplicateOutput(&device)
+            }
+        };
+        let mut dupl = duplicate()?;
         let desc = dupl.GetDesc();
-        println!("duplicating {}x{}", desc.ModeDesc.Width, desc.ModeDesc.Height);
+        println!("duplicating {}x{} ({:?}){}", desc.ModeDesc.Width, desc.ModeDesc.Height, desc.ModeDesc.Format, if new { ", DuplicateOutput1" } else { "" });
         let patch = 256u32;
         let staging_desc = D3D11_TEXTURE2D_DESC {
             Width: patch,
@@ -87,7 +109,7 @@ fn main() -> anyhow::Result<()> {
                         println!("{:.1} s: duplication lost ({})", start.elapsed().as_secs_f64(), e.message());
                     }
                     std::thread::sleep(Duration::from_millis(50));
-                    match output1.DuplicateOutput(&device) {
+                    match duplicate() {
                         Ok(d) => dupl = d,
                         Err(e) if lost <= 3 => println!("  starting again failed: {} ({:#x})", e.message(), e.code().0),
                         Err(_) => {}
