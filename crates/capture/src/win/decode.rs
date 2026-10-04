@@ -16,8 +16,9 @@
 //! GPU in a pool of shareable textures that the app's renderer opens once and
 //! draws directly: no copy back, no upload.
 //!
-//! Feeding the decoder ourselves skips the reader's seek: a jump to a
-//! keyframe takes ~5 ms instead of ~45 (see `direct`).
+//! Feeding the decoder ourselves skips the reader's seek: a jump takes
+//! 1.7-3× less time (a keyframe 15 ms instead of 45, with the picture's
+//! conversion), reading in order about as fast (see `direct`).
 //!
 //! Frames are numbered by time from the start of the clip (as the editor and
 //! the scrub proxy count them). Media Foundation shifts every timestamp by the
@@ -170,11 +171,10 @@ impl Decoder {
     /// With `share_on` (a graphics card's LUID), frames stay on that card in
     /// shareable textures instead of coming back as RGBA.
     ///
-    /// Through the file reader for now; `HESTECLIPS_DIRECT_DECODE=1` feeds the
-    /// decoder directly instead (jumps measured faster, reading in order not
-    /// yet: see `direct`).
+    /// Feeds the decoder directly when it can (see `direct`), else through the
+    /// file reader; `HESTECLIPS_NO_DIRECT_DECODE=1` always uses the reader.
     pub fn open(path: &Path, width: u32, share_on: Option<u64>) -> Result<Self> {
-        Self::open_with(path, width, share_on, std::env::var_os("HESTECLIPS_DIRECT_DECODE").is_some())
+        Self::open_with(path, width, share_on, std::env::var_os("HESTECLIPS_NO_DIRECT_DECODE").is_none())
     }
 
     /// [`Self::open`], feeding the decoder directly; an error if the file

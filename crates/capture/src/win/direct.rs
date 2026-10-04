@@ -1,15 +1,17 @@
 //! Frames handed straight to the H.264 decoder, read from the file by our own
-//! index (`mp4read`), instead of through Media Foundation's file reader. A
-//! jump to a keyframe takes ~5 ms this way, ~45 through the reader (whose seek
-//! is most of it); halfway between keyframes about half as long. Pictures are
-//! the same, bit for bit (checked against ffmpeg and the reader:
-//! decode_bench `VERIFY=1`).
+//! index (`mp4read`), instead of through Media Foundation's file reader.
+//! Measured on a quiet machine (decode_bench `DIRECT=1`, 1440p60, pictures
+//! converted to 640 px): a jump to a keyframe 15 ms instead of 45, halfway
+//! between keyframes 33-66 ms instead of 57-110, reading in order the same
+//! to 10% slower (750 fps against 850). Pictures are the same, bit for bit:
+//! checked against ffmpeg, and against the reader on every library clip
+//! (decode_bench `VERIFY=n`).
 //!
 //! The decoder is Media Foundation's H.264 decoder on the GPU (DXVA), the one
-//! the reader uses too. Without reordered frames (no B-frames, as recorded) it
-//! runs in low-latency mode: each frame comes out as soon as it's decoded.
+//! the reader uses too, in its normal mode: low-latency mode (each frame out
+//! as soon as it's decoded) made jumps slower, 25-35 ms instead of 15-20, and
+//! reading in order 600 fps instead of 850 (measured on a quiet machine).
 
-use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::mem::ManuallyDrop;
@@ -23,15 +25,10 @@ use super::mp4read::Index;
 
 /// Media Foundation's time unit: 100 ns.
 const UNITS: i64 = 10_000_000;
-/// Frames decoded ahead while reading in order, so the GPU decodes the next
-/// while the caller converts this one, as the file reader does. Whether it
-/// helps is still to be measured on a quiet machine (with a game running,
-/// in-order reading was 1.6-2× slower than the reader's either way).
-const AHEAD: usize = 3;
-
-pub(crate) struct Stream {
+/// The decoder itself, owned by the thread of a [`Stream`].
+struct Inner {
     mft: IMFTransform,
-    pub(crate) index: Index,
+    index: Index,
     file: File,
     /// The next sample (decode order) to hand the decoder.
     next: usize,
@@ -43,15 +40,18 @@ pub(crate) struct Stream {
     frame_units: i64,
     /// Frames come out in a different order than they go in (B-frames).
     reordered: bool,
-    /// Decoded, not yet handed out.
-    ahead: VecDeque<(i64, IMFSample)>,
-    /// Reads since the last seek: from a few on, reading is in order.
-    streak: u32,
+    /// The file read in blocks (frames are stored one after another): one
+    /// read per few dozen frames, not per frame.
+    block: Vec<u8>,
+    block_at: u64,
 }
 
-impl Stream {
+/// Bytes read from the file at a time.
+const BLOCK: usize = 4 << 20;
+
+impl Inner {
     /// The decoder for `path`'s video, on the GPU of `manager`.
-    pub(crate) fn open(path: &Path, manager: &IMFDXGIDeviceManager) -> Result<Self> {
+    fn open(path: &Path, manager: &IMFDXGIDeviceManager) -> Result<Self> {
         let index = Index::read(path)?;
         if index.samples.is_empty() {
             bail!("no video frames");
@@ -70,9 +70,6 @@ impl Stream {
                 bail!("the H.264 decoder can't use the graphics card");
             }
             mft.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, manager.as_raw() as usize)?;
-            if !reordered {
-                attrs.SetUINT32(&MF_LOW_LATENCY, 1)?;
-            }
             let t = MFCreateMediaType()?;
             t.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
             t.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
@@ -90,12 +87,12 @@ impl Stream {
                 .then(|| (index.samples[1].pts - index.samples[0].pts).abs() * UNITS / index.timescale.max(1) as i64)
                 .filter(|&d| d > 0)
                 .unwrap_or(UNITS / 60);
-            Ok(Self { mft, file: File::open(path)?, index, next: 0, drained: false, keys, frame_units, reordered, ahead: VecDeque::new(), streak: 0 })
+            Ok(Self { mft, file: File::open(path)?, index, next: 0, drained: false, keys, frame_units, reordered, block: Vec::new(), block_at: 0 })
         }
     }
 
     /// Frames per second, from the frame times (the caller usually knows better).
-    pub(crate) fn fps(&self) -> f64 {
+    fn fps(&self) -> f64 {
         UNITS as f64 / self.frame_units as f64
     }
 
@@ -110,65 +107,37 @@ impl Stream {
         self.keys[k.saturating_sub(1)]
     }
 
-    /// Whether reaching time `t` from time `from` (the next frame's) is
-    /// cheaper decoding on than starting again from `t`'s keyframe: unless
-    /// `t` is past the next keyframe, decoding on wins (a restart costs a few
-    /// ms, a frame ~1.5).
-    pub(crate) fn decode_on(&self, from: i64, t: i64) -> bool {
-        from <= t && self.time_of(self.key_for(t)) <= from + 3 * self.frame_units
-    }
-
     /// Start again from the keyframe at or before time `t` (100 ns).
-    pub(crate) fn seek(&mut self, t: i64) -> Result<()> {
+    fn seek(&mut self, t: i64) -> Result<()> {
         unsafe { self.mft.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0)? };
         if self.drained {
             unsafe { self.mft.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)? };
             self.drained = false;
         }
         self.next = self.key_for(t);
-        self.ahead.clear();
-        self.streak = 0;
         Ok(())
-    }
-
-    /// The time of the frame the next read returns, when that's known
-    /// without decoding it (frames not reordered); `i64::MAX` at the end.
-    pub(crate) fn upcoming(&self) -> Option<i64> {
-        if let Some((t, _)) = self.ahead.front() {
-            return Some(*t);
-        }
-        if self.reordered {
-            return None;
-        }
-        Some(if self.next < self.index.samples.len() { self.time_of(self.next) } else { i64::MAX })
     }
 
     /// The next decoded frame in presentation order: (time in 100 ns, sample
     /// holding its texture). `None` at the end.
-    pub(crate) fn read(&mut self) -> Result<Option<(i64, IMFSample)>> {
-        self.streak += 1;
-        if self.streak >= 3 {
-            while self.ahead.len() < AHEAD {
-                match self.decode_one()? {
-                    Some(f) => self.ahead.push_back(f),
-                    None => break,
-                }
-            }
-        }
-        match self.ahead.pop_front() {
-            Some(f) => Ok(Some(f)),
-            None => self.decode_one(),
-        }
-    }
-
-    fn decode_one(&mut self) -> Result<Option<(i64, IMFSample)>> {
+    fn read(&mut self) -> Result<Option<(i64, IMFSample)>> {
+        // A decoder that takes frames without ever giving one back (out of
+        // its own picture buffers): an error, not a hang.
+        let mut fed = 0;
         loop {
             if let Some(out) = self.output()? {
-                return Ok(Some((unsafe { out.GetSampleTime()? }, out)));
+                let t = unsafe { out.GetSampleTime()? };
+                return Ok(Some((t, out)));
             }
             if self.next < self.index.samples.len() {
+                if fed > 64 {
+                    bail!("the decoder stopped giving frames back");
+                }
                 if self.feed(self.next)? {
                     self.next += 1;
+                    fed += 1;
+                } else {
+                    bail!("the decoder won't take a frame and has none to give");
                 }
             } else if !self.drained {
                 unsafe { self.mft.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0)? };
@@ -182,18 +151,31 @@ impl Stream {
     /// Hand sample `i` to the decoder; false if it wants its output taken first.
     fn feed(&mut self, i: usize) -> Result<bool> {
         let s = self.index.samples[i];
-        let mut data = vec![0u8; s.size as usize];
-        self.file.seek(SeekFrom::Start(s.offset))?;
-        self.file.read_exact(&mut data)?;
-        let annexb = annexb(&self.index, &data, s.key);
+        let (start, end) = (s.offset, s.offset + s.size as u64);
+        if start < self.block_at || end > self.block_at + self.block.len() as u64 {
+            let len = (s.size as usize).max(BLOCK);
+            let file_len = self.file.metadata()?.len();
+            let len = len.min((file_len.saturating_sub(start)) as usize).max(s.size as usize);
+            self.block.resize(len, 0);
+            self.file.seek(SeekFrom::Start(start))?;
+            self.file.read_exact(&mut self.block)?;
+            self.block_at = start;
+        }
+        let at = (start - self.block_at) as usize;
+        let data = &self.block[at..at + s.size as usize];
+        // Start codes in place of the length prefixes, plus 4 bytes per
+        // parameter set on a keyframe: written straight into the decoder's buffer.
+        let extra: usize = if s.key { self.index.sps.iter().chain(&self.index.pps).map(|p| p.len() + 4).sum() } else { 0 };
+        let room = data.len() + extra + 4 * (data.len() / (self.index.nal_length + 1) + 1);
         unsafe {
             let input = MFCreateSample()?;
-            let buffer = MFCreateMemoryBuffer(annexb.len() as u32)?;
+            let buffer = MFCreateMemoryBuffer(room as u32)?;
             let mut ptr = std::ptr::null_mut();
             buffer.Lock(&mut ptr, None, None)?;
-            std::ptr::copy_nonoverlapping(annexb.as_ptr(), ptr, annexb.len());
+            let out = std::slice::from_raw_parts_mut(ptr, room);
+            let written = annexb_into(&self.index, data, s.key, out);
             buffer.Unlock()?;
-            buffer.SetCurrentLength(annexb.len() as u32)?;
+            buffer.SetCurrentLength(written as u32)?;
             input.AddBuffer(&buffer)?;
             input.SetSampleTime(self.time_of(i))?;
             input.SetSampleDuration(self.frame_units)?;
@@ -232,13 +214,150 @@ impl Stream {
     }
 }
 
-/// The decoder's input: NAL units with start codes, the SPS/PPS first on a keyframe.
-fn annexb(index: &Index, avcc: &[u8], key: bool) -> Vec<u8> {
-    let mut out = Vec::with_capacity(avcc.len() + 64);
+/// A decoded frame crossing from the decoder's thread (Media Foundation
+/// objects are free-threaded: the app runs in the multithreaded apartment).
+struct Frame(i64, IMFSample);
+unsafe impl Send for Frame {}
+
+struct SendManager(IMFDXGIDeviceManager);
+unsafe impl Send for SendManager {}
+
+enum Cmd {
+    Seek(i64),
+    Read,
+}
+
+/// The direct decoder, decoding on its own thread one frame ahead of the
+/// reader: the next frame decodes while the caller converts this one, as
+/// Media Foundation's file reader does (reading in order: 720 fps without
+/// it, 750-780 with, the reader 850).
+/// Only one frame ahead: holding more ran the decoder out of its own
+/// picture buffers.
+pub(crate) struct Stream {
+    pub(crate) index: Index,
+    keys: Vec<usize>,
+    frame_units: i64,
+    reordered: bool,
+    fps: f64,
+    cmd: std::sync::mpsc::Sender<Cmd>,
+    frames: std::sync::mpsc::Receiver<Result<Option<Frame>>>,
+    /// Time of the last frame handed out.
+    last: Option<i64>,
+}
+
+impl Stream {
+    /// The decoder for `path`'s video, on the GPU of `manager`.
+    pub(crate) fn open(path: &Path, manager: &IMFDXGIDeviceManager) -> Result<Self> {
+        let (cmd, cmds) = std::sync::mpsc::channel::<Cmd>();
+        let (frames_tx, frames) = std::sync::mpsc::channel::<Result<Option<Frame>>>();
+        let (opened_tx, opened) = std::sync::mpsc::channel::<Result<(Index, Vec<usize>, i64, bool, f64)>>();
+        let (path, manager) = (path.to_path_buf(), SendManager(manager.clone()));
+        std::thread::Builder::new().name("direct decode".into()).spawn(move || {
+            super::system::com_init();
+            let manager = manager;
+            let mut inner = match Inner::open(&path, &manager.0) {
+                Ok(i) => {
+                    let _ = opened_tx.send(Ok((i.index.clone(), i.keys.clone(), i.frame_units, i.reordered, i.fps())));
+                    i
+                }
+                Err(e) => {
+                    let _ = opened_tx.send(Err(e));
+                    return;
+                }
+            };
+            let mut ahead: Option<Result<Option<(i64, IMFSample)>>> = None;
+            let mut failed: Option<anyhow::Error> = None;
+            while let Ok(c) = cmds.recv() {
+                match c {
+                    Cmd::Seek(t) => {
+                        ahead = None;
+                        if let Err(e) = inner.seek(t) {
+                            failed = Some(e);
+                        }
+                    }
+                    Cmd::Read => {
+                        let r = match failed.take() {
+                            Some(e) => Err(e),
+                            None => ahead.take().unwrap_or_else(|| inner.read()),
+                        };
+                        let more = matches!(r, Ok(Some(_)));
+                        if frames_tx.send(r.map(|o| o.map(|(t, s)| Frame(t, s)))).is_err() {
+                            return;
+                        }
+                        // The next one while the caller converts this one.
+                        if more {
+                            ahead = Some(inner.read());
+                        }
+                    }
+                }
+            }
+        })?;
+        let (index, keys, frame_units, reordered, fps) = opened.recv().context("the decoder thread stopped")??;
+        Ok(Self { index, keys, frame_units, reordered, fps, cmd, frames, last: None })
+    }
+
+    /// Frames per second, from the frame times (the caller usually knows better).
+    pub(crate) fn fps(&self) -> f64 {
+        self.fps
+    }
+
+    fn time_of(&self, sample: usize) -> i64 {
+        self.index.samples[sample].pts * UNITS / self.index.timescale.max(1) as i64
+    }
+
+    fn key_for(&self, t: i64) -> usize {
+        let k = self.keys.partition_point(|&k| self.time_of(k) <= t);
+        self.keys[k.saturating_sub(1)]
+    }
+
+    /// Whether reaching time `t` from time `from` (the next frame's) is
+    /// cheaper decoding on than starting again from `t`'s keyframe: unless
+    /// `t` is past the next keyframe, decoding on wins.
+    pub(crate) fn decode_on(&self, from: i64, t: i64) -> bool {
+        from <= t && self.time_of(self.key_for(t)) <= from + 3 * self.frame_units
+    }
+
+    /// Start again from the keyframe at or before time `t` (100 ns).
+    pub(crate) fn seek(&mut self, t: i64) -> Result<()> {
+        self.last = None;
+        self.cmd.send(Cmd::Seek(t)).ok().context("the decoder thread stopped")
+    }
+
+    /// The next decoded frame in presentation order: (time in 100 ns, sample
+    /// holding its texture). `None` at the end.
+    pub(crate) fn read(&mut self) -> Result<Option<(i64, IMFSample)>> {
+        self.cmd.send(Cmd::Read).ok().context("the decoder thread stopped")?;
+        let got = self.frames.recv().context("the decoder thread stopped")??;
+        self.last = got.as_ref().map(|f| f.0);
+        Ok(got.map(|Frame(t, s)| (t, s)))
+    }
+
+    /// The time of the frame the next read returns, when that's known
+    /// without decoding it (frames not reordered: the one after the last
+    /// handed out, by the file's index); `i64::MAX` at the end.
+    pub(crate) fn upcoming(&self) -> Option<i64> {
+        if self.reordered {
+            return None;
+        }
+        let last = self.last?;
+        let next = self.index.samples.partition_point(|s| s.pts * UNITS / self.index.timescale.max(1) as i64 <= last);
+        Some(if next < self.index.samples.len() { self.time_of(next) } else { i64::MAX })
+    }
+}
+
+/// The decoder's input into `out`: NAL units with start codes, the SPS/PPS
+/// first on a keyframe. Returns the bytes written.
+fn annexb_into(index: &Index, avcc: &[u8], key: bool, out: &mut [u8]) -> usize {
+    let mut w = 0;
+    let mut put = |bytes: &[u8], w: &mut usize| {
+        let end = (*w + bytes.len()).min(out.len());
+        out[*w..end].copy_from_slice(&bytes[..end - *w]);
+        *w = end;
+    };
     if key {
         for p in index.sps.iter().chain(&index.pps) {
-            out.extend_from_slice(&[0, 0, 0, 1]);
-            out.extend_from_slice(p);
+            put(&[0, 0, 0, 1], &mut w);
+            put(p, &mut w);
         }
     }
     let n = index.nal_length;
@@ -247,11 +366,11 @@ fn annexb(index: &Index, avcc: &[u8], key: bool) -> Vec<u8> {
         let len = avcc[at..at + n].iter().fold(0usize, |a, &b| a << 8 | b as usize);
         at += n;
         let end = (at + len).min(avcc.len());
-        out.extend_from_slice(&[0, 0, 0, 1]);
-        out.extend_from_slice(&avcc[at..end]);
+        put(&[0, 0, 0, 1], &mut w);
+        put(&avcc[at..end], &mut w);
         at = end;
     }
-    out
+    w
 }
 
 fn set_nv12(mft: &IMFTransform) -> Result<()> {

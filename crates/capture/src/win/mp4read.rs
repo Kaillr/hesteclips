@@ -22,7 +22,7 @@ pub struct Sample {
     pub key: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Index {
     pub width: u32,
     pub height: u32,
