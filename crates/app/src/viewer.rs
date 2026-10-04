@@ -446,11 +446,7 @@ impl Ready {
         p.rect_filled(Rect::from_min_max(audio.min, Pos2::new(xp, audio.bottom())), 4, Color32::from_white_alpha(10));
 
         // Scrub proxy still building: a thin bar until every frame is scrubbable.
-        let prog = self.player.proxy_progress();
-        if prog < 1.0 {
-            p.rect_filled(Rect::from_min_size(Pos2::new(video.left(), video.bottom() - 3.0), Vec2::new(video.width() * prog, 3.0)), 0, ACCENT);
-            ui.ctx().request_repaint_after(Duration::from_millis(100));
-        }
+        crate::player::paint_proxy_bar(ui, &self.player, video, 0.0, dur);
 
         // Hover: a line, and that moment's picture and time above the timeline.
         if let Some(pos) = resp.hover_pos().filter(|_| self.dragging.is_none()) {

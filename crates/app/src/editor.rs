@@ -708,12 +708,7 @@ impl Ready {
         p.rect_filled(video, 4, v.extreme_bg_color);
         self.strip.paint(ui, video, v0, v0 + span, dur);
         // Scrub-proxy progress: a thin bar until every frame is scrubbable.
-        let prog = self.player.proxy_progress();
-        if prog < 1.0 {
-            let bar = Rect::from_min_size(Pos2::new(video.left(), video.bottom() - 3.0), Vec2::new(video.width() * prog, 3.0));
-            p.rect_filled(bar, 0, ACCENT);
-            ui.ctx().request_repaint();
-        }
+        crate::player::paint_proxy_bar(ui, &self.player, video, v0, v0 + span);
 
         // --- Audio lanes ---
         // Scrolled lanes are clipped to the space under the video lane.

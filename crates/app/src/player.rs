@@ -67,6 +67,30 @@ pub fn uptime() -> f64 {
     START.get_or_init(std::time::Instant::now).elapsed().as_secs_f64()
 }
 
+/// The scrub frames built so far, as a thin bar along the bottom of `lane`
+/// (which shows `from..to` seconds): built stretches lit, the rest dark. It
+/// fills from wherever the playhead is, not from the start.
+pub fn paint_proxy_bar(ui: &egui::Ui, player: &crate::player::Player, lane: egui::Rect, from: f64, to: f64) {
+    if player.proxy_progress() >= 1.0 {
+        return;
+    }
+    let n = (lane.width() / 2.0).max(1.0) as usize;
+    let built = player.proxy_built(from, to, n);
+    let p = ui.painter_at(lane);
+    let y = lane.bottom() - 3.0..=lane.bottom();
+    let step = lane.width() / n as f32;
+    let mut k = 0;
+    while k < n {
+        let on = built[k];
+        let run = built[k..].iter().take_while(|b| **b == on).count();
+        let x0 = lane.left() + k as f32 * step;
+        let color = if on { crate::library::ACCENT } else { egui::Color32::from_white_alpha(25) };
+        p.rect_filled(egui::Rect::from_x_y_ranges(x0..=x0 + run as f32 * step, y.clone()), 0, color);
+        k += run;
+    }
+    ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+}
+
 /// What's on screen, with its size in pixels.
 enum Display {
     /// An uploaded image: scrub proxy frames, frames that came back to the CPU.
@@ -281,6 +305,11 @@ impl Player {
         self.video_playing = false;
     }
 
+    /// For the `n` steps of `from..to` seconds: which have scrub frames.
+    pub fn proxy_built(&self, from: f64, to: f64, n: usize) -> Vec<bool> {
+        self.proxy.built(self.info.frame_index(from), self.info.frame_index(to), n)
+    }
+
     /// Fraction of the scrub proxy that's built (0..=1).
     pub fn proxy_progress(&self) -> f32 {
         let total = (self.info.duration * self.info.fps).floor().max(1.0);
@@ -311,6 +340,7 @@ impl Player {
     /// Returns the size of what's on screen (in pixels, to fit it); draw it
     /// with [`Self::paint`].
     pub fn update(&mut self, ctx: &egui::Context, scrubbing: bool) -> Option<egui::Vec2> {
+        self.proxy.set_focus(self.info.frame_index(self.time()));
         if self.hw().is_some() {
             self.update_hw(ctx, scrubbing);
             return self.display.as_ref().map(Display::size);

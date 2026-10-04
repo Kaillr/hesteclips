@@ -39,8 +39,36 @@ fn width_for(total: usize) -> u32 {
 /// shows the one before it).
 type Jpeg = Arc<[u8]>;
 
+/// The proxy frames by frame number, filled in any order (see `hw`).
+#[derive(Default)]
+struct Store {
+    frames: Vec<Option<Jpeg>>,
+    /// How many slots are filled.
+    ready: usize,
+}
+
+impl Store {
+    fn set(&mut self, i: usize, jpeg: &Jpeg) {
+        if i >= self.frames.len() {
+            self.frames.resize(i + 1, None);
+        }
+        if self.frames[i].is_none() {
+            self.ready += 1;
+        }
+        self.frames[i] = Some(jpeg.clone());
+    }
+
+    /// The next slot in order (the ffmpeg pass fills them front to back).
+    fn push(&mut self, jpeg: Jpeg) {
+        let i = self.frames.len();
+        self.set(i, &jpeg);
+    }
+}
+
 pub struct Proxy {
-    frames: Arc<Mutex<Vec<Jpeg>>>,
+    frames: Arc<Mutex<Store>>,
+    /// The frame the player is at: the build works outward from here.
+    focus: Arc<std::sync::atomic::AtomicU64>,
     /// The ffmpeg pass, when that's the way it's built.
     child: Arc<Mutex<Option<Child>>>,
     stop: Arc<AtomicBool>,
@@ -49,13 +77,18 @@ pub struct Proxy {
 impl Proxy {
     /// Every one of the `total` frames of `source`, numbered at `fps`.
     pub fn build(ctx: &egui::Context, source: &Path, fps: f64, total: usize) -> Self {
-        let proxy = Self { frames: Arc::new(Mutex::new(Vec::new())), child: Arc::new(Mutex::new(None)), stop: Arc::new(AtomicBool::new(false)) };
-        let (frames, child, stop) = (proxy.frames.clone(), proxy.child.clone(), proxy.stop.clone());
+        let proxy = Self {
+            frames: Arc::new(Mutex::new(Store::default())),
+            focus: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            child: Arc::new(Mutex::new(None)),
+            stop: Arc::new(AtomicBool::new(false)),
+        };
+        let (frames, child, stop, focus) = (proxy.frames.clone(), proxy.child.clone(), proxy.stop.clone(), proxy.focus.clone());
         let (ctx, source) = (ctx.clone(), source.to_path_buf());
         // Opening a decoder takes a few hundred ms: not on the UI thread.
         std::thread::spawn(move || {
             #[cfg(windows)]
-            if std::env::var_os("HESTECLIPS_NO_HW_DECODE").is_none() && hw::build(&ctx, &source, fps, total, &frames, &stop) {
+            if std::env::var_os("HESTECLIPS_NO_HW_DECODE").is_none() && hw::build(&ctx, &source, fps, total, &frames, &focus, &stop) {
                 return;
             }
             let mut slot = child.lock().unwrap();
@@ -71,21 +104,37 @@ impl Proxy {
         proxy
     }
 
-    /// How many frames are ready (they arrive in order).
+    /// How many frames are ready.
     pub fn ready(&self) -> usize {
-        self.frames.lock().map_or(0, |f| f.len())
+        self.frames.lock().map_or(0, |f| f.ready)
+    }
+
+    /// Which of `n` evenly spaced frames from `first` to `last` are built.
+    pub fn built(&self, first: u64, last: u64, n: usize) -> Vec<bool> {
+        let Ok(f) = self.frames.lock() else { return vec![false; n] };
+        (0..n)
+            .map(|k| {
+                let i = first + (last.saturating_sub(first) as f64 * (k as f64 + 0.5) / n.max(1) as f64) as u64;
+                f.frames.get(i as usize).is_some_and(Option::is_some)
+            })
+            .collect()
+    }
+
+    /// The player is at frame `idx`: build around here next.
+    pub fn set_focus(&self, idx: u64) {
+        self.focus.store(idx, Ordering::Relaxed);
     }
 
     /// Decode proxy frame `idx`, if it's been built yet.
     pub fn frame(&self, idx: u64) -> Option<egui::ColorImage> {
-        let jpeg = self.frames.lock().ok()?.get(idx as usize)?.clone();
+        let jpeg = self.frames.lock().ok()?.frames.get(idx as usize)?.clone()?;
         let img = image::load_from_memory_with_format(&jpeg, image::ImageFormat::Jpeg).ok()?.to_rgba8();
         Some(egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw()))
     }
 }
 
 /// The ffmpeg pass: every frame decoded in software, as an MJPEG stream.
-fn start_ffmpeg(ctx: &egui::Context, source: &Path, fps: f64, width: u32, frames: &Arc<Mutex<Vec<Jpeg>>>) -> Option<Child> {
+fn start_ffmpeg(ctx: &egui::Context, source: &Path, fps: f64, width: u32, frames: &Arc<Mutex<Store>>) -> Option<Child> {
     let mut child = media::ffmpeg_background()
         .args(["-hide_banner", "-loglevel", "error", "-i"])
         .arg(source)
@@ -117,7 +166,7 @@ impl Drop for Proxy {
 ///
 /// ffmpeg's mjpeg encoder byte-stuffs 0xFF inside entropy-coded data, so the first
 /// EOI after a frame's start ends that frame.
-fn split_jpegs(mut r: impl Read, frames: &Mutex<Vec<Jpeg>>, ctx: &egui::Context) {
+fn split_jpegs(mut r: impl Read, frames: &Mutex<Store>, ctx: &egui::Context) {
     let mut buf: Vec<u8> = Vec::with_capacity(1 << 20);
     let mut chunk = vec![0u8; 1 << 16];
     // Bytes before `scanned` have been searched for an EOI already.
@@ -171,7 +220,7 @@ mod hw {
     }
 
     /// Start building; false if the decoder can't open the clip.
-    pub fn build(ctx: &egui::Context, source: &Path, fps: f64, total: usize, frames: &Arc<Mutex<Vec<Jpeg>>>, stop: &Arc<AtomicBool>) -> bool {
+    pub fn build(ctx: &egui::Context, source: &Path, fps: f64, total: usize, frames: &Arc<Mutex<Store>>, focus: &Arc<std::sync::atomic::AtomicU64>, stop: &Arc<AtomicBool>) -> bool {
         let debug = std::env::var_os("HESTECLIPS_DEBUG_VIDEO").is_some();
         if debug {
             eprintln!("{:>8.3} scrub proxy: opening the decoder", crate::player::uptime());
@@ -191,38 +240,76 @@ mod hw {
         // Decoding on one thread, compressing on a few (it's the slower part),
         // then put back in order on another.
         let encoders = encoders();
-        let (tx, jobs) = mpsc::sync_channel::<(u64, Picture)>(encoders * 2);
-        let stop_d = stop.clone();
+        let (tx, jobs) = mpsc::sync_channel::<(u64, Job)>(encoders * 2);
+        let (stop_d, focus) = (stop.clone(), focus.clone());
         std::thread::spawn(move || {
             lower_priority();
+            let chunks = total.div_ceil(CHUNK);
+            let mut built = vec![false; chunks];
             let mut seq = 0u64;
-            while !stop_d.load(Ordering::Relaxed) {
-                crate::video::yield_to_urgent();
-                match dec.next() {
-                    Ok(Some(p)) => {
-                        if tx.send((seq, p)).is_err() {
+            let mut send = |job: Job| {
+                let ok = tx.send((seq, job)).is_ok();
+                seq += 1;
+                ok
+            };
+            // A frame read past the end of a chunk: the next chunk's first,
+            // if that's the one done next (then no seek is needed).
+            let mut carry: Option<Picture> = None;
+            'chunks: while !stop_d.load(Ordering::Relaxed) {
+                let at = (focus.load(Ordering::Relaxed) as usize).min(total.saturating_sub(1)) / CHUNK;
+                let Some(c) = next_chunk(&built, at) else { break };
+                let (start, end) = (c * CHUNK, ((c + 1) * CHUNK).min(total));
+                if debug {
+                    eprintln!("{:>8.3} scrub proxy: building frames {start}..{end}", crate::player::uptime());
+                }
+                let first = match carry.take() {
+                    Some(p) if (start..end).contains(&(p.index as usize)) => Ok(Some(p)),
+                    _ => dec.frame(start as u64),
+                };
+                let mut got = first;
+                loop {
+                    crate::video::yield_to_urgent();
+                    match got {
+                        Ok(Some(p)) if (p.index as usize) >= end => {
+                            carry = Some(p);
                             break;
                         }
-                        seq += 1;
+                        Ok(Some(p)) => {
+                            if !send(Job::Frame { start, end, pic: p }) {
+                                break 'chunks;
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(e) => {
+                            eprintln!("scrub proxy: {e:#}");
+                            break 'chunks;
+                        }
                     }
-                    Ok(None) => break,
-                    Err(e) => {
-                        eprintln!("scrub proxy: {e:#}");
-                        break;
+                    if stop_d.load(Ordering::Relaxed) {
+                        break 'chunks;
                     }
+                    got = dec.next();
+                }
+                built[c] = true;
+                if !send(Job::End { start, end }) {
+                    break;
                 }
             }
         });
         let jobs = Arc::new(Mutex::new(jobs));
-        let (done_tx, done) = mpsc::channel::<(u64, u64, Option<Jpeg>)>();
+        let (done_tx, done) = mpsc::channel::<(u64, Done)>();
         for _ in 0..encoders {
             let (jobs, done_tx) = (jobs.clone(), done_tx.clone());
             std::thread::spawn(move || {
                 lower_priority();
                 loop {
                     let job = jobs.lock().unwrap().recv();
-                    let Ok((seq, p)) = job else { return };
-                    if done_tx.send((seq, p.index, encode(&p))).is_err() {
+                    let Ok((seq, job)) = job else { return };
+                    let out = match job {
+                        Job::Frame { start, end, pic } => Done::Frame { start, end, index: pic.index as usize, jpeg: encode(&pic) },
+                        Job::End { start, end } => Done::End { start, end },
+                    };
+                    if done_tx.send((seq, out)).is_err() {
                         return;
                     }
                 }
@@ -234,58 +321,109 @@ mod hw {
         std::thread::spawn(move || {
             lower_priority();
             let mut last_repaint = std::time::Instant::now();
-            let mut last: Option<Jpeg> = None;
             let mut waiting = std::collections::BTreeMap::new();
             let mut next_seq = 0u64;
-            for (seq, index, jpeg) in done {
+            let mut chunk: Option<Chunk> = None;
+            let mut first = true;
+            for (seq, out) in done {
                 if stop.load(Ordering::Relaxed) {
                     return;
                 }
-                waiting.insert(seq, (index, jpeg));
-                while let Some((index, jpeg)) = waiting.remove(&next_seq) {
+                waiting.insert(seq, out);
+                while let Some(out) = waiting.remove(&next_seq) {
                     next_seq += 1;
-                    let Some(jpeg) = jpeg else { continue };
-                    if debug && last.is_none() {
-                        eprintln!("{:>8.3} scrub proxy: first frame in", crate::player::uptime());
+                    let (start, end) = match &out {
+                        Done::Frame { start, end, .. } | Done::End { start, end } => (*start, *end),
+                    };
+                    let c = chunk.get_or_insert_with(|| Chunk::new(start, end));
+                    if c.start != start {
+                        *c = Chunk::new(start, end);
                     }
-                    place(&mut frames.lock().unwrap(), last.as_ref(), index as usize, &jpeg);
-                    last = Some(jpeg);
+                    let mut store = frames.lock().unwrap();
+                    match out {
+                        Done::Frame { index, jpeg: Some(jpeg), .. } => {
+                            if debug && first {
+                                eprintln!("{:>8.3} scrub proxy: first frame in", crate::player::uptime());
+                                first = false;
+                            }
+                            c.frame(&mut store, index, jpeg);
+                        }
+                        Done::Frame { jpeg: None, .. } => {}
+                        Done::End { .. } => c.end(&mut store),
+                    }
                 }
                 if last_repaint.elapsed().as_millis() > 100 {
                     ctx.request_repaint();
                     last_repaint = std::time::Instant::now();
                 }
             }
-            // To the very end, even if the last frames were dropped.
-            let mut f = frames.lock().unwrap();
-            if let Some(prev) = last {
-                while f.len() < total {
-                    f.push(prev.clone());
-                }
-            }
-            if std::env::var_os("HESTECLIPS_DEBUG_VIDEO").is_some() {
+            if debug {
+                let f = frames.lock().unwrap();
                 let mut seen = std::collections::HashSet::new();
-                let bytes: usize = f.iter().filter(|j| seen.insert(j.as_ptr())).map(|j| j.len()).sum();
-                eprintln!("scrub proxy: {} frames in {:.1} s, {} MB", f.len(), started.elapsed().as_secs_f64(), bytes / 1_000_000);
+                let bytes: usize = f.frames.iter().flatten().filter(|j| seen.insert(j.as_ptr())).map(|j| j.len()).sum();
+                eprintln!("scrub proxy: {} frames in {:.1} s, {} MB", f.ready, started.elapsed().as_secs_f64(), bytes / 1_000_000);
             }
             ctx.request_repaint();
         });
         true
     }
 
-    /// Put decoded frame `i` in its slot. A dropped frame's slots show the
-    /// frame before it (`last`), like ffmpeg's `fps` filter; two frames on one
-    /// slot keep the later. Frames come in order.
-    pub(super) fn place(f: &mut Vec<Jpeg>, last: Option<&Jpeg>, i: usize, jpeg: &Jpeg) {
-        if let Some(prev) = last {
-            while f.len() < i {
-                f.push(prev.clone());
-            }
+    /// Frames per chunk: built one at a time, nearest the player first.
+    /// 2 s at 60 fps: switching to where you scrub takes a fraction of that.
+    const CHUNK: usize = 120;
+
+    enum Job {
+        Frame { start: usize, end: usize, pic: Picture },
+        /// The chunk's last frame was sent: fill its remaining slots.
+        End { start: usize, end: usize },
+    }
+
+    enum Done {
+        Frame { start: usize, end: usize, index: usize, jpeg: Option<Jpeg> },
+        End { start: usize, end: usize },
+    }
+
+    /// The chunk to build next: the one the player is in, then the ones
+    /// ahead of it, then behind (a chunk behind counts as three ahead).
+    pub(super) fn next_chunk(built: &[bool], at: usize) -> Option<usize> {
+        (0..built.len()).filter(|&c| !built[c]).min_by_key(|&c| if c >= at { (c - at, 0) } else { ((at - c) * 3, 1) })
+    }
+
+    /// Fills a chunk's slots as its frames come in, in order: slot `i` shows
+    /// the last frame at or before `i` (a dropped frame's slots show the frame
+    /// before; two frames on one slot keep the later).
+    pub(super) struct Chunk {
+        start: usize,
+        end: usize,
+        /// The first slot not filled yet.
+        next: usize,
+        last: Option<Jpeg>,
+    }
+
+    impl Chunk {
+        pub(super) fn new(start: usize, end: usize) -> Self {
+            Self { start, end, next: start, last: None }
         }
-        if f.len() == i + 1 {
-            f[i] = jpeg.clone();
-        } else if f.len() == i {
-            f.push(jpeg.clone());
+
+        pub(super) fn frame(&mut self, store: &mut Store, index: usize, jpeg: Jpeg) {
+            while self.next < index.min(self.end) {
+                store.set(self.next, self.last.as_ref().unwrap_or(&jpeg));
+                self.next += 1;
+            }
+            if (self.start..self.end).contains(&index) {
+                store.set(index, &jpeg);
+                self.next = self.next.max(index + 1);
+            }
+            self.last = Some(jpeg);
+        }
+
+        pub(super) fn end(&mut self, store: &mut Store) {
+            if let Some(last) = &self.last {
+                while self.next < self.end {
+                    store.set(self.next, last);
+                    self.next += 1;
+                }
+            }
         }
     }
 
@@ -306,19 +444,42 @@ mod hw {
 mod tests {
     use super::*;
 
-    /// Gaps repeat the frame before; a slot two frames land on keeps the later.
+    /// Gaps repeat the frame before; a slot two frames land on keeps the
+    /// later; a chunk starting in a gap shows the frame before it.
     #[cfg(windows)]
     #[test]
-    fn frames_fill_their_slots() {
+    fn chunks_fill_their_slots() {
         let j = |n: u8| -> Jpeg { Arc::from(vec![n]) };
-        let mut f = Vec::new();
-        let mut last: Option<Jpeg> = None;
+        let mut store = Store::default();
+        let mut c = hw::Chunk::new(0, 7);
         for (i, n) in [(0, 0), (1, 1), (3, 3), (3, 4), (6, 6)] {
-            hw::place(&mut f, last.as_ref(), i, &j(n));
-            last = Some(j(n));
+            c.frame(&mut store, i, j(n));
         }
-        let got: Vec<u8> = f.iter().map(|x| x[0]).collect();
+        c.end(&mut store);
+        let got: Vec<u8> = store.frames.iter().map(|x| x.as_ref().unwrap()[0]).collect();
         assert_eq!(got, [0, 1, 1, 4, 4, 4, 6]);
+        // A chunk 10..14 whose first frame (the one showing at 10) is 8.
+        let mut c = hw::Chunk::new(10, 14);
+        for (i, n) in [(8, 8), (12, 12), (15, 15)] {
+            c.frame(&mut store, i, j(n));
+        }
+        c.end(&mut store);
+        let got: Vec<u8> = (10..14).map(|i| store.frames[i].as_ref().unwrap()[0]).collect();
+        assert_eq!(got, [8, 8, 12, 12]);
+        assert_eq!(store.ready, 11);
+    }
+
+    /// Chunks are built from where the player is: there, ahead, then behind.
+    #[cfg(windows)]
+    #[test]
+    fn chunks_start_at_the_player() {
+        let mut built = vec![false; 10];
+        let mut order = Vec::new();
+        while let Some(c) = hw::next_chunk(&built, 6) {
+            built[c] = true;
+            order.push(c);
+        }
+        assert_eq!(order, [6, 7, 8, 9, 5, 4, 3, 2, 1, 0]);
     }
 
     /// Frames split correctly no matter how reads chop the stream.
@@ -336,9 +497,9 @@ mod tests {
                     Ok(n)
                 }
             }
-            let frames = Mutex::new(Vec::new());
+            let frames = Mutex::new(Store::default());
             split_jpegs(Chunked(stream.clone(), chunk), &frames, &egui::Context::default());
-            let got: Vec<Vec<u8>> = frames.into_inner().unwrap().iter().map(|f| f.to_vec()).collect();
+            let got: Vec<Vec<u8>> = frames.into_inner().unwrap().frames.iter().map(|f| f.as_ref().unwrap().to_vec()).collect();
             assert_eq!(got, (1..=5).map(frame).collect::<Vec<_>>(), "chunk size {chunk}");
         }
     }
