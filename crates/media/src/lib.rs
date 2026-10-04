@@ -1050,3 +1050,53 @@ mod tests {
         assert_eq!(parse_clip_tag("made with something else"), ClipTag::default());
     }
 }
+
+#[cfg(test)]
+mod jpeg_tests {
+    /// Colour accuracy and cost of JPEG settings on a real frame:
+    /// `JPEG_FRAME=<1280x720 rgba> cargo test --release -p media jpeg_settings -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn jpeg_settings() {
+        let Some(path) = std::env::var_os("JPEG_FRAME") else { return };
+        let rgba = std::fs::read(path).unwrap();
+        let (w, h) = (1280u16, 720u16);
+        let grey = [0x2E, 0x32, 0x38];
+        for (q, sub) in [(75u8, true), (90, true), (95, true), (90, false), (95, false)] {
+            let t = std::time::Instant::now();
+            let mut out = Vec::new();
+            let mut enc = jpeg_encoder::Encoder::new(&mut out, q);
+            enc.set_sampling_factor(if sub { jpeg_encoder::SamplingFactor::F_2_2 } else { jpeg_encoder::SamplingFactor::F_1_1 });
+            enc.encode(&rgba, w, h, jpeg_encoder::ColorType::Rgba).unwrap();
+            let ms = t.elapsed().as_secs_f64() * 1000.0;
+            // Decode with a tiny decoder-free check: re-encode isn't possible, so
+            // write it out for ffmpeg to read back.
+            let file = std::env::temp_dir().join(format!("jt_{q}_{sub}.jpg"));
+            std::fs::write(&file, &out).unwrap();
+            let back = std::process::Command::new("ffmpeg").args(["-v", "error", "-i"]).arg(&file).args(["-f", "rawvideo", "-pix_fmt", "rgba", "-"]).output().unwrap().stdout;
+            let (mut n, mut err, mut worst) = (0u64, [0i64; 3], 0u8);
+            let mut all = 0u64;
+            for (a, b) in rgba.chunks_exact(4).zip(back.chunks_exact(4)) {
+                for c in 0..3 {
+                    all += a[c].abs_diff(b[c]) as u64;
+                }
+                if a[..3] == grey {
+                    n += 1;
+                    for c in 0..3 {
+                        err[c] += b[c] as i64 - a[c] as i64;
+                        worst = worst.max(a[c].abs_diff(b[c]));
+                    }
+                }
+            }
+            println!(
+                "q{q} {}: {:>3} KB, {ms:.1} ms; mean error {:.2}; {n} px of 2E3238: mean shift ({:+.2},{:+.2},{:+.2}) worst {worst}",
+                if sub { "4:2:0" } else { "4:4:4" },
+                out.len() / 1024,
+                all as f64 / (rgba.len() / 4 * 3) as f64,
+                err[0] as f64 / n.max(1) as f64,
+                err[1] as f64 / n.max(1) as f64,
+                err[2] as f64 / n.max(1) as f64
+            );
+        }
+    }
+}

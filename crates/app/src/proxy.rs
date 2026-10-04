@@ -19,11 +19,21 @@ use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// Proxy frame width; enough for a crisp preview while dragging.
-const WIDTH: u32 = 640;
+/// JPEG quality of proxy frames. From 90 up the encoder keeps colour at full
+/// resolution (below, at half: greys shifted, a 2E3238 came back 2E313A),
+/// and blocking is gone: mean error a third of a level at 1280 px.
+const QUALITY: u8 = 90;
 
-/// JPEG quality of proxy frames: soft but clean at preview size.
-const QUALITY: u8 = 75;
+/// Proxy frame width: as sharp as fits in roughly 500 MB for the clip (a
+/// 1280 px frame is ~70 KB at quality 90): up to a minute of 60 fps at 1280,
+/// up to 2.5 minutes at 960, longer at 640.
+fn width_for(total: usize) -> u32 {
+    match total {
+        0..=4_000 => 1280,
+        4_001..=9_000 => 960,
+        _ => 640,
+    }
+}
 
 /// One frame, shared by every index it stands for (a dropped frame's slot
 /// shows the one before it).
@@ -48,9 +58,8 @@ impl Proxy {
             if std::env::var_os("HESTECLIPS_NO_HW_DECODE").is_none() && hw::build(&ctx, &source, fps, total, &frames, &stop) {
                 return;
             }
-            let _ = total;
             let mut slot = child.lock().unwrap();
-            *slot = start_ffmpeg(&ctx, &source, fps, &frames);
+            *slot = start_ffmpeg(&ctx, &source, fps, width_for(total), &frames);
             // Closed while it started: the drop already ran, so stop it here.
             if stop.load(Ordering::Relaxed) {
                 if let Some(mut c) = slot.take() {
@@ -76,13 +85,13 @@ impl Proxy {
 }
 
 /// The ffmpeg pass: every frame decoded in software, as an MJPEG stream.
-fn start_ffmpeg(ctx: &egui::Context, source: &Path, fps: f64, frames: &Arc<Mutex<Vec<Jpeg>>>) -> Option<Child> {
+fn start_ffmpeg(ctx: &egui::Context, source: &Path, fps: f64, width: u32, frames: &Arc<Mutex<Vec<Jpeg>>>) -> Option<Child> {
     let mut child = media::ffmpeg_background()
         .args(["-hide_banner", "-loglevel", "error", "-i"])
         .arg(source)
         // fps= pins one output frame per source frame index, even for VFR input.
-        .args(["-an", "-vf", &format!("fps={fps},scale={WIDTH}:-2:flags=bilinear")])
-        .args(["-c:v", "mjpeg", "-q:v", "6", "-f", "image2pipe", "-"])
+        .args(["-an", "-vf", &format!("fps={fps},scale={width}:-2:flags=lanczos,format=yuvj444p")])
+        .args(["-c:v", "mjpeg", "-q:v", "2", "-f", "image2pipe", "-"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -154,9 +163,12 @@ mod hw {
     use capture::win::decode::{Decoder, Picture};
 
 
-    /// Threads compressing frames (the slow part, ~2-5 ms a frame): enough to
-    /// get near the decoder's ~900 fps.
-    const ENCODERS: usize = 4;
+    /// Threads compressing frames (the slow part, 6-10 ms a frame at quality
+    /// 90): every core but two, at below-normal priority, so a game or the
+    /// app still comes first.
+    fn encoders() -> usize {
+        std::thread::available_parallelism().map_or(4, |n| n.get().saturating_sub(2)).clamp(2, 16)
+    }
 
     /// Start building; false if the decoder can't open the clip.
     pub fn build(ctx: &egui::Context, source: &Path, fps: f64, total: usize, frames: &Arc<Mutex<Vec<Jpeg>>>, stop: &Arc<AtomicBool>) -> bool {
@@ -165,7 +177,7 @@ mod hw {
             eprintln!("{:>8.3} scrub proxy: opening the decoder", crate::player::uptime());
         }
         // Open here, so a clip the decoder can't read falls back to ffmpeg.
-        let mut dec = match Decoder::open(source, WIDTH, None) {
+        let mut dec = match Decoder::open(source, width_for(total), None) {
             Ok(d) => d,
             Err(e) => {
                 eprintln!("scrub proxy: hardware decoder unavailable, using ffmpeg: {e:#}");
@@ -178,7 +190,8 @@ mod hw {
         }
         // Decoding on one thread, compressing on a few (it's the slower part),
         // then put back in order on another.
-        let (tx, jobs) = mpsc::sync_channel::<(u64, Picture)>(ENCODERS * 2);
+        let encoders = encoders();
+        let (tx, jobs) = mpsc::sync_channel::<(u64, Picture)>(encoders * 2);
         let stop_d = stop.clone();
         std::thread::spawn(move || {
             lower_priority();
@@ -202,7 +215,7 @@ mod hw {
         });
         let jobs = Arc::new(Mutex::new(jobs));
         let (done_tx, done) = mpsc::channel::<(u64, u64, Option<Jpeg>)>();
-        for _ in 0..ENCODERS {
+        for _ in 0..encoders {
             let (jobs, done_tx) = (jobs.clone(), done_tx.clone());
             std::thread::spawn(move || {
                 lower_priority();
