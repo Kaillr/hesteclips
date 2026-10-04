@@ -72,13 +72,18 @@ pub struct Surfaces {
     textures: Vec<ID3D11Texture2D>,
     handles: Vec<HANDLE>,
     free: Mutex<VecDeque<usize>>,
+    /// Signalled after each frame is written, for the other device to wait
+    /// on before reading it (with its NT handle). Without it the other API
+    /// could draw a texture's previous contents (another, old frame).
+    fence: Option<(ID3D11Fence, HANDLE)>,
+    fence_value: std::sync::atomic::AtomicU64,
 }
 unsafe impl Send for Surfaces {}
 unsafe impl Sync for Surfaces {}
 
 impl Drop for Surfaces {
     fn drop(&mut self) {
-        for h in &self.handles {
+        for h in self.handles.iter().chain(self.fence.as_ref().map(|(_, h)| h)) {
             unsafe {
                 let _ = CloseHandle(*h);
             }
@@ -90,6 +95,8 @@ impl Drop for Surfaces {
 pub struct Surface {
     pool: Arc<Surfaces>,
     slot: usize,
+    /// The fence value signalled once this frame was written.
+    ready: u64,
 }
 
 impl Surface {
@@ -102,6 +109,14 @@ impl Surface {
     /// Owned by the pool; valid while it lives.
     pub fn handle(&self) -> isize {
         self.pool.handles[self.slot].0 as isize
+    }
+
+    /// The pool's shared fence (NT handle, owned by the pool) and the value
+    /// that means this frame is written: wait for it before drawing it.
+    /// `None` if the graphics card couldn't share a fence (then the frame was
+    /// finished before it was handed over).
+    pub fn fence(&self) -> Option<(isize, u64)> {
+        self.pool.fence.as_ref().map(|(_, h)| (h.0 as isize, self.ready))
     }
 }
 
@@ -305,11 +320,25 @@ impl Decoder {
             }
             std::thread::sleep(Duration::from_millis(2));
         };
-        let surface = Surface { pool, slot };
         self.convert.run(&texture, slice, slot)?;
-        // The other device reads it as soon as it's handed over: wait until
-        // this one has finished writing it.
-        self.gpu.wait_idle()?;
+        let ready = match &pool.fence {
+            // The other device waits for this value before reading the frame.
+            Some((fence, _)) => {
+                let v = pool.fence_value.fetch_add(1, Ordering::Relaxed) + 1;
+                unsafe {
+                    let ctx4: ID3D11DeviceContext4 = self.gpu.context.cast()?;
+                    ctx4.Signal(fence, v)?;
+                    self.gpu.context.Flush();
+                }
+                v
+            }
+            // No shared fence: finish writing here before handing it over.
+            None => {
+                self.gpu.wait_idle()?;
+                0
+            }
+        };
+        let surface = Surface { pool, slot, ready };
         Ok(Picture { index, width: self.width, height: self.height, rgba: Vec::new(), gpu: Some(surface) })
     }
 }
@@ -342,7 +371,26 @@ fn surfaces(gpu: &Gpu, width: u32, height: u32) -> Result<Surfaces> {
             handles.push(handle);
         }
     }
-    Ok(Surfaces { id: NEXT.fetch_add(1, Ordering::Relaxed), textures, handles, free: Mutex::new((0..POOL).collect()) })
+    let fence = unsafe {
+        (|| -> Result<(ID3D11Fence, HANDLE)> {
+            let device5: ID3D11Device5 = gpu.device.cast()?;
+            let mut fence: Option<ID3D11Fence> = None;
+            device5.CreateFence(0, D3D11_FENCE_FLAG_SHARED, &mut fence)?;
+            let fence = fence.context("no fence")?;
+            let handle = fence.CreateSharedHandle(None, GENERIC_ALL.0, None)?;
+            Ok((fence, handle))
+        })()
+        .inspect_err(|e| eprintln!("decoder: no shared fence, waiting on the CPU instead: {e:#}"))
+        .ok()
+    };
+    Ok(Surfaces {
+        id: NEXT.fetch_add(1, Ordering::Relaxed),
+        textures,
+        handles,
+        free: Mutex::new((0..POOL).collect()),
+        fence,
+        fence_value: std::sync::atomic::AtomicU64::new(0),
+    })
 }
 
 /// The GPU pass from a decoded NV12 frame to RGBA at the output size, and the

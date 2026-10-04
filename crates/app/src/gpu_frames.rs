@@ -15,7 +15,7 @@ use capture::win::decode::Surface;
 use eframe::egui_wgpu::RenderState;
 use eframe::wgpu;
 use windows::Win32::Foundation::HANDLE;
-use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
+use windows::Win32::Graphics::Direct3D12::{ID3D12Fence, ID3D12Resource};
 
 static RENDER: OnceLock<RenderState> = OnceLock::new();
 
@@ -44,15 +44,21 @@ pub fn share_luid() -> Option<u64> {
 #[derive(Default)]
 pub struct Frames {
     opened: HashMap<(usize, usize), (wgpu::Texture, egui::TextureId)>,
+    /// Each pool's shared fence, opened on D3D12.
+    fences: HashMap<usize, ID3D12Fence>,
 }
 
 impl Frames {
-    /// The egui texture showing `s` (opened the first time it's seen).
+    /// The egui texture showing `s` (opened the first time it's seen). Call
+    /// it each time a new frame goes on screen: the next draw waits until the
+    /// decoder has finished writing it (else D3D12 could draw what the texture
+    /// held before: another, older frame).
     pub fn texture(&mut self, s: &Surface, width: u32, height: u32) -> Option<egui::TextureId> {
+        let rs = RENDER.get()?;
+        self.wait_for(rs, s);
         if let Some((_, id)) = self.opened.get(&s.key()) {
             return Some(*id);
         }
-        let rs = RENDER.get()?;
         let started = std::time::Instant::now();
         let texture = unsafe { open(rs, s.handle(), width, height) }.inspect_err(|e| eprintln!("sharing a frame failed: {e}")).ok()?;
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -62,6 +68,31 @@ impl Frames {
             eprintln!("{:>8.3} gpu frames: opened texture {:?} in {:.1} ms ({} open)", crate::player::uptime(), s.key(), started.elapsed().as_secs_f64() * 1000.0, self.opened.len());
         }
         Some(id)
+    }
+}
+
+impl Frames {
+    /// Have the renderer's next submit wait on GPU for `s` to be written.
+    fn wait_for(&mut self, rs: &RenderState, s: &Surface) {
+        let Some((handle, value)) = s.fence() else { return };
+        let pool = s.key().0;
+        if !self.fences.contains_key(&pool) {
+            let opened = unsafe {
+                rs.device.as_hal::<wgpu::hal::api::Dx12>().and_then(|d| {
+                    let mut fence: Option<ID3D12Fence> = None;
+                    d.raw_device().OpenSharedHandle(HANDLE(handle as *mut _), &mut fence).inspect_err(|e| eprintln!("sharing the decoder's fence failed: {}", e.message())).ok()?;
+                    fence
+                })
+            };
+            let Some(f) = opened else { return };
+            self.fences.insert(pool, f);
+        }
+        let fence = self.fences[&pool].clone();
+        unsafe {
+            if let Some(q) = rs.queue.as_hal::<wgpu::hal::api::Dx12>() {
+                q.add_wait_fence(fence, value);
+            }
+        }
     }
 }
 

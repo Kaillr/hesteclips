@@ -102,6 +102,9 @@ pub struct Player {
     display: Option<(egui::TextureId, egui::Vec2)>,
     /// The GPU frame on screen, held so its texture isn't reused meanwhile.
     on_screen: Option<Picture>,
+    /// GPU frames just taken off screen, held a few more frames: the GPU may
+    /// still be drawing them, and the decoder reuses a released texture.
+    retired: std::collections::VecDeque<(u64, Picture)>,
     /// GPU frames opened for drawing (see `gpu_frames.rs`).
     #[cfg(windows)]
     gpu_frames: crate::gpu_frames::Frames,
@@ -175,6 +178,7 @@ impl Player {
             texture: None,
             display: None,
             on_screen: None,
+            retired: Default::default(),
             #[cfg(windows)]
             gpu_frames: Default::default(),
             shown_frame: None,
@@ -424,7 +428,7 @@ impl Player {
             match on_gpu {
                 Some(id) => {
                     self.display = Some((id, egui::vec2(p.width as f32, p.height as f32)));
-                    self.on_screen = Some(p);
+                    self.retire(ctx, Some(p));
                 }
                 None if p.rgba.is_empty() => {}
                 None => self.set_texture(ctx, crate::video::to_image(p)),
@@ -443,13 +447,28 @@ impl Player {
         self.showing_proxy = false;
     }
 
+    /// Put `next` on screen (or nothing), keeping the frame it replaces for a
+    /// few more passes before its texture goes back to the decoder.
+    fn retire(&mut self, ctx: &egui::Context, next: Option<Picture>) {
+        /// Passes to hold a frame after it leaves the screen: more than the
+        /// GPU ever runs behind.
+        const HOLD: u64 = 4;
+        let pass = ctx.cumulative_pass_nr();
+        if let Some(old) = std::mem::replace(&mut self.on_screen, next) {
+            self.retired.push_back((pass, old));
+        }
+        while self.retired.front().is_some_and(|(at, _)| pass >= at + HOLD) {
+            self.retired.pop_front();
+        }
+    }
+
     fn set_texture(&mut self, ctx: &egui::Context, img: egui::ColorImage) {
         match &mut self.texture {
             Some(tex) => tex.set(img, egui::TextureOptions::LINEAR),
             None => self.texture = Some(ctx.load_texture("preview", img, egui::TextureOptions::LINEAR)),
         }
         self.display = self.texture.as_ref().map(|t| (t.id(), t.size_vec2()));
-        self.on_screen = None;
+        self.retire(ctx, None);
     }
 }
 
