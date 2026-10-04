@@ -126,8 +126,8 @@ impl Waveform {
             let y = |v: f32| mid - scale(v) * half;
             let (top, bottom) = (y(hi.max(0.0)).min(mid - 0.5), y(lo.min(0.0)).max(mid + 0.5));
             let r = (scale(rms) * half).min(mid - top).min(bottom - mid);
-            push_column(&mut peaks, x, top, bottom, col.gamma_multiply(0.55));
-            push_column(&mut body, x, mid - r, mid + r, col);
+            push_column(&mut peaks, x, top, bottom, col.gamma_multiply(0.55), step);
+            push_column(&mut body, x, mid - r, mid + r, col, step);
         }
         p.add(Shape::mesh(peaks));
         p.add(Shape::mesh(body));
@@ -140,13 +140,22 @@ impl Waveform {
 }
 
 /// Add a column (top and bottom vertex) and join it to the previous one.
-fn push_column(mesh: &mut Mesh, x: f32, top: f32, bottom: f32, color: Color32) {
+/// Add a column and join it to the previous one: solid from `top` to
+/// `bottom`, fading out over `feather` beyond each (anti-aliased edges, so a
+/// column's height shows to a fraction of a pixel).
+fn push_column(mesh: &mut Mesh, x: f32, top: f32, bottom: f32, color: Color32, feather: f32) {
     let i = mesh.vertices.len() as u32;
+    mesh.colored_vertex(Pos2::new(x, top - feather), Color32::TRANSPARENT);
     mesh.colored_vertex(Pos2::new(x, top), color);
     mesh.colored_vertex(Pos2::new(x, bottom), color);
-    if i >= 2 {
-        mesh.add_triangle(i - 2, i - 1, i);
-        mesh.add_triangle(i - 1, i + 1, i);
+    mesh.colored_vertex(Pos2::new(x, bottom + feather), Color32::TRANSPARENT);
+    if i >= 4 {
+        // Three bands (fade, solid, fade) between this column and the last.
+        for k in 0..3 {
+            let (a, b) = (i - 4 + k, i + k);
+            mesh.add_triangle(a, a + 1, b);
+            mesh.add_triangle(a + 1, b + 1, b);
+        }
     }
 }
 
