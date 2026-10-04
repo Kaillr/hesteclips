@@ -374,9 +374,12 @@ impl Player {
         }
         if let Some(p) = v.take_exact(want) {
             if let Some(at) = self.asked_at.take() {
-                trace!("sharp frame {} {:.0} ms after asking", p.index, at.elapsed().as_secs_f64() * 1000.0);
+                trace!("sharp frame {want} (picture {}) {:.0} ms after asking", p.index, at.elapsed().as_secs_f64() * 1000.0);
             }
             self.show_picture(ctx, p);
+            // It's the picture for `want` even when its own number is lower (a
+            // dropped frame's slot): don't put the proxy back over it.
+            self.shown_frame = Some(want);
         }
         let sharp = self.shown_frame == Some(want) && !self.showing_proxy;
         if !sharp {

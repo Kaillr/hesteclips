@@ -205,17 +205,28 @@ impl Decoder {
         }
     }
 
-    /// Frame `index`, exactly: decoded forward from where the reader is when
-    /// that's close, else from the keyframe before it. `None` past the end.
+    /// The frame showing at `index`: the last one at or before it, so a
+    /// dropped frame's slot shows the frame before the gap (as the scrub proxy
+    /// and playback do). Decoded forward from where the reader is when that's
+    /// close, else from the keyframe before it. `None` past the end.
     pub fn frame(&mut self, index: u64) -> Result<Option<Picture>> {
         let near = self.next_index.is_some_and(|n| n <= index && index - n <= MAX_SKIP);
         if !near {
             self.seek(index)?;
         }
+        let mut last: Option<(u64, IMFSample)> = None;
         loop {
-            let Some((i, sample)) = self.read()? else { return Ok(None) };
-            if i >= index {
-                return self.picture(i, &sample).map(Some);
+            match self.read()? {
+                Some((i, sample)) if i <= index => last = Some((i, sample)),
+                Some((i, sample)) => {
+                    // Past it: that's the answer's end. Keep this one for the
+                    // next read (it's the next frame, needed anyway).
+                    let Some((li, ls)) = last else { return self.picture(i, &sample).map(Some) };
+                    self.peeked = Some((i, sample));
+                    self.next_index = Some(i);
+                    return self.picture(li, &ls).map(Some);
+                }
+                None => return last.map(|(i, s)| self.picture(i, &s)).transpose(),
             }
         }
     }

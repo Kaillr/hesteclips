@@ -63,8 +63,9 @@ enum Cmd {
 struct State {
     /// Consecutive frames decoded ahead, oldest first.
     ahead: VecDeque<Picture>,
-    /// The answer to the latest `Show`.
-    exact: Option<Picture>,
+    /// The answer to the latest `Show`, by the frame asked for (in a gap left
+    /// by a dropped frame, the picture is the one before it).
+    exact: Option<(u64, Picture)>,
     /// Opening failed or the decoder broke: use another way.
     failed: bool,
 }
@@ -145,10 +146,11 @@ impl Video {
                             playing = false;
                             let have = {
                                 let mut s = shared.lock().unwrap();
-                                while s.ahead.front().is_some_and(|p| p.index < i) {
-                                    s.ahead.pop_front();
-                                }
-                                if s.ahead.front().is_some_and(|p| p.index == i) { s.ahead.pop_front() } else {
+                                drop_superseded(&mut s.ahead, i);
+                                // The frame showing at `i`, if the one after it
+                                // is decoded too (else it might not be the last).
+                                let known = s.ahead.front().is_some_and(|p| p.index <= i) && s.ahead.get(1).is_some_and(|p| p.index > i);
+                                if known { s.ahead.pop_front() } else {
                                     s.ahead.clear();
                                     None
                                 }
@@ -166,16 +168,17 @@ impl Video {
                             let mut s = shared.lock().unwrap();
                             next = s.ahead.back().map_or(i + 1, |p| p.index + 1);
                             at_end = pic.is_none();
-                            s.exact = pic;
+                            s.exact = pic.map(|p| (i, p));
                             ctx.request_repaint();
                         }
                         Cmd::Play(i) => {
                             playing = true;
                             let mut s = shared.lock().unwrap();
-                            while s.ahead.front().is_some_and(|p| p.index < i) {
-                                s.ahead.pop_front();
-                            }
-                            if s.ahead.front().is_none_or(|p| p.index != i) {
+                            drop_superseded(&mut s.ahead, i);
+                            // Carries on from what's decoded, unless that's from
+                            // somewhere else (after a gap, the next frame can be
+                            // a few numbers on).
+                            if s.ahead.front().is_none_or(|p| p.index > i + 30) {
                                 s.ahead.clear();
                                 next = i;
                                 at_end = false;
@@ -226,7 +229,7 @@ impl Video {
     /// The exact frame `i`, once decoded after `show(i)`.
     pub fn take_exact(&self, i: u64) -> Option<Picture> {
         let mut s = self.state.lock().unwrap();
-        if s.exact.as_ref().is_some_and(|p| p.index == i) { s.exact.take() } else { None }
+        if s.exact.as_ref().is_some_and(|(asked, _)| *asked == i) { s.exact.take().map(|(_, p)| p) } else { None }
     }
 
     /// Playing: the newest decoded frame at or before `i`, dropping the ones
@@ -243,7 +246,19 @@ impl Video {
     /// Frame `i` is decoded and waiting.
     pub fn has(&self, i: u64) -> bool {
         let s = self.state.lock().unwrap();
-        s.ahead.iter().any(|p| p.index == i) || s.exact.as_ref().is_some_and(|p| p.index == i)
+        s.ahead.front().is_some_and(|p| p.index <= i) || s.exact.as_ref().is_some_and(|(asked, _)| *asked == i)
+    }
+}
+
+/// Drop decoded frames that frame `i` is past: each one whose successor is
+/// at or before `i` (the last one at or before it is the one showing).
+fn drop_superseded(ahead: &mut VecDeque<Picture>, i: u64) {
+    while ahead.get(1).is_some_and(|next| next.index <= i) {
+        ahead.pop_front();
+    }
+    if ahead.front().is_some_and(|p| p.index < i) && ahead.len() == 1 {
+        // Alone and behind: can't tell it's still the one showing at `i`.
+        ahead.clear();
     }
 }
 
