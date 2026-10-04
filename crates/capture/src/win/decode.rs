@@ -1,5 +1,6 @@
-//! Video decoding for playback, in-process: Media Foundation's source reader
-//! with the GPU's hardware decoder, then our own D3D11 video processor pass
+//! Video decoding for playback, in-process: the GPU's hardware decoder fed
+//! straight from the file (`direct`: H.264 MP4s, as recorded), else through
+//! Media Foundation's source reader (anything else), then our own D3D11 video processor pass
 //! that scales the NV12 frame and converts it to full-range RGBA. One reader
 //! stays open per clip, so playing, seeking and stepping never start anything
 //! new (an ffmpeg process per play took 120-500 ms to show its first frame;
@@ -14,6 +15,9 @@
 //! Frames either come back to the CPU as RGBA, or (`share_on`) stay on the
 //! GPU in a pool of shareable textures that the app's renderer opens once and
 //! draws directly: no copy back, no upload.
+//!
+//! Feeding the decoder ourselves skips the reader's seek: a jump to a
+//! keyframe takes ~5 ms instead of ~45 (see `direct`).
 //!
 //! Frames are numbered by time from the start of the clip (as the editor and
 //! the scrub proxy count them). Media Foundation shifts every timestamp by the
@@ -130,8 +134,15 @@ impl Drop for Surface {
     }
 }
 
+/// Where decoded frames come from.
+enum Source {
+    /// Our own reading of the file, straight into the decoder.
+    Direct(super::direct::Stream),
+    Reader(IMFSourceReader),
+}
+
 pub struct Decoder {
-    reader: IMFSourceReader,
+    src: Source,
     _manager: IMFDXGIDeviceManager,
     gpu: Gpu,
     /// Output size.
@@ -158,7 +169,39 @@ impl Decoder {
     /// Open `path`, decoding to `width` wide (height keeps the aspect, even).
     /// With `share_on` (a graphics card's LUID), frames stay on that card in
     /// shareable textures instead of coming back as RGBA.
+    ///
+    /// Through the file reader for now; `HESTECLIPS_DIRECT_DECODE=1` feeds the
+    /// decoder directly instead (jumps measured faster, reading in order not
+    /// yet: see `direct`).
     pub fn open(path: &Path, width: u32, share_on: Option<u64>) -> Result<Self> {
+        Self::open_with(path, width, share_on, std::env::var_os("HESTECLIPS_DIRECT_DECODE").is_some())
+    }
+
+    /// [`Self::open`], feeding the decoder directly; an error if the file
+    /// can't be read that way.
+    pub fn open_direct(path: &Path, width: u32, share_on: Option<u64>) -> Result<Self> {
+        let d = Self::open_with(path, width, share_on, true)?;
+        if d.way() != "direct" {
+            bail!("this file can't be decoded directly");
+        }
+        Ok(d)
+    }
+
+    /// [`Self::open`], always through Media Foundation's file reader (to
+    /// compare with the direct way).
+    pub fn open_file_reader(path: &Path, width: u32, share_on: Option<u64>) -> Result<Self> {
+        Self::open_with(path, width, share_on, false)
+    }
+
+    /// Which way frames come: "direct" or "file reader".
+    pub fn way(&self) -> &'static str {
+        match self.src {
+            Source::Direct(_) => "direct",
+            Source::Reader(_) => "file reader",
+        }
+    }
+
+    fn open_with(path: &Path, width: u32, share_on: Option<u64>, direct: bool) -> Result<Self> {
         com_init();
         mf_startup()?;
         let gpu = match share_on {
@@ -175,34 +218,59 @@ impl Decoder {
             let manager = manager.context("no device manager")?;
             manager.ResetDevice(&gpu.device, token)?;
 
-            let mut attrs = None;
-            MFCreateAttributes(&mut attrs, 3)?;
-            let attrs = attrs.context("no attributes")?;
-            attrs.SetUnknown(&MF_SOURCE_READER_D3D_MANAGER, &manager)?;
-            attrs.SetUINT32(&MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1)?;
-            let reader = MFCreateSourceReaderFromURL(&HSTRING::from(path.as_os_str()), &attrs).context("couldn't open the video")?;
-            reader.SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS.0 as u32, false)?;
-            reader.SetStreamSelection(STREAM, true)?;
+            let direct = if direct {
+                match super::direct::Stream::open(path, &manager) {
+                    Ok(d) => Some(d),
+                    Err(e) => {
+                        if std::env::var_os("HESTECLIPS_DEBUG_VIDEO").is_some() {
+                            eprintln!("decoder: through the file reader ({e:#})");
+                        }
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let (src, (sw, sh), fps, bt601) = match direct {
+                Some(d) => {
+                    let size = (d.index.width, d.index.height);
+                    let fps = d.fps();
+                    // BT.601 only when the file says so, as the reader does.
+                    let bt601 = matches!(d.index.matrix, Some(5 | 6));
+                    (Source::Direct(d), size, fps, bt601)
+                }
+                None => {
+                    let mut attrs = None;
+                    MFCreateAttributes(&mut attrs, 3)?;
+                    let attrs = attrs.context("no attributes")?;
+                    attrs.SetUnknown(&MF_SOURCE_READER_D3D_MANAGER, &manager)?;
+                    attrs.SetUINT32(&MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1)?;
+                    let reader = MFCreateSourceReaderFromURL(&HSTRING::from(path.as_os_str()), &attrs).context("couldn't open the video")?;
+                    reader.SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS.0 as u32, false)?;
+                    reader.SetStreamSelection(STREAM, true)?;
 
-            let native = reader.GetNativeMediaType(STREAM, 0)?;
-            let size = native.GetUINT64(&MF_MT_FRAME_SIZE)?;
-            let (sw, sh) = ((size >> 32) as u32, size as u32);
-            let rate = native.GetUINT64(&MF_MT_FRAME_RATE).unwrap_or(60 << 32 | 1);
-            let fps = (rate >> 32) as f64 / (rate as u32).max(1) as f64;
+                    let native = reader.GetNativeMediaType(STREAM, 0)?;
+                    let size = native.GetUINT64(&MF_MT_FRAME_SIZE)?;
+                    let (sw, sh) = ((size >> 32) as u32, size as u32);
+                    let rate = native.GetUINT64(&MF_MT_FRAME_RATE).unwrap_or(60 << 32 | 1);
+                    let fps = (rate >> 32) as f64 / (rate as u32).max(1) as f64;
+                    // SD video is usually BT.601; everything else BT.709.
+                    let bt601 = native.GetUINT32(&MF_MT_YUV_MATRIX).ok() == Some(MFVideoTransferMatrix_BT601.0 as u32);
+
+                    // The decoder's own output: NV12 textures on the GPU, with the file's times.
+                    let out = MFCreateMediaType()?;
+                    out.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
+                    out.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12)?;
+                    reader.SetCurrentMediaType(STREAM, None, &out).context("the video can't be decoded to NV12")?;
+                    (Source::Reader(reader), (sw, sh), fps, bt601)
+                }
+            };
             let width = width.min(sw).max(2) / 2 * 2;
             let height = even_height(width, (sw, sh));
-            // SD video is usually BT.601; everything else BT.709.
-            let bt601 = native.GetUINT32(&MF_MT_YUV_MATRIX).ok() == Some(MFVideoTransferMatrix_BT601.0 as u32);
-
-            // The decoder's own output: NV12 textures on the GPU, with the file's times.
-            let out = MFCreateMediaType()?;
-            out.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
-            out.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12)?;
-            reader.SetCurrentMediaType(STREAM, None, &out).context("the video can't be decoded to NV12")?;
 
             let (pool, convert) = outputs(&gpu, share_on.is_some(), (sw, sh), (width, height), fps, bt601)?;
             let mut d = Self {
-                reader,
+                src,
                 _manager: manager,
                 gpu,
                 width,
@@ -247,14 +315,31 @@ impl Decoder {
     /// and playback do). Decoded forward from where the reader is when that's
     /// close, else from the keyframe before it. `None` past the end.
     pub fn frame(&mut self, index: u64) -> Result<Option<Picture>> {
-        let near = self.next_index.is_some_and(|n| n <= index && index - n <= MAX_SKIP);
+        let near = match (&self.src, self.next_index) {
+            (Source::Direct(d), Some(n)) => d.decode_on(self.time_of(n), self.time_of(index)),
+            (Source::Reader(_), Some(n)) => n <= index && index - n <= MAX_SKIP,
+            (_, None) => false,
+        };
         if !near {
             self.seek(index)?;
         }
         let mut last: Option<(u64, IMFSample)> = None;
         loop {
             match self.read()? {
-                Some((i, sample)) if i <= index => last = Some((i, sample)),
+                Some((i, sample)) if i <= index => {
+                    // The next frame's time known from the file's index: no
+                    // need to decode it to know this is the answer.
+                    if let Source::Direct(d) = &self.src {
+                        if let Some(t) = d.upcoming() {
+                            let next = (t != i64::MAX).then(|| self.index_of(t));
+                            if next.is_none_or(|n| n > index) {
+                                self.next_index = next;
+                                return self.picture(i, &sample).map(Some);
+                            }
+                        }
+                    }
+                    last = Some((i, sample));
+                }
                 Some((i, sample)) => {
                     // Past it: that's the answer's end. Keep this one for the
                     // next read (it's the next frame, needed anyway).
@@ -276,12 +361,27 @@ impl Decoder {
         }
     }
 
+    /// The frame whose slot on the grid contains `time` (the decoder's clock).
+    fn index_of(&self, time: i64) -> u64 {
+        (((time - self.offset) as f64 / UNITS) * self.fps + 1e-3).floor().max(0.0) as u64
+    }
+
+    /// Frame `index`'s time on the decoder's clock (100 ns).
+    fn time_of(&self, index: u64) -> i64 {
+        (index as f64 / self.fps * UNITS) as i64 + self.offset
+    }
+
     fn seek(&mut self, index: u64) -> Result<()> {
         self.peeked = None;
         self.next_index = None;
-        let t = (index as f64 / self.fps * UNITS) as i64 + self.offset;
-        let pos = PROPVARIANT::from(t);
-        unsafe { self.reader.SetCurrentPosition(&GUID::zeroed(), &pos)? };
+        let t = self.time_of(index);
+        match &mut self.src {
+            Source::Direct(d) => d.seek(t)?,
+            Source::Reader(r) => {
+                let pos = PROPVARIANT::from(t);
+                unsafe { r.SetCurrentPosition(&GUID::zeroed(), &pos)? };
+            }
+        }
         Ok(())
     }
 
@@ -300,17 +400,21 @@ impl Decoder {
         // exactly k/60 s reads a hair early: allow a thousandth of a frame,
         // or every third frame of a 60 fps clip takes the previous one's
         // number (and the next number is skipped: judder).
-        let index = (((time - self.offset) as f64 / UNITS) * self.fps + 1e-3).floor().max(0.0) as u64;
+        let index = self.index_of(time);
         self.next_index = Some(index + 1);
         Ok(Some((index, sample)))
     }
 
     fn read_sample(&mut self) -> Result<Option<(i64, IMFSample)>> {
+        let reader = match &mut self.src {
+            Source::Direct(d) => return d.read(),
+            Source::Reader(r) => r,
+        };
         loop {
             let mut flags = 0u32;
             let mut time = 0i64;
             let mut sample = None;
-            unsafe { self.reader.ReadSample(STREAM, 0, None, Some(&mut flags), Some(&mut time), Some(&mut sample))? };
+            unsafe { reader.ReadSample(STREAM, 0, None, Some(&mut flags), Some(&mut time), Some(&mut sample))? };
             if flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32 != 0 {
                 return Ok(None);
             }

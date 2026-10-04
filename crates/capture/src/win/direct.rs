@@ -1,8 +1,15 @@
-//! Prototype: frames handed straight to the H.264 decoder, read from the
-//! file by our own index (`mp4read`), skipping Media Foundation's file reader
-//! and its seek. Being measured against `decode::Decoder` (decode_bench
-//! `DIRECT=1`) before anything uses it.
+//! Frames handed straight to the H.264 decoder, read from the file by our own
+//! index (`mp4read`), instead of through Media Foundation's file reader. A
+//! jump to a keyframe takes ~5 ms this way, ~45 through the reader (whose seek
+//! is most of it); halfway between keyframes about half as long. Pictures are
+//! the same, bit for bit (checked against ffmpeg and the reader:
+//! decode_bench `VERIFY=1`).
+//!
+//! The decoder is Media Foundation's H.264 decoder on the GPU (DXVA), the one
+//! the reader uses too. Without reordered frames (no B-frames, as recorded) it
+//! runs in low-latency mode: each frame comes out as soon as it's decoded.
 
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::mem::ManuallyDrop;
@@ -12,49 +19,58 @@ use anyhow::{Context, Result, bail};
 use windows::Win32::Media::MediaFoundation::*;
 use windows::core::Interface;
 
-use super::d3d::Gpu;
 use super::mp4read::Index;
-use super::system::{com_init, mf_startup};
 
-pub struct Direct {
-    gpu: Gpu,
-    _manager: IMFDXGIDeviceManager,
+/// Media Foundation's time unit: 100 ns.
+const UNITS: i64 = 10_000_000;
+/// Frames decoded ahead while reading in order, so the GPU decodes the next
+/// while the caller converts this one, as the file reader does. Whether it
+/// helps is still to be measured on a quiet machine (with a game running,
+/// in-order reading was 1.6-2× slower than the reader's either way).
+const AHEAD: usize = 3;
+
+pub(crate) struct Stream {
     mft: IMFTransform,
-    pub index: Index,
+    pub(crate) index: Index,
     file: File,
-    /// The decoder works on the GPU (DXVA), not in software.
-    pub on_gpu: bool,
+    /// The next sample (decode order) to hand the decoder.
+    next: usize,
+    /// Told the decoder there's no more input (at the end of the file).
+    drained: bool,
+    /// Sample (decode order) of each keyframe, ascending.
+    keys: Vec<usize>,
+    /// A frame's length in 100 ns, for sample durations.
+    frame_units: i64,
+    /// Frames come out in a different order than they go in (B-frames).
+    reordered: bool,
+    /// Decoded, not yet handed out.
+    ahead: VecDeque<(i64, IMFSample)>,
+    /// Reads since the last seek: from a few on, reading is in order.
+    streak: u32,
 }
 
-unsafe impl Send for Direct {}
-
-impl Direct {
-    pub fn open(path: &Path, low_latency: bool) -> Result<Self> {
-        com_init();
-        mf_startup()?;
+impl Stream {
+    /// The decoder for `path`'s video, on the GPU of `manager`.
+    pub(crate) fn open(path: &Path, manager: &IMFDXGIDeviceManager) -> Result<Self> {
         let index = Index::read(path)?;
-        let gpu = Gpu::new()?;
+        if index.samples.is_empty() {
+            bail!("no video frames");
+        }
+        let reordered = index.samples.windows(2).any(|w| w[1].pts < w[0].pts);
         unsafe {
-            let mut token = 0u32;
-            let mut manager = None;
-            MFCreateDXGIDeviceManager(&mut token, &mut manager)?;
-            let manager = manager.context("no device manager")?;
-            manager.ResetDevice(&gpu.device, token)?;
-
             let input = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: MFVideoFormat_H264 };
             let mut list = std::ptr::null_mut();
             let mut count = 0u32;
             let flags = MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_LOCALMFT | MFT_ENUM_FLAG_SORTANDFILTER;
             MFTEnumEx(MFT_CATEGORY_VIDEO_DECODER, flags, Some(&input), None, &mut list, &mut count)?;
             let found = super::h264::take_activates(list, count);
-            let activate = found.first().context("no H.264 decoder")?;
-            let mft: IMFTransform = activate.ActivateObject()?;
+            let mft: IMFTransform = found.first().context("no H.264 decoder")?.ActivateObject()?;
             let attrs = mft.GetAttributes()?;
-            let on_gpu = attrs.GetUINT32(&MF_SA_D3D11_AWARE).unwrap_or(0) != 0;
-            if on_gpu {
-                mft.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, manager.as_raw() as usize)?;
+            if attrs.GetUINT32(&MF_SA_D3D11_AWARE).unwrap_or(0) == 0 {
+                bail!("the H.264 decoder can't use the graphics card");
             }
-            if low_latency {
+            mft.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, manager.as_raw() as usize)?;
+            if !reordered {
                 attrs.SetUINT32(&MF_LOW_LATENCY, 1)?;
             }
             let t = MFCreateMediaType()?;
@@ -62,24 +78,115 @@ impl Direct {
             t.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
             t.SetUINT64(&MF_MT_FRAME_SIZE, (index.width as u64) << 32 | index.height as u64)?;
             t.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
-            mft.SetInputType(0, &t, 0).context("the decoder rejected the input")?;
+            mft.SetInputType(0, &t, 0).context("the decoder rejected the video")?;
             set_nv12(&mft)?;
             mft.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)?;
             mft.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
-            Ok(Self { gpu, _manager: manager, mft, file: File::open(path)?, index, on_gpu })
+            let keys = index.keyframes();
+            if keys.first() != Some(&0) {
+                bail!("the video doesn't start with a keyframe");
+            }
+            let frame_units = (index.samples.len() > 1)
+                .then(|| (index.samples[1].pts - index.samples[0].pts).abs() * UNITS / index.timescale.max(1) as i64)
+                .filter(|&d| d > 0)
+                .unwrap_or(UNITS / 60);
+            Ok(Self { mft, file: File::open(path)?, index, next: 0, drained: false, keys, frame_units, reordered, ahead: VecDeque::new(), streak: 0 })
         }
     }
 
-    /// Decode the keyframe `sample` (an index into `index.samples`) on its own,
-    /// waiting until the GPU has finished it.
-    pub fn keyframe(&mut self, sample: usize) -> Result<IMFSample> {
-        let s = self.index.samples[sample];
+    /// Frames per second, from the frame times (the caller usually knows better).
+    pub(crate) fn fps(&self) -> f64 {
+        UNITS as f64 / self.frame_units as f64
+    }
+
+    fn time_of(&self, sample: usize) -> i64 {
+        self.index.samples[sample].pts * UNITS / self.index.timescale.max(1) as i64
+    }
+
+    /// The keyframe (sample) to start from for time `t` (100 ns): the last one
+    /// at or before it.
+    fn key_for(&self, t: i64) -> usize {
+        let k = self.keys.partition_point(|&k| self.time_of(k) <= t);
+        self.keys[k.saturating_sub(1)]
+    }
+
+    /// Whether reaching time `t` from time `from` (the next frame's) is
+    /// cheaper decoding on than starting again from `t`'s keyframe: unless
+    /// `t` is past the next keyframe, decoding on wins (a restart costs a few
+    /// ms, a frame ~1.5).
+    pub(crate) fn decode_on(&self, from: i64, t: i64) -> bool {
+        from <= t && self.time_of(self.key_for(t)) <= from + 3 * self.frame_units
+    }
+
+    /// Start again from the keyframe at or before time `t` (100 ns).
+    pub(crate) fn seek(&mut self, t: i64) -> Result<()> {
+        unsafe { self.mft.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0)? };
+        if self.drained {
+            unsafe { self.mft.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)? };
+            self.drained = false;
+        }
+        self.next = self.key_for(t);
+        self.ahead.clear();
+        self.streak = 0;
+        Ok(())
+    }
+
+    /// The time of the frame the next read returns, when that's known
+    /// without decoding it (frames not reordered); `i64::MAX` at the end.
+    pub(crate) fn upcoming(&self) -> Option<i64> {
+        if let Some((t, _)) = self.ahead.front() {
+            return Some(*t);
+        }
+        if self.reordered {
+            return None;
+        }
+        Some(if self.next < self.index.samples.len() { self.time_of(self.next) } else { i64::MAX })
+    }
+
+    /// The next decoded frame in presentation order: (time in 100 ns, sample
+    /// holding its texture). `None` at the end.
+    pub(crate) fn read(&mut self) -> Result<Option<(i64, IMFSample)>> {
+        self.streak += 1;
+        if self.streak >= 3 {
+            while self.ahead.len() < AHEAD {
+                match self.decode_one()? {
+                    Some(f) => self.ahead.push_back(f),
+                    None => break,
+                }
+            }
+        }
+        match self.ahead.pop_front() {
+            Some(f) => Ok(Some(f)),
+            None => self.decode_one(),
+        }
+    }
+
+    fn decode_one(&mut self) -> Result<Option<(i64, IMFSample)>> {
+        loop {
+            if let Some(out) = self.output()? {
+                return Ok(Some((unsafe { out.GetSampleTime()? }, out)));
+            }
+            if self.next < self.index.samples.len() {
+                if self.feed(self.next)? {
+                    self.next += 1;
+                }
+            } else if !self.drained {
+                unsafe { self.mft.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0)? };
+                self.drained = true;
+            } else {
+                return Ok(None);
+            }
+        }
+    }
+
+    /// Hand sample `i` to the decoder; false if it wants its output taken first.
+    fn feed(&mut self, i: usize) -> Result<bool> {
+        let s = self.index.samples[i];
         let mut data = vec![0u8; s.size as usize];
         self.file.seek(SeekFrom::Start(s.offset))?;
         self.file.read_exact(&mut data)?;
-        let annexb = self.annexb(&data, true);
+        let annexb = annexb(&self.index, &data, s.key);
         unsafe {
-            self.mft.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0)?;
             let input = MFCreateSample()?;
             let buffer = MFCreateMemoryBuffer(annexb.len() as u32)?;
             let mut ptr = std::ptr::null_mut();
@@ -88,153 +195,17 @@ impl Direct {
             buffer.Unlock()?;
             buffer.SetCurrentLength(annexb.len() as u32)?;
             input.AddBuffer(&buffer)?;
-            input.SetSampleTime(s.pts * 10_000_000 / self.index.timescale as i64)?;
-            input.SetSampleDuration(10_000_000 / 60)?;
-            input.SetUINT32(&MFSampleExtension_CleanPoint, 1)?;
-            self.mft.ProcessInput(0, &input, 0)?;
-            let mut drained = false;
-            loop {
-                if let Some(out) = self.output()? {
-                    self.gpu.wait_idle()?;
-                    return Ok(out);
-                }
-                if drained {
-                    bail!("the decoder gave nothing back");
-                }
-                self.mft.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0)?;
-                drained = true;
+            input.SetSampleTime(self.time_of(i))?;
+            input.SetSampleDuration(self.frame_units)?;
+            if s.key {
+                input.SetUINT32(&MFSampleExtension_CleanPoint, 1)?;
+            }
+            match self.mft.ProcessInput(0, &input, 0) {
+                Ok(()) => Ok(true),
+                Err(e) if e.code() == MF_E_NOTACCEPTING => Ok(false),
+                Err(e) => Err(e.into()),
             }
         }
-    }
-
-    /// Decode sample `target` (decode order): from the keyframe before it,
-    /// every frame up to it, keeping the last. Waits until the GPU is done.
-    pub fn frame(&mut self, target: usize) -> Result<IMFSample> {
-        let key = (0..=target).rev().find(|&i| self.index.samples[i].key).context("no keyframe before it")?;
-        unsafe { self.mft.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0)? };
-        // One read for the whole stretch: our files keep a GOP's frames together.
-        let (first, last) = (self.index.samples[key], self.index.samples[target]);
-        let contiguous = last.offset >= first.offset;
-        let span = if contiguous { (last.offset + last.size as u64 - first.offset) as usize } else { 0 };
-        let mut block = vec![0u8; span];
-        if contiguous {
-            self.file.seek(SeekFrom::Start(first.offset))?;
-            self.file.read_exact(&mut block)?;
-        }
-        let mut out = None;
-        for i in key..=target {
-            let s = self.index.samples[i];
-            let data = if contiguous && s.offset >= first.offset && ((s.offset - first.offset) as usize + s.size as usize) <= span {
-                let at = (s.offset - first.offset) as usize;
-                block[at..at + s.size as usize].to_vec()
-            } else {
-                let mut d = vec![0u8; s.size as usize];
-                self.file.seek(SeekFrom::Start(s.offset))?;
-                self.file.read_exact(&mut d)?;
-                d
-            };
-            let annexb = self.annexb(&data, i == key);
-            unsafe {
-                let input = MFCreateSample()?;
-                let buffer = MFCreateMemoryBuffer(annexb.len() as u32)?;
-                let mut ptr = std::ptr::null_mut();
-                buffer.Lock(&mut ptr, None, None)?;
-                std::ptr::copy_nonoverlapping(annexb.as_ptr(), ptr, annexb.len());
-                buffer.Unlock()?;
-                buffer.SetCurrentLength(annexb.len() as u32)?;
-                input.AddBuffer(&buffer)?;
-                input.SetSampleTime(s.pts * 10_000_000 / self.index.timescale as i64)?;
-                input.SetSampleDuration(10_000_000 / 60)?;
-                loop {
-                    match self.mft.ProcessInput(0, &input, 0) {
-                        Ok(()) => break,
-                        Err(e) if e.code() == MF_E_NOTACCEPTING => {
-                            if let Some(o) = self.output()? {
-                                out = Some(o);
-                            }
-                        }
-                        Err(e) => return Err(e.into()),
-                    }
-                }
-                while let Some(o) = self.output()? {
-                    out = Some(o);
-                }
-            }
-        }
-        if out.is_none() {
-            unsafe { self.mft.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0)? };
-            while let Some(o) = self.output()? {
-                out = Some(o);
-            }
-        }
-        self.gpu.wait_idle()?;
-        out.context("the decoder gave nothing back")
-    }
-
-    /// The decoded picture's NV12 bytes (rows packed, cropped to the video).
-    pub fn read_nv12(&self, sample: &IMFSample) -> Result<Vec<u8>> {
-        use windows::Win32::Graphics::Direct3D11::*;
-        unsafe {
-            let buffer = sample.GetBufferByIndex(0)?;
-            let dxgi: IMFDXGIBuffer = buffer.cast()?;
-            let mut texture: Option<ID3D11Texture2D> = None;
-            dxgi.GetResource(&ID3D11Texture2D::IID, &mut texture as *mut _ as *mut _)?;
-            let texture = texture.context("no texture")?;
-            let slice = dxgi.GetSubresourceIndex()?;
-            let mut desc = D3D11_TEXTURE2D_DESC::default();
-            texture.GetDesc(&mut desc);
-            let staging_desc = D3D11_TEXTURE2D_DESC {
-                ArraySize: 1,
-                MipLevels: 1,
-                Usage: D3D11_USAGE_STAGING,
-                BindFlags: 0,
-                CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
-                MiscFlags: 0,
-                ..desc
-            };
-            let mut staging = None;
-            self.gpu.device.CreateTexture2D(&staging_desc, None, Some(&mut staging))?;
-            let staging = staging.context("no staging texture")?;
-            self.gpu.context.CopySubresourceRegion(&staging, 0, 0, 0, 0, &texture, slice, None);
-            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-            self.gpu.context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
-            let (w, h) = (self.index.width as usize, self.index.height as usize);
-            let pitch = mapped.RowPitch as usize;
-            let base = mapped.pData as *const u8;
-            let mut out = Vec::with_capacity(w * h * 3 / 2);
-            for y in 0..h {
-                out.extend_from_slice(std::slice::from_raw_parts(base.add(y * pitch), w));
-            }
-            // The chroma plane starts after the texture's full (maybe padded) height.
-            let uv = base.add(desc.Height as usize * pitch);
-            for y in 0..h / 2 {
-                out.extend_from_slice(std::slice::from_raw_parts(uv.add(y * pitch), w));
-            }
-            self.gpu.context.Unmap(&staging, 0);
-            Ok(out)
-        }
-    }
-
-    /// The decoder's input: NAL units with start codes, the SPS/PPS first on a keyframe.
-    fn annexb(&self, avcc: &[u8], key: bool) -> Vec<u8> {
-        let mut out = Vec::with_capacity(avcc.len() + 64);
-        if key {
-            for p in self.index.sps.iter().chain(&self.index.pps) {
-                out.extend_from_slice(&[0, 0, 0, 1]);
-                out.extend_from_slice(p);
-            }
-        }
-        let n = self.index.nal_length;
-        let mut at = 0;
-        while at + n <= avcc.len() {
-            let len = avcc[at..at + n].iter().fold(0usize, |a, &b| a << 8 | b as usize);
-            at += n;
-            let end = (at + len).min(avcc.len());
-            out.extend_from_slice(&[0, 0, 0, 1]);
-            out.extend_from_slice(&avcc[at..end]);
-            at = end;
-        }
-        out
     }
 
     fn output(&self) -> Result<Option<IMFSample>> {
@@ -242,14 +213,10 @@ impl Direct {
             loop {
                 let info = self.mft.GetOutputStreamInfo(0)?;
                 let provides = info.dwFlags & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES.0) as u32 != 0;
-                let own = if provides {
-                    None
-                } else {
-                    let s = MFCreateSample()?;
-                    s.AddBuffer(&MFCreateMemoryBuffer(info.cbSize.max(1))?)?;
-                    Some(s)
-                };
-                let mut buf = [MFT_OUTPUT_DATA_BUFFER { dwStreamID: 0, pSample: ManuallyDrop::new(own), dwStatus: 0, pEvents: ManuallyDrop::new(None) }];
+                if !provides {
+                    bail!("the decoder doesn't hand out GPU frames");
+                }
+                let mut buf = [MFT_OUTPUT_DATA_BUFFER { dwStreamID: 0, pSample: ManuallyDrop::new(None), dwStatus: 0, pEvents: ManuallyDrop::new(None) }];
                 let mut status = 0u32;
                 let result = self.mft.ProcessOutput(0, &mut buf, &mut status);
                 let sample = ManuallyDrop::take(&mut buf[0].pSample);
@@ -263,6 +230,28 @@ impl Direct {
             }
         }
     }
+}
+
+/// The decoder's input: NAL units with start codes, the SPS/PPS first on a keyframe.
+fn annexb(index: &Index, avcc: &[u8], key: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(avcc.len() + 64);
+    if key {
+        for p in index.sps.iter().chain(&index.pps) {
+            out.extend_from_slice(&[0, 0, 0, 1]);
+            out.extend_from_slice(p);
+        }
+    }
+    let n = index.nal_length;
+    let mut at = 0;
+    while at + n <= avcc.len() {
+        let len = avcc[at..at + n].iter().fold(0usize, |a, &b| a << 8 | b as usize);
+        at += n;
+        let end = (at + len).min(avcc.len());
+        out.extend_from_slice(&[0, 0, 0, 1]);
+        out.extend_from_slice(&avcc[at..end]);
+        at = end;
+    }
+    out
 }
 
 fn set_nv12(mft: &IMFTransform) -> Result<()> {

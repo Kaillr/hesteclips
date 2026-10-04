@@ -33,6 +33,9 @@ pub struct Index {
     pub nal_length: usize,
     pub sps: Vec<Vec<u8>>,
     pub pps: Vec<Vec<u8>>,
+    /// The colour matrix the file states (`colr` box, ISO 23091-2 numbers:
+    /// 1 BT.709, 5/6 BT.601), if it does.
+    pub matrix: Option<u16>,
 }
 
 impl Index {
@@ -71,6 +74,7 @@ fn parse_video(mdia: &[u8]) -> Result<Index> {
     ensure!(body.len() >= 78, "short sample entry");
     let (width, height) = (be16(&body[24..]) as u32, be16(&body[26..]) as u32);
     let avcc = child(&body[78..], b"avcC").context("no avcC")?;
+    let matrix = child(&body[78..], b"colr").filter(|c| c.get(..4) == Some(b"nclx") && c.len() >= 10).map(|c| be16(&c[8..]));
     ensure!(avcc.len() >= 7, "short avcC");
     let nal_length = (avcc[4] & 3) as usize + 1;
     let mut at = 6;
@@ -152,7 +156,7 @@ fn parse_video(mdia: &[u8]) -> Result<Index> {
             key: keys.as_ref().is_none_or(|k| k.binary_search(&(i as u32 + 1)).is_ok()),
         })
         .collect();
-    Ok(Index { width, height, timescale, samples, nal_length, sps, pps })
+    Ok(Index { width, height, timescale, samples, nal_length, sps, pps, matrix })
 }
 
 /// A top-level box's body, read into memory.
