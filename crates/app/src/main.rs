@@ -359,6 +359,11 @@ impl App {
         if let Some(clip) = std::env::var_os("HESTECLIPS_DEMO_RENAME").map(PathBuf::from) {
             app.rename_clip(clip);
         }
+        // `HESTECLIPS_DEMO_PREBUILD=<clip>` builds its scrub frames in the
+        // background at launch, as after saving it.
+        if let Some(clip) = std::env::var_os("HESTECLIPS_DEMO_PREBUILD").map(PathBuf::from) {
+            proxy::prebuild(&app.ctx(), &clip);
+        }
         // `HESTECLIPS_OPEN_SOURCES=1` opens on the Sources page.
         let open_sources = std::env::var_os("HESTECLIPS_OPEN_SOURCES").is_some();
         if open_sources {
@@ -936,6 +941,7 @@ impl App {
             let job = self.renders.remove(i);
             match result {
                 Ok(path) => {
+                    proxy::prebuild(&self.ctx(), &path);
                     // Highlight the card that changed: the new clip, or the edited one.
                     let card = if job.as_new { path } else { job.source };
                     self.last_saved = Some((card, Instant::now()));
@@ -1078,6 +1084,8 @@ impl App {
                 Evt::Saved(path) => {
                     self.saving = self.saving.saturating_sub(1);
                     self.toast(format!("Saved {}", file_name(&path)));
+                    // Scrub frames ready before it's opened.
+                    proxy::prebuild(&self.ctx(), &path);
                     self.last_saved = Some((path, Instant::now()));
                     self.refresh_clips();
                 }

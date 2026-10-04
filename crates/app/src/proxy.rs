@@ -12,12 +12,20 @@
 //! tested; slowing down left most of a long clip unscrubbable for a minute). It used
 //! to be an ffmpeg process decoding every full-size frame in software on every
 //! core, which is still the fallback (and elsewhere).
+//!
+//! A clip just saved gets its proxy built in the background ([`prebuild`]),
+//! gently (two compressing threads, paused while any clip is open), and every
+//! finished proxy is kept on disk (`cache`), so a clip opens fully scrubbable.
+//! A player opening a clip whose build is under way joins it at full speed:
+//! one build per clip, never two decoders on it (they slow each other down).
 
+use std::collections::HashMap;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 
 /// JPEG quality of proxy frames. From 90 up the encoder keeps colour at full
 /// resolution (below, at half: greys shifted, a 2E3238 came back 2E313A),
@@ -65,53 +73,191 @@ impl Store {
     }
 }
 
-pub struct Proxy {
-    frames: Arc<Mutex<Store>>,
+/// One clip's proxy, being built or built: shared by every player showing
+/// the clip and by the background builder.
+struct Build {
+    source: PathBuf,
+    fps: f64,
+    total: usize,
+    frames: Mutex<Store>,
     /// The frame the player is at: the build works outward from here.
-    focus: Arc<std::sync::atomic::AtomicU64>,
+    focus: AtomicU64,
+    stop: AtomicBool,
+    /// Players showing it. With none it's a background build: gentle.
+    watchers: AtomicUsize,
+    /// Keep building with nobody watching (a clip just saved).
+    background: AtomicBool,
+    /// Every frame built, so it can be kept.
+    complete: AtomicBool,
+    /// The pass ended (complete, stopped or failed).
+    done: AtomicBool,
     /// The ffmpeg pass, when that's the way it's built.
-    child: Arc<Mutex<Option<Child>>>,
-    stop: Arc<AtomicBool>,
+    child: Mutex<Option<Child>>,
+    /// Where it's kept once complete; `None` if the file can't be keyed.
+    cache: Option<PathBuf>,
+}
+
+impl Build {
+    fn watched(&self) -> bool {
+        self.watchers.load(Ordering::Relaxed) > 0
+    }
+
+    /// Nobody wants it any more: stop building.
+    fn stop_if_unwanted(&self) {
+        if self.watched() || self.background.load(Ordering::Relaxed) {
+            return;
+        }
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(mut c) = self.child.lock().unwrap().take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+
+    /// The pass ended: keep the proxy if every frame is in.
+    fn finish(&self) {
+        let complete = self.complete.load(Ordering::Relaxed) && !self.stop.load(Ordering::Relaxed);
+        if let (true, Some(path)) = (complete, &self.cache) {
+            let t = std::time::Instant::now();
+            let f = self.frames.lock().unwrap();
+            match cache::save(path, &f) {
+                Err(e) => eprintln!("scrub proxy: couldn't keep it: {e}"),
+                Ok(()) if std::env::var_os("HESTECLIPS_DEBUG_VIDEO").is_some() => {
+                    eprintln!("{:>8.3} scrub proxy: kept on disk in {:.0} ms", crate::player::uptime(), t.elapsed().as_secs_f64() * 1000.0);
+                }
+                Ok(()) => {}
+            }
+        }
+        self.done.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Builds under way or in use, by cache key (one per clip).
+static BUILDS: Mutex<Option<HashMap<u64, Weak<Build>>>> = Mutex::new(None);
+
+/// While anyone watches a build, background builds wait (the decoder is
+/// theirs, and the CPU mostly is).
+fn anyone_watching() -> bool {
+    let builds = BUILDS.lock().unwrap();
+    builds.as_ref().is_some_and(|m| m.values().filter_map(Weak::upgrade).any(|b| b.watched() && !b.done.load(Ordering::Relaxed)))
+}
+
+/// The clip's build: the one under way, else a new one (from the cache if
+/// it's kept there).
+fn shared_build(ctx: &egui::Context, source: &Path, fps: f64, total: usize, background: bool) -> Arc<Build> {
+    let key = cache::key(source, fps, total);
+    let mut builds = BUILDS.lock().unwrap();
+    let map = builds.get_or_insert_with(HashMap::new);
+    map.retain(|_, b| b.strong_count() > 0);
+    if let Some(b) = key.and_then(|k| map.get(&k)).and_then(Weak::upgrade).filter(|b| !b.stop.load(Ordering::Relaxed)) {
+        if background {
+            b.background.store(true, Ordering::Relaxed);
+        }
+        return b;
+    }
+    let b = Arc::new(Build {
+        source: source.to_path_buf(),
+        fps,
+        total,
+        frames: Mutex::new(Store::default()),
+        focus: AtomicU64::new(0),
+        stop: AtomicBool::new(false),
+        watchers: AtomicUsize::new(0),
+        background: AtomicBool::new(background),
+        complete: AtomicBool::new(false),
+        done: AtomicBool::new(false),
+        child: Mutex::new(None),
+        cache: key.map(cache::path),
+    });
+    if let Some(k) = key {
+        map.insert(k, Arc::downgrade(&b));
+    }
+    drop(builds);
+    let (ctx, b2) = (ctx.clone(), b.clone());
+    // Opening a decoder takes a few hundred ms: not on the UI thread.
+    std::thread::spawn(move || start(&ctx, &b2));
+    b
+}
+
+fn start(ctx: &egui::Context, b: &Arc<Build>) {
+    if let Some(path) = &b.cache {
+        let t = std::time::Instant::now();
+        if let Some(store) = cache::load(path, b.total) {
+            if std::env::var_os("HESTECLIPS_DEBUG_VIDEO").is_some() {
+                eprintln!("{:>8.3} scrub proxy: {} frames from the cache in {:.0} ms", crate::player::uptime(), store.ready, t.elapsed().as_secs_f64() * 1000.0);
+            }
+            *b.frames.lock().unwrap() = store;
+            b.done.store(true, Ordering::Relaxed);
+            ctx.request_repaint();
+            return;
+        }
+    }
+    #[cfg(windows)]
+    if std::env::var_os("HESTECLIPS_NO_HW_DECODE").is_none() && hw::build(ctx, b) {
+        return;
+    }
+    let mut slot = b.child.lock().unwrap();
+    *slot = start_ffmpeg(ctx, b);
+    if slot.is_none() {
+        b.done.store(true, Ordering::Relaxed);
+    }
+    // Closed while it started: the drop already ran, so stop it here.
+    if b.stop.load(Ordering::Relaxed) {
+        if let Some(mut c) = slot.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+}
+
+/// Build `source`'s proxy in the background and keep it, unless it's kept
+/// already: one clip at a time, in the order asked.
+pub fn prebuild(ctx: &egui::Context, source: &Path) {
+    static QUEUE: std::sync::OnceLock<Mutex<std::sync::mpsc::Sender<PathBuf>>> = std::sync::OnceLock::new();
+    let queue = QUEUE.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<PathBuf>();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            for source in rx {
+                // The same numbers a player opening it uses.
+                let Ok(info) = media::probe(&source) else { continue };
+                let total = (info.duration * info.fps).floor() as usize;
+                if cache::key(&source, info.fps, total).is_some_and(|k| cache::path(k).exists()) {
+                    continue;
+                }
+                let b = shared_build(&ctx, &source, info.fps, total, true);
+                while !b.done.load(Ordering::Relaxed) && !b.stop.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+                b.background.store(false, Ordering::Relaxed);
+                b.stop_if_unwanted();
+            }
+        });
+        Mutex::new(tx)
+    });
+    let _ = queue.lock().unwrap().send(source.to_path_buf());
+}
+
+pub struct Proxy {
+    build: Arc<Build>,
 }
 
 impl Proxy {
     /// Every one of the `total` frames of `source`, numbered at `fps`.
     pub fn build(ctx: &egui::Context, source: &Path, fps: f64, total: usize) -> Self {
-        let proxy = Self {
-            frames: Arc::new(Mutex::new(Store::default())),
-            focus: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            child: Arc::new(Mutex::new(None)),
-            stop: Arc::new(AtomicBool::new(false)),
-        };
-        let (frames, child, stop, focus) = (proxy.frames.clone(), proxy.child.clone(), proxy.stop.clone(), proxy.focus.clone());
-        let (ctx, source) = (ctx.clone(), source.to_path_buf());
-        // Opening a decoder takes a few hundred ms: not on the UI thread.
-        std::thread::spawn(move || {
-            #[cfg(windows)]
-            if std::env::var_os("HESTECLIPS_NO_HW_DECODE").is_none() && hw::build(&ctx, &source, fps, total, &frames, &focus, &stop) {
-                return;
-            }
-            let mut slot = child.lock().unwrap();
-            *slot = start_ffmpeg(&ctx, &source, fps, width_for(total), &frames);
-            // Closed while it started: the drop already ran, so stop it here.
-            if stop.load(Ordering::Relaxed) {
-                if let Some(mut c) = slot.take() {
-                    let _ = c.kill();
-                    let _ = c.wait();
-                }
-            }
-        });
-        proxy
+        let build = shared_build(ctx, source, fps, total, false);
+        build.watchers.fetch_add(1, Ordering::Relaxed);
+        Self { build }
     }
 
     /// How many frames are ready.
     pub fn ready(&self) -> usize {
-        self.frames.lock().map_or(0, |f| f.ready)
+        self.build.frames.lock().map_or(0, |f| f.ready)
     }
 
     /// Which of `n` evenly spaced frames from `first` to `last` are built.
     pub fn built(&self, first: u64, last: u64, n: usize) -> Vec<bool> {
-        let Ok(f) = self.frames.lock() else { return vec![false; n] };
+        let Ok(f) = self.build.frames.lock() else { return vec![false; n] };
         (0..n)
             .map(|k| {
                 let i = first + (last.saturating_sub(first) as f64 * (k as f64 + 0.5) / n.max(1) as f64) as u64;
@@ -122,13 +268,13 @@ impl Proxy {
 
     /// The player is at frame `idx`: build around here next.
     pub fn set_focus(&self, idx: u64) {
-        self.focus.store(idx, Ordering::Relaxed);
+        self.build.focus.store(idx, Ordering::Relaxed);
     }
 
     /// The built frame nearest `idx`, at most `within` frames away (ties go
     /// to the earlier one): a stand-in while `idx` itself isn't built yet.
     pub fn nearest(&self, idx: u64, within: u64) -> Option<u64> {
-        let f = self.frames.lock().ok()?;
+        let f = self.build.frames.lock().ok()?;
         let built = |i: u64| f.frames.get(i as usize).is_some_and(Option::is_some);
         (0..=within).find_map(|d| {
             if idx >= d && built(idx - d) {
@@ -143,19 +289,26 @@ impl Proxy {
 
     /// Decode proxy frame `idx`, if it's been built yet.
     pub fn frame(&self, idx: u64) -> Option<egui::ColorImage> {
-        let jpeg = self.frames.lock().ok()?.frames.get(idx as usize)?.clone()?;
+        let jpeg = self.build.frames.lock().ok()?.frames.get(idx as usize)?.clone()?;
         let img = image::load_from_memory_with_format(&jpeg, image::ImageFormat::Jpeg).ok()?.to_rgba8();
         Some(egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw()))
     }
 }
 
+impl Drop for Proxy {
+    fn drop(&mut self) {
+        self.build.watchers.fetch_sub(1, Ordering::Relaxed);
+        self.build.stop_if_unwanted();
+    }
+}
+
 /// The ffmpeg pass: every frame decoded in software, as an MJPEG stream.
-fn start_ffmpeg(ctx: &egui::Context, source: &Path, fps: f64, width: u32, frames: &Arc<Mutex<Store>>) -> Option<Child> {
+fn start_ffmpeg(ctx: &egui::Context, b: &Arc<Build>) -> Option<Child> {
     let mut child = media::ffmpeg_background()
         .args(["-hide_banner", "-loglevel", "error", "-i"])
-        .arg(source)
+        .arg(&b.source)
         // fps= pins one output frame per source frame index, even for VFR input.
-        .args(["-an", "-vf", &format!("fps={fps},scale={width}:-2:flags=lanczos,format=yuvj444p")])
+        .args(["-an", "-vf", &format!("fps={},scale={}:-2:flags=lanczos,format=yuvj444p", b.fps, width_for(b.total))])
         .args(["-c:v", "mjpeg", "-q:v", "2", "-f", "image2pipe", "-"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -163,19 +316,14 @@ fn start_ffmpeg(ctx: &egui::Context, source: &Path, fps: f64, width: u32, frames
         .spawn()
         .ok()?;
     let stdout = child.stdout.take()?;
-    let (frames, ctx) = (frames.clone(), ctx.clone());
-    std::thread::spawn(move || split_jpegs(stdout, &frames, &ctx));
+    let (b, ctx) = (b.clone(), ctx.clone());
+    std::thread::spawn(move || {
+        split_jpegs(stdout, &b.frames, &ctx);
+        let ready = b.frames.lock().map_or(0, |f| f.ready);
+        b.complete.store(ready >= b.total, Ordering::Relaxed);
+        b.finish();
+    });
     Some(child)
-}
-
-impl Drop for Proxy {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(mut c) = self.child.lock().unwrap().take() {
-            let _ = c.kill();
-            let _ = c.wait();
-        }
-    }
 }
 
 /// Split an MJPEG byte stream into individual JPEGs (each SOI 0xFFD8 … EOI 0xFFD9).
@@ -236,7 +384,8 @@ mod hw {
     }
 
     /// Start building; false if the decoder can't open the clip.
-    pub fn build(ctx: &egui::Context, source: &Path, fps: f64, total: usize, frames: &Arc<Mutex<Store>>, focus: &Arc<std::sync::atomic::AtomicU64>, stop: &Arc<AtomicBool>) -> bool {
+    pub fn build(ctx: &egui::Context, b: &Arc<Build>) -> bool {
+        let (source, fps, total) = (&b.source, b.fps, b.total);
         let debug = std::env::var_os("HESTECLIPS_DEBUG_VIDEO").is_some();
         if debug {
             eprintln!("{:>8.3} scrub proxy: opening the decoder", crate::player::uptime());
@@ -257,8 +406,9 @@ mod hw {
         // then put back in order on another.
         let encoders = encoders();
         let (tx, jobs) = mpsc::sync_channel::<(u64, Job)>(encoders * 2);
-        let (stop_d, focus) = (stop.clone(), focus.clone());
+        let bd = b.clone();
         std::thread::spawn(move || {
+            let (stop_d, focus) = (&bd.stop, &bd.focus);
             lower_priority();
             let chunks = total.div_ceil(CHUNK);
             let mut built = vec![false; chunks];
@@ -273,7 +423,10 @@ mod hw {
             let mut carry: Option<Picture> = None;
             'chunks: while !stop_d.load(Ordering::Relaxed) {
                 let at = (focus.load(Ordering::Relaxed) as usize).min(total.saturating_sub(1)) / CHUNK;
-                let Some(c) = next_chunk(&built, at) else { break };
+                let Some(c) = next_chunk(&built, at) else {
+                    bd.complete.store(true, Ordering::Relaxed);
+                    break;
+                };
                 let (start, end) = (c * CHUNK, ((c + 1) * CHUNK).min(total));
                 if debug {
                     eprintln!("{:>8.3} scrub proxy: building frames {start}..{end}", crate::player::uptime());
@@ -287,8 +440,16 @@ mod hw {
                     eprintln!("{:>8.3} scrub proxy: first frame of {start} decoded in {:.0} ms", crate::player::uptime(), asked.elapsed().as_secs_f64() * 1000.0);
                 }
                 let mut got = first;
+                let mut n = 0u32;
                 loop {
                     crate::video::yield_to_urgent();
+                    // In the background: wait while any clip is open.
+                    if n % 16 == 0 && !bd.watched() {
+                        while anyone_watching() && !stop_d.load(Ordering::Relaxed) {
+                            std::thread::sleep(Duration::from_millis(100));
+                        }
+                    }
+                    n += 1;
                     match got {
                         Ok(Some(p)) if (p.index as usize) >= end => {
                             carry = Some(p);
@@ -330,11 +491,15 @@ mod hw {
         });
         let jobs = Arc::new(Mutex::new(jobs));
         let (done_tx, done) = mpsc::channel::<(u64, Done)>();
-        for _ in 0..encoders {
-            let (jobs, done_tx) = (jobs.clone(), done_tx.clone());
+        for k in 0..encoders {
+            let (jobs, done_tx, b) = (jobs.clone(), done_tx.clone(), b.clone());
             std::thread::spawn(move || {
                 lower_priority();
                 loop {
+                    // In the background only two compress.
+                    while k >= BACKGROUND_ENCODERS && !b.watched() && !b.stop.load(Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
                     let job = jobs.lock().unwrap().recv();
                     let Ok((seq, job)) = job else { return };
                     let out = match job {
@@ -348,9 +513,10 @@ mod hw {
             });
         }
         drop(done_tx);
-        let (frames, ctx, stop) = (frames.clone(), ctx.clone(), stop.clone());
+        let (b, ctx) = (b.clone(), ctx.clone());
         let started = std::time::Instant::now();
         std::thread::spawn(move || {
+            let (frames, stop) = (&b.frames, &b.stop);
             lower_priority();
             let mut last_repaint = std::time::Instant::now();
             let mut waiting = std::collections::BTreeMap::new();
@@ -392,7 +558,8 @@ mod hw {
                 }
                 // Otherwise at most every 100 ms, but always within it (a
                 // frame arriving while the mouse rests still gets shown).
-                if urgent_repaint || last_repaint.elapsed().as_millis() > 100 {
+                if !b.watched() {
+                } else if urgent_repaint || last_repaint.elapsed().as_millis() > 100 {
                     ctx.request_repaint();
                     last_repaint = std::time::Instant::now();
                 } else {
@@ -405,10 +572,15 @@ mod hw {
                 let bytes: usize = f.frames.iter().flatten().filter(|j| seen.insert(j.as_ptr())).map(|j| j.len()).sum();
                 eprintln!("scrub proxy: {} frames in {:.1} s, {} MB", f.ready, started.elapsed().as_secs_f64(), bytes / 1_000_000);
             }
+            b.finish();
             ctx.request_repaint();
         });
         true
     }
+
+    /// Compressing threads of a build nobody's watching (a clip just saved,
+    /// while you may be playing): a game keeps the rest of the CPU.
+    const BACKGROUND_ENCODERS: usize = 2;
 
     /// Frames per chunk: built one at a time, nearest the player first; one
     /// left half-built when the player moves to another not built yet.
@@ -479,6 +651,166 @@ mod hw {
         use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL};
         unsafe {
             let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        }
+    }
+}
+
+/// Finished proxies on disk, so a clip opens fully scrubbable: one file per
+/// clip (keyed by path, size, modification time and frame count, so an edited
+/// or replaced file gets a fresh one), the least recently opened dropped once
+/// they pass [`CAP`].
+mod cache {
+    use super::*;
+    use std::hash::{Hash, Hasher};
+    use std::io::Write;
+
+    /// Disk the kept proxies may take, in all.
+    const CAP: u64 = 5_000_000_000;
+    /// File format: magic, slot count, frame count, then each slot's frame
+    /// (`u32::MAX`: none), then each frame as length + JPEG.
+    const MAGIC: &[u8; 8] = b"HCPROXY1";
+
+    fn dir() -> PathBuf {
+        dirs::cache_dir().unwrap_or_else(std::env::temp_dir).join("hesteclips").join("proxy")
+    }
+
+    pub fn key(source: &Path, fps: f64, total: usize) -> Option<u64> {
+        let meta = std::fs::metadata(source).ok()?;
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (MAGIC, source, meta.len(), meta.modified().ok()?, fps.to_bits(), total, super::QUALITY).hash(&mut h);
+        Some(h.finish())
+    }
+
+    pub fn path(key: u64) -> PathBuf {
+        dir().join(format!("{key:016x}.proxy"))
+    }
+
+    pub fn save(path: &Path, store: &Store) -> std::io::Result<()> {
+        std::fs::create_dir_all(dir())?;
+        // Each frame once, however many slots show it.
+        let mut index = HashMap::<*const u8, u32>::new();
+        let mut unique: Vec<&Jpeg> = Vec::new();
+        let slots: Vec<u32> = store
+            .frames
+            .iter()
+            .map(|f| match f {
+                None => u32::MAX,
+                Some(j) => *index.entry(j.as_ptr()).or_insert_with(|| {
+                    unique.push(j);
+                    unique.len() as u32 - 1
+                }),
+            })
+            .collect();
+        let tmp = path.with_extension("partial");
+        {
+            let mut w = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(&tmp)?);
+            w.write_all(MAGIC)?;
+            w.write_all(&(slots.len() as u64).to_le_bytes())?;
+            w.write_all(&(unique.len() as u64).to_le_bytes())?;
+            for s in &slots {
+                w.write_all(&s.to_le_bytes())?;
+            }
+            for j in &unique {
+                w.write_all(&(j.len() as u32).to_le_bytes())?;
+                w.write_all(j)?;
+            }
+            w.flush()?;
+        }
+        std::fs::rename(&tmp, path)?;
+        evict();
+        Ok(())
+    }
+
+    /// The kept proxy at `path`, if there is a whole one for `total` frames.
+    pub fn load(path: &Path, total: usize) -> Option<Store> {
+        let bytes = std::fs::read(path).ok()?;
+        let store = parse(&bytes, total);
+        match &store {
+            // Just opened: the last to be dropped.
+            Some(_) => {
+                let _ = std::fs::File::options().write(true).open(path).and_then(|f| f.set_modified(std::time::SystemTime::now()));
+            }
+            None => {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+        store
+    }
+
+    fn parse(bytes: &[u8], total: usize) -> Option<Store> {
+        let mut at = 0usize;
+        let mut take = |n: usize| -> Option<&[u8]> {
+            let b = bytes.get(at..at.checked_add(n)?)?;
+            at += n;
+            Some(b)
+        };
+        if take(8)? != MAGIC {
+            return None;
+        }
+        let u64_at = |b: &[u8]| u64::from_le_bytes(b.try_into().unwrap());
+        let slots = u64_at(take(8)?) as usize;
+        let count = u64_at(take(8)?) as usize;
+        if slots != total {
+            return None;
+        }
+        let index: Vec<u32> = take(slots.checked_mul(4)?)?.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+        let mut unique: Vec<Jpeg> = Vec::with_capacity(count);
+        for _ in 0..count {
+            let len = u32::from_le_bytes(take(4)?.try_into().unwrap()) as usize;
+            unique.push(Arc::from(take(len)?));
+        }
+        let mut store = Store::default();
+        for (i, &u) in index.iter().enumerate() {
+            if u != u32::MAX {
+                store.set(i, unique.get(u as usize)?);
+            }
+        }
+        Some(store)
+    }
+
+    /// Drop the least recently opened until they fit in [`CAP`].
+    fn evict() {
+        let Ok(entries) = std::fs::read_dir(dir()) else { return };
+        let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = entries
+            .flatten()
+            .filter_map(|e| {
+                let m = e.metadata().ok()?;
+                Some((m.modified().ok()?, m.len(), e.path()))
+            })
+            .collect();
+        files.sort();
+        let mut total: u64 = files.iter().map(|f| f.1).sum();
+        for (_, len, path) in files {
+            if total <= CAP {
+                break;
+            }
+            if std::fs::remove_file(&path).is_ok() {
+                total -= len;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn kept_proxies_read_back() {
+            let j = |n: u8| -> Jpeg { Arc::from(vec![n, n, n]) };
+            let mut store = Store::default();
+            let a = j(1);
+            store.set(0, &a);
+            store.set(1, &a);
+            store.set(3, &j(2));
+            let path = std::env::temp_dir().join(format!("hesteclips-proxy-test-{}.proxy", std::process::id()));
+            save(&path, &store).unwrap();
+            let back = load(&path, 4).expect("reads back");
+            assert_eq!(back.ready, 3);
+            assert_eq!(back.frames[1].as_deref(), Some(&[1u8, 1, 1][..]));
+            assert!(back.frames[2].is_none());
+            assert!(Arc::ptr_eq(back.frames[0].as_ref().unwrap(), back.frames[1].as_ref().unwrap()), "one copy per frame");
+            assert!(load(&path, 5).is_none(), "another frame count isn't this clip's");
+            let _ = std::fs::remove_file(&path);
         }
     }
 }
