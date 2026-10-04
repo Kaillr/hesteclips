@@ -288,7 +288,8 @@ impl Ready {
         // Scroll over the picture or the timeline to scrub through the clip.
         let pointer = ctx.pointer_hover_pos();
         let over = pointer.is_some_and(|p| preview.contains(p) || outer.contains(p));
-        let input = if over { crate::wheel::read(&ctx).scroll } else { Vec2::ZERO };
+        let mut input = if over { crate::wheel::read(&ctx).scroll } else { Vec2::ZERO };
+        input.y += dev_wheel();
         // Down or left (towards you, or swiping left) goes forward, like reading on.
         let d = self.glide.step(&ctx, input);
         let px = -(d.x + d.y);
@@ -536,6 +537,23 @@ fn set_fullscreen(ctx: &egui::Context, on: bool) {
     if is_fullscreen(ctx) != on {
         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(on));
     }
+}
+
+/// Dev aid: `HESTECLIPS_DEV_WHEEL=3.0:-40,3.3:-40` scrolls by those points at
+/// those times (seconds since start), as wheel notches would, to reproduce
+/// wheel scrubbing without touching the mouse.
+fn dev_wheel() -> f32 {
+    static PLAN: std::sync::OnceLock<std::sync::Mutex<Vec<(f64, f32)>>> = std::sync::OnceLock::new();
+    let plan = PLAN.get_or_init(|| {
+        let spec = std::env::var("HESTECLIPS_DEV_WHEEL").unwrap_or_default();
+        let steps = spec.split(',').filter_map(|s| s.split_once(':')).filter_map(|(t, d)| Some((t.trim().parse().ok()?, d.trim().parse().ok()?))).collect();
+        std::sync::Mutex::new(steps)
+    });
+    let now = crate::player::uptime();
+    let mut plan = plan.lock().unwrap();
+    let due: f32 = plan.iter().filter(|(t, _)| *t <= now).map(|(_, d)| *d).sum();
+    plan.retain(|(t, _)| *t > now);
+    due
 }
 
 fn volume_id() -> egui::Id {

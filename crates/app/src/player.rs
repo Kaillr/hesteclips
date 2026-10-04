@@ -44,6 +44,7 @@ impl Video {
     fn take_exact(&self, _: u64) -> Option<Picture> { match *self {} }
     fn take_upto(&self, _: u64) -> Option<Picture> { match *self {} }
     fn has(&self, _: u64) -> bool { match *self {} }
+    fn open_for(&self) -> Option<std::time::Duration> { match *self {} }
 }
 
 /// `HESTECLIPS_DEBUG_VIDEO=1`: log what playback does, with times.
@@ -353,7 +354,11 @@ impl Player {
         let want = self.info.frame_index(self.time());
         // Waiting to start: the sound goes once the first frame is here.
         if let Some(since) = self.pending_start {
-            if v.has(want) || since.elapsed() >= START_WAIT {
+            // The wait counts from when the decoder opened (a few hundred ms
+            // after a clip opens), so picture and sound start together then
+            // too; at most 1.5 s in all.
+            let waited = v.open_for().map_or(std::time::Duration::ZERO, |open| open.min(since.elapsed()));
+            if v.has(want) || waited >= START_WAIT || since.elapsed() >= std::time::Duration::from_millis(1500) {
                 trace!("sound starts after {:.0} ms (frame ready: {})", since.elapsed().as_secs_f64() * 1000.0, v.has(want));
                 self.pending_start = None;
                 self.shared.playing.store(true, Ordering::Relaxed);
@@ -419,6 +424,10 @@ impl Player {
     #[cfg_attr(not(windows), allow(dead_code))]
     fn show_picture(&mut self, ctx: &egui::Context, p: Picture) {
         let idx = p.index;
+        let clock = self.info.frame_index(self.time());
+        if idx + 30 < clock || idx > clock + 30 {
+            trace!("WRONG FRAME on screen: {idx}, clock at {clock}");
+        }
         if let Some(at) = self.played_at.take() {
             trace!("first frame after play: {idx}, {:.0} ms after pressing", at.elapsed().as_secs_f64() * 1000.0);
         }

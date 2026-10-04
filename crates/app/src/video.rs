@@ -68,6 +68,12 @@ struct State {
     exact: Option<(u64, Picture)>,
     /// Opening failed or the decoder broke: use another way.
     failed: bool,
+    /// When the decoder opened (play waits for its first frame until then).
+    opened: Option<std::time::Instant>,
+    /// Bumped each time `play` throws the queue away (playing from somewhere
+    /// else): a frame the worker was already decoding for the old spot is
+    /// dropped instead of joining the queue.
+    generation: u64,
 }
 
 pub struct Video {
@@ -98,6 +104,7 @@ impl Video {
             let mut dec = match opened {
                 Ok(mut d) => {
                     d.set_fps(fps);
+                    shared.lock().unwrap().opened = Some(std::time::Instant::now());
                     d
                 }
                 Err(e) => {
@@ -121,6 +128,8 @@ impl Video {
             // frame showing at the gap is the one before it, so the same
             // number came back every time.)
             let mut positioned = false;
+            // The queue generation this worker is filling (see `State::generation`).
+            let mut generation = 0u64;
             let mut at_end = false;
             loop {
                 let room = {
@@ -183,6 +192,7 @@ impl Video {
                         Cmd::Play(i) => {
                             playing = true;
                             let mut s = shared.lock().unwrap();
+                            generation = s.generation;
                             drop_superseded(&mut s.ahead, i);
                             // Carries on from what's decoded, unless that's from
                             // somewhere else (after a gap, the next frame can be
@@ -206,7 +216,12 @@ impl Video {
                 match got {
                     Ok(Some(p)) => {
                         next = p.index + 1;
-                        shared.lock().unwrap().ahead.push_back(p);
+                        let mut s = shared.lock().unwrap();
+                        // Decoded for a spot `play` has since moved away from.
+                        if s.generation == generation {
+                            s.ahead.push_back(p);
+                        }
+                        drop(s);
                         if playing {
                             ctx.request_repaint();
                         }
@@ -230,8 +245,24 @@ impl Video {
     }
 
     /// Start delivering frames from `i` on.
+    /// Frames from somewhere else are thrown away here, at once: the caller
+    /// takes frames from the queue in the same pass, before the worker has
+    /// seen this (it showed a frame from before a scrub for a moment).
     pub fn play(&self, i: u64) {
+        {
+            let mut s = self.state.lock().unwrap();
+            drop_superseded(&mut s.ahead, i);
+            if s.ahead.front().is_none_or(|p| p.index > i + 30) {
+                s.ahead.clear();
+                s.generation += 1;
+            }
+        }
         let _ = self.tx.send(Cmd::Play(i));
+    }
+
+    /// How long ago the decoder opened, once it has.
+    pub fn open_for(&self) -> Option<std::time::Duration> {
+        self.state.lock().unwrap().opened.map(|t| t.elapsed())
     }
 
     pub fn pause(&self) {
