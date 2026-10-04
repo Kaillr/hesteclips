@@ -129,6 +129,8 @@ struct Shared {
     /// Stereo frames (sample pairs) played since `start`.
     pos: AtomicU64,
     playing: AtomicBool,
+    /// Paused and being scrubbed: the sound follows `pos` (see [`Scrub`]).
+    scrubbing: AtomicBool,
     /// Where playback stops (in stereo frames).
     end: AtomicU64,
     mix: Mutex<Mix>,
@@ -187,6 +189,7 @@ impl Player {
         let shared = Arc::new(Shared {
             pos: AtomicU64::new(0),
             playing: AtomicBool::new(false),
+            scrubbing: AtomicBool::new(false),
             end: AtomicU64::new(u64::MAX),
             mix: Mutex::new(Mix { tracks: gains, track_levels: vec![(0.0, 0.0); n], master_level: (0.0, 0.0) }),
         });
@@ -345,6 +348,7 @@ impl Player {
     /// with [`Self::paint`].
     pub fn update(&mut self, ctx: &egui::Context, scrubbing: bool) -> Option<egui::Vec2> {
         self.proxy.set_focus(self.info.frame_index(self.time()));
+        self.shared.scrubbing.store(scrubbing && !self.sound_playing(), Ordering::Relaxed);
         if scrubbing && self.proxy_progress() < 1.0 {
             crate::video::scrubbing();
         }
@@ -600,6 +604,219 @@ fn open_video(ctx: &egui::Context, source: &Path, fps: f64) -> Option<Video> {
     None
 }
 
+/// The sound while scrubbing a paused clip, at its own pitch whatever the
+/// speed (WSOLA): every [`Scrub::HOP`] it takes a [`Scrub::GRAIN`]-long slice
+/// from where the playhead is right then, shifted by up to [`Scrub::SEARCH`]
+/// to line up with how the last slice goes on, and cross-fades it in. Moving
+/// faster than real time skips through, slower overlaps; a jump just takes
+/// the next slice from the new place. With the playhead still for
+/// [`Scrub::STILL`] it fades out (else one slice would repeat as a buzz).
+/// Runs in the audio callback: its buffers are allocated once.
+struct Scrub {
+    /// Output frames per second.
+    rate: f64,
+    /// Where the last slice started (source frames), if sounding.
+    prev: Option<usize>,
+    /// The fading-out half of the last slice, to overlap with the next.
+    tail: Vec<(f32, f32)>,
+    /// Made, not yet played (source rate).
+    made: std::collections::VecDeque<(f32, f32)>,
+    /// Two made samples the output is between, and how far (resampling).
+    a: (f32, f32),
+    b: (f32, f32),
+    frac: f64,
+    window: Vec<f32>,
+    /// Mono copies for lining slices up.
+    want: Vec<f32>,
+    near: Vec<f32>,
+    gains: Vec<f32>,
+    track_peak: Vec<f32>,
+    /// Loudness, eased (fades in and out).
+    level: f64,
+    /// The playhead last seen, and for how long (s) it hasn't moved.
+    last_target: f64,
+    still: f64,
+}
+
+impl Scrub {
+    /// Slice length (source frames): 30 ms, long enough to hear a sound as
+    /// itself, short enough to follow the playhead.
+    const GRAIN: usize = 1440;
+    /// A new slice every half slice (15 ms), overlapping the last.
+    const HOP: usize = Self::GRAIN / 2;
+    /// How far a slice may shift (each way) to line up: 5 ms.
+    const SEARCH: usize = 240;
+    /// Samples compared when lining up.
+    const MATCH: usize = 360;
+    /// Fade out once the playhead has been still this long (s).
+    const STILL: f64 = 0.08;
+    /// Fade time (s).
+    const FADE: f64 = 0.008;
+
+    fn new(rate: f64) -> Self {
+        let window = (0..Self::GRAIN).map(|k| (0.5 - 0.5 * (std::f64::consts::TAU * k as f64 / Self::GRAIN as f64).cos()) as f32).collect();
+        Self {
+            rate,
+            prev: None,
+            tail: vec![(0.0, 0.0); Self::HOP],
+            made: std::collections::VecDeque::with_capacity(Self::GRAIN * 2),
+            a: (0.0, 0.0),
+            b: (0.0, 0.0),
+            frac: 0.0,
+            window,
+            want: vec![0.0; Self::MATCH],
+            near: vec![0.0; 2 * Self::SEARCH + Self::MATCH],
+            gains: Vec::new(),
+            track_peak: Vec::new(),
+            level: 0.0,
+            last_target: -1.0,
+            still: 0.0,
+        }
+    }
+
+    /// Whether there's anything to play: scrubbing, or still fading out.
+    fn sounding(&self, scrubbing: bool) -> bool {
+        scrubbing || self.level > 1e-4
+    }
+
+    /// Playing normally again: the next scrub starts afresh.
+    fn reset(&mut self) {
+        self.silence();
+        self.last_target = -1.0;
+    }
+
+    /// Faded out: drop the slices (the next sound starts at its own place),
+    /// but keep watching the playhead, so standing still stays quiet.
+    fn silence(&mut self) {
+        self.prev = None;
+        self.tail.iter_mut().for_each(|t| *t = (0.0, 0.0));
+        self.made.clear();
+        self.a = (0.0, 0.0);
+        self.b = (0.0, 0.0);
+        self.level = 0.0;
+    }
+
+    /// Source frame `i` of every track, mixed with this slice's gains.
+    fn sample(&self, pcm: &[Vec<f32>], i: usize) -> (f32, f32) {
+        let (mut l, mut r) = (0.0, 0.0);
+        for (t, track) in pcm.iter().enumerate() {
+            if let Some(s) = track.get(2 * i..2 * i + 2) {
+                let g = self.gains.get(t).copied().unwrap_or(1.0);
+                l += s[0] * g;
+                r += s[1] * g;
+            }
+        }
+        (l, r)
+    }
+
+    /// The next half slice into `made`, the slice taken near `target`.
+    fn make(&mut self, pcm: &[Vec<f32>], tracks: &[TrackEdit], target: usize) {
+        self.gains.clear();
+        self.gains.extend(tracks.iter().map(|tr| tr.gain_at(target as f64 / PREVIEW_RATE as f64)));
+        let start = match self.prev {
+            None => target,
+            Some(prev) => {
+                // Where the last slice would go on, and the start near the
+                // playhead that sounds most like it (cross-correlation).
+                let natural = prev + Self::HOP;
+                let lo = target.saturating_sub(Self::SEARCH);
+                for k in 0..Self::MATCH {
+                    let (l, r) = self.sample(pcm, natural + k);
+                    self.want[k] = l + r;
+                }
+                for k in 0..self.near.len() {
+                    let (l, r) = self.sample(pcm, lo + k);
+                    self.near[k] = l + r;
+                }
+                let mut best = (f32::MIN, target);
+                for off in (0..=2 * Self::SEARCH).step_by(2) {
+                    let c: f32 = (0..Self::MATCH).step_by(2).map(|k| self.want[k] * self.near[off + k]).sum();
+                    if c > best.0 {
+                        best = (c, lo + off);
+                    }
+                }
+                best.1
+            }
+        };
+        let tracks_n = pcm.len();
+        self.track_peak.resize(tracks_n, 0.0);
+        for k in 0..Self::HOP {
+            let (l, r) = self.sample(pcm, start + k);
+            let w = self.window[k];
+            let t = self.tail[k];
+            self.made.push_back((t.0 + l * w, t.1 + r * w));
+            let (l2, r2) = self.sample(pcm, start + Self::HOP + k);
+            let w2 = self.window[Self::HOP + k];
+            self.tail[k] = (l2 * w2, r2 * w2);
+        }
+        for (t, track) in pcm.iter().enumerate() {
+            let g = self.gains.get(t).copied().unwrap_or(1.0);
+            let peak = (start..start + Self::HOP)
+                .step_by(8)
+                .filter_map(|i| track.get(2 * i..2 * i + 2))
+                .map(|s| s[0].abs().max(s[1].abs()) * g)
+                .fold(0.0f32, f32::max);
+            self.track_peak[t] = peak;
+        }
+        self.prev = Some(start);
+    }
+
+    /// Fill `out` following the playhead at `target` (source frames); `active`
+    /// false fades out. Returns the master's (peak, rms) and each track's.
+    fn render(&mut self, out: &mut [f32], channels: usize, pcm: &[Vec<f32>], tracks: &[TrackEdit], target: f64, active: bool) -> (f32, f32, Vec<(f32, f32)>) {
+        let frames = out.len() / channels.max(1);
+        if (target - self.last_target).abs() >= 1.0 {
+            self.still = 0.0;
+        } else {
+            self.still += frames as f64 / self.rate;
+        }
+        self.last_target = target;
+        let want_level = if active && self.still < Self::STILL { 1.0 } else { 0.0 };
+        if want_level == 0.0 && self.level < 1e-4 {
+            // Quiet and staying so: nothing to make.
+            self.silence();
+            out.fill(0.0);
+            return (0.0, 0.0, vec![(0.0, 0.0); pcm.len()]);
+        }
+        let ease = 1.0 / (Self::FADE * self.rate);
+        let step = PREVIEW_RATE as f64 / self.rate;
+        let (mut peak, mut sq) = (0.0f32, 0.0f64);
+        for frame in out.chunks_mut(channels) {
+            self.frac += step;
+            while self.frac >= 1.0 {
+                self.frac -= 1.0;
+                if self.made.is_empty() {
+                    self.make(pcm, tracks, target as usize);
+                }
+                self.a = self.b;
+                self.b = self.made.pop_front().unwrap_or((0.0, 0.0));
+            }
+            self.level += (want_level - self.level) * ease;
+            let f = self.frac as f32;
+            let g = self.level as f32;
+            let l = (self.a.0 + (self.b.0 - self.a.0) * f) * g;
+            let r = (self.a.1 + (self.b.1 - self.a.1) * f) * g;
+            let m = l.abs().max(r.abs());
+            peak = peak.max(m);
+            sq += (m as f64).powi(2);
+            match channels {
+                1 => frame[0] = (l + r) * 0.5,
+                _ => {
+                    frame[0] = l;
+                    frame[1] = r;
+                }
+            }
+        }
+        if self.level < 1e-4 && want_level == 0.0 {
+            self.silence();
+        }
+        let rms = if frames == 0 { 0.0 } else { (sq / frames as f64).sqrt() as f32 };
+        let g = self.level as f32;
+        let levels = self.track_peak.iter().map(|&p| (p * g, p * g * 0.7)).collect();
+        (peak, rms, levels)
+    }
+}
+
 /// Opens the default output device and mixes the tracks into it.
 fn start_audio(shared: Arc<Shared>, pcm: Arc<Vec<Vec<f32>>>) -> Result<cpal::Stream, String> {
     let device = cpal::default_host().default_output_device().ok_or("no audio output device")?;
@@ -612,6 +829,7 @@ fn start_audio(shared: Arc<Shared>, pcm: Arc<Vec<Vec<f32>>>) -> Result<cpal::Str
     let mut frac = 0.0f64;
     let n_tracks = pcm.len();
     let mut was_playing = false;
+    let mut scrub = Scrub::new(out_rate);
     trace!("audio output: {} Hz, {} channels, buffer {:?}", out_rate, channels, supported.buffer_size());
 
     let stream = device
@@ -628,6 +846,21 @@ fn start_audio(shared: Arc<Shared>, pcm: Arc<Vec<Vec<f32>>>) -> Result<cpal::Str
                         trace!("audio callback plays ({} frames per callback, heard {:?} later)", out.len() / channels.max(1), latency);
                     }
                 }
+                if !playing && scrub.sounding(shared.scrubbing.load(Ordering::Relaxed)) {
+                    let tracks: Vec<TrackEdit> = match shared.mix.lock() {
+                        Ok(m) => m.tracks.clone(),
+                        Err(_) => return,
+                    };
+                    let target = shared.pos.load(Ordering::Relaxed) as f64;
+                    let active = shared.scrubbing.load(Ordering::Relaxed);
+                    let (peak, rms, track_levels) = scrub.render(out, channels, &pcm, &tracks, target, active);
+                    if let Ok(mut m) = shared.mix.lock() {
+                        m.track_levels = track_levels;
+                        m.master_level = (peak, rms);
+                    }
+                    return;
+                }
+                scrub.reset();
                 if !playing {
                     // Silence: report zero so meters fall and the UI can stop redrawing.
                     if let Ok(mut m) = shared.mix.try_lock() {
@@ -765,5 +998,95 @@ impl Drop for FrameStream {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A stereo tone at `hz`, `secs` long, at the source rate.
+    fn tone(hz: f64, secs: f64) -> Vec<f32> {
+        let n = (secs * PREVIEW_RATE as f64) as usize;
+        (0..n).flat_map(|i| {
+            let v = (std::f64::consts::TAU * hz * i as f64 / PREVIEW_RATE as f64).sin() as f32 * 0.5;
+            [v, v]
+        }).collect()
+    }
+
+    /// Scrub with the playhead moving at `speed` × real time for `secs`;
+    /// returns the left channel out, at 48 kHz.
+    fn scrub(pcm: &[Vec<f32>], speed: f64, secs: f64, start: f64) -> Vec<f32> {
+        let rate = 48_000.0;
+        let mut s = Scrub::new(rate);
+        let tracks = [TrackEdit { index: 0, gain: 1.0, muted: false, points: Vec::new() }];
+        let mut out = Vec::new();
+        let mut target = start;
+        let block = 480; // 10 ms callbacks
+        for _ in 0..(secs * rate / block as f64) as usize {
+            let mut buf = vec![0.0f32; block * 2];
+            s.render(&mut buf, 2, pcm, &tracks, target, true);
+            out.extend(buf.chunks(2).map(|f| f[0]));
+            target += speed * block as f64 * PREVIEW_RATE as f64 / rate;
+        }
+        out
+    }
+
+    /// Frequency from upward zero crossings, over the loud part.
+    fn pitch(x: &[f32]) -> f64 {
+        let x = &x[x.len() / 4..];
+        let ups = x.windows(2).filter(|w| w[0] < 0.0 && w[1] >= 0.0).count();
+        ups as f64 / (x.len() as f64 / 48_000.0)
+    }
+
+    #[test]
+    fn scrubbing_keeps_the_pitch() {
+        let pcm = vec![tone(440.0, 20.0)];
+        for speed in [0.5, 1.0, 2.0, 4.0, -1.0] {
+            let out = scrub(&pcm, speed, 1.0, 5.0 * PREVIEW_RATE as f64);
+            let hz = pitch(&out);
+            assert!((hz - 440.0).abs() < 15.0, "at {speed}× it came out at {hz:.0} Hz");
+            let loud = out[out.len() / 2..].iter().fold(0.0f32, |a, &b| a.max(b.abs()));
+            assert!(loud > 0.3, "at {speed}× it's quiet ({loud})");
+        }
+    }
+
+    #[test]
+    fn standing_still_goes_quiet_and_a_jump_plays_the_new_place() {
+        // 440 Hz for the first 10 s, 880 after.
+        let mut pcm = tone(440.0, 10.0);
+        pcm.extend(tone(880.0, 10.0));
+        let pcm = vec![pcm];
+        let still = scrub(&pcm, 0.0, 0.5, 2.0 * PREVIEW_RATE as f64);
+        let end = still[still.len() - 2400..].iter().fold(0.0f32, |a, &b| a.max(b.abs()));
+        assert!(end < 1e-3, "still playing when the playhead stands still ({end})");
+
+        let rate = 48_000.0;
+        let mut s = Scrub::new(rate);
+        let tracks = [TrackEdit { index: 0, gain: 1.0, muted: false, points: Vec::new() }];
+        let mut out = Vec::new();
+        for k in 0..60 {
+            // Moving through the 440 Hz part, then a jump into the 880 Hz part.
+            let target = if k < 30 { 2.0 + k as f64 * 0.01 } else { 15.0 + k as f64 * 0.01 } * PREVIEW_RATE as f64;
+            let mut buf = vec![0.0f32; 960];
+            s.render(&mut buf, 2, &pcm, &tracks, target, true);
+            if k >= 35 {
+                out.extend(buf.chunks(2).map(|f| f[0]));
+            }
+        }
+        let hz = pitch(&out);
+        assert!((hz - 880.0).abs() < 30.0, "after the jump: {hz:.0} Hz");
+    }
+
+    #[test]
+    fn scrubbing_is_cheap_enough_for_the_audio_callback() {
+        // Six tracks (an editor clip), one second of output: well under a
+        // second even unoptimized.
+        let pcm: Vec<Vec<f32>> = (0..6).map(|_| tone(440.0, 20.0)).collect();
+        let t = std::time::Instant::now();
+        let _ = scrub(&pcm, 1.5, 1.0, 5.0 * PREVIEW_RATE as f64);
+        let took = t.elapsed();
+        eprintln!("one second of scrub sound, 6 tracks: {took:?}");
+        assert!(took.as_secs_f64() < 0.25, "took {took:?}");
     }
 }
