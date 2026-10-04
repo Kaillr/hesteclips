@@ -41,6 +41,17 @@ impl Placement {
         let margin_y = margin_x * frame_aspect;
         Self { x: 1.0 - w - margin_x, y: 1.0 - h - margin_y, w, h, crop: [0.0; 4], flip_h: false, flip_v: false }
     }
+
+    /// The webcam switched off: a box of no size, which is never drawn, so a
+    /// running capture drops it at once. The camera itself is closed too
+    /// ([`keep_open`]) and taken up again when it's switched back on.
+    pub fn hidden() -> Self {
+        Self { x: 0.0, y: 0.0, w: 0.0, h: 0.0, crop: [0.0; 4], flip_h: false, flip_v: false }
+    }
+
+    pub fn is_hidden(&self) -> bool {
+        self.w <= 0.0 || self.h <= 0.0
+    }
 }
 
 /// Placement shared between the app and a running capture.

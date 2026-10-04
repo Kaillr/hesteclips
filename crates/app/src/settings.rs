@@ -132,6 +132,10 @@ pub struct WebcamCfg {
     #[serde(default)]
     pub format: Option<FormatCfg>,
     pub placement: PlacementCfg,
+    /// In the clips. Off keeps the camera, format and placement for later
+    /// (and closes the camera).
+    #[serde(default = "yes")]
+    pub enabled: bool,
 }
 
 /// A camera format: see `capture::webcam::Format`.
@@ -520,6 +524,15 @@ impl RecordSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_webcam_from_before_the_switch_is_on() {
+        let s: RecordSettings = serde_json::from_str(
+            r#"{"webcam": {"id": "cam", "name": "Cam", "placement": {"x": 0.7, "y": 0.7, "w": 0.25, "h": 0.25}}}"#,
+        )
+        .unwrap();
+        assert!(s.webcam.unwrap().enabled);
+    }
 
     #[test]
     fn single_app_setting_becomes_a_list() {

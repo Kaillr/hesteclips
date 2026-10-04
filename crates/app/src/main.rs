@@ -489,11 +489,13 @@ impl eframe::App for App {
         self.ensure_video_preview();
         self.sync_capture_video();
         if let Some(w) = &self.settings.webcam {
-            *self.webcam_placement.lock().unwrap() = w.placement.into();
+            *self.webcam_placement.lock().unwrap() = if w.enabled { w.placement.into() } else { capture::webcam::Placement::hidden() };
         }
-        // Keep the webcam open whenever one is set up, previewed or recorded or
-        // not: closing a camera can reset its own settings.
-        let camera = self.webcam_source().map(|w| (w.device, w.format));
+        // Keep the webcam open whenever one is set up and on, previewed or
+        // recorded or not: closing a camera can reset its own settings. Off,
+        // it's closed (its light goes out); a capture takes it up again.
+        let on = self.settings.webcam.as_ref().is_some_and(|w| w.enabled);
+        let camera = self.webcam_source().filter(|_| on).map(|w| (w.device, w.format));
         if camera != self.kept_camera {
             capture::webcam::keep_open(camera.clone());
             self.kept_camera = camera;

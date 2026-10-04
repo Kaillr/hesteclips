@@ -821,6 +821,29 @@ pub(crate) fn segmented(ui: &mut egui::Ui, labels: [&str; 2], chosen: usize) -> 
     (out.pop().unwrap(), second)
 }
 
+/// An on/off switch.
+pub(crate) fn toggle(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
+    let size = egui::vec2(36.0, 20.0);
+    let (rect, mut response) = ui.allocate_exact_size(size, Sense::click());
+    if response.clicked() {
+        *on = !*on;
+        response.mark_changed();
+    }
+    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+    let t = ui.ctx().animate_bool_with_time(response.id, *on, 0.12);
+    let off_fill = ui.visuals().widgets.inactive.bg_fill;
+    let fill = Color32::from_rgb(
+        egui::lerp(off_fill.r() as f32..=ACCENT.r() as f32, t) as u8,
+        egui::lerp(off_fill.g() as f32..=ACCENT.g() as f32, t) as u8,
+        egui::lerp(off_fill.b() as f32..=ACCENT.b() as f32, t) as u8,
+    );
+    let r = rect.height() / 2.0;
+    ui.painter().rect_filled(rect, r, fill);
+    let x = egui::lerp(rect.left() + r..=rect.right() - r, t);
+    ui.painter().circle_filled(egui::pos2(x, rect.center().y), r - 3.0, Color32::WHITE);
+    response
+}
+
 /// A small coloured label in a pill, its own height whatever the row's.
 pub(crate) fn status_tag(ui: &mut egui::Ui, text: &str, color: Color32) {
     let galley = ui.painter().layout_no_wrap(text.to_owned(), egui::FontId::proportional(11.5), color);

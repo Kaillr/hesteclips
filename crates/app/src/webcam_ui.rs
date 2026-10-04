@@ -244,10 +244,11 @@ impl App {
             let cam = self.settings.webcam.clone();
             ui.horizontal(|ui| {
                 ui.label(RichText::new("📷 Webcam").size(16.0).strong());
-                if cam.is_some() {
+                if let Some(cam) = &cam {
                     ui.add_space(6.0);
                     let (color, text) = match &status {
-                        Status::Live { .. } => (crate::meter::GREEN, "On"),
+                        _ if !cam.enabled => (ui.visuals().weak_text_color(), "Off"),
+                        Status::Live { .. } => (crate::meter::GREEN, "In your clips"),
                         Status::Opening => (ui.visuals().weak_text_color(), "Opening…"),
                         Status::Unavailable(_) => (ui.visuals().warn_fg_color, "Not working"),
                         _ => (ui.visuals().weak_text_color(), "Off"),
@@ -264,6 +265,15 @@ impl App {
                                 self.settings.webcam = None;
                             }
                         });
+                        ui.add_space(8.0);
+                        // Works while capturing too: it only hides it.
+                        let mut on = cam.enabled;
+                        let tip = if on { "Turn the webcam off: it leaves your clips, and its place, size, crop and format are kept for when you turn it on" } else { "Turn the webcam back on, where it was" };
+                        if crate::sources_ui::toggle(ui, &mut on).on_hover_text(tip).changed() {
+                            if let Some(w) = self.settings.webcam.as_mut() {
+                                w.enabled = on;
+                            }
+                        }
                     });
                 }
             });
@@ -285,6 +295,7 @@ impl App {
                                     name: c.name,
                                     format: None,
                                     placement: Placement::default_for(16.0 / 9.0, frame_aspect).into(),
+                                    enabled: true,
                                 });
                                 self.webcam_view.fit_pending = true;
                                 ui.close();
@@ -299,7 +310,10 @@ impl App {
                 return;
             };
 
-            if let Status::Unavailable(why) = &status {
+            if !cam.enabled {
+                ui.weak("Off: not in your clips, and the camera is closed. Its place and settings are kept.");
+                ui.add_space(4.0);
+            } else if let Status::Unavailable(why) = &status {
                 // Under the "Not working" tag: just why, as a sentence.
                 let mut why = why.clone();
                 if let Some(first) = why.get(..1) {
@@ -393,7 +407,7 @@ impl App {
 
     /// The webcam's box on the preview, its handles, and dragging them.
     pub(crate) fn webcam_on_preview(&mut self, ui: &mut egui::Ui, frame_rect: Rect, response: &egui::Response) {
-        let Some(cam) = self.settings.webcam.as_ref() else { return };
+        let Some(cam) = self.settings.webcam.as_ref().filter(|c| c.enabled) else { return };
         let p: Placement = cam.placement.into();
         let to_screen = |x: f32, y: f32| Pos2::new(frame_rect.left() + x * frame_rect.width(), frame_rect.top() + y * frame_rect.height());
         let bx = Rect::from_min_max(to_screen(p.x, p.y), to_screen(p.x + p.w, p.y + p.h));

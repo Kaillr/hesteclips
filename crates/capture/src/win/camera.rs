@@ -171,16 +171,28 @@ fn wait_or_stop(feed: &CameraFeed, d: Duration) {
 /// A capture's copy of the camera on its own GPU: the newest frame is uploaded
 /// each time it's asked for and the camera has a new one.
 pub(crate) struct CameraLayer {
-    feed: Arc<CameraFeed>,
+    /// The camera's feed; `None` (or a stopped one) while the webcam is
+    /// switched off, and found again when the app opens it.
+    feed: Option<Arc<CameraFeed>>,
+    device: String,
+    format: Option<crate::webcam::Format>,
     pub latest: Arc<Latest>,
     last: u64,
 }
 
 impl CameraLayer {
-    /// For webcam `w`, opening it if nothing has (the app keeps it open itself).
+    /// For webcam `w`, opening it if nothing has (the app keeps it open
+    /// itself), unless it's switched off: then it waits for the app to.
     pub(crate) fn new(gpu: &Gpu, w: &crate::webcam::Webcam) -> Result<Self> {
+        let hidden = w.placement.lock().unwrap().is_hidden();
         let feed = match CameraFeed::current(&w.device, w.format) {
             Some(f) => f,
+            None if hidden => {
+                // Its size isn't known yet: the format's, else the most
+                // "Automatic" picks (a smaller picture fits, a bigger is cut).
+                let (width, height) = w.format.map_or((1920, 1080), |f| (f.width, f.height));
+                return Ok(Self { feed: None, device: w.device.clone(), format: w.format, latest: Latest::new(gpu, width, height)?, last: 0 });
+            }
             None => {
                 keep_open(Some((w.device.clone(), w.format)));
                 CameraFeed::current(&w.device, w.format).context("the camera couldn't be opened")?
@@ -197,12 +209,20 @@ impl CameraLayer {
             }
             thread::sleep(Duration::from_millis(20));
         };
-        Ok(Self { feed, latest: Latest::new(gpu, width, height)?, last: 0 })
+        Ok(Self { feed: Some(feed), device: w.device.clone(), format: w.format, latest: Latest::new(gpu, width, height)?, last: 0 })
     }
 
     /// Upload the camera's newest frame, if it has one we haven't.
     pub(crate) fn pull(&mut self) {
-        if let Some(f) = self.feed.latest() {
+        // Switched off and on again: the app opened it anew.
+        if self.feed.as_ref().is_none_or(|f| f.stop.load(Ordering::Relaxed)) {
+            if let Some(f) = CameraFeed::current(&self.device, self.format) {
+                self.feed = Some(f);
+                self.last = 0;
+            }
+        }
+        let Some(feed) = &self.feed else { return };
+        if let Some(f) = feed.latest() {
             if f.seq != self.last {
                 self.last = f.seq;
                 self.latest.upload_bgra(f.bgra.as_ptr(), f.width * 4, f.width, f.height);
