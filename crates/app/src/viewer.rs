@@ -212,6 +212,11 @@ impl Ready {
         let volume = ctx.data(|d| d.get_temp::<(f32, bool)>(volume_id())).unwrap_or((1.0, false));
         let tracks = if l.pcm.is_empty() { Vec::new() } else { vec![l.pcm] };
         let mut player = Player::new(ctx, clip, l.info.clone(), tracks, Vec::new());
+        // Dev aid: `HESTECLIPS_START_AT=<seconds>` starts there (to check a
+        // stretch of a clip without scrubbing to it).
+        if let Some(t) = std::env::var("HESTECLIPS_START_AT").ok().and_then(|s| s.parse::<f64>().ok()) {
+            player.seek(t);
+        }
         // Opened to watch: start right away.
         player.play(l.info.duration);
         let r = Self {

@@ -115,6 +115,12 @@ impl Video {
             let mut playing = false;
             // The frame the ahead queue continues with.
             let mut next: u64 = 0;
+            // The decoder's next frame continues the ahead queue: read on in
+            // order. Otherwise start from `next` with a lookup. (Looking up
+            // each number in turn froze playback at a dropped frame: the
+            // frame showing at the gap is the one before it, so the same
+            // number came back every time.)
+            let mut positioned = false;
             let mut at_end = false;
             loop {
                 let room = {
@@ -167,6 +173,9 @@ impl Video {
                             };
                             let mut s = shared.lock().unwrap();
                             next = s.ahead.back().map_or(i + 1, |p| p.index + 1);
+                            // Either way the decoder now continues right after
+                            // what's decoded (the answer, or the queue's end).
+                            positioned = true;
                             at_end = pic.is_none();
                             s.exact = pic.map(|p| (i, p));
                             ctx.request_repaint();
@@ -181,6 +190,7 @@ impl Video {
                             if s.ahead.front().is_none_or(|p| p.index > i + 30) {
                                 s.ahead.clear();
                                 next = i;
+                                positioned = false;
                                 at_end = false;
                             }
                         }
@@ -191,7 +201,9 @@ impl Video {
                 if !room {
                     continue;
                 }
-                match dec.frame(next) {
+                let got = if positioned { dec.next() } else { dec.frame(next) };
+                positioned = true;
+                match got {
                     Ok(Some(p)) => {
                         next = p.index + 1;
                         shared.lock().unwrap().ahead.push_back(p);
@@ -241,6 +253,12 @@ impl Video {
             best = s.ahead.pop_front();
         }
         best
+    }
+
+    /// Debug: how many frames are decoded ahead, and their numbers' range.
+    pub fn ahead_info(&self) -> (usize, Option<u64>, Option<u64>) {
+        let s = self.state.lock().unwrap();
+        (s.ahead.len(), s.ahead.front().map(|p| p.index), s.ahead.back().map(|p| p.index))
     }
 
     /// Frame `i` is decoded and waiting.
