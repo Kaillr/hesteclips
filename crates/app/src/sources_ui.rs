@@ -105,6 +105,10 @@ impl App {
         if capture::preview::AVAILABLE {
             self.video_card(ui);
             ui.add_space(12.0);
+            if capture::webcam::AVAILABLE {
+                self.webcam_card(ui);
+                ui.add_space(12.0);
+            }
         }
         // The mix first: it's what people hear, and where clipping matters most.
         self.master_strip(ui, now, dt);
@@ -254,10 +258,9 @@ impl App {
             // while capturing; the app list below changes live.
             if capture::APP_CAPTURE {
                 ui.add_enabled_ui(idle, |ui| {
-                    ui.horizontal(|ui| {
-                        let screen = ui.selectable_label(!apps_mode, RichText::new("🖥  Whole screen").size(14.0));
-                        let apps = ui.selectable_label(apps_mode, RichText::new("🎮  Games and apps").size(14.0));
-                        if screen.on_hover_text("Everything on one display.").on_disabled_hover_text(STOP_TO_SWITCH).clicked() {
+                    let (screen, apps) = segmented(ui, ["🖥  Whole screen", "🎮  Games and apps"], usize::from(apps_mode));
+                    {
+                        if screen.on_hover_text("Everything on one display.").on_disabled_hover_text(STOP_TO_SWITCH).clicked() && apps_mode {
                             let apps = std::mem::replace(&mut self.settings.capture, CaptureTarget::Screen);
                             if matches!(apps, CaptureTarget::Apps { .. }) {
                                 self.settings.idle_apps = Some(apps);
@@ -276,9 +279,9 @@ impl App {
                                 .unwrap_or(CaptureTarget::Apps { apps: Vec::new(), away_screen: true });
                             self.windowed_apps = capture::list_windowed_apps();
                         }
-                    });
+                    }
                 });
-                ui.add_space(8.0);
+                ui.add_space(10.0);
             }
 
             self.preview_picture(ui, frame.as_deref());
@@ -302,12 +305,6 @@ impl App {
                         .on_disabled_hover_text("Stop capturing to switch displays.");
                     });
                 }
-            }
-            if capture::webcam::AVAILABLE {
-                ui.add_space(6.0);
-                ui.separator();
-                ui.add_space(2.0);
-                self.webcam_row(ui, frame.as_deref());
             }
         });
     }
@@ -373,107 +370,135 @@ impl App {
         });
     }
 
-    /// The games and apps to record: each with whether it's open (and which is
-    /// being recorded), a way to remove it, and a way to add more. Changes
-    /// apply right away, even while capturing.
+    /// The games and apps to record: a framed list, each with whether it's
+    /// open (and which is being recorded) and a remove button, then a way to
+    /// add more. Changes apply right away, even while capturing.
     fn app_list(&mut self, ui: &mut egui::Ui, apps: Vec<CaptureApp>, away_screen: bool, frame: Option<&capture::preview::PreviewFrame>) {
         let showing = frame.filter(|f| !f.waiting).and_then(|f| f.app.clone());
         let capturing = self.rec_state != crate::RecState::Idle;
         let mut list = apps.clone();
         let mut away = away_screen;
-        if list.is_empty() {
-            ui.weak("Add the games you play, and any apps you want in your clips.");
-            ui.add_space(4.0);
-        }
         let mut remove = None;
-        for (i, app) in list.iter().enumerate() {
-            let open = self.windowed_apps.iter().any(|a| a.id.eq_ignore_ascii_case(&app.id));
-            let active = showing.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(&app.id));
-            let (color, status) = if active {
-                (ACCENT, if capturing { "Recording now" } else { "In the preview" })
-            } else if open {
-                (meter::GREEN, "Open")
-            } else {
-                (ui.visuals().weak_text_color(), "Not open")
-            };
-            ui.horizontal(|ui| {
-                let (dot, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), Sense::hover());
-                ui.painter().circle_filled(dot.center(), 4.0, color);
-                ui.label(RichText::new(&app.name).strong()).on_hover_text(&app.id);
-                ui.label(RichText::new(status).size(12.0).color(if active { ACCENT } else { ui.visuals().weak_text_color() }));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("✕").on_hover_text(format!("Stop recording {}", app.name)).clicked() {
-                        remove = Some(i);
+        let weak = ui.visuals().weak_text_color();
+        egui::Frame::new()
+            .fill(ui.visuals().extreme_bg_color)
+            .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+            .corner_radius(6)
+            .inner_margin(egui::Margin::symmetric(4, 4))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                if list.is_empty() {
+                    ui.add_space(10.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(RichText::new("No games or apps yet").strong());
+                        ui.weak("Add the games you play, and any apps you want in your clips.");
+                    });
+                    ui.add_space(10.0);
+                }
+                for (i, app) in list.iter().enumerate() {
+                    let open = self.windowed_apps.iter().any(|a| a.id.eq_ignore_ascii_case(&app.id));
+                    let active = showing.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(&app.id));
+                    let (color, status) = if active {
+                        (ACCENT, if capturing { "Recording now" } else { "In the preview" })
+                    } else if open {
+                        (meter::GREEN, "Open")
+                    } else {
+                        (weak, "Not open")
+                    };
+                    // Painted under the row once its size is known.
+                    let hover_bg = ui.painter().add(egui::Shape::Noop);
+                    let row = ui.horizontal(|ui| {
+                        ui.set_min_height(34.0);
+                        ui.add_space(8.0);
+                        let (dot, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), Sense::hover());
+                        ui.painter().circle_filled(dot.center(), 4.5, color);
+                        ui.add_space(4.0);
+                        ui.label(RichText::new(&app.name).size(14.0).strong()).on_hover_text(&app.id);
+                        ui.add_space(4.0);
+                        status_tag(ui, status, color);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add_space(4.0);
+                            if remove_button(ui).on_hover_text(format!("Stop recording {}", app.name)).clicked() {
+                                remove = Some(i);
+                            }
+                        });
+                    });
+                    // Rows divided by a hairline, highlighted under the pointer.
+                    let rect = row.response.rect;
+                    if ui.rect_contains_pointer(rect) {
+                        let fill = ui.visuals().widgets.hovered.weak_bg_fill.gamma_multiply(0.5);
+                        ui.painter().set(hover_bg, egui::epaint::RectShape::filled(rect, 4.0, fill));
                     }
-                });
+                    if i + 1 < list.len() {
+                        let y = rect.bottom() + ui.spacing().item_spacing.y / 2.0;
+                        ui.painter().hline(rect.x_range().shrink(8.0), y, ui.visuals().widgets.noninteractive.bg_stroke);
+                    }
+                }
             });
-        }
         if let Some(i) = remove {
             list.remove(i);
         }
-        ui.add_space(4.0);
-        ui.horizontal_wrapped(|ui| {
-            let add = ui.menu_button("➕ Add game or app", |ui| {
-                ui.set_min_width(240.0);
-                ui.weak("Open apps with a window");
-                ui.separator();
-                let mut any = false;
-                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-                    for app in self.windowed_apps.clone() {
-                        if list.iter().any(|a| a.id.eq_ignore_ascii_case(&app.id)) {
-                            continue;
-                        }
-                        any = true;
-                        if ui.button(&app.name).on_hover_text(&app.id).clicked() {
-                            list.push(CaptureApp { id: app.id, name: app.name });
-                            ui.close();
-                        }
+        ui.add_space(8.0);
+        let add = ui.menu_button(RichText::new("➕  Add game or app").size(14.0), |ui| {
+            ui.set_min_width(260.0);
+            ui.weak("Open apps with a window");
+            ui.separator();
+            let mut any = false;
+            egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                for app in self.windowed_apps.clone() {
+                    if list.iter().any(|a| a.id.eq_ignore_ascii_case(&app.id)) {
+                        continue;
                     }
-                });
-                if !any {
-                    ui.weak("Nothing else is open. Start the game or app, then add it here.");
+                    any = true;
+                    if ui.button(&app.name).on_hover_text(&app.id).clicked() {
+                        list.push(CaptureApp { id: app.id, name: app.name });
+                        ui.close();
+                    }
                 }
             });
-            if add.response.clicked() {
-                self.windowed_apps = capture::list_windowed_apps();
+            if !any {
+                ui.weak("Nothing else is open. Start the game or app, then add it here.");
             }
-            // Their sound usually belongs with their picture.
-            let silent: Vec<CaptureApp> = list
-                .iter()
-                .filter(|a| {
-                    !self
-                        .settings
-                        .audio_sources
-                        .iter()
-                        .any(|s| matches!(&s.kind, SourceKind::App { bundle_id, .. } if bundle_id.eq_ignore_ascii_case(&a.id)))
-                })
-                .cloned()
-                .collect();
-            if !silent.is_empty() {
-                let label = if silent.len() == 1 { format!("🔊 Also record {}'s sound", silent[0].name) } else { "🔊 Also record their sound".to_owned() };
-                if ui.button(label).on_hover_text("Adds them to the audio sources below.").clicked() {
+        });
+        if add.response.clicked() {
+            self.windowed_apps = capture::list_windowed_apps();
+        }
+        // Their sound usually belongs with their picture: a suggestion, not
+        // another button that looks like adding a game.
+        let silent: Vec<CaptureApp> = list
+            .iter()
+            .filter(|a| {
+                !self
+                    .settings
+                    .audio_sources
+                    .iter()
+                    .any(|s| matches!(&s.kind, SourceKind::App { bundle_id, .. } if bundle_id.eq_ignore_ascii_case(&a.id)))
+            })
+            .cloned()
+            .collect();
+        if !silent.is_empty() {
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                let names = if silent.len() == 1 { format!("{}'s sound isn't", silent[0].name) } else { "Their sound isn't".to_owned() };
+                ui.label(RichText::new(format!("🔈 {names} in your clips yet.")).color(weak));
+                if ui.link("Add it to the audio sources").clicked() {
                     for a in &silent {
                         self.settings
                             .audio_sources
                             .push(AudioSourceCfg::new(&a.name, SourceKind::App { bundle_id: a.id.clone(), app_name: a.name.clone() }));
                     }
                 }
-            }
-        });
-        ui.add_space(6.0);
+            });
+        }
+        ui.add_space(8.0);
         ui.checkbox(&mut away, "Show \u{201c}Tabbed out\u{201d} when it's minimized").on_hover_text(
             "When the game or app you were in stops showing (most games minimize when you alt-tab), \
              clips show the HesteClips logo with \u{201c}Tabbed out\u{201d}. Off: they keep its last picture. \
              A window that's still on screen keeps being recorded either way, \
              and that screen also shows while none of them is open.",
         );
-        if !list.is_empty() {
-            ui.add_space(2.0);
-            ui.label(
-                RichText::new("Records the one you're using, and keeps recording it while you click into something else, as long as it's on screen.")
-                    .size(12.0)
-                    .weak(),
-            );
+        if list.len() > 1 {
+            ui.label(RichText::new("Records the one you're using, and keeps it while you click into something else as long as it's on screen.").size(12.0).weak());
         }
         if list != apps || away != away_screen {
             self.settings.capture = CaptureTarget::Apps { apps: list, away_screen: away };
@@ -776,7 +801,60 @@ fn status_badge(ui: &mut egui::Ui, status: SourceStatus) {
 }
 
 /// A rounded panel around one source.
-fn card(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
+/// A two-way switch: equal halves, the chosen one filled. Returns both
+/// halves' responses.
+pub(crate) fn segmented(ui: &mut egui::Ui, labels: [&str; 2], chosen: usize) -> (egui::Response, egui::Response) {
+    let gap = 4.0;
+    let w = ((ui.available_width() - gap) / 2.0).max(60.0);
+    let mut out = Vec::new();
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = gap;
+        for (i, label) in labels.iter().enumerate() {
+            let on = i == chosen;
+            let text = RichText::new(*label).size(14.0).color(if on { Color32::WHITE } else { ui.visuals().text_color() });
+            let mut b = egui::Button::new(text).min_size(egui::vec2(w, 32.0)).corner_radius(6);
+            b = if on { b.fill(ACCENT.gamma_multiply(0.8)) } else { b.fill(ui.visuals().extreme_bg_color) };
+            out.push(ui.add(b));
+        }
+    });
+    let second = out.pop().unwrap();
+    (out.pop().unwrap(), second)
+}
+
+/// A small coloured label in a pill, its own height whatever the row's.
+pub(crate) fn status_tag(ui: &mut egui::Ui, text: &str, color: Color32) {
+    let galley = ui.painter().layout_no_wrap(text.to_owned(), egui::FontId::proportional(11.5), color);
+    let size = galley.size() + egui::vec2(14.0, 4.0);
+    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    ui.painter().rect_filled(rect, size.y / 2.0, color.gamma_multiply(0.18));
+    ui.painter().galley(rect.center() - galley.size() / 2.0, galley, color);
+}
+
+/// A remove button drawn as an ✕ (the font has no ✕): grey, red under the pointer.
+pub(crate) fn remove_button(ui: &mut egui::Ui) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(26.0, 26.0), Sense::click());
+    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+    let hovered = response.hovered() && ui.is_enabled();
+    let red = Color32::from_rgb(235, 87, 87);
+    if hovered {
+        ui.painter().rect_filled(rect, 6.0, red.gamma_multiply(0.2));
+    }
+    let color = if !ui.is_enabled() {
+        ui.visuals().weak_text_color().gamma_multiply(0.5)
+    } else if hovered {
+        red
+    } else {
+        ui.visuals().weak_text_color()
+    };
+    let c = rect.center();
+    let r = 4.5;
+    let stroke = egui::Stroke::new(1.6, color);
+    ui.painter().line_segment([c + egui::vec2(-r, -r), c + egui::vec2(r, r)], stroke);
+    ui.painter().line_segment([c + egui::vec2(-r, r), c + egui::vec2(r, -r)], stroke);
+    response
+}
+
+pub(crate) fn card(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::group(ui.style()).inner_margin(egui::Margin::same(12)).corner_radius(8).show(ui, |ui| {
         ui.set_width(ui.available_width());
         add(ui);
