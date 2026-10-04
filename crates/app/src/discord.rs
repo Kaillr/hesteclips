@@ -117,10 +117,12 @@ fn run(rx: mpsc::Receiver<Option<Status>>, connected: Arc<AtomicBool>) {
 
 fn activity(status: &Status) -> Activity<'_> {
     let doing = if status.recording { "Recording" } else { "Clipping" };
-    let details = match &status.game {
-        Some(g) => format!("{doing} {}", g.name),
-        None if status.recording => "Recording".to_owned(),
-        None => "Replay buffer on".to_owned(),
+    // As Medal does it: the activity is named after the game ("osu! with
+    // HesteClips") instead of the app, so it reads like the game itself.
+    let (name, details) = match &status.game {
+        Some(g) => (Some(format!("{} with HesteClips", g.name)), format!("{doing} {} with HesteClips", g.name)),
+        None if status.recording => (None, "Recording".to_owned()),
+        None => (None, "Replay buffer on".to_owned()),
     };
     let assets = match status.game.as_ref().and_then(|g| Some((g, g.icon.as_deref()?))) {
         // The game's picture, with HesteClips as the badge in its corner.
@@ -128,7 +130,11 @@ fn activity(status: &Status) -> Activity<'_> {
         None => Assets::new().large_image(LOGO).large_text("HesteClips"),
     };
     let since = status.since.duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64);
-    Activity::new().details(details).assets(assets).timestamps(Timestamps::new().start(since))
+    let activity = Activity::new().details(details).assets(assets).timestamps(Timestamps::new().start(since));
+    match name {
+        Some(name) => activity.name(name),
+        None => activity,
+    }
 }
 
 /// A game Discord knows, by executable (`osu!.exe`, lower case). `None` until
