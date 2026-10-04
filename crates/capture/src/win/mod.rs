@@ -22,6 +22,8 @@ mod aac;
 mod camera;
 mod d3d;
 pub mod decode;
+pub mod direct;
+pub mod mp4read;
 pub(crate) mod file;
 mod h264;
 mod loopback;
