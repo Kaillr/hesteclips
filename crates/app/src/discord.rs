@@ -129,7 +129,9 @@ fn activity(status: &Status) -> Activity<'_> {
         Some((g, icon)) => Assets::new().large_image(icon).large_text(g.name.as_str()).small_image(LOGO).small_text("HesteClips"),
         None => Assets::new().large_image(LOGO).large_text("HesteClips"),
     };
-    let since = status.since.duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64);
+    // In seconds: Discord takes milliseconds as seconds (whatever the crate
+    // says), and a start that far ahead shows a timer stuck at 0:00.
+    let since = status.since.duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
     let activity = Activity::new().details(details).assets(assets).timestamps(Timestamps::new().start(since));
     match name {
         Some(name) => activity.name(name),
@@ -232,4 +234,17 @@ fn download_games() -> Option<HashMap<String, KnownGame>> {
         }
     }
     Some(by_exe.into_iter().filter_map(|(exe, g)| Some((exe, g?))).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    /// Downloads Discord's real list: `cargo test -p hesteclips discord -- --ignored`.
+    #[test]
+    #[ignore = "network"]
+    fn finds_games_by_executable() {
+        let games = super::download_games().expect("download and parse Discord's games");
+        assert_eq!(games["osu!.exe"].name, "osu!");
+        assert_eq!(games["cs2.exe"].name, "Counter-Strike 2");
+        assert!(!games.contains_key("game.exe"), "names shared by several games are dropped");
+    }
 }

@@ -785,8 +785,8 @@ impl App {
     }
 
     /// Discord shows what's being clipped while capture runs (when turned on).
-    /// The game is the last one in focus: one from the games-and-apps list, or
-    /// while recording the screen, any game Discord knows.
+    /// The game is the last one in focus from the games-and-apps list, or any
+    /// game Discord knows.
     fn update_presence(&mut self) {
         if !self.settings.discord_presence || self.rec_state == RecState::Idle {
             self.presence_since = None;
@@ -799,10 +799,9 @@ impl App {
             _ => None,
         };
         if let Some(exe) = capture::foreground_exe() {
-            let clipped = match apps {
-                Some(apps) => apps.iter().any(|a| a.id.eq_ignore_ascii_case(&exe)),
-                None => discord::known_game(&exe).is_some(),
-            };
+            // Asks for Discord's games list the first time, so it's there
+            // by the next check.
+            let clipped = apps.is_some_and(|apps| apps.iter().any(|a| a.id.eq_ignore_ascii_case(&exe))) || discord::known_game(&exe).is_some();
             if clipped {
                 self.clipped_game = Some((exe, Instant::now()));
             }
