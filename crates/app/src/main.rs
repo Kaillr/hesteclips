@@ -120,9 +120,15 @@ enum RecState {
 }
 
 /// The app icon (`assets/icon.svg` rendered to PNG), shown in the Dock and taskbar
-/// while running. Release bundles use `assets/hesteclips.icns` instead.
+/// while running. Release bundles use `assets/hesteclips.icns` instead. On
+/// Windows, where icons are small, the glyph without the macOS plate
+/// (`assets/icon-windows.svg`).
 fn app_icon() -> egui::IconData {
-    let img = image::load_from_memory_with_format(include_bytes!("../assets/icon-1024.png"), image::ImageFormat::Png)
+    #[cfg(windows)]
+    let png = include_bytes!("../assets/icon-windows-256.png");
+    #[cfg(not(windows))]
+    let png = include_bytes!("../assets/icon-1024.png");
+    let img = image::load_from_memory_with_format(png, image::ImageFormat::Png)
         .expect("bundled icon is a valid PNG")
         .to_rgba8();
     egui::IconData { width: img.width(), height: img.height(), rgba: img.into_raw() }
