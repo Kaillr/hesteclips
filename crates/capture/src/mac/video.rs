@@ -152,16 +152,6 @@ fn display_pixels(display: &SCDisplay) -> (usize, usize) {
     if w == 0 || h == 0 { unsafe { (display.width() as usize, display.height() as usize) } } else { (w, h) }
 }
 
-/// Output size: `w`×`h` downscaled to `target_height` if that's smaller.
-/// Even dimensions, as H.264 4:2:0 requires.
-pub(crate) fn output_size(mut w: usize, mut h: usize, target_height: Option<u32>) -> (usize, usize) {
-    if let Some(t) = target_height.map(|t| t as usize).filter(|&t| t < h) {
-        w = (w * t + h / 2) / h;
-        h = t;
-    }
-    (w & !1, h & !1)
-}
-
 /// What to record and the frame size: a display's own, or for games and
 /// apps the main display's (so it can't change mid-file, whatever the
 /// windows do).
@@ -173,7 +163,8 @@ pub(crate) fn plan(source: &VideoSource, target_height: Option<u32>) -> Result<(
     };
     let display = pick_display(&content, id).context("no display to capture")?;
     let (w, h) = display_pixels(&display);
-    Ok((content, display, output_size(w, h, target_height)))
+    let (w, h) = crate::output_size(w as u32, h as u32, target_height);
+    Ok((content, display, (w as usize, h as usize)))
 }
 
 /// One running capture: its stream, and for games and apps the thread that

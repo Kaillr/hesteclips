@@ -84,6 +84,23 @@ impl Recorder for Unsupported {
     }
 }
 
+/// The largest side the H.264 hardware encoders take: VideoToolbox refuses
+/// anything wider or taller than 4096 (error -12903; measured with
+/// `examples/vt_limits`), as do NVENC, AMF and Quick Sync for H.264.
+pub const MAX_SIDE: u32 = 4096;
+
+/// The recording's size for a source `w`×`h`: downscaled to `target_height`
+/// if that's smaller, and to fit [`MAX_SIDE`] (a 5K2K ultrawide, 6720×2836
+/// natively, records at 4096×1728). Keeps the shape; even dimensions, as
+/// H.264 4:2:0 requires.
+pub fn output_size(w: u32, h: u32, target_height: Option<u32>) -> (u32, u32) {
+    let (w, h) = (w.max(2) as f64, h.max(2) as f64);
+    let mut scale = target_height.map_or(1.0, |t| (t as f64 / h).min(1.0));
+    scale = scale.min(MAX_SIDE as f64 / (w * scale).max(1.0)).min(1.0).min(MAX_SIDE as f64 / h);
+    let even = |v: f64| ((v.round() as u32) & !1).max(2);
+    (even(w * scale), even(h * scale))
+}
+
 /// What a recording's video shows. This is the bottom layer of the picture;
 /// overlays (a webcam) will go on top of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -315,5 +332,28 @@ pub trait Recorder {
     /// was applied; otherwise it takes effect on the next start.
     fn update_video(&mut self, _video: &VideoSource) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod size_tests {
+    use super::output_size;
+
+    #[test]
+    fn output_size_keeps_aspect_and_even() {
+        assert_eq!(output_size(2560, 1440, None), (2560, 1440));
+        assert_eq!(output_size(2560, 1440, Some(1080)), (1920, 1080));
+        assert_eq!(output_size(1920, 1080, Some(1440)), (1920, 1080));
+        assert_eq!(output_size(3440, 1440, Some(721)), (1722, 720));
+    }
+
+    #[test]
+    fn output_size_fits_the_encoder() {
+        assert_eq!(output_size(6720, 2836, None), (4096, 1728));
+        assert_eq!(output_size(7680, 4320, Some(2160)), (3840, 2160));
+        assert_eq!(output_size(5120, 2880, None), (4096, 2304));
+        // Portrait.
+        assert_eq!(output_size(2160, 7680, None), (1152, 4096));
+        assert_eq!(output_size(4096, 2304, None), (4096, 2304));
     }
 }

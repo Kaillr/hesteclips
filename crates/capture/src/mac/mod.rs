@@ -16,3 +16,8 @@ pub fn bench_windows() {
     }
     println!("{n} windows, {:?} per query", t.elapsed() / 100);
 }
+
+/// For `examples/vt_limits`: whether the hardware H.264 encoder opens at this size.
+pub fn probe_encoder(width: usize, height: usize) -> String {
+    crate::sck::probe_encoder(width, height)
+}

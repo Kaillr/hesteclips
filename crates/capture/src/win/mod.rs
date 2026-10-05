@@ -201,7 +201,7 @@ impl Session {
         system::mf_startup()?;
         let gpu = d3d::Gpu::new()?;
         let (picture_source, (canvas_w, canvas_h)) = PictureSource::plan(&s.video)?;
-        let (width, height) = output_size(canvas_w, canvas_h, s.target_height);
+        let (width, height) = crate::output_size(canvas_w, canvas_h, s.target_height);
         let clock = Arc::new(Clock::default());
 
         let (titles, comment, has_rest) = track_layout(&s.sources);
@@ -433,7 +433,7 @@ impl PreviewCapture {
                     *list = shared; // so `update` reaches the running follower
                 }
                 let picture = source.open(&gpu, w, h, fps, away)?;
-                let (width, height) = output_size(w, h, target_height);
+                let (width, height) = crate::output_size(w, h, target_height);
                 let cam = webcam.as_ref().and_then(|wc| camera::CameraLayer::new(&gpu, wc).ok());
                 let overlay = cam.as_ref().zip(webcam.as_ref()).map(|(c, wc)| (&c.latest, wc.placement.clone()));
                 let preview = d3d::Previewer::new(&gpu, &picture.latest, overlay, width, height, fps, generation)?;
@@ -635,16 +635,6 @@ fn spawn_aac(track: usize, mut enc: AacEncoder, rx: mpsc::Receiver<Vec<f32>>, ou
     })
 }
 
-/// Output size: the display's native pixels, downscaled to `target_height` if
-/// that's smaller. Even dimensions, as H.264 4:2:0 requires.
-fn output_size(mut w: u32, mut h: u32, target_height: Option<u32>) -> (u32, u32) {
-    if let Some(t) = target_height.filter(|&t| t < h) {
-        w = (w * t + h / 2) / h;
-        h = t;
-    }
-    (w & !1, h & !1)
-}
-
 // ---------------------------------------------------------------------------
 // Pacer: constant frame rate
 // ---------------------------------------------------------------------------
@@ -714,17 +704,4 @@ fn spawn_pacer(
         encoder.finish();
     });
     (stop, handle)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::output_size;
-
-    #[test]
-    fn output_size_keeps_aspect_and_even() {
-        assert_eq!(output_size(2560, 1440, None), (2560, 1440));
-        assert_eq!(output_size(2560, 1440, Some(1080)), (1920, 1080));
-        assert_eq!(output_size(1920, 1080, Some(1440)), (1920, 1080));
-        assert_eq!(output_size(3440, 1440, Some(721)), (1722, 720));
-    }
 }
