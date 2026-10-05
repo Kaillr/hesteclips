@@ -331,6 +331,8 @@ struct App {
     pub(crate) game_icons: game_icons::GameIcons,
     pub(crate) updater: update::Updater,
     pub(crate) presence: discord::Presence,
+    /// Saves a clip as Save clip is pressed, frames or not.
+    quick_save: service::QuickSave,
     /// The game being clipped: its executable, and when we last checked it's
     /// still open. For Discord, and the folder clips go in.
     clipped_game: Option<(String, Instant)>,
@@ -357,12 +359,14 @@ impl App {
         let clips = clips::scan(&settings.output_dir);
         // Assets of clips deleted in Finder go to the Bin.
         store::sweep_orphans(&settings.output_dir, &clips);
-        let hotkeys = shortcuts::Registered::new(ctx.clone()).map(|mut h| {
+        let live_audio = capture::mixer::LiveAudio::new();
+        let service = CaptureService::new(live_audio.clone());
+        let quick_save = service.quick_save();
+        let hotkeys = shortcuts::Registered::new(ctx.clone(), quick_save.clone()).map(|mut h| {
             h.sync(&settings.shortcuts);
             h
         });
         let (render_tx, render_rx) = std::sync::mpsc::channel();
-        let live_audio = capture::mixer::LiveAudio::new();
         live_audio.set_limiter(settings.limiter);
         for s in &settings.audio_sources {
             live_audio.channel(&s.id).set_volume(sources_ui::from_db(s.volume_db), s.muted);
@@ -379,7 +383,8 @@ impl App {
                 let k = k.to_string_lossy();
                 ["HESTECLIPS_OPEN_", "HESTECLIPS_DEMO_", "HESTECLIPS_LIBRARY", "HESTECLIPS_SETTINGS"].iter().any(|p| k.starts_with(p))
             }),
-            service: CaptureService::new(live_audio.clone()),
+            service,
+            quick_save,
             hotkeys,
             recording_shortcut: None,
             confirm_reset: false,
@@ -609,18 +614,22 @@ impl eframe::App for App {
             }
             Err(_) => Vec::new(),
         };
-        for action in pressed {
+        for (action, saved) in pressed {
             if self.recording_shortcut.is_some() {
                 continue;
             }
             match action {
                 settings::ShortcutAction::ToggleBuffer => self.toggle_buffer(),
                 settings::ShortcutAction::ToggleRecord => self.toggle_record(),
+                // Saved already, the moment the key went down.
+                settings::ShortcutAction::SaveClip if saved => self.clip_saving(),
                 settings::ShortcutAction::SaveClip => self.save_clip(),
             }
         }
 
         self.pump_capture_events();
+        let armed = (self.rec_state == RecState::Buffering && self.recording_shortcut.is_none()).then(|| (self.clip_folder(), self.settings.save_sound.clone()));
+        self.quick_save.arm(armed);
         self.updater.set_auto(self.settings.auto_update);
         self.cloud.poll();
         self.pump_uploads();
@@ -951,7 +960,7 @@ impl App {
     /// Where a clip saved now goes: its game's folder in the library
     /// (Desktop without one), or the library itself with folders turned off.
     /// A recording goes with the game it was mostly of.
-    fn clip_folder(&mut self) -> PathBuf {
+    fn clip_folder(&self) -> PathBuf {
         let lib = self.settings.output_dir.clone();
         if !self.settings.folder_per_game {
             return lib;
@@ -1322,6 +1331,11 @@ impl App {
         let dir = self.clip_folder();
         self.service.save_clip(dir);
         sound::play_saved(&self.settings.save_sound);
+        self.clip_saving();
+    }
+
+    /// A clip is being saved: a card for it in the library, shown.
+    fn clip_saving(&mut self) {
         self.saving += 1;
         self.page = Page::Clips;
     }

@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -43,6 +43,38 @@ pub fn stop_all_and_wait(timeout: Duration) {
     let (ack_tx, ack_rx) = std::sync::mpsc::channel();
     if tx.send(Cmd::StopAndAck(ack_tx)).is_ok() {
         let _ = ack_rx.recv_timeout(timeout);
+    }
+}
+
+/// Saves a replay clip right from a shortcut's own event, without waiting for
+/// the app's next frame: while a game covers the window, Windows can hold
+/// those back for seconds, and the clip is of the moment it's asked for.
+#[derive(Clone)]
+pub struct QuickSave {
+    tx: Sender<Cmd>,
+    /// While the replay buffer runs: the folder a clip goes in now, and the
+    /// sound that says it's saved.
+    armed: Arc<Mutex<Option<(PathBuf, crate::settings::SaveSound)>>>,
+}
+
+impl QuickSave {
+    /// Kept up to date by the app, every frame.
+    pub fn arm(&self, to: Option<(PathBuf, crate::settings::SaveSound)>) {
+        if let Ok(mut armed) = self.armed.lock()
+            && *armed != to
+        {
+            *armed = to;
+        }
+    }
+
+    /// Save a clip now, if the replay buffer runs. Whether it was asked for.
+    pub fn save(&self) -> bool {
+        let Some((dir, sound)) = self.armed.lock().ok().and_then(|a| a.clone()) else { return false };
+        if self.tx.send(Cmd::SaveClip(dir)).is_err() {
+            return false;
+        }
+        crate::sound::play_saved(&sound);
+        true
     }
 }
 
@@ -115,6 +147,12 @@ impl CaptureService {
     pub fn start(&self, mode: Mode, settings: EncodeSettings) {
         self.send(Cmd::Start(mode, settings));
     }
+    /// A way to save a clip from another thread (a shortcut's).
+    pub fn quick_save(&self) -> QuickSave {
+        let tx = self.cmd_tx.clone().expect("the capture thread runs while the service lives");
+        QuickSave { tx, armed: Default::default() }
+    }
+
     pub fn save_clip(&self, dir: PathBuf) {
         self.send(Cmd::SaveClip(dir));
     }

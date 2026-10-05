@@ -13,6 +13,8 @@
 //! does it (`portal_shortcuts`): the keys set here are what we ask it for.
 
 use std::str::FromStr;
+use std::sync::mpsc::{Receiver, channel};
+use std::sync::{Arc, Mutex};
 
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
@@ -29,6 +31,10 @@ pub struct Registered {
     ctx: egui::Context,
     /// What's registered now, with the action each id triggers.
     active: Vec<(HotKey, ShortcutAction)>,
+    /// The same by id, for the shortcut event handler.
+    ids: Arc<Mutex<Vec<(u32, ShortcutAction)>>>,
+    /// Presses from the handler, and whether it saved the clip itself.
+    presses: Receiver<(ShortcutAction, bool)>,
     /// What `active` was built from, to re-register only on change.
     from: Option<Shortcuts>,
     /// Shortcuts that couldn't be registered (taken by another app, invalid).
@@ -36,21 +42,42 @@ pub struct Registered {
 }
 
 impl Registered {
-    /// `ctx` is woken when a shortcut is pressed (where the backend can).
-    pub fn new(ctx: egui::Context) -> Result<Self, String> {
+    /// `ctx` is woken when a shortcut is pressed (where the backend can). Save
+    /// clip saves through `quick` as the key is pressed, frames or not.
+    pub fn new(ctx: egui::Context, quick: crate::service::QuickSave) -> Result<Self, String> {
+        let ids: Arc<Mutex<Vec<(u32, ShortcutAction)>>> = Default::default();
+        let (tx, presses) = channel();
         #[cfg(target_os = "linux")]
         if crate::portal_shortcuts::wanted() {
             if crate::portal_shortcuts::available() {
-                return Ok(Self { mgr: None, portal: None, ctx, active: Vec::new(), from: None, errors: Vec::new() });
+                let _ = (quick, tx);
+                return Ok(Self { mgr: None, portal: None, ctx, active: Vec::new(), ids, presses, from: None, errors: Vec::new() });
             }
             eprintln!("the desktop has no GlobalShortcuts portal: shortcuts only work while an X11 app is focused");
         }
+        let mgr = GlobalHotKeyManager::new().map_err(|e| e.to_string())?;
+        // Runs as the OS delivers the key, on the thread pumping the window's
+        // messages, whether the app is drawing frames or not.
+        let (handler_ids, wake) = (ids.clone(), ctx.clone());
+        GlobalHotKeyEvent::set_event_handler(Some(move |ev: GlobalHotKeyEvent| {
+            if ev.state != HotKeyState::Pressed {
+                return;
+            }
+            let action = handler_ids.lock().ok().and_then(|ids| ids.iter().find(|(id, _)| *id == ev.id).map(|(_, a)| *a));
+            if let Some(action) = action {
+                let saved = action == ShortcutAction::SaveClip && quick.save();
+                let _ = tx.send((action, saved));
+                wake.request_repaint();
+            }
+        }));
         Ok(Self {
-            mgr: Some(GlobalHotKeyManager::new().map_err(|e| e.to_string())?),
+            mgr: Some(mgr),
             #[cfg(target_os = "linux")]
             portal: None,
             ctx,
             active: Vec::new(),
+            ids,
+            presses,
             from: None,
             errors: Vec::new(),
         })
@@ -95,20 +122,20 @@ impl Registered {
             self.portal = Some(crate::portal_shortcuts::Portal::bind(list, self.ctx.clone()));
         }
         let _ = valid;
+        if let Ok(mut ids) = self.ids.lock() {
+            *ids = self.active.iter().map(|(h, a)| (h.id(), *a)).collect();
+        }
         self.from = Some(wanted.clone());
     }
 
-    /// Shortcuts pressed since the last call.
-    pub fn pressed(&mut self) -> Vec<ShortcutAction> {
-        let mut out = Vec::new();
-        while let Ok(ev) = GlobalHotKeyEvent::receiver().try_recv() {
-            if ev.state == HotKeyState::Pressed {
-                out.extend(self.active.iter().find(|(h, _)| h.id() == ev.id).map(|(_, a)| *a));
-            }
-        }
+    /// Shortcuts pressed since the last call, and whether the clip was saved
+    /// already (Save clip, as it was pressed).
+    pub fn pressed(&mut self) -> Vec<(ShortcutAction, bool)> {
+        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+        let mut out: Vec<(ShortcutAction, bool)> = self.presses.try_iter().collect();
         #[cfg(target_os = "linux")]
         if let Some(p) = &self.portal {
-            out.extend(p.pressed());
+            out.extend(p.pressed().into_iter().map(|a| (a, false)));
         }
         out
     }
