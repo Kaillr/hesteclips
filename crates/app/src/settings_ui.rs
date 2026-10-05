@@ -172,7 +172,7 @@ impl App {
 
         section(ui, "Discord", |ui| {
             let hint = "While the replay buffer or a recording runs, your Discord profile shows what you're clipping, like \"Clipping osu!\". Needs the Discord app running on this computer.";
-            row(ui, "Show on Discord", Some(hint), |ui| {
+            row(ui, "Show as your Discord activity", Some(hint), |ui| {
                 ui.horizontal(|ui| {
                     toggle(ui, &mut self.settings.discord_presence);
                     if self.settings.discord_presence && self.rec_state != RecState::Idle {
