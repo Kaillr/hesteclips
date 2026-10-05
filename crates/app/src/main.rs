@@ -618,6 +618,7 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        let mut laps = Laps::start();
 
         // Global shortcuts: these fire even while a game is focused. Paused while
         // the Settings recorder listens, so pressing the current key rebinds it
@@ -642,7 +643,9 @@ impl eframe::App for App {
             }
         }
 
+        laps.lap("shortcuts");
         self.pump_capture_events();
+        laps.lap("capture events");
         let capturing = match self.rec_state {
             RecState::Idle => games::Capturing::Off,
             RecState::Buffering => games::Capturing::Buffer(self.settings.replay_seconds),
@@ -660,12 +663,16 @@ impl eframe::App for App {
         self.cloud.poll();
         self.pump_uploads();
         self.pump_renders();
+        laps.lap("games, uploads, renders");
         // Every frame, not just while the Sources page draws: leaving the page must
         // stop the meters' capture, or macOS keeps showing its recording indicator.
         self.ensure_level_monitor();
+        laps.lap("level monitor");
         self.ensure_video_preview();
+        laps.lap("video preview");
         self.sync_capture_video();
         self.refit_webcam();
+        laps.lap("webcam fit");
         if let Some(w) = &self.settings.webcam {
             *self.webcam_placement.lock().unwrap() = if w.enabled { w.placement.into() } else { capture::webcam::Placement::hidden() };
         }
@@ -678,6 +685,7 @@ impl eframe::App for App {
             capture::webcam::keep_open(camera.clone());
             self.kept_camera = camera;
         }
+        laps.lap("webcam");
 
         // Left the viewer some other way (a hotkey that shows the library): stop it.
         if self.page != Page::View && self.viewer.is_some() {
@@ -719,6 +727,7 @@ impl eframe::App for App {
         } else {
             egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin::symmetric(16, 4))
         };
+        laps.lap("bars");
         egui::CentralPanel::default()
             .frame(central)
             .show(ui, |ui| match self.page {
@@ -729,8 +738,16 @@ impl eframe::App for App {
                 Page::View => self.viewer_page(ui, frame),
             });
 
+        laps.lap(match self.page {
+            Page::Clips => "library page",
+            Page::Sources => "sources page",
+            Page::Settings => "settings page",
+            Page::Edit => "editor page",
+            Page::View => "player page",
+        });
         self.dialogs(&ctx);
         self.rename_dialog(&ctx);
+        laps.lap("dialogs");
 
         // Library auto-refresh: poll the output folder ~once a second and rescan only
         // when it actually changed (cheap, no watcher thread).
@@ -738,20 +755,25 @@ impl eframe::App for App {
         if self.last_poll.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(1)) {
             self.last_poll = Some(now);
             self.permission = capture::screen_permission();
+            laps.lap("permission");
             let stamp = clips::stamp(&self.settings.output_dir);
             if stamp != self.library_stamp {
                 self.library_stamp = stamp;
                 self.refresh_clips();
             }
+            laps.lap("library scan");
             self.track_game();
             self.update_presence();
+            laps.lap("game, discord");
             // Persist settings as they change; no Save button to forget.
             let json = self.settings.to_json();
             if json != self.saved_settings && self.persist_settings {
                 RecordSettings::save_json(&json);
                 self.saved_settings = json;
             }
+            laps.lap("settings");
         }
+        laps.report();
 
         // Keep repainting: every frame while capturing (live timer), else a steady
         // tick so capture-thread events and folder changes are picked up promptly.
@@ -1410,6 +1432,40 @@ fn open_screen_settings() {
         let _ = std::process::Command::new("open")
             .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")
             .spawn();
+    }
+}
+
+/// Times the parts of one UI update, and logs them when it was slow: the
+/// window shows nothing new (a player's picture stays black) until it ends.
+struct Laps {
+    start: Instant,
+    last: Instant,
+    laps: Vec<(&'static str, Duration)>,
+}
+
+impl Laps {
+    /// A UI update this slow is logged (a guess: well past a dropped frame or
+    /// two, short of anything you'd notice).
+    const SLOW: Duration = Duration::from_millis(250);
+
+    fn start() -> Self {
+        let now = Instant::now();
+        Self { start: now, last: now, laps: Vec::new() }
+    }
+
+    fn lap(&mut self, what: &'static str) {
+        let now = Instant::now();
+        self.laps.push((what, now - self.last));
+        self.last = now;
+    }
+
+    fn report(self) {
+        let total = self.start.elapsed();
+        if total < Self::SLOW {
+            return;
+        }
+        let parts: Vec<String> = self.laps.iter().filter(|(_, d)| *d >= Duration::from_millis(5)).map(|(w, d)| format!("{w} {} ms", d.as_millis())).collect();
+        eprintln!("{} slow UI update: {} ms ({})", chrono::Local::now().format("%H:%M:%S"), total.as_millis(), parts.join(", "));
     }
 }
 
