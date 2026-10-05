@@ -22,6 +22,10 @@ enum Cmd {
     Stop(Option<PathBuf>),
     /// Stop, then signal once the file is finished (app being killed).
     StopAndAck(Sender<()>),
+    /// The app is closing: end the thread (dropping the recorder finishes any
+    /// recording). Asked for outright, as the shortcut handler keeps a sender
+    /// of its own for as long as the process runs.
+    Quit,
 }
 
 /// Results from the capture thread, drained by the UI.
@@ -149,6 +153,7 @@ impl CaptureService {
                         let _ = recorder.stop(None);
                         let _ = ack.send(());
                     }
+                    Cmd::Quit => break,
                 }
             }
         });
@@ -191,11 +196,13 @@ impl CaptureService {
 }
 
 impl Drop for CaptureService {
-    /// Quitting the app must stop capture: close the command channels so the
-    /// thread exits its loop and drops the recorder (which finishes any recording),
-    /// and wait for that so the process doesn't exit mid-write.
+    /// Quitting the app must stop capture: the thread exits its loop and drops
+    /// the recorder (which finishes any recording), and we wait for that so the
+    /// process doesn't exit mid-write.
     fn drop(&mut self) {
-        self.cmd_tx = None;
+        if let Some(tx) = self.cmd_tx.take() {
+            let _ = tx.send(Cmd::Quit);
+        }
         if let Some(hook) = STOP_HOOK.get() {
             let _ = hook.lock().map(|mut h| *h = None);
         }
