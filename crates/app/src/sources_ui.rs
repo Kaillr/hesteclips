@@ -47,6 +47,12 @@ pub(crate) struct SourcesView {
     apps: Vec<capture::Device>,
     /// The preview picture, and which frame it shows.
     preview: Option<(egui::TextureHandle, u64)>,
+    /// macOS: the preview frame drawn straight from the GPU, and the frames
+    /// opened for it (the capture's buffers, each opened once).
+    #[cfg(target_os = "macos")]
+    preview_gpu: Option<(crate::gpu_frames::Shown, u64)>,
+    #[cfg(target_os = "macos")]
+    preview_frames: crate::gpu_frames::Frames,
     /// Preview frames shown in the current second, when it started, and the
     /// rate over the last full second.
     preview_rate: (u32, Option<Instant>, u32),
@@ -314,9 +320,36 @@ impl App {
         if self.sources_view.preview.as_ref().is_some_and(|(_, seq)| *seq == f.seq) {
             return;
         }
+        #[cfg(target_os = "macos")]
+        if self.sources_view.preview_gpu.as_ref().is_some_and(|(_, seq)| *seq == f.seq) {
+            return;
+        }
+        self.count_preview_frame();
+        // macOS: the frame itself, on the GPU, drawn as it is.
+        #[cfg(target_os = "macos")]
+        if let Some(s) = &f.surface {
+            if let Some(shown) = self.sources_view.preview_frames.show(s, f.width, f.height) {
+                self.sources_view.preview_gpu = Some((shown, f.seq));
+            }
+            return;
+        }
+        if f.rgba.is_empty() {
+            return;
+        }
         // Opaque, so it's already premultiplied: one copy, no per-pixel work.
         let pixels: Vec<egui::Color32> = bytemuck::cast_slice(&f.rgba).to_vec();
         let image = egui::ColorImage::new([f.width as usize, f.height as usize], pixels);
+        match &mut self.sources_view.preview {
+            Some((tex, seq)) => {
+                tex.set(image, egui::TextureOptions::LINEAR);
+                *seq = f.seq;
+            }
+            None => self.sources_view.preview = Some((ctx.load_texture("capture_preview", image, egui::TextureOptions::LINEAR), f.seq)),
+        }
+    }
+
+    /// Count a new preview frame, for the rate shown.
+    fn count_preview_frame(&mut self) {
         let (count, since, rate) = &mut self.sources_view.preview_rate;
         *count += 1;
         match since {
@@ -327,13 +360,6 @@ impl App {
             }
             None => *since = Some(Instant::now()),
             _ => {}
-        }
-        match &mut self.sources_view.preview {
-            Some((tex, seq)) => {
-                tex.set(image, egui::TextureOptions::LINEAR);
-                *seq = f.seq;
-            }
-            None => self.sources_view.preview = Some((ctx.load_texture("capture_preview", image, egui::TextureOptions::LINEAR), f.seq)),
         }
     }
 
@@ -350,9 +376,24 @@ impl App {
             let message = |text: &str| {
                 p.text(rect.center(), egui::Align2::CENTER_CENTER, text, egui::FontId::proportional(13.0), Color32::from_gray(170));
             };
-            match (&self.sources_view.preview, frame) {
-                (Some((tex, _)), Some(f)) => {
+            #[cfg(target_os = "macos")]
+            let gpu = self.sources_view.preview_gpu.as_ref().map(|(s, _)| s.clone());
+            #[cfg(not(target_os = "macos"))]
+            let gpu: Option<()> = None;
+            let drawn = match (&gpu, &self.sources_view.preview) {
+                #[cfg(target_os = "macos")]
+                (Some(shown), _) => {
+                    shown.paint(ui, rect);
+                    true
+                }
+                (_, Some((tex, _))) => {
                     p.image(tex.id(), rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+                    true
+                }
+                _ => false,
+            };
+            match (drawn, frame) {
+                (true, Some(f)) => {
                     if f.waiting && matches!(&self.settings.capture, CaptureTarget::Apps { apps, .. } if apps.is_empty()) {
                         let band = egui::Rect::from_center_size(rect.center_bottom() - egui::vec2(0.0, 22.0), egui::vec2(rect.width(), 28.0));
                         p.rect_filled(band, 0.0, Color32::from_black_alpha(180));

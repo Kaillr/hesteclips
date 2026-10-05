@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use crate::Device;
 
 /// Whether this platform can record a webcam.
-pub const AVAILABLE: bool = cfg!(target_os = "windows");
+pub const AVAILABLE: bool = cfg!(any(target_os = "windows", target_os = "macos"));
 
 /// Where the webcam goes and how much of it shows.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -106,10 +106,15 @@ pub fn formats(device: &str) -> Vec<Format> {
     FORMATS.lock().unwrap().as_ref().filter(|(d, _)| d == device).map(|(_, f)| f.clone()).unwrap_or_default()
 }
 
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "windows", target_os = "macos")), allow(dead_code))]
 pub(crate) fn set_formats(device: &str, formats: Vec<Format>) {
     *FORMATS.lock().unwrap() = Some((device.to_owned(), formats));
 }
+
+/// Whether cameras have their own settings window ([`open_settings`]): on
+/// Windows, from the driver. macOS has none (its controls are in Control
+/// Centre's Video Effects).
+pub const HAS_SETTINGS: bool = cfg!(target_os = "windows");
 
 /// Open the camera's own settings window (exposure, focus, white balance…, as
 /// its driver offers them). Changes apply to the camera straight away, in
@@ -134,7 +139,11 @@ pub fn keep_open(want: Option<(String, Option<Format>)>) {
     {
         crate::win::keep_camera_open(want);
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    {
+        crate::mac::camera::keep_open(want);
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         let _ = want;
     }
@@ -146,7 +155,11 @@ pub fn list_cameras() -> Vec<Device> {
     {
         crate::win::list_cameras()
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    {
+        crate::mac::camera::list_cameras()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         Vec::new()
     }
@@ -172,7 +185,7 @@ pub fn status() -> Status {
     STATUS.lock().unwrap().clone()
 }
 
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "windows", target_os = "macos")), allow(dead_code))]
 pub(crate) fn set_status(s: Status) {
     *STATUS.lock().unwrap() = s;
 }

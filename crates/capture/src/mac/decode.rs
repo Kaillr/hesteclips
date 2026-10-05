@@ -98,6 +98,11 @@ unsafe impl Send for Surface {}
 unsafe impl Sync for Surface {}
 
 impl Surface {
+    /// A frame from elsewhere (a capture's), studio-range NV12, BT.709.
+    pub(crate) fn from_buffer(buf: CFRetained<CVPixelBuffer>) -> Self {
+        Self { buf, bt601: false }
+    }
+
     /// The IOSurface holding the pixels.
     pub fn io_surface(&self) -> Option<CFRetained<IOSurfaceRef>> {
         CVPixelBufferGetIOSurface(Some(&self.buf))

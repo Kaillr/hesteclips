@@ -110,7 +110,7 @@ pub struct StillImage {
 }
 
 /// Whether this platform can record games and apps ([`VideoSource::Apps`]).
-pub const APP_CAPTURE: bool = cfg!(target_os = "windows");
+pub const APP_CAPTURE: bool = cfg!(any(target_os = "windows", target_os = "macos"));
 
 /// Running apps with a window, for [`VideoSource::Apps`], sorted by name.
 pub fn list_windowed_apps() -> Vec<Device> {
@@ -118,22 +118,38 @@ pub fn list_windowed_apps() -> Vec<Device> {
     {
         win::list_windowed_apps()
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    {
+        mac::windows::list_windowed_apps()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         Vec::new()
     }
 }
 
-/// The executable of the app in focus (`osu!.exe`), where the platform can tell.
+/// The app in focus, where the platform can tell: its executable on Windows
+/// (`osu!.exe`), its bundle id on macOS (else its executable).
 pub fn foreground_exe() -> Option<String> {
     #[cfg(target_os = "windows")]
     {
         win::foreground_exe()
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    {
+        mac::windows::foreground_exe()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         None
     }
+}
+
+/// The file name of a running app's bundle (`World of Warcraft.app`), by
+/// its id (bundle id, or executable for an app without one).
+#[cfg(target_os = "macos")]
+pub fn app_file_name(id: &str) -> Option<String> {
+    mac::windows::bundle_file_name(id)
 }
 
 /// Screens the backend can capture; their ids go in [`VideoSource::Screen`].

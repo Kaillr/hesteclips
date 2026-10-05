@@ -139,9 +139,13 @@ fn activity(status: &Status) -> Activity<'_> {
     }
 }
 
-/// A game Discord knows, by executable (`osu!.exe`, lower case). `None` until
-/// the list has loaded (from the cache, or from Discord in the background).
+/// A game Discord knows, by the app's id (`capture::foreground_exe`): an
+/// executable on Windows (`osu!.exe`), a bundle id on macOS, looked up by
+/// its bundle's name as Discord lists them (`world of warcraft.app`). `None`
+/// until the list has loaded (from the cache, or from Discord in the background).
 pub fn known_game(exe: &str) -> Option<Game> {
+    #[cfg(target_os = "macos")]
+    let exe = &capture::app_file_name(exe)?;
     static GAMES: OnceLock<Option<HashMap<String, KnownGame>>> = OnceLock::new();
     static LOADING: AtomicBool = AtomicBool::new(false);
     if GAMES.get().is_none() && !LOADING.swap(true, Ordering::Relaxed) {
@@ -161,7 +165,7 @@ struct KnownGame {
 }
 
 fn games_cache() -> Option<PathBuf> {
-    dirs::cache_dir().map(|d| d.join("hesteclips").join("discord-games.json"))
+    dirs::cache_dir().map(|d| d.join("hesteclips").join("discord-games-2.json"))
 }
 
 /// Discord's games, from our cache while it's fresh, else downloaded (and cached).
@@ -210,15 +214,21 @@ fn download_games() -> Option<HashMap<String, KnownGame>> {
         .limit(64 << 20)
         .read_json()
         .ok()?;
-    // Executable names are paths (`win64/cs2.exe`); match on the file name.
+    // Executable names are paths (`win64/cs2.exe`, `osx64/dota2.app`); match
+    // on the file name.
     // Some are only told apart by their arguments (`>javaw.exe`), and a few
     // names are shared by several games (`game.exe`): those can't be matched.
     let mut by_exe: HashMap<String, Option<KnownGame>> = HashMap::new();
     for app in apps {
         let Some(icon) = app.icon_hash else { continue };
-        let ours = std::env::consts::OS == "windows";
+        // Discord's names for the OSes.
+        let ours = match std::env::consts::OS {
+            "windows" => "win32",
+            "macos" => "darwin",
+            other => other,
+        };
         for exe in app.executables {
-            if exe.is_launcher || exe.arguments.is_some() || exe.name.starts_with('>') || (exe.os == "win32") != ours {
+            if exe.is_launcher || exe.arguments.is_some() || exe.name.starts_with('>') || exe.os != ours {
                 continue;
             }
             let file = exe.name.rsplit('/').next().unwrap_or(&exe.name).to_lowercase();

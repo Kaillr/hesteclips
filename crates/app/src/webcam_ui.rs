@@ -375,7 +375,8 @@ impl App {
                             .response
                             .on_disabled_hover_text("Stop capturing to change the camera's format.");
                     });
-                    if ui
+                    if capture::webcam::HAS_SETTINGS
+                        && ui
                         .button("⚙ Camera settings…")
                         .on_hover_text("The camera's own settings: exposure, focus, white balance and more. They apply to the camera right away, in every app.")
                         .clicked()

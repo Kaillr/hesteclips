@@ -21,14 +21,16 @@ use std::time::{Duration, Instant};
 use crate::VideoSource;
 
 /// Whether this platform can show a preview.
-pub const AVAILABLE: bool = cfg!(target_os = "windows");
+pub const AVAILABLE: bool = cfg!(any(target_os = "windows", target_os = "macos"));
 
-/// One preview picture, RGBA.
-#[derive(Debug)]
+/// One preview picture: RGBA on Windows; on macOS the recording's own NV12
+/// frame on the GPU (`surface`, drawn without a copy) and `rgba` empty.
 pub struct PreviewFrame {
     pub width: u32,
     pub height: u32,
     pub rgba: Vec<u8>,
+    #[cfg(target_os = "macos")]
+    pub surface: Option<crate::decode::Surface>,
     /// Increases with every new frame, to notice changes cheaply.
     pub seq: u64,
     /// No app is being shown: none of the recorded apps is open, or you've
@@ -61,15 +63,15 @@ pub fn latest() -> Option<Arc<PreviewFrame>> {
 
 /// Whether to make a frame now: someone looked at the preview recently, and
 /// has taken the last frame.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "windows", target_os = "macos")), allow(dead_code))]
 pub(crate) fn wants_frame() -> bool {
     TAKEN.load(Ordering::Acquire) && REQUESTED.lock().unwrap().is_some_and(|t| t.elapsed() < Duration::from_secs(1))
 }
 
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "windows", target_os = "macos")), allow(dead_code))]
 /// Register a new producer, which from now on is the only one whose frames are
 /// shown. Returns its generation.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "windows", target_os = "macos")), allow(dead_code))]
 pub(crate) fn new_producer() -> u64 {
     let generation = GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
     *LATEST.lock().unwrap() = None; // the old picture isn't what's captured anymore
@@ -78,12 +80,29 @@ pub(crate) fn new_producer() -> u64 {
 }
 
 /// Make `rgba` the newest frame, if `generation` is still the newest producer.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 /// Returns it either way, so the producer can reuse its buffer once nobody
 /// else holds it.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "windows", target_os = "macos")), allow(dead_code))]
 pub(crate) fn publish(generation: u64, width: u32, height: u32, rgba: Vec<u8>, waiting: bool, app: Option<String>) -> Arc<PreviewFrame> {
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed) + 1;
-    let frame = Arc::new(PreviewFrame { width, height, rgba, seq, waiting, app });
+    publish_frame(generation, PreviewFrame {
+        width,
+        height,
+        rgba,
+        #[cfg(target_os = "macos")]
+        surface: None,
+        seq: 0,
+        waiting,
+        app,
+    })
+}
+
+/// Make `frame` the newest (its `seq` is set here), if `generation` is still
+/// the newest producer.
+#[cfg_attr(not(any(target_os = "windows", target_os = "macos")), allow(dead_code))]
+pub(crate) fn publish_frame(generation: u64, mut frame: PreviewFrame) -> Arc<PreviewFrame> {
+    frame.seq = SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+    let frame = Arc::new(frame);
     let mut latest = LATEST.lock().unwrap();
     if GENERATION.load(Ordering::Acquire) == generation {
         TAKEN.store(false, Ordering::Release);
@@ -93,7 +112,7 @@ pub(crate) fn publish(generation: u64, width: u32, height: u32, rgba: Vec<u8>, w
 }
 
 /// A producer stopped: forget its last frame, unless a newer one took over.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "windows", target_os = "macos")), allow(dead_code))]
 pub(crate) fn clear(generation: u64) {
     let mut latest = LATEST.lock().unwrap();
     if GENERATION.load(Ordering::Acquire) == generation {
@@ -109,6 +128,8 @@ pub(crate) fn clear(generation: u64) {
 pub struct VideoPreview {
     #[cfg(target_os = "windows")]
     inner: crate::win::PreviewCapture,
+    #[cfg(target_os = "macos")]
+    inner: crate::mac::preview::PreviewCapture,
 }
 
 impl VideoPreview {
@@ -125,7 +146,11 @@ impl VideoPreview {
         {
             Self { inner: crate::win::PreviewCapture::start(source.clone(), target_height, fps, away_screen, webcam) }
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(target_os = "macos")]
+        {
+            Self { inner: crate::mac::preview::PreviewCapture::start(source.clone(), target_height, fps, away_screen, webcam) }
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         {
             let _ = (source, target_height, fps, away_screen, webcam);
             Self {}
@@ -135,11 +160,11 @@ impl VideoPreview {
     /// Change what the preview shows without restarting it, if the change
     /// allows (a different list of games and apps). Returns whether it did.
     pub fn update(&self, source: &VideoSource) -> bool {
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         {
             self.inner.update(source)
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         {
             let _ = source;
             false
@@ -148,11 +173,11 @@ impl VideoPreview {
 
     /// Why the preview couldn't start, if it couldn't.
     pub fn error(&self) -> Option<String> {
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         {
             self.inner.error()
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         {
             Some("the preview isn't available on this platform yet".into())
         }

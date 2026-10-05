@@ -17,14 +17,15 @@ dispatch2 = "0.3.1"
 objc2 = "0.6.4"
 objc2-app-kit = { version = "0.3.2", features = ["NSWorkspace", "NSRunningApplication"] }
 objc2-audio-toolbox = { version = "0.3.2", default-features = false, features = ["std", "AudioConverter", "objc2-core-audio-types"] }
-objc2-av-foundation = { version = "0.3.2", default-features = false, features = ["std", "block2", "AVAssetWriter", "AVAssetWriterInput", "AVMediaFormat", "AVMetadataItem", "AVMetadataIdentifiers", "AVAsynchronousKeyValueLoading", "objc2-core-media"] }
+objc2-av-foundation = { version = "0.3.2", default-features = false, features = ["std", "block2", "dispatch2", "AVAssetWriter", "AVAssetWriterInput", "AVMediaFormat", "AVMetadataItem", "AVMetadataIdentifiers", "AVAsynchronousKeyValueLoading", "AVCaptureDevice", "AVCaptureInput", "AVCaptureOutputBase", "AVCaptureSession", "AVCaptureSessionPreset", "AVCaptureVideoDataOutput", "objc2-core-media", "objc2-core-video"] }
 objc2-core-audio-types = "0.3.2"
-objc2-core-foundation = { version = "0.3.2", features = ["CFArray", "CFData", "CFDictionary", "CFNumber", "CFString"] }
-objc2-core-graphics = { version = "0.3.2", features = ["CGWindow", "CGDirectDisplay", "CGDisplayStream"] }
+objc2-core-foundation = { version = "0.3.2", features = ["CFArray", "CFCGTypes", "CFData", "CFDictionary", "CFNumber", "CFString"] }
+objc2-core-graphics = { version = "0.3.2", features = ["CGColor", "CGGeometry", "CGWindow", "CGDirectDisplay", "CGDisplayStream"] }
 objc2-core-media = { version = "0.3.2", features = ["CMSampleBuffer", "CMBlockBuffer", "CMFormatDescription", "CMTime", "CMSync", "objc2-core-video", "objc2-core-audio-types"] }
-objc2-core-video = { version = "0.3.2", features = ["CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVPixelBufferIOSurface", "CVReturn", "objc2-io-surface"] }
+objc2-core-video = { version = "0.3.2", features = ["CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVPixelBufferIOSurface", "CVPixelBufferPool", "CVReturn", "objc2-io-surface"] }
 objc2-io-surface = { version = "0.3.2", default-features = false, features = ["std", "IOSurfaceRef", "IOSurfaceTypes", "objc2", "objc2-core-foundation"] }
-objc2-foundation = { version = "0.3.2", features = ["NSArray", "NSString", "NSError", "NSEnumerator", "NSObject", "NSURL"] }
+objc2-foundation = { version = "0.3.2", features = ["NSArray", "NSDictionary", "NSString", "NSError", "NSEnumerator", "NSObject", "NSURL", "NSValue"] }
+objc2-metal = { version = "0.3.2", default-features = false, features = ["std", "block2", "MTLAllocation", "MTLBlitCommandEncoder", "MTLCommandBuffer", "MTLCommandEncoder", "MTLCommandQueue", "MTLComputeCommandEncoder", "MTLComputePipeline", "MTLDevice", "MTLLibrary", "MTLPixelFormat", "MTLResource", "MTLTexture", "MTLTypes", "objc2-io-surface"] }
 objc2-screen-capture-kit = { version = "0.3.2", features = ["SCShareableContent", "SCStream", "block2", "dispatch2", "objc2-core-media", "objc2-core-graphics"] }
 objc2-video-toolbox = { version = "0.3.2", features = ["VTCompressionSession", "VTCompressionProperties", "VTDecompressionSession", "VTDecompressionProperties", "VTPixelTransferProperties", "VTSession", "VTErrors", "objc2-core-media", "objc2-core-video"] }
 

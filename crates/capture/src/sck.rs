@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -34,9 +34,6 @@ use objc2_core_audio_types::{
     AudioBuffer, AudioBufferList, AudioStreamBasicDescription, kAudioFormatFlagIsNonInterleaved,
 };
 use objc2_core_foundation::{CFBoolean, CFDictionary, CFNumber, CFRetained, CFString, CFType};
-use objc2_core_graphics::{
-    CGDisplayCopyDisplayMode, CGDisplayMode, CGMainDisplayID, kCGDisplayStreamYCbCrMatrix_ITU_R_709_2,
-};
 use objc2_core_media::{
     CMAudioFormatDescriptionGetStreamBasicDescription, CMBlockBuffer, CMClock, CMSampleBuffer, CMTime,
     kCMSampleAttachmentKey_NotSync,
@@ -50,7 +47,7 @@ use objc2_core_video::{
 };
 use objc2_foundation::{NSArray, NSError, NSObject, NSObjectProtocol};
 use objc2_screen_capture_kit::{
-    SCContentFilter, SCDisplay, SCRunningApplication, SCShareableContent, SCStream,
+    SCContentFilter, SCDisplay, SCRunningApplication, SCStream,
     SCStreamConfiguration, SCStreamOutput, SCStreamOutputType,
 };
 use objc2_video_toolbox::{
@@ -71,6 +68,7 @@ use crate::output::{in_progress, timestamp};
 use crate::sources::{AudioCapture, AudioSource, SourceKind, mix_inputs, track_layout};
 use crate::avwriter::{SendFormat, SendSample};
 use crate::writer::{self, Layout, Media, Writer};
+use crate::mac::video::{self, Frames, Picture, pick_display, shareable_content};
 use crate::{EncodeSettings, Mode, Recorder};
 
 use crate::AUDIO_BITRATE;
@@ -163,6 +161,10 @@ impl Recorder for SckRecorder {
     fn is_running(&self) -> bool {
         self.session.is_some()
     }
+
+    fn update_video(&mut self, video: &crate::VideoSource) -> bool {
+        self.session.as_ref().and_then(|s| s.video.as_ref()).is_some_and(|p| p.update(video))
+    }
 }
 
 impl Drop for SckRecorder {
@@ -194,8 +196,8 @@ const MIX_LATENCY: f64 = 0.3;
 /// Everything a running capture owns. Torn down in `finish` in an order that
 /// lets every encoder flush into the writer before it closes the file.
 struct Session {
-    /// The screen stream and its callback object (kept alive while it may call in).
-    video: Option<(Retained<SCStream>, Retained<StreamOutput>)>,
+    /// The screen or app capture (`mac::video`).
+    video: Option<Picture>,
     pacer: Option<(Arc<AtomicBool>, JoinHandle<()>)>,
     audio: Option<AudioCapture>,
     mixer: Option<(Arc<AtomicBool>, JoinHandle<()>)>,
@@ -207,13 +209,12 @@ struct Session {
 
 impl Session {
     fn start(s: &EncodeSettings, target: Target, live: &Arc<LiveAudio>) -> Result<Self> {
-        let content = shareable_content()?;
-        let screen_id = match &s.video {
-            crate::VideoSource::Screen { id } => id.as_str(),
-            crate::VideoSource::Apps { .. } => bail!("recording games and apps isn't available on macOS yet"),
+        let (content, display, (width, height)) = video::plan(&s.video, s.target_height)?;
+        // The away screen, converted once.
+        let away = match &s.away_screen {
+            Some(img) if matches!(s.video, crate::VideoSource::Apps { .. }) => Some(Arc::new(video::still_buffer(Some(img), width, height)?)),
+            _ => None,
         };
-        let display = pick_display(&content, screen_id).context("no display to capture")?;
-        let (width, height) = output_size(&display, s.target_height);
         let clock = Arc::new(Clock::default());
 
         // The writer needs every track's format up front: the video format comes
@@ -263,22 +264,12 @@ impl Session {
             session.mixer = Some((stop, mixer));
 
             let encoder = Encoder::new(width, height, s, session.writer_tx.clone())?;
-            let shared = Arc::new(Shared::default());
-            let output = StreamOutput::new(shared.clone());
-            let stream = make_video_stream(&display, width, height, s.fps, &output)?;
-            start_capture(&stream)?;
-            session.video = Some((stream, output));
-
-            // Wait for the first frame so a capture that can't see the screen fails
-            // here, visibly, instead of producing an empty file.
-            let deadline = Instant::now() + Duration::from_secs(3);
-            while shared.latest.lock().unwrap().is_none() {
-                if Instant::now() >= deadline {
-                    bail!("the screen isn't delivering frames — check Screen Recording permission");
-                }
-                thread::sleep(Duration::from_millis(10));
-            }
-            session.pacer = Some(spawn_pacer(s.fps, shared, encoder, clock));
+            let picture = Picture::start(&s.video, &content, &display, (width, height), s.fps, away)?;
+            // A webcam that can't open doesn't stop the recording: its status
+            // says why, and the picture goes on without it.
+            let frames = Frames::new(picture.latest.clone(), s.webcam.as_ref(), width, height, crate::preview::new_producer())?;
+            session.video = Some(picture);
+            session.pacer = Some(spawn_pacer(s.fps, frames, encoder, clock));
             Ok(())
         })();
         if let Err(e) = started {
@@ -290,13 +281,13 @@ impl Session {
 
     /// Stop capturing and finish the file (record) or drop the ring (replay).
     fn finish(mut self) -> Result<()> {
-        if let Some((stream, _)) = &self.video {
-            stop_capture(stream);
-        }
         // The pacer flushes the video encoder on its way out.
         if let Some((stop, handle)) = self.pacer.take() {
             stop.store(true, Ordering::Relaxed);
             let _ = handle.join();
+        }
+        if let Some(picture) = self.video.take() {
+            picture.stop();
         }
         if let Some(audio) = self.audio.take() {
             audio.stop();
@@ -346,11 +337,8 @@ pub(crate) fn host_now() -> f64 {
 struct SendBox<T>(T);
 unsafe impl<T> Send for SendBox<T> {}
 
-/// What a stream's callbacks feed: the newest screen frame (for the pacer) and/or
-/// a source's audio.
-#[derive(Default)]
+/// What an audio stream's callbacks feed: a source's audio.
 struct Shared {
-    latest: Mutex<Option<SendBox<CFRetained<CVPixelBuffer>>>>,
     audio: Option<Arc<SourceFeed>>,
 }
 
@@ -371,12 +359,7 @@ define_class!(
             kind: SCStreamOutputType,
         ) {
             let shared = self.ivars();
-            if kind == SCStreamOutputType::Screen {
-                // Idle/blank status frames carry no image; keep the previous one.
-                if let Some(image) = unsafe { sample.image_buffer() } {
-                    *shared.latest.lock().unwrap() = Some(SendBox(image));
-                }
-            } else if kind == SCStreamOutputType::Audio {
+            if kind == SCStreamOutputType::Audio {
                 if let Some((feed, (pcm, channels))) = shared.audio.as_ref().zip(interleaved_pcm(sample)) {
                     let start = unsafe { sample.presentation_time_stamp().seconds() };
                     feed.push(start, &pcm, channels);
@@ -433,79 +416,6 @@ fn interleaved_pcm(sample: &CMSampleBuffer) -> Option<(Vec<f32>, usize)> {
             }
         }
         Some((out, planes.len()))
-    }
-}
-
-fn shareable_content() -> Result<Retained<SCShareableContent>> {
-    let (tx, rx) = mpsc::channel::<Result<SendBox<Retained<SCShareableContent>>, String>>();
-    let handler = RcBlock::new(move |content: *mut SCShareableContent, err: *mut NSError| {
-        let result = match unsafe { Retained::retain(content) } {
-            Some(c) => Ok(SendBox(c)),
-            None => Err(unsafe { err.as_ref() }
-                .map(|e| e.localizedDescription().to_string())
-                .unwrap_or_else(|| "unknown error".into())),
-        };
-        let _ = tx.send(result);
-    });
-    unsafe { SCShareableContent::getShareableContentWithCompletionHandler(&handler) };
-    match rx.recv_timeout(Duration::from_secs(5)) {
-        Ok(Ok(c)) => Ok(c.0),
-        Ok(Err(e)) => bail!("can't list screens to capture ({e}) — check Screen Recording permission"),
-        Err(_) => bail!("ScreenCaptureKit didn't respond"),
-    }
-}
-
-/// The display with this id, else the main display, else any display.
-fn pick_display(content: &SCShareableContent, id: &str) -> Option<Retained<SCDisplay>> {
-    let displays = unsafe { content.displays() };
-    let by_id = |want: u32| displays.iter().find(|d| unsafe { d.displayID() } == want);
-    id.parse().ok().and_then(by_id).or_else(|| by_id(CGMainDisplayID())).or_else(|| displays.iter().next())
-}
-
-/// Output size: the display's native pixels, downscaled to `target_height` if
-/// that's smaller. Even dimensions, as H.264 4:2:0 requires.
-fn output_size(display: &SCDisplay, target_height: Option<u32>) -> (usize, usize) {
-    let id = unsafe { display.displayID() };
-    let mode = CGDisplayCopyDisplayMode(id);
-    let (mut w, mut h) = (CGDisplayMode::pixel_width(mode.as_deref()), CGDisplayMode::pixel_height(mode.as_deref()));
-    if w == 0 || h == 0 {
-        (w, h) = unsafe { (display.width() as usize, display.height() as usize) };
-    }
-    if let Some(t) = target_height.map(|t| t as usize).filter(|&t| t < h) {
-        w = (w * t + h / 2) / h;
-        h = t;
-    }
-    (w & !1, h & !1)
-}
-
-fn make_video_stream(
-    display: &SCDisplay,
-    width: usize,
-    height: usize,
-    fps: u32,
-    output: &StreamOutput,
-) -> Result<Retained<SCStream>> {
-    unsafe {
-        let filter = SCContentFilter::initWithDisplay_excludingWindows(
-            SCContentFilter::alloc(),
-            display,
-            &NSArray::new(),
-        );
-        let config = SCStreamConfiguration::new();
-        config.setWidth(width);
-        config.setHeight(height);
-        config.setMinimumFrameInterval(CMTime::new(1, fps as i32));
-        config.setPixelFormat(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange);
-        config.setColorMatrix(kCGDisplayStreamYCbCrMatrix_ITU_R_709_2);
-        config.setShowsCursor(true);
-        // Room for the frame we hold + frames in the encoder without starving SCK.
-        config.setQueueDepth(8);
-        let stream = SCStream::initWithFilter_configuration_delegate(SCStream::alloc(), &filter, &config, None);
-        let queue = DispatchQueue::new("hesteclips.sck.video", None);
-        stream
-            .addStreamOutput_type_sampleHandlerQueue_error(ProtocolObject::from_ref(output), SCStreamOutputType::Screen, Some(&queue))
-            .map_err(|e| anyhow::anyhow!("can't capture the screen: {}", e.localizedDescription()))?;
-        Ok(stream)
     }
 }
 
@@ -700,7 +610,7 @@ fn sync_taps(taps: &mut [Tap]) {
                     let _ = await_completion(|h| unsafe { stream.updateContentFilter_completionHandler(&filter, Some(h)) });
                 }
                 None => {
-                    let output = StreamOutput::new(Arc::new(Shared { latest: Mutex::new(None), audio: Some(tap.feed.clone()) }));
+                    let output = StreamOutput::new(Arc::new(Shared { audio: Some(tap.feed.clone()) }));
                     match make_audio_stream(&display, &apps, include, &output).and_then(|st| start_capture(&st).map(|_| st)) {
                         Ok(stream) => tap.stream = Some((stream, output)),
                         Err(e) => {
@@ -724,7 +634,7 @@ fn sync_taps(taps: &mut [Tap]) {
 /// Encode the newest screen frame every 1/fps on the host clock. SCK only sends
 /// frames when the screen changes; repeating the last one keeps the output CFR.
 /// Frame N is stamped N/fps seconds after t0, the same clock the audio uses.
-fn spawn_pacer(fps: u32, shared: Arc<Shared>, encoder: Encoder, clock: Arc<Clock>) -> (Arc<AtomicBool>, JoinHandle<()>) {
+fn spawn_pacer(fps: u32, mut frames: Frames, encoder: Encoder, clock: Arc<Clock>) -> (Arc<AtomicBool>, JoinHandle<()>) {
     let stop = Arc::new(AtomicBool::new(false));
     let stop2 = stop.clone();
     let encoder = SendBox(encoder);
@@ -740,9 +650,8 @@ fn spawn_pacer(fps: u32, shared: Arc<Shared>, encoder: Encoder, clock: Arc<Clock
             // After a stall, catch up gradually rather than in one huge burst.
             let mut burst = 0;
             while next <= due && burst < fps * 2 {
-                let frame = shared.latest.lock().unwrap().as_ref().map(|f| f.0.clone());
-                if let Some(frame) = frame {
-                    encoder.0.encode(&frame, next, fps);
+                if let Some(frame) = frames.next() {
+                    encoder.0.encode(&frame.0, next, fps);
                 }
                 next += 1;
                 burst += 1;

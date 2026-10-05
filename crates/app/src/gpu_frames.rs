@@ -371,6 +371,34 @@ mod tests {
         }
     }
 
+    /// A live preview frame (a ScreenCaptureKit buffer) opens as textures.
+    /// `cargo test -p hesteclips sck_preview -- --ignored --nocapture`
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn sck_preview_frame_opens() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor { backends: wgpu::Backends::METAL, ..wgpu::InstanceDescriptor::new_without_display_handle() });
+        let adapter = pollster::block_on(instance.request_adapter(&Default::default())).expect("adapter");
+        let (device, _queue) = pollster::block_on(adapter.request_device(&Default::default())).expect("device");
+        let preview = capture::preview::VideoPreview::start(&capture::VideoSource::Screen { id: String::new() }, Some(720), 30, None, None);
+        let frame = (0..100)
+            .find_map(|_| {
+                capture::preview::request();
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                capture::preview::latest()
+            })
+            .unwrap_or_else(|| panic!("no preview frame: {:?}", preview.error()));
+        let s = frame.surface.as_ref().expect("a surface");
+        let surface = s.io_surface().unwrap();
+        println!("frame {}x{}, surface {}x{}, planes {:?}", frame.width, frame.height, surface.width(), surface.height(),
+            (0..2).map(|p| (surface.width_of_plane(p), surface.height_of_plane(p))).collect::<Vec<_>>());
+        let y = unsafe { metal::open(&device, &surface, 0, wgpu::TextureFormat::R8Unorm, frame.width, frame.height) };
+        let c = unsafe { metal::open(&device, &surface, 1, wgpu::TextureFormat::Rg8Unorm, frame.width.div_ceil(2), frame.height.div_ceil(2)) };
+        println!("y: {:?}, cbcr: {:?}", y.as_ref().map(|_| ()), c.as_ref().map(|_| ()));
+        y.unwrap();
+        c.unwrap();
+    }
+
     /// A decoded NV12 frame drawn by the real pipeline matches ffmpeg's
     /// conversion of the same frame: at 1:1 and shrunk (Lanczos both).
     /// `HESTECLIPS_TEST_CLIP=<mp4> cargo test -p hesteclips nv12 -- --ignored --nocapture`
