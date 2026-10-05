@@ -17,6 +17,7 @@ mod editor;
 mod export_ui;
 mod filmstrip;
 mod game_icons;
+mod games;
 mod library;
 #[cfg(target_os = "linux")]
 mod linux_desktop;
@@ -337,12 +338,11 @@ struct App {
     pub(crate) presence: discord::Presence,
     /// Saves a clip as Save clip is pressed, frames or not.
     quick_save: service::QuickSave,
-    /// The game being clipped: its executable, and when we last checked it's
-    /// still open. For Discord, and the folder clips go in.
-    clipped_game: Option<(String, Instant)>,
-    /// While recording: seconds each game (by name) has been the one clipped,
-    /// so a recording goes in the folder of the game it's mostly of.
-    game_time: std::collections::HashMap<String, u32>,
+    /// The game being clipped, for Discord: its app's id, the game, and when
+    /// we last checked it's still open.
+    clipped_game: Option<(String, discord::Game, Instant)>,
+    /// What's in focus while capturing, for the folder clips go in.
+    games: games::Tracker,
     /// When the current capture started, as Discord's "elapsed" timer counts.
     presence_since: Option<SystemTime>,
 }
@@ -365,7 +365,8 @@ impl App {
         store::sweep_orphans(&settings.output_dir, &clips);
         let live_audio = capture::mixer::LiveAudio::new();
         let service = CaptureService::new(live_audio.clone());
-        let quick_save = service.quick_save();
+        let games = games::Tracker::new();
+        let quick_save = service.quick_save(games.clone());
         let hotkeys = shortcuts::Registered::new(ctx.clone(), quick_save.clone()).map(|mut h| {
             h.sync(&settings.shortcuts);
             h
@@ -441,7 +442,7 @@ impl App {
             updater,
             presence: discord::Presence::new(),
             clipped_game: None,
-            game_time: Default::default(),
+            games,
             presence_since: None,
         };
         // Dev aid: `HESTECLIPS_OPEN_EDITOR=<clip>` opens the editor at launch, so the
@@ -632,7 +633,18 @@ impl eframe::App for App {
         }
 
         self.pump_capture_events();
-        let armed = (self.rec_state == RecState::Buffering && self.recording_shortcut.is_none()).then(|| (self.clip_folder(), self.settings.save_sound.clone()));
+        let capturing = match self.rec_state {
+            RecState::Idle => games::Capturing::Off,
+            RecState::Buffering => games::Capturing::Buffer(self.settings.replay_seconds),
+            RecState::Recording => games::Capturing::Record,
+        };
+        self.games.set(capturing, &self.listed_apps());
+        let armed = (self.rec_state == RecState::Buffering && self.recording_shortcut.is_none()).then(|| service::Armed {
+            library: self.settings.output_dir.clone(),
+            folder_per_game: self.settings.folder_per_game,
+            game_folders: self.settings.game_folders.clone(),
+            sound: self.settings.save_sound.clone(),
+        });
         self.quick_save.arm(armed);
         self.updater.set_auto(self.settings.auto_update);
         self.cloud.poll();
@@ -912,69 +924,42 @@ impl App {
         }
     }
 
-    /// Follow the game being clipped while capture runs: the last one in
-    /// focus from the games-and-apps list, or any game Discord knows, for as
-    /// long as it's open. While recording, also count how long each one was.
+    /// Follow the game being clipped, for Discord: the last one in focus, for
+    /// as long as it's open.
     fn track_game(&mut self) {
         if self.rec_state == RecState::Idle {
             self.clipped_game = None;
-        } else {
-            let apps = match &self.settings.capture {
-                settings::CaptureTarget::Apps { apps, .. } => Some(apps),
-                _ => None,
-            };
-            if let Some(exe) = capture::foreground_exe() {
-                // Asks for Discord's games list the first time, so it's there
-                // by the next check.
-                let clipped = apps.is_some_and(|apps| apps.iter().any(|a| a.id.eq_ignore_ascii_case(&exe))) || discord::known_game(&exe).is_some();
-                if clipped {
-                    self.clipped_game = Some((exe, Instant::now()));
-                }
-            }
-            // Not in focus for a while: is it still open?
-            if let Some((exe, checked)) = &mut self.clipped_game
-                && checked.elapsed() > Duration::from_secs(5)
-            {
-                if capture::list_windowed_apps().iter().any(|a| a.id.eq_ignore_ascii_case(exe)) {
-                    *checked = Instant::now();
-                } else {
-                    self.clipped_game = None;
-                }
-            }
+            return;
         }
-        if self.rec_state != RecState::Recording {
-            self.game_time.clear();
-        } else if let Some(game) = self.game() {
-            // Called about once a second.
-            *self.game_time.entry(game.name).or_default() += 1;
+        if let Some((id, game)) = self.games.focused() {
+            self.clipped_game = Some((id, game, Instant::now()));
+        }
+        // Not in focus for a while: is it still open?
+        if let Some((id, _, checked)) = &mut self.clipped_game
+            && checked.elapsed() > Duration::from_secs(5)
+        {
+            if capture::list_windowed_apps().iter().any(|a| a.id.eq_ignore_ascii_case(id)) {
+                *checked = Instant::now();
+            } else {
+                self.clipped_game = None;
+            }
         }
     }
 
-    /// The game being clipped, named as Discord knows it, else as the games
-    /// and apps list does.
-    fn game(&self) -> Option<discord::Game> {
-        let (exe, _) = self.clipped_game.as_ref()?;
-        discord::known_game(exe).or_else(|| {
-            let settings::CaptureTarget::Apps { apps, .. } = &self.settings.capture else { return None };
-            let app = apps.iter().find(|a| a.id.eq_ignore_ascii_case(exe))?;
-            Some(discord::Game { name: app.name.clone(), icon: None })
-        })
+    /// The games and apps list, as (id, name).
+    fn listed_apps(&self) -> Vec<(String, String)> {
+        match &self.settings.capture {
+            settings::CaptureTarget::Apps { apps, .. } => apps.iter().map(|a| (a.id.clone(), a.name.clone())).collect(),
+            _ => Vec::new(),
+        }
     }
 
-    /// Where a clip saved now goes: its game's folder in the library
-    /// (Desktop without one), or the library itself with folders turned off.
-    /// A recording goes with the game it was mostly of.
+    /// Where a clip saved now goes: the folder of the game in focus longest
+    /// in it (Desktop without one), or the library itself with folders
+    /// turned off.
     fn clip_folder(&self) -> PathBuf {
-        let lib = self.settings.output_dir.clone();
-        if !self.settings.folder_per_game {
-            return lib;
-        }
-        let most = self.game_time.iter().max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0))).map(|(name, _)| name.clone());
-        let game = most.or_else(|| self.game().map(|g| g.name));
-        let folder = clips::folder_name(game.as_deref().unwrap_or(clips::DESKTOP));
-        // Its folder may have been renamed in the library.
-        let folder = self.settings.game_folders.get(&folder).cloned().unwrap_or(folder);
-        lib.join(folder)
+        let game = if self.rec_state == RecState::Recording { self.games.recording_game() } else { self.games.clip_game() };
+        games::folder_for(&self.settings.output_dir, self.settings.folder_per_game, &self.settings.game_folders, game.as_deref())
     }
 
     /// Discord shows what's being clipped while capture runs (when turned on).
@@ -984,7 +969,7 @@ impl App {
             self.presence.set(None);
             return;
         }
-        let game = self.game();
+        let game = self.clipped_game.as_ref().map(|(_, g, _)| g.clone());
         let since = *self.presence_since.get_or_insert_with(SystemTime::now);
         self.presence.set(Some(discord::Status { recording: self.rec_state == RecState::Recording, game, since }));
     }
@@ -1330,8 +1315,6 @@ impl App {
         }
         // Its moment is taken at once; the Saved event lands it in the library.
         // Another can be saved while it's still being written.
-        // The game in focus right now, not as of the last check a second ago.
-        self.track_game();
         let dir = self.clip_folder();
         self.service.save_clip(dir);
         sound::play_saved(&self.settings.save_sound);

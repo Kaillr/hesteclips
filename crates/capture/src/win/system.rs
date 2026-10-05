@@ -391,6 +391,23 @@ pub(crate) struct Foreground {
     pub main: bool,
 }
 
+/// The focused window's app: its executable's name and full path.
+pub fn foreground_app_path() -> Option<(String, std::path::PathBuf)> {
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.is_invalid() {
+            return None;
+        }
+        let mut pid = 0;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid == std::process::id() {
+            return None;
+        }
+        let path = std::path::PathBuf::from(image_path(pid)?);
+        Some((path.file_name()?.to_string_lossy().into_owned(), path))
+    }
+}
+
 pub(crate) fn foreground_app() -> Option<Foreground> {
     unsafe {
         let hwnd = GetForegroundWindow();

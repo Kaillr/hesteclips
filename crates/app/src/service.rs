@@ -52,14 +52,25 @@ pub fn stop_all_and_wait(timeout: Duration) {
 #[derive(Clone)]
 pub struct QuickSave {
     tx: Sender<Cmd>,
-    /// While the replay buffer runs: the folder a clip goes in now, and the
-    /// sound that says it's saved.
-    armed: Arc<Mutex<Option<(PathBuf, crate::settings::SaveSound)>>>,
+    /// What's in focus, for the folder the clip goes in.
+    games: crate::games::Tracker,
+    /// While the replay buffer runs: how to save.
+    armed: Arc<Mutex<Option<Armed>>>,
+}
+
+/// How a clip is saved: in which library, sorted by game or not, and the
+/// sound that says it's saved.
+#[derive(Clone, PartialEq)]
+pub struct Armed {
+    pub library: PathBuf,
+    pub folder_per_game: bool,
+    pub game_folders: std::collections::BTreeMap<String, String>,
+    pub sound: crate::settings::SaveSound,
 }
 
 impl QuickSave {
     /// Kept up to date by the app, every frame.
-    pub fn arm(&self, to: Option<(PathBuf, crate::settings::SaveSound)>) {
+    pub fn arm(&self, to: Option<Armed>) {
         if let Ok(mut armed) = self.armed.lock()
             && *armed != to
         {
@@ -69,11 +80,12 @@ impl QuickSave {
 
     /// Save a clip now, if the replay buffer runs. Whether it was asked for.
     pub fn save(&self) -> bool {
-        let Some((dir, sound)) = self.armed.lock().ok().and_then(|a| a.clone()) else { return false };
+        let Some(a) = self.armed.lock().ok().and_then(|a| a.clone()) else { return false };
+        let dir = crate::games::folder_for(&a.library, a.folder_per_game, &a.game_folders, self.games.clip_game().as_deref());
         if self.tx.send(Cmd::SaveClip(dir)).is_err() {
             return false;
         }
-        crate::sound::play_saved(&sound);
+        crate::sound::play_saved(&a.sound);
         true
     }
 }
@@ -148,9 +160,9 @@ impl CaptureService {
         self.send(Cmd::Start(mode, settings));
     }
     /// A way to save a clip from another thread (a shortcut's).
-    pub fn quick_save(&self) -> QuickSave {
+    pub fn quick_save(&self, games: crate::games::Tracker) -> QuickSave {
         let tx = self.cmd_tx.clone().expect("the capture thread runs while the service lives");
-        QuickSave { tx, armed: Default::default() }
+        QuickSave { tx, games, armed: Default::default() }
     }
 
     pub fn save_clip(&self, dir: PathBuf) {

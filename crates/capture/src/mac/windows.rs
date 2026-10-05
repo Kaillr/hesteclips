@@ -83,6 +83,17 @@ pub(crate) fn frontmost() -> Option<(i32, String)> {
     (pid != std::process::id() as i32).then(|| Some((pid, id_of(&app)?))).flatten()
 }
 
+/// The app in front: its id, and where it's installed (its bundle, else its
+/// executable).
+pub fn foreground_app_path() -> Option<(String, std::path::PathBuf)> {
+    let app = NSWorkspace::sharedWorkspace().frontmostApplication()?;
+    if app.processIdentifier() == std::process::id() as i32 {
+        return None;
+    }
+    let url = app.bundleURL().or_else(|| app.executableURL())?;
+    Some((id_of(&app)?, std::path::PathBuf::from(url.path()?.to_string())))
+}
+
 /// The pids of running apps with this id (an app can run more than once).
 pub(crate) fn pids_of(id: &str) -> Vec<i32> {
     NSWorkspace::sharedWorkspace()

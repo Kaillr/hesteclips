@@ -197,6 +197,23 @@ pub fn foreground_exe() -> Option<String> {
     }
 }
 
+/// The app in focus: its id (as [`foreground_exe`]) and where it's installed,
+/// to tell a game by its folder (`…/steamapps/common/<game>/…`).
+pub fn foreground_app_path() -> Option<(String, PathBuf)> {
+    #[cfg(target_os = "windows")]
+    {
+        win::foreground_app_path()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        mac::windows::foreground_app_path()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        None
+    }
+}
+
 /// The file name of a running app's bundle (`World of Warcraft.app`), by
 /// its id (bundle id, or executable for an app without one).
 #[cfg(target_os = "macos")]
