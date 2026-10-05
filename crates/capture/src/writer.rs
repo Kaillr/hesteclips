@@ -170,7 +170,7 @@ impl Ring {
         }
     }
 
-    /// Everything from the last keyframe at or before `end - seconds` up to `end`,
+    /// Everything from the keyframe nearest `end - seconds` up to `end`,
     /// where `end` is the newest moment every track has reached (audio runs a
     /// little behind video, so cutting at the newest frame would leave the clip's
     /// last fraction of a second silent). Shares the frames.
@@ -191,14 +191,16 @@ impl Ring {
             (_, Some(a)) => newest_video.min(a),
             (_, None) => return Vec::new(),
         };
+        // The keyframe nearest `want`, before or after: the clip is then within
+        // half a keyframe interval of `seconds` long. (The last one before it
+        // made clips up to a whole interval longer: 30.6 s for 30, shown as 0:31.)
         let want = newest - seconds;
         let start = self
             .items
             .iter()
-            .rev()
-            .find(|(t, m)| matches!(m, Media::Video { key: true, .. }) && *t <= want + 1e-6)
+            .filter(|(t, m)| matches!(m, Media::Video { key: true, .. }) && *t <= newest)
             .map(|(t, _)| *t)
-            .or_else(|| self.items.iter().find_map(|(t, m)| matches!(m, Media::Video { key: true, .. }).then_some(*t)));
+            .min_by(|a, b| (a - want).abs().total_cmp(&(b - want).abs()));
         let Some(start) = start else { return Vec::new() };
         self.items
             .iter()
@@ -303,5 +305,25 @@ mod tests {
         // Only the last few seconds are kept, starting at a keyframe.
         assert!(ring.items.len() <= 4, "kept {} items", ring.items.len());
         assert!(ring.items.iter().all(|(t, _)| *t >= 8.0 - 1e-9));
+    }
+
+    /// A clip starts at the keyframe nearest the length asked for, so it's
+    /// about that long rather than up to a keyframe interval longer.
+    #[test]
+    fn clip_starts_at_the_nearest_keyframe() {
+        let mut ring = Ring { items: VecDeque::new(), keep: 32.0 };
+        // 60 fps, a keyframe every second; ends at 40.65 s.
+        for k in 0..=2439 {
+            let t = k as f64 / 60.0;
+            ring.push(video(t, k % 60 == 0));
+            ring.push(audio(t));
+        }
+        let start = |s: &[(f64, Media)]| s.first().unwrap().0;
+        // 30 s back from 40.65 is 10.65: 11 is nearer than 10.
+        assert_eq!(start(&ring.snapshot(30.0, 1)), 11.0);
+        // From 40.65, 10.0 s back is 30.65: 31 is nearer than 30.
+        assert_eq!(start(&ring.snapshot(10.0, 1)), 31.0);
+        // 10.2 s back is 30.45: 30 is nearer.
+        assert_eq!(start(&ring.snapshot(10.2, 1)), 30.0);
     }
 }
