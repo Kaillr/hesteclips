@@ -1,5 +1,6 @@
 //! macOS pieces beyond the recorder's core (`crate::sck`).
 
+pub mod bench;
 pub(crate) mod camera;
 pub mod decode;
 pub(crate) mod gpu;

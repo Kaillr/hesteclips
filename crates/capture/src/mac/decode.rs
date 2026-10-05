@@ -103,6 +103,12 @@ impl Surface {
         Self { buf, bt601: false }
     }
 
+    /// The buffer itself.
+    #[allow(dead_code)]
+    pub(crate) fn buffer(&self) -> &CVPixelBuffer {
+        &self.buf
+    }
+
     /// The IOSurface holding the pixels.
     pub fn io_surface(&self) -> Option<CFRetained<IOSurfaceRef>> {
         CVPixelBufferGetIOSurface(Some(&self.buf))

@@ -671,21 +671,21 @@ fn spawn_pacer(fps: u32, mut frames: Frames, encoder: Encoder, clock: Arc<Clock>
 // VideoToolbox H.264 encoder
 // ---------------------------------------------------------------------------
 
-struct Encoder {
-    session: CFRetained<VTCompressionSession>,
+pub(crate) struct Encoder {
+    pub(crate) session: CFRetained<VTCompressionSession>,
     /// Owned by the encoder callback; freed in `finish` after the last callback.
     ctx: *mut EncodedSink,
 }
 
 /// Where encoded frames go.
-struct EncodedSink {
-    tx: Option<Sender<writer::Command>>,
+pub(crate) struct EncodedSink {
+    pub(crate) tx: Option<Sender<writer::Command>>,
     /// Catches the format description of the first frame (`probe_video_format`).
-    probe: Option<Sender<CFRetained<objc2_core_media::CMFormatDescription>>>,
+    pub(crate) probe: Option<Sender<CFRetained<objc2_core_media::CMFormatDescription>>>,
 }
 
 impl Encoder {
-    fn new(width: usize, height: usize, s: &EncodeSettings, tx: Sender<writer::Command>) -> Result<Self> {
+    pub(crate) fn new(width: usize, height: usize, s: &EncodeSettings, tx: Sender<writer::Command>) -> Result<Self> {
         Self::with_sink(width, height, s, EncodedSink { tx: Some(tx), probe: None })
     }
 
@@ -735,7 +735,7 @@ impl Encoder {
     }
 
     /// Encode `frame` as frame number `n` (presented at n/fps).
-    fn encode(&self, frame: &CVPixelBuffer, n: i64, fps: u32) {
+    pub(crate) fn encode(&self, frame: &CVPixelBuffer, n: i64, fps: u32) {
         unsafe {
             let status = self.session.encode_frame(
                 frame,
@@ -752,7 +752,7 @@ impl Encoder {
     }
 
     /// Flush pending frames, then release the sink.
-    fn finish(self) {
+    pub(crate) fn finish(self) {
         unsafe {
             self.session.complete_frames(kCMTimeInvalid);
             self.session.invalidate();
@@ -792,7 +792,7 @@ unsafe extern "C-unwind" fn on_encoded(
 
 /// The H.264 format description our encoder settings produce, from encoding one
 /// blank frame — the writer must know each track's format before the first frame.
-fn probe_video_format(
+pub(crate) fn probe_video_format(
     width: usize,
     height: usize,
     s: &EncodeSettings,
