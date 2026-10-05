@@ -8,12 +8,12 @@
 //!
 //! "HesteClip" isn't English, and said quickly no one spelling of the phrase
 //! comes through whole, so it's heard in three parts — "hashtag", "heste",
-//! "clip that" — and any two of them within [`WITHIN`] of each other count.
-//! One part alone ("hashtag blessed", "has the clip that we made") does
-//! nothing. Tuned on 30 takes of the user saying it (fast, slow, in
-//! sentences): the two-part version caught 5 of them (and saved some twice),
-//! this one 13, once each, with no near miss triggering it. The small model
-//! still misses some fast takes.
+//! "clip that" — and only all three within [`WITHIN`] of each other count:
+//! the exact phrase, nothing less ("hashtag", "hashtag hesteclip" and
+//! "hesteclip that" don't; letting any two count caught more takes, but
+//! saved clips on those). Tuned on 30 takes of the user saying it (fast,
+//! slow, in sentences): it catches 17. The small model misses some fast
+//! takes: saying it again works.
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -94,17 +94,21 @@ mod spotting {
     /// the whole one was lost), and ones that fired on near misses ("clip at"
     /// in "clip it later", "este" in "hashtag blessed", and "clips", which
     /// fired on "clip it" once the search was wider) are left out.
-    const PARTS: [&str; 3] = [
+    ///
+    /// Each with how readily it's taken (sherpa-onnx's boosting score and
+    /// trigger threshold), the best of a sweep of all three over the user's
+    /// takes: "clip that" needs to be taken most readily.
+    const PARTS: [(&str, f32, f32); 3] = [
         // "Hashtag"
-        "▁HAS H TA G @hashtag\n▁HAS H ▁TA G @hashtag\n▁HE SH TA G @hashtag\n▁HAS ▁TA G @hashtag\n▁HAS TA G @hashtag",
+        ("▁HAS H TA G @hashtag\n▁HAS H ▁TA G @hashtag\n▁HE SH TA G @hashtag\n▁HAS ▁TA G @hashtag\n▁HAS TA G @hashtag", 2.0, 0.15),
         // "Heste"
-        "▁HE S TE @heste\n▁HE S TA @heste\n▁HAS TE @heste\n▁HE S TER @heste\n▁HE S TY @heste\n▁HE S T @heste\n▁HE S TI @heste\n▁HE S SE @heste\n▁HE S T EN @heste",
+        ("▁HE S TE @heste\n▁HE S TA @heste\n▁HAS TE @heste\n▁HE S TER @heste\n▁HE S TY @heste\n▁HE S T @heste\n▁HE S TI @heste\n▁HE S SE @heste\n▁HE S T EN @heste", 2.0, 0.15),
         // "Clip that"
-        "▁C LI P ▁THAT @clip_that\n▁K LI PP ▁THAT @clip_that\n▁C LI P ▁DA T @clip_that\n▁K LI PP ▁DA T @clip_that\n▁C LI PP ▁THAT @clip_that\n▁C LI P ▁THE T @clip_that",
+        ("▁C LI P ▁THAT @clip_that\n▁K LI PP ▁THAT @clip_that\n▁C LI P ▁DA T @clip_that\n▁K LI PP ▁DA T @clip_that\n▁C LI PP ▁THAT @clip_that\n▁C LI P ▁THE T @clip_that", 3.5, 0.03),
     ];
-    /// Two parts count as the phrase this close together, in either order
-    /// (the model sometimes reports a part late; in the user's takes the
-    /// parts came 0.3–1.2 s apart: a guess with room for saying it slowly).
+    /// The three parts count as the phrase this close together, in any order
+    /// (the model sometimes reports a part late; in the user's takes they
+    /// came within 0.3–1.2 s: a guess with room for saying it slowly).
     const WITHIN: f64 = 2.5;
     /// After a clip is saved, parts heard this long after are ignored: the
     /// take's late third part could pair with something and save it twice
@@ -125,11 +129,6 @@ mod spotting {
     /// The model's rate: sound is brought to it here (48 kHz in from the
     /// mixer), rather than by the engine (which logs about it).
     const MODEL_RATE: u32 = 16_000;
-    /// How readily a part is taken (sherpa-onnx's boosting score and trigger
-    /// threshold): the best of a sweep over 30 takes of the user (1.5/0.2
-    /// caught 10, 2.0/0.15 15, 2.5/0.1 14), with no near miss firing two parts.
-    const SCORE: f32 = 2.0;
-    const THRESHOLD: f32 = 0.15;
 
     pub(super) fn run(
         rx: Receiver<Option<String>>,
@@ -207,7 +206,7 @@ mod spotting {
                 }
             }
             let started = std::time::Instant::now();
-            let spotter = |keywords: &str| {
+            let spotter = |(keywords, score, threshold): &(&str, f32, f32)| {
                 let text = |name: &str| Some(path(name).to_string_lossy().into_owned());
                 let mut config = KeywordSpotterConfig::default();
                 config.model_config.transducer.encoder = text("encoder.int8.onnx");
@@ -217,13 +216,13 @@ mod spotting {
                 // One thread: it keeps up ~30× faster than speech (measured),
                 // and a game wants the rest.
                 config.model_config.num_threads = 1;
-                config.keywords_score = SCORE;
-                config.keywords_threshold = THRESHOLD;
+                config.keywords_score = *score;
+                config.keywords_threshold = *threshold;
                 config.max_active_paths = PATHS;
-                config.keywords_buf = Some(keywords.to_owned());
+                config.keywords_buf = Some((*keywords).to_owned());
                 KeywordSpotter::create(&config).ok_or_else(|| "the voice model didn't load".to_owned())
             };
-            let spotters = Self { parts: PARTS.iter().map(|k| spotter(k)).collect::<Result<_, _>>()? };
+            let spotters = Self { parts: PARTS.iter().map(spotter).collect::<Result<_, _>>()? };
             eprintln!("voice: listening for \"hashtag HesteClip that\" (model loaded in {} ms)", started.elapsed().as_millis());
             Ok(spotters)
         }
@@ -377,9 +376,9 @@ mod spotting {
                         continue;
                     }
                     self.heard_at[part] = Some(now);
-                    // Any two parts close enough together.
+                    // All three parts, close enough together.
                     let near = self.heard_at.iter().flatten().filter(|t| now - **t <= WITHIN).count();
-                    if near >= 2 {
+                    if near == PARTS.len() {
                         self.said_at = Some(now);
                         eprintln!("voice: heard \"hashtag HesteClip that\"");
                         self.heard_at = [None; 3];
@@ -436,6 +435,11 @@ mod spotting {
                 ("check the hashtag on twitter", false),
                 ("stag party this weekend", false),
                 ("he has to clip through the wall", false),
+                // Parts of the phrase: only the whole of it counts.
+                ("hashtag", false),
+                ("hashtag hesteclip", false),
+                ("hesteclip that", false),
+                ("heste clip that", false),
             ] {
                 let file = dir.join("speech.wav");
                 speak(text, &file);
