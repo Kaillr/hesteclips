@@ -9,7 +9,10 @@
 //! to show.
 //!
 //! Each set of shortcuts is one portal session on its own thread; changing
-//! the shortcuts closes it and binds the new set in a new one.
+//! the shortcuts closes it and binds the new set in a new one. Binding is
+//! what makes the desktop ask the user, so it's only done when the desktop
+//! doesn't already have these shortcuts as last asked for (remembered in
+//! `$XDG_STATE_HOME/hesteclips/shortcuts`): not at every launch.
 
 use std::pin::pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -78,12 +81,23 @@ impl Portal {
             let run = async {
                 let proxy = GlobalShortcuts::new().await?;
                 let session = proxy.create_session(Default::default()).await?;
-                let shortcuts: Vec<NewShortcut> = wanted
-                    .iter()
-                    .map(|(action, keys)| NewShortcut::new(id(*action), action.label()).preferred_trigger(trigger(keys).as_deref()))
-                    .collect();
-                let bound = proxy.bind_shortcuts(&session, &shortcuts, None, Default::default()).await?.response()?;
-                let assigned = bound.shortcuts().iter().filter_map(|s| Some((action(s.id())?, s.trigger_description().to_owned()))).collect();
+                let asked = request_key(&wanted);
+                // The desktop may already have them, as we last asked: then
+                // there's nothing to ask the user.
+                let known = proxy.list_shortcuts(&session, Default::default()).await?.response()?;
+                let has_all = wanted.iter().all(|(a, _)| known.shortcuts().iter().any(|s| s.id() == id(*a)));
+                let shortcuts = if has_all && last_request().as_deref() == Some(asked.as_str()) {
+                    known.shortcuts().to_vec()
+                } else {
+                    let new: Vec<NewShortcut> = wanted
+                        .iter()
+                        .map(|(action, keys)| NewShortcut::new(id(*action), action.label()).preferred_trigger(trigger(keys).as_deref()))
+                        .collect();
+                    let bound = proxy.bind_shortcuts(&session, &new, None, Default::default()).await?.response()?;
+                    save_request(&asked);
+                    bound.shortcuts().to_vec()
+                };
+                let assigned = shortcuts.iter().filter_map(|s| Some((action(s.id())?, s.trigger_description().to_owned()))).collect();
                 *state2.lock().unwrap() = State::Bound(assigned);
                 ctx.request_repaint();
                 let mut activated = pin!(proxy.receive_activated().await?);
@@ -131,6 +145,30 @@ impl Drop for Portal {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
     }
+}
+
+/// What a bind asks for, as one line: each shortcut's id and keys.
+fn request_key(wanted: &[(ShortcutAction, String)]) -> String {
+    wanted.iter().map(|(a, keys)| format!("{}={}", id(*a), trigger(keys).unwrap_or_default())).collect::<Vec<_>>().join(";")
+}
+
+/// `$XDG_STATE_HOME/hesteclips/shortcuts` (`~/.local/state/…`).
+fn state_file() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/state")))?;
+    Some(base.join("hesteclips").join("shortcuts"))
+}
+
+/// What the desktop was last asked for and granted.
+fn last_request() -> Option<String> {
+    std::fs::read_to_string(state_file()?).ok().map(|s| s.trim().to_owned())
+}
+
+fn save_request(key: &str) {
+    let Some(file) = state_file() else { return };
+    let _ = file.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::write(file, key));
 }
 
 fn id(action: ShortcutAction) -> &'static str {
