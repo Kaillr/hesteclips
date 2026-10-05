@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 ab_glyph = "0.2"
 anyhow = "1"
+log = "0.4"
 bytemuck = "1"
 capture = { path = "../capture" }
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }

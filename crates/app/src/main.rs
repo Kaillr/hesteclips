@@ -46,7 +46,27 @@ use library::{ACCENT, REC_RED};
 use service::{CaptureService, Evt};
 use settings::{Encoder, RecordSettings, SourceKind};
 
+/// `HESTECLIPS_DEBUG_GPU=1`: print the renderer's (wgpu's) warnings and
+/// errors, which are otherwise silent: a failed draw just leaves the window blank.
+struct GpuLog;
+
+impl log::Log for GpuLog {
+    fn enabled(&self, m: &log::Metadata) -> bool {
+        m.level() <= log::Level::Warn && (m.target().starts_with("wgpu") || m.target().starts_with("naga") || m.target().starts_with("egui"))
+    }
+    fn log(&self, r: &log::Record) {
+        if self.enabled(r.metadata()) {
+            eprintln!("[{} {}] {}", r.level(), r.target(), r.args());
+        }
+    }
+    fn flush(&self) {}
+}
+
 fn main() -> eframe::Result<()> {
+    if std::env::var_os("HESTECLIPS_DEBUG_GPU").is_some() {
+        static LOGGER: GpuLog = GpuLog;
+        let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(log::LevelFilter::Warn));
+    }
     // The installer's hooks (install, update, uninstall) run the app with special
     // arguments and exit here; a downloaded update left uninstalled is put in
     // place now. Does nothing in a development build.
@@ -320,7 +340,7 @@ impl App {
             saved_settings,
             persist_settings: !std::env::vars_os().any(|(k, _)| {
                 let k = k.to_string_lossy();
-                ["HESTECLIPS_OPEN_", "HESTECLIPS_DEMO_", "HESTECLIPS_LIBRARY"].iter().any(|p| k.starts_with(p))
+                ["HESTECLIPS_OPEN_", "HESTECLIPS_DEMO_", "HESTECLIPS_LIBRARY", "HESTECLIPS_SETTINGS"].iter().any(|p| k.starts_with(p))
             }),
             service: CaptureService::new(live_audio.clone()),
             hotkeys,

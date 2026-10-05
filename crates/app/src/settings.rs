@@ -489,10 +489,17 @@ fn settings_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("hesteclips").join("settings.json"))
 }
 
+/// Dev aid: `HESTECLIPS_SETTINGS=<file>` loads the settings from that file
+/// instead (to check a setup without touching the real one; dev-hook
+/// launches never save).
+fn load_path() -> Option<PathBuf> {
+    std::env::var_os("HESTECLIPS_SETTINGS").map(PathBuf::from).or_else(settings_path)
+}
+
 impl RecordSettings {
     /// Last saved settings, or defaults on first run / unreadable file.
     pub fn load() -> Self {
-        let mut s: Self = settings_path()
+        let mut s: Self = load_path()
             .and_then(|p| std::fs::read(p).ok())
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
