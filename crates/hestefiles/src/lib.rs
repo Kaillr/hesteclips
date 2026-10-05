@@ -50,10 +50,26 @@ pub struct UserInfo {
     pub username: String,
     /// An address, or the literal `"No email"`.
     pub email: String,
-    /// Where their profile picture is (maybe relative to the site: see
-    /// [`Client::url`]).
-    #[serde(default, alias = "profile_picture_url", alias = "pfp_url")]
-    pub profile_pic_url: Option<String>,
+    /// Their profile picture, in three sizes (maybe relative to the site:
+    /// see [`Client::url`]).
+    #[serde(default)]
+    pub profile_picture_32px: Option<String>,
+    #[serde(default)]
+    pub profile_picture_64px: Option<String>,
+    #[serde(default)]
+    pub profile_picture_256px: Option<String>,
+}
+
+impl UserInfo {
+    /// Their profile picture: the 64 px one (sharp at 32 px on a 2× display),
+    /// else whichever size there is.
+    pub fn profile_picture(&self) -> Option<&str> {
+        [&self.profile_picture_64px, &self.profile_picture_256px, &self.profile_picture_32px]
+            .into_iter()
+            .flatten()
+            .map(String::as_str)
+            .find(|u| !u.trim().is_empty())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -439,5 +455,21 @@ impl Client {
             Envelope::Success(v) => serde_json::from_value(v).map_err(|_| Error::Malformed),
             Envelope::Error(e) => Err(Error::Api { code: e.code, message: e.message }),
         }
+    }
+}
+
+#[cfg(test)]
+mod account_tests {
+    /// As validate_token answers (2026-10-05).
+    #[test]
+    fn reads_the_profile_picture() {
+        let json = r#"{"username": "mikhail", "email": "a@b.c",
+            "profile_picture_32px": "http://x/p_32.jpeg",
+            "profile_picture_64px": "http://x/p_64.jpeg",
+            "profile_picture_256px": "http://x/p_256.jpeg"}"#;
+        let user: super::UserInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(user.profile_picture(), Some("http://x/p_64.jpeg"));
+        let none: super::UserInfo = serde_json::from_str(r#"{"username": "a", "email": "b"}"#).unwrap();
+        assert_eq!(none.profile_picture(), None);
     }
 }
