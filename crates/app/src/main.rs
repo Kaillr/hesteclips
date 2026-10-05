@@ -91,6 +91,7 @@ fn main() -> eframe::Result<()> {
 /// pick could be Vulkan, which can't open them as simply.
 /// `HESTECLIPS_WGPU_BACKEND` (e.g. "vulkan") overrides it, to compare.
 fn wgpu_options() -> eframe::egui_wgpu::WgpuConfiguration {
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut options = eframe::egui_wgpu::WgpuConfiguration::default();
     #[cfg(windows)]
     if let eframe::egui_wgpu::WgpuSetup::CreateNew(new) = &mut options.wgpu_setup {

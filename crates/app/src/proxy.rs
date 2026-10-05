@@ -137,6 +137,7 @@ static BUILDS: Mutex<Option<HashMap<u64, Weak<Build>>>> = Mutex::new(None);
 
 /// While anyone watches a build, background builds wait (the decoder is
 /// theirs, and the CPU mostly is).
+#[cfg(windows)]
 fn anyone_watching() -> bool {
     let builds = BUILDS.lock().unwrap();
     builds.as_ref().is_some_and(|m| m.values().filter_map(Weak::upgrade).any(|b| b.watched() && !b.done.load(Ordering::Relaxed)))

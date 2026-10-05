@@ -349,6 +349,7 @@ impl Player {
     pub fn update(&mut self, ctx: &egui::Context, scrubbing: bool) -> Option<egui::Vec2> {
         self.proxy.set_focus(self.info.frame_index(self.time()));
         self.shared.scrubbing.store(scrubbing && !self.sound_playing(), Ordering::Relaxed);
+        #[cfg(windows)]
         if scrubbing && self.proxy_progress() < 1.0 {
             crate::video::scrubbing();
         }
@@ -453,6 +454,8 @@ impl Player {
                 if last.is_none_or(|t| t.elapsed().as_secs_f64() >= 1.0) {
                     *last = Some(std::time::Instant::now());
                     PASSES.store(0, std::sync::atomic::Ordering::Relaxed);
+                    #[cfg(not(windows))]
+                    let _ = passes;
                     #[cfg(windows)]
                     trace!("playing: want {want}, showing {:?}, ahead {:?}, {passes} redraws/s, last frame {:.1} ms", self.shown_frame, v.ahead_info(), ctx.input(|i| i.unstable_dt) * 1000.0);
                 }

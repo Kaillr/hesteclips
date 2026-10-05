@@ -9,6 +9,9 @@
 //! A copy run from the build folder (`cargo run`) isn't installed, so it has
 //! nothing to update: [`Status::Unavailable`].
 
+// Only the installed Windows app updates itself so far.
+#![cfg_attr(not(windows), allow(dead_code))]
+
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
