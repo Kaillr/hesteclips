@@ -336,6 +336,11 @@ struct App {
 impl App {
     fn new(ctx: egui::Context) -> Self {
         add_symbol_font(&ctx);
+        // Dark, always: the app is designed dark. On Wayland this also makes
+        // the window's frame (drawn by winit, light by default) dark, as egui
+        // keeps the window's theme in step with its own.
+        #[cfg(target_os = "linux")]
+        ctx.set_theme(egui::ThemePreference::Dark);
         let settings = RecordSettings::load();
         sound::preload(&settings.save_sound.sound);
         let recovered = capture::output::recover_unfinished(&settings.output_dir);
