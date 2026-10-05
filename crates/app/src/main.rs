@@ -17,6 +17,7 @@ mod editor;
 mod export_ui;
 mod filmstrip;
 mod game_icons;
+mod logfile;
 mod games;
 mod library;
 #[cfg(target_os = "linux")]
@@ -72,6 +73,12 @@ fn main() -> eframe::Result<()> {
     if std::env::var_os("HESTECLIPS_DEBUG_GPU").is_some() {
         static LOGGER: GpuLog = GpuLog;
         let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(log::LevelFilter::Warn));
+    }
+    // An installed app has no console: what it prints goes to its log file
+    // (`HESTECLIPS_LOG=1` does the same in a development build, to check it).
+    #[cfg(windows)]
+    if cfg!(not(debug_assertions)) || std::env::var_os("HESTECLIPS_LOG").is_some() {
+        logfile::start();
     }
     // The installer's hooks (install, update, uninstall) run the app with special
     // arguments and exit here; a downloaded update left uninstalled is put in

@@ -237,6 +237,8 @@ struct Tap {
     streams: HashMap<Target, (Stream, Arc<SourceFeed>)>,
     /// Targets that failed to start, so they aren't retried every second.
     failed: HashSet<Target>,
+    /// What the log last said about this source, to log only changes.
+    logged: String,
 }
 
 impl SystemAudio {
@@ -251,7 +253,7 @@ impl SystemAudio {
             com_init();
             let mut taps: Vec<Tap> = sources
                 .into_iter()
-                .map(|(source, feed, channel)| Tap { source, feed, channel, streams: HashMap::new(), failed: HashSet::new() })
+                .map(|(source, feed, channel)| Tap { source, feed, channel, streams: HashMap::new(), failed: HashSet::new(), logged: String::new() })
                 .collect();
             let mut first = true;
             while !stop2.load(Ordering::Relaxed) {
@@ -307,6 +309,12 @@ fn sync_taps(taps: &mut [Tap]) {
                     }
                     tap.failed.clear();
                     tap.channel.set_status(SourceStatus::WaitingForApp);
+                    // Names like it, in case it runs under another one.
+                    let stem = bundle_id.trim_end_matches(".exe").to_lowercase();
+                    let mut alike: Vec<&str> = tree.iter().map(|p| p.exe.as_str()).filter(|e| !stem.is_empty() && e.to_lowercase().contains(&stem)).collect();
+                    alike.sort_unstable();
+                    alike.dedup();
+                    log_change(tap, format!("waiting: no process runs {bundle_id} (similar names running: {alike:?})"));
                     continue;
                 }
                 roots.into_iter().map(Target::Include).collect()
@@ -353,6 +361,23 @@ fn sync_taps(taps: &mut [Tap]) {
         }
         let live = !tap.streams.is_empty() || matches!(tap.source.kind, SourceKind::Desktop { .. }) && tap.failed.is_empty();
         tap.channel.set_status(if live { SourceStatus::Live } else { SourceStatus::Unavailable });
+        let mut capturing: Vec<String> = tap.streams.keys().map(|t| format!("{t:?}")).collect();
+        capturing.sort_unstable();
+        let mut failed: Vec<String> = tap.failed.iter().map(|t| format!("{t:?}")).collect();
+        failed.sort_unstable();
+        let what = match &tap.source.kind {
+            SourceKind::App { bundle_id } => format!("app {bundle_id}"),
+            other => format!("{other:?}"),
+        };
+        log_change(tap, format!("{} ({what}): capturing {capturing:?}, failed {failed:?}", if live { "live" } else { "unavailable" }));
+    }
+}
+
+/// Log what a source is doing when it changes (a line a second otherwise).
+fn log_change(tap: &mut Tap, line: String) {
+    if tap.logged != line {
+        eprintln!("{} audio source \"{}\": {line}", chrono::Local::now().format("%H:%M:%S"), tap.source.name);
+        tap.logged = line;
     }
 }
 

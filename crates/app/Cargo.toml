@@ -52,7 +52,7 @@ pollster = "1"
 # Windows-only: drawing decoded frames straight from the GPU (gpu_frames.rs).
 [target.'cfg(windows)'.dependencies]
 velopack = "1.2.161"
-windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Direct3D12", "Win32_System_Threading"] }
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Direct3D12", "Win32_System_Console", "Win32_System_Registry", "Win32_System_Threading"] }
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1.31"
