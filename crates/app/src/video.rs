@@ -86,6 +86,17 @@ pub fn lower_priority() {
 const AHEAD_PAUSED: usize = 4;
 /// Frames kept decoded ahead of the clock, while playing.
 const AHEAD_PLAYING: usize = 12;
+/// Play from `i` keeps the decoded queue when it starts at most this many
+/// numbers after `i` (a dropped frame's gap). Any further and it's from later
+/// on: a jump back while playing, which it can't show (with 30 here, jumps
+/// back of under a second froze the picture until the clock caught up).
+/// A guess: gaps in recordings are a frame or two.
+const GAP: u64 = 3;
+
+/// The queue starting with `front` can't play from `i`.
+fn elsewhere(front: Option<&Picture>, i: u64) -> bool {
+    front.is_none_or(|p| p.index > i + GAP)
+}
 
 enum Cmd {
     /// Paused: decode exactly this frame.
@@ -226,7 +237,7 @@ impl Video {
                             // Carries on from what's decoded, unless that's from
                             // somewhere else (after a gap, the next frame can be
                             // a few numbers on).
-                            if s.ahead.front().is_none_or(|p| p.index > i + 30) {
+                            if elsewhere(s.ahead.front(), i) {
                                 s.ahead.clear();
                                 next = i;
                                 positioned = false;
@@ -281,7 +292,7 @@ impl Video {
         {
             let mut s = self.state.lock().unwrap();
             drop_superseded(&mut s.ahead, i);
-            if s.ahead.front().is_none_or(|p| p.index > i + 30) {
+            if elsewhere(s.ahead.front(), i) {
                 s.ahead.clear();
                 s.generation += 1;
             }
