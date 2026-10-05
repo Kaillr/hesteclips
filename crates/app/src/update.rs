@@ -8,6 +8,13 @@
 //!
 //! A copy run from the build folder (`cargo run`) isn't installed, so it has
 //! nothing to update: [`Status::Unavailable`].
+//!
+//! The installer is only started once the app has shut down completely
+//! ([`apply_queued`], last thing in `main`): it's meant to wait for the app to
+//! exit, but on some PCs Windows won't let it ("Access is denied"), and then
+//! it goes ahead at once and kills the app if it's still running — which,
+//! mid-way through stopping a capture and finishing its file, looked like a
+//! crash.
 
 // Only the installed Windows app updates itself so far.
 #![cfg_attr(not(windows), allow(dead_code))]
@@ -51,11 +58,15 @@ struct Shared {
     status: Status,
     /// Check and download on our own (the setting).
     auto: bool,
-    /// The downloaded update, and whether it's been handed to the installer.
+    /// The downloaded update.
     #[cfg(windows)]
     ready: Option<velopack::VelopackAsset>,
-    applied: bool,
 }
+
+/// The update to install once the app has shut down, and whether to start
+/// the new version after.
+#[cfg(windows)]
+static QUEUED: Mutex<Option<(velopack::UpdateManager, velopack::VelopackAsset, bool)>> = Mutex::new(None);
 
 impl Updater {
     pub fn new(ctx: egui::Context, auto: bool) -> Self {
@@ -64,7 +75,6 @@ impl Updater {
             auto,
             #[cfg(windows)]
             ready: None,
-            applied: false,
         }));
         #[cfg(windows)]
         {
@@ -121,26 +131,36 @@ impl Updater {
         }
     }
 
-    /// Hand the downloaded update to the installer, to put in place once this
-    /// process has exited — and start the new version after, if `restart`.
-    /// The caller closes the app. Returns false when there's nothing to install.
+    /// Install the downloaded update once the app has shut down ([`apply_queued`])
+    /// — and start the new version after, if `restart`. The caller closes the
+    /// app. Returns false when there's nothing to install.
     pub fn install_on_exit(&self, restart: bool) -> bool {
         #[cfg(windows)]
         {
-            let mut s = self.shared.lock().unwrap();
-            if let (Some(m), Some(asset), false) = (&self.manager, &s.ready, s.applied) {
-                // Silent when quitting: no window should pop up after the app is gone.
-                match m.wait_exit_then_apply_updates(asset, !restart, restart, Vec::<String>::new()) {
-                    Ok(()) => {
-                        s.applied = true;
-                        return true;
-                    }
-                    Err(e) => s.status = Status::Failed(format!("Couldn't install the update: {e}")),
-                }
+            let s = self.shared.lock().unwrap();
+            if let (Some(m), Some(asset)) = (&self.manager, &s.ready) {
+                let mut queued = QUEUED.lock().unwrap();
+                // Quitting after "Update ready" was clicked still restarts.
+                let restart = restart || queued.as_ref().is_some_and(|(_, _, r)| *r);
+                *queued = Some((m.clone(), asset.clone(), restart));
+                return true;
             }
         }
         let _ = restart;
         false
+    }
+}
+
+/// Start the installer for an update queued by [`Updater::install_on_exit`].
+/// Called at the very end, once capture has stopped and every file is
+/// finished, so nothing is lost if the installer doesn't wait for us.
+pub fn apply_queued() {
+    #[cfg(windows)]
+    if let Some((m, asset, restart)) = QUEUED.lock().ok().and_then(|mut q| q.take()) {
+        // Silent when quitting: no window should pop up after the app is gone.
+        if let Err(e) = m.wait_exit_then_apply_updates(&asset, !restart, restart, Vec::<String>::new()) {
+            eprintln!("couldn't install the update: {e}");
+        }
     }
 }
 

@@ -112,7 +112,7 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
-    eframe::run_native(
+    let result = eframe::run_native(
         "HesteClips",
         options,
         Box::new(|cc| {
@@ -120,7 +120,11 @@ fn main() -> eframe::Result<()> {
             gpu_frames::init(cc.wgpu_render_state.as_ref());
             Ok(Box::new(App::new(cc.egui_ctx.clone())))
         }),
-    )
+    );
+    // The app is gone by now (capture stopped, files finished): an update
+    // can go in.
+    update::apply_queued();
+    result
 }
 
 /// The renderer's setup. On Windows, D3D12, so decoded video frames can be
