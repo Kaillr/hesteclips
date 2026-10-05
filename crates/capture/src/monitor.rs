@@ -23,6 +23,17 @@ const BUFFER_SECS: f32 = 0.005;
 /// little over the two buffers, so a late callback doesn't click).
 const MAX_QUEUE: f32 = 0.02;
 
+/// The input's error handler.
+#[cfg(not(target_os = "linux"))]
+fn input_errors(device: &str) -> impl FnMut(cpal::Error) + Send + 'static {
+    crate::sources::quiet_xruns(format!("{device} (Listen)"))
+}
+
+#[cfg(target_os = "linux")]
+fn input_errors(_: &str) -> impl FnMut(cpal::Error) + Send + 'static {
+    |e| eprintln!("mic monitor (input): {e}")
+}
+
 /// A microphone being played live; stops when dropped.
 pub struct MicMonitor {
     _input: cpal::Stream,
@@ -74,7 +85,9 @@ impl MicMonitor {
                 let excess = q.len().saturating_sub(max_queue);
                 q.drain(..excess);
             },
-            |e| eprintln!("mic monitor (input): {e}"),
+            // Windows flags the first packets after a start as a gap (not lost
+            // sound): only real dropouts are reported, and at most once a minute.
+            input_errors(device),
             None,
         )?;
 

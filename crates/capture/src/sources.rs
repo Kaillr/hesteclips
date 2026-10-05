@@ -204,7 +204,7 @@ fn start_mic(name: &str, feed: Arc<SourceFeed>) -> Result<cpal::Stream> {
 /// ignored. A real dropout later — the mic's buffer filled before it was read,
 /// usually because the PC was too busy — is reported, at most once a minute.
 #[cfg(not(target_os = "linux"))]
-fn quiet_xruns(name: String) -> impl FnMut(cpal::Error) + Send + 'static {
+pub(crate) fn quiet_xruns(name: String) -> impl FnMut(cpal::Error) + Send + 'static {
     let started = std::time::Instant::now();
     let mut dropouts = 0u32;
     let mut reported: Option<std::time::Instant> = None;
