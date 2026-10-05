@@ -139,6 +139,10 @@ pub struct Channel {
     pub meter: Meter,
     /// Before volume and mute: what the source delivers (shows a muted mic is live).
     pub input: Meter,
+    /// Gets the source's sound as it arrives (before volume and mute), mono at
+    /// [`RATE`], when set: for listening to the microphone ("hashtag
+    /// HesteClip that").
+    tap: Mutex<Option<std::sync::mpsc::Sender<Vec<f32>>>>,
 }
 
 impl Channel {
@@ -149,6 +153,21 @@ impl Channel {
             status: AtomicU8::new(0),
             meter: Meter::default(),
             input: Meter::default(),
+            tap: Mutex::new(None),
+        }
+    }
+
+    /// Hand the source's sound, mono at [`RATE`], to `tap` (`None`: stop).
+    pub fn set_tap(&self, tap: Option<std::sync::mpsc::Sender<Vec<f32>>>) {
+        *self.tap.lock().unwrap() = tap;
+    }
+
+    fn send_tap(&self, block: &[[f32; 2]]) {
+        let mut tap = self.tap.lock().unwrap();
+        if let Some(tx) = tap.as_ref()
+            && tx.send(block.iter().map(|f| (f[0] + f[1]) * 0.5).collect()).is_err()
+        {
+            *tap = None;
         }
     }
 
@@ -517,6 +536,7 @@ pub(crate) fn spawn_mixer(
                     for input in &inputs {
                         let mut block = input.feed.peek(*from, n);
                         input.channel.input.record(&block);
+                        input.channel.send_tap(&block);
                         let g = input.channel.effective_gain();
                         for f in block.iter_mut() {
                             f[0] *= g;
