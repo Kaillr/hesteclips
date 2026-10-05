@@ -144,13 +144,55 @@ pub fn reveal_in_file_manager(path: &Path) -> std::io::Result<()> {
             .raw_arg(format!("/select,\"{}\"", std::path::absolute(path)?.display()))
             .spawn()?;
     }
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(target_os = "linux")]
     {
-        // No universal "select" on Linux; open the containing folder.
+        // The file manager's D-Bus interface opens the folder with the file
+        // selected (Files, Dolphin, Nemo, …); without one, just the folder.
+        if show_items(path).is_err() {
+            let dir = path.parent().unwrap_or(path);
+            std::process::Command::new("xdg-open").arg(dir).spawn()?;
+        }
+    }
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+    {
         let dir = path.parent().unwrap_or(path);
         std::process::Command::new("xdg-open").arg(dir).spawn()?;
     }
     Ok(())
+}
+
+/// `org.freedesktop.FileManager1.ShowItems`: show `path` selected.
+#[cfg(target_os = "linux")]
+fn show_items(path: &Path) -> Result<(), ashpd::zbus::Error> {
+    let uri = file_uri(&std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()));
+    pollster::block_on(async {
+        let bus = ashpd::zbus::Connection::session().await?;
+        bus.call_method(
+            Some("org.freedesktop.FileManager1"),
+            "/org/freedesktop/FileManager1",
+            Some("org.freedesktop.FileManager1"),
+            "ShowItems",
+            &(vec![uri], ""),
+        )
+        .await
+        .map(|_| ())
+    })
+}
+
+/// A `file://` URI for an absolute path, with anything but plain characters
+/// percent-encoded.
+#[cfg(target_os = "linux")]
+pub fn file_uri(path: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    let mut uri = String::from("file://");
+    for &b in path.as_os_str().as_bytes() {
+        if b.is_ascii_alphanumeric() || b"/-_.~".contains(&b) {
+            uri.push(b as char);
+        } else {
+            uri.push_str(&format!("%{b:02X}"));
+        }
+    }
+    uri
 }
 
 /// "Today" / "Yesterday" / "Tuesday 29 September" (year added when not this year).

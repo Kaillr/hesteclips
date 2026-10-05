@@ -548,12 +548,16 @@ impl App {
             });
         }
 
-        let hint = if selecting { "Click to select" } else { "Click to play · drag into any app to share" };
+        let hint = match (selecting, share::CAN_DRAG_OUT) {
+            (true, _) => "Click to select",
+            (false, true) => "Click to play · drag into any app to share",
+            (false, false) => "Click to play",
+        };
         let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(format!("{}\n{hint}", clip.name));
         // Once the pointer has moved a little with the button held, it's a drag:
         // hand it to the OS so the clip can be dropped into Discord, Finder, a
         // browser… (egui alone can't drag outside its own window).
-        if resp.drag_started() && action.is_none() && !selecting {
+        if share::CAN_DRAG_OUT && resp.drag_started() && action.is_none() && !selecting {
             let preview = thumbs::cached_jpeg(clip);
             action = Some(Action::DragOut(clip.path.clone(), preview));
         }
@@ -712,8 +716,10 @@ pub(crate) fn share_menu(ui: &mut egui::Ui, anchor: Pos2) -> Option<ShareChoice>
     if ui.button(format!("📂  {}", crate::reveal_label())).clicked() {
         choice = Some(ShareChoice::Reveal);
     }
-    ui.separator();
-    ui.weak("Tip: drag the clip into any app");
+    if share::CAN_DRAG_OUT {
+        ui.separator();
+        ui.weak("Tip: drag the clip into any app");
+    }
     if choice.is_some() {
         ui.close();
     }

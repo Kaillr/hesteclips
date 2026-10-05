@@ -2,7 +2,8 @@
 //!
 //! - **Drag**: drag a card out of the window onto Discord, a chat, a browser
 //!   upload box, the desktop, an editor — a real OS file drag, so every app that
-//!   accepts dropped files accepts a clip.
+//!   accepts dropped files accepts a clip. (macOS and Windows: on Linux the
+//!   window system has no drag we can start from an eframe window.)
 //! - **Copy**: put the file on the clipboard, then paste it anywhere (⌘V).
 //! - **Share sheet**: AirDrop, Messages, Mail, Notes, … on macOS; Nearby
 //!   Share, Mail and share-capable apps on Windows.
@@ -15,8 +16,12 @@ use std::path::{Path, PathBuf};
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use raw_window_handle::HasWindowHandle;
 
+/// Whether clips can be dragged out of the window into other apps.
+pub const CAN_DRAG_OUT: bool = cfg!(any(target_os = "macos", target_os = "windows"));
+
 /// Start a native drag of `file` out of the window. The drag image is the clip's
 /// thumbnail (a JPEG on disk) when we have one.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 pub fn start_drag(frame: &eframe::Frame, file: &Path, preview: Option<PathBuf>) -> Result<(), String> {
     let image = drag::Image::Raw(drag_image(preview.as_deref()));
     drag::start_drag(
@@ -29,18 +34,43 @@ pub fn start_drag(frame: &eframe::Frame, file: &Path, preview: Option<PathBuf>) 
     .map_err(|e| e.to_string())
 }
 
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub fn start_drag(_frame: &eframe::Frame, _file: &Path, _preview: Option<PathBuf>) -> Result<(), String> {
+    Err("dragging clips out isn't available here — use Copy clip".into())
+}
+
 /// Put `file` on the clipboard as a file (not its path as text), ready to paste
 /// into chats, Finder, mail…
 pub fn copy_file(file: &Path) -> Result<(), String> {
     use clipboard_rs::Clipboard;
-    let ctx = clipboard_rs::ClipboardContext::new().map_err(|e| e.to_string())?;
-    // macOS wants a file URL; Windows/Linux take a plain path.
+    // macOS wants a file URL; Windows takes a plain path; on Linux it becomes
+    // a `text/uri-list` entry, which must be a URL with odd characters
+    // (spaces in a renamed clip) escaped.
+    #[cfg(target_os = "linux")]
+    let entry = crate::clips::file_uri(&std::path::absolute(file).map_err(|e| e.to_string())?);
+    #[cfg(not(target_os = "linux"))]
     let entry = if cfg!(target_os = "macos") {
         format!("file://{}", file.display())
     } else {
         file.display().to_string()
     };
-    ctx.set_files(vec![entry]).map_err(|e| e.to_string())
+    // On Linux (X11) the clipboard holds no data itself: whoever copied
+    // serves it until something else is copied. One context does that for
+    // every copy.
+    #[cfg(target_os = "linux")]
+    {
+        static CTX: std::sync::Mutex<Option<clipboard_rs::ClipboardContext>> = std::sync::Mutex::new(None);
+        let mut ctx = CTX.lock().unwrap();
+        if ctx.is_none() {
+            *ctx = Some(clipboard_rs::ClipboardContext::new().map_err(|e| e.to_string())?);
+        }
+        return ctx.as_ref().unwrap().set_files(vec![entry]).map_err(|e| e.to_string());
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let ctx = clipboard_rs::ClipboardContext::new().map_err(|e| e.to_string())?;
+        ctx.set_files(vec![entry]).map_err(|e| e.to_string())
+    }
 }
 
 /// Whether this platform has a system share sheet.
@@ -136,6 +166,7 @@ pub fn share_sheet(_frame: &eframe::Frame, _file: &Path, _at: egui::Pos2) -> Res
 /// The picture that follows the cursor: the clip's thumbnail at a small size
 /// (the cached one is 480 px, far too big to drag around), or a plain tile if the
 /// thumbnail isn't ready yet.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn drag_image(preview: Option<&Path>) -> Vec<u8> {
     let img = preview
         .and_then(|p| image::open(p).ok())

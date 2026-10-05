@@ -142,7 +142,15 @@ impl App {
         section(ui, "Sound", |ui| self.sound_settings(ui));
 
         section(ui, "Shortcuts", |ui| {
-            ui.weak("These work everywhere, even while a game has focus. Click one, then press the new keys.");
+            if self.hotkeys.as_ref().is_ok_and(|h| h.via_desktop()) {
+                ui.weak(
+                    "These work everywhere, even while a game has focus. Your desktop looks after them: \
+                     HesteClips asks it for the keys set here (it may ask you to confirm), and they can also \
+                     be changed in its keyboard settings.",
+                );
+            } else {
+                ui.weak("These work everywhere, even while a game has focus. Click one, then press the new keys.");
+            }
             ui.add_space(4.0);
             if let Err(e) = &self.hotkeys {
                 ui.colored_label(ui.visuals().warn_fg_color, format!("Shortcuts are unavailable: {e}"));
@@ -378,6 +386,13 @@ impl App {
             };
             if let Some(p) = problem {
                 ui.colored_label(ui.visuals().warn_fg_color, p);
+            } else if let Some(keys) = self.hotkeys.as_ref().ok().and_then(|h| h.assigned(action)) {
+                // The desktop has the last word on Wayland: say if it chose differently.
+                let asked = shortcuts::label(&current);
+                let same = |a: &str, b: &str| a.replace([' ', '+'], "").eq_ignore_ascii_case(&b.replace([' ', '+'], ""));
+                if !listening && !same(&asked, &keys) {
+                    ui.weak(format!("Your desktop set it to {keys}"));
+                }
             }
         });
     }

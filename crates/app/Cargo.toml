@@ -19,7 +19,6 @@ clipboard-rs = { version = "0.3", default-features = false }
 cpal = "0.18"
 ctrlc = { version = "3.5.2", features = ["termination"] }
 dirs = "6.0.0"
-drag = "2"
 eframe = "0.36.1"
 epaint_default_fonts = "0.36"
 egui = "0.36.1"
@@ -36,6 +35,19 @@ trash = "5"
 uuid = { version = "1", features = ["v4"] }
 discord-rich-presence = "1.1.0"
 ureq = { version = "3.4.2", features = ["json"] }
+
+# Dragging a clip out of the window as a file. Its Linux side needs a GTK
+# window, which eframe doesn't have.
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+drag = "2"
+
+# Linux: global shortcuts through the desktop portal (Wayland has no other
+# way), and showing a clip in the file manager.
+[target.'cfg(target_os = "linux")'.dependencies]
+ashpd = { version = "0.13", default-features = false, features = ["async-io", "global_shortcuts"] }
+async-io = "2"
+futures-util = { version = "0.3", default-features = false }
+pollster = "1"
 
 # Windows-only: drawing decoded frames straight from the GPU (gpu_frames.rs).
 [target.'cfg(windows)'.dependencies]

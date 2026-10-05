@@ -920,17 +920,24 @@ fn render_video(source: &Path, info: &ClipInfo, edit: &Edit, plan: &Plan, work: 
     // copies timestamps without rescaling, plays the middle at the wrong rate:
     // a 60 fps trim came out as 48 fps with a fifth of its frames gone.
     let timescale = source_timescale(source).unwrap_or(600).to_string();
+    let encoder = video_encoder();
+    // VA-API encodes from GPU memory: the frames go up last.
+    if encoder == "h264_vaapi" {
+        filters.push("format=nv12,hwupload".to_owned());
+    }
     let encode = |from: f64, to: f64, dest: &Path, progress: &dyn Fn(f32)| -> Result<()> {
         run_progress(
             ffmpeg()
                 .args(["-hide_banner", "-loglevel", "error", "-y"])
+                .args(vaapi_device(encoder))
                 .args(["-ss", &format!("{from:.6}"), "-to", &format!("{to:.6}"), "-i"])
                 .arg(source)
-                .args(["-map", "0:v:0", "-an", "-c:v", video_encoder(), "-b:v", &format!("{kbps}k")])
+                .args(["-map", "0:v:0", "-an", "-c:v", encoder, "-b:v", &format!("{kbps}k")])
                 .args(&cap)
                 .args(if filters.is_empty() { Vec::new() } else { vec!["-vf".to_owned(), filters.join(",")] })
                 // Same profile as our recordings so the segments can be joined.
-                .args(["-profile:v", "high", "-pix_fmt", "yuv420p"])
+                .args(["-profile:v", "high"])
+                .args(if encoder == "h264_vaapi" { &[][..] } else { &["-pix_fmt", "yuv420p"][..] })
                 .args(["-video_track_timescale", &timescale])
                 .arg(dest),
             to - from,
@@ -1125,21 +1132,124 @@ fn is_h264(source: &Path) -> bool {
 
 /// The H.264 encoder for re-encoded cuts: the platform's hardware one on
 /// macOS; elsewhere x264 when this ffmpeg build has it (LGPL builds don't),
-/// else Media Foundation on Windows.
+/// else Media Foundation on Windows, or on Linux the GPU's (NVENC, VA-API)
+/// or OpenH264 — whichever really works (an ffmpeg lists NVENC without an
+/// NVIDIA card).
 fn video_encoder() -> &'static str {
     static CHOSEN: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
     CHOSEN.get_or_init(|| {
         if cfg!(target_os = "macos") {
             return "h264_videotoolbox";
         }
-        let listed = ffmpeg()
-            .args(["-hide_banner", "-encoders"])
-            .stdin(Stdio::null())
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-            .unwrap_or_default();
+        let listed = ffmpeg_list("-encoders");
         let has = |name: &str| listed.split_whitespace().any(|w| w == name);
-        if !has("libx264") && cfg!(windows) && has("h264_mf") { "h264_mf" } else { "libx264" }
+        if has("libx264") {
+            return "libx264";
+        }
+        if cfg!(windows) && has("h264_mf") {
+            return "h264_mf";
+        }
+        if cfg!(target_os = "linux") {
+            if let Some(e) = ["h264_nvenc", "h264_vaapi", "libopenh264"].into_iter().find(|e| has(e) && encodes(e)) {
+                return e;
+            }
+        }
+        "libx264"
+    })
+}
+
+/// `-encoders` / `-decoders` output of the ffmpeg in use.
+fn ffmpeg_list(what: &str) -> String {
+    ffmpeg()
+        .args(["-hide_banner", what])
+        .stdin(Stdio::null())
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default()
+}
+
+/// Where VA-API encodes: the first GPU render node.
+fn vaapi_device(encoder: &str) -> Vec<String> {
+    if encoder != "h264_vaapi" {
+        return Vec::new();
+    }
+    let mut nodes: Vec<String> = std::fs::read_dir("/dev/dri")
+        .map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.starts_with("renderD")).collect())
+        .unwrap_or_default();
+    nodes.sort();
+    let node = nodes.first().map_or("/dev/dri/renderD128".to_owned(), |n| format!("/dev/dri/{n}"));
+    vec!["-vaapi_device".to_owned(), node]
+}
+
+/// Whether `encoder` can really encode a few frames here.
+fn encodes(encoder: &str) -> bool {
+    let mut filters = "format=yuv420p".to_owned();
+    if encoder == "h264_vaapi" {
+        filters = "format=nv12,hwupload".to_owned();
+    }
+    ffmpeg()
+        .args(["-hide_banner", "-loglevel", "error"])
+        .args(vaapi_device(encoder))
+        .args(["-f", "lavfi", "-i", "color=c=black:s=320x180:r=30", "-frames:v", "5", "-vf", &filters, "-c:v", encoder, "-f", "null", "-"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// What's wrong with the ffmpeg in use, if anything: missing, or unable to
+/// read or write H.264 (Fedora's own `ffmpeg-free` can do neither without
+/// extra codecs). Takes a moment: call it off the UI thread.
+pub fn problem() -> Option<String> {
+    if ffmpeg().arg("-version").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status().is_err() {
+        return Some(if cfg!(target_os = "linux") {
+            "ffmpeg isn't installed, so clips can't be played, edited or shown. Install it with your package manager \
+             (on Fedora, RPM Fusion's `ffmpeg`)."
+                .into()
+        } else {
+            "ffmpeg isn't installed, so clips can't be played, edited or shown.".into()
+        });
+    }
+    let decoders = ffmpeg_list("-decoders");
+    let decodes = decoders.split_whitespace().any(|w| w == "h264" || w == "h264_cuvid" || w == "libopenh264");
+    // Listed doesn't mean usable: Fedora's ffmpeg lists OpenH264 against a stub library.
+    let usable = decodes
+        && ffmpeg()
+            .args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=black:s=64x64:r=30", "-frames:v", "2"])
+            .args(["-c:v", video_encoder(), "-f", "h264", "-"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()
+            .filter(|o| o.status.success() && !o.stdout.is_empty())
+            .is_some_and(|o| {
+                let mut child = match ffmpeg()
+                    .args(["-hide_banner", "-loglevel", "error", "-f", "h264", "-i", "-", "-f", "null", "-"])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                {
+                    Ok(c) => c,
+                    Err(_) => return false,
+                };
+                if let Some(mut stdin) = child.stdin.take() {
+                    use std::io::Write;
+                    let _ = stdin.write_all(&o.stdout);
+                }
+                child.wait().is_ok_and(|s| s.success())
+            });
+    if usable {
+        return None;
+    }
+    Some(if cfg!(target_os = "linux") {
+        "This ffmpeg can't read or write H.264 video, so clips can't be played, edited or shown. Fedora's own \
+         ffmpeg leaves it out: install RPM Fusion's (`sudo dnf swap ffmpeg-free ffmpeg --allowerasing`), or the \
+         `openh264` package."
+            .into()
+    } else {
+        "This ffmpeg can't read or write H.264 video, so clips can't be played, edited or shown.".into()
     })
 }
 

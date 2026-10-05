@@ -7,17 +7,26 @@
 //!
 //! Shortcuts are stored as `global_hotkey` strings ("alt+F10"), which round-trip
 //! through `HotKey`'s `FromStr`/`Display`.
+//!
+//! They're registered with `global_hotkey` on macOS, Windows and X11. On
+//! Wayland, where an app can't see keys pressed elsewhere, the desktop portal
+//! does it (`portal_shortcuts`): the keys set here are what we ask it for.
 
 use std::str::FromStr;
 
-use global_hotkey::GlobalHotKeyManager;
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
+use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 
 use crate::settings::{ShortcutAction, Shortcuts};
 
 /// The registered shortcuts. The manager must stay alive for them to work.
 pub struct Registered {
-    mgr: GlobalHotKeyManager,
+    /// `None` when the desktop portal has them instead.
+    mgr: Option<GlobalHotKeyManager>,
+    #[cfg(target_os = "linux")]
+    portal: Option<crate::portal_shortcuts::Portal>,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    ctx: egui::Context,
     /// What's registered now, with the action each id triggers.
     active: Vec<(HotKey, ShortcutAction)>,
     /// What `active` was built from, to re-register only on change.
@@ -27,8 +36,24 @@ pub struct Registered {
 }
 
 impl Registered {
-    pub fn new() -> global_hotkey::Result<Self> {
-        Ok(Self { mgr: GlobalHotKeyManager::new()?, active: Vec::new(), from: None, errors: Vec::new() })
+    /// `ctx` is woken when a shortcut is pressed (where the backend can).
+    pub fn new(ctx: egui::Context) -> Result<Self, String> {
+        #[cfg(target_os = "linux")]
+        if crate::portal_shortcuts::wanted() {
+            if crate::portal_shortcuts::available() {
+                return Ok(Self { mgr: None, portal: None, ctx, active: Vec::new(), from: None, errors: Vec::new() });
+            }
+            eprintln!("the desktop has no GlobalShortcuts portal: shortcuts only work while an X11 app is focused");
+        }
+        Ok(Self {
+            mgr: Some(GlobalHotKeyManager::new().map_err(|e| e.to_string())?),
+            #[cfg(target_os = "linux")]
+            portal: None,
+            ctx,
+            active: Vec::new(),
+            from: None,
+            errors: Vec::new(),
+        })
     }
 
     /// Make the OS shortcuts match `wanted`. Cheap when nothing changed.
@@ -36,35 +61,93 @@ impl Registered {
         if self.from.as_ref() == Some(wanted) {
             return;
         }
-        for (hk, _) in self.active.drain(..) {
-            let _ = self.mgr.unregister(hk);
+        if let Some(mgr) = &self.mgr {
+            for (hk, _) in self.active.drain(..) {
+                let _ = mgr.unregister(hk);
+            }
         }
         self.errors.clear();
+        let mut valid = Vec::new();
         for action in ShortcutAction::ALL {
             let text = wanted.get(action);
             if text.is_empty() {
                 continue;
             }
             match HotKey::from_str(text) {
-                Ok(hk) if self.active.iter().any(|(h, _)| h.id() == hk.id()) => {
+                Ok(hk) if self.active.iter().chain(&valid).any(|(h, _)| h.id() == hk.id()) => {
                     self.errors.push((action, "used twice".into()));
                 }
-                Ok(hk) => match self.mgr.register(hk) {
-                    Ok(()) => self.active.push((hk, action)),
-                    Err(_) => self.errors.push((action, "taken by another app".into())),
+                Ok(hk) => match &self.mgr {
+                    Some(mgr) => match mgr.register(hk) {
+                        Ok(()) => self.active.push((hk, action)),
+                        Err(_) => self.errors.push((action, "taken by another app".into())),
+                    },
+                    None => valid.push((hk, action)),
                 },
                 Err(_) => self.errors.push((action, "not a valid shortcut".into())),
             }
         }
+        #[cfg(target_os = "linux")]
+        if self.mgr.is_none() {
+            // The old set goes (dropping it unbinds them), the new one is bound.
+            self.portal = None;
+            let list = valid.iter().map(|(_, a)| (*a, wanted.get(*a).to_owned())).collect();
+            self.portal = Some(crate::portal_shortcuts::Portal::bind(list, self.ctx.clone()));
+        }
+        let _ = valid;
         self.from = Some(wanted.clone());
     }
 
-    pub fn action_for(&self, id: u32) -> Option<ShortcutAction> {
-        self.active.iter().find(|(h, _)| h.id() == id).map(|(_, a)| *a)
+    /// Shortcuts pressed since the last call.
+    pub fn pressed(&mut self) -> Vec<ShortcutAction> {
+        let mut out = Vec::new();
+        while let Ok(ev) = GlobalHotKeyEvent::receiver().try_recv() {
+            if ev.state == HotKeyState::Pressed {
+                out.extend(self.active.iter().find(|(h, _)| h.id() == ev.id).map(|(_, a)| *a));
+            }
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(p) = &self.portal {
+            out.extend(p.pressed());
+        }
+        out
     }
 
-    pub fn error_for(&self, action: ShortcutAction) -> Option<&str> {
-        self.errors.iter().find(|(a, _)| *a == action).map(|(_, e)| e.as_str())
+    pub fn error_for(&self, action: ShortcutAction) -> Option<String> {
+        if let Some((_, e)) = self.errors.iter().find(|(a, _)| *a == action) {
+            return Some(e.clone());
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(p) = &self.portal {
+            use crate::portal_shortcuts::State;
+            return match p.state() {
+                State::Failed(e) => Some(format!("the desktop didn't take it ({e})")),
+                State::Bound(list) if list.iter().any(|(a, keys)| *a == action && keys.trim().is_empty()) => {
+                    Some("the desktop gave it no keys — set them in its keyboard settings".into())
+                }
+                _ => None,
+            };
+        }
+        None
+    }
+
+    /// Whether the desktop owns the shortcuts (Wayland), so the keys set here
+    /// are what's asked for and the desktop's settings have the last word.
+    pub fn via_desktop(&self) -> bool {
+        self.mgr.is_none()
+    }
+
+    /// The keys the desktop assigned to `action`, as it writes them, when
+    /// the desktop owns the shortcuts.
+    pub fn assigned(&self, action: ShortcutAction) -> Option<String> {
+        #[cfg(target_os = "linux")]
+        if let Some(p) = &self.portal {
+            if let crate::portal_shortcuts::State::Bound(list) = p.state() {
+                return list.into_iter().find(|(a, _)| *a == action).map(|(_, k)| k).filter(|k| !k.trim().is_empty());
+            }
+        }
+        let _ = action;
+        None
     }
 }
 

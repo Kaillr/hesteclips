@@ -214,7 +214,8 @@ impl App {
                     }
                 });
                 if self.sources_view.apps.is_empty() {
-                    ui.weak("No apps found.");
+                    // PipeWire only knows apps by their sound.
+                    ui.weak(if cfg!(target_os = "linux") { "No apps are playing sound. Start one, then look again." } else { "No apps found." });
                 }
             });
             if menu.response.clicked() {
@@ -251,7 +252,7 @@ impl App {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if let Some(f) = &frame {
                         let rate = self.sources_view.preview_rate.2;
-                        ui.weak(format!("{}×{} · {rate} fps", f.width, f.height)).on_hover_text(
+                        ui.weak(format!("{}×{} · {rate} fps", f.recorded.0, f.recorded.1)).on_hover_text(
                             "What's recorded: its size, and how many frames the preview is showing per second \
                              (it can't show more than your display refreshes). Change them in Settings → Video quality.",
                         );
@@ -294,7 +295,24 @@ impl App {
             ui.add_space(8.0);
 
             match self.settings.capture.clone() {
-                CaptureTarget::Apps { apps, away_screen } => self.app_list(ui, apps, away_screen, frame.as_deref()),
+                CaptureTarget::Apps { apps, away_screen } if capture::APP_CAPTURE => self.app_list(ui, apps, away_screen, frame.as_deref()),
+                // Linux: the desktop's own dialog picks the screen (once; it's remembered).
+                #[cfg(target_os = "linux")]
+                _ => {
+                    ui.add_enabled_ui(idle, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Screen");
+                            ui.weak("picked in your desktop's sharing dialog");
+                            if ui.button("Choose another…").on_hover_text("Your desktop asks again which screen to record").clicked() {
+                                capture::linux::choose_screen_again();
+                                self.video_preview = None; // restarts, and asks
+                            }
+                        })
+                        .response
+                        .on_disabled_hover_text("Stop capturing to switch screens.");
+                    });
+                }
+                #[cfg(not(target_os = "linux"))]
                 _ => {
                     ui.add_enabled_ui(idle, |ui| {
                         ui.horizontal(|ui| {
@@ -834,7 +852,12 @@ fn status_badge(ui: &mut egui::Ui, status: SourceStatus) {
     let (text, color, tip) = match status {
         SourceStatus::Live | SourceStatus::Off => return,
         SourceStatus::WaitingForApp => {
-            ("waiting for app", ui.visuals().weak_text_color(), "Starts by itself as soon as the app opens.")
+            let tip = if cfg!(target_os = "linux") {
+                "Starts by itself as soon as the app plays sound."
+            } else {
+                "Starts by itself as soon as the app opens."
+            };
+            ("waiting for app", ui.visuals().weak_text_color(), tip)
         }
         SourceStatus::Unavailable => ("unavailable", ui.visuals().warn_fg_color, "The device isn't connected, or couldn't be opened."),
     };

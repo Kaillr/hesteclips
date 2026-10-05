@@ -17,8 +17,12 @@ mod editor;
 mod export_ui;
 mod filmstrip;
 mod library;
+#[cfg(target_os = "linux")]
+mod linux_desktop;
 mod meter;
 mod player;
+#[cfg(target_os = "linux")]
+mod portal_shortcuts;
 mod proxy;
 mod service;
 mod settings;
@@ -42,7 +46,6 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
 use egui::{Color32, RichText};
-use global_hotkey::{GlobalHotKeyEvent, HotKeyState};
 use library::{ACCENT, REC_RED};
 use service::{CaptureService, Evt};
 use settings::{Encoder, RecordSettings, SourceKind};
@@ -73,6 +76,13 @@ fn main() -> eframe::Result<()> {
     // place now. Does nothing in a development build.
     #[cfg(windows)]
     velopack::VelopackApp::build().run();
+    // Before anything talks to the desktop portal (screen capture, shortcuts),
+    // which wants to know who we are, and needs our `.desktop` file for that.
+    #[cfg(target_os = "linux")]
+    {
+        linux_desktop::integrate();
+        portal_shortcuts::register_app();
+    }
 
     // Killed from outside (Ctrl+C, SIGTERM, logout): stop capture and finish the
     // file before exiting, since destructors don't run on a signal.
@@ -86,12 +96,17 @@ fn main() -> eframe::Result<()> {
         .ok()
         .and_then(|s| s.split_once('x').and_then(|(w, h)| Some([w.parse().ok()?, h.parse().ok()?])))
         .unwrap_or([1040.0, 700.0]);
+    let viewport = egui::ViewportBuilder::default()
+        .with_inner_size(size)
+        .with_min_inner_size([560.0, 420.0])
+        .with_title("HesteClips")
+        .with_icon(app_icon());
+    // Wayland names the window's app by this (its icon and name come from
+    // the `.desktop` file of the same name).
+    #[cfg(target_os = "linux")]
+    let viewport = viewport.with_app_id(portal_shortcuts::APP_ID);
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size(size)
-            .with_min_inner_size([560.0, 420.0])
-            .with_title("HesteClips")
-            .with_icon(app_icon()),
+        viewport,
         wgpu_options: wgpu_options(),
         ..Default::default()
     };
@@ -109,8 +124,10 @@ fn main() -> eframe::Result<()> {
 
 /// The renderer's setup. On Windows, D3D12, so decoded video frames can be
 /// shared with it straight from the GPU (`gpu_frames.rs`); wgpu's default
-/// pick could be Vulkan, which can't open them as simply.
-/// `HESTECLIPS_WGPU_BACKEND` (e.g. "vulkan") overrides it, to compare.
+/// pick could be Vulkan, which can't open them as simply. Elsewhere wgpu's
+/// pick. `HESTECLIPS_WGPU_BACKEND` (e.g. "vulkan", "gl") overrides it, to
+/// compare (or on Linux, where a GPU without a Vulkan driver gets Mesa's
+/// software one, "gl" draws on the GPU instead).
 fn wgpu_options() -> eframe::egui_wgpu::WgpuConfiguration {
     let mut options = eframe::egui_wgpu::WgpuConfiguration::default();
     // A hidden window (covered, minimized, or not shown yet) gets no frame to
@@ -125,12 +142,12 @@ fn wgpu_options() -> eframe::egui_wgpu::WgpuConfiguration {
         }
         default(status)
     });
-    #[cfg(windows)]
     if let eframe::egui_wgpu::WgpuSetup::CreateNew(new) = &mut options.wgpu_setup {
-        new.instance_descriptor.backends = match std::env::var("HESTECLIPS_WGPU_BACKEND") {
-            Ok(b) => eframe::wgpu::Backends::from_comma_list(&b),
-            Err(_) => eframe::wgpu::Backends::DX12,
-        };
+        match std::env::var("HESTECLIPS_WGPU_BACKEND") {
+            Ok(b) => new.instance_descriptor.backends = eframe::wgpu::Backends::from_comma_list(&b),
+            Err(_) if cfg!(windows) => new.instance_descriptor.backends = eframe::wgpu::Backends::DX12,
+            Err(_) => {}
+        }
     }
     options
 }
@@ -253,6 +270,8 @@ struct App {
     /// Screen-recording permission, re-checked each poll so the banner clears the
     /// moment the user grants it.
     permission: capture::Permission,
+    /// What's wrong with ffmpeg, once checked (in the background, at launch).
+    ffmpeg_problem: std::sync::Arc<std::sync::OnceLock<Option<String>>>,
     /// Screens detected by the capture backend.
     screens: Vec<capture::Device>,
     /// The recording's frame size for (what's recorded, resolution), cached:
@@ -324,7 +343,7 @@ impl App {
         let clips = clips::scan(&settings.output_dir);
         // Assets of clips deleted in Finder go to the Bin.
         store::sweep_orphans(&settings.output_dir, &clips);
-        let hotkeys = shortcuts::Registered::new().map_err(|e| e.to_string()).map(|mut h| {
+        let hotkeys = shortcuts::Registered::new(ctx.clone()).map(|mut h| {
             h.sync(&settings.shortcuts);
             h
         });
@@ -353,6 +372,18 @@ impl App {
             sound_error: None,
             reveal_clip: None,
             permission: capture::screen_permission(),
+            ffmpeg_problem: {
+                let problem = std::sync::Arc::new(std::sync::OnceLock::new());
+                let (p, ctx) = (problem.clone(), ctx.clone());
+                std::thread::spawn(move || {
+                    let found = media::problem();
+                    if found.is_some() {
+                        ctx.request_repaint();
+                    }
+                    let _ = p.set(found);
+                });
+                problem
+            },
             screens: capture::list_screens(),
             frame_size: None,
             windowed_apps: Vec::new(),
@@ -552,18 +583,21 @@ impl eframe::App for App {
         // Global shortcuts: these fire even while a game is focused. Paused while
         // the Settings recorder listens, so pressing the current key rebinds it
         // instead of starting a recording.
-        if let Ok(h) = &mut self.hotkeys {
-            h.sync(&self.settings.shortcuts);
-        }
-        while let Ok(ev) = GlobalHotKeyEvent::receiver().try_recv() {
-            if ev.state != HotKeyState::Pressed || self.recording_shortcut.is_some() {
+        let pressed = match &mut self.hotkeys {
+            Ok(h) => {
+                h.sync(&self.settings.shortcuts);
+                h.pressed()
+            }
+            Err(_) => Vec::new(),
+        };
+        for action in pressed {
+            if self.recording_shortcut.is_some() {
                 continue;
             }
-            match self.hotkeys.as_ref().ok().and_then(|h| h.action_for(ev.id)) {
-                Some(settings::ShortcutAction::ToggleBuffer) => self.toggle_buffer(),
-                Some(settings::ShortcutAction::ToggleRecord) => self.toggle_record(),
-                Some(settings::ShortcutAction::SaveClip) => self.save_clip(),
-                None => {}
+            match action {
+                settings::ShortcutAction::ToggleBuffer => self.toggle_buffer(),
+                settings::ShortcutAction::ToggleRecord => self.toggle_record(),
+                settings::ShortcutAction::SaveClip => self.save_clip(),
             }
         }
 
@@ -920,6 +954,13 @@ impl App {
     }
 
     fn permission_banner(&mut self, ui: &mut egui::Ui) {
+        if let Some(Some(problem)) = self.ffmpeg_problem.get() {
+            ui.add_space(8.0);
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.colored_label(ui.visuals().warn_fg_color, problem);
+            });
+        }
         if self.permission != capture::Permission::Denied {
             return;
         }

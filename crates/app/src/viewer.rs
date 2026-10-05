@@ -247,7 +247,11 @@ impl Viewer {
                     .fill(ACCENT)
                     .min_size(Vec2::new(86.0, 30.0))
                     .corner_radius(8);
-                let share = ui.add(share).on_hover_text("Copy it, send it or upload it — or drag the picture into any app");
+                let share = ui.add(share).on_hover_text(if crate::share::CAN_DRAG_OUT {
+                    "Copy it, send it or upload it — or drag the picture into any app"
+                } else {
+                    "Copy it, send it or upload it"
+                });
                 egui::Popup::menu(&share).show(|ui| {
                     if let Some(c) = crate::library::share_menu(ui, share.rect.left_bottom()) {
                         out = ViewerOutcome::Share(c);
@@ -382,7 +386,7 @@ impl Ready {
         }
 
         let preview_resp = preview_resp.on_hover_cursor(if full { egui::CursorIcon::Default } else { egui::CursorIcon::PointingHand });
-        if preview_resp.drag_started() {
+        if crate::share::CAN_DRAG_OUT && preview_resp.drag_started() {
             self.drag_out = true;
         }
         if preview_resp.double_clicked() {

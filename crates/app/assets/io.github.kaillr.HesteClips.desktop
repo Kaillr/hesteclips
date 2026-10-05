@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=HesteClips
+GenericName=Clip Recorder
+Comment=Keep a replay buffer running and save clips with a hotkey
+Exec=hesteclips
+Icon=io.github.kaillr.HesteClips
+Terminal=false
+Categories=AudioVideo;Video;Recorder;
+Keywords=clip;replay;record;screen;capture;game;
+StartupWMClass=io.github.kaillr.HesteClips
+SingleMainWindow=true
