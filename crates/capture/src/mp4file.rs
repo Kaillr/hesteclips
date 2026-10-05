@@ -1,5 +1,5 @@
-//! Windows file writing: the `FileWriter` behind `crate::writer`, on our own
-//! MP4 muxer (`crate::mp4mux`).
+//! File writing on Windows and Linux: the `FileWriter` behind `crate::writer`,
+//! on our own MP4 muxer (`crate::mp4mux`).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

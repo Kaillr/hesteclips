@@ -12,7 +12,7 @@
 //!   thread, so capture never pauses. Nothing touches the disk until you save.
 //!
 //! The file itself is written by `FileWriter`: AVAssetWriter on macOS
-//! (`avwriter`), our own MP4 muxer on Windows (`win::file`).
+//! (`avwriter`), our own MP4 muxer on Windows and Linux (`mp4file`).
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -24,8 +24,8 @@ use anyhow::{Context, Result, anyhow, bail};
 #[cfg(target_os = "macos")]
 pub(crate) use crate::avwriter::{FileWriter, Layout, VideoFrame};
 use crate::mixer::RATE;
-#[cfg(target_os = "windows")]
-pub(crate) use crate::win::file::{FileWriter, Layout, VideoFrame};
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+pub(crate) use crate::mp4file::{FileWriter, Layout, VideoFrame};
 
 /// One encoded AAC packet and the frame (48 kHz sample index) it starts at.
 pub struct AacPacket {
@@ -263,13 +263,13 @@ impl Media {
     }
 }
 
-#[cfg(all(test, target_os = "windows"))]
+#[cfg(all(test, any(target_os = "windows", target_os = "linux")))]
 mod tests {
     use super::*;
     use std::sync::Arc;
 
     fn video(pts: f64, key: bool) -> Media {
-        let frame = crate::win::file::VideoFrame(Arc::new(crate::win::file::EncodedFrame { data: Arc::from(vec![0u8; 4]), config: None }));
+        let frame = crate::mp4file::VideoFrame(Arc::new(crate::mp4file::EncodedFrame { data: Arc::from(vec![0u8; 4]), config: None }));
         Media::Video { frame, pts, key }
     }
 

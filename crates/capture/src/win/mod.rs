@@ -23,7 +23,6 @@ mod camera;
 mod d3d;
 pub mod decode;
 pub(crate) mod direct;
-pub(crate) mod file;
 mod h264;
 mod loopback;
 mod system;
@@ -50,7 +49,7 @@ use crate::sources::{AudioCapture, mix_inputs, track_layout};
 use crate::writer::{self, Media, Writer};
 use crate::{EncodeSettings, Mode, Recorder, VideoSource};
 use aac::AacEncoder;
-use file::Layout;
+use crate::mp4file::Layout;
 
 /// AAC bitrate per audio track.
 const AUDIO_BITRATE: u32 = 192_000;

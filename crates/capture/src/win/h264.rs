@@ -27,7 +27,7 @@ use windows::Win32::System::Variant::{VARIANT, VT_BOOL, VT_UI4};
 use windows::core::{Interface, implement};
 
 use super::d3d::{Gpu, TexturePool};
-use super::file::{EncodedFrame, VideoFrame};
+use crate::mp4file::{EncodedFrame, VideoFrame};
 use crate::EncodeSettings;
 use crate::mp4mux::{AvcConfig, annexb_to_avcc};
 use crate::writer::{Command, Media};
