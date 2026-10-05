@@ -14,6 +14,7 @@ mod cloud;
 mod cloud_ui;
 mod discord;
 mod editor;
+mod export_ui;
 mod filmstrip;
 mod library;
 mod meter;
@@ -637,7 +638,7 @@ impl eframe::App for App {
                 Page::Sources => self.sources_page(ui),
                 Page::Settings => self.settings_page(ui),
                 Page::Edit => self.editor_page(ui),
-                Page::View => self.viewer_page(ui),
+                Page::View => self.viewer_page(ui, frame),
             });
 
         self.dialogs(&ctx);
@@ -963,7 +964,7 @@ impl App {
         self.page = Page::View;
     }
 
-    fn viewer_page(&mut self, ui: &mut egui::Ui) {
+    fn viewer_page(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
         let Some(v) = &mut self.viewer else {
             self.page = Page::Clips;
             return;
@@ -995,6 +996,19 @@ impl App {
                 self.open_editor(clip);
             }
             viewer::ViewerOutcome::Open(clip) => self.viewer = Some(viewer::Viewer::open(&self.ctx(), &clip)),
+            viewer::ViewerOutcome::Share(choice) => {
+                let clip = v.clip().to_path_buf();
+                self.share(frame, clip, choice);
+            }
+            viewer::ViewerOutcome::Rename => {
+                let clip = v.clip().to_path_buf();
+                self.rename_clip(clip);
+            }
+            viewer::ViewerOutcome::DragOut => {
+                let clip = v.clip().to_path_buf();
+                let preview = self.clips.iter().find(|c| c.path == clip).and_then(thumbs::cached_jpeg);
+                self.drag_out(ui.ctx(), frame, &clip, preview);
+            }
         }
     }
 
@@ -1018,6 +1032,12 @@ impl App {
                     Err(e) => self.toast_error(format!("Couldn't revert: {e}")),
                 }
                 self.close_editor();
+            }
+            editor::EditorOutcome::Rename => {
+                if let Some(ed) = &self.editor {
+                    let clip = ed.clip().to_path_buf();
+                    self.rename_clip(clip);
+                }
             }
             editor::EditorOutcome::Saved { target, info, edit, new_name } => {
                 self.start_render(target, info, edit, new_name);

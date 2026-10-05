@@ -9,7 +9,7 @@
 //! card instead of playing it, and a bar on top acts on all of them.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use egui::{Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
@@ -87,16 +87,12 @@ impl Selection {
 enum Action {
     /// Drag the file out of the window (to another app / the desktop).
     DragOut(PathBuf, Option<PathBuf>),
-    Copy(PathBuf),
-    /// System share sheet at a window position.
-    ShareSheet(PathBuf, Pos2),
+    Share(PathBuf, ShareChoice),
     Rename(PathBuf),
     Open(PathBuf),
     /// Play it in the OS default video player instead.
     OpenExternal(PathBuf),
     Edit(PathBuf),
-    Reveal(PathBuf),
-    Share(PathBuf),
     Trash(PathBuf),
     /// Toggle a card's selection, or (`range`) select up to it from the anchor.
     Select { path: PathBuf, range: bool },
@@ -195,29 +191,8 @@ impl App {
                     self.toast_error(format!("Couldn't open the clip: {e}"));
                 }
             }
-            Some(Action::Reveal(p)) => {
-                if let Err(e) = clips::reveal_in_file_manager(&p) {
-                    self.toast_error(format!("Couldn't show the file: {e}"));
-                }
-            }
-            Some(Action::Share(p)) => self.open_share_dialog(p),
-            Some(Action::DragOut(p, preview)) => {
-                // Hand the gesture to the OS; egui must forget its own drag or the
-                // card would stay "grabbed" after the drop.
-                ui.ctx().stop_dragging();
-                if let Err(e) = share::start_drag(frame, &p, preview) {
-                    self.toast_error(format!("Couldn't start the drag: {e}"));
-                }
-            }
-            Some(Action::Copy(p)) => match share::copy_file(&p) {
-                Ok(()) => self.toast(format!("Copied — paste it into any app ({})", crate::hotkey_label_cmd("V"))),
-                Err(e) => self.toast_error(format!("Couldn't copy the clip: {e}")),
-            },
-            Some(Action::ShareSheet(p, at)) => {
-                if let Err(e) = share::share_sheet(frame, &p, at) {
-                    self.toast_error(format!("Couldn't open sharing: {e}"));
-                }
-            }
+            Some(Action::Share(p, choice)) => self.share(frame, p, choice),
+            Some(Action::DragOut(p, preview)) => self.drag_out(ui.ctx(), frame, &p, preview),
             Some(Action::Edit(p)) => self.open_editor(p),
             Some(Action::Rename(p)) => self.rename_clip(p),
             Some(Action::Trash(p)) => self.trash_clips(&[p]),
@@ -567,8 +542,8 @@ impl App {
             }
             let share_btn = overlay_button(ui, share_rect, "📤 Share", ACCENT);
             egui::Popup::menu(&share_btn).id(share_id).show(|ui| {
-                if let Some(a) = share_menu(ui, clip, share_btn.rect.left_bottom()) {
-                    action = Some(a);
+                if let Some(c) = share_menu(ui, share_btn.rect.left_bottom()) {
+                    action = Some(Action::Share(clip.path.clone(), c));
                 }
             });
         }
@@ -625,8 +600,8 @@ impl App {
                 if ui.button("✕  Cancel upload").clicked() {
                     action = Some(Action::CancelUpload(clip.path.clone()));
                 }
-            } else if let Some(a) = share_menu(ui, clip, ui.ctx().pointer_latest_pos().unwrap_or_default()) {
-                action = Some(a);
+            } else if let Some(c) = share_menu(ui, ui.ctx().pointer_latest_pos().unwrap_or_default()) {
+                action = Some(Action::Share(clip.path.clone(), c));
             }
             ui.separator();
             if ui.button(egui::RichText::new("🗑  Move to Trash").color(v.error_fg_color)).clicked() {
@@ -688,6 +663,13 @@ impl App {
                         if self.last_saved.as_ref().is_some_and(|(p, _)| *p == r.path) {
                             self.last_saved = None;
                         }
+                        // Open in the player or editor: it follows the file.
+                        if let Some(v) = &mut self.viewer {
+                            v.renamed(ctx, &r.path, &to);
+                        }
+                        if let Some(e) = &mut self.editor {
+                            e.renamed(ctx, &r.path, &to);
+                        }
                         close = true;
                         self.refresh_clips();
                     }
@@ -702,31 +684,73 @@ impl App {
     }
 }
 
-/// The ways to get a clip out, shared by the Share button and the right-click
-/// menu. Ordered by how often people reach for them.
-fn share_menu(ui: &mut egui::Ui, clip: &clips::Clip, anchor: Pos2) -> Option<Action> {
-    let file = clip.path.clone();
-    let mut action = None;
+/// A way to get a clip out, picked from [`share_menu`].
+pub(crate) enum ShareChoice {
+    Copy,
+    /// The system share sheet, at this window position.
+    Sheet(Pos2),
+    Upload,
+    Reveal,
+}
+
+/// The ways to get a clip out, shared by the library's Share button and
+/// right-click menu and the player's Share button. Ordered by how often
+/// people reach for them.
+pub(crate) fn share_menu(ui: &mut egui::Ui, anchor: Pos2) -> Option<ShareChoice> {
+    let mut choice = None;
     ui.set_min_width(230.0);
     let paste = crate::hotkey_label_cmd("V");
     if ui.button("📋  Copy clip").on_hover_text(format!("Then paste it into Discord, a chat or a folder ({paste})")).clicked() {
-        action = Some(Action::Copy(file.clone()));
+        choice = Some(ShareChoice::Copy);
     }
     if share::HAS_SHARE_SHEET && ui.button(share::SHARE_SHEET_LABEL).clicked() {
-        action = Some(Action::ShareSheet(file.clone(), anchor));
+        choice = Some(ShareChoice::Sheet(anchor));
     }
     if ui.button("☁  Upload to HesteFiles…").clicked() {
-        action = Some(Action::Share(file.clone()));
+        choice = Some(ShareChoice::Upload);
     }
     if ui.button(format!("📂  {}", crate::reveal_label())).clicked() {
-        action = Some(Action::Reveal(file));
+        choice = Some(ShareChoice::Reveal);
     }
     ui.separator();
     ui.weak("Tip: drag the clip into any app");
-    if action.is_some() {
+    if choice.is_some() {
         ui.close();
     }
-    action
+    choice
+}
+
+impl App {
+    /// Do what was picked in [`share_menu`] for `file`.
+    pub(crate) fn share(&mut self, frame: &eframe::Frame, file: PathBuf, choice: ShareChoice) {
+        match choice {
+            ShareChoice::Copy => match share::copy_file(&file) {
+                Ok(()) => self.toast(format!("Copied — paste it into any app ({})", crate::hotkey_label_cmd("V"))),
+                Err(e) => self.toast_error(format!("Couldn't copy the clip: {e}")),
+            },
+            ShareChoice::Sheet(at) => {
+                if let Err(e) = share::share_sheet(frame, &file, at) {
+                    self.toast_error(format!("Couldn't open sharing: {e}"));
+                }
+            }
+            ShareChoice::Upload => self.open_share_dialog(file),
+            ShareChoice::Reveal => {
+                if let Err(e) = clips::reveal_in_file_manager(&file) {
+                    self.toast_error(format!("Couldn't show the file: {e}"));
+                }
+            }
+        }
+    }
+
+    /// Hand a drag of `file` to the OS, so it can be dropped into any app.
+    pub(crate) fn drag_out(&mut self, ctx: &egui::Context, frame: &eframe::Frame, file: &Path, preview: Option<PathBuf>) {
+        // egui must forget its own drag, or what was dragged would stay
+        // "grabbed" after the drop.
+        ctx.stop_dragging();
+        if let Err(e) = share::start_drag(frame, file, preview) {
+            self.toast_error(format!("Couldn't start the drag: {e}"));
+        }
+    }
 }
 
 /// The "Edited" marker in a card's caption: a small accent pill. Returns its width.

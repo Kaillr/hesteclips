@@ -10,6 +10,9 @@
 //! It plays the clip as it's shared: the saved edit if there is one, and the
 //! mix (track 1).
 //!
+//! Share and Rename sit in the header; dragging the picture out of the window
+//! drops the clip into any app, as dragging a card does in the library.
+//!
 //! Previous clip / Next clip (P / N) step through the library in its order
 //! without going back to it, and F, double-click or ⛶ go fullscreen, so a
 //! session's clips can be reviewed one after another.
@@ -38,6 +41,10 @@ pub enum ViewerOutcome {
     Edit,
     /// Show this clip instead (the next or previous one).
     Open(PathBuf),
+    Share(crate::library::ShareChoice),
+    Rename,
+    /// The picture was dragged: hand the clip to the OS to drop into an app.
+    DragOut,
 }
 
 /// Where this clip sits in the library, for stepping through clips.
@@ -88,6 +95,8 @@ struct Ready {
     hover: Option<(u64, egui::TextureHandle)>,
     volume: f32,
     muted: bool,
+    /// The picture was dragged this frame: share the clip by drag and drop.
+    drag_out: bool,
 }
 
 impl Viewer {
@@ -116,6 +125,28 @@ impl Viewer {
         &self.clip
     }
 
+    /// The clip was renamed from `from` to `to`: opened again under its new
+    /// name (frames are read by path), at the same moment.
+    pub fn renamed(&mut self, ctx: &egui::Context, from: &Path, to: &Path) {
+        if self.clip != from {
+            return;
+        }
+        self.clip = to.to_path_buf();
+        match &mut self.state {
+            State::Ready(r) => {
+                let playing = r.player.is_playing();
+                r.player = r.player.reopen(ctx, to);
+                r.strip = Filmstrip::build(ctx, to, &r.info);
+                r.apply_volume(ctx);
+                if playing {
+                    r.play();
+                }
+            }
+            // Still loading from the old name: start again.
+            _ => *self = Self::open(ctx, to),
+        }
+    }
+
     pub fn ui(&mut self, ui: &mut egui::Ui, nav: &Nav) -> ViewerOutcome {
         if let State::Loading(rx) = &self.state {
             if let Ok(result) = rx.try_recv() {
@@ -142,9 +173,18 @@ impl Viewer {
         }
         if !ctx.egui_wants_keyboard_input() {
             let none = egui::Modifiers::NONE;
-            let (esc, prev, next, f) = ctx.input_mut(|i| {
-                (i.consume_key(none, Key::Escape), i.consume_key(none, Key::P), i.consume_key(none, Key::N), i.consume_key(none, Key::F))
+            let (esc, prev, next, f, f2) = ctx.input_mut(|i| {
+                (
+                    i.consume_key(none, Key::Escape),
+                    i.consume_key(none, Key::P),
+                    i.consume_key(none, Key::N),
+                    i.consume_key(none, Key::F),
+                    i.consume_key(none, Key::F2),
+                )
             });
+            if f2 {
+                out = ViewerOutcome::Rename;
+            }
             if esc {
                 // Out of fullscreen first; out of the viewer after that.
                 if is_fullscreen(&ctx) {
@@ -161,9 +201,14 @@ impl Viewer {
                 set_fullscreen(&ctx, !is_fullscreen(&ctx));
             }
         }
-        if !matches!(out, ViewerOutcome::Stay) {
+        if matches!(out, ViewerOutcome::Close | ViewerOutcome::Edit | ViewerOutcome::Open(_)) {
             if let State::Ready(r) = &mut self.state {
                 r.player.pause();
+            }
+        }
+        if let State::Ready(r) = &mut self.state {
+            if std::mem::take(&mut r.drag_out) {
+                out = ViewerOutcome::DragOut;
             }
         }
         if matches!(out, ViewerOutcome::Close | ViewerOutcome::Edit) {
@@ -181,7 +226,10 @@ impl Viewer {
             }
             ui.add_space(6.0);
             let stem = self.clip.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-            ui.add(egui::Label::new(RichText::new(crate::clips::title_for_stem(&stem)).size(18.0).strong()).truncate());
+            let title = ui.add(egui::Label::new(RichText::new(crate::clips::title_for_stem(&stem)).size(18.0).strong()).truncate().sense(Sense::click()));
+            if title.on_hover_text("Double-click to rename").double_clicked() {
+                out = ViewerOutcome::Rename;
+            }
             ui.add_space(10.0);
             // Step through the library without leaving the viewer.
             let step = |s: &str| egui::Button::new(RichText::new(s).size(14.0)).min_size(Vec2::new(0.0, 28.0)).corner_radius(6);
@@ -195,12 +243,23 @@ impl Viewer {
                 ui.weak(format!("{i} of {n}"));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let edit = egui::Button::new(RichText::new("✂ Edit").size(14.0).color(Color32::WHITE))
+                let share = egui::Button::new(RichText::new("📤 Share").size(14.0).color(Color32::WHITE))
                     .fill(ACCENT)
-                    .min_size(Vec2::new(76.0, 30.0))
+                    .min_size(Vec2::new(86.0, 30.0))
                     .corner_radius(8);
-                if ui.add(edit).on_hover_text("Trim it and adjust its audio").clicked() {
+                let share = ui.add(share).on_hover_text("Copy it, send it or upload it — or drag the picture into any app");
+                egui::Popup::menu(&share).show(|ui| {
+                    if let Some(c) = crate::library::share_menu(ui, share.rect.left_bottom()) {
+                        out = ViewerOutcome::Share(c);
+                    }
+                });
+                let edit = egui::Button::new(RichText::new("✂ Edit").size(14.0)).min_size(Vec2::new(76.0, 30.0)).corner_radius(8);
+                if ui.add(edit).on_hover_text("Trim it, adjust its audio, or save it smaller").clicked() {
                     out = ViewerOutcome::Edit;
+                }
+                let rename = egui::Button::new(RichText::new("✏ Rename").size(14.0)).min_size(Vec2::new(0.0, 30.0)).corner_radius(8);
+                if ui.add(rename).on_hover_text("Rename this clip  (F2)").clicked() {
+                    out = ViewerOutcome::Rename;
                 }
             });
         });
@@ -234,6 +293,7 @@ impl Ready {
             hover: None,
             volume: volume.0,
             muted: volume.1,
+            drag_out: false,
         };
         r.apply_volume(ctx);
         r
@@ -270,7 +330,8 @@ impl Ready {
         let timeline_h = 52.0 + 2.0 + 40.0;
         let controls_h = 8.0 + timeline_h + 8.0 + 34.0 + 6.0;
         let preview_h = if full { ui.available_height() } else { (ui.available_height() - controls_h).max(160.0) };
-        let (preview, preview_resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), preview_h), Sense::click());
+        // Click to play or pause; drag out of the window to share the clip.
+        let (preview, preview_resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), preview_h), Sense::click_and_drag());
         ui.painter().rect_filled(preview, if full { 0 } else { 8 }, Color32::BLACK);
         if let Some(size) = self.player.update(&ctx, scrubbing) {
             let scale = (preview.width() / size.x).min(preview.height() / size.y);
@@ -321,6 +382,9 @@ impl Ready {
         }
 
         let preview_resp = preview_resp.on_hover_cursor(if full { egui::CursorIcon::Default } else { egui::CursorIcon::PointingHand });
+        if preview_resp.drag_started() {
+            self.drag_out = true;
+        }
         if preview_resp.double_clicked() {
             // The first click of the two already toggled playing: undo that.
             self.toggle_play();

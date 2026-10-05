@@ -45,6 +45,8 @@ pub enum EditorOutcome {
     /// or (`new_name`) as a separate new clip, leaving this clip as it was.
     Saved { target: EditTarget, info: ClipInfo, edit: Edit, new_name: Option<String> },
     Reverted(EditTarget),
+    /// Rename the clip (the edit stays open).
+    Rename,
 }
 
 struct Loaded {
@@ -85,6 +87,10 @@ struct Ready {
     confirm_discard: bool,
     /// "Save as new clip" dialog: the name being typed, and any problem with it.
     save_as: Option<(String, Option<String>)>,
+    /// F2 was pressed.
+    rename_requested: bool,
+    /// The export settings were opened by the dev hook.
+    export_shown: bool,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -157,6 +163,32 @@ impl Editor {
             repaint.request_repaint();
         });
         Self { target, state: State::Loading(rx), preview_share }
+    }
+
+    /// The clip was renamed from `from` to `to`: saved under the new name.
+    /// A clip never edited is its own original, so it's read from there too
+    /// (the edit in progress is kept).
+    pub fn renamed(&mut self, ctx: &egui::Context, from: &Path, to: &Path) {
+        if self.target.clip != from {
+            return;
+        }
+        self.target.clip = to.to_path_buf();
+        if self.target.source != from {
+            return;
+        }
+        self.target.source = to.to_path_buf();
+        match &mut self.state {
+            State::Ready(r) => {
+                r.player = r.player.reopen(ctx, to);
+                r.strip = Filmstrip::build(ctx, to, &r.info);
+            }
+            _ => *self = Self::open(ctx, to, self.preview_share),
+        }
+    }
+
+    /// The clip as named in the library.
+    pub fn clip(&self) -> &Path {
+        &self.target.clip
     }
 
     /// The preview's share of the height, as last dragged (to remember it).
@@ -239,6 +271,8 @@ impl Ready {
             view: (0.0, full),
             confirm_discard: false,
             save_as: None,
+            rename_requested: false,
+            export_shown: false,
         }
     }
 
@@ -262,6 +296,9 @@ impl Ready {
         }
 
         let mut outcome = EditorOutcome::Stay;
+        if std::mem::take(&mut self.rename_requested) {
+            outcome = EditorOutcome::Rename;
+        }
 
         // --- Header ---
         ui.add_space(4.0);
@@ -275,7 +312,14 @@ impl Ready {
             }
             ui.add_space(6.0);
             ui.label(RichText::new("Edit clip").size(18.0).strong());
-            ui.weak(crate::file_name(source));
+            let stem = source.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            let name = ui.add(egui::Label::new(RichText::new(crate::clips::title_for_stem(&stem)).size(15.0).weak()).truncate().sense(Sense::click()));
+            if name.on_hover_text("Double-click to rename").double_clicked() {
+                outcome = EditorOutcome::Rename;
+            }
+            if ui.add(egui::Button::new("✏").frame(false)).on_hover_text("Rename this clip  (F2)").clicked() {
+                outcome = EditorOutcome::Rename;
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let changed = !self.edit.is_identity(&self.info);
                 let done = egui::Button::new(RichText::new("Done").size(15.0).color(Color32::WHITE))
@@ -292,7 +336,7 @@ impl Ready {
                 if ui
                     .add_enabled(changed, save_new)
                     .on_hover_text("Keep this clip unchanged and save the edit as a separate clip")
-                    .on_disabled_hover_text("Trim or change the audio first")
+                    .on_disabled_hover_text("Trim, change the audio or the export settings first")
                     .clicked()
                 {
                     self.player.pause();
@@ -300,6 +344,20 @@ impl Ready {
                     let suggested = crate::clips::sanitize_name(&format!("{} (edit)", crate::clips::title_for_stem(&base)));
                     self.save_as = Some((suggested, None));
                 }
+                // How the saved file is made: applies to Done and Save as new.
+                let export = egui::Button::new(RichText::new(format!("⚙ {}", crate::export_ui::summary(&self.info, &self.edit))).size(14.0))
+                    .min_size(Vec2::new(0.0, 30.0))
+                    .corner_radius(8)
+                    .selected(self.edit.output != media::Output::default());
+                let export = ui.add(export).on_hover_text("Export settings: resolution, frame rate, quality, a size to fit under, audio tracks");
+                // Dev aid: `HESTECLIPS_OPEN_EXPORT=1` opens it at launch.
+                if std::env::var_os("HESTECLIPS_OPEN_EXPORT").is_some() && !self.export_shown {
+                    self.export_shown = true;
+                    egui::Popup::open_id(ui.ctx(), egui::Popup::default_response_id(&export));
+                }
+                egui::Popup::from_toggle_button_response(&export)
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                    .show(|ui| crate::export_ui::ui(ui, &self.info, &mut self.edit));
                 let has_saved_edit = target.source != target.clip;
                 if (has_saved_edit || changed)
                     && ui.button(RichText::new("↺ Revert").size(14.0)).on_hover_text("Undo every edit and go back to the original recording").clicked()
@@ -484,6 +542,9 @@ impl Ready {
     }
 
     fn keyboard(&mut self, ctx: &egui::Context) {
+        if !ctx.egui_wants_keyboard_input() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::F2)) {
+            self.rename_requested = true;
+        }
         if ctx.egui_wants_keyboard_input() {
             return;
         }
@@ -1077,7 +1138,8 @@ fn single_line(text: &str, font: FontId, color: Color32, max_width: f32) -> egui
 }
 
 fn same_edit(a: &Edit, b: &Edit) -> bool {
-    (a.start - b.start).abs() < 1e-6
+    a.output == b.output
+        && (a.start - b.start).abs() < 1e-6
         && (a.end - b.end).abs() < 1e-6
         && a.tracks.len() == b.tracks.len()
         && a.tracks.iter().zip(&b.tracks).all(|(x, y)| {

@@ -99,6 +99,8 @@ pub struct ClipInfo {
     pub fps: f64,
     pub width: u32,
     pub height: u32,
+    /// The video's bitrate, when the file says.
+    pub video_kbps: Option<u32>,
     pub audio: Vec<AudioStream>,
     /// Permanent id from the clip tag, once the clip has one (see [`clip_tag`]).
     pub id: Option<String>,
@@ -153,7 +155,7 @@ impl AudioStream {
 pub fn probe(source: &Path) -> Result<ClipInfo> {
     let out = ffprobe()
         .args(["-v", "error", "-show_entries"])
-        .arg("format=duration:format_tags=comment:stream=index,codec_type,width,height,avg_frame_rate,r_frame_rate:stream_tags=title,handler_name,name")
+        .arg("format=duration:format_tags=comment:stream=index,codec_type,width,height,avg_frame_rate,r_frame_rate,bit_rate:stream_tags=title,handler_name,name")
         .args(["-of", "json"])
         .arg(source)
         .stdin(Stdio::null())
@@ -187,6 +189,7 @@ pub fn probe(source: &Path) -> Result<ClipInfo> {
         height: Option<u32>,
         avg_frame_rate: Option<String>,
         r_frame_rate: Option<String>,
+        bit_rate: Option<String>,
         #[serde(default)]
         tags: Tags,
     }
@@ -232,6 +235,7 @@ pub fn probe(source: &Path) -> Result<ClipInfo> {
         fps,
         width: video.width.unwrap_or(0),
         height: video.height.unwrap_or(0),
+        video_kbps: video.bit_rate.as_deref().and_then(|b| b.parse::<u64>().ok()).map(|b| (b / 1000) as u32).filter(|&k| k > 0),
         audio,
         id: tag.id,
     })
@@ -413,6 +417,147 @@ pub struct Edit {
     pub start: f64,
     pub end: f64,
     pub tracks: Vec<TrackEdit>,
+    /// How the saved file is made: size, rate, bitrate, audio.
+    #[serde(default)]
+    pub output: Output,
+}
+
+/// How a saved clip is made, when not just like the recording: smaller
+/// (resolution, frame rate, bitrate or a size to fit under) and with fewer
+/// audio tracks. The default changes nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct Output {
+    /// Height in pixels (the width follows the shape); only below the source's.
+    #[serde(default)]
+    pub height: Option<u32>,
+    /// Frames per second; only below the source's.
+    #[serde(default)]
+    pub fps: Option<u32>,
+    /// Video bitrate.
+    #[serde(default)]
+    pub video_kbps: Option<u32>,
+    /// Aim for a file no bigger than this many megabytes (MiB): picks the
+    /// video bitrate from the length, over `video_kbps`.
+    #[serde(default)]
+    pub max_mb: Option<u32>,
+    /// Only the mix (track 1), not each source on its own track too.
+    #[serde(default)]
+    pub mix_only: bool,
+}
+
+/// AAC bitrate of each audio track a render writes.
+pub const RENDER_AUDIO_KBPS: u32 = 192;
+
+impl Output {
+    /// The settings that actually change something for `info` (a height or
+    /// rate at or above the source's is the source's).
+    pub fn effective(&self, info: &ClipInfo) -> Self {
+        let mut e = Self {
+            height: self.height.filter(|&h| h < info.height),
+            fps: self.fps.filter(|&f| (f as f64) < info.fps - 0.5),
+            video_kbps: self.video_kbps.filter(|&k| info.video_kbps.is_none_or(|src| k < src)),
+            max_mb: self.max_mb,
+            mix_only: self.mix_only,
+        };
+        e.fit_picture(info);
+        e
+    }
+
+    /// With a size to fit under and the resolution or rate left as they
+    /// are: the biggest picture the bitrate can carry (about 0.05 bits per
+    /// pixel), as an encoder can't make a big picture small enough: a
+    /// minute of 3600×2338 asked for 10 MB came out at 14.
+    fn fit_picture(&mut self, info: &ClipInfo) {
+        let Some(mb) = self.max_mb else { return };
+        if self.height.is_some() && self.fps.is_some() {
+            return;
+        }
+        let audio = if self.mix_only { RENDER_AUDIO_KBPS } else { RENDER_AUDIO_KBPS * (info.source_tracks().len() as u32 + 1) };
+        let audio = if info.audio.is_empty() { 0 } else { audio };
+        let kbps = fit_kbps(mb, info.duration, audio) as f64 * 1000.0;
+        let aspect = info.width as f64 / info.height.max(1) as f64;
+        let src_fps = info.fps.round() as u32;
+        // Best first: full rate down to 30, then smaller.
+        let heights = [2160, 1440, 1080, 720, 540, 480, 360];
+        let rates: Vec<u32> = [src_fps, 30].into_iter().filter(|&f| f <= src_fps).collect();
+        for h in heights.into_iter().filter(|&h| h <= info.height) {
+            for &f in &rates {
+                let (h, f) = (self.height.unwrap_or(h), self.fps.unwrap_or(f));
+                if kbps / (h as f64 * h as f64 * aspect * f as f64) >= 0.05 {
+                    self.height = self.height.or(Some(h).filter(|&h| h < info.height));
+                    self.fps = self.fps.or(Some(f).filter(|&f| (f as f64) < info.fps - 0.5));
+                    return;
+                }
+            }
+        }
+        self.height = self.height.or(Some(360).filter(|&h| h < info.height));
+        self.fps = self.fps.or(Some(30).filter(|&f| (f as f64) < info.fps - 0.5));
+    }
+
+    /// Whether the video must be re-encoded whole (else it can be copied).
+    pub fn changes_video(&self, info: &ClipInfo) -> bool {
+        let e = self.effective(info);
+        e.height.is_some() || e.fps.is_some() || e.video_kbps.is_some() || e.max_mb.is_some()
+    }
+
+    /// Output frame size for `info`: even, same shape.
+    pub fn size(&self, info: &ClipInfo) -> (u32, u32) {
+        match self.effective(info).height {
+            None => (info.width, info.height),
+            Some(h) => {
+                let w = (info.width as f64 * h as f64 / info.height.max(1) as f64 / 2.0).round() as u32 * 2;
+                (w.max(2), h / 2 * 2)
+            }
+        }
+    }
+
+    /// Output frame rate for `info`.
+    pub fn frame_rate(&self, info: &ClipInfo) -> f64 {
+        self.effective(info).fps.map_or(info.fps, f64::from)
+    }
+
+    /// Audio tracks a render of `edit` writes.
+    pub fn audio_tracks(&self, edit: &Edit) -> u32 {
+        match edit.tracks.len() {
+            0 => 0,
+            n if self.mix_only => 1.min(n as u32),
+            n => n as u32 + 1,
+        }
+    }
+
+    /// The video bitrate a render of `duration` seconds uses: the size
+    /// target's, else the one chosen, else the source's (`None` if unknown).
+    pub fn video_kbps_for(&self, info: &ClipInfo, edit: &Edit) -> Option<u32> {
+        let e = self.effective(info);
+        if let Some(mb) = e.max_mb {
+            return Some(fit_kbps(mb, edit.duration(), self.audio_tracks(edit) * RENDER_AUDIO_KBPS));
+        }
+        if let Some(k) = e.video_kbps {
+            return Some(k);
+        }
+        // Smaller or fewer frames and no bitrate chosen: the source's, scaled
+        // down with the pixels a second (to the ¾ power: smaller pictures need
+        // a bit more per pixel to look as good).
+        let src = info.video_kbps?;
+        let (w, h) = self.size(info);
+        let ratio = (w as f64 * h as f64 * self.frame_rate(info)) / (info.width as f64 * info.height as f64 * info.fps).max(1.0);
+        Some(((src as f64 * ratio.min(1.0).powf(0.75)) as u32).max(500))
+    }
+
+    /// Roughly how big a render of `edit` comes out, in bytes.
+    pub fn estimate_bytes(&self, info: &ClipInfo, edit: &Edit) -> Option<u64> {
+        let video = self.video_kbps_for(info, edit)? as f64;
+        let audio = (self.audio_tracks(edit) * RENDER_AUDIO_KBPS) as f64;
+        Some(((video + audio) * 1000.0 / 8.0 * edit.duration()) as u64)
+    }
+}
+
+/// Video bitrate (kbps) for a file of `duration` s to come in under `mb` MiB
+/// next to `audio_kbps` of audio. Hardware encoders overshoot a little, and
+/// the container takes a few percent, so it aims 10% low; never below 200.
+pub fn fit_kbps(mb: u32, duration: f64, audio_kbps: u32) -> u32 {
+    let total = mb as f64 * 1024.0 * 1024.0 * 8.0 / 1000.0 / duration.max(0.1) * 0.90;
+    (total - audio_kbps as f64).max(200.0) as u32
 }
 
 impl Edit {
@@ -428,6 +573,7 @@ impl Edit {
                 // mix matches the original until you choose to bring it in.
                 .map(|a| TrackEdit { index: a.index, gain: 1.0, muted: !a.in_mix, points: Vec::new() })
                 .collect(),
+            output: Output::default(),
         }
     }
 
@@ -440,7 +586,11 @@ impl Edit {
             let in_mix = info.audio.iter().find(|a| a.index == t.index).is_none_or(|a| a.in_mix);
             TrackEdit { muted: false, ..t.clone() }.is_unity() && t.muted == !in_mix
         };
-        self.start <= eps && self.end >= info.duration - eps && self.tracks.iter().all(as_recorded)
+        self.start <= eps
+            && self.end >= info.duration - eps
+            && self.tracks.iter().all(as_recorded)
+            && !self.output.changes_video(info)
+            && !(self.output.mix_only && self.tracks.len() > 1)
     }
 
     pub fn duration(&self) -> f64 {
@@ -685,7 +835,7 @@ pub fn render_with_progress(
         let video = work.join(format!("video.{ext}"));
         let plan = plan(source, info, edit);
         let weights = Weights::new(&plan, edit.duration());
-        render_video(source, edit, &plan, &work, &video, &|f| progress(f * weights.video))?;
+        render_video(source, info, edit, &plan, &work, &video, &|f| progress(f * weights.video))?;
         // `.name.rendering.mp4`: hidden (dotfile) so the library never shows a
         // half-written clip, and ending in the real extension so ffmpeg picks the
         // container. (Not `with_extension`, which would replace `.mp4` and could
@@ -708,6 +858,10 @@ enum Plan {
 }
 
 fn plan(source: &Path, info: &ClipInfo, edit: &Edit) -> Plan {
+    // A new size, rate or bitrate: every frame is encoded again.
+    if edit.output.changes_video(info) {
+        return Plan::Encode;
+    }
     // Keyframes inside the trim, with a frame of margin from the cuts.
     let fd = info.frame_duration();
     let keys: Vec<f64> = keyframes(source)
@@ -739,8 +893,28 @@ impl Weights {
 }
 
 /// Video only, trimmed frame-exactly, into `out`. `progress` gets 0..=1.
-fn render_video(source: &Path, edit: &Edit, plan: &Plan, work: &Path, out: &Path, progress: &dyn Fn(f32)) -> Result<()> {
-    let kbps = source_video_kbps(source).unwrap_or(20_000);
+fn render_video(source: &Path, info: &ClipInfo, edit: &Edit, plan: &Plan, work: &Path, out: &Path, progress: &dyn Fn(f32)) -> Result<()> {
+    let output = edit.output.effective(info);
+    let kbps = if edit.output.changes_video(info) {
+        edit.output.video_kbps_for(info, edit).map(u64::from).unwrap_or(8_000)
+    } else {
+        source_video_kbps(source).unwrap_or(20_000)
+    };
+    // Smaller and fewer frames: scaled (Lanczos, sharp) and dropped evenly.
+    let mut filters = Vec::new();
+    if output.fps.is_some() {
+        filters.push(format!("fps={}", edit.output.frame_rate(info)));
+    }
+    if output.height.is_some() {
+        let (w, h) = edit.output.size(info);
+        filters.push(format!("scale={w}:{h}:flags=lanczos"));
+    }
+    // A size to fit under: hold the encoder to the bitrate over short spans,
+    // not just on average.
+    let cap: Vec<String> = match output.max_mb {
+        Some(_) => vec!["-maxrate".into(), format!("{kbps}k"), "-bufsize".into(), format!("{}k", kbps * 2)],
+        None => Vec::new(),
+    };
     // Every part gets the source's timescale. Otherwise the muxer picks one per
     // part (copied middle 1/19200, encoded edges 1/15360) and concat, which
     // copies timestamps without rescaling, plays the middle at the wrong rate:
@@ -753,6 +927,8 @@ fn render_video(source: &Path, edit: &Edit, plan: &Plan, work: &Path, out: &Path
                 .args(["-ss", &format!("{from:.6}"), "-to", &format!("{to:.6}"), "-i"])
                 .arg(source)
                 .args(["-map", "0:v:0", "-an", "-c:v", video_encoder(), "-b:v", &format!("{kbps}k")])
+                .args(&cap)
+                .args(if filters.is_empty() { Vec::new() } else { vec!["-vf".to_owned(), filters.join(",")] })
                 // Same profile as our recordings so the segments can be joined.
                 .args(["-profile:v", "high", "-pix_fmt", "yuv420p"])
                 .args(["-video_track_timescale", &timescale])
@@ -852,13 +1028,23 @@ fn mux_audio(source: &Path, info: &ClipInfo, edit: &Edit, id: Option<&str>, vide
     cmd.args(["-hide_banner", "-loglevel", "error", "-y", "-i"]).arg(video);
     cmd.args(["-ss", &format!("{:.6}", edit.start), "-t", &format!("{:.6}", edit.duration()), "-i"]).arg(source);
     cmd.args(["-map", "0:v:0", "-c:v", "copy"]);
-    cmd.args(["-metadata", &format!("comment={}", render_tag(edit, id))]);
+    // Only the mix: the file's one track is the mix, and it's in its own mix.
+    let tag = if edit.output.mix_only { clip_tag(&[0], id) } else { render_tag(edit, id) };
+    cmd.args(["-metadata", &format!("comment={tag}")]);
     if has_audio {
+        if edit.output.mix_only {
+            // The sources aren't written: each one's split ends here.
+            for m in &maps {
+                graph.push(format!("{m}anullsink"));
+            }
+            maps.clear();
+            titles.clear();
+        }
         cmd.args(["-filter_complex", &graph.join(";"), "-map", "[mix]"]);
         for m in &maps {
             cmd.args(["-map", m]);
         }
-        cmd.args(["-c:a", "aac", "-b:a", "192k", "-shortest"]);
+        cmd.args(["-c:a", "aac", "-b:a", &format!("{RENDER_AUDIO_KBPS}k"), "-shortest"]);
         let all_titles = std::iter::once("Mix".to_owned()).chain(titles);
         for (i, t) in all_titles.enumerate() {
             cmd.args([format!("-metadata:s:a:{i}"), format!("title={t}")]);
@@ -1038,6 +1224,46 @@ mod tests {
         let expr = track.volume_expr(0.0);
         assert!(expr.starts_with("if(lte("), "{expr}");
         assert!(expr.matches("lt(t,").count() >= 8, "{expr}");
+    }
+
+    fn info() -> ClipInfo {
+        ClipInfo { duration: 60.0, fps: 60.0, width: 3600, height: 2338, video_kbps: Some(20_000), audio: Vec::new(), id: None }
+    }
+
+    #[test]
+    fn output_settings() {
+        let info = info();
+        let edit = |output| Edit { start: 0.0, end: 60.0, tracks: Vec::new(), output };
+        // Nothing chosen, or nothing below the source: the video is copied.
+        assert!(!Output::default().changes_video(&info));
+        assert!(!Output { height: Some(2338), fps: Some(60), video_kbps: Some(30_000), ..Default::default() }.changes_video(&info));
+        assert!(edit(Output { height: Some(4000), ..Default::default() }).is_identity(&info));
+        // 1080p keeps the shape, even sizes.
+        let o = Output { height: Some(1080), ..Default::default() };
+        assert_eq!(o.size(&info), (1662, 1080));
+        assert!(!edit(o).is_identity(&info));
+        // Smaller with no bitrate chosen: less than the source's.
+        let k = o.video_kbps_for(&info, &edit(o)).unwrap();
+        assert!(k < 20_000 && k > 5_000, "{k}");
+        // Under 10 MB for a minute with no audio: ~1.2 Mbps.
+        let fit = Output { max_mb: Some(10), ..Default::default() };
+        let k = fit.video_kbps_for(&info, &edit(fit)).unwrap();
+        assert!((1_150..1_300).contains(&k), "{k}");
+        let bytes = fit.estimate_bytes(&info, &edit(fit)).unwrap();
+        assert!(bytes < 10 * 1024 * 1024, "{bytes}");
+        // ...in a picture that bitrate can carry.
+        assert_eq!((fit.size(&info).1, fit.frame_rate(&info)), (720, 30.0));
+    }
+
+    #[test]
+    fn output_saved_with_the_edit() {
+        // Edits saved before export settings existed still open.
+        let old: Edit = serde_json::from_str(r#"{"start":1.0,"end":5.0,"tracks":[]}"#).unwrap();
+        assert_eq!(old.output, Output::default());
+        let mut e = old.clone();
+        e.output = Output { height: Some(720), max_mb: Some(10), mix_only: true, ..Default::default() };
+        let back: Edit = serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
+        assert_eq!(back.output, e.output);
     }
 
     #[test]

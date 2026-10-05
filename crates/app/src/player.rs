@@ -139,6 +139,8 @@ struct Shared {
 pub struct Player {
     source: PathBuf,
     info: ClipInfo,
+    /// The decoded sound, kept to open the clip again under a new name.
+    pcm: Arc<Vec<Vec<f32>>>,
     shared: Arc<Shared>,
     _stream: Option<cpal::Stream>,
     pub audio_error: Option<String>,
@@ -185,6 +187,10 @@ pub struct Player {
 impl Player {
     /// `pcm[i]` is source track `i` as interleaved stereo at [`PREVIEW_RATE`].
     pub fn new(ctx: &egui::Context, source: &Path, info: ClipInfo, pcm: Vec<Vec<f32>>, gains: Vec<TrackEdit>) -> Self {
+        Self::with_pcm(ctx, source, info, Arc::new(pcm), gains)
+    }
+
+    fn with_pcm(ctx: &egui::Context, source: &Path, info: ClipInfo, pcm: Arc<Vec<Vec<f32>>>, gains: Vec<TrackEdit>) -> Self {
         let n = pcm.len();
         let shared = Arc::new(Shared {
             pos: AtomicU64::new(0),
@@ -193,7 +199,7 @@ impl Player {
             end: AtomicU64::new(u64::MAX),
             mix: Mutex::new(Mix { tracks: gains, track_levels: vec![(0.0, 0.0); n], master_level: (0.0, 0.0) }),
         });
-        let (stream, audio_error) = match start_audio(shared.clone(), Arc::new(pcm)) {
+        let (stream, audio_error) = match start_audio(shared.clone(), pcm.clone()) {
             Ok(s) => (Some(s), None),
             Err(e) => (None, Some(e)),
         };
@@ -222,6 +228,7 @@ impl Player {
         Self {
             source: source.to_path_buf(),
             info,
+            pcm,
             shared,
             _stream: stream,
             audio_error,
@@ -246,6 +253,15 @@ impl Player {
             shown_count: None,
             asked_at: None,
         }
+    }
+
+    /// The same clip, renamed to `to`: opened again there (frames are read
+    /// by path), at the same moment and mix, paused.
+    pub fn reopen(&self, ctx: &egui::Context, to: &Path) -> Self {
+        let mix = self.shared.mix.lock().unwrap().tracks.clone();
+        let mut p = Self::with_pcm(ctx, to, self.info.clone(), self.pcm.clone(), mix);
+        p.seek(self.time());
+        p
     }
 
     pub fn time(&self) -> f64 {

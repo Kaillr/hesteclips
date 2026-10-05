@@ -213,7 +213,7 @@ mod tests {
     }
 
     fn edit(end: f64) -> Edit {
-        Edit { start: 1.0, end, tracks: Vec::new() }
+        Edit { start: 1.0, end, tracks: Vec::new(), output: Default::default() }
     }
 
     /// Stand-in for a render: write the staged file the way the app would.
