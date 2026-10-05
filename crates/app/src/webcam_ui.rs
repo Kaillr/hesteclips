@@ -13,7 +13,7 @@ use egui::{Color32, CursorIcon, Pos2, Rect, RichText, Stroke, vec2};
 
 use crate::App;
 use crate::library::ACCENT;
-use crate::settings::WebcamCfg;
+use crate::settings::{PlacementCfg, WebcamCfg};
 
 /// Smallest the webcam's box gets, as a fraction of the frame.
 const MIN_SIZE: f32 = 0.03;
@@ -266,6 +266,7 @@ impl App {
                 let p = &mut w.placement;
                 let visible = (1.0 - p.crop[0] - p.crop[2]).max(0.05) / (1.0 - p.crop[1] - p.crop[3]).max(0.05);
                 p.h = p.w * frame_aspect / (camera_aspect * visible);
+                p.frame_aspect = Some(frame_aspect);
                 self.webcam_view.fit_pending = false;
                 self.webcam_view.fit_from = None;
             }
@@ -325,7 +326,7 @@ impl App {
                                     id: c.id,
                                     name: c.name,
                                     format: None,
-                                    placement: Placement::default_for(16.0 / 9.0, frame_aspect).into(),
+                                    placement: PlacementCfg::laid_out(Placement::default_for(16.0 / 9.0, frame_aspect), frame_aspect),
                                     enabled: true,
                                 });
                                 self.webcam_view.ask_fit();
@@ -425,7 +426,7 @@ impl App {
                             _ => 16.0 / 9.0,
                         };
                         if let Some(w) = self.settings.webcam.as_mut() {
-                            w.placement = Placement::default_for(camera_aspect, frame_aspect).into();
+                            w.placement = PlacementCfg::laid_out(Placement::default_for(camera_aspect, frame_aspect), frame_aspect);
                         }
                     }
                     ui.label(RichText::new("Drag it on the preview to move or resize it").weak()).on_hover_text(
@@ -468,8 +469,9 @@ impl App {
                     let mods = Mods { crop: modifiers.alt, snap: !modifiers.ctrl };
                     let (dx, dy) = ((now.x - from.x) / frame_rect.width(), (now.y - from.y) / frame_rect.height());
                     let moved = drag(start, handle, dx, dy, mods);
+                    let aspect = frame_rect.width() / frame_rect.height().max(1.0);
                     if let Some(w) = self.settings.webcam.as_mut() {
-                        w.placement = moved.into();
+                        w.placement = PlacementCfg::laid_out(moved, aspect);
                     }
                 }
                 ui.ctx().set_cursor_icon(if handle == Handle::Move { CursorIcon::Grabbing } else { handle.cursor() });

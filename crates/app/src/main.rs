@@ -254,6 +254,9 @@ struct App {
     permission: capture::Permission,
     /// Screens detected by the capture backend.
     screens: Vec<capture::Device>,
+    /// The recording's frame size for (what's recorded, resolution), cached:
+    /// for keeping the webcam's box its shape.
+    frame_size: Option<((capture::VideoSource, Option<u32>), Option<(u32, u32)>, Instant)>,
     /// Apps with a window, for the games-and-apps list: to add, and to show
     /// which are open. Refreshed while the Sources page shows.
     pub(crate) windowed_apps: Vec<capture::Device>,
@@ -350,6 +353,7 @@ impl App {
             reveal_clip: None,
             permission: capture::screen_permission(),
             screens: capture::list_screens(),
+            frame_size: None,
             windowed_apps: Vec::new(),
             capturing_video: None,
             away_screen: away::screen(),
@@ -474,6 +478,31 @@ impl App {
 
     /// What the video shows, for the capture backend.
     /// The webcam, for the capture backend.
+    /// Keep the webcam's box its own shape in the frame being recorded: the
+    /// box is fractions of the frame, so switching to a display of another
+    /// shape would stretch it into that shape (a strip on an ultrawide).
+    fn refit_webcam(&mut self) {
+        if self.settings.webcam.is_none() {
+            return;
+        }
+        let key = (self.video_source(), self.settings.resolution.height());
+        // Asked again now and then too: a display's mode can change, or it
+        // can be plugged in, under the same choice.
+        if self.frame_size.as_ref().is_none_or(|(k, _, at)| *k != key || at.elapsed() > Duration::from_secs(2)) {
+            let size = capture::frame_size(&key.0, key.1);
+            self.frame_size = Some((key, size, Instant::now()));
+        }
+        let Some((_, Some((fw, fh)), _)) = &self.frame_size else { return };
+        let frame_aspect = *fw as f32 / (*fh).max(1) as f32;
+        let camera_aspect = match capture::webcam::status() {
+            capture::webcam::Status::Live { width, height } => Some(width as f32 / height.max(1) as f32),
+            _ => None,
+        };
+        if let Some(w) = self.settings.webcam.as_mut() {
+            w.placement.refit(frame_aspect, camera_aspect);
+        }
+    }
+
     pub(crate) fn webcam_source(&self) -> Option<capture::webcam::Webcam> {
         let w = self.settings.webcam.as_ref().filter(|_| capture::webcam::AVAILABLE)?;
         Some(capture::webcam::Webcam { device: w.id.clone(), format: w.format.map(Into::into), placement: self.webcam_placement.clone() })
@@ -547,6 +576,7 @@ impl eframe::App for App {
         self.ensure_level_monitor();
         self.ensure_video_preview();
         self.sync_capture_video();
+        self.refit_webcam();
         if let Some(w) = &self.settings.webcam {
             *self.webcam_placement.lock().unwrap() = if w.enabled { w.placement.into() } else { capture::webcam::Placement::hidden() };
         }

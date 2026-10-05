@@ -130,6 +130,14 @@ pub fn list_screens() -> Vec<Device> {
         .collect()
 }
 
+/// A monitor's size in pixels, by device name (`None`: the main one), else
+/// the main one's.
+pub(crate) fn display_pixels(id: Option<&str>) -> Option<(u32, u32)> {
+    let all = monitors();
+    let m = id.and_then(|id| all.iter().find(|m| m.device == id)).or_else(|| all.iter().find(|m| m.primary)).or(all.first())?;
+    Some((m.width, m.height))
+}
+
 /// The monitor with this device name, else the main one.
 pub(crate) fn find_monitor(id: &str) -> HMONITOR {
     monitors()

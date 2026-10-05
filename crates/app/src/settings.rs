@@ -172,6 +172,50 @@ pub struct PlacementCfg {
     pub flip_h: bool,
     #[serde(default)]
     pub flip_v: bool,
+    /// The shape (width / height) of the frame this was laid out in. The box
+    /// is fractions of the frame, so in a frame of another shape (another
+    /// display, an ultrawide) the same fractions are another shape: it's
+    /// refitted then (`refit`), keeping its own shape in pixels.
+    #[serde(default)]
+    pub frame_aspect: Option<f32>,
+}
+
+impl PlacementCfg {
+    /// Keep the box right for a frame of shape `frame_aspect`: rescaled to
+    /// keep its shape in pixels, around the same centre, as wide a share of
+    /// the frame (narrower if that won't fit). Laid out before the frame's
+    /// shape was kept: given the camera's shape (`camera_aspect`, when
+    /// known), as every box was meant to have. Returns whether it changed.
+    pub fn refit(&mut self, frame_aspect: f32, camera_aspect: Option<f32>) -> bool {
+        if frame_aspect <= 0.0 || self.w <= 0.0 || self.h <= 0.0 {
+            return false;
+        }
+        let box_aspect = match self.frame_aspect {
+            Some(was) if (was - frame_aspect).abs() < 1e-3 => return false,
+            // Its shape in pixels, in the frame it was made for.
+            Some(was) => self.w * was / self.h,
+            None => match camera_aspect {
+                Some(cam) => {
+                    let visible = (1.0 - self.crop[0] - self.crop[2]).max(0.05) / (1.0 - self.crop[1] - self.crop[3]).max(0.05);
+                    cam * visible
+                }
+                None => return false, // wait for the camera's shape
+            },
+        };
+        let (cx, cy) = (self.x + self.w / 2.0, self.y + self.h / 2.0);
+        let mut w = self.w;
+        let mut h = w * frame_aspect / box_aspect;
+        if h > 1.0 {
+            w *= 1.0 / h;
+            h = 1.0;
+        }
+        self.w = w;
+        self.h = h;
+        self.x = cx - w / 2.0;
+        self.y = cy - h / 2.0;
+        self.frame_aspect = Some(frame_aspect);
+        true
+    }
 }
 
 impl From<PlacementCfg> for capture::webcam::Placement {
@@ -180,9 +224,10 @@ impl From<PlacementCfg> for capture::webcam::Placement {
     }
 }
 
-impl From<capture::webcam::Placement> for PlacementCfg {
-    fn from(p: capture::webcam::Placement) -> Self {
-        Self { x: p.x, y: p.y, w: p.w, h: p.h, crop: p.crop, flip_h: p.flip_h, flip_v: p.flip_v }
+impl PlacementCfg {
+    /// `p`, laid out in a frame of shape `frame_aspect`.
+    pub fn laid_out(p: capture::webcam::Placement, frame_aspect: f32) -> Self {
+        Self { x: p.x, y: p.y, w: p.w, h: p.h, crop: p.crop, flip_h: p.flip_h, flip_v: p.flip_v, frame_aspect: Some(frame_aspect) }
     }
 }
 
@@ -531,6 +576,57 @@ impl RecordSettings {
             }
             let _ = std::fs::write(path, json);
         }
+    }
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use super::PlacementCfg;
+
+    fn cfg(x: f32, y: f32, w: f32, h: f32, frame_aspect: Option<f32>) -> PlacementCfg {
+        PlacementCfg { x, y, w, h, crop: [0.0; 4], flip_h: false, flip_v: false, frame_aspect }
+    }
+
+    fn pixel_aspect(p: &PlacementCfg, frame: f32) -> f32 {
+        p.w * frame / p.h
+    }
+
+    #[test]
+    fn same_frame_shape_leaves_it_alone() {
+        let mut p = cfg(0.7, 0.7, 0.25, 0.25, Some(16.0 / 9.0));
+        assert!(!p.refit(16.0 / 9.0, Some(16.0 / 9.0)));
+    }
+
+    #[test]
+    fn moving_to_an_ultrawide_keeps_its_shape() {
+        // A 16:9 box on a 16:9 display, then a 6720x2836 ultrawide.
+        let mut p = cfg(0.7, 0.7, 0.25, 0.25, Some(16.0 / 9.0));
+        let (cx, cy) = (p.x + p.w / 2.0, p.y + p.h / 2.0);
+        let uw = 6720.0 / 2836.0;
+        assert!(p.refit(uw, None));
+        assert!((pixel_aspect(&p, uw) - 16.0 / 9.0).abs() < 1e-4);
+        assert!((p.x + p.w / 2.0 - cx).abs() < 1e-5 && (p.y + p.h / 2.0 - cy).abs() < 1e-5);
+        assert_eq!(p.frame_aspect, Some(uw));
+    }
+
+    #[test]
+    fn the_stretched_box_from_before_gets_the_cameras_shape() {
+        // The saved box from the bug report: w = h = 0.2718 (the frame's
+        // shape on any display), no frame shape kept, a 16:9 camera.
+        let mut p = cfg(0.728, 0.707, 0.2718, 0.2718, None);
+        let mac = 3024.0 / 1964.0;
+        assert!(!p.refit(mac, None), "waits for the camera");
+        assert!(p.refit(mac, Some(16.0 / 9.0)));
+        assert!((pixel_aspect(&p, mac) - 16.0 / 9.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn never_taller_than_the_frame() {
+        // A portrait-shaped box moved to a very wide frame.
+        let mut p = cfg(0.4, 0.0, 0.2, 1.0, Some(1.0));
+        p.refit(4.0, None);
+        assert!(p.h <= 1.0 + 1e-6);
+        assert!((pixel_aspect(&p, 4.0) - 0.2).abs() < 1e-4);
     }
 }
 

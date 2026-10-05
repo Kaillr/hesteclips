@@ -101,6 +101,26 @@ pub fn output_size(w: u32, h: u32, target_height: Option<u32>) -> (u32, u32) {
     (even(w * scale), even(h * scale))
 }
 
+/// The size a recording of `source` will be, without starting anything
+/// (cheap: asks the system for display sizes). Games and apps record at the
+/// main display's size. `None` if the display isn't known.
+pub fn frame_size(source: &VideoSource, target_height: Option<u32>) -> Option<(u32, u32)> {
+    let id = match source {
+        VideoSource::Screen { id } => Some(id.as_str()),
+        VideoSource::Apps { .. } => None,
+    };
+    #[cfg(target_os = "macos")]
+    let native = mac::display_pixels(id);
+    #[cfg(target_os = "windows")]
+    let native = win::display_pixels(id);
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let native: Option<(u32, u32)> = {
+        let _ = id;
+        None
+    };
+    native.map(|(w, h)| output_size(w, h, target_height))
+}
+
 /// What a recording's video shows. This is the bottom layer of the picture;
 /// overlays (a webcam) will go on top of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
