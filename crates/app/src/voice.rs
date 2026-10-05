@@ -6,13 +6,14 @@
 //! while the replay buffer runs and the setting is on. It can only hear the
 //! words it's given, so talking doesn't save clips.
 //!
-//! "HesteClip" isn't English, and said quickly it doesn't come out as any
-//! one spelling, so the phrase is heard in two parts: "hashtag" and "clip
-//! that", within [`WITHIN`] of each other — whatever's said between them.
-//! Each part alone ("hashtag blessed", "has the clip that we made") does
-//! nothing. Tested on recordings of the user saying it (live, too) and on
-//! synthesized speech. Said very fast, "clip that" can blur past what the
-//! small model hears: it then takes saying it again.
+//! "HesteClip" isn't English, and said quickly no one spelling of the phrase
+//! comes through whole, so it's heard in three parts — "hashtag", "heste",
+//! "clip that" — and any two of them within [`WITHIN`] of each other count.
+//! One part alone ("hashtag blessed", "has the clip that we made") does
+//! nothing. Tuned on 30 takes of the user saying it (fast, slow, in
+//! sentences): the two-part version caught 5 of them (and saved some twice),
+//! this one 13, once each, with no near miss triggering it. The small model
+//! still misses some fast takes.
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -87,21 +88,33 @@ mod spotting {
         ("tokens.txt", include_bytes!("../assets/kws/tokens.txt")),
     ];
 
-    /// "Hashtag", as the model's word pieces, spelled the ways it's said.
-    const FIRST: &str = "▁HAS H TA G @hashtag\n▁HAS H ▁TA G @hashtag\n▁HE SH TA G @hashtag\n▁HAS ▁TA G @hashtag\n▁HAS TA G @hashtag";
-    /// "Clip that", likewise ("clips" too: the model heard the user's "clip
-    /// that" as that, said quickly).
-    const SECOND: &str =
-        "▁C LI P ▁THAT @clip_that\n▁K LI PP ▁THAT @clip_that\n▁C LI P ▁DA T @clip_that\n▁K LI PP ▁DA T @clip_that\n▁C LI PP ▁THAT @clip_that\n▁C LI P ▁THE T @clip_that\n▁C LI P S @clip_that";
-    /// The parts count as one phrase this close together, in either order:
-    /// the model sometimes reports "hashtag" after "clip that" (in the user's
-    /// takes 0.3–0.7 s apart; a guess with room for saying it slowly).
+    /// The phrase's parts, as the model's word pieces, each spelled the ways
+    /// it comes out. Found on the user's takes; more spellings for "hashtag"
+    /// made it worse (short ones like "hash" fired on part of the word and
+    /// the whole one was lost), and ones that fired on near misses ("clip at"
+    /// in "clip it later") are left out.
+    const PARTS: [&str; 3] = [
+        // "Hashtag"
+        "▁HAS H TA G @hashtag\n▁HAS H ▁TA G @hashtag\n▁HE SH TA G @hashtag\n▁HAS ▁TA G @hashtag\n▁HAS TA G @hashtag",
+        // "Heste"
+        "▁HE S TE @heste\n▁HE S TA @heste\n▁HAS TE @heste\n▁HE S TER @heste\n▁HE S TY @heste\n▁HE S T @heste\n▁HE S TI @heste\n▁HE S SE @heste\n▁HE S T EN @heste\n▁E S TE @heste",
+        // "Clip that" ("clips": how the model heard it said quickly)
+        "▁C LI P ▁THAT @clip_that\n▁K LI PP ▁THAT @clip_that\n▁C LI P ▁DA T @clip_that\n▁K LI PP ▁DA T @clip_that\n▁C LI PP ▁THAT @clip_that\n▁C LI P ▁THE T @clip_that\n▁C LI P S @clip_that",
+    ];
+    /// Two parts count as the phrase this close together, in either order
+    /// (the model sometimes reports a part late; in the user's takes the
+    /// parts came 0.3–1.2 s apart: a guess with room for saying it slowly).
     const WITHIN: f64 = 2.5;
-    /// How readily a keyword is taken (sherpa-onnx's boosting score and trigger
-    /// threshold): tuned on the test recordings, where 1.0/0.25 missed the
-    /// user's take. Guesses beyond that.
-    const SCORE: f32 = 1.5;
-    const THRESHOLD: f32 = 0.2;
+    /// After a clip is saved, parts heard this long after are ignored: the
+    /// take's late third part could pair with something and save it twice
+    /// (0.7 and 1.0 s after, in the user's session), while the next take can
+    /// come 1.6 s later (2.0 swallowed real takes).
+    const QUIET_AFTER: f64 = 1.2;
+    /// How readily a part is taken (sherpa-onnx's boosting score and trigger
+    /// threshold): the best of a sweep over 30 takes of the user (1.5/0.2
+    /// caught 10, 2.0/0.15 15, 2.5/0.1 14), with no near miss firing two parts.
+    const SCORE: f32 = 2.0;
+    const THRESHOLD: f32 = 0.15;
 
     pub(super) fn run(
         rx: Receiver<Option<String>>,
@@ -162,8 +175,7 @@ mod spotting {
     /// "clip that" stream heard "hashtag"), so each part gets a spotter of
     /// its own.
     struct Spotters {
-        first: KeywordSpotter,
-        second: KeywordSpotter,
+        parts: Vec<KeywordSpotter>,
     }
 
     impl Spotters {
@@ -195,7 +207,7 @@ mod spotting {
                 config.keywords_buf = Some(keywords.to_owned());
                 KeywordSpotter::create(&config).ok_or_else(|| "the voice model didn't load".to_owned())
             };
-            let spotters = Self { first: spotter(FIRST)?, second: spotter(SECOND)? };
+            let spotters = Self { parts: PARTS.iter().map(|k| spotter(k)).collect::<Result<_, _>>()? };
             eprintln!("voice: listening for \"hashtag HesteClip that\" (model loaded in {} ms)", started.elapsed().as_millis());
             Ok(spotters)
         }
@@ -206,11 +218,13 @@ mod spotting {
     struct Listening {
         mic: String,
         sound: Receiver<Vec<f32>>,
-        first: OnlineStream,
-        second: OnlineStream,
+        /// A stream per part, on its spotter.
+        streams: Vec<OnlineStream>,
         /// Seconds of sound heard, and when each part was last heard.
         clock: f64,
-        heard_at: [Option<f64>; 2],
+        heard_at: [Option<f64>; 3],
+        /// When the phrase was last heard (a clip saved).
+        said_at: Option<f64>,
         /// `HESTECLIPS_DEBUG_VOICE=1`: the loudest sample since the level was
         /// last logged, and when that was.
         peak: f32,
@@ -258,9 +272,9 @@ mod spotting {
 
     impl Listening {
         fn new(spotters: &Spotters, mic: String, sound: Receiver<Vec<f32>>) -> Self {
-            let (first, second) = (spotters.first.create_stream(), spotters.second.create_stream());
+            let streams = spotters.parts.iter().map(KeywordSpotter::create_stream).collect();
             let dump = std::env::var_os("HESTECLIPS_VOICE_DUMP").map(|p| (std::path::PathBuf::from(p), Vec::new()));
-            Self { mic, sound, first, second, clock: 0.0, heard_at: [None; 2], peak: 0.0, logged_at: 0.0, dump }
+            Self { mic, sound, streams, clock: 0.0, heard_at: [None; 3], said_at: None, peak: 0.0, logged_at: 0.0, dump }
         }
 
         /// Take the sound that's come in (waiting a little for some); whether
@@ -292,7 +306,7 @@ mod spotting {
                 }
             }
             let mut said = false;
-            for (spotter, stream, is_first) in [(&spotters.first, &self.first, true), (&spotters.second, &self.second, false)] {
+            for (part, (spotter, stream)) in spotters.parts.iter().zip(&self.streams).enumerate() {
                 stream.accept_waveform(rate as i32, samples);
                 while spotter.is_ready(stream) {
                     spotter.decode(stream);
@@ -304,12 +318,17 @@ mod spotting {
                     if debug() {
                         eprintln!("voice: {:.1} s, heard \"{}\"", self.clock, hit.keyword);
                     }
-                    self.heard_at[usize::from(!is_first)] = Some(self.clock);
-                    if let [Some(a), Some(b)] = self.heard_at
-                        && (a - b).abs() <= WITHIN
-                    {
-                        eprintln!("voice: heard \"hashtag … clip that\"");
-                        self.heard_at = [None; 2];
+                    let now = self.clock;
+                    if self.said_at.is_some_and(|t| now - t < QUIET_AFTER) {
+                        continue;
+                    }
+                    self.heard_at[part] = Some(now);
+                    // Any two parts close enough together.
+                    let near = self.heard_at.iter().flatten().filter(|t| now - **t <= WITHIN).count();
+                    if near >= 2 {
+                        self.said_at = Some(now);
+                        eprintln!("voice: heard \"hashtag HesteClip that\"");
+                        self.heard_at = [None; 3];
                         said = true;
                     }
                 }
@@ -354,6 +373,27 @@ mod spotting {
                 assert_eq!(said, wanted, "{text}");
             }
             let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// How often a long recording (many takes, some talk) triggers it, for
+        /// tuning: `HESTECLIPS_VOICE_SESSION=session.wav cargo test -- --ignored
+        /// --nocapture counts_a_session`.
+        #[test]
+        #[ignore]
+        fn counts_a_session() {
+            let spotters = Spotters::load().expect("load the model");
+            let file = std::env::var("HESTECLIPS_VOICE_SESSION").expect("HESTECLIPS_VOICE_SESSION");
+            let wave = sherpa_onnx::Wave::read(&file).expect("read the session");
+            let rate = wave.sample_rate() as u32;
+            let (_tx, rx) = channel();
+            let mut l = Listening::new(&spotters, String::new(), rx);
+            let mut at = Vec::new();
+            for (i, chunk) in wave.samples().chunks(rate as usize / 10).enumerate() {
+                if l.hear(&spotters, chunk, rate) {
+                    at.push(format!("{:.1}", (i + 1) as f64 / 10.0));
+                }
+            }
+            println!("triggered {} times, at {} s", at.len(), at.join(", "));
         }
 
         /// Say `text` into `file` (16 kHz mono WAV) with Windows' text-to-speech.
