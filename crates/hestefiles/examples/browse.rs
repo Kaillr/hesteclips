@@ -10,7 +10,7 @@ fn main() {
         }
         Some(base) => {
             let path = args.next().unwrap_or_default();
-            println!("{:#?}", client.directory(&base, &path).map(|d| d.folders));
+            println!("{:#?}", client.directory(&base, &path, hestefiles::Include::Folders).map(|d| d.folders));
         }
     }
 }

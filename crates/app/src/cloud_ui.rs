@@ -224,6 +224,20 @@ impl App {
                 ShareTarget::DefaultFolder => self.cloud.default_folder.clone(),
                 ShareTarget::Custom => self.cloud.browser_selection(),
             };
+            // A clip in one of the library's game folders can go in a folder
+            // for its game there too (made if it isn't there yet).
+            let game = self.clips.iter().find(|c| c.path == share.clip).and_then(|c| c.folder.as_deref()).and_then(hestefiles::folder_name);
+            let mut subfolder = None;
+            if let Some(game) = &game {
+                ui.add_space(8.0);
+                let mut on = self.cloud.game_folders;
+                ui.checkbox(&mut on, format!("Put it in a folder for {game}"))
+                    .on_hover_text("Inside the folder above. It's made the first time.");
+                self.cloud.set_game_folders(on);
+                if on {
+                    subfolder = Some(game.clone());
+                }
+            }
             ui.add_space(12.0);
             let busy = self.cloud.upload_for(&share.clip).is_some();
             ui.horizontal(|ui| {
@@ -235,7 +249,7 @@ impl App {
                     .on_disabled_hover_text(if busy { "This clip is already uploading." } else { "Choose a folder you can save into." });
                 if r.clicked() {
                     if let Some(to) = destination.clone() {
-                        self.cloud.upload(share.clip.clone(), to);
+                        self.cloud.upload(share.clip.clone(), to, subfolder.clone());
                         keep_open = false;
                     }
                 }

@@ -59,9 +59,22 @@ impl FolderRef {
 }
 
 /// What's persisted between launches (the token lives in the keychain, not here).
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct Config {
     default_folder: Option<FolderRef>,
+    /// Upload clips into a folder for their game (inside the folder picked).
+    #[serde(default = "yes")]
+    game_folders: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self { default_folder: None, game_folders: true }
+    }
 }
 
 fn config_path() -> Option<PathBuf> {
@@ -138,6 +151,8 @@ pub struct Cloud {
     /// Text field buffer for pasting a token.
     pub token_input: String,
     pub default_folder: Option<FolderRef>,
+    /// Upload clips into a folder for their game, as last chosen.
+    pub game_folders: bool,
     pub browser: FolderBrowser,
     pub uploads: Vec<Upload>,
     next_upload: u64,
@@ -161,6 +176,7 @@ impl Cloud {
             connection: Connection::Disconnected,
             token_input: String::new(),
             default_folder: config.default_folder,
+            game_folders: config.game_folders,
             browser: FolderBrowser::default(),
             uploads: Vec::new(),
             next_upload: 0,
@@ -212,7 +228,18 @@ impl Cloud {
 
     pub fn set_default_folder(&mut self, folder: Option<FolderRef>) {
         self.default_folder = folder;
-        let config = Config { default_folder: self.default_folder.clone() };
+        self.save_config();
+    }
+
+    pub fn set_game_folders(&mut self, on: bool) {
+        if self.game_folders != on {
+            self.game_folders = on;
+            self.save_config();
+        }
+    }
+
+    fn save_config(&self) {
+        let config = Config { default_folder: self.default_folder.clone(), game_folders: self.game_folders };
         if let (Some(path), Ok(json)) = (config_path(), serde_json::to_vec_pretty(&config)) {
             if let Some(dir) = path.parent() {
                 let _ = std::fs::create_dir_all(dir);
@@ -260,17 +287,25 @@ impl Cloud {
 
     /// Start uploading `clip` into `to` in the background. Its progress shows on
     /// the clip's card; how it ended comes back from [`Cloud::take_finished`].
-    pub fn upload(&mut self, clip: PathBuf, to: FolderRef) {
+    /// Upload `clip` to `to`, or to a folder named `subfolder` in it (made if
+    /// it isn't there; a game's).
+    pub fn upload(&mut self, clip: PathBuf, to: FolderRef, subfolder: Option<String>) {
         let Some(client) = self.client.clone() else { return };
         let id = self.next_upload;
         self.next_upload += 1;
         let (progress, merging, cancel) = (Arc::new(AtomicU32::new(0)), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let parent = to;
+        let to = subfolder.as_deref().map_or(parent.clone(), |name| parent.child(name));
         self.uploads.push(Upload { id, clip: clip.clone(), to: to.clone(), progress: progress.clone(), merging: merging.clone(), cancel: cancel.clone() });
         let ctx = self.ctx.clone();
         self.spawn(move || {
             let name = clip.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            let result = client
-                .upload(&clip, &to.base_id, &to.path, &name, &cancel, |p| {
+            let made = match &subfolder {
+                Some(folder) => client.new_folder(&parent.base_id, &parent.path, folder).map(|_| ()),
+                None => Ok(()),
+            };
+            let result = made
+                .and_then(|()| client.upload(&clip, &to.base_id, &to.path, &name, &cancel, |p| {
                     // Sending is ~95% of the bar; the server's merge fills the rest.
                     let f = match p {
                         UploadProgress::Sending { sent, total } => 0.95 * sent as f32 / total.max(1) as f32,
@@ -281,7 +316,7 @@ impl Cloud {
                     };
                     progress.store(f.to_bits(), Ordering::Relaxed);
                     ctx.request_repaint();
-                })
+                }))
                 .map_err(|e| e.to_string());
             Evt::Uploaded { id, result }
         });
@@ -313,7 +348,7 @@ impl Cloud {
         let (Some(at), Some(client)) = (to, self.client.clone()) else { return };
         self.spawn(move || {
             let result = client
-                .directory(&at.base_id, &at.path)
+                .directory(&at.base_id, &at.path, hestefiles::Include::Folders)
                 .map(|dir| {
                     let mut names: Vec<String> = dir.folders.into_iter().map(|f| f.name).collect();
                     names.sort_by_key(|n| n.to_lowercase());

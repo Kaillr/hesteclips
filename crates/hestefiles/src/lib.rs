@@ -83,6 +83,15 @@ pub struct FileEntry {
     pub mime: String,
 }
 
+/// What [`Client::directory`] lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Include {
+    All,
+    Files,
+    Folders,
+}
+
 #[derive(Debug, Clone)]
 pub struct Directory {
     pub folders: Vec<FolderEntry>,
@@ -92,6 +101,30 @@ pub struct Directory {
 
 /// Largest chunk the server accepts.
 pub const MAX_CHUNK: u64 = 2 * 1024 * 1024;
+
+/// A folder name HesteFiles takes, made from `name`: without the characters
+/// it doesn't allow (`\/:*?<>%|"'` and the backtick), at most 150 characters.
+/// `None` if nothing's left.
+pub fn folder_name(name: &str) -> Option<String> {
+    const FORBIDDEN: &[char] = &['\\', '/', ':', '*', '?', '<', '>', '%', '|', '"', '\'', '`'];
+    let kept: String = name.chars().filter(|&c| !c.is_control() && !FORBIDDEN.contains(&c)).collect();
+    let name: String = kept.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(150).collect();
+    let name = name.trim().to_owned();
+    (!name.is_empty()).then_some(name)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn folder_names() {
+        use super::folder_name;
+        assert_eq!(folder_name("osu!").as_deref(), Some("osu!"));
+        assert_eq!(folder_name("Tom Clancy's Rainbow Six: Siege").as_deref(), Some("Tom Clancys Rainbow Six Siege"));
+        assert_eq!(folder_name("100% Orange Juice").as_deref(), Some("100 Orange Juice"));
+        assert_eq!(folder_name("'`%"), None);
+        assert_eq!(folder_name(&"a".repeat(200)).map(|n| n.len()), Some(150));
+    }
+}
 
 /// Where an upload is, for progress display.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -144,12 +177,14 @@ impl Client {
     }
 
     /// List one directory. `path` is relative to the base folder, `/`-separated, with
-    /// no leading or trailing slash; `""` is the base folder itself.
-    pub fn directory(&self, base_folder_id: &str, path: &str) -> Result<Directory> {
+    /// no leading or trailing slash; `""` is the base folder itself. `include`
+    /// says what to list (asking for less is quicker).
+    pub fn directory(&self, base_folder_id: &str, path: &str, include: Include) -> Result<Directory> {
         #[derive(Serialize)]
         struct Req<'a> {
             base_folder_id: &'a str,
             path: &'a str,
+            include: Include,
         }
         #[derive(Deserialize)]
         struct List {
@@ -168,13 +203,38 @@ impl Client {
             self.agent
                 .post(format!("{}/get_directory", self.base_url))
                 .header("X-AccountToken", &self.token)
-                .send_json(Req { base_folder_id, path: path.trim_matches('/') })?,
+                .send_json(Req { base_folder_id, path: path.trim_matches('/'), include })?,
         )?;
         Ok(Directory {
             folders: resp.directory_list.folders,
             files: resp.directory_list.files,
             read_only: resp.read_only,
         })
+    }
+
+    /// Make a folder named `name` in `path` of `base_folder_id` (see
+    /// [`folder_name`] for the names allowed). Fine if it's there already:
+    /// returns whether it was.
+    pub fn new_folder(&self, base_folder_id: &str, path: &str, name: &str) -> Result<bool> {
+        #[derive(Serialize)]
+        struct Req<'a> {
+            base_folder_id: &'a str,
+            path: &'a str,
+            folder_name: &'a str,
+            exist_ok: bool,
+        }
+        #[derive(Deserialize)]
+        struct Resp {
+            #[serde(default)]
+            already_exists: bool,
+        }
+        let resp: Resp = self.parse(
+            self.agent
+                .post(format!("{}/new_folder", self.base_url))
+                .header("X-AccountToken", &self.token)
+                .send_json(Req { base_folder_id, path: path.trim_matches('/'), folder_name: name, exist_ok: true })?,
+        )?;
+        Ok(resp.already_exists)
     }
 
     /// Upload `file` into `path` of `base_folder_id`, named `filename`. The server
