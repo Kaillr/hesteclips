@@ -14,10 +14,12 @@ use capture::{EncodeSettings, Mode};
 
 enum Cmd {
     Start(Mode, EncodeSettings),
-    SaveClip,
+    /// Save the replay buffer as a clip in this folder.
+    SaveClip(PathBuf),
     /// Change what the running capture records, if it can without a restart.
     UpdateVideo(capture::VideoSource),
-    Stop,
+    /// Stop; a recording goes into this folder.
+    Stop(Option<PathBuf>),
     /// Stop, then signal once the file is finished (app being killed).
     StopAndAck(Sender<()>),
 }
@@ -72,7 +74,7 @@ impl CaptureService {
                     // Save doesn't change capture state — still buffering afterwards.
                     // The clip's moment is taken now; it's written on its own
                     // thread, so this one is free for the next save at once.
-                    Cmd::SaveClip => match recorder.save_clip() {
+                    Cmd::SaveClip(dir) => match recorder.save_clip(&dir) {
                         Ok(pending) => {
                             let evt_tx = evt_tx.clone();
                             thread::spawn(move || match pending.finish() {
@@ -91,8 +93,8 @@ impl CaptureService {
                     Cmd::UpdateVideo(video) => {
                         recorder.update_video(&video);
                     }
-                    Cmd::Stop => {
-                        match recorder.stop() {
+                    Cmd::Stop(dir) => {
+                        match recorder.stop(dir.as_deref()) {
                             Ok(Some(path)) => send(&evt_tx, Evt::Saved(path)),
                             Ok(None) => {}
                             Err(e) => send(&evt_tx, Evt::Error(e.to_string())),
@@ -100,7 +102,7 @@ impl CaptureService {
                         send(&evt_tx, Evt::State(None));
                     }
                     Cmd::StopAndAck(ack) => {
-                        let _ = recorder.stop();
+                        let _ = recorder.stop(None);
                         let _ = ack.send(());
                     }
                 }
@@ -113,11 +115,11 @@ impl CaptureService {
     pub fn start(&self, mode: Mode, settings: EncodeSettings) {
         self.send(Cmd::Start(mode, settings));
     }
-    pub fn save_clip(&self) {
-        self.send(Cmd::SaveClip);
+    pub fn save_clip(&self, dir: PathBuf) {
+        self.send(Cmd::SaveClip(dir));
     }
-    pub fn stop(&self) {
-        self.send(Cmd::Stop);
+    pub fn stop(&self, dir: Option<PathBuf>) {
+        self.send(Cmd::Stop(dir));
     }
     pub fn update_video(&self, video: capture::VideoSource) {
         self.send(Cmd::UpdateVideo(video));

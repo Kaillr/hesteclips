@@ -7,7 +7,7 @@
 //! from cpal on macOS and Windows, from PipeWire on Linux, and are mixed in
 //! `mixer`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "macos")]
 mod aac;
@@ -85,10 +85,10 @@ impl Recorder for Unsupported {
     fn start(&mut self, _: Mode, _: &EncodeSettings) -> anyhow::Result<()> {
         anyhow::bail!("recording isn't available on this platform yet")
     }
-    fn save_clip(&mut self) -> anyhow::Result<PendingClip> {
+    fn save_clip(&mut self, _: &Path) -> anyhow::Result<PendingClip> {
         anyhow::bail!("recording isn't available on this platform yet")
     }
-    fn stop(&mut self) -> anyhow::Result<Option<PathBuf>> {
+    fn stop(&mut self, _: Option<&Path>) -> anyhow::Result<Option<PathBuf>> {
         Ok(None)
     }
     fn is_running(&self) -> bool {
@@ -361,13 +361,16 @@ pub trait Recorder {
     /// Begin capturing in the given mode with the given settings.
     fn start(&mut self, mode: Mode, settings: &EncodeSettings) -> anyhow::Result<()>;
 
-    /// In `ReplayBuffer` mode, save the buffered window as a clip. Its moment is
-    /// taken right away; the returned [`PendingClip`] finishes writing it,
-    /// which can take a while — so another can be saved meanwhile.
-    fn save_clip(&mut self) -> anyhow::Result<PendingClip>;
+    /// In `ReplayBuffer` mode, save the buffered window as a clip in `dir` (a
+    /// game's folder in the library, say). Its moment is taken right away; the
+    /// returned [`PendingClip`] finishes writing it, which can take a while — so
+    /// another can be saved meanwhile.
+    fn save_clip(&mut self, dir: &Path) -> anyhow::Result<PendingClip>;
 
-    /// Stop capturing. In `Record` mode, returns the finished file.
-    fn stop(&mut self) -> anyhow::Result<Option<PathBuf>>;
+    /// Stop capturing. In `Record` mode, returns the finished file, moved into
+    /// `dir` if given (it's written in the output folder: which game it was is
+    /// only known at the end).
+    fn stop(&mut self, dir: Option<&Path>) -> anyhow::Result<Option<PathBuf>>;
 
     /// Whether a capture is currently running.
     fn is_running(&self) -> bool;

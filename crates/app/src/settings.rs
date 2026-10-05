@@ -386,6 +386,12 @@ pub struct RecordSettings {
     /// larger files. 2s is a sane default.
     pub keyframe_interval_secs: u32,
     pub output_dir: PathBuf,
+    /// Save each clip in a folder named after the game it's of (`osu!/`,
+    /// `Desktop/` when there's no game), shown as categories in the library.
+    pub folder_per_game: bool,
+    /// Game folders renamed in the library: the folder a game's clips would
+    /// go in (its name, as `clips::folder_name` makes it) → the one they go in.
+    pub game_folders: std::collections::BTreeMap<String, String>,
 
     // --- Sources page ---
     pub audio_sources: Vec<AudioSourceCfg>,
@@ -428,6 +434,8 @@ impl Default for RecordSettings {
             rate_control: RateControl::Cbr,
             keyframe_interval_secs: 2,
             output_dir: default_output_dir(),
+            folder_per_game: true,
+            game_folders: Default::default(),
             audio_sources: default_sources(),
             limiter: true,
             shortcuts: Shortcuts::default(),

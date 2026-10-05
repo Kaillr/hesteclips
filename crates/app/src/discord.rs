@@ -146,6 +146,26 @@ fn activity(status: &Status) -> Activity<'_> {
 pub fn known_game(exe: &str) -> Option<Game> {
     #[cfg(target_os = "macos")]
     let exe = &capture::app_file_name(exe)?;
+    games()?.get(&exe.to_lowercase()).map(KnownGame::game)
+}
+
+/// A game Discord knows, by the library folder its clips go in
+/// (`clips::folder_name` of its name, any case). `None` until the list has loaded.
+pub fn game_for_folder(folder: &str) -> Option<Game> {
+    static BY_FOLDER: OnceLock<HashMap<String, Game>> = OnceLock::new();
+    let by_folder = match BY_FOLDER.get() {
+        Some(map) => map,
+        None => {
+            let games = games()?;
+            BY_FOLDER.get_or_init(|| games.values().map(|g| (crate::clips::folder_name(&g.name).to_lowercase(), g.game())).collect())
+        }
+    };
+    by_folder.get(&folder.to_lowercase()).cloned()
+}
+
+/// Discord's games by executable, once loaded: the first ask starts loading
+/// them in the background.
+fn games() -> Option<&'static HashMap<String, KnownGame>> {
     static GAMES: OnceLock<Option<HashMap<String, KnownGame>>> = OnceLock::new();
     static LOADING: AtomicBool = AtomicBool::new(false);
     if GAMES.get().is_none() && !LOADING.swap(true, Ordering::Relaxed) {
@@ -153,8 +173,7 @@ pub fn known_game(exe: &str) -> Option<Game> {
             let _ = GAMES.set(load_games());
         });
     }
-    let game = GAMES.get()?.as_ref()?.get(&exe.to_lowercase())?;
-    Some(Game { name: game.name.clone(), icon: Some(format!("https://cdn.discordapp.com/app-icons/{}/{}.png?size=512", game.id, game.icon)) })
+    GAMES.get()?.as_ref()
 }
 
 #[derive(Serialize, Deserialize)]
@@ -162,6 +181,12 @@ struct KnownGame {
     name: String,
     id: String,
     icon: String,
+}
+
+impl KnownGame {
+    fn game(&self) -> Game {
+        Game { name: self.name.clone(), icon: Some(format!("https://cdn.discordapp.com/app-icons/{}/{}.png?size=512", self.id, self.icon)) }
+    }
 }
 
 fn games_cache() -> Option<PathBuf> {

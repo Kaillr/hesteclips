@@ -12,8 +12,9 @@
 //!     edit.json               ← trim + volume, to reopen and change the edit
 //! ```
 //!
-//! Because the id travels inside the file, renaming or moving a clip in Finder
-//! never loses its edit. A clip gets its id the first time it's edited; clips
+//! Clips in the library's folders (one per game) keep theirs in the same
+//! `.hesteclips` at the library's top. Because the id travels inside the file,
+//! renaming a clip or moving it to another folder never loses its edit. A clip gets its id the first time it's edited; clips
 //! that were never edited are just their file.
 
 use std::path::{Path, PathBuf};
@@ -32,22 +33,42 @@ pub struct EditTarget {
     pub clip: PathBuf,
     pub source: PathBuf,
     pub id: Option<String>,
+    library: PathBuf,
 }
 
 impl EditTarget {
     pub fn of(clip: &Path) -> Self {
         let id = read_id(clip);
-        let source = id.as_deref().and_then(|id| find_original(library_of(clip), id)).unwrap_or_else(|| clip.to_path_buf());
-        Self { clip: clip.to_path_buf(), source, id }
+        let library = library_of(clip);
+        let source = id.as_deref().and_then(|id| find_original(&library, id)).unwrap_or_else(|| clip.to_path_buf());
+        Self { clip: clip.to_path_buf(), source, id, library }
     }
 
     pub fn library(&self) -> &Path {
-        library_of(&self.clip)
+        &self.library
     }
 }
 
-fn library_of(clip: &Path) -> &Path {
-    clip.parent().unwrap_or(Path::new("."))
+/// The library folder, as the app has it (Settings → Clips folder).
+static LIBRARY: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
+
+/// Tell the store where the library is, so clips in its folders find their
+/// assets at its top.
+pub fn set_library(lib: &Path) {
+    if let Ok(mut l) = LIBRARY.write() {
+        *l = Some(lib.to_path_buf());
+    }
+}
+
+/// The library a clip belongs to: the folder above its own when that's the
+/// library (a game's folder), else its own folder.
+fn library_of(clip: &Path) -> PathBuf {
+    let dir = clip.parent().unwrap_or(Path::new("."));
+    let lib = LIBRARY.read().ok().and_then(|l| l.clone());
+    match lib {
+        Some(lib) if dir.parent() == Some(lib.as_path()) => lib,
+        _ => dir.to_path_buf(),
+    }
 }
 
 pub fn assets_dir(lib: &Path, id: &str) -> PathBuf {
@@ -176,7 +197,7 @@ pub fn trash(clip: &Clip, library: &[Clip]) -> Result<(), trash::Error> {
     trash::delete(&clip.path)?;
     if let Some(id) = clip.id.as_deref() {
         let shared = library.iter().any(|c| c.path != clip.path && c.id.as_deref() == Some(id));
-        let dir = assets_dir(library_of(&clip.path), id);
+        let dir = assets_dir(&library_of(&clip.path), id);
         if !shared && dir.exists() {
             trash::delete(dir)?;
         }
@@ -226,9 +247,9 @@ mod tests {
 
     /// The store reads ids from the file, which our stub files don't carry.
     fn with_id(clip: &Path, id: &str) -> EditTarget {
-        let lib = clip.parent().unwrap();
-        let source = find_original(lib, id).unwrap_or_else(|| clip.to_path_buf());
-        EditTarget { clip: clip.to_path_buf(), source, id: Some(id.into()) }
+        let library = library_of(clip);
+        let source = find_original(&library, id).unwrap_or_else(|| clip.to_path_buf());
+        EditTarget { clip: clip.to_path_buf(), source, id: Some(id.into()), library }
     }
 
     #[test]
@@ -286,6 +307,30 @@ mod tests {
         abandon_render(&dir, id, &staged);
         assert_eq!(std::fs::read(&clip).unwrap(), b"original");
         assert!(!assets_dir(&dir, id).exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn game_folders_share_the_library_assets() {
+        let dir = lib("folders");
+        std::fs::create_dir_all(dir.join("osu!")).unwrap();
+        let clip = dir.join("osu!").join("Ace.mp4");
+        std::fs::write(&clip, b"original").unwrap();
+        let id = "cccccccc3333";
+        set_library(&dir);
+        let t = with_id(&clip, id);
+        assert_eq!(t.library(), dir);
+        let staged = render(&t, id, b"render");
+        commit_render(&t, &staged, id, &edit(5.0)).unwrap();
+        assert!(assets_dir(&dir, id).join("original.mp4").exists());
+
+        // Moved to another game's folder: the edit is still found.
+        std::fs::create_dir_all(dir.join("Desktop")).unwrap();
+        let moved = dir.join("Desktop").join("Ace.mp4");
+        std::fs::rename(&clip, &moved).unwrap();
+        let t = with_id(&moved, id);
+        assert_eq!(t.source, assets_dir(&dir, id).join("original.mp4"));
+        assert!(load_edit(&t).is_some());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

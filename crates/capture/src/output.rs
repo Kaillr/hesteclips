@@ -13,7 +13,7 @@ pub fn in_progress(file: &Path) -> PathBuf {
 /// A name for a new replay clip in `dir`: `clip_<timestamp>.<ext>`, with
 /// `-2`, `-3`… when clips are saved within the same second (one may still be
 /// being written, so its file can't be relied on to exist yet).
-#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows", target_os = "linux")), allow(dead_code))]
 pub(crate) fn new_clip_path(dir: &Path, ext: &str) -> PathBuf {
     static LAST: std::sync::Mutex<Option<(String, u32)>> = std::sync::Mutex::new(None);
     let ts = timestamp();
@@ -30,6 +30,16 @@ pub(crate) fn new_clip_path(dir: &Path, ext: &str) -> PathBuf {
             return path;
         }
         n += 1;
+    }
+}
+
+/// Where a finished recording goes: `file`'s name in `dir`, when one is given
+/// and can be made (a game's folder), else where it is. Never over another file.
+pub(crate) fn destination(file: &Path, dir: Option<&Path>) -> PathBuf {
+    let moved = dir.zip(file.file_name()).map(|(dir, name)| dir.join(name));
+    match moved {
+        Some(to) if !to.exists() && to.parent().is_some_and(|d| std::fs::create_dir_all(d).is_ok()) => to,
+        _ => file.to_path_buf(),
     }
 }
 
@@ -64,8 +74,14 @@ pub fn recover_unfinished(dir: &Path) -> Vec<PathBuf> {
     let mut recovered = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        let Some(real) = name.strip_prefix('.') else { continue };
         let path = entry.path();
+        // Clips are saved straight into their game's folder: one cut off there
+        // is removed the same way. (Recordings are written in the library itself.)
+        if !name.starts_with('.') && entry.file_type().is_ok_and(|t| t.is_dir()) {
+            remove_unfinished_clips(&path);
+            continue;
+        }
+        let Some(real) = name.strip_prefix('.') else { continue };
         // Only exact capture names: the editor keeps hidden files next to clips too
         // (`.recording_….mp4.edit.json`, `.….edited.mp4`), and those must stay hidden.
         if is_capture_name(real, "recording_") && entry.metadata().is_ok_and(|m| m.len() > 0) {
@@ -78,6 +94,16 @@ pub fn recover_unfinished(dir: &Path) -> Vec<PathBuf> {
         }
     }
     recovered
+}
+
+fn remove_unfinished_clips(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.strip_prefix('.').is_some_and(|real| is_capture_name(real, "clip_")) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// `{prefix}2026-08-13_14-32-05.{ext}`: a file name the capture backends write,
@@ -111,8 +137,17 @@ mod tests {
         let assets = dir.join(".hesteclips").join("3f9c0000aaaa");
         std::fs::create_dir_all(&assets).unwrap();
         std::fs::write(assets.join("original.mp4"), b"x").unwrap();
+        // A game's folder: a clip cut off while saving goes, finished ones stay.
+        let game = dir.join("osu!");
+        std::fs::create_dir_all(&game).unwrap();
+        std::fs::write(game.join(".clip_2026-10-02_10-00-00.mp4"), b"x").unwrap();
+        std::fs::write(game.join("clip_2026-10-02_09-59-00.mp4"), b"x").unwrap();
+        std::fs::write(game.join(".clip_2026-10-02_09-59-00.mp4.edit.json"), b"x").unwrap();
         let recovered = recover_unfinished(&dir);
         assert_eq!(recovered, vec![dir.join("recording_2026-10-02_09-45-44.mp4")]);
+        assert!(!game.join(".clip_2026-10-02_10-00-00.mp4").exists());
+        assert!(game.join("clip_2026-10-02_09-59-00.mp4").exists());
+        assert!(game.join(".clip_2026-10-02_09-59-00.mp4.edit.json").exists());
         for name in &hidden[1..] {
             assert!(dir.join(name).exists(), "{name} stays hidden");
         }

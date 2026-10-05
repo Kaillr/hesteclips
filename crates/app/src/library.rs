@@ -4,6 +4,9 @@
 //! else. While a capture is running a placeholder card stands in for the clip, so
 //! a half-written file never shows up as if it were finished.
 //!
+//! Clips in the library's folders (one per game) can be shown one game at a
+//! time, picked from a row of chips on top, and moved between folders.
+//!
 //! Selecting works like Photos and Finder: the check circle on a card, ⌘-click
 //! or Shift-click start a selection; while one is active a plain click toggles a
 //! card instead of playing it, and a bar on top acts on all of them.
@@ -26,12 +29,80 @@ const NEW_HIGHLIGHT: Duration = Duration::from_secs(8);
 pub(crate) const REC_RED: Color32 = Color32::from_rgb(235, 72, 72);
 pub(crate) const ACCENT: Color32 = Color32::from_rgb(90, 150, 255);
 
-/// The "Rename clip" dialog.
+/// The "Rename clip" dialog, or "Rename folder" for one of the library's folders.
 pub(crate) struct Rename {
     path: PathBuf,
     name: String,
     error: Option<String>,
     focused: bool,
+    folder: bool,
+}
+
+/// Which clips the library shows.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) enum Filter {
+    #[default]
+    All,
+    /// The clips in this folder of the library (a game's).
+    Folder(String),
+    /// The clips in the library itself, in no folder.
+    Loose,
+}
+
+impl Filter {
+    fn matches(&self, clip: &clips::Clip) -> bool {
+        match self {
+            Filter::All => true,
+            Filter::Folder(name) => clip.folder.as_ref() == Some(name),
+            Filter::Loose => clip.folder.is_none(),
+        }
+    }
+
+    /// Back to all clips once none is left to show (the last one moved or deleted).
+    pub fn retain(&mut self, clips: &[clips::Clip]) {
+        if !clips.iter().any(|c| self.matches(c)) {
+            *self = Filter::All;
+        }
+    }
+
+    /// Make sure the clip at `path` is shown: all clips, if it's another game's.
+    pub fn reveal(&mut self, clips: &[clips::Clip], path: &Path) {
+        if clips.iter().any(|c| c.path == path && !self.matches(c)) {
+            *self = Filter::All;
+        }
+    }
+}
+
+/// A chip on top of the library: a folder (game) to show the clips of.
+struct Category {
+    filter: Filter,
+    label: String,
+    count: usize,
+}
+
+/// The chips: All, each folder with clips (the game played last first), and
+/// Other for clips in no folder. None when there are no folders to pick between.
+fn categories(clips: &[clips::Clip]) -> Vec<Category> {
+    let mut cats: Vec<Category> = Vec::new();
+    let mut loose = 0;
+    // Newest first, so a folder's place is its newest clip's.
+    for clip in clips {
+        match &clip.folder {
+            Some(f) => match cats.iter_mut().find(|c| &c.label == f) {
+                Some(c) => c.count += 1,
+                None => cats.push(Category { filter: Filter::Folder(f.clone()), label: f.clone(), count: 1 }),
+            },
+            None => loose += 1,
+        }
+    }
+    if cats.is_empty() {
+        return cats;
+    }
+    if loose > 0 {
+        cats.push(Category { filter: Filter::Loose, label: "Other".into(), count: loose });
+    }
+    cats.insert(0, Category { filter: Filter::All, label: "All".into(), count: clips.len() });
+    cats
 }
 
 /// Clips picked for a bulk action.
@@ -94,6 +165,12 @@ enum Action {
     OpenExternal(PathBuf),
     Edit(PathBuf),
     Trash(PathBuf),
+    /// Move clips to this folder of the library (`None`: out of any folder).
+    MoveTo(Vec<PathBuf>, Option<String>),
+    MoveSelectedTo(Option<String>),
+    Filter(Filter),
+    RenameFolder(String),
+    RevealFolder(String),
     /// Toggle a card's selection, or (`range`) select up to it from the anchor.
     Select { path: PathBuf, range: bool },
     SelectAll,
@@ -123,16 +200,24 @@ impl App {
             return;
         }
 
+        // The clips of the game picked on top. Cards borrow a snapshot so
+        // drawing them can still use `&mut self` (thumbnail cache).
+        let cats = categories(&self.clips);
+        let mut folders: Vec<String> = cats.iter().filter_map(|c| if let Filter::Folder(f) = &c.filter { Some(f.clone()) } else { None }).collect();
+        folders.sort_by_key(|f| f.to_lowercase());
+        let clips: Vec<clips::Clip> = self.clips.iter().filter(|c| self.library_filter.matches(c)).cloned().collect();
+
         let mut action = self.selection_keys(ui);
         if !self.selection.is_empty() {
-            if let Some(a) = self.selection_bar(ui) {
+            if let Some(a) = self.selection_bar(ui, clips.len(), &folders) {
                 action = Some(a);
             }
         }
+        if let Some(a) = self.category_chips(ui, &cats) {
+            action = Some(a);
+        }
 
-        // Group into days. The placeholder always belongs to today. Cards borrow a
-        // snapshot so drawing them can still use `&mut self` (thumbnail cache).
-        let clips = self.clips.clone();
+        // Group into days. The placeholder always belongs to today.
         let mut groups: Vec<(chrono::NaiveDate, Vec<Card>)> = Vec::new();
         let mut live: Vec<Card> = new_renders.into_iter().map(Card::NewRender).collect();
         for _ in 0..placeholders {
@@ -172,7 +257,7 @@ impl App {
                                 Card::Placeholder => self.placeholder_card(ui, card_w),
                                 Card::NewRender(i) => self.new_render_card(ui, *i, card_w),
                                 Card::Clip(clip) => {
-                                    if let Some(a) = self.clip_card(ui, clip, card_w) {
+                                    if let Some(a) = self.clip_card(ui, clip, card_w, &folders) {
                                         action = Some(a);
                                     }
                                 }
@@ -196,15 +281,30 @@ impl App {
             Some(Action::Edit(p)) => self.open_editor(p),
             Some(Action::Rename(p)) => self.rename_clip(p),
             Some(Action::Trash(p)) => self.trash_clips(&[p]),
+            Some(Action::MoveTo(paths, folder)) => self.move_clips(ui.ctx(), &paths, folder),
+            Some(Action::MoveSelectedTo(folder)) => {
+                let paths: Vec<PathBuf> = clips.iter().filter(|c| self.selection.paths.contains(&c.path)).map(|c| c.path.clone()).collect();
+                self.move_clips(ui.ctx(), &paths, folder);
+            }
+            Some(Action::Filter(f)) => {
+                self.library_filter = f;
+                self.selection.clear();
+            }
+            Some(Action::RenameFolder(name)) => self.rename_folder(&name),
+            Some(Action::RevealFolder(name)) => {
+                if let Err(e) = clips::open_in_default_app(&self.settings.output_dir.join(name)) {
+                    self.toast_error(format!("Couldn't open the folder: {e}"));
+                }
+            }
             Some(Action::Select { path, range }) => {
                 if range {
-                    self.selection.extend_to(&path, &self.clips);
+                    self.selection.extend_to(&path, &clips);
                 } else {
                     self.selection.toggle(&path);
                 }
             }
             Some(Action::SelectAll) => {
-                self.selection.paths = self.clips.iter().map(|c| c.path.clone()).collect();
+                self.selection.paths = clips.iter().map(|c| c.path.clone()).collect();
             }
             Some(Action::Deselect) => self.selection.clear(),
             Some(Action::CancelUpload(p)) => {
@@ -242,8 +342,9 @@ impl App {
         })
     }
 
-    /// The bar on top while clips are selected: how many, and what to do with them.
-    fn selection_bar(&self, ui: &mut egui::Ui) -> Option<Action> {
+    /// The bar on top while clips are selected: how many, and what to do with
+    /// them. `shown`: how many clips the library shows.
+    fn selection_bar(&self, ui: &mut egui::Ui, shown: usize, folders: &[String]) -> Option<Action> {
         let mut action = None;
         let n = self.selection.paths.len();
         ui.add_space(8.0);
@@ -257,7 +358,7 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new(if n == 1 { "1 clip selected".to_owned() } else { format!("{n} clips selected") }).strong().size(15.0));
                     ui.add_space(8.0);
-                    if n < self.clips.len() && ui.button("Select all").on_hover_text(crate::hotkey_label_cmd("A")).clicked() {
+                    if n < shown && ui.button("Select all").on_hover_text(crate::hotkey_label_cmd("A")).clicked() {
                         action = Some(Action::SelectAll);
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -265,6 +366,13 @@ impl App {
                         let key = if cfg!(target_os = "macos") { crate::hotkey_label_cmd("Delete") } else { "Delete".to_owned() };
                         if ui.add(trash).on_hover_text(key).clicked() {
                             action = Some(Action::TrashSelected);
+                        }
+                        if !folders.is_empty() {
+                            ui.menu_button("📁  Move to", |ui| {
+                                if let Some(f) = move_menu(ui, folders, None, true) {
+                                    action = Some(Action::MoveSelectedTo(f));
+                                }
+                            });
                         }
                         if ui.button("Cancel").on_hover_text("Esc").clicked() {
                             action = Some(Action::Deselect);
@@ -309,6 +417,119 @@ impl App {
         }
         self.selection.clear();
         self.refresh_clips();
+    }
+
+    /// The row of folders (games) to show the clips of.
+    fn category_chips(&mut self, ui: &mut egui::Ui, cats: &[Category]) -> Option<Action> {
+        if cats.is_empty() {
+            return None;
+        }
+        let mut action = None;
+        ui.add_space(8.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+            for cat in cats {
+                let selected = self.library_filter == cat.filter;
+                let v = ui.visuals();
+                let (text, weak) = if selected { (Color32::WHITE, Color32::from_white_alpha(190)) } else { (v.text_color(), v.weak_text_color()) };
+                let mut job = egui::text::LayoutJob::default();
+                let format = |size: f32, color| egui::TextFormat { font_id: FontId::proportional(size), color, valign: egui::Align::Center, ..Default::default() };
+                job.append(&cat.label, 0.0, format(14.0, text));
+                job.append(&cat.count.to_string(), 7.0, format(12.0, weak));
+                let fill = if selected { ACCENT } else { v.widgets.inactive.weak_bg_fill };
+                let icon = match &cat.filter {
+                    Filter::Folder(name) => self.folder_icon(ui.ctx(), name),
+                    _ => None,
+                };
+                let button = match icon {
+                    Some(tex) => egui::Button::image_and_text(egui::Image::from_texture((tex.id(), Vec2::splat(18.0))).corner_radius(4), job),
+                    None => egui::Button::new(job),
+                };
+                let r = ui.add(button.fill(fill).corner_radius(CornerRadius::same(14)).min_size(Vec2::new(0.0, 28.0)));
+                if r.clicked() && !selected {
+                    action = Some(Action::Filter(cat.filter.clone()));
+                }
+                if let Filter::Folder(name) = &cat.filter {
+                    r.context_menu(|ui| {
+                        if ui.button(format!("📂  {}", crate::reveal_label())).clicked() {
+                            action = Some(Action::RevealFolder(name.clone()));
+                        }
+                        if ui.button("✏  Rename folder…").clicked() {
+                            action = Some(Action::RenameFolder(name.clone()));
+                        }
+                    });
+                }
+            }
+        });
+        ui.add_space(2.0);
+        action
+    }
+
+    /// The game's picture for one of the library's folders, when Discord knows
+    /// the game (also after the folder's been renamed).
+    fn folder_icon(&mut self, ctx: &egui::Context, folder: &str) -> Option<egui::TextureHandle> {
+        let game = self.settings.game_folders.iter().find(|(_, f)| *f == folder).map_or(folder, |(game, _)| game.as_str());
+        let url = crate::discord::game_for_folder(game)?.icon?;
+        self.game_icons.get(ctx, &url)
+    }
+
+    /// Move clips to another folder of the library (`None`: the library
+    /// itself). Their edits follow by id. Clips busy saving an edit or
+    /// uploading stay where they are.
+    fn move_clips(&mut self, ctx: &egui::Context, paths: &[PathBuf], folder: Option<String>) {
+        let lib = self.settings.output_dir.clone();
+        let dir = folder.as_ref().map_or(lib.clone(), |f| lib.join(f));
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            self.toast_error(format!("Couldn't move: {e}"));
+            return;
+        }
+        let (mut moved, mut busy, mut error) = (0, 0, None);
+        for path in paths {
+            if path.parent() == Some(dir.as_path()) {
+                continue;
+            }
+            if self.renders.iter().any(|j| &j.source == path) || self.cloud.upload_for(path).is_some() {
+                busy += 1;
+                continue;
+            }
+            let Some(name) = path.file_name() else { continue };
+            let to = clips::free_path(&dir, &name.to_string_lossy());
+            match clips::rename(path, &to) {
+                Ok(()) => {
+                    self.follow_rename(ctx, path, &to);
+                    moved += 1;
+                }
+                Err(e) => error = Some(e.to_string()),
+            }
+        }
+        let place = folder.as_deref().unwrap_or("Other");
+        if let Some(e) = error {
+            self.toast_error(format!("Couldn't move: {e}"));
+        } else if busy > 0 {
+            self.toast_error("Clips that are still saving an edit or uploading were kept where they are.");
+        } else if moved == 1 {
+            self.toast(format!("Moved to {place}"));
+        } else if moved > 1 {
+            self.toast(format!("Moved {moved} clips to {place}"));
+        }
+        self.selection.clear();
+        self.refresh_clips();
+    }
+
+    /// A clip's file moved (renamed, or to another folder): the player, the
+    /// editor and the "new" highlight follow it.
+    fn follow_rename(&mut self, ctx: &egui::Context, from: &Path, to: &Path) {
+        if let Some((p, _)) = &mut self.last_saved
+            && p == from
+        {
+            *p = to.to_path_buf();
+        }
+        if let Some(v) = &mut self.viewer {
+            v.renamed(ctx, from, to);
+        }
+        if let Some(e) = &mut self.editor {
+            e.renamed(ctx, from, to);
+        }
     }
 
     fn empty_state(&mut self, ui: &mut egui::Ui) {
@@ -391,7 +612,7 @@ impl App {
         }
     }
 
-    fn clip_card(&mut self, ui: &mut egui::Ui, clip: &clips::Clip, w: f32) -> Option<Action> {
+    fn clip_card(&mut self, ui: &mut egui::Ui, clip: &clips::Clip, w: f32, folders: &[String]) -> Option<Action> {
         let thumb_h = w * 9.0 / 16.0;
         // click_and_drag: a click plays, a drag pulls the file out of the window.
         let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, thumb_h + CAPTION_HEIGHT), Sense::click_and_drag());
@@ -500,10 +721,14 @@ impl App {
         } else {
             None
         };
-        let detail = match trimmed_from {
+        let mut detail = match trimmed_from {
             Some(orig) => format!("{}  ·  {ext}  ·  trimmed from {orig}", clip.human_size()),
             None => format!("{}  ·  {ext}", clip.human_size()),
         };
+        // Every game's clips together: say whose this is.
+        if let (Filter::All, Some(folder)) = (&self.library_filter, &clip.folder) {
+            detail = format!("{folder}  ·  {detail}");
+        }
         let meta = p.layout_job(single_line(&detail, FontId::proportional(12.0), v.weak_text_color(), w - 4.0));
         p.galley(Pos2::new(rect.left() + 2.0, thumb_rect.bottom() + 24.0), meta, v.weak_text_color());
 
@@ -576,6 +801,13 @@ impl App {
             ui.set_min_width(190.0);
             // Right-clicking one of several selected clips acts on all of them.
             if selected && n > 1 {
+                if !folders.is_empty() {
+                    ui.menu_button(format!("📁  Move {n} clips to"), |ui| {
+                        if let Some(f) = move_menu(ui, folders, None, true) {
+                            action = Some(Action::MoveSelectedTo(f));
+                        }
+                    });
+                }
                 if ui.button(egui::RichText::new(format!("🗑  Move {n} clips to Trash")).color(v.error_fg_color)).clicked() {
                     action = Some(Action::TrashSelected);
                 }
@@ -595,6 +827,13 @@ impl App {
             }
             if ui.button("✏  Rename…").clicked() {
                 action = Some(Action::Rename(clip.path.clone()));
+            }
+            if !folders.is_empty() {
+                ui.menu_button("📁  Move to", |ui| {
+                    if let Some(f) = move_menu(ui, folders, clip.folder.as_deref(), clip.folder.is_some()) {
+                        action = Some(Action::MoveTo(vec![clip.path.clone()], f));
+                    }
+                });
             }
             if !selected && ui.button("☑  Select").clicked() {
                 action = Some(Action::Select { path: clip.path.clone(), range: false });
@@ -619,7 +858,47 @@ impl App {
 impl App {
     pub(crate) fn rename_clip(&mut self, path: PathBuf) {
         let name = self.clips.iter().find(|c| c.path == path).map(|c| c.editable_name()).unwrap_or_default();
-        self.rename = Some(Rename { path, name, error: None, focused: false });
+        self.rename = Some(Rename { path, name, error: None, focused: false, folder: false });
+    }
+
+    fn rename_folder(&mut self, name: &str) {
+        let path = self.settings.output_dir.join(name);
+        self.rename = Some(Rename { path, name: name.to_owned(), error: None, focused: false, folder: true });
+    }
+
+    /// Rename one of the library's folders. Its game's clips keep going in it.
+    fn commit_folder_rename(&mut self, ctx: &egui::Context, from: &Path, name: &str) -> Result<(), String> {
+        let to = clips::path_for_folder(&self.settings.output_dir, name, from)?;
+        if to == from {
+            return Ok(());
+        }
+        if self.renders.iter().any(|j| j.source.starts_with(from)) {
+            return Err("Wait for the edits being saved in it to finish.".into());
+        }
+        std::fs::rename(from, &to).map_err(|e| format!("Couldn't rename: {e}"))?;
+        let inside: Vec<PathBuf> = self.clips.iter().filter(|c| c.path.parent() == Some(from)).map(|c| c.path.clone()).collect();
+        for path in inside {
+            if let Some(file) = path.file_name() {
+                self.follow_rename(ctx, &path, &to.join(file));
+            }
+        }
+        let (old, new) = (file_name_of(from), file_name_of(&to));
+        // New clips of its game go in it from now on.
+        let folders = &mut self.settings.game_folders;
+        let mut followed = false;
+        for f in folders.values_mut().filter(|f| **f == old) {
+            *f = new.clone();
+            followed = true;
+        }
+        if !followed {
+            folders.insert(old.clone(), new.clone());
+        }
+        folders.retain(|game, f| game != f);
+        if self.library_filter == Filter::Folder(old) {
+            self.library_filter = Filter::Folder(new);
+        }
+        self.refresh_clips();
+        Ok(())
     }
 
     /// The "Rename clip" dialog, if open.
@@ -629,7 +908,7 @@ impl App {
         let mut submit = false;
         let modal = egui::Modal::new(egui::Id::new("rename_clip")).show(ctx, |ui| {
             ui.set_width(380.0);
-            ui.heading("Rename clip");
+            ui.heading(if r.folder { "Rename folder" } else { "Rename clip" });
             ui.add_space(6.0);
             let out = egui::TextEdit::singleline(&mut r.name).desired_width(f32::INFINITY).show(ui);
             if !r.focused {
@@ -657,23 +936,26 @@ impl App {
                 }
             });
         });
-        if submit {
+        if submit && r.folder {
+            let (from, name) = (r.path.clone(), r.name.clone());
+            match self.commit_folder_rename(ctx, &from, &name) {
+                Ok(()) => close = true,
+                Err(e) => {
+                    if let Some(r) = &mut self.rename {
+                        r.error = Some(e);
+                    }
+                }
+            }
+        } else if submit {
             let ext = r.path.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or("mp4".into());
             let dir = r.path.parent().unwrap_or(std::path::Path::new(".")).to_path_buf();
             match clips::path_for_name(&dir, &r.name, &ext, Some(&r.path)) {
                 Ok(to) if to == r.path => close = true,
                 Ok(to) => match clips::rename(&r.path, &to) {
                     Ok(()) => {
-                        if self.last_saved.as_ref().is_some_and(|(p, _)| *p == r.path) {
-                            self.last_saved = None;
-                        }
                         // Open in the player or editor: it follows the file.
-                        if let Some(v) = &mut self.viewer {
-                            v.renamed(ctx, &r.path, &to);
-                        }
-                        if let Some(e) = &mut self.editor {
-                            e.renamed(ctx, &r.path, &to);
-                        }
+                        let from = r.path.clone();
+                        self.follow_rename(ctx, &from, &to);
                         close = true;
                         self.refresh_clips();
                     }
@@ -803,6 +1085,28 @@ fn badge(p: &egui::Painter, pos: Pos2, anchor: Align2, text: &str, fill: Color32
     p.galley(rect.min + Vec2::new(5.0, 2.0), galley, Color32::WHITE);
 }
 
+/// The folders to move clips to: each of the library's but `current`, and
+/// Other (out of any folder) when `offer_other`. The one picked, if any.
+fn move_menu(ui: &mut egui::Ui, folders: &[String], current: Option<&str>, offer_other: bool) -> Option<Option<String>> {
+    let mut picked = None;
+    for f in folders.iter().filter(|f| Some(f.as_str()) != current) {
+        if ui.button(f).clicked() {
+            picked = Some(Some(f.clone()));
+        }
+    }
+    if offer_other {
+        ui.separator();
+        if ui.button("Other").on_hover_text("Out of any game's folder").clicked() {
+            picked = Some(None);
+        }
+    }
+    picked
+}
+
+fn file_name_of(path: &Path) -> String {
+    path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+}
+
 fn single_line(text: &str, font: FontId, color: Color32, max_width: f32) -> egui::text::LayoutJob {
     let mut job = egui::text::LayoutJob::simple_singleline(text.to_owned(), font, color);
     job.wrap = egui::text::TextWrapping::truncate_at_width(max_width);
@@ -821,6 +1125,7 @@ mod tests {
             size_bytes: 0,
             id: None,
             original: None,
+            folder: None,
         }
     }
 

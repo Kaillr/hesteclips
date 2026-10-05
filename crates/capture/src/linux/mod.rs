@@ -30,7 +30,7 @@ mod image;
 mod portal;
 mod screen;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
@@ -109,7 +109,7 @@ impl LinuxRecorder {
 impl Recorder for LinuxRecorder {
     fn start(&mut self, mode: Mode, settings: &EncodeSettings) -> Result<()> {
         if self.session.is_some() {
-            let _ = self.stop();
+            let _ = self.stop(None);
         }
         self.replay_seconds = settings.replay_seconds;
         self.output_dir = settings.output_dir.clone();
@@ -136,13 +136,14 @@ impl Recorder for LinuxRecorder {
         Ok(())
     }
 
-    fn save_clip(&mut self) -> Result<crate::PendingClip> {
+    fn save_clip(&mut self, dir: &Path) -> Result<crate::PendingClip> {
         let session = self.session.as_ref().filter(|_| self.mode == Some(Mode::ReplayBuffer));
         let session = session.context("replay buffer is not running")?;
-        writer::request_clip(&session.writer_tx, &self.output_dir, &self.container_ext, self.replay_seconds as f64)
+        std::fs::create_dir_all(dir)?;
+        writer::request_clip(&session.writer_tx, dir, &self.container_ext, self.replay_seconds as f64)
     }
 
-    fn stop(&mut self) -> Result<Option<PathBuf>> {
+    fn stop(&mut self, dir: Option<&Path>) -> Result<Option<PathBuf>> {
         let finished = self.session.take().map(Session::finish);
         let file = self.current_file.take();
         let was_record = self.mode == Some(Mode::Record);
@@ -162,6 +163,7 @@ impl Recorder for LinuxRecorder {
         if !partial.exists() {
             bail!("recording failed — nothing was written");
         }
+        let file = crate::output::destination(&file, dir);
         crate::output::finish_rename(&partial, &file).context("couldn't finish the recording")?;
         Ok(Some(file))
     }
@@ -175,7 +177,7 @@ impl Drop for LinuxRecorder {
     /// Dropping (app quit) must still finalise the file.
     fn drop(&mut self) {
         if self.session.is_some() {
-            let _ = self.stop();
+            let _ = self.stop(None);
         }
     }
 }

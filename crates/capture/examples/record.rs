@@ -84,14 +84,14 @@ fn main() -> anyhow::Result<()> {
     if mode == Mode::ReplayBuffer {
         // Two clips half a second apart; the second is asked for while the
         // first is still being written.
-        let first = rec.save_clip();
+        let first = rec.save_clip(&std::env::temp_dir().join("hc"));
         std::thread::sleep(std::time::Duration::from_millis(500));
-        let second = rec.save_clip();
+        let second = rec.save_clip(&std::env::temp_dir().join("hc"));
         for (n, pending) in [first, second].into_iter().enumerate() {
             println!("save {}: {:?}", n + 1, pending.and_then(|p| p.finish()));
         }
     }
-    println!("{:?}", rec.stop()?);
+    println!("{:?}", rec.stop(None)?);
     Ok(())
 }
 

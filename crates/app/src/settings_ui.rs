@@ -129,6 +129,11 @@ impl App {
                     });
                 });
                 divider(ui);
+                let hint = "Clips go in a folder named after the game you're playing, like osu!, and the library sorts them the same way. Clips with no game go in Desktop.";
+                row(ui, "A folder per game", Some(hint), |ui| {
+                    toggle(ui, &mut self.settings.folder_per_game);
+                });
+                divider(ui);
                 row(ui, "File format", Some("MP4 plays everywhere."), |ui| {
                     ui.horizontal_wrapped(|ui| {
                         for c in [Container::Mp4, Container::Mov] {
@@ -466,6 +471,7 @@ impl App {
                 if ui.add(reset).clicked() {
                     let mut fresh = settings::RecordSettings::default();
                     fresh.output_dir = self.settings.output_dir.clone();
+                    fresh.game_folders = std::mem::take(&mut self.settings.game_folders);
                     fresh.audio_sources = std::mem::take(&mut self.settings.audio_sources);
                     fresh.capture = std::mem::take(&mut self.settings.capture);
                     fresh.idle_apps = self.settings.idle_apps.take();

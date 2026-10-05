@@ -18,6 +18,8 @@ pub struct Clip {
     pub id: Option<String>,
     /// The untouched recording, when this clip is an edit of it.
     pub original: Option<PathBuf>,
+    /// The library's folder it's in (its game's), if it isn't loose in the library.
+    pub folder: Option<String>,
 }
 
 impl Clip {
@@ -47,6 +49,7 @@ impl Clip {
             size_bytes: meta.len(),
             id: None,
             original: None,
+            folder: None,
         })
     }
 
@@ -85,15 +88,46 @@ impl Clip {
     }
 }
 
-/// Scan `dir` for video files, newest first. Missing dir → empty list (not an error).
-pub fn scan(dir: &Path) -> Vec<Clip> {
+/// The library's clips, newest first: the ones in `lib` itself and in its
+/// folders (one per game), one level deep. Missing dir → empty list (not an error).
+pub fn scan(lib: &Path) -> Vec<Clip> {
+    // Only edited clips have ids; skip reading metadata when nothing's been edited.
+    let any_edits = lib.join(crate::store::DIR).is_dir();
+    let mut clips = scan_dir(lib, lib, None, any_edits);
+    for folder in folders(lib) {
+        clips.extend(scan_dir(lib, &lib.join(&folder), Some(&folder), any_edits));
+    }
+    clips.sort_by(|a, b| b.captured_at().cmp(&a.captured_at()));
+    clips
+}
+
+/// The library's folders, by name. Hidden ones (`.hesteclips`, the edits)
+/// aren't clips.
+pub fn folders(lib: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(lib) else { return Vec::new() };
+    entries
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .filter_map(|e| e.file_name().to_str().map(str::to_owned))
+        .filter(|name| !name.starts_with('.'))
+        .collect()
+}
+
+/// When the library or one of its folders last changed: adding, removing or
+/// renaming a clip in any of them changes this.
+pub fn stamp(lib: &Path) -> Vec<Option<SystemTime>> {
+    let mtime = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    let mut names = folders(lib);
+    names.sort();
+    std::iter::once(mtime(lib)).chain(names.iter().map(|n| mtime(&lib.join(n)))).collect()
+}
+
+/// The clips directly in `dir`, which is `lib` or its `folder`.
+fn scan_dir(lib: &Path, dir: &Path, folder: Option<&str>, any_edits: bool) -> Vec<Clip> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
-    // Only edited clips have ids; skip reading metadata when nothing's been edited.
-    let any_edits = dir.join(crate::store::DIR).is_dir();
-
-    let mut clips: Vec<Clip> = entries
+    entries
         .flatten()
         .filter_map(|entry| {
             let path = entry.path();
@@ -111,21 +145,65 @@ pub fn scan(dir: &Path) -> Vec<Clip> {
                 return None;
             }
             let meta = entry.metadata().ok()?;
+            if !meta.is_file() {
+                return None;
+            }
             let id = if any_edits { crate::store::read_id(&path) } else { None };
-            let original = id.as_deref().and_then(|id| crate::store::find_original(dir, id));
+            let original = id.as_deref().and_then(|id| crate::store::find_original(lib, id));
             Some(Clip {
                 name: path.file_name()?.to_string_lossy().into_owned(),
                 modified: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
                 size_bytes: meta.len(),
                 id,
                 original,
+                folder: folder.map(str::to_owned),
                 path,
             })
         })
-        .collect();
+        .collect()
+}
 
-    clips.sort_by(|a, b| b.captured_at().cmp(&a.captured_at()));
-    clips
+/// The folder for clips with no game.
+pub const DESKTOP: &str = "Desktop";
+
+/// A folder name for a game, as Windows (the strictest) allows: "Counter-Strike:
+/// Global Offensive" → "Counter-Strike Global Offensive". Names Windows keeps
+/// for devices (`CON`, `COM1`…) get a `_`.
+pub fn folder_name(game: &str) -> String {
+    let kept: String = game.chars().filter(|&c| !c.is_control() && !FORBIDDEN.contains(&c)).collect();
+    let mut name = kept.split_whitespace().collect::<Vec<_>>().join(" ");
+    // No leading dot (hidden, and how we tell our own files apart), no
+    // trailing dot or space (Windows drops them).
+    name = name.trim_start_matches('.').trim_end_matches(['.', ' ']).to_owned();
+    if name.chars().count() > 80 {
+        name = name.chars().take(80).collect::<String>().trim_end_matches(['.', ' ']).to_owned();
+    }
+    if name.is_empty() {
+        return DESKTOP.to_owned();
+    }
+    let stem = name.split('.').next().unwrap_or("").to_ascii_uppercase();
+    let device = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (stem.len() == 4 && (stem.starts_with("COM") || stem.starts_with("LPT")) && stem.as_bytes()[3].is_ascii_digit());
+    if device {
+        name.push('_');
+    }
+    name
+}
+
+/// Characters no file or folder name can have (on Windows).
+const FORBIDDEN: [char; 9] = ['/', '\\', ':', '*', '?', '"', '<', '>', '|'];
+
+/// A path in `dir` for a file named `name` that isn't taken: "clip.mp4", else
+/// "clip (2).mp4", "clip (3).mp4"…
+pub fn free_path(dir: &Path, name: &str) -> PathBuf {
+    let path = dir.join(name);
+    if !path.exists() {
+        return path;
+    }
+    let p = Path::new(name);
+    let stem = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let ext = p.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+    (2..).map(|n| dir.join(format!("{stem} ({n}){ext}"))).find(|p| !p.exists()).expect("a free name")
 }
 
 /// Reveal a file in the OS file manager, selecting it.
@@ -243,21 +321,43 @@ pub fn sanitize_name(name: &str) -> String {
 /// `existing` (same folder, same extension). `current` is the clip being renamed,
 /// which may keep its own name.
 pub fn path_for_name(dir: &Path, name: &str, ext: &str, current: Option<&Path>) -> Result<PathBuf, String> {
-    let name = name.trim();
-    if name.is_empty() {
-        return Err("Give the clip a name.".into());
-    }
-    if name.starts_with('.') {
-        return Err("Names can't start with a dot.".into());
-    }
-    if let Some(c) = name.chars().find(|c| matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')) {
-        return Err(format!("Names can't contain “{c}”."));
-    }
+    let name = check_name(name, "Give the clip a name.")?;
     let path = dir.join(format!("{name}.{ext}"));
     if path.exists() && current != Some(path.as_path()) {
         return Err("A clip with that name already exists.".into());
     }
     Ok(path)
+}
+
+/// Check a new name the user typed for one of the library's folders, and
+/// turn it into its path.
+pub fn path_for_folder(lib: &Path, name: &str, current: &Path) -> Result<PathBuf, String> {
+    let name = check_name(name, "Give the folder a name.")?;
+    if name.ends_with('.') {
+        return Err("Names can't end with a dot.".into());
+    }
+    let path = lib.join(name);
+    // A change of case only is the same folder on Windows and macOS.
+    let same = path.to_string_lossy().to_lowercase() == current.to_string_lossy().to_lowercase();
+    if path.exists() && !same {
+        return Err("A folder with that name already exists.".into());
+    }
+    Ok(path)
+}
+
+/// A name the user typed, trimmed, if a file or folder can have it.
+fn check_name<'a>(name: &'a str, empty: &str) -> Result<&'a str, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(empty.into());
+    }
+    if name.starts_with('.') {
+        return Err("Names can't start with a dot.".into());
+    }
+    if let Some(c) = name.chars().find(|c| FORBIDDEN.contains(c)) {
+        return Err(format!("Names can't contain “{c}”."));
+    }
+    Ok(name)
 }
 
 /// Rename a clip. Its edit follows by id, so only the file moves.
@@ -302,6 +402,40 @@ mod tests {
         assert_eq!(title_for_stem("clip_2026-10-01_14-51-01 (edit)"), "14:51:01 (edit)");
         assert_eq!(title_for_stem("Ace clutch"), "Ace clutch");
         assert_eq!(sanitize_name("14:51:01 (edit)"), "14.51.01 (edit)");
+    }
+
+    #[test]
+    fn folder_names() {
+        assert_eq!(folder_name("osu!"), "osu!");
+        assert_eq!(folder_name("Counter-Strike: Global Offensive"), "Counter-Strike Global Offensive");
+        assert_eq!(folder_name("  What?  Now... "), "What Now");
+        assert_eq!(folder_name(".hack//G.U."), "hackG.U");
+        assert_eq!(folder_name("CON"), "CON_");
+        assert_eq!(folder_name("com3"), "com3_");
+        assert_eq!(folder_name("Company"), "Company");
+        assert_eq!(folder_name("???"), DESKTOP);
+    }
+
+    #[test]
+    fn scans_game_folders() {
+        let lib = std::env::temp_dir().join(format!("hc-scan-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&lib);
+        std::fs::create_dir_all(lib.join("osu!")).unwrap();
+        std::fs::create_dir_all(lib.join(".hesteclips").join("abcdef12")).unwrap();
+        std::fs::write(lib.join("clip_2026-10-01_14-51-01.mp4"), b"x").unwrap();
+        std::fs::write(lib.join("osu!").join("clip_2026-10-02_14-51-01.mp4"), b"x").unwrap();
+        std::fs::write(lib.join("osu!").join(".clip_2026-10-02_14-52-01.mp4"), b"x").unwrap();
+        std::fs::write(lib.join(".hesteclips").join("abcdef12").join("original.mp4"), b"x").unwrap();
+        let found: Vec<(String, Option<String>)> = scan(&lib).into_iter().map(|c| (c.name, c.folder)).collect();
+        assert_eq!(
+            found,
+            [("clip_2026-10-02_14-51-01.mp4".to_owned(), Some("osu!".to_owned())), ("clip_2026-10-01_14-51-01.mp4".to_owned(), None)]
+        );
+        assert_eq!(free_path(&lib, "clip_2026-10-01_14-51-01.mp4"), lib.join("clip_2026-10-01_14-51-01 (2).mp4"));
+        assert_eq!(free_path(&lib, "new.mp4"), lib.join("new.mp4"));
+        assert!(path_for_folder(&lib, "OSU!", &lib.join("osu!")).is_ok());
+        assert!(path_for_folder(&lib, "osu!", &lib.join("Desktop")).is_err());
+        std::fs::remove_dir_all(&lib).unwrap();
     }
 
     #[test]
