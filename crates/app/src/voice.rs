@@ -92,14 +92,15 @@ mod spotting {
     /// it comes out. Found on the user's takes; more spellings for "hashtag"
     /// made it worse (short ones like "hash" fired on part of the word and
     /// the whole one was lost), and ones that fired on near misses ("clip at"
-    /// in "clip it later") are left out.
+    /// in "clip it later", "este" in "hashtag blessed", and "clips", which
+    /// fired on "clip it" once the search was wider) are left out.
     const PARTS: [&str; 3] = [
         // "Hashtag"
         "▁HAS H TA G @hashtag\n▁HAS H ▁TA G @hashtag\n▁HE SH TA G @hashtag\n▁HAS ▁TA G @hashtag\n▁HAS TA G @hashtag",
         // "Heste"
-        "▁HE S TE @heste\n▁HE S TA @heste\n▁HAS TE @heste\n▁HE S TER @heste\n▁HE S TY @heste\n▁HE S T @heste\n▁HE S TI @heste\n▁HE S SE @heste\n▁HE S T EN @heste\n▁E S TE @heste",
-        // "Clip that" ("clips": how the model heard it said quickly)
-        "▁C LI P ▁THAT @clip_that\n▁K LI PP ▁THAT @clip_that\n▁C LI P ▁DA T @clip_that\n▁K LI PP ▁DA T @clip_that\n▁C LI PP ▁THAT @clip_that\n▁C LI P ▁THE T @clip_that\n▁C LI P S @clip_that",
+        "▁HE S TE @heste\n▁HE S TA @heste\n▁HAS TE @heste\n▁HE S TER @heste\n▁HE S TY @heste\n▁HE S T @heste\n▁HE S TI @heste\n▁HE S SE @heste\n▁HE S T EN @heste",
+        // "Clip that"
+        "▁C LI P ▁THAT @clip_that\n▁K LI PP ▁THAT @clip_that\n▁C LI P ▁DA T @clip_that\n▁K LI PP ▁DA T @clip_that\n▁C LI PP ▁THAT @clip_that\n▁C LI P ▁THE T @clip_that",
     ];
     /// Two parts count as the phrase this close together, in either order
     /// (the model sometimes reports a part late; in the user's takes the
@@ -110,6 +111,20 @@ mod spotting {
     /// (0.7 and 1.0 s after, in the user's session), while the next take can
     /// come 1.6 s later (2.0 swallowed real takes).
     const QUIET_AFTER: f64 = 1.2;
+    /// Paths the spotter keeps open while decoding (sherpa-onnx's default is
+    /// 4): wider finds blurred, fast speech (on the user's session, with the
+    /// gain below: 4 → 18 takes, 16 → 25).
+    const PATHS: i32 = 16;
+    /// Automatic gain: the voice's recent peak (falling off over
+    /// [`GAIN_FALL`] seconds) is brought up to this, never turned down, at
+    /// most [`GAIN_MAX`] times. Quiet microphones were heard far worse (the
+    /// user's peaks at −16 dB: ×4–8 caught 17–18 takes instead of 15).
+    const GAIN_TARGET: f32 = 0.5;
+    const GAIN_MAX: f32 = 32.0;
+    const GAIN_FALL: f32 = 2.0;
+    /// The model's rate: sound is brought to it here (48 kHz in from the
+    /// mixer), rather than by the engine (which logs about it).
+    const MODEL_RATE: u32 = 16_000;
     /// How readily a part is taken (sherpa-onnx's boosting score and trigger
     /// threshold): the best of a sweep over 30 takes of the user (1.5/0.2
     /// caught 10, 2.0/0.15 15, 2.5/0.1 14), with no near miss firing two parts.
@@ -204,6 +219,7 @@ mod spotting {
                 config.model_config.num_threads = 1;
                 config.keywords_score = SCORE;
                 config.keywords_threshold = THRESHOLD;
+                config.max_active_paths = PATHS;
                 config.keywords_buf = Some(keywords.to_owned());
                 KeywordSpotter::create(&config).ok_or_else(|| "the voice model didn't load".to_owned())
             };
@@ -228,6 +244,10 @@ mod spotting {
         /// `HESTECLIPS_DEBUG_VOICE=1`: the loudest sample since the level was
         /// last logged, and when that was.
         peak: f32,
+        /// The automatic gain's level (the recent peak).
+        level: f32,
+        /// The last input samples, for the 48 → 16 kHz filter.
+        tail: Vec<f32>,
         logged_at: f64,
         /// `HESTECLIPS_VOICE_DUMP=<file.wav>`: everything heard, kept to
         /// replay through the tests (written when listening stops).
@@ -274,7 +294,7 @@ mod spotting {
         fn new(spotters: &Spotters, mic: String, sound: Receiver<Vec<f32>>) -> Self {
             let streams = spotters.parts.iter().map(KeywordSpotter::create_stream).collect();
             let dump = std::env::var_os("HESTECLIPS_VOICE_DUMP").map(|p| (std::path::PathBuf::from(p), Vec::new()));
-            Self { mic, sound, streams, clock: 0.0, heard_at: [None; 3], said_at: None, peak: 0.0, logged_at: 0.0, dump }
+            Self { mic, sound, streams, clock: 0.0, heard_at: [None; 3], said_at: None, peak: 0.0, level: 0.0, tail: Vec::new(), logged_at: 0.0, dump }
         }
 
         /// Take the sound that's come in (waiting a little for some); whether
@@ -284,6 +304,39 @@ mod spotting {
             let mut samples = block;
             samples.extend(self.sound.try_iter().flatten());
             self.hear(spotters, &samples, RATE)
+        }
+
+        /// Sound as the model wants it: at its rate (48 kHz is filtered and
+        /// taken every third sample), and with the automatic gain.
+        fn prepare(&mut self, samples: &[f32], rate: u32) -> (Vec<f32>, u32) {
+            let (mut out, rate) = if rate == MODEL_RATE * 3 {
+                // Low-pass below the new rate's limit, then every third sample.
+                let taps = decimation_filter();
+                let mut all = std::mem::take(&mut self.tail);
+                all.extend_from_slice(samples);
+                let mut out = Vec::with_capacity(samples.len() / 3 + 1);
+                // One output per three inputs, while the filter fits; the rest
+                // (the filter's length, less) waits for the next call.
+                let mut i = 0;
+                while i + taps.len() <= all.len() {
+                    out.push(taps.iter().zip(&all[i..]).map(|(t, s)| t * s).sum());
+                    i += 3;
+                }
+                self.tail = all[i..].to_vec();
+                (out, MODEL_RATE)
+            } else {
+                (samples.to_vec(), rate)
+            };
+            let fall = (-1.0 / (GAIN_FALL * rate as f32)).exp();
+            for chunk in out.chunks_mut((rate / 100).max(1) as usize) {
+                let peak = chunk.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+                self.level = (self.level * fall.powi(chunk.len() as i32)).max(peak).max(1e-4);
+                let gain = (GAIN_TARGET / self.level).clamp(1.0, GAIN_MAX);
+                for s in chunk.iter_mut() {
+                    *s = (*s * gain).clamp(-1.0, 1.0);
+                }
+            }
+            (out, rate)
         }
 
         /// Listen to `samples` (mono, at `rate`); whether the whole phrase was
@@ -305,9 +358,10 @@ mod spotting {
                     (self.peak, self.logged_at) = (0.0, self.clock);
                 }
             }
+            let (samples, rate) = self.prepare(samples, rate);
             let mut said = false;
             for (part, (spotter, stream)) in spotters.parts.iter().zip(&self.streams).enumerate() {
-                stream.accept_waveform(rate as i32, samples);
+                stream.accept_waveform(rate as i32, &samples);
                 while spotter.is_ready(stream) {
                     spotter.decode(stream);
                     let Some(hit) = spotter.get_result(stream) else { continue };
@@ -337,6 +391,27 @@ mod spotting {
         }
     }
 
+    /// A 48 → 16 kHz low-pass: a windowed sinc cutting off at 7 kHz, below
+    /// the 8 kHz the new rate can hold.
+    fn decimation_filter() -> &'static [f32] {
+        static TAPS: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
+        TAPS.get_or_init(|| {
+            let n = 49;
+            let cutoff = 7_000.0 / (MODEL_RATE * 3) as f32;
+            let mid = (n - 1) as f32 / 2.0;
+            let taps: Vec<f32> = (0..n)
+                .map(|i| {
+                    let x = i as f32 - mid;
+                    let sinc = if x == 0.0 { 2.0 * cutoff } else { (2.0 * std::f32::consts::PI * cutoff * x).sin() / (std::f32::consts::PI * x) };
+                    let window = 0.54 - 0.46 * (2.0 * std::f32::consts::PI * i as f32 / (n - 1) as f32).cos();
+                    sinc * window
+                })
+                .collect();
+            let sum: f32 = taps.iter().sum();
+            taps.into_iter().map(|t| t / sum).collect()
+        })
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -355,6 +430,12 @@ mod spotting {
                 ("I love this game, let's go again", false),
                 ("hashtag blessed, clip it later", false),
                 ("has the clip that we made been saved yet", false),
+                ("can you clip that for me", false),
+                ("that was a nice clip", false),
+                ("hashtag gaming", false),
+                ("check the hashtag on twitter", false),
+                ("stag party this weekend", false),
+                ("he has to clip through the wall", false),
             ] {
                 let file = dir.join("speech.wav");
                 speak(text, &file);
