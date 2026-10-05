@@ -277,13 +277,9 @@ fn open_reader(device: &str, format: Option<crate::webcam::Format>) -> Result<(I
         // per thing you'd tell apart.
         list.dedup_by(|a, b| a.label() == b.label());
         crate::webcam::set_formats(device, list);
-        let auto_key = |f: &crate::webcam::Format| {
-            let fits = f.width * f.height <= 1920 * 1080;
-            (fits && f.fps() >= 29.5, fits, f.width * f.height, (f.fps() * 100.0) as u32)
-        };
         let chosen = format
             .and_then(|want| offered.iter().find(|(f, _)| *f == want).or_else(|| offered.iter().find(|(f, _)| f.label() == want.label())))
-            .or_else(|| offered.iter().max_by_key(|(f, _)| auto_key(f)));
+            .or_else(|| offered.iter().max_by_key(|(f, _)| f.auto_rank()));
         let (chosen, native) = chosen.context("the camera offers no usable format")?;
         let (width, height) = (chosen.width, chosen.height);
         reader.SetCurrentMediaType(STREAM, None, native)?;

@@ -581,7 +581,8 @@ fn overlay_rects(p: crate::webcam::Placement, (cw, ch): (u32, u32), width: u32, 
         let (a, b) = if flip { (s1 - t1 * span, s1 - t0 * span) } else { (s0 + t0 * span, s0 + t1 * span) };
         Some((v0, v1, a, b))
     };
-    let [cl, ct, cr, cb] = p.crop;
+    // Never stretched: the camera's picture fills the box with its own shape.
+    let [cl, ct, cr, cb] = p.fill_crop((cw, ch), (width, height));
     let (dx0, dx1, sx0, sx1) = axis(p.x * fw, (p.x + p.w) * fw, fw, cl * cw as f32, (1.0 - cr) * cw as f32, p.flip_h)?;
     let (dy0, dy1, sy0, sy1) = axis(p.y * fh, (p.y + p.h) * fh, fh, ct * ch as f32, (1.0 - cb) * ch as f32, p.flip_v)?;
     let r = |a: f32, b: f32, c: f32, d: f32| RECT { left: a.round() as i32, top: b.round() as i32, right: c.round() as i32, bottom: d.round() as i32 };
@@ -771,6 +772,9 @@ mod overlay_tests {
         assert_eq!((d.left, d.right), (1680, 1920));
         // Visible camera is 320..1280; half of it shows.
         assert_eq!((s.left, s.right), (320, 800));
+        // Never stretched: the 960x720 left after the crop is 4:3, the box
+        // 16:9, so rows are trimmed to 540, centred.
+        assert_eq!((s.top, s.bottom), (90, 630));
         assert!(overlay_rects(Placement { x: 1.2, ..p }, (1280, 720), 1920, 1080).is_none());
         // Flipped, the frame's right edge cuts the camera's left side instead:
         // the visible half is the crop's left half, 320..800 → mirrored → 800..1280.

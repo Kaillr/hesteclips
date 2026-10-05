@@ -3,7 +3,7 @@
 //! Args are sources: `mic:<device>`, `desktop`, `desktop-excl` (desktop minus app
 //! sources), `app:<bundle id or exe>`. Append `@mix`, `@track` to limit where it
 //! goes (default both). Env: REPLAY=1, SECS=n, EXT=mov, HEIGHT=n (0 = native),
-//! FPS=n, SOFTWARE=1, SCREEN=<id>, APP=<exe>[,<exe>…] (record those apps' windows,
+//! FPS=n, SOFTWARE=1, SCREEN=<id>, WEBCAM=<id|1>, WEBCAM_FORMAT=WxH, APP=<exe>[,<exe>…] (record those apps' windows,
 //! following focus).
 use capture::sources::{AudioSource, SourceKind};
 use capture::{EncodeSettings, Mode, mixer::LiveAudio};
@@ -60,7 +60,11 @@ fn main() -> anyhow::Result<()> {
             } else {
                 device
             },
-            format: None,
+            // WEBCAM_FORMAT=WxH: that format (any rate it offers).
+            format: env("WEBCAM_FORMAT").and_then(|f| {
+                let (w, h) = f.split_once('x')?;
+                Some(capture::webcam::Format { width: w.parse().ok()?, height: h.parse().ok()?, fps_num: 30, fps_den: 1 })
+            }),
             placement: std::sync::Arc::new(std::sync::Mutex::new(capture::webcam::Placement::default_for(16.0 / 9.0, 16.0 / 9.0))),
         }),
         sources: sources.clone(),

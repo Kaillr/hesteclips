@@ -183,14 +183,10 @@ fn open_session(feed: &Arc<CameraFeed>) -> Result<(Retained<AVCaptureSession>, R
     let offered = formats_of(&device);
     set_formats(&feed.device, offered.iter().map(|(f, ..)| *f).collect());
     // The format asked for, else the biggest up to 1080p that does at least 30 fps.
-    let auto_key = |f: &Format| {
-        let fits = f.width * f.height <= 1920 * 1080;
-        (fits && f.fps() >= 29.5, fits, f.width * f.height, (f.fps() * 100.0) as u32)
-    };
     let chosen = feed
         .format
         .and_then(|want| offered.iter().find(|(f, ..)| *f == want).or_else(|| offered.iter().find(|(f, ..)| f.label() == want.label())))
-        .or_else(|| offered.iter().max_by_key(|(f, ..)| auto_key(f)));
+        .or_else(|| offered.iter().max_by_key(|(f, ..)| f.auto_rank()));
     let (chosen, device_format, duration) = chosen.context("the camera offers no usable format")?;
 
     unsafe {
@@ -290,4 +286,10 @@ impl CameraLayer {
         }
         self.feed.as_ref()?.latest()
     }
+}
+
+/// The newest picture's size, from the open camera.
+pub(crate) fn frame_size() -> Option<(usize, usize)> {
+    let f = CURRENT.lock().unwrap().clone()?.latest()?;
+    Some((objc2_core_video::CVPixelBufferGetWidth(&f.buffer), objc2_core_video::CVPixelBufferGetHeight(&f.buffer)))
 }

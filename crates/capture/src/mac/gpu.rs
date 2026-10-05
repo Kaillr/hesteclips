@@ -187,7 +187,8 @@ fn overlay_rects(p: Placement, (cw, ch): (u32, u32), width: u32, height: u32) ->
         let (a, b) = if flip { (s1 - t0 * span, s1 - t1 * span) } else { (s0 + t0 * span, s0 + t1 * span) };
         Some((v0, v1, a, b))
     };
-    let [cl, ct, cr, cb] = p.crop;
+    // Never stretched: the camera's picture fills the box with its own shape.
+    let [cl, ct, cr, cb] = p.fill_crop((cw, ch), (width, height));
     let (dx0, dx1, sx0, sx1) = axis(p.x * fw, (p.x + p.w) * fw, fw, cl * cw as f32, (1.0 - cr) * cw as f32, p.flip_h)?;
     let (dy0, dy1, sy0, sy1) = axis(p.y * fh, (p.y + p.h) * fh, fh, ct * ch as f32, (1.0 - cb) * ch as f32, p.flip_v)?;
     Some(Overlay { dest: [dx0, dy0, dx1, dy1], src: [sx0, sy0, sx1, sy1] })

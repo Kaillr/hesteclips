@@ -30,8 +30,24 @@ pub(crate) struct WebcamView {
     cameras: Vec<capture::Device>,
     /// A drag in progress: what's held, where it started, and the placement then.
     drag: Option<(Handle, Pos2, Placement)>,
-    /// Just added: size its box to the camera's shape once that's known.
+    /// Just added, or a new camera or format: size its box to the camera's
+    /// shape once the camera delivers it.
     fit_pending: bool,
+    /// The camera's size when that was asked for: until it changes, the
+    /// camera is still the old one (it takes a moment to reopen), and fitting
+    /// to it would shape the box for the format just left.
+    fit_from: Option<(u32, u32)>,
+}
+
+impl WebcamView {
+    /// Fit the box to the camera's shape once the camera reopens.
+    fn ask_fit(&mut self) {
+        self.fit_pending = true;
+        self.fit_from = match capture::webcam::status() {
+            Status::Live { width, height } => Some((width, height)),
+            _ => None,
+        };
+    }
 }
 
 /// What part of the webcam's box is being dragged.
@@ -231,12 +247,27 @@ impl App {
         // Just added, or a new camera or format: once its shape is known, give
         // the box that shape (same width, same top-left; crop kept).
         if self.webcam_view.fit_pending {
-            if let (Status::Live { width, height }, Some(w)) = (&status, self.settings.webcam.as_mut()) {
+            let live = match &status {
+                Status::Live { width, height } => Some((*width, *height)),
+                _ => None,
+            };
+            let wanted = self.settings.webcam.as_ref().and_then(|w| w.format).map(|f| (f.width, f.height));
+            // The new camera or format is open: its size is the one asked
+            // for, or (Automatic, another camera) not the one before.
+            let reopened = live.is_some_and(|l| match wanted {
+                Some(want) => l == want,
+                None => Some(l) != self.webcam_view.fit_from,
+            });
+            if !reopened {
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
+            }
+            if let (true, Status::Live { width, height }, Some(w)) = (reopened, &status, self.settings.webcam.as_mut()) {
                 let camera_aspect = *width as f32 / (*height).max(1) as f32;
                 let p = &mut w.placement;
                 let visible = (1.0 - p.crop[0] - p.crop[2]).max(0.05) / (1.0 - p.crop[1] - p.crop[3]).max(0.05);
                 p.h = p.w * frame_aspect / (camera_aspect * visible);
                 self.webcam_view.fit_pending = false;
+                self.webcam_view.fit_from = None;
             }
         }
 
@@ -297,7 +328,7 @@ impl App {
                                     placement: Placement::default_for(16.0 / 9.0, frame_aspect).into(),
                                     enabled: true,
                                 });
-                                self.webcam_view.fit_pending = true;
+                                self.webcam_view.ask_fit();
                                 ui.close();
                             }
                         }
@@ -333,7 +364,7 @@ impl App {
                                     w.name = c.name;
                                     w.format = None; // that camera's own formats
                                 }
-                                self.webcam_view.fit_pending = true;
+                                self.webcam_view.ask_fit();
                             }
                         }
                     });
@@ -358,7 +389,7 @@ impl App {
                                     if let Some(w) = self.settings.webcam.as_mut() {
                                         w.format = None;
                                     }
-                                    self.webcam_view.fit_pending = true;
+                                    self.webcam_view.ask_fit();
                                 }
                                 if formats.is_empty() {
                                     ui.weak("The camera's formats show once it's open.");
@@ -368,7 +399,7 @@ impl App {
                                         if let Some(w) = self.settings.webcam.as_mut() {
                                             w.format = Some(f.into());
                                         }
-                                        self.webcam_view.fit_pending = true;
+                                        self.webcam_view.ask_fit();
                                     }
                                 }
                             })
