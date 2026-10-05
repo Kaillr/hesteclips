@@ -16,7 +16,6 @@ mod discord;
 mod editor;
 mod export_ui;
 mod filmstrip;
-mod game_icons;
 mod logfile;
 mod games;
 mod library;
@@ -41,6 +40,7 @@ mod update;
 mod gpu_frames;
 #[cfg(hw_decode)]
 mod video;
+mod web_images;
 mod viewer;
 mod waveform;
 mod wheel;
@@ -340,7 +340,8 @@ struct App {
     library_stamp: Vec<Option<SystemTime>>,
     /// Which of the library's folders (games) the library shows.
     pub(crate) library_filter: library::Filter,
-    pub(crate) game_icons: game_icons::GameIcons,
+    /// Games' icons and the HesteFiles profile picture.
+    pub(crate) web_images: web_images::WebImages,
     pub(crate) updater: update::Updater,
     pub(crate) presence: discord::Presence,
     /// Saves a clip as Save clip is pressed, frames or not.
@@ -445,7 +446,7 @@ impl App {
             last_poll: None,
             library_stamp: Vec::new(),
             library_filter: library::Filter::All,
-            game_icons: Default::default(),
+            web_images: Default::default(),
             updater,
             presence: discord::Presence::new(),
             clipped_game: None,

@@ -470,7 +470,7 @@ impl App {
     fn folder_icon(&mut self, ctx: &egui::Context, folder: &str) -> Option<egui::TextureHandle> {
         let game = self.settings.game_folders.iter().find(|(_, f)| *f == folder).map_or(folder, |(game, _)| game.as_str());
         let url = crate::discord::game_for_folder(game)?.icon?;
-        self.game_icons.get(ctx, &url)
+        self.web_images.icon(ctx, &url)
     }
 
     /// Move clips to another folder of the library (`None`: the library

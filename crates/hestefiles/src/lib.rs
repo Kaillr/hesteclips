@@ -50,6 +50,10 @@ pub struct UserInfo {
     pub username: String,
     /// An address, or the literal `"No email"`.
     pub email: String,
+    /// Where their profile picture is (maybe relative to the site: see
+    /// [`Client::url`]).
+    #[serde(default, alias = "profile_picture_url", alias = "pfp_url")]
+    pub profile_pic_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -163,6 +167,17 @@ impl Client {
 
     pub fn token(&self) -> &str {
         &self.token
+    }
+
+    /// A full address for one the server gave, which may be relative to the
+    /// site (`/static/…`).
+    pub fn url(&self, href: &str) -> String {
+        if href.starts_with("http://") || href.starts_with("https://") {
+            href.to_owned()
+        } else {
+            let site = self.base_url.trim_end_matches("/rest");
+            format!("{site}/{}", href.trim_start_matches('/'))
+        }
     }
 
     /// Check the token and return who it belongs to.

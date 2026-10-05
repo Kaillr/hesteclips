@@ -40,8 +40,17 @@ impl App {
                         format!("expires {}", token.expires)
                     };
                     let mut disconnect = false;
+                    let picture = self.cloud.profile_picture().and_then(|url| self.web_images.fresh(ui.ctx(), &url));
                     ui.horizontal(|ui| {
-                        ui.colored_label(egui::Color32::from_rgb(90, 190, 110), "●");
+                        match &picture {
+                            // Round, as HesteFiles shows it.
+                            Some(tex) => {
+                                ui.add(egui::Image::from_texture((tex.id(), egui::vec2(24.0, 24.0))).corner_radius(12));
+                            }
+                            None => {
+                                ui.colored_label(egui::Color32::from_rgb(90, 190, 110), "●");
+                            }
+                        }
                         ui.label(format!("Connected as {}", user.username));
                         ui.weak(format!("· token “{}”, {expires}", token.name));
                         disconnect = ui.small_button("Disconnect").clicked();

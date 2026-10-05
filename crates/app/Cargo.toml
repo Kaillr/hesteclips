@@ -24,7 +24,7 @@ epaint_default_fonts = "0.36"
 egui = "0.36.1"
 global-hotkey = "0.8.0"
 hestefiles = { path = "../hestefiles" }
-image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
 media = { path = "../media" }
 raw-window-handle = "0.6"

@@ -1,11 +1,13 @@
-//! Games' pictures for the library's folders, from Discord: downloaded once,
-//! kept in the cache folder, and turned into small textures.
+//! Small pictures from the web — games' icons (from Discord) for the library's
+//! folders, your HesteFiles profile picture — downloaded on a thread and
+//! turned into textures. Game icons are kept in the cache folder; they never
+//! change at their address.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
-/// Side of the texture, in pixels: enough for a chip's icon on a 2× display.
+/// Side of the texture, in pixels: enough for a 32 px picture on a 2× display.
 const SIZE: u32 = 64;
 
 enum Slot {
@@ -14,18 +16,29 @@ enum Slot {
 }
 
 #[derive(Default)]
-pub struct GameIcons {
+pub struct WebImages {
     by_url: HashMap<String, Slot>,
 }
 
-impl GameIcons {
-    /// The picture at `url`, once it's loaded; asks for it the first time.
-    pub fn get(&mut self, ctx: &egui::Context, url: &str) -> Option<egui::TextureHandle> {
+impl WebImages {
+    /// A game's icon at `url`, once it's loaded (from the cache folder after the
+    /// first time); asks for it the first time.
+    pub fn icon(&mut self, ctx: &egui::Context, url: &str) -> Option<egui::TextureHandle> {
+        self.get(ctx, url, true)
+    }
+
+    /// The picture at `url`, downloaded once per run (it may change at the
+    /// same address, as a profile picture does).
+    pub fn fresh(&mut self, ctx: &egui::Context, url: &str) -> Option<egui::TextureHandle> {
+        self.get(ctx, url, false)
+    }
+
+    fn get(&mut self, ctx: &egui::Context, url: &str, keep: bool) -> Option<egui::TextureHandle> {
         let slot = self.by_url.entry(url.to_owned()).or_insert_with(|| {
             let cell = Arc::new(OnceLock::new());
             let (done, url, ctx) = (cell.clone(), url.to_owned(), ctx.clone());
             std::thread::spawn(move || {
-                let _ = done.set(load(&url));
+                let _ = done.set(load(&url, keep));
                 ctx.request_repaint();
             });
             Slot::Loading(cell)
@@ -33,7 +46,7 @@ impl GameIcons {
         if let Slot::Loading(cell) = slot
             && let Some(image) = cell.get()
         {
-            let texture = image.clone().map(|img| ctx.load_texture(format!("game-icon-{url}"), img, egui::TextureOptions::LINEAR));
+            let texture = image.clone().map(|img| ctx.load_texture(format!("web-image-{url}"), img, egui::TextureOptions::LINEAR));
             *slot = Slot::Ready(texture);
         }
         match slot {
@@ -43,9 +56,9 @@ impl GameIcons {
     }
 }
 
-/// From the cache, else downloaded (and cached).
-fn load(url: &str) -> Option<egui::ColorImage> {
-    let cached = cache_path(url);
+/// From the cache (when `keep`), else downloaded (and cached, when `keep`).
+fn load(url: &str, keep: bool) -> Option<egui::ColorImage> {
+    let cached = keep.then(|| cache_path(url)).flatten();
     let bytes = match cached.as_ref().and_then(|p| std::fs::read(p).ok()) {
         Some(bytes) => bytes,
         None => {

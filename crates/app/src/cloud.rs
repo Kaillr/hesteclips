@@ -212,6 +212,13 @@ impl Cloud {
         cloud
     }
 
+    /// Where the connected account's profile picture is.
+    pub fn profile_picture(&self) -> Option<String> {
+        let (Connection::Connected(account), Some(client)) = (&self.connection, &self.client) else { return None };
+        let href = account.user_info.profile_pic_url.as_deref().filter(|h| !h.trim().is_empty())?;
+        Some(client.url(href))
+    }
+
     pub fn is_connected(&self) -> bool {
         matches!(self.connection, Connection::Connected(_))
     }
