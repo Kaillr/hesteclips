@@ -177,6 +177,11 @@ impl Decoder {
         Self::open_with(path, width, share_on, std::env::var_os("HESTECLIPS_NO_DIRECT_DECODE").is_none())
     }
 
+    /// Frames at `width` wide, back on the CPU as RGBA (thumbnails, scrub frames).
+    pub fn open_rgba(path: &Path, width: u32) -> Result<Self> {
+        Self::open(path, width, None)
+    }
+
     /// [`Self::open`], feeding the decoder directly; an error if the file
     /// can't be read that way.
     pub fn open_direct(path: &Path, width: u32, share_on: Option<u64>) -> Result<Self> {

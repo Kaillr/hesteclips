@@ -29,9 +29,9 @@ mod sources_ui;
 mod store;
 mod thumbs;
 mod update;
-#[cfg(windows)]
+#[cfg(hw_decode)]
 mod gpu_frames;
-#[cfg(windows)]
+#[cfg(hw_decode)]
 mod video;
 mod viewer;
 mod waveform;
@@ -79,7 +79,7 @@ fn main() -> eframe::Result<()> {
         "HesteClips",
         options,
         Box::new(|cc| {
-            #[cfg(windows)]
+            #[cfg(hw_decode)]
             gpu_frames::init(cc.wgpu_render_state.as_ref());
             Ok(Box::new(App::new(cc.egui_ctx.clone())))
         }),

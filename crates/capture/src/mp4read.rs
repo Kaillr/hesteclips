@@ -1,10 +1,11 @@
 //! Reading an MP4's index: where each video frame's bytes are, which frames
 //! are keyframes, and the decoder's setup (SPS/PPS), so a frame can be handed
-//! straight to the decoder without Media Foundation's file reader (whose
-//! seek costs ~30 ms of a ~40 ms jump).
+//! straight to the decoder without a file reader in between: on Windows,
+//! Media Foundation's (whose seek costs ~30 ms of a ~40 ms jump); on macOS
+//! AVFoundation's, which can't hand frames to our own decoder at all.
 //!
 //! Only what H.264 video in a plain (not fragmented) MP4 needs; anything
-//! else is an error, and the caller falls back to the file reader.
+//! else is an error, and the caller falls back to another way.
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -30,9 +31,15 @@ pub struct Index {
     /// In decode order.
     pub samples: Vec<Sample>,
     /// Bytes in each NAL unit's length prefix.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub nal_length: usize,
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub sps: Vec<Vec<u8>>,
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub pps: Vec<Vec<u8>>,
+    /// The `avcC` box's body as stored: what a decoder setup takes whole.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub avcc: Vec<u8>,
     /// The colour matrix the file states (`colr` box, ISO 23091-2 numbers:
     /// 1 BT.709, 5/6 BT.601), if it does.
     pub matrix: Option<u16>,
@@ -156,7 +163,7 @@ fn parse_video(mdia: &[u8]) -> Result<Index> {
             key: keys.as_ref().is_none_or(|k| k.binary_search(&(i as u32 + 1)).is_ok()),
         })
         .collect();
-    Ok(Index { width, height, timescale, samples, nal_length, sps, pps, matrix })
+    Ok(Index { width, height, timescale, samples, nal_length, sps, pps, avcc: avcc.to_vec(), matrix })
 }
 
 /// A top-level box's body, read into memory.

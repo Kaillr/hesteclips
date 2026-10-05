@@ -4,9 +4,9 @@
 //! and mixed live in the cpal callback at the current gains, so moving a slider is
 //! heard instantly. The playhead is however many samples the callback has played.
 //!
-//! Video follows the clock. On Windows it comes from the in-process hardware
-//! decoder (`video.rs`), which keeps the next frames decoded so play starts at
-//! once; if that can't open a file (or elsewhere), an ffmpeg process streams
+//! Video follows the clock. On Windows and macOS it comes from the in-process
+//! hardware decoder (`video.rs`), which keeps the next frames decoded so play
+//! starts at once; if that can't open a file (or elsewhere), an ffmpeg process streams
 //! scaled RGBA frames from the playhead onward, and single exact frames are
 //! decoded on demand when paused. Either way the UI shows whichever decoded
 //! frame matches the clock. While scrubbing, frames come from the in-memory
@@ -23,19 +23,19 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use media::{ClipInfo, PREVIEW_RATE, TrackEdit};
 
 use crate::proxy::Proxy;
-#[cfg(windows)]
-use capture::win::decode::Picture;
-#[cfg(windows)]
+#[cfg(hw_decode)]
+use capture::decode::Picture;
+#[cfg(hw_decode)]
 use crate::video::Video;
-#[cfg(not(windows))]
+#[cfg(not(hw_decode))]
 struct Picture {
     index: u64,
 }
 
 /// Elsewhere there's no in-process decoder yet: a type with no values.
-#[cfg(not(windows))]
+#[cfg(not(hw_decode))]
 enum Video {}
-#[cfg(not(windows))]
+#[cfg(not(hw_decode))]
 impl Video {
     fn failed(&self) -> bool { match *self {} }
     fn show(&self, _: u64) { match *self {} }
@@ -96,7 +96,7 @@ enum Display {
     /// An uploaded image: scrub proxy frames, frames that came back to the CPU.
     Image(egui::TextureId, egui::Vec2),
     /// A decoded frame on the GPU, drawn with the sharp filter.
-    #[cfg(windows)]
+    #[cfg(hw_decode)]
     Gpu(crate::gpu_frames::Shown, egui::Vec2),
 }
 
@@ -104,7 +104,7 @@ impl Display {
     fn size(&self) -> egui::Vec2 {
         match self {
             Display::Image(_, s) => *s,
-            #[cfg(windows)]
+            #[cfg(hw_decode)]
             Display::Gpu(_, s) => *s,
         }
     }
@@ -152,7 +152,7 @@ pub struct Player {
     /// still be drawing them, and the decoder reuses a released texture.
     retired: std::collections::VecDeque<(u64, Picture)>,
     /// GPU frames opened for drawing (see `gpu_frames.rs`).
-    #[cfg(windows)]
+    #[cfg(hw_decode)]
     gpu_frames: crate::gpu_frames::Frames,
     shown_frame: Option<u64>,
     decoder: Option<FrameStream>,
@@ -229,7 +229,7 @@ impl Player {
             display: None,
             on_screen: None,
             retired: Default::default(),
-            #[cfg(windows)]
+            #[cfg(hw_decode)]
             gpu_frames: Default::default(),
             shown_frame: None,
             decoder: None,
@@ -349,7 +349,7 @@ impl Player {
     pub fn update(&mut self, ctx: &egui::Context, scrubbing: bool) -> Option<egui::Vec2> {
         self.proxy.set_focus(self.info.frame_index(self.time()));
         self.shared.scrubbing.store(scrubbing && !self.sound_playing(), Ordering::Relaxed);
-        #[cfg(windows)]
+        #[cfg(hw_decode)]
         if scrubbing && self.proxy_progress() < 1.0 {
             crate::video::scrubbing();
         }
@@ -417,7 +417,7 @@ impl Player {
     pub fn paint(&self, ui: &egui::Ui, rect: egui::Rect) {
         match &self.display {
             Some(Display::Image(id, _)) => egui::Image::from_texture((*id, rect.size())).paint_at(ui, rect),
-            #[cfg(windows)]
+            #[cfg(hw_decode)]
             Some(Display::Gpu(shown, _)) => shown.paint(ui, rect),
             None => {}
         }
@@ -454,9 +454,9 @@ impl Player {
                 if last.is_none_or(|t| t.elapsed().as_secs_f64() >= 1.0) {
                     *last = Some(std::time::Instant::now());
                     PASSES.store(0, std::sync::atomic::Ordering::Relaxed);
-                    #[cfg(not(windows))]
+                    #[cfg(not(hw_decode))]
                     let _ = passes;
-                    #[cfg(windows)]
+                    #[cfg(hw_decode)]
                     trace!("playing: want {want}, showing {:?}, ahead {:?}, {passes} redraws/s, last frame {:.1} ms", self.shown_frame, v.ahead_info(), ctx.input(|i| i.unstable_dt) * 1000.0);
                 }
             }
@@ -525,7 +525,7 @@ impl Player {
                 self.shown_count = None;
             }
         }
-        #[cfg(windows)]
+        #[cfg(hw_decode)]
         {
             // On the GPU: draw its texture as it is.
             let on_gpu = p.gpu.as_ref().and_then(|s| self.gpu_frames.show(s, p.width, p.height));
@@ -538,7 +538,7 @@ impl Player {
                 None => self.set_texture(ctx, crate::video::to_image(p)),
             }
         }
-        #[cfg(not(windows))]
+        #[cfg(not(hw_decode))]
         let _ = (ctx, p);
         self.shown_frame = Some(idx);
         self.showing_proxy = false;
@@ -596,10 +596,10 @@ impl Player {
     }
 }
 
-/// The hardware decoder for `source`, on Windows (unless
+/// The hardware decoder for `source`, on Windows and macOS (unless
 /// `HESTECLIPS_NO_HW_DECODE` is set, to compare with the ffmpeg path).
 fn open_video(ctx: &egui::Context, source: &Path, fps: f64) -> Option<Video> {
-    #[cfg(windows)]
+    #[cfg(hw_decode)]
     if std::env::var_os("HESTECLIPS_NO_HW_DECODE").is_none() {
         return Some(Video::open(ctx, source, fps));
     }

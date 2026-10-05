@@ -726,6 +726,7 @@ dependencies = [
  "objc2-core-media",
  "objc2-core-video",
  "objc2-foundation 0.3.2",
+ "objc2-io-surface",
  "objc2-screen-capture-kit",
  "objc2-video-toolbox",
  "rubato",
@@ -2172,6 +2173,7 @@ name = "hesteclips"
 version = "0.1.0"
 dependencies = [
  "ab_glyph",
+ "anyhow",
  "bytemuck",
  "capture",
  "chrono",
@@ -2188,10 +2190,15 @@ dependencies = [
  "hestefiles",
  "image",
  "keyring",
+ "libc",
  "media",
+ "naga",
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",
+ "objc2-io-surface",
+ "objc2-metal 0.3.2",
+ "pollster 1.0.1",
  "raw-window-handle",
  "rfd",
  "serde",
@@ -3246,6 +3253,7 @@ dependencies = [
  "block2 0.6.2",
  "objc2 0.6.4",
  "objc2-foundation 0.3.2",
+ "objc2-io-surface",
 ]
 
 [[package]]

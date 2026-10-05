@@ -14,6 +14,8 @@ pub mod audio;
 mod avwriter;
 pub mod mixer;
 pub mod mp4meta;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub(crate) mod mp4read;
 #[cfg(any(target_os = "windows", test))]
 mod mp4mux;
 pub mod output;
@@ -22,6 +24,8 @@ pub mod webcam;
 pub mod sources;
 
 #[cfg(target_os = "macos")]
+pub mod mac;
+#[cfg(target_os = "macos")]
 pub mod macos;
 #[cfg(target_os = "macos")]
 pub mod sck;
@@ -29,6 +33,12 @@ pub mod sck;
 pub mod win;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod writer;
+
+/// The in-process hardware video decoder, for playback (same API on both).
+#[cfg(target_os = "macos")]
+pub use mac::decode;
+#[cfg(target_os = "windows")]
+pub use win::decode;
 
 #[cfg(target_os = "macos")]
 pub use sck::SckRecorder;

@@ -21,7 +21,7 @@ use anyhow::{Context, Result, bail};
 use windows::Win32::Media::MediaFoundation::*;
 use windows::core::Interface;
 
-use super::mp4read::Index;
+use crate::mp4read::Index;
 
 /// Media Foundation's time unit: 100 ns.
 const UNITS: i64 = 10_000_000;

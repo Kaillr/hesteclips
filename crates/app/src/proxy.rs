@@ -6,8 +6,8 @@
 //! move. Frames arrive in order while it builds, so the start of the clip is
 //! scrubbable almost immediately.
 //!
-//! On Windows the pass uses the GPU's video decoder (`capture::win::decode`)
-//! and the CPU only compresses the small frames, on low-priority threads, at
+//! On Windows and macOS the pass uses the GPU's video decoder
+//! (`capture::decode`) and the CPU only compresses the small frames, on low-priority threads, at
 //! full speed even while the clip plays (playback still gets every frame:
 //! tested; slowing down left most of a long clip unscrubbable for a minute). It used
 //! to be an ffmpeg process decoding every full-size frame in software on every
@@ -137,7 +137,7 @@ static BUILDS: Mutex<Option<HashMap<u64, Weak<Build>>>> = Mutex::new(None);
 
 /// While anyone watches a build, background builds wait (the decoder is
 /// theirs, and the CPU mostly is).
-#[cfg(windows)]
+#[cfg(hw_decode)]
 fn anyone_watching() -> bool {
     let builds = BUILDS.lock().unwrap();
     builds.as_ref().is_some_and(|m| m.values().filter_map(Weak::upgrade).any(|b| b.watched() && !b.done.load(Ordering::Relaxed)))
@@ -193,7 +193,7 @@ fn start(ctx: &egui::Context, b: &Arc<Build>) {
             return;
         }
     }
-    #[cfg(windows)]
+    #[cfg(hw_decode)]
     if std::env::var_os("HESTECLIPS_NO_HW_DECODE").is_none() && hw::build(ctx, b) {
         return;
     }
@@ -369,12 +369,12 @@ fn split_jpegs(mut r: impl Read, frames: &Mutex<Store>, ctx: &egui::Context) {
 }
 
 /// The proxy from the GPU's video decoder.
-#[cfg(windows)]
+#[cfg(hw_decode)]
 mod hw {
     use super::*;
     use std::sync::mpsc;
 
-    use capture::win::decode::{Decoder, Picture};
+    use capture::decode::{Decoder, Picture};
 
 
     /// Threads compressing frames (the slow part, 6-10 ms a frame at quality
@@ -392,7 +392,7 @@ mod hw {
             eprintln!("{:>8.3} scrub proxy: opening the decoder", crate::player::uptime());
         }
         // Open here, so a clip the decoder can't read falls back to ffmpeg.
-        let mut dec = match Decoder::open(source, width_for(total), None) {
+        let mut dec = match Decoder::open_rgba(source, width_for(total)) {
             Ok(d) => d,
             Err(e) => {
                 eprintln!("scrub proxy: hardware decoder unavailable, using ffmpeg: {e:#}");
@@ -410,7 +410,7 @@ mod hw {
         let bd = b.clone();
         std::thread::spawn(move || {
             let (stop_d, focus) = (&bd.stop, &bd.focus);
-            lower_priority();
+            crate::video::lower_priority();
             let chunks = total.div_ceil(CHUNK);
             let mut built = vec![false; chunks];
             let mut seq = 0u64;
@@ -495,7 +495,7 @@ mod hw {
         for k in 0..encoders {
             let (jobs, done_tx, b) = (jobs.clone(), done_tx.clone(), b.clone());
             std::thread::spawn(move || {
-                lower_priority();
+                crate::video::lower_priority();
                 loop {
                     // In the background only two compress.
                     while k >= BACKGROUND_ENCODERS && !b.watched() && !b.stop.load(Ordering::Relaxed) {
@@ -518,7 +518,7 @@ mod hw {
         let started = std::time::Instant::now();
         std::thread::spawn(move || {
             let (frames, stop) = (&b.frames, &b.stop);
-            lower_priority();
+            crate::video::lower_priority();
             let mut last_repaint = std::time::Instant::now();
             let mut waiting = std::collections::BTreeMap::new();
             let mut next_seq = 0u64;
@@ -645,14 +645,6 @@ mod hw {
 
     fn encode(p: &Picture) -> Option<Jpeg> {
         media::encode_jpeg(&p.rgba, p.width as u16, p.height as u16, QUALITY).map(Arc::from)
-    }
-
-    /// This thread yields to the game, the app and playback.
-    fn lower_priority() {
-        use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL};
-        unsafe {
-            let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-        }
     }
 }
 
@@ -822,7 +814,7 @@ mod tests {
 
     /// Gaps repeat the frame before; a slot two frames land on keeps the
     /// later; a chunk starting in a gap shows the frame before it.
-    #[cfg(windows)]
+    #[cfg(hw_decode)]
     #[test]
     fn chunks_fill_their_slots() {
         let j = |n: u8| -> Jpeg { Arc::from(vec![n]) };
@@ -846,7 +838,7 @@ mod tests {
     }
 
     /// Chunks are built from where the player is: there, ahead, then behind.
-    #[cfg(windows)]
+    #[cfg(hw_decode)]
     #[test]
     fn chunks_start_at_the_player() {
         let mut built = vec![false; 10];

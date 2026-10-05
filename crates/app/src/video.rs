@@ -1,5 +1,5 @@
-//! Playback frames from the in-process hardware decoder (Windows; see
-//! `capture::win::decode`), on a worker thread that keeps the next frames
+//! Playback frames from the in-process hardware decoder (`capture::decode`:
+//! Media Foundation on Windows, VideoToolbox on macOS), on a worker thread that keeps the next frames
 //! decoded before they're needed:
 //!
 //! - Paused, it decodes the exact frame asked for, then the few after it, so
@@ -15,7 +15,7 @@ use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use capture::win::decode::{Decoder, Picture};
+use capture::decode::{Decoder, Picture};
 
 /// Decodes someone is waiting to see (a paused frame, filmstrip pictures).
 /// While any runs, background decoding (the scrub proxy) waits: they share
@@ -66,6 +66,22 @@ pub fn yield_to_scrub() {
     }
 }
 
+/// This thread yields to the game, the app and playback (background decoding
+/// and compressing: scrub frames, the filmstrip).
+pub fn lower_priority() {
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL};
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    }
+    // Utility: below the UI and playback, still on the performance cores
+    // when there's room (background would pin it to the efficiency cores).
+    #[cfg(target_os = "macos")]
+    unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0);
+    }
+}
+
 /// Frames kept decoded after the one shown, while paused.
 const AHEAD_PAUSED: usize = 4;
 /// Frames kept decoded ahead of the clock, while playing.
@@ -110,18 +126,7 @@ impl Video {
         let state = Arc::new(Mutex::new(State::default()));
         let (path, shared, ctx) = (path.to_path_buf(), state.clone(), ctx.clone());
         std::thread::spawn(move || {
-            // Frames straight to the screen when the renderer can take them;
-            // copied back as RGBA otherwise.
-            let on_gpu = crate::gpu_frames::share_luid().and_then(|luid| {
-                Decoder::open(&path, u32::MAX, Some(luid)).inspect_err(|e| eprintln!("sharing decoded frames isn't possible, copying them: {e:#}")).ok()
-            });
-            if std::env::var_os("HESTECLIPS_DEBUG_VIDEO").is_some() {
-                eprintln!("video: decoded frames {}", if on_gpu.is_some() { "drawn from the GPU" } else { "copied to the CPU" });
-            }
-            let opened = match on_gpu {
-                Some(d) => Ok(d),
-                None => Decoder::open(&path, u32::MAX, None),
-            };
+            let opened = open_decoder(&path);
             let mut dec = match opened {
                 Ok(mut d) => {
                     d.set_fps(fps);
@@ -320,6 +325,30 @@ impl Video {
     pub fn has(&self, i: u64) -> bool {
         let s = self.state.lock().unwrap();
         s.ahead.front().is_some_and(|p| p.index <= i) || s.exact.as_ref().is_some_and(|(asked, _)| *asked == i)
+    }
+}
+
+/// The playback decoder: frames straight to the screen when the renderer
+/// can take them; copied back as RGBA otherwise (Windows only: on macOS the
+/// renderer is always Metal, which opens every frame).
+fn open_decoder(path: &Path) -> anyhow::Result<Decoder> {
+    #[cfg(windows)]
+    {
+        let on_gpu = crate::gpu_frames::share_luid().and_then(|luid| {
+            Decoder::open(path, u32::MAX, Some(luid)).inspect_err(|e| eprintln!("sharing decoded frames isn't possible, copying them: {e:#}")).ok()
+        });
+        if std::env::var_os("HESTECLIPS_DEBUG_VIDEO").is_some() {
+            eprintln!("video: decoded frames {}", if on_gpu.is_some() { "drawn from the GPU" } else { "copied to the CPU" });
+        }
+        match on_gpu {
+            Some(d) => Ok(d),
+            None => Decoder::open(path, u32::MAX, None),
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        anyhow::ensure!(crate::gpu_frames::available(), "the renderer can't draw decoded frames");
+        Decoder::open(path, capture::decode::Output::Screen)
     }
 }
 

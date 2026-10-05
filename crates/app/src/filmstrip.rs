@@ -5,7 +5,7 @@
 //! there and the preview shows the same picture. Its full height always
 //! shows (only the sides are trimmed, by at most a fifth).
 //!
-//! On Windows the pictures are exact frames from the GPU's video decoder, in
+//! On Windows and macOS the pictures are exact frames from the GPU's video decoder, in
 //! stretches of a fixed number of frames laid end to end from the clip's
 //! start (the last one to its end), as many frames as fit a thumbnail at
 //! this zoom: they stay put while panning. A picture not decoded yet shows
@@ -27,14 +27,14 @@ const HEIGHT: u32 = 112;
 const MAX_THUMBS: usize = 160;
 
 pub enum Filmstrip {
-    #[cfg(windows)]
+    #[cfg(hw_decode)]
     Exact(exact::Exact),
     Keys(Keys),
 }
 
 impl Filmstrip {
     pub fn build(ctx: &egui::Context, source: &Path, info: &ClipInfo) -> Self {
-        #[cfg(windows)]
+        #[cfg(hw_decode)]
         if std::env::var_os("HESTECLIPS_NO_HW_DECODE").is_none() {
             return Self::Exact(exact::Exact::open(ctx, source, info));
         }
@@ -45,14 +45,14 @@ impl Filmstrip {
     /// Paint into `lane`, which shows `from..to` seconds of a clip `dur` long.
     pub fn paint(&mut self, ui: &egui::Ui, lane: Rect, from: f64, to: f64, dur: f64) {
         // The decoder couldn't open the clip: keyframes instead.
-        #[cfg(windows)]
+        #[cfg(hw_decode)]
         if let Self::Exact(e) = self {
             if e.failed() {
                 *self = Self::Keys(Keys::build(ui.ctx(), &e.source));
             }
         }
         match self {
-            #[cfg(windows)]
+            #[cfg(hw_decode)]
             Self::Exact(e) => e.paint(ui, lane, from, to, dur),
             Self::Keys(k) => k.paint(ui, lane, from, to, dur),
         }
@@ -61,7 +61,7 @@ impl Filmstrip {
     /// The decoded thumbnail nearest `t`, if any (a rough hover preview).
     pub fn near(&self, t: f64) -> Option<&egui::TextureHandle> {
         match self {
-            #[cfg(windows)]
+            #[cfg(hw_decode)]
             Self::Exact(e) => e.near(t),
             Self::Keys(k) => k.near(t),
         }
@@ -95,13 +95,13 @@ fn paint_cells(ui: &egui::Ui, lane: Rect, from: f64, to: f64, cells: &[(f64, f64
 }
 
 /// Exact frames on a zoom-dependent grid, from the GPU's video decoder.
-#[cfg(windows)]
+#[cfg(hw_decode)]
 mod exact {
     use std::collections::BTreeMap;
     use std::sync::mpsc::{Sender, TryRecvError};
 
     use super::*;
-    use capture::win::decode::{Decoder, Picture};
+    use capture::decode::{Decoder, Picture};
 
     /// Thumbnails kept, at ~90 KB each.
     const CACHE: usize = 800;
@@ -135,9 +135,10 @@ mod exact {
             let failed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let (path, fps, failed_t) = (source.to_path_buf(), info.fps, failed.clone());
             std::thread::spawn(move || {
-                lower_priority();
+                // The filmstrip's decoding yields to everything else.
+                crate::video::lower_priority();
                 // Opened here, not on the UI thread: it takes a few hundred ms.
-                let mut dec = match Decoder::open(&path, width, None) {
+                let mut dec = match Decoder::open_rgba(&path, width) {
                     Ok(d) => d,
                     Err(e) => {
                         eprintln!("filmstrip: hardware decoder unavailable, using keyframes: {e:#}");
@@ -291,14 +292,6 @@ mod exact {
         }
         best
     }
-
-    /// The filmstrip's decoding yields to everything else.
-    fn lower_priority() {
-        use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL};
-        unsafe {
-            let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-        }
-    }
 }
 
 enum Msg {
@@ -396,7 +389,7 @@ impl Keys {
     }
 }
 
-#[cfg(all(test, windows))]
+#[cfg(all(test, hw_decode))]
 mod tests {
     #[test]
     fn grid_steps_never_wider_than_a_thumbnail() {

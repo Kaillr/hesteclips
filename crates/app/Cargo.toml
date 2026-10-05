@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 ab_glyph = "0.2"
+anyhow = "1"
 bytemuck = "1"
 capture = { path = "../capture" }
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
@@ -45,7 +46,12 @@ winresource = "0.1.31"
 
 # macOS-only: the system share sheet (AirDrop, Messages, Mail, …).
 [target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
 objc2 = "0.6.4"
+# Decoded frames drawn straight from their IOSurfaces (gpu_frames.rs); the
+# versions wgpu's Metal backend uses.
+objc2-io-surface = { version = "0.3.2", default-features = false, features = ["std", "IOSurfaceRef", "objc2"] }
+objc2-metal = { version = "0.3.2", default-features = false, features = ["std", "MTLAllocation", "MTLDevice", "MTLPixelFormat", "MTLResource", "MTLTexture", "objc2-io-surface"] }
 objc2-foundation = { version = "0.3.2", features = ["NSArray", "NSString", "NSURL", "NSGeometry"] }
 objc2-app-kit = { version = "0.3.2", features = ["NSSharingService", "NSView", "NSResponder"] }
 
@@ -64,3 +70,7 @@ windows = { version = "0.62", features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[dev-dependencies]
+naga = { version = "30", features = ["wgsl-in"] }
+pollster = "1"

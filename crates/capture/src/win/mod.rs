@@ -23,7 +23,6 @@ mod camera;
 mod d3d;
 pub mod decode;
 pub(crate) mod direct;
-pub(crate) mod mp4read;
 pub(crate) mod file;
 mod h264;
 mod loopback;
