@@ -97,6 +97,9 @@ enum Evt {
     Validated { client: Client, result: Result<Account, String> },
     BaseFolders(Result<Vec<BaseFolder>, String>),
     Dir { at: FolderRef, result: Result<(Vec<String>, bool), String> },
+    /// A folder made in the browser: where, its name, and whether it was
+    /// there already.
+    FolderMade { parent: FolderRef, name: String, result: Result<bool, String> },
     Uploaded { id: u64, result: Result<(), String> },
 }
 
@@ -143,6 +146,17 @@ pub struct FolderBrowser {
     at: Option<FolderRef>,
     /// Subfolders of `at` plus whether it's read-only; `None` while loading.
     listing: Option<Result<(Vec<String>, bool), String>>,
+    /// "New folder" is open: the name being typed.
+    new_folder: Option<NewFolder>,
+}
+
+#[derive(Default)]
+struct NewFolder {
+    name: String,
+    error: Option<String>,
+    /// Being made on the server.
+    busy: bool,
+    focused: bool,
 }
 
 pub struct Cloud {
@@ -272,6 +286,27 @@ impl Cloud {
                     self.browser.listing = Some(result);
                 }
                 Evt::Dir { .. } => {}
+                Evt::FolderMade { parent, name, result } => {
+                    if self.browser.at.as_ref() != Some(&parent) {
+                        continue;
+                    }
+                    match result {
+                        // Open it: it's what you made it for.
+                        Ok(false) => self.navigate(Some(parent.child(&name))),
+                        Ok(true) => {
+                            if let Some(n) = &mut self.browser.new_folder {
+                                n.busy = false;
+                                n.error = Some("A folder with that name is already here.".into());
+                            }
+                        }
+                        Err(e) => {
+                            if let Some(n) = &mut self.browser.new_folder {
+                                n.busy = false;
+                                n.error = Some(e);
+                            }
+                        }
+                    }
+                }
                 Evt::Uploaded { id, result } => {
                     let Some(i) = self.uploads.iter().position(|u| u.id == id) else { continue };
                     let up = self.uploads.remove(i);
@@ -345,6 +380,7 @@ impl Cloud {
     fn navigate(&mut self, to: Option<FolderRef>) {
         self.browser.at = to.clone();
         self.browser.listing = None;
+        self.browser.new_folder = None;
         let (Some(at), Some(client)) = (to, self.client.clone()) else { return };
         self.spawn(move || {
             let result = client
@@ -447,9 +483,67 @@ impl Cloud {
         if let Some(Ok((_, true))) = &self.browser.listing {
             ui.colored_label(ui.visuals().warn_fg_color, "Read-only — pick a folder you can write to.");
         }
+        if let (Some(at), Some(Ok((_, false)))) = (self.browser.at.clone(), &self.browser.listing) {
+            self.new_folder_ui(ui, &at);
+        }
 
         if let Some(to) = go {
             self.navigate(to);
+        }
+    }
+
+    /// "New folder" under the list: a name field, made in `at` on Create (and
+    /// opened, so it's picked).
+    fn new_folder_ui(&mut self, ui: &mut egui::Ui, at: &FolderRef) {
+        ui.add_space(4.0);
+        let Some(n) = &mut self.browser.new_folder else {
+            if ui.button("➕  New folder").clicked() {
+                self.browser.new_folder = Some(NewFolder::default());
+            }
+            return;
+        };
+        let mut create = false;
+        let mut cancel = false;
+        ui.horizontal(|ui| {
+            let field = ui.add_enabled(!n.busy, egui::TextEdit::singleline(&mut n.name).hint_text("Folder name").desired_width(220.0));
+            if !n.focused {
+                field.request_focus();
+                n.focused = true;
+            }
+            if field.changed() {
+                n.error = None;
+            }
+            create = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if n.busy {
+                ui.spinner();
+            } else {
+                create |= ui.button("Create").clicked();
+                cancel = ui.button("Cancel").clicked();
+            }
+        });
+        if let Some(e) = &n.error {
+            ui.colored_label(ui.visuals().error_fg_color, e);
+        }
+        if cancel {
+            self.browser.new_folder = None;
+            return;
+        }
+        if !create || n.busy {
+            return;
+        }
+        let name = n.name.trim().to_owned();
+        match check_folder_name(&name) {
+            Err(e) => n.error = Some(e),
+            Ok(()) => {
+                let Some(client) = self.client.clone() else { return };
+                n.busy = true;
+                n.error = None;
+                let parent = at.clone();
+                self.spawn(move || {
+                    let result = client.new_folder(&parent.base_id, &parent.path, &name).map_err(|e| e.to_string());
+                    Evt::FolderMade { parent, name, result }
+                });
+            }
         }
     }
 
@@ -461,6 +555,20 @@ impl Cloud {
             ctx.request_repaint();
         });
     }
+}
+
+/// Whether HesteFiles takes `name` for a folder, and why not.
+fn check_folder_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("Give the folder a name.".into());
+    }
+    if name.chars().count() > 150 {
+        return Err("Names can be at most 150 characters.".into());
+    }
+    if let Some(c) = name.chars().find(|c| hestefiles::FORBIDDEN.contains(c) || c.is_control()) {
+        return Err(format!("Names can't contain “{c}”."));
+    }
+    Ok(())
 }
 
 fn base_icon(base: &BaseFolder) -> &'static str {

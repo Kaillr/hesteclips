@@ -102,11 +102,13 @@ pub struct Directory {
 /// Largest chunk the server accepts.
 pub const MAX_CHUNK: u64 = 2 * 1024 * 1024;
 
+/// Characters HesteFiles doesn't allow in a folder's name.
+pub const FORBIDDEN: &[char] = &['\\', '/', ':', '*', '?', '<', '>', '%', '|', '"', '\'', '`'];
+
 /// A folder name HesteFiles takes, made from `name`: without the characters
 /// it doesn't allow (`\/:*?<>%|"'` and the backtick), at most 150 characters.
 /// `None` if nothing's left.
 pub fn folder_name(name: &str) -> Option<String> {
-    const FORBIDDEN: &[char] = &['\\', '/', ':', '*', '?', '<', '>', '%', '|', '"', '\'', '`'];
     let kept: String = name.chars().filter(|&c| !c.is_control() && !FORBIDDEN.contains(&c)).collect();
     let name: String = kept.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(150).collect();
     let name = name.trim().to_owned();
