@@ -190,7 +190,12 @@ fn pace(fps: u32, secs: f64, t0: f64, enc: &Encoder, mut next: impl FnMut() -> O
             late += 1;
         }
         if let Some(f) = next() {
-            enc.encode(&f.0, n, fps);
+            let t = Instant::now();
+            let took = enc.encode(&f.0, n, fps);
+            let ms = t.elapsed().as_secs_f64() * 1000.0;
+            if n % 120 == 0 && std::env::var("TRACE").is_ok() {
+                println!("    frame {n}: encode call {ms:.1} ms, taken {took}, in flight {}", enc.in_flight());
+            }
         }
         n += 1;
     }

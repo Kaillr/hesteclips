@@ -18,7 +18,7 @@
 use std::ffi::c_void;
 use std::path::PathBuf;
 use std::ptr::{self, NonNull};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -634,6 +634,12 @@ fn sync_taps(taps: &mut [Tap]) {
 /// Encode the newest screen frame every 1/fps on the host clock. SCK only sends
 /// frames when the screen changes; repeating the last one keeps the output CFR.
 /// Frame N is stamped N/fps seconds after t0, the same clock the audio uses.
+///
+/// When the encoder can't keep up (a big frame at a high rate is more than
+/// the hardware does: ~60 fps at 3600×2338 on an M4 Pro), slots are skipped
+/// rather than queued: the pacer always encodes the slot that's due now, and
+/// a skipped slot shows the previous picture a little longer. Video never
+/// falls behind real time, so it stays in sync and nothing piles up.
 fn spawn_pacer(fps: u32, mut frames: Frames, encoder: Encoder, clock: Arc<Clock>) -> (Arc<AtomicBool>, JoinHandle<()>) {
     let stop = Arc::new(AtomicBool::new(false));
     let stop2 = stop.clone();
@@ -644,20 +650,30 @@ fn spawn_pacer(fps: u32, mut frames: Frames, encoder: Encoder, clock: Arc<Clock>
         let t0 = host_now();
         clock.set(t0);
         let mut next: i64 = 0;
-        while !stop2.load(Ordering::Relaxed) {
-            let now = host_now();
-            let due = ((now - t0) * fps_f) as i64;
-            // After a stall, catch up gradually rather than in one huge burst.
-            let mut burst = 0;
-            while next <= due && burst < fps * 2 {
-                if let Some(frame) = frames.next() {
-                    encoder.0.encode(&frame.0, next, fps);
-                }
-                next += 1;
-                burst += 1;
+        let mut skipped = 0u64;
+        let mut note = |n: i64| {
+            let before = skipped;
+            skipped += n as u64;
+            // Once per doubling, so a long session doesn't flood the log.
+            if before.checked_ilog2() != skipped.checked_ilog2() {
+                eprintln!("video encoder is behind: {skipped} frames skipped so far");
             }
-            let wake = t0 + next as f64 / fps_f;
-            let wait = wake - host_now();
+        };
+        while !stop2.load(Ordering::Relaxed) {
+            let due = ((host_now() - t0) * fps_f) as i64;
+            if next <= due {
+                // Missed slots (the encoder or the system stalled) are skipped.
+                if due > next {
+                    note(due - next);
+                }
+                if let Some(frame) = frames.next() {
+                    if !encoder.0.encode(&frame.0, due, fps) {
+                        note(1);
+                    }
+                }
+                next = due + 1;
+            }
+            let wait = t0 + next as f64 / fps_f - host_now();
             if wait > 0.0 {
                 thread::sleep(Duration::from_secs_f64(wait));
             }
@@ -671,6 +687,11 @@ fn spawn_pacer(fps: u32, mut frames: Frames, encoder: Encoder, clock: Arc<Clock>
 // VideoToolbox H.264 encoder
 // ---------------------------------------------------------------------------
 
+/// Frames in the encoder before the pacer skips one instead of waiting.
+/// VideoToolbox's own limit is 8: past it `encode_frame` blocks until a
+/// frame is done, which would hold the pacer up.
+const QUEUE: usize = 6;
+
 pub(crate) struct Encoder {
     pub(crate) session: CFRetained<VTCompressionSession>,
     /// Owned by the encoder callback; freed in `finish` after the last callback.
@@ -682,11 +703,13 @@ pub(crate) struct EncodedSink {
     pub(crate) tx: Option<Sender<writer::Command>>,
     /// Catches the format description of the first frame (`probe_video_format`).
     pub(crate) probe: Option<Sender<CFRetained<objc2_core_media::CMFormatDescription>>>,
+    /// Frames handed to the encoder and not called back yet.
+    in_flight: AtomicUsize,
 }
 
 impl Encoder {
     pub(crate) fn new(width: usize, height: usize, s: &EncodeSettings, tx: Sender<writer::Command>) -> Result<Self> {
-        Self::with_sink(width, height, s, EncodedSink { tx: Some(tx), probe: None })
+        Self::with_sink(width, height, s, EncodedSink { tx: Some(tx), probe: None, in_flight: AtomicUsize::new(0) })
     }
 
     fn with_sink(width: usize, height: usize, s: &EncodeSettings, sink: EncodedSink) -> Result<Self> {
@@ -734,8 +757,14 @@ impl Encoder {
         }
     }
 
-    /// Encode `frame` as frame number `n` (presented at n/fps).
-    pub(crate) fn encode(&self, frame: &CVPixelBuffer, n: i64, fps: u32) {
+    /// Encode `frame` as frame number `n` (presented at n/fps). False if the
+    /// encoder is too far behind to take it.
+    pub(crate) fn encode(&self, frame: &CVPixelBuffer, n: i64, fps: u32) -> bool {
+        let sink = unsafe { &*self.ctx };
+        if sink.in_flight.load(Ordering::Relaxed) >= QUEUE {
+            return false;
+        }
+        sink.in_flight.fetch_add(1, Ordering::Relaxed);
         unsafe {
             let status = self.session.encode_frame(
                 frame,
@@ -746,9 +775,18 @@ impl Encoder {
                 ptr::null_mut(),
             );
             if status != 0 {
+                // No callback comes for a frame refused outright.
+                sink.in_flight.fetch_sub(1, Ordering::Relaxed);
                 eprintln!("VideoToolbox encode error {status}");
             }
         }
+        true
+    }
+
+    /// Frames handed in and not called back yet.
+    #[allow(dead_code)]
+    pub(crate) fn in_flight(&self) -> usize {
+        unsafe { &*self.ctx }.in_flight.load(Ordering::Relaxed)
     }
 
     /// Flush pending frames, then release the sink.
@@ -770,12 +808,10 @@ unsafe extern "C-unwind" fn on_encoded(
     _flags: VTEncodeInfoFlags,
     sample: *mut CMSampleBuffer,
 ) {
-    let (Some(sink), Some(sample)) = (unsafe { (ctx as *const EncodedSink).as_ref() }, unsafe { sample.as_ref() }) else {
-        return;
-    };
-    if status != 0 {
-        return;
-    }
+    let Some(sink) = (unsafe { (ctx as *const EncodedSink).as_ref() }) else { return };
+    // Called once per frame handed in, encoded or dropped.
+    sink.in_flight.fetch_sub(1, Ordering::Relaxed);
+    let Some(sample) = (unsafe { sample.as_ref() }).filter(|_| status == 0) else { return };
     if let Some(probe) = &sink.probe {
         if let Some(fmt) = unsafe { sample.format_description() } {
             let _ = probe.send(fmt);
@@ -798,7 +834,7 @@ pub(crate) fn probe_video_format(
     s: &EncodeSettings,
 ) -> Result<CFRetained<objc2_core_media::CMFormatDescription>> {
     let (tx, rx) = mpsc::channel();
-    let enc = Encoder::with_sink(width, height, s, EncodedSink { tx: None, probe: Some(tx) })?;
+    let enc = Encoder::with_sink(width, height, s, EncodedSink { tx: None, probe: Some(tx), in_flight: AtomicUsize::new(0) })?;
     let mut pb: *mut CVPixelBuffer = ptr::null_mut();
     let status = unsafe {
         objc2_core_video::CVPixelBufferCreate(
