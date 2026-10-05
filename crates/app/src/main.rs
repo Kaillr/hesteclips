@@ -91,8 +91,19 @@ fn main() -> eframe::Result<()> {
 /// pick could be Vulkan, which can't open them as simply.
 /// `HESTECLIPS_WGPU_BACKEND` (e.g. "vulkan") overrides it, to compare.
 fn wgpu_options() -> eframe::egui_wgpu::WgpuConfiguration {
-    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut options = eframe::egui_wgpu::WgpuConfiguration::default();
+    // A hidden window (covered, minimized, or not shown yet) gets no frame to
+    // draw into, and egui skips the frame and tries again at once: a page that
+    // repaints continuously (Sources, with its meters and preview) spun at
+    // ~7000 tries a second, and right after launch macOS never got to show the
+    // window at all, so it stayed blank. Wait a display refresh first.
+    let default = options.on_surface_status.clone();
+    options.on_surface_status = std::sync::Arc::new(move |status| {
+        if matches!(status, eframe::wgpu::CurrentSurfaceTexture::Occluded) {
+            std::thread::sleep(std::time::Duration::from_millis(16));
+        }
+        default(status)
+    });
     #[cfg(windows)]
     if let eframe::egui_wgpu::WgpuSetup::CreateNew(new) = &mut options.wgpu_setup {
         new.instance_descriptor.backends = match std::env::var("HESTECLIPS_WGPU_BACKEND") {
