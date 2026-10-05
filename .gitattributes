@@ -1,0 +1,2 @@
+# The voice model (src/voice.rs embeds these byte for byte): never convert.
+crates/app/assets/kws/** binary
