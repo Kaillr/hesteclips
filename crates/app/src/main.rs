@@ -40,6 +40,7 @@ mod update;
 mod gpu_frames;
 #[cfg(hw_decode)]
 mod video;
+mod voice;
 mod web_images;
 mod viewer;
 mod waveform;
@@ -348,6 +349,8 @@ struct App {
     pub(crate) presence: discord::Presence,
     /// Saves a clip as Save clip is pressed, frames or not.
     quick_save: service::QuickSave,
+    /// Listens for "hashtag HesteClip that".
+    pub(crate) voice: voice::Voice,
     /// The game being clipped, for Discord: its app's id, the game, and when
     /// we last checked it's still open.
     clipped_game: Option<(String, discord::Game, Instant)>,
@@ -399,6 +402,7 @@ impl App {
                 ["HESTECLIPS_OPEN_", "HESTECLIPS_DEMO_", "HESTECLIPS_LIBRARY", "HESTECLIPS_SETTINGS"].iter().any(|p| k.starts_with(p))
             }),
             service,
+            voice: voice::Voice::new(quick_save.clone(), live_audio.clone(), ctx.clone()),
             quick_save,
             hotkeys,
             recording_shortcut: None,
@@ -643,6 +647,13 @@ impl eframe::App for App {
             }
         }
 
+        // "Hashtag HesteClip that": saved already, as it was said.
+        for _ in 0..self.voice.heard() {
+            self.clip_saving();
+        }
+        let listen = self.settings.voice_clip && self.rec_state == RecState::Buffering && self.recording_shortcut.is_none();
+        let mic = listen.then(|| self.voice_mic()).flatten();
+        self.voice.listen(mic.as_deref());
         laps.lap("shortcuts");
         self.pump_capture_events();
         laps.lap("capture events");
@@ -976,6 +987,12 @@ impl App {
                 self.clipped_game = None;
             }
         }
+    }
+
+    /// The microphone "hashtag HesteClip that" is heard through: the first
+    /// one on the Sources page that's being captured.
+    fn voice_mic(&self) -> Option<String> {
+        self.settings.audio_sources.iter().find(|s| s.enabled && matches!(s.kind, settings::SourceKind::Microphone { .. })).map(|s| s.id.clone())
     }
 
     /// The games and apps list, as (id, name).

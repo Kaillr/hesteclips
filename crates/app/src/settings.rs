@@ -377,6 +377,8 @@ pub struct RecordSettings {
     pub auto_update: bool,
     /// Show what you're clipping on your Discord profile (Rich Presence).
     pub discord_presence: bool,
+    /// Saying "hashtag HesteClip that" saves a clip (while the replay buffer runs).
+    pub voice_clip: bool,
 
     // --- Advanced (collapsible; sane defaults) ---
     pub encoder: Encoder,
@@ -429,6 +431,7 @@ impl Default for RecordSettings {
             auto_start_buffer: true,
             auto_update: true,
             discord_presence: false,
+            voice_clip: true,
             encoder: Encoder::Auto,
             container: Container::Mp4,
             rate_control: RateControl::Cbr,
