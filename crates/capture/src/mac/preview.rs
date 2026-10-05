@@ -35,6 +35,7 @@ impl Producer {
             PreviewFrame {
                 width: width as u32,
                 height: height as u32,
+                recorded: (width as u32, height as u32),
                 rgba: Vec::new(),
                 surface: Some(crate::decode::Surface::from_buffer(frame.0.clone())),
                 seq: 0,

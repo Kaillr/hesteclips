@@ -1,9 +1,11 @@
 //! Capture backend abstraction.
 //!
 //! macOS uses `sck` (ScreenCaptureKit + VideoToolbox), Windows uses `win`
-//! (Windows Graphics Capture + Media Foundation + WASAPI), both behind the same
+//! (Windows Graphics Capture + Media Foundation + WASAPI), Linux uses `linux`
+//! (the desktop portal + PipeWire, encoded by ffmpeg), all behind the same
 //! `Recorder` trait so the app never depends on which one is live. Mics come
-//! from cpal everywhere and are mixed in `mixer`. Linux has no recorder yet.
+//! from cpal on macOS and Windows, from PipeWire on Linux, and are mixed in
+//! `mixer`.
 
 use std::path::PathBuf;
 
@@ -16,7 +18,9 @@ pub mod mixer;
 pub mod mp4meta;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub(crate) mod mp4read;
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+mod mp4file;
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
 mod mp4mux;
 pub mod output;
 pub mod preview;
@@ -31,7 +35,9 @@ pub mod macos;
 pub mod sck;
 #[cfg(target_os = "windows")]
 pub mod win;
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(target_os = "linux")]
+pub mod linux;
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 mod writer;
 
 /// The in-process hardware video decoder, for playback (same API on both).
@@ -44,6 +50,8 @@ pub use win::decode;
 pub use sck::SckRecorder;
 #[cfg(target_os = "windows")]
 pub use win::WinRecorder;
+#[cfg(target_os = "linux")]
+pub use linux::LinuxRecorder;
 
 /// The capture backend for this platform. `live` gets the meters and supplies
 /// each source's volume.
@@ -56,7 +64,11 @@ pub fn default_recorder(live: std::sync::Arc<mixer::LiveAudio>) -> Box<dyn Recor
     {
         Box::new(WinRecorder::new(live))
     }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(target_os = "linux")]
+    {
+        Box::new(LinuxRecorder::new(live))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {
         let _ = live;
         Box::new(Unsupported)
@@ -65,10 +77,10 @@ pub fn default_recorder(live: std::sync::Arc<mixer::LiveAudio>) -> Box<dyn Recor
 
 /// Stand-in where there's no backend yet, so the app runs (library, editor)
 /// and says why capture won't start.
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 struct Unsupported;
 
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 impl Recorder for Unsupported {
     fn start(&mut self, _: Mode, _: &EncodeSettings) -> anyhow::Result<()> {
         anyhow::bail!("recording isn't available on this platform yet")
@@ -86,7 +98,7 @@ impl Recorder for Unsupported {
 
 /// The largest side the H.264 hardware encoders take: VideoToolbox refuses
 /// anything wider or taller than 4096 (error -12903; measured with
-/// `examples/vt_limits`), as do NVENC, AMF and Quick Sync for H.264.
+/// `examples/vt_limits`), as do NVENC, AMF, Quick Sync and VA-API for H.264.
 pub const MAX_SIDE: u32 = 4096;
 
 /// The recording's size for a source `w`×`h`: downscaled to `target_height`
@@ -103,7 +115,8 @@ pub fn output_size(w: u32, h: u32, target_height: Option<u32>) -> (u32, u32) {
 
 /// The size a recording of `source` will be, without starting anything
 /// (cheap: asks the system for display sizes). Games and apps record at the
-/// main display's size. `None` if the display isn't known.
+/// main display's size. `None` if the display isn't known (on Linux, until
+/// the screen has been picked in the system's dialog once).
 pub fn frame_size(source: &VideoSource, target_height: Option<u32>) -> Option<(u32, u32)> {
     let id = match source {
         VideoSource::Screen { id } => Some(id.as_str()),
@@ -113,7 +126,9 @@ pub fn frame_size(source: &VideoSource, target_height: Option<u32>) -> Option<(u
     let native = mac::display_pixels(id);
     #[cfg(target_os = "windows")]
     let native = win::display_pixels(id);
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(target_os = "linux")]
+    let native = linux::display_pixels(id);
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     let native: Option<(u32, u32)> = {
         let _ = id;
         None
@@ -199,7 +214,11 @@ pub fn list_screens() -> Vec<Device> {
     {
         win::list_screens()
     }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(target_os = "linux")]
+    {
+        linux::list_screens()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {
         Vec::new()
     }
@@ -207,7 +226,8 @@ pub fn list_screens() -> Vec<Device> {
 
 /// Running apps the user could add as an audio source, sorted by name. Their
 /// ids go in `SourceKind::App` (a bundle id on macOS, an executable name on
-/// Windows).
+/// Windows, the program's name on Linux). On Linux only apps that have
+/// opened their sound are listed: PipeWire knows nothing of the rest.
 pub fn list_apps() -> Vec<Device> {
     #[cfg(target_os = "macos")]
     {
@@ -217,7 +237,11 @@ pub fn list_apps() -> Vec<Device> {
     {
         win::list_apps()
     }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(target_os = "linux")]
+    {
+        linux::audio::list_apps()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {
         Vec::new()
     }
@@ -320,7 +344,7 @@ pub struct EncodeSettings {
 pub struct PendingClip(Box<dyn FnOnce() -> anyhow::Result<PathBuf> + Send>);
 
 impl PendingClip {
-    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+    #[cfg_attr(not(any(target_os = "macos", target_os = "windows", target_os = "linux")), allow(dead_code))]
     pub(crate) fn new(finish: impl FnOnce() -> anyhow::Result<PathBuf> + Send + 'static) -> Self {
         Self(Box::new(finish))
     }
@@ -331,7 +355,8 @@ impl PendingClip {
     }
 }
 
-/// A capture backend. Implemented by `SckRecorder` (macOS) and `WinRecorder` (Windows).
+/// A capture backend. Implemented by `SckRecorder` (macOS), `WinRecorder`
+/// (Windows) and `LinuxRecorder` (Linux).
 pub trait Recorder {
     /// Begin capturing in the given mode with the given settings.
     fn start(&mut self, mode: Mode, settings: &EncodeSettings) -> anyhow::Result<()>;

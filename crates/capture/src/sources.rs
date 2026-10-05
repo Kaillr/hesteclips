@@ -10,9 +10,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 
 use anyhow::Result;
+#[cfg(not(target_os = "linux"))]
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
-use crate::mixer::{Clock, LiveAudio, MixInput, SourceFeed, SourceStatus, spawn_mixer};
+use crate::mixer::{Clock, LiveAudio, MixInput, SourceFeed, spawn_mixer};
+#[cfg(not(target_os = "linux"))]
+use crate::mixer::SourceStatus;
 
 /// Where a source's sound comes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,8 +25,9 @@ pub enum SourceKind {
     /// Everything the computer plays. With `exclude_app_sources`, apps that are
     /// also added as their own source are left out, so they aren't heard twice.
     Desktop { exclude_app_sources: bool },
-    /// One application (and its helper processes), by bundle id on macOS or
-    /// executable name (`Discord.exe`) on Windows.
+    /// One application (and its helper processes), by bundle id on macOS,
+    /// executable name (`Discord.exe`) on Windows, or program name
+    /// (`Discord`, or `Game.exe` for one running in Wine/Proton) on Linux.
     App { bundle_id: String },
 }
 
@@ -79,8 +83,9 @@ pub fn track_layout(sources: &[AudioSource]) -> (Vec<String>, String, bool) {
 pub(crate) struct AudioCapture {
     /// One per source, in the order given.
     pub feeds: Vec<Arc<SourceFeed>>,
+    #[cfg(not(target_os = "linux"))]
     mics: Vec<cpal::Stream>,
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     system: Option<SystemAudio>,
 }
 
@@ -88,6 +93,9 @@ pub(crate) struct AudioCapture {
 use crate::sck::SystemAudio;
 #[cfg(target_os = "windows")]
 use crate::win::SystemAudio;
+/// On Linux every kind of source, mics included, is a PipeWire stream.
+#[cfg(target_os = "linux")]
+use crate::linux::audio::SystemAudio;
 
 impl AudioCapture {
     /// Start every source. A source that can't start (unplugged mic, app not
@@ -98,12 +106,14 @@ impl AudioCapture {
             .iter()
             .map(|s| SourceFeed::new(native_rate(&s.kind), clock.clone()))
             .collect();
+        #[cfg(not(target_os = "linux"))]
         let mut mics = Vec::new();
-        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
         let mut system_sources = Vec::new();
         for (source, feed) in sources.iter().zip(&feeds) {
             let channel = live.channel(&source.id);
             match &source.kind {
+                #[cfg(not(target_os = "linux"))]
                 SourceKind::Microphone { device } => match start_mic(device, feed.clone()) {
                     Ok(stream) => {
                         channel.set_status(SourceStatus::Live);
@@ -114,34 +124,38 @@ impl AudioCapture {
                         channel.set_status(SourceStatus::Unavailable);
                     }
                 },
-                #[cfg(any(target_os = "macos", target_os = "windows"))]
+                #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
                 _ => system_sources.push((source.clone(), feed.clone(), channel)),
-                #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+                #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
                 _ => channel.set_status(SourceStatus::Unavailable),
             }
         }
-        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
         let system = if system_sources.is_empty() { None } else { Some(SystemAudio::start(system_sources)?) };
         Ok(Self {
             feeds,
+            #[cfg(not(target_os = "linux"))]
             mics,
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
             system,
         })
     }
 
     pub(crate) fn stop(mut self) {
+        #[cfg(not(target_os = "linux"))]
         self.mics.clear();
-        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
         if let Some(system) = self.system.take() {
             system.stop();
         }
     }
 }
 
-/// Every source is converted to 48 kHz; desktop/app audio is captured at it.
+/// Every source is converted to 48 kHz; desktop/app audio is captured at it,
+/// and on Linux so is every mic (PipeWire converts it).
 fn native_rate(kind: &SourceKind) -> u32 {
     match kind {
+        #[cfg(not(target_os = "linux"))]
         SourceKind::Microphone { device } => {
             find_input(device).and_then(|d| d.default_input_config().ok()).map_or(crate::mixer::RATE, |c| c.sample_rate())
         }
@@ -149,6 +163,7 @@ fn native_rate(kind: &SourceKind) -> u32 {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 fn find_input(name: &str) -> Option<cpal::Device> {
     cpal::default_host()
         .input_devices()
@@ -156,6 +171,7 @@ fn find_input(name: &str) -> Option<cpal::Device> {
         .find(|d| d.description().is_ok_and(|desc| desc.name() == name))
 }
 
+#[cfg(not(target_os = "linux"))]
 fn start_mic(name: &str, feed: Arc<SourceFeed>) -> Result<cpal::Stream> {
     let device = find_input(name).ok_or_else(|| anyhow::anyhow!("not connected"))?;
     let config = device.default_input_config()?;
@@ -187,6 +203,7 @@ fn start_mic(name: &str, feed: Arc<SourceFeed>) -> Result<cpal::Stream> {
 /// starts as a gap (an "underrun or overrun"), which isn't lost audio: that's
 /// ignored. A real dropout later — the mic's buffer filled before it was read,
 /// usually because the PC was too busy — is reported, at most once a minute.
+#[cfg(not(target_os = "linux"))]
 fn quiet_xruns(name: String) -> impl FnMut(cpal::Error) + Send + 'static {
     let started = std::time::Instant::now();
     let mut dropouts = 0u32;
@@ -223,7 +240,11 @@ impl LevelMonitor {
         let inputs = mix_inputs(sources, &capture.feeds, &live, |_| None);
         let stop = Arc::new(AtomicBool::new(false));
         // Short latency: meters should feel live; a late block only costs a blip.
-        let mixer = spawn_mixer(inputs, None, None, live, clock, host_now, 0.08, stop.clone());
+        // Longer on Linux, where PipeWire's timestamps include the device's
+        // buffering, which runs to a fifth of a second for Bluetooth mics and
+        // in virtual machines: their audio would always arrive too late.
+        let latency = if cfg!(target_os = "linux") { 0.25 } else { 0.08 };
+        let mixer = spawn_mixer(inputs, None, None, live, clock, host_now, latency, stop.clone());
         Ok(Self { capture: Some(capture), stop, mixer: Some(mixer) })
     }
 }
@@ -259,7 +280,8 @@ pub(crate) fn mix_inputs(
 }
 
 /// Host time in seconds — the clock capture timestamps use (CoreAudio and SCK
-/// on macOS; QueryPerformanceCounter for WGC and WASAPI on Windows).
+/// on macOS; QueryPerformanceCounter for WGC and WASAPI on Windows;
+/// CLOCK_MONOTONIC, PipeWire's, on Linux).
 pub(crate) fn host_now() -> f64 {
     #[cfg(target_os = "macos")]
     {
@@ -269,7 +291,11 @@ pub(crate) fn host_now() -> f64 {
     {
         crate::win::host_now()
     }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(target_os = "linux")]
+    {
+        crate::linux::host_now()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {
         use std::sync::OnceLock;
         static START: OnceLock<std::time::Instant> = OnceLock::new();

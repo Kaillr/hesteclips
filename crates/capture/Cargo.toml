@@ -6,8 +6,11 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.104"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
-cpal = "0.18.2"
 rubato = "5.0.1"
+
+# Mics on macOS and Windows (Linux takes them from PipeWire, like the rest).
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+cpal = "0.18.2"
 
 # macOS-only: native ScreenCaptureKit backend, so these Apple-framework bindings
 # must not be pulled in elsewhere.
@@ -67,3 +70,11 @@ windows = { version = "0.62", features = [
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+
+# Linux: screen capture through the xdg-desktop-portal (any Wayland or X11
+# desktop), its pictures and all audio through PipeWire. Encoding is done by
+# ffmpeg, which the app ships with anyway.
+[target.'cfg(target_os = "linux")'.dependencies]
+ashpd = { version = "0.13", default-features = false, features = ["async-io", "screencast"] }
+pipewire = "0.10"
+pollster = "1"

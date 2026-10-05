@@ -341,6 +341,16 @@ impl SourceFeed {
         st.feed(&l, &r);
     }
 
+    /// The output frame just past the newest audio that has arrived (in this
+    /// feed or any it sums), if any has.
+    pub(crate) fn arrived(&self) -> Option<i64> {
+        let own = {
+            let st = self.st.lock().unwrap();
+            st.next_in.map(|_| st.out_base + st.out.len() as i64)
+        };
+        self.children.lock().unwrap().iter().filter_map(|c| c.arrived()).chain(own).max()
+    }
+
     /// `n` frames starting at output frame `from` (silence where nothing has
     /// arrived), without consuming them — for the meters, which look at audio
     /// well ahead of what's being written.
@@ -449,8 +459,15 @@ pub(crate) struct MixInput {
 }
 
 /// How far behind real time the meters run: just enough for the sources'
-/// newest audio to have arrived.
+/// newest audio to have arrived. A source whose audio comes later (a device
+/// that buffers a lot: Bluetooth, or any in a virtual machine on Linux,
+/// where timestamps include the device's buffering) holds them back until it
+/// has, so it doesn't look silent.
 const METER_LAG: f64 = 0.04;
+
+/// A source whose newest audio is older than this isn't delivering (an app
+/// that went quiet, a mic unplugged): the meters don't wait for it.
+const STALLED: f64 = 0.5;
 
 /// Mix sources into tracks until `stop` is set: every 10 ms, take the span that's
 /// `latency` seconds behind now from every feed, apply volume, sum the mix
@@ -486,7 +503,11 @@ pub(crate) fn spawn_mixer(
         loop {
             let stopping = stop.load(Ordering::Relaxed);
             if let Some(t0) = clock.get() {
-                let target = ((now() - t0 - METER_LAG) * RATE as f64).floor() as i64;
+                let mut target = ((now() - t0 - METER_LAG) * RATE as f64).floor() as i64;
+                let stalled = target - (STALLED * RATE as f64) as i64;
+                if let Some(slowest) = inputs.iter().filter_map(|i| i.feed.arrived()).filter(|&a| a > stalled).min() {
+                    target = target.min(slowest);
+                }
                 let from = metered.get_or_insert(target.max(0));
                 // Never meter what's already been written (and so is gone).
                 *from = (*from).max(mixed.unwrap_or(0));

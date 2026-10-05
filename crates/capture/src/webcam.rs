@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use crate::Device;
 
 /// Whether this platform can record a webcam.
-pub const AVAILABLE: bool = cfg!(any(target_os = "windows", target_os = "macos"));
+pub const AVAILABLE: bool = cfg!(any(target_os = "windows", target_os = "macos", target_os = "linux"));
 
 /// Where the webcam goes and how much of it shows.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -205,14 +205,15 @@ pub fn formats(device: &str) -> Vec<Format> {
     FORMATS.lock().unwrap().as_ref().filter(|(d, _)| d == device).map(|(_, f)| f.clone()).unwrap_or_default()
 }
 
-#[cfg_attr(not(any(target_os = "windows", target_os = "macos")), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "windows", target_os = "macos", target_os = "linux")), allow(dead_code))]
 pub(crate) fn set_formats(device: &str, formats: Vec<Format>) {
     *FORMATS.lock().unwrap() = Some((device.to_owned(), formats));
 }
 
 /// Whether cameras have their own settings window ([`open_settings`]): on
 /// Windows, from the driver. macOS has none (its controls are in Control
-/// Centre's Video Effects).
+/// Centre's Video Effects), nor does Linux (apps like `cameractrls` and
+/// `guvcview` set a camera's controls for every app).
 pub const HAS_SETTINGS: bool = cfg!(target_os = "windows");
 
 /// Open the camera's own settings window (exposure, focus, white balance…, as
@@ -242,7 +243,11 @@ pub fn keep_open(want: Option<(String, Option<Format>)>) {
     {
         crate::mac::camera::keep_open(want);
     }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    #[cfg(target_os = "linux")]
+    {
+        crate::linux::keep_camera_open(want);
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     {
         let _ = want;
     }
@@ -258,7 +263,11 @@ pub fn list_cameras() -> Vec<Device> {
     {
         crate::mac::camera::list_cameras()
     }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    #[cfg(target_os = "linux")]
+    {
+        crate::linux::list_cameras()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     {
         Vec::new()
     }
@@ -284,7 +293,7 @@ pub fn status() -> Status {
     STATUS.lock().unwrap().clone()
 }
 
-#[cfg_attr(not(any(target_os = "windows", target_os = "macos")), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "windows", target_os = "macos", target_os = "linux")), allow(dead_code))]
 pub(crate) fn set_status(s: Status) {
     *STATUS.lock().unwrap() = s;
 }

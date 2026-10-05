@@ -1,9 +1,11 @@
 //! System audio device enumeration (inputs = mics, outputs = speakers/headphones).
 //!
-//! Uses cpal so the same list works on macOS (CoreAudio), Windows (WASAPI) and
-//! Linux (ALSA/PipeWire). Device ids are the device *names*, which stay stable
-//! across reboots and replugging (indices don't).
+//! Uses cpal on macOS (CoreAudio) and Windows (WASAPI), and PipeWire on Linux
+//! (where ALSA, under cpal, lists plugin names like `sysdefault:CARD=…`).
+//! Device ids are stable across reboots and replugging (indices aren't): the
+//! device *names* on macOS and Windows, PipeWire's `node.name` on Linux.
 
+#[cfg(not(target_os = "linux"))]
 use cpal::traits::{DeviceTrait, HostTrait};
 
 use crate::Device;
@@ -40,6 +42,14 @@ fn resolve(id: &str, default: Option<&str>) -> Option<String> {
 
 /// Enumerate input and output devices. Never fails — a broken audio host just
 /// yields empty lists.
+#[cfg(target_os = "linux")]
+pub fn list_audio_devices() -> AudioDevices {
+    crate::linux::audio::list_devices()
+}
+
+/// Enumerate input and output devices. Never fails — a broken audio host just
+/// yields empty lists.
+#[cfg(not(target_os = "linux"))]
 pub fn list_audio_devices() -> AudioDevices {
     let host = cpal::default_host();
     let name = |d: &cpal::Device| d.description().ok().map(|desc| desc.name().to_owned());
