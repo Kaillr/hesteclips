@@ -41,11 +41,27 @@ pub use metal::{Frames, available};
 
 static RENDER: OnceLock<RenderState> = OnceLock::new();
 
-/// Remember the app's renderer, at startup.
-pub fn init(state: Option<&RenderState>) {
-    if let Some(s) = state {
-        let _ = RENDER.set(s.clone());
-    }
+/// Remember the app's renderer, at startup, and get the frame filter ready
+/// in the background: DirectX takes seconds to compile its three shaders, and
+/// done on the first draw that kept a clip's first picture black that long
+/// (the sound playing already).
+pub fn init(state: Option<&RenderState>, ctx: &egui::Context) {
+    let Some(s) = state else { return };
+    let _ = RENDER.set(s.clone());
+    let (s, ctx) = (s.clone(), ctx.clone());
+    std::thread::Builder::new()
+        .name("frame filter".into())
+        .spawn(move || {
+            let started = std::time::Instant::now();
+            let scaler = Scaler::new(&s.device, s.target_format);
+            s.renderer.write().callback_resources.insert(scaler);
+            // A picture waiting for it is drawn now.
+            ctx.request_repaint();
+            if std::env::var_os("HESTECLIPS_DEBUG_VIDEO").is_some() {
+                eprintln!("frame filter ready in {} ms", started.elapsed().as_millis());
+            }
+        })
+        .expect("spawn frame filter thread");
 }
 
 /// A decoded frame ready to draw: its texture(s), opened once per decoder
@@ -110,11 +126,9 @@ impl CallbackTrait for Draw {
         _encoder: &mut wgpu::CommandEncoder,
         resources: &mut CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
-        if resources.get::<Scaler>().is_none() {
-            let Some(rs) = RENDER.get() else { return Vec::new() };
-            resources.insert(Scaler::new(device, rs.target_format));
-        }
-        let scaler = resources.get_mut::<Scaler>().expect("just made");
+        // Still being made (right after launch): no picture yet, rather than
+        // the window stuck for seconds compiling it here.
+        let Some(scaler) = resources.get_mut::<Scaler>() else { return Vec::new() };
         let now = std::time::Instant::now();
         scaler.groups.retain(|_, (_, used)| now.duration_since(*used).as_secs() < 2);
         if let Some((_, used)) = scaler.groups.get_mut(&self.0.key) {
@@ -153,18 +167,27 @@ impl CallbackTrait for Draw {
 }
 
 impl Scaler {
+    /// Compiles its three shaders side by side: DirectX's compiler takes 1–2.5 s
+    /// over each (measured), most of it on the loops over the weights.
     fn new(device: &wgpu::Device, target: wgpu::TextureFormat) -> Self {
         let srgb = if target.is_srgb() { "true" } else { "false" };
-        let rgba = Pipeline::new(device, target, &format!("{COMMON}{RGBA}").replace("SRGB_TARGET", srgb), 1);
-        let nv12 = ["false", "true"].map(|bt601| Pipeline::new(device, target, &format!("{COMMON}{NV12}").replace("SRGB_TARGET", srgb).replace("BT601", bt601), 2));
-        Self { rgba, nv12, groups: HashMap::new() }
+        let nv12 = |bt601: &str| format!("{COMMON}{NV12}").replace("SRGB_TARGET", srgb).replace("BT601", bt601);
+        let (rgba, bt709, bt601) = std::thread::scope(|scope| {
+            let rgba = scope.spawn(|| Pipeline::new(device, target, &format!("{COMMON}{RGBA}").replace("SRGB_TARGET", srgb), 1));
+            let bt709 = scope.spawn(|| Pipeline::new(device, target, &nv12("false"), 2));
+            let bt601 = Pipeline::new(device, target, &nv12("true"), 2);
+            (rgba.join().expect("frame filter compile"), bt709.join().expect("frame filter compile"), bt601)
+        });
+        Self { rgba, nv12: [bt709, bt601], groups: HashMap::new() }
     }
 }
 
 impl Pipeline {
     /// A pipeline drawing with `source`, which reads `textures` unfiltered textures.
     fn new(device: &wgpu::Device, target: wgpu::TextureFormat, source: &str, textures: u32) -> Self {
+        let t0 = std::time::Instant::now();
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("frame filter"), source: wgpu::ShaderSource::Wgsl(source.into()) });
+        let t_module = t0.elapsed();
         let entries: Vec<_> = (0..textures)
             .map(|binding| wgpu::BindGroupLayoutEntry {
                 binding,
@@ -199,6 +222,9 @@ impl Pipeline {
             multiview_mask: None,
             cache: None,
         });
+        if std::env::var_os("HESTECLIPS_DEBUG_VIDEO").is_some() {
+            eprintln!("frame filter pipeline: shader parsed in {} ms, pipeline (DirectX compile) in {} ms", t_module.as_millis(), (t0.elapsed() - t_module).as_millis());
+        }
         Self { pipeline, layout }
     }
 }

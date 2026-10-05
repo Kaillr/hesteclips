@@ -127,7 +127,7 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| {
             #[cfg(hw_decode)]
-            gpu_frames::init(cc.wgpu_render_state.as_ref());
+            gpu_frames::init(cc.wgpu_render_state.as_ref(), &cc.egui_ctx);
             Ok(Box::new(App::new(cc.egui_ctx.clone())))
         }),
     );
