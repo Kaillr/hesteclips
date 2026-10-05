@@ -197,6 +197,12 @@ pub fn foreground_exe() -> Option<String> {
     }
 }
 
+/// Whether Windows shows the cursor, and its image's handle (for a debug log).
+#[cfg(target_os = "windows")]
+pub fn win_cursor_state() -> Option<(bool, usize)> {
+    win::cursor_state()
+}
+
 /// The app in focus: its id (as [`foreground_exe`]) and where it's installed,
 /// to tell a game by its folder (`…/steamapps/common/<game>/…`).
 pub fn foreground_app_path() -> Option<(String, PathBuf)> {

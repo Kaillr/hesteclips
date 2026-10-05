@@ -42,6 +42,33 @@ pub fn start() {
     );
 }
 
+/// `HESTECLIPS_CURSOR_LOG=1`: log the cursor ten times a second when it
+/// changes — shown or not, which image, which app has focus — to find out why
+/// it vanishes in some games while HesteClips runs.
+#[cfg(windows)]
+pub fn log_cursor() {
+    if std::env::var_os("HESTECLIPS_CURSOR_LOG").is_none() {
+        return;
+    }
+    std::thread::spawn(|| {
+        let mut last = None;
+        loop {
+            let now = (capture::win_cursor_state(), capture::foreground_exe());
+            if last.as_ref() != Some(&now) {
+                let (cursor, app) = &now;
+                let cursor = match cursor {
+                    Some((true, image)) => format!("shown (image {image:#x})"),
+                    Some((false, image)) => format!("HIDDEN (image {image:#x})"),
+                    None => "unknown".to_owned(),
+                };
+                eprintln!("{} cursor {cursor}, focus: {}", chrono::Local::now().format("%H:%M:%S%.3f"), app.as_deref().unwrap_or("-"));
+                last = Some(now);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    });
+}
+
 /// "Windows 11 24H2 (build 26100.4061)", from the registry (the version APIs
 /// say whatever the app's manifest claims to support).
 #[cfg(windows)]

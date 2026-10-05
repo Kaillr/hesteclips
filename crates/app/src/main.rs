@@ -80,6 +80,8 @@ fn main() -> eframe::Result<()> {
     if cfg!(not(debug_assertions)) || std::env::var_os("HESTECLIPS_LOG").is_some() {
         logfile::start();
     }
+    #[cfg(windows)]
+    logfile::log_cursor();
     // The installer's hooks (install, update, uninstall) run the app with special
     // arguments and exit here; a downloaded update left uninstalled is put in
     // place now. Does nothing in a development build.

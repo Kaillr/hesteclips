@@ -279,7 +279,10 @@ impl Capture {
         // Free-threaded: frames arrive on a system thread, no message loop needed.
         let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(&winrt_device, format, 2, size)?;
         let session = pool.CreateCaptureSession(item)?;
-        let _ = session.SetIsCursorCaptureEnabled(true);
+        // `HESTECLIPS_CURSOR_CAPTURE=0` leaves the cursor out: a test for a
+        // cursor that vanishes in some games while they're captured.
+        let cursor = std::env::var_os("HESTECLIPS_CURSOR_CAPTURE").is_none_or(|v| v != "0");
+        let _ = session.SetIsCursorCaptureEnabled(cursor);
         // Windows 11: no yellow "being captured" border.
         let _ = session.SetIsBorderRequired(false);
         // Not every display refresh (540 a second on a 540 Hz monitor), just

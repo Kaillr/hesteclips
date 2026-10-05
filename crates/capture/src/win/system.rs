@@ -391,6 +391,16 @@ pub(crate) struct Foreground {
     pub main: bool,
 }
 
+/// Whether Windows is showing the cursor, and which cursor image it uses
+/// (for the cursor log).
+pub fn cursor_state() -> Option<(bool, usize)> {
+    use windows::Win32::UI::WindowsAndMessaging::{CURSOR_SHOWING, CURSORINFO, GetCursorInfo};
+    let mut info = CURSORINFO { cbSize: std::mem::size_of::<CURSORINFO>() as u32, ..Default::default() };
+    // SAFETY: a CURSORINFO with its size set.
+    unsafe { GetCursorInfo(&mut info) }.ok()?;
+    Some((info.flags.0 & CURSOR_SHOWING.0 != 0, info.hCursor.0 as usize))
+}
+
 /// The focused window's app: its executable's name and full path.
 pub fn foreground_app_path() -> Option<(String, std::path::PathBuf)> {
     unsafe {
