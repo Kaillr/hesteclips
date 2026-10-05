@@ -138,9 +138,11 @@ impl App {
         for i in 0..n {
             let channel = self.live_audio.channel(&self.settings.audio_sources[i].id);
             let id = self.settings.audio_sources[i].id.clone();
+            let id_for_listen = id.clone();
             let meters = self.sources_view.meters.entry(id).or_default();
             meters.input.update(channel.input.take(), now, dt);
             meters.output.update(channel.meter.take(), now, dt);
+            let listening = self.listening.as_ref().filter(|l| l.source == id_for_listen).map(|l| l.monitor.latency_ms());
             let action = source_card(
                 ui,
                 &mut self.settings.audio_sources[i],
@@ -149,10 +151,12 @@ impl App {
                 &self.audio,
                 has_app_sources,
                 &mut self.sources_view.renaming,
+                listening,
             );
             match action {
                 CardAction::Remove => remove = Some(i),
                 CardAction::MoveUp if i > 0 => move_up = Some(i),
+                CardAction::Listen => self.toggle_listening(i),
                 _ => {}
             }
             // Volume applies live, even mid-recording.
@@ -167,6 +171,7 @@ impl App {
             self.settings.audio_sources.swap(i, i - 1);
         }
 
+        self.keep_listening();
         self.add_source_buttons(ui);
 
         if self.rec_state != crate::RecState::Idle {
@@ -174,6 +179,50 @@ impl App {
             ui.weak("Volume changes apply right away. Adding or removing sources applies the next time you start the buffer or a recording.");
         }
         ui.add_space(16.0);
+    }
+
+    /// "Listen" on source `i`: hear it live, or stop.
+    fn toggle_listening(&mut self, i: usize) {
+        let source = &self.settings.audio_sources[i];
+        if self.listening.as_ref().is_some_and(|l| l.source == source.id) {
+            self.listening = None;
+            return;
+        }
+        self.listening = None;
+        if let Some(err) = self.start_listening(i) {
+            self.toast_error(format!("Couldn't play the microphone: {err}"));
+        }
+    }
+
+    fn start_listening(&mut self, i: usize) -> Option<String> {
+        let source = &self.settings.audio_sources[i];
+        let SourceKind::Microphone { device } = &source.kind else { return None };
+        let Some(device) = self.audio.resolve_input(device) else { return Some("no microphone".into()) };
+        match capture::monitor::MicMonitor::start(&device, self.live_audio.channel(&source.id)) {
+            Ok(monitor) => {
+                self.listening = Some(Listening { source: source.id.clone(), device, monitor });
+                None
+            }
+            Err(e) => Some(e.to_string()),
+        }
+    }
+
+    /// Stop listening to a microphone that's gone, off or removed; follow it
+    /// to another device.
+    fn keep_listening(&mut self) {
+        let Some(l) = &self.listening else { return };
+        let found = self.settings.audio_sources.iter().position(|s| s.id == l.source && s.enabled);
+        let Some(i) = found else {
+            self.listening = None;
+            return;
+        };
+        let SourceKind::Microphone { device } = &self.settings.audio_sources[i].kind else { return };
+        if self.audio.resolve_input(device).as_deref() != Some(l.device.as_str()) {
+            self.listening = None;
+            if let Some(err) = self.start_listening(i) {
+                self.toast_error(format!("Couldn't play the microphone: {err}"));
+            }
+        }
     }
 
     fn add_source_buttons(&mut self, ui: &mut egui::Ui) {
@@ -664,6 +713,15 @@ enum CardAction {
     None,
     Remove,
     MoveUp,
+    /// "Listen" on a microphone: hear it live, or stop.
+    Listen,
+}
+
+/// Hearing a microphone live: which source, from which device.
+pub(crate) struct Listening {
+    pub source: String,
+    pub device: String,
+    pub monitor: capture::monitor::MicMonitor,
 }
 
 fn source_card(
@@ -674,6 +732,8 @@ fn source_card(
     devices: &capture::audio::AudioDevices,
     has_app_sources: bool,
     renaming: &mut Option<String>,
+    // A microphone's "Listen": `Some(latency in ms, if known)` while on.
+    listening: Option<Option<f32>>,
 ) -> CardAction {
     let mut action = CardAction::None;
     card(ui, |ui| {
@@ -802,6 +862,19 @@ fn source_card(
                 ui.add_enabled(has_app_sources, egui::Checkbox::new(exclude_apps, "Leave out apps added below"))
                     .on_hover_text("Apps you add as their own source won't also be heard here, so nothing plays twice.")
                     .on_disabled_hover_text("Add an app as its own source to use this.");
+            }
+            if matches!(source.kind, SourceKind::Microphone { .. }) {
+                ui.add_space(8.0);
+                let on = listening.is_some();
+                let r = ui.selectable_label(on, "🎧 Listen").on_hover_text(
+                    "Hear this microphone live, at its volume, to check it works and how it sounds. Use headphones: speakers would feed back into it.",
+                );
+                if r.clicked() {
+                    action = CardAction::Listen;
+                }
+                if let Some(Some(ms)) = listening {
+                    ui.weak(format!("≈ {ms:.0} ms delay")).on_hover_text("From the microphone to your ears, as the devices report it (their hardware adds a little).");
+                }
             }
         });
         if !source.in_mix && !source.own_track {

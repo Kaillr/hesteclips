@@ -178,6 +178,11 @@ impl Channel {
         self.muted.store(muted, Ordering::Relaxed);
     }
 
+    /// The gain applied now: 0 when muted.
+    pub fn gain(&self) -> f32 {
+        self.effective_gain()
+    }
+
     fn effective_gain(&self) -> f32 {
         if self.muted.load(Ordering::Relaxed) { 0.0 } else { self.gain.load() }
     }

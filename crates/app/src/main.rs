@@ -318,6 +318,8 @@ struct App {
     /// with the source, height and frame rate it was started for.
     pub(crate) video_preview: Option<((capture::VideoSource, Option<u32>, u32, Option<capture::webcam::Webcam>), capture::preview::VideoPreview)>,
     sources_view: sources_ui::SourcesView,
+    /// A microphone heard live ("Listen" on the Sources page).
+    pub(crate) listening: Option<sources_ui::Listening>,
     clips: Vec<clips::Clip>,
     thumbs: thumbs::Thumbs,
     /// Most recently saved clip, highlighted in the library for a few seconds.
@@ -435,6 +437,7 @@ impl App {
             level_monitor: None,
             video_preview: None,
             sources_view: Default::default(),
+            listening: None,
             clips,
             thumbs: thumbs::Thumbs::new(ctx.clone()),
             last_saved: None,
@@ -697,6 +700,11 @@ impl eframe::App for App {
             self.kept_camera = camera;
         }
         laps.lap("webcam");
+
+        // Hearing a microphone is for the Sources page only: never left on.
+        if self.page != Page::Sources {
+            self.listening = None;
+        }
 
         // Left the viewer some other way (a hotkey that shows the library): stop it.
         if self.page != Page::View && self.viewer.is_some() {

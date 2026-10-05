@@ -15,6 +15,7 @@ pub mod audio;
 #[cfg(target_os = "macos")]
 mod avwriter;
 pub mod mixer;
+pub mod monitor;
 pub mod mp4meta;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub(crate) mod mp4read;
