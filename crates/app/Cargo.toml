@@ -32,6 +32,8 @@ rfd = "0.17.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 trash = "5"
+# "Hashtag HesteClip that" (voice.rs): runs its small ONNX models, pure Rust.
+tract-onnx = "0.23.8"
 uuid = { version = "1", features = ["v4"] }
 discord-rich-presence = "1.1.0"
 ureq = { version = "3.4.2", features = ["json"] }
@@ -51,8 +53,6 @@ pollster = "1"
 
 # Windows-only: drawing decoded frames straight from the GPU (gpu_frames.rs).
 [target.'cfg(windows)'.dependencies]
-# "Hashtag HesteClip that" (voice.rs): keyword spotting, linked in statically.
-sherpa-onnx = "1.13.8"
 velopack = "1.2.161"
 windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Direct3D12", "Win32_System_Console", "Win32_System_Registry", "Win32_System_Threading"] }
 
@@ -87,5 +87,6 @@ windows = { version = "0.62", features = [
 ] }
 
 [dev-dependencies]
+hound = "3"
 naga = { version = "30", features = ["wgsl-in"] }
 pollster = "1"

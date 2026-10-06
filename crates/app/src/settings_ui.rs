@@ -169,7 +169,7 @@ impl App {
         });
 
         section(ui, "Voice", |ui| {
-            let hint = "While the replay buffer runs, say it and a clip is saved, like pressing the shortcut. HesteClips listens on this PC, to your microphone from the Sources page, for this phrase only.";
+            let hint = "While the replay buffer runs, say it and a clip is saved, like pressing the shortcut. HesteClips listens on this computer, to your microphone from the Sources page, for this phrase only.";
             row(ui, "Say \"hashtag HesteClip that\"", Some(hint), |ui| {
                 ui.horizontal(|ui| {
                     toggle(ui, &mut self.settings.voice_clip);
