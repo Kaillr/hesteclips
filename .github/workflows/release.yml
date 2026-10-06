@@ -1,11 +1,17 @@
 # Release: run by hand (Actions → Release → Run workflow) on main.
-# semantic-release reads the commits since the last tag (feat: → minor,
-# fix: → patch, BREAKING CHANGE → major), builds the Windows installer and
-# update packages (scripts/release.ps1), tags vX.Y.Z and publishes the GitHub
-# release the installed apps update from. No release-worthy commits → nothing.
-# Then the Linux and macOS jobs build HesteClips-linux-x64.tar.gz and
-# HesteClips-mac-arm64.dmg and add them to that release. Given a tag, only
-# those two are built, for that release.
+#
+# 1. version: semantic-release reads the commits since the last tag (feat: →
+#    minor, fix: → patch, BREAKING CHANGE → major) and says what the next
+#    version is, without releasing anything. No release-worthy commits → the
+#    rest is skipped.
+# 2. windows, linux, mac: build that version, all at once (installer and
+#    update packages, HesteClips-linux-x64.tar.gz, HesteClips-mac-arm64.dmg).
+# 3. publish: only once all three built, semantic-release tags vX.Y.Z and
+#    publishes the GitHub release with everything on it, which the installed
+#    apps update from. A failed build means no release, never half of one.
+#
+# Given a tag, only the Linux and macOS packages are built, for that existing
+# release, and added to it.
 name: Release
 
 on:
@@ -21,20 +27,53 @@ permissions:
 concurrency: release
 
 jobs:
-  release:
-    if: inputs.tag == ''
-    runs-on: windows-latest
+  version:
+    runs-on: ubuntu-24.04
     outputs:
-      tag: ${{ steps.tag.outputs.tag }}
+      version: ${{ steps.v.outputs.version }}
+      ref: ${{ steps.v.outputs.ref }}
     steps:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0 # all tags and commits, to work out the version
 
       - uses: actions/setup-node@v5
+        if: inputs.tag == ''
         with:
           node-version: 24
           cache: npm
+
+      - run: npm ci
+        if: inputs.tag == ''
+
+      # The next version (written by .releaserc.json's verifyReleaseCmd), and
+      # the commit every build uses, so all three build the same code.
+      - id: v
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          if [ -n "$TAG" ]; then
+            echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+            echo "ref=$TAG" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          npx semantic-release --dry-run
+          if [ -f .next-version ]; then
+            echo "version=$(cat .next-version)" >> "$GITHUB_OUTPUT"
+            echo "ref=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          else
+            echo "Nothing to release."
+          fi
+
+  windows:
+    needs: version
+    if: needs.version.outputs.version != '' && inputs.tag == ''
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.version.outputs.ref }}
 
       - uses: actions/setup-dotnet@v5
         with:
@@ -47,31 +86,27 @@ jobs:
       # Same version as the velopack crate in crates/app/Cargo.toml.
       - run: dotnet tool install -g vpk --version 1.2.161
 
-      - run: npm ci
-
-      - run: npx semantic-release
+      # The token: the previous release, so updates to this one can be deltas.
+      - run: pwsh -NoProfile -File scripts/release.ps1 -Version ${{ needs.version.outputs.version }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # The tag semantic-release just made, if it made one.
-      - id: tag
-        shell: bash
-        run: echo "tag=$(git tag --points-at HEAD 'v*' | head -n1)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: Releases/*
+          if-no-files-found: error
 
   linux:
-    needs: release
-    # Runs after a release (or on its own, given a tag); skipped when nothing
-    # was released.
-    if: always() && (inputs.tag != '' || (needs.release.result == 'success' && needs.release.outputs.tag != ''))
+    needs: version
+    if: needs.version.outputs.version != ''
     # 24.04, not older: the pipewire crate needs PipeWire 1.0's headers. The
     # binary then needs glibc 2.39+ (Ubuntu 24.04, Fedora 40, Debian 13, Arch).
     runs-on: ubuntu-24.04
-    env:
-      TAG: ${{ inputs.tag || needs.release.outputs.tag }}
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ inputs.tag || needs.release.outputs.tag }}
+          ref: ${{ needs.version.outputs.ref }}
 
       - run: sudo apt-get update && sudo apt-get install -y build-essential libclang-dev libpipewire-0.3-dev libdbus-1-dev libasound2-dev patchelf
 
@@ -82,24 +117,23 @@ jobs:
       # Packaging as main has it (what's bundled, how), for an older tag too.
       - run: git fetch --depth=1 origin main && git show FETCH_HEAD:scripts/release-linux.sh > scripts/release-linux.sh && chmod +x scripts/release-linux.sh
 
-      - run: scripts/release-linux.sh "${TAG#v}"
+      - run: scripts/release-linux.sh ${{ needs.version.outputs.version }}
 
-      - run: gh release upload "$TAG" Releases/HesteClips-linux-x64.tar.gz --clobber
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: Releases/HesteClips-linux-x64.tar.gz
+          if-no-files-found: error
 
   mac:
-    needs: release
-    # Like the Linux job: after a release, or on its own given a tag.
-    if: always() && (inputs.tag != '' || (needs.release.result == 'success' && needs.release.outputs.tag != ''))
+    needs: version
+    if: needs.version.outputs.version != ''
     # Apple Silicon. Free for a public repo, like the others.
     runs-on: macos-15
-    env:
-      TAG: ${{ inputs.tag || needs.release.outputs.tag }}
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ inputs.tag || needs.release.outputs.tag }}
+          ref: ${{ needs.version.outputs.ref }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -110,8 +144,56 @@ jobs:
       # Packaging as main has it (what's bundled, how), for an older tag too.
       - run: git fetch --depth=1 origin main && git show FETCH_HEAD:scripts/release-mac.sh > scripts/release-mac.sh && chmod +x scripts/release-mac.sh
 
-      - run: scripts/release-mac.sh "${TAG#v}"
+      - run: scripts/release-mac.sh ${{ needs.version.outputs.version }}
 
-      - run: gh release upload "$TAG" Releases/HesteClips-mac-arm64.dmg --clobber
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac
+          path: Releases/HesteClips-mac-arm64.dmg
+          if-no-files-found: error
+
+  publish:
+    needs: [version, windows, linux, mac]
+    # Every build that ran succeeded (Windows is skipped when adding to an
+    # existing release).
+    if: >-
+      always() && needs.version.outputs.version != '' &&
+      needs.linux.result == 'success' && needs.mac.result == 'success' &&
+      (inputs.tag != '' || needs.windows.result == 'success')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.version.outputs.ref }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: Releases
+          merge-multiple: true
+
+      - run: ls -la Releases
+
+      - name: Add to the existing release
+        if: inputs.tag != ''
+        run: gh release upload "${{ inputs.tag }}" Releases/* --clobber
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-node@v5
+        if: inputs.tag == ''
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+        if: inputs.tag == ''
+
+      # Tags the commit the builds used and publishes Releases/*. Checks the
+      # version is still the one built (verifyReleaseCmd); semantic-release
+      # also refuses if main moved on meanwhile — run the workflow again then.
+      - run: git checkout -B main && npx semantic-release
+        if: inputs.tag == ''
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EXPECT_VERSION: ${{ needs.version.outputs.version }}

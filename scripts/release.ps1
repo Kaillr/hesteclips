@@ -2,8 +2,8 @@
 # to it, packed by Velopack into an installer (HesteClips-win-Setup.exe), a
 # portable zip, and the full + delta packages the installed app updates from.
 #
-# semantic-release runs this with the version it picked (see .releaserc.json)
-# and then uploads Releases/* to the GitHub release. It also runs locally:
+# The release workflow runs this with the version semantic-release picked, and
+# publishes Releases/* once every platform has built. It also runs locally:
 #   pwsh scripts/release.ps1 -Version 0.0.1-local
 # Needs Rust, and `vpk` (dotnet tool install -g vpk --version 1.2.161).
 param(
