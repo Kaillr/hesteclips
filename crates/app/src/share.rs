@@ -47,14 +47,15 @@ pub fn save_mp3(clip: &Path, out: &Path) -> Result<(), String> {
 /// Whether clips can be dragged out of the window into other apps.
 pub const CAN_DRAG_OUT: bool = cfg!(any(target_os = "macos", target_os = "windows"));
 
-/// Start a native drag of `file` out of the window. The drag image is the clip's
-/// thumbnail (a JPEG on disk) when we have one.
+/// Start a native drag of `files` out of the window. The drag image is the
+/// first clip's thumbnail (a JPEG on disk) when we have one, as a little stack
+/// when there are several.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-pub fn start_drag(frame: &eframe::Frame, file: &Path, preview: Option<PathBuf>) -> Result<(), String> {
-    let image = drag::Image::Raw(drag_image(preview.as_deref()));
+pub fn start_drag(frame: &eframe::Frame, files: Vec<PathBuf>, preview: Option<PathBuf>) -> Result<(), String> {
+    let image = drag::Image::Raw(drag_image(preview.as_deref(), files.len()));
     drag::start_drag(
         frame,
-        drag::DragItem::Files(vec![file.to_path_buf()]),
+        drag::DragItem::Files(files),
         image,
         |_, _| {},
         drag::Options::default(),
@@ -63,7 +64,7 @@ pub fn start_drag(frame: &eframe::Frame, file: &Path, preview: Option<PathBuf>) 
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-pub fn start_drag(_frame: &eframe::Frame, _file: &Path, _preview: Option<PathBuf>) -> Result<(), String> {
+pub fn start_drag(_frame: &eframe::Frame, _files: Vec<PathBuf>, _preview: Option<PathBuf>) -> Result<(), String> {
     Err("dragging clips out isn't available here — use Copy clip".into())
 }
 
@@ -195,11 +196,25 @@ pub fn share_sheet(_frame: &eframe::Frame, _file: &Path, _at: egui::Pos2) -> Res
 /// (the cached one is 480 px, far too big to drag around), or a plain tile if the
 /// thumbnail isn't ready yet.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-fn drag_image(preview: Option<&Path>) -> Vec<u8> {
-    let img = preview
+fn drag_image(preview: Option<&Path>, count: usize) -> Vec<u8> {
+    let mut img = preview
         .and_then(|p| image::open(p).ok())
         .map(|i| i.resize(192, 108, image::imageops::FilterType::Triangle))
         .unwrap_or_else(|| image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(160, 90, image::Rgba([40, 40, 44, 230]))));
+    // Several clips: cards peeking out behind it, up to two.
+    let behind = count.saturating_sub(1).min(2) as u32;
+    if behind > 0 {
+        const STEP: u32 = 7;
+        let (w, h) = (img.width(), img.height());
+        let mut pile = image::RgbaImage::new(w + STEP * behind, h + STEP * behind);
+        for k in (1..=behind).rev() {
+            let shade = 70 - 15 * k as u8;
+            let card = image::RgbaImage::from_pixel(w, h, image::Rgba([shade, shade, shade + 4, 235]));
+            image::imageops::overlay(&mut pile, &card, (STEP * k) as i64, (STEP * k) as i64);
+        }
+        image::imageops::overlay(&mut pile, &img.to_rgba8(), 0, 0);
+        img = image::DynamicImage::ImageRgba8(pile);
+    }
     let mut png = Vec::new();
     let _ = img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png);
     png

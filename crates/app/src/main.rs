@@ -1169,7 +1169,7 @@ impl App {
             viewer::ViewerOutcome::DragOut => {
                 let clip = v.clip().to_path_buf();
                 let preview = self.clips.iter().find(|c| c.path == clip).and_then(thumbs::cached_jpeg);
-                self.drag_out(ui.ctx(), frame, &clip, preview);
+                self.drag_out(ui.ctx(), frame, vec![clip], preview);
             }
         }
     }

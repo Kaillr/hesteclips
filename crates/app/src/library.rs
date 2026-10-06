@@ -157,7 +157,7 @@ impl Selection {
 
 enum Action {
     /// Drag the file out of the window (to another app / the desktop).
-    DragOut(PathBuf, Option<PathBuf>),
+    DragOut(Vec<PathBuf>, Option<PathBuf>),
     Share(PathBuf, ShareChoice),
     Rename(PathBuf),
     Open(PathBuf),
@@ -277,7 +277,7 @@ impl App {
                 }
             }
             Some(Action::Share(p, choice)) => self.share(frame, p, choice),
-            Some(Action::DragOut(p, preview)) => self.drag_out(ui.ctx(), frame, &p, preview),
+            Some(Action::DragOut(files, preview)) => self.drag_out(ui.ctx(), frame, files, preview),
             Some(Action::Edit(p)) => self.open_editor(p),
             Some(Action::Rename(p)) => self.rename_clip(p),
             Some(Action::Trash(p)) => self.trash_clips(&[p]),
@@ -776,7 +776,8 @@ impl App {
         }
 
         let hint = match (selecting, share::CAN_DRAG_OUT) {
-            (true, _) => "Click to select",
+            (true, true) => "Click to select · drag the selected clips into any app",
+            (true, false) => "Click to select",
             (false, true) => "Click to play · drag into any app to share",
             (false, false) => "Click to play",
         };
@@ -784,9 +785,16 @@ impl App {
         // Once the pointer has moved a little with the button held, it's a drag:
         // hand it to the OS so the clip can be dropped into Discord, Finder, a
         // browser… (egui alone can't drag outside its own window).
-        if share::CAN_DRAG_OUT && resp.drag_started() && action.is_none() && !selecting {
+        // Dragging one of the selected clips takes them all, in library order;
+        // any other clip goes alone, as in a file manager.
+        if share::CAN_DRAG_OUT && resp.drag_started() && action.is_none() {
+            let files = if selected {
+                self.clips.iter().filter(|c| self.selection.paths.contains(&c.path)).map(|c| c.path.clone()).collect()
+            } else {
+                vec![clip.path.clone()]
+            };
             let preview = thumbs::cached_jpeg(clip);
-            action = Some(Action::DragOut(clip.path.clone(), preview));
+            action = Some(Action::DragOut(files, preview));
         }
         if resp.clicked() && action.is_none() && render.is_none() {
             action = Some(if modifiers.shift && (selecting || modifiers.command) {
@@ -1069,12 +1077,12 @@ impl App {
         }
     }
 
-    /// Hand a drag of `file` to the OS, so it can be dropped into any app.
-    pub(crate) fn drag_out(&mut self, ctx: &egui::Context, frame: &eframe::Frame, file: &Path, preview: Option<PathBuf>) {
+    /// Hand a drag of `files` to the OS, so they can be dropped into any app.
+    pub(crate) fn drag_out(&mut self, ctx: &egui::Context, frame: &eframe::Frame, files: Vec<PathBuf>, preview: Option<PathBuf>) {
         // egui must forget its own drag, or what was dragged would stay
         // "grabbed" after the drop.
         ctx.stop_dragging();
-        if let Err(e) = share::start_drag(frame, file, preview) {
+        if let Err(e) = share::start_drag(frame, files, preview) {
             self.toast_error(format!("Couldn't start the drag: {e}"));
         }
     }
