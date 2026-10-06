@@ -91,6 +91,8 @@ struct Ready {
     rename_requested: bool,
     /// The export settings were opened by the dev hook.
     export_shown: bool,
+    /// The export settings popup is open.
+    export_open: bool,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -273,6 +275,7 @@ impl Ready {
             save_as: None,
             rename_requested: false,
             export_shown: false,
+            export_open: false,
         }
     }
 
@@ -345,19 +348,31 @@ impl Ready {
                     self.save_as = Some((suggested, None));
                 }
                 // How the saved file is made: applies to Done and Save as new.
-                let export = egui::Button::new(RichText::new(format!("⚙ {}", crate::export_ui::summary(&self.info, &self.edit))).size(14.0))
+                let export = egui::Button::new(RichText::new(format!("⚙ Export: {}", crate::export_ui::summary(&self.info, &self.edit))).size(14.0))
                     .min_size(Vec2::new(0.0, 30.0))
                     .corner_radius(8)
                     .selected(self.edit.output != media::Output::default());
                 let export = ui.add(export).on_hover_text("Export settings: resolution, frame rate, quality, a size to fit under, audio tracks");
+                if export.clicked() {
+                    self.export_open = !self.export_open;
+                }
                 // Dev aid: `HESTECLIPS_OPEN_EXPORT=1` opens it at launch.
                 if std::env::var_os("HESTECLIPS_OPEN_EXPORT").is_some() && !self.export_shown {
                     self.export_shown = true;
-                    egui::Popup::open_id(ui.ctx(), egui::Popup::default_response_id(&export));
+                    self.export_open = true;
                 }
-                egui::Popup::from_toggle_button_response(&export)
-                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                // Its dropdowns open popups of their own, and egui remembers
+                // only one open popup: left to egui, opening a dropdown closed
+                // this. So it's kept open here, and a click closes it only
+                // outside it, and not when it was for an open dropdown.
+                let dropdown_open = egui::Popup::is_any_open(ui.ctx());
+                let shown = egui::Popup::from_response(&export)
+                    .open_bool(&mut self.export_open)
+                    .close_behavior(egui::PopupCloseBehavior::IgnoreClicks)
                     .show(|ui| crate::export_ui::ui(ui, &self.info, &mut self.edit));
+                if shown.is_some_and(|r| r.response.clicked_elsewhere()) && !dropdown_open && !export.clicked() {
+                    self.export_open = false;
+                }
                 let has_saved_edit = target.source != target.clip;
                 if (has_saved_edit || changed)
                     && ui.button(RichText::new("↺ Revert").size(14.0)).on_hover_text("Undo every edit and go back to the original recording").clicked()
