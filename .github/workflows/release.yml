@@ -79,13 +79,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       # The release's own copy of the script may predate Linux releases.
-      - run: git fetch --depth=1 origin main && git show FETCH_HEAD:scripts/release-linux.sh > /tmp/release-linux.sh && chmod +x /tmp/release-linux.sh
+      - run: git fetch --depth=1 origin main && git show FETCH_HEAD:scripts/release-linux.sh > scripts/release-linux.sh && chmod +x scripts/release-linux.sh
         if: hashFiles('scripts/release-linux.sh') == ''
 
-      - run: |
-          script=scripts/release-linux.sh
-          [ -f "$script" ] || script=/tmp/release-linux.sh
-          "$script" "${TAG#v}"
+      - run: scripts/release-linux.sh "${TAG#v}"
 
       - run: gh release upload "$TAG" Releases/HesteClips-linux-x64.tar.gz --clobber
         env:
