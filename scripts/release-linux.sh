@@ -15,8 +15,8 @@ cd "$root"
 
 # Encoding, the editor, thumbnails and probing run ffmpeg. BtbN's GPL build,
 # with x264, NVENC and VA-API; the shared-library one is ~40 MB smaller packed
-# than the static one, and finds its libraries through its own RPATH
-# ($ORIGIN/../lib). It loads libva, libdrm and CUDA from the system when there
+# than the static one. Its RPATH is set to $ORIGIN/lib, so it finds its
+# libraries in lib/ beside it (needs patchelf). It loads libva, libdrm and CUDA from the system when there
 # (dlopen), so the GPU encoders use the distro's own drivers. Pinned by checksum.
 ffmpeg_build="ffmpeg-n9.0.1-11-ge47273f4d9-linux64-gpl-shared-9.0"
 ffmpeg_url="https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-31-13-27/$ffmpeg_build.tar.xz"
@@ -57,6 +57,7 @@ tar -C "$work" -xf "$tarball"
 cp "$work/$ffmpeg_build/bin/ffmpeg" "$work/$ffmpeg_build/bin/ffprobe" "$stage/"
 mkdir -p "$stage/lib"
 cp -P "$work/$ffmpeg_build"/lib/*.so.* "$stage/lib/"
+patchelf --set-rpath '$ORIGIN/lib' "$stage/ffmpeg" "$stage/ffprobe"
 cp "$work/$ffmpeg_build/LICENSE.txt" "$stage/ffmpeg-LICENSE.txt"
 "$stage/ffmpeg" -hide_banner -version >/dev/null
 "$stage/ffprobe" -hide_banner -version >/dev/null
