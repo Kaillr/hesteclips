@@ -10,8 +10,9 @@ on:
 
 jobs:
   build:
-    # The oldest supported Ubuntu, so the binary runs on older glibc too.
-    runs-on: ubuntu-22.04
+    # 24.04, not older: the pipewire crate needs PipeWire 1.0's headers. The
+    # binary then needs glibc 2.39+ (Ubuntu 24.04, Fedora 40, Debian 13, Arch).
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
 
