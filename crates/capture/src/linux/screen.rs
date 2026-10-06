@@ -1,18 +1,19 @@
-//! The screen's picture: the portal's PipeWire video node, read into memory.
+//! The screen's picture, read into memory: from the X server on an X11
+//! session (`super::x11`), else from the portal's PipeWire video node.
 //!
 //! One cast serves everything that wants the screen: the Sources preview and
 //! a recording share it, and it lives on for a few seconds after the last one
 //! lets go, so the preview handing over to a recording (or back) neither
 //! re-asks the desktop nor flashes its "sharing" indicator.
 //!
-//! Frames arrive only when something on screen changes; the newest one stays
-//! in [`Latest`] for the pacer to repeat at a constant frame rate. They come
-//! as plain memory (no DMA-BUF modifiers are offered, so the compositor
+//! From the portal, frames arrive only when something on screen changes; the
+//! newest one stays in [`Latest`] for the pacer to repeat at a constant frame
+//! rate. From X11 they're read at the frame rate. They come as plain memory (no DMA-BUF modifiers are offered, so the compositor
 //! copies them out for us): 4 bytes a pixel, BGRx or RGBx.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -21,6 +22,7 @@ use pipewire as pw;
 use pw::spa;
 
 use super::portal::{self, Cast};
+use super::x11;
 
 /// Which way round a frame's colour bytes are.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +51,13 @@ pub(crate) struct Latest {
     seq: AtomicU64,
     /// Why the picture stopped coming, once it has.
     ended: Mutex<Option<String>>,
+    /// The picture before the newest, once nobody holds it: the next one is
+    /// made in its memory.
+    spare: Mutex<Option<Frame>>,
+    /// Whether a new picture is wanted, for a source that makes them on
+    /// request (X11), and the signal to it.
+    wanted: Mutex<bool>,
+    wake: Condvar,
 }
 
 impl Latest {
@@ -56,6 +65,21 @@ impl Latest {
     pub(crate) fn get(&self) -> Option<(Arc<Frame>, u64)> {
         let frame = self.frame.lock().unwrap().clone()?;
         Some((frame, self.seq.load(Ordering::Acquire)))
+    }
+
+    /// Ask for a new picture, from a source that makes them on request: it's
+    /// made at once, for the next reader. Readers ask once per picture they
+    /// use, so pictures come as often as they're used, evenly spaced.
+    pub(crate) fn want(&self) {
+        *self.wanted.lock().unwrap() = true;
+        self.wake.notify_one();
+    }
+
+    /// Wait until a picture is wanted (true), or `timeout` passes (false).
+    pub(crate) fn wait_wanted(&self, timeout: Duration) -> bool {
+        let wanted = self.wanted.lock().unwrap();
+        let (mut wanted, _) = self.wake.wait_timeout_while(wanted, timeout, |w| !*w).unwrap();
+        std::mem::take(&mut *wanted)
     }
 
     pub(crate) fn has_frame(&self) -> bool {
@@ -68,51 +92,77 @@ impl Latest {
         self.ended.lock().unwrap().clone()
     }
 
-    fn end(&self, why: String) {
+    pub(crate) fn end(&self, why: String) {
         self.ended.lock().unwrap().get_or_insert(why);
     }
 
-    /// Copy a picture in, reusing the last one's memory if nobody holds it.
+    /// Copy a picture in, rows `stride` bytes apart.
     fn store(&self, width: u32, height: u32, stride: usize, order: Order, rows: &[u8]) {
         let row = width as usize * 4;
-        let mut slot = self.frame.lock().unwrap();
-        let mut frame = match slot.take().map(Arc::try_unwrap) {
-            Some(Ok(f)) => f,
-            _ => Frame { width, height, stride: row, order, data: Vec::new() },
-        };
+        self.fill(width, height, order, |data| {
+            for (y, out) in data.chunks_exact_mut(row).enumerate() {
+                let at = y * stride;
+                out.copy_from_slice(&rows[at..at + row]);
+            }
+        });
+    }
+
+    /// Make the new picture with `draw`, which is given its rows (packed).
+    /// The newest stays readable meanwhile.
+    pub(crate) fn fill(&self, width: u32, height: u32, order: Order, draw: impl FnOnce(&mut [u8])) {
+        let row = width as usize * 4;
+        let spare = self.spare.lock().unwrap().take();
+        let mut frame = spare.unwrap_or(Frame { width, height, stride: row, order, data: Vec::new() });
         frame.width = width;
         frame.height = height;
         frame.stride = row;
         frame.order = order;
         frame.data.resize(row * height as usize, 0);
-        for (y, out) in frame.data.chunks_exact_mut(row).enumerate() {
-            let at = y * stride;
-            out.copy_from_slice(&rows[at..at + row]);
-        }
-        *slot = Some(Arc::new(frame));
+        draw(&mut frame.data);
+        let old = self.frame.lock().unwrap().replace(Arc::new(frame));
         self.seq.fetch_add(1, Ordering::Release);
+        if let Some(Ok(old)) = old.map(Arc::try_unwrap) {
+            *self.spare.lock().unwrap() = Some(old);
+        }
     }
 }
 
 /// A running screen cast.
 pub(crate) struct Screen {
     pub latest: Arc<Latest>,
-    stop: Mutex<Option<pw::channel::Sender<()>>>,
+    /// The screen asked for (on X11 a monitor; the portal picks its own).
+    id: String,
+    stop: Stop,
     thread: Mutex<Option<JoinHandle<()>>>,
+}
+
+/// How to stop a cast's thread.
+enum Stop {
+    Portal(Mutex<Option<pw::channel::Sender<()>>>),
+    X11(Arc<AtomicBool>),
 }
 
 static SHARED: Mutex<Option<Weak<Screen>>> = Mutex::new(None);
 
-/// The screen cast, started if none is running. Blocks while the desktop asks
-/// which screen to share (only when no choice is remembered), then until the
-/// first picture arrives.
-pub(crate) fn acquire() -> Result<Arc<Screen>> {
+/// The screen cast of `id`, started if none is running. Blocks while the
+/// desktop asks which screen to share (the portal, and only when no choice
+/// is remembered), then until the first picture arrives.
+pub(crate) fn acquire(id: &str) -> Result<Arc<Screen>> {
     // Held throughout, so two starting together share one dialog and cast.
     let mut shared = SHARED.lock().unwrap();
-    if let Some(screen) = shared.as_ref().and_then(Weak::upgrade).filter(|s| s.latest.ended().is_none()) {
+    if let Some(screen) = shared.as_ref().and_then(Weak::upgrade).filter(|s| s.latest.ended().is_none() && s.id == id) {
         return Ok(screen);
     }
-    let screen = Arc::new(Screen::start()?);
+    let x11 = if x11::session() {
+        // Should X11 fail, the portal may still work (GNOME and KDE have it on X11 too).
+        Screen::start_x11(id).inspect_err(|e| eprintln!("X11 screen capture: {e:#}; trying the desktop portal")).ok()
+    } else {
+        None
+    };
+    let screen = Arc::new(match x11 {
+        Some(s) => s,
+        None => Screen::start_portal(id)?,
+    });
     *shared = Some(Arc::downgrade(&screen));
     drop(shared);
     // Fails here, visibly, rather than recording a black file.
@@ -146,7 +196,7 @@ pub(crate) fn release(screen: Arc<Screen>) {
 }
 
 impl Screen {
-    fn start() -> Result<Self> {
+    fn start_portal(id: &str) -> Result<Self> {
         let (cast, fd) = Cast::open()?;
         let latest = Arc::new(Latest::default());
         let (ready_tx, ready_rx) = mpsc::channel::<Result<pw::channel::Sender<()>>>();
@@ -160,14 +210,31 @@ impl Screen {
             cast.close();
         })?;
         let stop = ready_rx.recv_timeout(Duration::from_secs(10)).map_err(|_| anyhow!("PipeWire didn't open the screen"))??;
-        Ok(Self { latest, stop: Mutex::new(Some(stop)), thread: Mutex::new(Some(thread)) })
+        Ok(Self { latest, id: id.to_owned(), stop: Stop::Portal(Mutex::new(Some(stop))), thread: Mutex::new(Some(thread)) })
+    }
+
+    fn start_x11(id: &str) -> Result<Self> {
+        let grab = x11::Grab::open(id)?;
+        let latest = Arc::new(Latest::default());
+        let stop = Arc::new(AtomicBool::new(false));
+        let (latest2, stop2, id2) = (latest.clone(), stop.clone(), id.to_owned());
+        let thread = thread::Builder::new().name("screen".into()).spawn(move || x11::run(grab, &id2, &latest2, &stop2))?;
+        Ok(Self { latest, id: id.to_owned(), stop: Stop::X11(stop), thread: Mutex::new(Some(thread)) })
     }
 }
 
 impl Drop for Screen {
     fn drop(&mut self) {
-        if let Some(stop) = self.stop.lock().unwrap().take() {
-            let _ = stop.send(());
+        match &self.stop {
+            Stop::Portal(stop) => {
+                if let Some(stop) = stop.lock().unwrap().take() {
+                    let _ = stop.send(());
+                }
+            }
+            Stop::X11(stop) => {
+                stop.store(true, Ordering::Relaxed);
+                self.latest.want();
+            }
         }
         if let Some(t) = self.thread.lock().unwrap().take() {
             let _ = t.join();

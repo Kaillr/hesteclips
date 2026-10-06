@@ -1,10 +1,12 @@
-//! Native Linux capture backend: the ScreenCast desktop portal + PipeWire,
-//! encoded by ffmpeg. Works on Wayland and X11 desktops that have a portal
-//! (GNOME, KDE Plasma, and wlroots or Hyprland ones with theirs).
+//! Native Linux capture backend: the screen from the X server on X11, else
+//! through the ScreenCast desktop portal + PipeWire, encoded by ffmpeg. Works
+//! on every X11 desktop, and on Wayland ones that have a portal (GNOME, KDE
+//! Plasma, and wlroots or Hyprland ones with theirs).
 //!
-//! - **Video**: the portal asks which screen to share (once; the choice is
-//!   remembered) and hands over a PipeWire stream of it (`portal`,
-//!   `screen`). A pacer thread takes the newest picture every 1/fps, scales
+//! - **Video**: on X11 the monitor picked in the app is read straight from
+//!   the X server (`x11`). On Wayland the portal asks which screen to share
+//!   (once; the choice is remembered) and hands over a PipeWire stream of it
+//!   (`portal`, `screen`). A pacer thread takes the newest picture every 1/fps, scales
 //!   it to the output size, draws the webcam over it and converts it to NV12
 //!   (`image`), so the output is constant frame rate even when the screen is
 //!   still and nothing new arrives. ffmpeg encodes it (`ffmpeg`): NVENC or
@@ -29,6 +31,7 @@ pub mod ffmpeg;
 mod image;
 mod portal;
 mod screen;
+mod x11;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -59,13 +62,32 @@ pub(crate) fn host_now() -> f64 {
     ts.tv_sec as f64 + ts.tv_nsec as f64 / 1e9
 }
 
-/// The one screen entry: which screen is picked in the desktop's own dialog.
+/// The one screen entry on Wayland: which screen is picked in the desktop's own dialog.
 pub(crate) const SCREEN_ID: &str = "portal";
 
-/// Screens to record. The desktop doesn't tell apps what screens there are
-/// (on Wayland it can't be asked), so there's one entry, and the desktop asks
-/// which screen it is the first time.
+/// Whether the screens to record are picked in the app (X11), not in the
+/// desktop's own dialog (Wayland).
+pub fn screens_listed() -> bool {
+    x11::session()
+}
+
+/// Screens to record. On X11, every monitor, the main one first. On Wayland
+/// the desktop doesn't tell apps what screens there are, so there's one
+/// entry, and the desktop asks which screen it is the first time.
 pub fn list_screens() -> Vec<Device> {
+    if x11::session() {
+        let mut monitors = x11::monitors();
+        monitors.sort_by_key(|m| (!m.primary, m.x, m.y));
+        if !monitors.is_empty() {
+            return monitors
+                .into_iter()
+                .map(|m| {
+                    let main = if m.primary { ", main" } else { "" };
+                    Device { name: format!("{} ({}×{}{main})", m.name, m.width, m.height), id: m.id }
+                })
+                .collect();
+        }
+    }
     vec![Device { id: SCREEN_ID.into(), name: "Screen (picked when recording first starts)".into() }]
 }
 
@@ -76,8 +98,14 @@ pub fn choose_screen_again() {
     screen::forget();
 }
 
-/// The screen's size in pixels, once one has been recorded.
-pub(crate) fn display_pixels(_id: Option<&str>) -> Option<(u32, u32)> {
+/// The screen's size in pixels: on X11 the monitor's, else the last one
+/// the portal shared.
+pub(crate) fn display_pixels(id: Option<&str>) -> Option<(u32, u32)> {
+    if x11::session()
+        && let Some(m) = x11::find(&x11::monitors(), id.unwrap_or(""))
+    {
+        return Some((m.width as u32, m.height as u32));
+    }
     portal::last_size()
 }
 
@@ -198,7 +226,7 @@ const MIX_LATENCY: f64 = 0.3;
 /// The screen, for a video source: games and apps can't be recorded here.
 fn open_screen(source: &VideoSource) -> Result<Arc<screen::Screen>> {
     match source {
-        VideoSource::Screen { .. } => screen::acquire(),
+        VideoSource::Screen { id } => screen::acquire(id),
         VideoSource::Apps { .. } => bail!("recording games and apps isn't available on Linux — record the screen instead"),
     }
 }
@@ -326,6 +354,8 @@ impl Picture {
 
     /// Bring the canvas up to date. Returns whether there's a picture yet.
     fn update(&mut self, nv12: bool) -> bool {
+        // A source that reads the screen on request (X11) reads the next one now.
+        self.latest.want();
         let Some((frame, seq)) = self.latest.get() else { return false };
         let (cam, place) = match &mut self.camera {
             Some((layer, place)) => {
