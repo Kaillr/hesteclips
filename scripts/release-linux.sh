@@ -2,7 +2,7 @@
 # Builds the Linux release into Releases/: HesteClips-linux-x64.tar.gz, the app
 # with its desktop entry and icon. Unpack it anywhere and run ./hesteclips; on
 # first launch it adds itself to the desktop's apps (linux_desktop.rs).
-# ffmpeg isn't included: it comes from the distro (see the README).
+# ffmpeg is included, so there's nothing else to install.
 #
 # The release workflow runs this for each new version. It also runs locally:
 #   scripts/release-linux.sh 0.0.1-local
@@ -12,6 +12,15 @@ set -euo pipefail
 version="${1:?usage: release-linux.sh <version>}"
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
+
+# Encoding, the editor, thumbnails and probing run ffmpeg. BtbN's GPL build,
+# with x264, NVENC and VA-API; the shared-library one is ~40 MB smaller packed
+# than the static one, and finds its libraries through its own RPATH
+# ($ORIGIN/../lib). It loads libva, libdrm and CUDA from the system when there
+# (dlopen), so the GPU encoders use the distro's own drivers. Pinned by checksum.
+ffmpeg_build="ffmpeg-n9.0.1-11-ge47273f4d9-linux64-gpl-shared-9.0"
+ffmpeg_url="https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-31-13-27/$ffmpeg_build.tar.xz"
+ffmpeg_sha256="30801e00d25f823c6da339378ea63c38e5265f237741909e1d6164b6b5bd3d33"
 
 name="HesteClips-linux-x64"
 work="target/release-package"
@@ -36,6 +45,22 @@ trap - EXIT
 
 cp target/release/hesteclips "$stage/"
 strip "$stage/hesteclips"
+
+# Next to the app, where it looks first; the libraries in lib/ beside it.
+tarball="$work/$ffmpeg_build.tar.xz"
+if [ ! -f "$tarball" ] || ! echo "$ffmpeg_sha256  $tarball" | sha256sum -c --status; then
+    curl -fsSL "$ffmpeg_url" -o "$tarball"
+    echo "$ffmpeg_sha256  $tarball" | sha256sum -c --status || { echo "ffmpeg download has the wrong checksum" >&2; exit 1; }
+fi
+rm -rf "$work/$ffmpeg_build"
+tar -C "$work" -xf "$tarball"
+cp "$work/$ffmpeg_build/bin/ffmpeg" "$work/$ffmpeg_build/bin/ffprobe" "$stage/"
+mkdir -p "$stage/lib"
+cp -P "$work/$ffmpeg_build"/lib/*.so.* "$stage/lib/"
+cp "$work/$ffmpeg_build/LICENSE.txt" "$stage/ffmpeg-LICENSE.txt"
+"$stage/ffmpeg" -hide_banner -version >/dev/null
+"$stage/ffprobe" -hide_banner -version >/dev/null
+
 cp crates/app/assets/io.github.kaillr.HesteClips.desktop crates/app/assets/icon.svg "$stage/"
 cat > "$stage/README.txt" <<EOF
 HesteClips $version for Linux (x86-64)
@@ -44,8 +69,8 @@ Run ./hesteclips. The first time, it adds itself to your desktop's apps, so
 after that you can start it from there (move this folder first if you want it
 somewhere else, then run it once from its new place).
 
-Needs PipeWire, an xdg-desktop-portal for your desktop, and ffmpeg that can
-encode and decode H.264 (Fedora: RPM Fusion's ffmpeg, not ffmpeg-free).
+Needs PipeWire and an xdg-desktop-portal for your desktop. ffmpeg is
+included (ffmpeg, ffprobe and lib/, GPL: see ffmpeg-LICENSE.txt).
 
 https://github.com/Kaillr/hesteclips
 EOF
