@@ -1,10 +1,12 @@
-//! Native Linux capture backend: the screen from the X server on X11, else
-//! through the ScreenCast desktop portal + PipeWire, encoded by ffmpeg. Works
-//! on every X11 desktop, and on Wayland ones that have a portal (GNOME, KDE
-//! Plasma, and wlroots or Hyprland ones with theirs).
+//! Native Linux capture backend: the screen from the X server on X11, from
+//! the compositor on wlroots-style Wayland desktops, else through the
+//! ScreenCast desktop portal + PipeWire, encoded by ffmpeg. Works on every
+//! X11 desktop, Sway, Hyprland and their kin, and on Wayland ones that have a
+//! portal (GNOME, KDE Plasma).
 //!
 //! - **Video**: on X11 the monitor picked in the app is read straight from
-//!   the X server (`x11`). On Wayland the portal asks which screen to share
+//!   the X server (`x11`); on wlroots-style desktops it's copied from the
+//!   compositor (`wlr`). Elsewhere the portal asks which screen to share
 //!   (once; the choice is remembered) and hands over a PipeWire stream of it
 //!   (`portal`, `screen`). A pacer thread takes the newest picture every 1/fps, scales
 //!   it to the output size, draws the webcam over it and converts it to NV12
@@ -31,6 +33,7 @@ pub mod ffmpeg;
 mod image;
 mod portal;
 mod screen;
+mod wlr;
 mod x11;
 
 use std::path::{Path, PathBuf};
@@ -65,15 +68,16 @@ pub(crate) fn host_now() -> f64 {
 /// The one screen entry on Wayland: which screen is picked in the desktop's own dialog.
 pub(crate) const SCREEN_ID: &str = "portal";
 
-/// Whether the screens to record are picked in the app (X11), not in the
-/// desktop's own dialog (Wayland).
+/// Whether the screens to record are picked in the app (X11, wlroots), not
+/// in the desktop's own dialog (GNOME, KDE).
 pub fn screens_listed() -> bool {
-    x11::session()
+    x11::session() || wlr::available()
 }
 
-/// Screens to record. On X11, every monitor, the main one first. On Wayland
-/// the desktop doesn't tell apps what screens there are, so there's one
-/// entry, and the desktop asks which screen it is the first time.
+/// Screens to record. On X11, every monitor, the main one first; on
+/// wlroots-style desktops every monitor, leftmost first. Elsewhere the
+/// desktop doesn't tell apps what screens there are, so there's one entry,
+/// and the desktop asks which screen it is the first time.
 pub fn list_screens() -> Vec<Device> {
     if x11::session() {
         let mut monitors = x11::monitors();
@@ -87,6 +91,14 @@ pub fn list_screens() -> Vec<Device> {
                 })
                 .collect();
         }
+    } else if wlr::available() {
+        let monitors = wlr::monitors();
+        if !monitors.is_empty() {
+            return monitors
+                .into_iter()
+                .map(|m| Device { name: format!("{} ({}×{})", m.name, m.width, m.height), id: m.id })
+                .collect();
+        }
     }
     vec![Device { id: SCREEN_ID.into(), name: "Screen (picked when recording first starts)".into() }]
 }
@@ -98,13 +110,19 @@ pub fn choose_screen_again() {
     screen::forget();
 }
 
-/// The screen's size in pixels: on X11 the monitor's, else the last one
-/// the portal shared.
+/// The screen's size in pixels: on X11 and wlroots the monitor's, else the
+/// last one the portal shared.
 pub(crate) fn display_pixels(id: Option<&str>) -> Option<(u32, u32)> {
     if x11::session()
         && let Some(m) = x11::find(&x11::monitors(), id.unwrap_or(""))
     {
         return Some((m.width as u32, m.height as u32));
+    }
+    if !x11::session() && wlr::available() {
+        let monitors = wlr::monitors();
+        if let Some(m) = monitors.iter().find(|m| Some(m.id.as_str()) == id).or(monitors.first()) {
+            return Some((m.width, m.height));
+        }
     }
     portal::last_size()
 }

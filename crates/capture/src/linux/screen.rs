@@ -1,5 +1,6 @@
 //! The screen's picture, read into memory: from the X server on an X11
-//! session (`super::x11`), else from the portal's PipeWire video node.
+//! session (`super::x11`), copied from the compositor on wlroots-style
+//! Wayland desktops (`super::wlr`), else from the portal's PipeWire video node.
 //!
 //! One cast serves everything that wants the screen: the Sources preview and
 //! a recording share it, and it lives on for a few seconds after the last one
@@ -8,7 +9,7 @@
 //!
 //! From the portal, frames arrive only when something on screen changes; the
 //! newest one stays in [`Latest`] for the pacer to repeat at a constant frame
-//! rate. From X11 they're read at the frame rate. They come as plain memory (no DMA-BUF modifiers are offered, so the compositor
+//! rate. From X11 and wlroots they're read at the frame rate. They come as plain memory (no DMA-BUF modifiers are offered, so the compositor
 //! copies them out for us): 4 bytes a pixel, BGRx or RGBx.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -22,7 +23,7 @@ use pipewire as pw;
 use pw::spa;
 
 use super::portal::{self, Cast};
-use super::x11;
+use super::{wlr, x11};
 
 /// Which way round a frame's colour bytes are.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,7 +131,7 @@ impl Latest {
 /// A running screen cast.
 pub(crate) struct Screen {
     pub latest: Arc<Latest>,
-    /// The screen asked for (on X11 a monitor; the portal picks its own).
+    /// The screen asked for (on X11 and wlroots a monitor; the portal picks its own).
     id: String,
     stop: Stop,
     thread: Mutex<Option<JoinHandle<()>>>,
@@ -139,7 +140,8 @@ pub(crate) struct Screen {
 /// How to stop a cast's thread.
 enum Stop {
     Portal(Mutex<Option<pw::channel::Sender<()>>>),
-    X11(Arc<AtomicBool>),
+    /// A source that reads the screen itself (X11, wlroots).
+    Direct(Arc<AtomicBool>),
 }
 
 static SHARED: Mutex<Option<Weak<Screen>>> = Mutex::new(None);
@@ -153,13 +155,15 @@ pub(crate) fn acquire(id: &str) -> Result<Arc<Screen>> {
     if let Some(screen) = shared.as_ref().and_then(Weak::upgrade).filter(|s| s.latest.ended().is_none() && s.id == id) {
         return Ok(screen);
     }
-    let x11 = if x11::session() {
-        // Should X11 fail, the portal may still work (GNOME and KDE have it on X11 too).
-        Screen::start_x11(id).inspect_err(|e| eprintln!("X11 screen capture: {e:#}; trying the desktop portal")).ok()
+    // Should reading the screen directly fail, the portal may still work.
+    let direct = if x11::session() {
+        Screen::start_direct(id, x11::Grab::open, x11::run).inspect_err(|e| eprintln!("X11 screen capture: {e:#}; trying the desktop portal")).ok()
+    } else if wlr::available() {
+        Screen::start_direct(id, wlr::Grab::open, wlr::run).inspect_err(|e| eprintln!("Wayland screen copy: {e:#}; trying the desktop portal")).ok()
     } else {
         None
     };
-    let screen = Arc::new(match x11 {
+    let screen = Arc::new(match direct {
         Some(s) => s,
         None => Screen::start_portal(id)?,
     });
@@ -213,13 +217,19 @@ impl Screen {
         Ok(Self { latest, id: id.to_owned(), stop: Stop::Portal(Mutex::new(Some(stop))), thread: Mutex::new(Some(thread)) })
     }
 
-    fn start_x11(id: &str) -> Result<Self> {
-        let grab = x11::Grab::open(id)?;
+    /// A source that reads the screen itself: `open` connects (here, so a
+    /// failure is reported), `run` reads on its own thread.
+    fn start_direct<G: Send + 'static>(
+        id: &str,
+        open: fn(&str) -> Result<G>,
+        run: fn(G, &str, &Latest, &AtomicBool),
+    ) -> Result<Self> {
+        let grab = open(id)?;
         let latest = Arc::new(Latest::default());
         let stop = Arc::new(AtomicBool::new(false));
         let (latest2, stop2, id2) = (latest.clone(), stop.clone(), id.to_owned());
-        let thread = thread::Builder::new().name("screen".into()).spawn(move || x11::run(grab, &id2, &latest2, &stop2))?;
-        Ok(Self { latest, id: id.to_owned(), stop: Stop::X11(stop), thread: Mutex::new(Some(thread)) })
+        let thread = thread::Builder::new().name("screen".into()).spawn(move || run(grab, &id2, &latest2, &stop2))?;
+        Ok(Self { latest, id: id.to_owned(), stop: Stop::Direct(stop), thread: Mutex::new(Some(thread)) })
     }
 }
 
@@ -231,7 +241,7 @@ impl Drop for Screen {
                     let _ = stop.send(());
                 }
             }
-            Stop::X11(stop) => {
+            Stop::Direct(stop) => {
                 stop.store(true, Ordering::Relaxed);
                 self.latest.want();
             }
