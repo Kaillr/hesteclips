@@ -3,10 +3,16 @@
 # fix: → patch, BREAKING CHANGE → major), builds the Windows installer and
 # update packages (scripts/release.ps1), tags vX.Y.Z and publishes the GitHub
 # release the installed apps update from. No release-worthy commits → nothing.
+# Then the Linux job builds HesteClips-linux-x64.tar.gz and adds it to that
+# release. Given a tag, only the Linux package is built, for that release.
 name: Release
 
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Only add the Linux package to this existing release (e.g. v1.3.0)
+        required: false
 
 permissions:
   contents: write
@@ -15,7 +21,10 @@ concurrency: release
 
 jobs:
   release:
+    if: inputs.tag == ''
     runs-on: windows-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -42,3 +51,42 @@ jobs:
       - run: npx semantic-release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # The tag semantic-release just made, if it made one.
+      - id: tag
+        shell: bash
+        run: echo "tag=$(git tag --points-at HEAD 'v*' | head -n1)" >> "$GITHUB_OUTPUT"
+
+  linux:
+    needs: release
+    # Runs after a release (or on its own, given a tag); skipped when nothing
+    # was released.
+    if: always() && (inputs.tag != '' || (needs.release.result == 'success' && needs.release.outputs.tag != ''))
+    # 24.04, not older: the pipewire crate needs PipeWire 1.0's headers. The
+    # binary then needs glibc 2.39+ (Ubuntu 24.04, Fedora 40, Debian 13, Arch).
+    runs-on: ubuntu-24.04
+    env:
+      TAG: ${{ inputs.tag || needs.release.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || needs.release.outputs.tag }}
+
+      - run: sudo apt-get update && sudo apt-get install -y build-essential libclang-dev libpipewire-0.3-dev libdbus-1-dev libasound2-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The release's own copy of the script may predate Linux releases.
+      - run: git fetch --depth=1 origin main && git show FETCH_HEAD:scripts/release-linux.sh > /tmp/release-linux.sh && chmod +x /tmp/release-linux.sh
+        if: hashFiles('scripts/release-linux.sh') == ''
+
+      - run: |
+          script=scripts/release-linux.sh
+          [ -f "$script" ] || script=/tmp/release-linux.sh
+          "$script" "${TAG#v}"
+
+      - run: gh release upload "$TAG" Releases/HesteClips-linux-x64.tar.gz --clobber
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

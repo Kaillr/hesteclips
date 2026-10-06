@@ -28,11 +28,13 @@
 |---|---|
 | macOS 13+ | ✅ Recording, editing and library all work |
 | Windows 10 2004+ / 11 | ✅ Recording (Windows Graphics Capture), editing and library all work |
-| Linux (Wayland or X11, PipeWire) | ✅ Recording (screen through the desktop portal), editing and library work. Not yet: recording games and apps by window, dragging clips out, auto-updates |
+| Linux (Wayland or X11, PipeWire) | ✅ Recording (screen through the desktop portal), editing and library work. Not yet: recording games and apps by window, dragging clips out, auto-updates, voice commands, a folder per game |
 
 ## Install
 
 **Windows:** download `HesteClips-win-Setup.exe` from the [latest release](https://github.com/Kaillr/hesteclips/releases/latest) and run it. It installs for your user only (no admin prompt), ffmpeg included. Updates download in the background and install when you quit; turn that off in *Settings → Updates*.
+
+**Linux (x86-64):** download `HesteClips-linux-x64.tar.gz` from the [latest release](https://github.com/Kaillr/hesteclips/releases/latest), unpack it where you want to keep it and run `./hesteclips`; it adds itself to your apps on first launch. You need PipeWire, an xdg-desktop-portal and ffmpeg with H.264 (see below). It doesn't update itself yet: download new releases by hand.
 
 ## Requirements (building from source)
 
