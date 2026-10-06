@@ -2,9 +2,10 @@
 //! leaving the game.
 //!
 //! Sounds are decoded once (ffmpeg, so any audio file works) and kept in
-//! memory; playing one opens the default output for as long as it lasts. On
-//! Windows the desktop-audio capture leaves out HesteClips' own sound (see
-//! `capture::win::loopback`), so the cue never ends up in a later clip.
+//! memory; playing one opens the default output for as long as it lasts.
+//! Desktop capture leaves out what HesteClips plays, so as it plays the cue is
+//! also handed to the desktop sound source (`capture::sources::own_sound`):
+//! like any other app's sound, it's in the clips saved after it.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -204,10 +205,12 @@ fn output(pcm: &Pcm, gain: f32) -> Result<(), String> {
     let frames = pcm.len() / 2;
     let data = pcm.clone();
     let mut pos = 0.0f64;
+    let recorded = capture::sources::own_sound::Playing::start();
     let stream = device
         .build_output_stream::<f32, _, _>(
             config,
             move |out: &mut [f32], _| {
+                let from = (pos as usize).min(frames);
                 for frame in out.chunks_mut(channels) {
                     let i = pos as usize;
                     let (l, r) = if i < frames { (data[i * 2] * gain, data[i * 2 + 1] * gain) } else { (0.0, 0.0) };
@@ -220,6 +223,11 @@ fn output(pcm: &Pcm, gain: f32) -> Result<(), String> {
                         }
                     }
                     pos += step;
+                }
+                let to = (pos as usize).min(frames);
+                if to > from {
+                    let played: Vec<f32> = data[from * 2..to * 2].iter().map(|x| x * gain).collect();
+                    recorded.push(&played);
                 }
             },
             |e| eprintln!("clip sound output: {e}"),

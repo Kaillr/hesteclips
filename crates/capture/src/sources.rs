@@ -132,6 +132,11 @@ impl AudioCapture {
         }
         #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
         let system = if system_sources.is_empty() { None } else { Some(SystemAudio::start(system_sources)?) };
+        for (source, feed) in sources.iter().zip(&feeds) {
+            if matches!(source.kind, SourceKind::Desktop { .. }) {
+                own_sound::listen(feed);
+            }
+        }
         Ok(Self {
             feeds,
             #[cfg(not(target_os = "linux"))]
@@ -142,6 +147,9 @@ impl AudioCapture {
     }
 
     pub(crate) fn stop(mut self) {
+        for feed in &self.feeds {
+            own_sound::forget(feed);
+        }
         #[cfg(not(target_os = "linux"))]
         self.mics.clear();
         #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
@@ -221,6 +229,72 @@ pub(crate) fn quiet_xruns(name: String) -> impl FnMut(cpal::Error) + Send + 'sta
             eprintln!("microphone \"{name}\": {dropouts} short dropout(s) — it wasn't read in time (the PC was busy)");
             reported = Some(std::time::Instant::now());
             dropouts = 0;
+        }
+    }
+}
+
+/// HesteClips' own sounds (the clip-saved cue) in desktop audio.
+///
+/// Desktop capture leaves out everything HesteClips plays, so clip previews and
+/// a mic you "Listen" to never end up in a clip. Its sounds are added to every
+/// desktop source here instead, as they play, so they're in the recording
+/// like any other app's.
+pub mod own_sound {
+    use std::sync::{Arc, Mutex, Weak};
+
+    use crate::mixer::{RATE, SourceFeed};
+
+    fn desktops() -> &'static Mutex<Vec<Weak<SourceFeed>>> {
+        static DESKTOPS: Mutex<Vec<Weak<SourceFeed>>> = Mutex::new(Vec::new());
+        &DESKTOPS
+    }
+
+    pub(crate) fn listen(feed: &Arc<SourceFeed>) {
+        let mut d = desktops().lock().unwrap();
+        d.retain(|w| w.strong_count() > 0);
+        d.push(Arc::downgrade(feed));
+    }
+
+    pub(crate) fn forget(feed: &Arc<SourceFeed>) {
+        desktops().lock().unwrap().retain(|w| w.strong_count() > 0 && !std::ptr::eq(w.as_ptr(), Arc::as_ptr(feed)));
+    }
+
+    /// One sound being played: what it pushes goes into every desktop source
+    /// capturing right now.
+    pub struct Playing {
+        children: Vec<(Weak<SourceFeed>, Arc<SourceFeed>)>,
+    }
+
+    impl Playing {
+        pub fn start() -> Self {
+            let children = desktops()
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|w| Some((w.clone(), w.upgrade()?.add_child(RATE))))
+                .collect();
+            Self { children }
+        }
+
+        /// Stereo 48 kHz samples, played now.
+        pub fn push(&self, samples: &[f32]) {
+            if self.children.is_empty() || samples.is_empty() {
+                return;
+            }
+            let now = super::host_now();
+            for (_, child) in &self.children {
+                child.push(now, samples, 2);
+            }
+        }
+    }
+
+    impl Drop for Playing {
+        fn drop(&mut self) {
+            for (parent, child) in &self.children {
+                if let Some(p) = parent.upgrade() {
+                    p.remove_child(child);
+                }
+            }
         }
     }
 }
@@ -338,5 +412,27 @@ mod tests {
     #[test]
     fn no_sources_no_tracks() {
         assert_eq!(track_layout(&[]).0.len(), 0);
+    }
+
+    #[test]
+    #[ignore = "captures real system audio; run with --ignored"]
+    fn own_sound_reaches_the_desktop_source() {
+        let live = LiveAudio::new();
+        let desktop = src("Desktop", true, false);
+        let _monitor = LevelMonitor::start(std::slice::from_ref(&desktop), live.clone()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let channel = live.channel("Desktop");
+        let before = channel.input.take().max_peak();
+        // Half a second of a loud tone, pushed as it would play.
+        let playing = own_sound::Playing::start();
+        let block: Vec<f32> = (0..480).flat_map(|i| [0.8 * (i as f32 * 0.1).sin(); 2]).collect();
+        for _ in 0..50 {
+            playing.push(&block);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let during = channel.input.take().max_peak();
+        eprintln!("desktop peak before {before:.3}, with our sound {during:.3}");
+        assert!(during > 0.7, "{during}");
     }
 }

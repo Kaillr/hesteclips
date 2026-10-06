@@ -319,14 +319,12 @@ impl SourceFeed {
     }
 
     /// A new feed (at `rate`) whose audio is added to this one's.
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     pub(crate) fn add_child(&self, rate: u32) -> Arc<SourceFeed> {
         let child = SourceFeed::new(rate, self.clock.clone());
         self.children.lock().unwrap().push(child.clone());
         child
     }
 
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     pub(crate) fn remove_child(&self, child: &Arc<SourceFeed>) {
         self.children.lock().unwrap().retain(|c| !Arc::ptr_eq(c, child));
     }

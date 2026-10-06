@@ -4,7 +4,8 @@
 //!
 //! - **App source**: one include stream per top process of the app, so its
 //!   helpers (browser tabs, Discord's voice process) come along.
-//! - **Desktop**: everything except HesteClips itself (its clip previews).
+//! - **Desktop**: everything except HesteClips itself (its clip previews);
+//!   its cue sounds are added back in by `sources::own_sound`.
 //! - **Desktop minus app sources**: WASAPI can exclude only one tree, so while
 //!   any of those apps runs, the desktop is rebuilt from an include stream per
 //!   process that has an audio session — minus the apps, minus us.
