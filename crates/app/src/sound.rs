@@ -18,8 +18,9 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crate::settings::{CustomSound, SaveSound};
 
 /// Built-in sounds: id and name.
-pub const BUILTIN: [(&str, &str); 2] = [("silverfish", "Silverfish"), ("chime", "Chime")];
+pub const BUILTIN: [(&str, &str); 3] = [("horse", "Horse"), ("silverfish", "Silverfish"), ("chime", "Chime")];
 
+const HORSE: &[u8] = include_bytes!("../assets/sounds/horse.ogg");
 const SILVERFISH: &[u8] = include_bytes!("../assets/sounds/silverfish.ogg");
 /// Decoded sounds are stereo f32 at this rate.
 const RATE: u32 = 48_000;
@@ -120,10 +121,11 @@ fn pcm(sound: &str) -> Result<Pcm, String> {
     }
     let pcm = Arc::new(match sound {
         "chime" => chime(),
+        "horse" => decode(Source::Bytes(HORSE))?,
         "silverfish" => decode(Source::Bytes(SILVERFISH))?,
         s => match s.strip_prefix("file:") {
             Some(path) => decode(Source::File(Path::new(path)))?,
-            None => decode(Source::Bytes(SILVERFISH))?, // an id from a newer version: the default
+            None => decode(Source::Bytes(HORSE))?, // an id from a newer version: the default
         },
     });
     if let Ok(mut c) = cache().lock() {
@@ -239,6 +241,10 @@ mod tests {
         let secs = s.len() as f64 / 2.0 / RATE as f64;
         assert!((0.3..0.5).contains(&secs), "{secs}");
         assert!(s.iter().any(|x| x.abs() > 0.05), "not silent");
+        let h = decode(Source::Bytes(HORSE)).unwrap();
+        let secs = h.len() as f64 / 2.0 / RATE as f64;
+        assert!((1.4..1.7).contains(&secs), "{secs}");
+        assert!(h.iter().any(|x| x.abs() > 0.05), "not silent");
         assert!(chime().iter().all(|x| x.abs() <= 1.0));
     }
 }

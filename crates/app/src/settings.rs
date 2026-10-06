@@ -466,7 +466,7 @@ pub struct SaveSound {
 
 impl Default for SaveSound {
     fn default() -> Self {
-        Self { enabled: true, sound: "silverfish".into(), volume: 0.6, custom: Vec::new() }
+        Self { enabled: true, sound: "horse".into(), volume: 0.6, custom: Vec::new() }
     }
 }
 
