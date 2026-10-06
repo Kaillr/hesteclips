@@ -979,6 +979,7 @@ pub(crate) enum ShareChoice {
     Sheet(Pos2),
     Upload,
     Reveal,
+    Mp3,
 }
 
 /// The ways to get a clip out, shared by the library's Share button and
@@ -999,6 +1000,9 @@ pub(crate) fn share_menu(ui: &mut egui::Ui, anchor: Pos2) -> Option<ShareChoice>
     }
     if ui.button(format!("📂  {}", crate::reveal_label())).clicked() {
         choice = Some(ShareChoice::Reveal);
+    }
+    if ui.button("🎵  Save audio as MP3…").on_hover_text("Just the clip's sound, saved where you pick").clicked() {
+        choice = Some(ShareChoice::Mp3);
     }
     if share::CAN_DRAG_OUT {
         ui.separator();
@@ -1028,6 +1032,39 @@ impl App {
                 if let Err(e) = clips::reveal_in_file_manager(&file) {
                     self.toast_error(format!("Couldn't show the file: {e}"));
                 }
+            }
+            ShareChoice::Mp3 => self.save_mp3(file),
+        }
+    }
+
+    /// Ask where, then save the clip's sound there as an MP3 in the background.
+    fn save_mp3(&mut self, clip: PathBuf) {
+        let name = clip.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Clip".into());
+        let picked = rfd::FileDialog::new()
+            .set_title("Save audio as MP3")
+            .set_file_name(format!("{name}.mp3"))
+            .add_filter("MP3 audio", &["mp3"])
+            .save_file();
+        let Some(mut out) = picked else { return };
+        if !out.extension().is_some_and(|e| e.eq_ignore_ascii_case("mp3")) {
+            let mut s = out.into_os_string();
+            s.push(".mp3");
+            out = s.into();
+        }
+        let (tx, ctx) = (self.mp3_tx.clone(), self.ctx());
+        std::thread::spawn(move || {
+            let result = share::save_mp3(&clip, &out).map(|()| out);
+            let _ = tx.send(result);
+            ctx.request_repaint();
+        });
+    }
+
+    /// Finished MP3s: say so.
+    pub(crate) fn pump_mp3s(&mut self) {
+        while let Ok(result) = self.mp3_rx.try_recv() {
+            match result {
+                Ok(out) => self.toast(format!("Saved “{}”", out.file_name().unwrap_or_default().to_string_lossy())),
+                Err(e) => self.toast_error(format!("Couldn't save the MP3: {e}")),
             }
         }
     }

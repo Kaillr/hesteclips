@@ -7,6 +7,7 @@
 //! - **Copy**: put the file on the clipboard, then paste it anywhere (⌘V).
 //! - **Share sheet**: AirDrop, Messages, Mail, Notes, … on macOS; Nearby
 //!   Share, Mail and share-capable apps on Windows.
+//! - **MP3**: just the clip's sound, saved wherever you pick.
 //!
 //! All of these hand over the clip's file in the library, which is always the
 //! clip as it looks now (an edit replaces it), so what you share is what you see.
@@ -15,6 +16,33 @@ use std::path::{Path, PathBuf};
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use raw_window_handle::HasWindowHandle;
+
+/// The clip's sound as an MP3 at `out`: its mix (track 1, what the clip sounds
+/// like), at the clip's own sample rate and 320 kbps, MP3's best — as close
+/// to the clip's own (already compressed) sound as MP3 gets.
+pub fn save_mp3(clip: &Path, out: &Path) -> Result<(), String> {
+    let info = media::probe(clip).map_err(|e| e.to_string())?;
+    if info.audio.is_empty() {
+        return Err("this clip has no sound".into());
+    }
+    let title = clip.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let done = media::ffmpeg()
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+        .arg(clip)
+        .args(["-map", "0:a:0", "-map_metadata", "-1", "-metadata"])
+        .arg(format!("title={title}"))
+        .args(["-c:a", "libmp3lame", "-b:a", "320k"])
+        .arg(out)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("ffmpeg: {e}"))?;
+    if done.status.success() {
+        return Ok(());
+    }
+    let _ = std::fs::remove_file(out);
+    let why = String::from_utf8_lossy(&done.stderr);
+    Err(why.lines().last().unwrap_or("ffmpeg failed").to_owned())
+}
 
 /// Whether clips can be dragged out of the window into other apps.
 pub const CAN_DRAG_OUT: bool = cfg!(any(target_os = "macos", target_os = "windows"));
@@ -194,5 +222,28 @@ mod tests {
         let ok = std::fs::canonicalize(&got).ok() == std::fs::canonicalize(&f).ok();
         std::fs::remove_file(&f).unwrap();
         assert!(ok, "clipboard held {got:?}, expected {f:?}");
+    }
+
+    #[test]
+    fn mp3_keeps_the_clips_sample_rate_at_320k() {
+        let dir = std::env::temp_dir().join(format!("hc-mp3-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("Clip.mp4");
+        let made = media::ffmpeg()
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "color=black:s=64x64:d=2", "-f", "lavfi", "-i", "sine=f=440:r=48000:d=2", "-ac", "2", "-shortest"])
+            .arg(&clip)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let out = dir.join("Clip.mp3");
+        super::save_mp3(&clip, &out).unwrap();
+        let probe = media::ffprobe()
+            .args(["-v", "error", "-show_entries", "stream=codec_name,sample_rate,bit_rate,channels", "-of", "csv=p=0"])
+            .arg(&out)
+            .output()
+            .unwrap();
+        let line = String::from_utf8_lossy(&probe.stdout).trim().to_owned();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(line, "mp3,48000,2,320000", "{line}");
     }
 }

@@ -335,6 +335,9 @@ struct App {
     pub(crate) renders: Vec<RenderJob>,
     render_tx: std::sync::mpsc::Sender<(u64, Result<PathBuf, String>)>,
     render_rx: std::sync::mpsc::Receiver<(u64, Result<PathBuf, String>)>,
+    /// Clips' sound being saved as MP3s, when done.
+    mp3_tx: std::sync::mpsc::Sender<Result<PathBuf, String>>,
+    mp3_rx: std::sync::mpsc::Receiver<Result<PathBuf, String>>,
     next_render_id: u64,
     /// Open "Rename clip" dialog.
     pub(crate) rename: Option<library::Rename>,
@@ -390,6 +393,7 @@ impl App {
             h
         });
         let (render_tx, render_rx) = std::sync::mpsc::channel();
+        let (mp3_tx, mp3_rx) = std::sync::mpsc::channel();
         live_audio.set_limiter(settings.limiter);
         for s in &settings.audio_sources {
             live_audio.channel(&s.id).set_volume(sources_ui::from_db(s.volume_db), s.muted);
@@ -452,6 +456,8 @@ impl App {
             renders: Vec::new(),
             render_tx,
             render_rx,
+            mp3_tx,
+            mp3_rx,
             next_render_id: 0,
             rename: None,
             selection: library::Selection::default(),
@@ -681,6 +687,7 @@ impl eframe::App for App {
         self.cloud.poll();
         self.pump_uploads();
         self.pump_renders();
+        self.pump_mp3s();
         laps.lap("games, uploads, renders");
         // Every frame, not just while the Sources page draws: leaving the page must
         // stop the meters' capture, or macOS keeps showing its recording indicator.
