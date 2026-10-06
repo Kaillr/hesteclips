@@ -321,7 +321,7 @@ impl App {
         }
     }
 
-    /// ⌘A selects every clip, ⌘⌫ / Delete trashes the selection, Esc clears it.
+    /// ⌘A selects every clip, ⌫ / Delete trashes the selection, Esc clears it.
     fn selection_keys(&mut self, ui: &egui::Ui) -> Option<Action> {
         if self.rename.is_some() || self.dialog.is_some() || ui.ctx().egui_wants_keyboard_input() {
             return None;
@@ -332,7 +332,9 @@ impl App {
                 Some(Action::SelectAll)
             } else if self.selection.is_empty() {
                 None
-            } else if i.consume_key(cmd, egui::Key::Backspace) || i.consume_key(egui::Modifiers::NONE, egui::Key::Delete) {
+            } else if i.consume_key(cmd, egui::Key::Backspace)
+                || i.consume_key(egui::Modifiers::NONE, egui::Key::Backspace)
+                || i.consume_key(egui::Modifiers::NONE, egui::Key::Delete) {
                 Some(Action::TrashSelected)
             } else if i.consume_key(egui::Modifiers::NONE, egui::Key::Escape) {
                 Some(Action::Deselect)
@@ -363,7 +365,7 @@ impl App {
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let trash = egui::Button::new(egui::RichText::new("🗑  Move to Trash").color(Color32::WHITE)).fill(ui.visuals().error_fg_color);
-                        let key = if cfg!(target_os = "macos") { crate::hotkey_label_cmd("Delete") } else { "Delete".to_owned() };
+                        let key = if cfg!(target_os = "macos") { "⌫".to_owned() } else { "Delete".to_owned() };
                         if ui.add(trash).on_hover_text(key).clicked() {
                             action = Some(Action::TrashSelected);
                         }

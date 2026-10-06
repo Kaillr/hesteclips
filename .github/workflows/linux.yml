@@ -1,0 +1,30 @@
+# Builds the Linux release package on every push to main, so Linux keeps
+# building while the app is developed on macOS and Windows. The package is
+# kept as a workflow artifact for trying a build without a release.
+name: Linux build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    # 24.04, not older: the pipewire crate needs PipeWire 1.0's headers. The
+    # binary then needs glibc 2.39+ (Ubuntu 24.04, Fedora 40, Debian 13, Arch).
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - run: sudo apt-get update && sudo apt-get install -y build-essential libclang-dev libpipewire-0.3-dev libdbus-1-dev libasound2-dev patchelf
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: scripts/release-linux.sh 0.0.0-ci
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HesteClips-linux-x64
+          path: Releases/HesteClips-linux-x64.tar.gz

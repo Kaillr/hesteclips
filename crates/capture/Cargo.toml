@@ -71,10 +71,14 @@ windows = { version = "0.62", features = [
 libc = "0.2"
 
 
-# Linux: screen capture through the xdg-desktop-portal (any Wayland or X11
-# desktop), its pictures and all audio through PipeWire. Encoding is done by
-# ffmpeg, which the app ships with anyway.
+# Linux: the screen from the X server on X11 (no dialog, any desktop), or
+# copied from the compositor on Sway, Hyprland and their kin (no dialog), else
+# through the xdg-desktop-portal, its pictures and all audio through
+# PipeWire. Encoding is done by ffmpeg, which the app ships with anyway.
 [target.'cfg(target_os = "linux")'.dependencies]
 ashpd = { version = "0.13", default-features = false, features = ["async-io", "screencast"] }
 pipewire = "0.10"
 pollster = "1"
+x11rb = { version = "0.13", features = ["randr", "shm", "xfixes"] }
+wayland-client = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }

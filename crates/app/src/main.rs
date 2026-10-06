@@ -22,6 +22,7 @@ mod library;
 #[cfg(target_os = "linux")]
 mod linux_desktop;
 mod meter;
+mod nav;
 mod player;
 #[cfg(target_os = "linux")]
 mod portal_shortcuts;
@@ -345,6 +346,8 @@ struct App {
     library_stamp: Vec<Option<SystemTime>>,
     /// Which of the library's folders (games) the library shows.
     pub(crate) library_filter: library::Filter,
+    /// Where the mouse's back/forward buttons go.
+    pub(crate) nav: nav::History,
     /// Games' icons and the HesteFiles profile picture.
     pub(crate) web_images: web_images::WebImages,
     pub(crate) updater: update::Updater,
@@ -455,6 +458,7 @@ impl App {
             last_poll: None,
             library_stamp: Vec::new(),
             library_filter: library::Filter::All,
+            nav: nav::History::default(),
             web_images: Default::default(),
             updater,
             presence: discord::Presence::new(),
@@ -700,6 +704,8 @@ impl eframe::App for App {
             self.kept_camera = camera;
         }
         laps.lap("webcam");
+
+        self.navigate(&ctx);
 
         // Hearing a microphone is for the Sources page only: never left on.
         if self.page != Page::Sources {

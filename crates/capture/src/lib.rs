@@ -228,6 +228,27 @@ pub fn app_file_name(id: &str) -> Option<String> {
     mac::windows::bundle_file_name(id)
 }
 
+/// Whether [`list_screens`] lists the actual screens, to pick from in the
+/// app. Not on Linux under Wayland, where the desktop's own dialog picks one
+/// (see [`choose_screen_again`]).
+pub fn screens_listed() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        linux::screens_listed()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        true
+    }
+}
+
+/// Have the desktop's dialog ask again which screen to record (Linux under
+/// Wayland; elsewhere screens are picked in the app, and this does nothing).
+pub fn choose_screen_again() {
+    #[cfg(target_os = "linux")]
+    linux::choose_screen_again();
+}
+
 /// Screens the backend can capture; their ids go in [`VideoSource::Screen`].
 pub fn list_screens() -> Vec<Device> {
     #[cfg(target_os = "macos")]

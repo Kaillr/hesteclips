@@ -345,15 +345,14 @@ impl App {
 
             match self.settings.capture.clone() {
                 CaptureTarget::Apps { apps, away_screen } if capture::APP_CAPTURE => self.app_list(ui, apps, away_screen, frame.as_deref()),
-                // Linux: the desktop's own dialog picks the screen (once; it's remembered).
-                #[cfg(target_os = "linux")]
-                _ => {
+                // Linux on Wayland: the desktop's own dialog picks the screen (once; it's remembered).
+                _ if cfg!(target_os = "linux") && !capture::screens_listed() => {
                     ui.add_enabled_ui(idle, |ui| {
                         ui.horizontal(|ui| {
                             ui.label("Screen");
                             ui.weak("picked in your desktop's sharing dialog");
                             if ui.button("Choose another…").on_hover_text("Your desktop asks again which screen to record").clicked() {
-                                capture::linux::choose_screen_again();
+                                capture::choose_screen_again();
                                 self.video_preview = None; // restarts, and asks
                             }
                         })
@@ -361,7 +360,6 @@ impl App {
                         .on_disabled_hover_text("Stop capturing to switch screens.");
                     });
                 }
-                #[cfg(not(target_os = "linux"))]
                 _ => {
                     ui.add_enabled_ui(idle, |ui| {
                         ui.horizontal(|ui| {
