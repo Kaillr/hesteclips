@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Builds the Linux release into Releases/: HesteClips-linux-x64.tar.gz, the app
+# with its desktop entry and icon. Unpack it anywhere and run ./hesteclips; on
+# first launch it adds itself to the desktop's apps (linux_desktop.rs).
+# ffmpeg isn't included: it comes from the distro (see the README).
+#
+# The release workflow runs this for each new version. It also runs locally:
+#   scripts/release-linux.sh 0.0.1-local
+# Needs Rust and the build packages listed in the README.
+set -euo pipefail
+
+version="${1:?usage: release-linux.sh <version>}"
+root="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$root"
+
+name="HesteClips-linux-x64"
+work="target/release-package"
+stage="$work/$name"
+out="Releases"
+rm -rf "$stage" "$out"
+mkdir -p "$stage" "$out"
+
+# The version goes into the binary; the repo itself isn't changed (Cargo.lock
+# follows the version, so it's put back too).
+cp Cargo.toml "$work/Cargo.toml.orig"
+cp Cargo.lock "$work/Cargo.lock.orig"
+restore() {
+    cp "$work/Cargo.toml.orig" Cargo.toml
+    cp "$work/Cargo.lock.orig" Cargo.lock
+}
+trap restore EXIT
+sed -i.bak -E "s/^version = \"[^\"]*\"/version = \"$version\"/" Cargo.toml && rm Cargo.toml.bak
+cargo build --release -p hesteclips
+restore
+trap - EXIT
+
+cp target/release/hesteclips "$stage/"
+strip "$stage/hesteclips"
+cp crates/app/assets/io.github.kaillr.HesteClips.desktop crates/app/assets/icon.svg "$stage/"
+cat > "$stage/README.txt" <<EOF
+HesteClips $version for Linux (x86-64)
+
+Run ./hesteclips. The first time, it adds itself to your desktop's apps, so
+after that you can start it from there (move this folder first if you want it
+somewhere else, then run it once from its new place).
+
+Needs PipeWire, an xdg-desktop-portal for your desktop, and ffmpeg that can
+encode and decode H.264 (Fedora: RPM Fusion's ffmpeg, not ffmpeg-free).
+
+https://github.com/Kaillr/hesteclips
+EOF
+
+tar -C "$work" -czf "$out/$name.tar.gz" "$name"
+echo "built $out/$name.tar.gz"
