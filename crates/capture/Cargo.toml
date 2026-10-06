@@ -7,9 +7,8 @@ edition = "2024"
 anyhow = "1.0.104"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 rubato = "5.0.1"
-
-# Mics on macOS and Windows (Linux takes them from PipeWire, like the rest).
-[target.'cfg(not(target_os = "linux"))'.dependencies]
+# Mics on macOS and Windows (Linux records them from PipeWire, like the
+# rest), and "Listen" everywhere.
 cpal = "0.18.2"
 
 # macOS-only: native ScreenCaptureKit backend, so these Apple-framework bindings
