@@ -299,9 +299,6 @@ struct App {
     pub(crate) windowed_apps: Vec<capture::Device>,
     /// What the running capture records, to send it list changes live.
     capturing_video: Option<capture::VideoSource>,
-    /// What the running capture was started with, of what only applies at a
-    /// start, and since when the settings have asked for something else.
-    capturing_with: Option<(CaptureKey, Option<Instant>)>,
     /// The replay length the running capture keeps, to send it changes live.
     capturing_replay: Option<u32>,
     /// Shown instead of a game or app while you're tabbed out.
@@ -442,7 +439,6 @@ impl App {
             frame_size: None,
             windowed_apps: Vec::new(),
             capturing_video: None,
-            capturing_with: None,
             capturing_replay: None,
             away_screen: away::screen(),
             webcam_placement: std::sync::Arc::new(std::sync::Mutex::new(capture::webcam::Placement::default_for(16.0 / 9.0, 16.0 / 9.0))),
@@ -1384,7 +1380,6 @@ impl App {
     fn start_replay_buffer(&mut self) {
         self.refresh_audio_devices();
         self.capturing_video = Some(self.video_source());
-        self.capturing_with = Some((self.capture_key(), None));
         self.capturing_replay = Some(self.settings.replay_seconds);
         // Optimistic state; a State/Error event confirms or corrects it.
         self.service.start(capture::Mode::ReplayBuffer, self.encode_settings());
@@ -1395,7 +1390,6 @@ impl App {
     fn start_recording(&mut self) {
         self.refresh_audio_devices();
         self.capturing_video = Some(self.video_source());
-        self.capturing_with = Some((self.capture_key(), None));
         self.capturing_replay = Some(self.settings.replay_seconds);
         self.service.start(capture::Mode::Record, self.encode_settings());
         self.rec_state = RecState::Recording;
@@ -1446,56 +1440,13 @@ impl App {
         }
     }
 
-    /// What a capture only takes up when it starts: its audio sources (which
-    /// tracks a clip has), video quality, file format, and the display or
-    /// whether it follows games and apps. The list of games and apps, the
-    /// webcam, volumes and the replay length all change live instead.
-    fn capture_key(&self) -> CaptureKey {
-        let s = &self.settings;
-        let video = match self.video_source() {
-            // Which apps changes live; only the switch to apps counts.
-            capture::VideoSource::Apps { .. } => None,
-            capture::VideoSource::Screen { id } => Some(id),
-        };
-        CaptureKey {
-            sources: self.capture_sources(),
-            video,
-            quality: (s.resolution.height(), s.fps, s.video_bitrate_mbps, s.keyframe_interval_secs, s.encoder != Encoder::Software),
-            container: s.container.ext().to_owned(),
-        }
-    }
-
-    /// Settings changed while the replay buffer runs reach it: the replay
-    /// length right away, the rest by restarting it, once the changes settle
-    /// (a rename typed letter by letter, a slider dragged, restart it once).
-    /// A recording is left alone — it would be cut in two — and picks the
-    /// changes up next time. Not cleared while idle: a restart passes through
-    /// idle on its way.
+    /// The replay length reaches a running replay buffer right away. Not
+    /// cleared while idle: the next start sends its own.
     fn sync_capture_settings(&mut self) {
-        if self.rec_state == RecState::Idle {
-            return;
-        }
         if self.rec_state == RecState::Buffering && self.capturing_replay != Some(self.settings.replay_seconds) {
             self.service.set_replay_seconds(self.settings.replay_seconds);
             self.capturing_replay = Some(self.settings.replay_seconds);
         }
-        let now = self.capture_key();
-        let Some((running, changed)) = &mut self.capturing_with else { return };
-        if *running == now {
-            *changed = None;
-            return;
-        }
-        let since = *changed.get_or_insert_with(Instant::now);
-        if self.rec_state == RecState::Buffering && since.elapsed() > Duration::from_millis(1500) && self.recording_shortcut.is_none() {
-            self.service.stop(None);
-            self.start_replay_buffer();
-        }
-    }
-
-    /// Whether settings changed since the running capture started that it
-    /// takes up only at its next start.
-    pub(crate) fn capture_settings_pending(&self) -> bool {
-        self.rec_state != RecState::Idle && self.capturing_with.as_ref().is_some_and(|(k, _)| *k != self.capture_key())
     }
 
     /// Drain capture-thread events each frame.
@@ -1589,13 +1540,3 @@ fn file_name(path: &std::path::Path) -> String {
         .unwrap_or_default()
 }
 
-/// See `App::capture_key`.
-#[derive(Debug, Clone, PartialEq)]
-struct CaptureKey {
-    sources: Vec<capture::sources::AudioSource>,
-    /// The display recorded, or `None` following games and apps.
-    video: Option<String>,
-    /// Height, frame rate, bitrate, keyframe interval, hardware encoding.
-    quality: (Option<u32>, u32, u32, u32, bool),
-    container: String,
-}

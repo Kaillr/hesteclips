@@ -36,22 +36,21 @@ impl App {
     }
 
     fn settings_column(&mut self, ui: &mut egui::Ui) {
-        // Capture settings apply to a running replay buffer: the length right
-        // away, the rest by restarting it. A recording takes them up next time.
+        // How the video is encoded and the file it goes in are set when the
+        // buffer or a recording starts, so they're locked while one runs
+        // rather than looking changed and not applying. The replay length and
+        // where clips are saved change right away.
         let idle = self.rec_state == RecState::Idle;
+        let stop_first = self.stop_first();
         match self.rec_state {
             RecState::Idle => {}
             RecState::Buffering => {
                 ui.add_space(12.0);
-                note(ui, "Changes apply right away. Video quality and file format restart the replay buffer, so what it has kept so far is let go.");
+                note(ui, "Stop the replay buffer to change video quality or file format. The rest changes right away.");
             }
             RecState::Recording => {
                 ui.add_space(12.0);
-                note(ui, if self.capture_settings_pending() {
-                    "These changes apply to your next recording."
-                } else {
-                    "Video quality and file format changes apply to your next recording."
-                });
+                note(ui, "Stop recording to change video quality or file format. The rest changes right away.");
             }
         }
 
@@ -76,7 +75,7 @@ impl App {
         section(ui, "Video quality", |ui| {
             ui.weak("What to record is chosen on the Sources page.");
             ui.add_space(4.0);
-            {
+            ui.add_enabled_ui(idle, |ui| {
                 row(ui, "Resolution", Some("Lower sizes make smaller files."), |ui| {
                     egui::ComboBox::from_id_salt("resolution").selected_text(self.settings.resolution.label()).show_ui(ui, |ui| {
                         for r in OutputResolution::ALL {
@@ -109,7 +108,9 @@ impl App {
                         ui.add_space(4.0);
                         self.advanced(ui);
                     });
-            }
+            })
+            .response
+            .on_disabled_hover_text(stop_first);
         });
 
         section(ui, "Saving", |ui| {
@@ -139,10 +140,14 @@ impl App {
                 });
                 divider(ui);
                 row(ui, "File format", Some("MP4 plays everywhere."), |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        for c in [Container::Mp4, Container::Mov] {
-                            ui.selectable_value(&mut self.settings.container, c, c.ext().to_uppercase()).on_hover_text(c.label());
-                        }
+                    ui.add_enabled_ui(idle, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            for c in [Container::Mp4, Container::Mov] {
+                                ui.selectable_value(&mut self.settings.container, c, c.ext().to_uppercase())
+                                    .on_hover_text(c.label())
+                                    .on_disabled_hover_text(stop_first);
+                            }
+                        });
                     });
                 });
             }

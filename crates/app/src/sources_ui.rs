@@ -133,6 +133,7 @@ impl App {
         let mut move_up = None;
         let n = self.settings.audio_sources.len();
         let has_app_sources = self.settings.audio_sources.iter().any(|s| matches!(s.kind, SourceKind::App { .. }));
+        let locked = (self.rec_state != crate::RecState::Idle).then(|| self.stop_first());
         for i in 0..n {
             let channel = self.live_audio.channel(&self.settings.audio_sources[i].id);
             let id = self.settings.audio_sources[i].id.clone();
@@ -150,6 +151,7 @@ impl App {
                 has_app_sources,
                 &mut self.sources_view.renaming,
                 listening,
+                locked,
             );
             match action {
                 CardAction::Remove => remove = Some(i),
@@ -173,16 +175,12 @@ impl App {
         self.keep_listening();
         self.add_source_buttons(ui);
 
-        match self.rec_state {
-            crate::RecState::Idle => {}
-            crate::RecState::Buffering => {
-                ui.add_space(10.0);
-                ui.weak("Volume and webcam changes apply right away. Adding, removing or changing sources, or switching what to record, restarts the replay buffer, so what it has kept so far is let go.");
-            }
-            crate::RecState::Recording => {
-                ui.add_space(10.0);
-                ui.weak("Volume and webcam changes apply right away. Adding, removing or changing sources, or switching what to record, applies to your next recording.");
-            }
+        if self.rec_state != crate::RecState::Idle {
+            ui.add_space(10.0);
+            ui.weak(match self.rec_state {
+                crate::RecState::Recording => "Volume, mute and noise removal change right away. Stop recording to add, remove or change sources.",
+                _ => "Volume, mute and noise removal change right away. Stop the replay buffer to add, remove or change sources.",
+            });
         }
         ui.add_space(16.0);
     }
@@ -232,8 +230,11 @@ impl App {
     }
 
     fn add_source_buttons(&mut self, ui: &mut egui::Ui) {
+        // Which sources are recorded is set when capture starts.
+        let idle = self.rec_state == crate::RecState::Idle;
+        let stop_first = self.stop_first();
         // Wraps onto two lines in a narrow window.
-        ui.horizontal_wrapped(|ui| {
+        ui.add_enabled_ui(idle, |ui| ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("Add").strong());
             if ui.button("🎤 Microphone").clicked() {
                 let n = self.settings.audio_sources.iter().filter(|s| matches!(s.kind, SourceKind::Microphone { .. })).count();
@@ -282,7 +283,17 @@ impl App {
                     .audio_sources
                     .push(AudioSourceCfg::new("Desktop", SourceKind::Desktop { exclude_apps: true }));
             }
-        });
+        }))
+        .response
+        .on_disabled_hover_text(stop_first);
+    }
+
+    /// Why something that's set when capture starts is locked now.
+    pub(crate) fn stop_first(&self) -> &'static str {
+        match self.rec_state {
+            crate::RecState::Recording => "Stop recording to change this.",
+            _ => "Stop the replay buffer to change this.",
+        }
     }
 
     /// The clip's mix: a big stereo meter with scale, peak readout, clip light,
@@ -316,14 +327,15 @@ impl App {
             });
             ui.add_space(6.0);
 
-            // What to record. Switching kinds (or displays) restarts the replay
-            // buffer; a recording takes it up next time. The app list below
-            // changes live.
+            // What to record. Switching kinds (or displays) needs a fresh
+            // start, so it waits while capturing; the app list below changes
+            // live.
+            let stop_first = self.stop_first();
             if capture::APP_CAPTURE {
-                {
+                ui.add_enabled_ui(idle, |ui| {
                     let (screen, apps) = segmented(ui, ["🖥  Whole screen", "🎮  Games and apps"], usize::from(apps_mode));
                     {
-                        if screen.on_hover_text("Everything on one display.").clicked() && apps_mode {
+                        if screen.on_hover_text("Everything on one display.").on_disabled_hover_text(stop_first).clicked() && apps_mode {
                             let apps = std::mem::replace(&mut self.settings.capture, CaptureTarget::Screen);
                             if matches!(apps, CaptureTarget::Apps { .. }) {
                                 self.settings.idle_apps = Some(apps);
@@ -331,6 +343,7 @@ impl App {
                         }
                         if apps
                             .on_hover_text("Only the games and apps you pick, following whichever you're using.")
+                            .on_disabled_hover_text(stop_first)
                             .clicked()
                             && !apps_mode
                         {
@@ -342,14 +355,10 @@ impl App {
                             self.windowed_apps = capture::list_windowed_apps();
                         }
                     }
-                }
+                });
                 ui.add_space(10.0);
             }
 
-            if self.rec_state == crate::RecState::Recording && self.capture_settings_pending() {
-                ui.colored_label(ui.visuals().warn_fg_color, "Changed while recording: applies to your next recording.");
-                ui.add_space(6.0);
-            }
             self.preview_picture(ui, frame.as_deref());
             ui.add_space(8.0);
 
@@ -371,7 +380,7 @@ impl App {
                     });
                 }
                 _ => {
-                    {
+                    ui.add_enabled_ui(idle, |ui| {
                         ui.horizontal(|ui| {
                             ui.label("Display");
                             let names: Vec<String> = self.screens.iter().map(|d| d.name.clone()).collect();
@@ -381,8 +390,10 @@ impl App {
                                     ui.selectable_value(&mut self.settings.display_index, i, name);
                                 }
                             });
-                        });
-                    }
+                        })
+                        .response
+                        .on_disabled_hover_text(stop_first);
+                    });
                 }
             }
         });
@@ -740,13 +751,17 @@ fn source_card(
     renaming: &mut Option<String>,
     // A microphone's "Listen": `Some(latency in ms, if known)` while on.
     listening: Option<Option<f32>>,
+    // While capturing: why what's recorded can't change (it's set at the start).
+    locked: Option<&str>,
 ) -> CardAction {
     let mut action = CardAction::None;
     card(ui, |ui| {
         let narrow = ui.available_width() < NARROW;
         // --- Header: on/off, name, status · what it captures, menu ---
         ui.horizontal(|ui| {
-            ui.checkbox(&mut source.enabled, "").on_hover_text(if source.enabled { "Turn off" } else { "Turn on" });
+            ui.add_enabled(locked.is_none(), egui::Checkbox::new(&mut source.enabled, ""))
+                .on_hover_text(if source.enabled { "Turn off" } else { "Turn on" })
+                .on_disabled_hover_text(locked.unwrap_or_default());
             if renaming.as_deref() == Some(source.id.as_str()) {
                 let r = ui.add(egui::TextEdit::singleline(&mut source.name).desired_width(160.0));
                 r.request_focus();
@@ -770,23 +785,27 @@ fn source_card(
                         *renaming = Some(source.id.clone());
                         ui.close();
                     }
-                    if ui.button("Move up").clicked() {
+                    if ui.add_enabled(locked.is_none(), egui::Button::new("Move up")).on_disabled_hover_text(locked.unwrap_or_default()).clicked() {
                         action = CardAction::MoveUp;
                         ui.close();
                     }
                     ui.separator();
-                    if ui.button("Remove").clicked() {
+                    if ui.add_enabled(locked.is_none(), egui::Button::new("Remove")).on_disabled_hover_text(locked.unwrap_or_default()).clicked() {
                         action = CardAction::Remove;
                         ui.close();
                     }
                 });
                 if !narrow {
-                    source_picker(ui, source, devices, 220.0);
+                    ui.add_enabled_ui(locked.is_none(), |ui| source_picker(ui, source, devices, 220.0))
+                        .response
+                        .on_disabled_hover_text(locked.unwrap_or_default());
                 }
             });
         });
         if narrow {
-            source_picker(ui, source, devices, ui.available_width().min(320.0));
+            ui.add_enabled_ui(locked.is_none(), |ui| source_picker(ui, source, devices, ui.available_width().min(320.0)))
+                .response
+                .on_disabled_hover_text(locked.unwrap_or_default());
         }
         if !source.enabled {
             return;
@@ -860,14 +879,17 @@ fn source_card(
         // --- Where it goes, in plain words ---
         ui.add_space(2.0);
         ui.horizontal_wrapped(|ui| {
-            ui.checkbox(&mut source.in_mix, "In the clip")
-                .on_hover_text("Part of what your clips sound like when you play or share them.");
-            ui.checkbox(&mut source.own_track, "Separate track for editing")
-                .on_hover_text("Also kept on its own, so you can change its volume later in the editor.");
+            let lock = locked.unwrap_or_default();
+            ui.add_enabled(locked.is_none(), egui::Checkbox::new(&mut source.in_mix, "In the clip"))
+                .on_hover_text("Part of what your clips sound like when you play or share them.")
+                .on_disabled_hover_text(lock);
+            ui.add_enabled(locked.is_none(), egui::Checkbox::new(&mut source.own_track, "Separate track for editing"))
+                .on_hover_text("Also kept on its own, so you can change its volume later in the editor.")
+                .on_disabled_hover_text(lock);
             if let SourceKind::Desktop { exclude_apps } = &mut source.kind {
-                ui.add_enabled(has_app_sources, egui::Checkbox::new(exclude_apps, "Leave out apps added below"))
+                ui.add_enabled(has_app_sources && locked.is_none(), egui::Checkbox::new(exclude_apps, "Leave out apps added below"))
                     .on_hover_text("Apps you add as their own source won't also be heard here, so nothing plays twice.")
-                    .on_disabled_hover_text("Add an app as its own source to use this.");
+                    .on_disabled_hover_text(if locked.is_some() { lock } else { "Add an app as its own source to use this." });
             }
             if matches!(source.kind, SourceKind::Microphone { .. }) {
                 ui.checkbox(&mut source.noise_removal, "Remove background noise").on_hover_text(
