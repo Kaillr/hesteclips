@@ -341,7 +341,7 @@ impl App {
             }
         }
 
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        crate::ui_kit::scroll(ui, "library_clips", |ui| {
             let avail = ui.available_width();
             let cols = (((avail + GAP) / (MIN_CARD_WIDTH + GAP)).floor() as usize).max(1);
             let card_w = (avail - GAP * (cols - 1) as f32) / cols as f32;

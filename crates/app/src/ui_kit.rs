@@ -119,10 +119,29 @@ pub fn section<R>(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui
     card(ui, add)
 }
 
+/// Scrolling content with its scrollbar in the page's right margin, between
+/// the content and the window's edge: never over the content, and the content
+/// doesn't move when the bar widens under the pointer.
+pub fn scroll<R>(ui: &mut egui::Ui, id: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let gutter = PAGE_MARGIN as f32;
+    let mut rect = ui.available_rect_before_wrap();
+    rect.max.x += gutter;
+    let mut area = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+    area.spacing_mut().scroll = egui::style::ScrollStyle { bar_outer_margin: 3.0, bar_inner_margin: 0.0, ..egui::style::ScrollStyle::floating() };
+    egui::ScrollArea::vertical()
+        .id_salt(id)
+        .auto_shrink([false, false])
+        .show(&mut area, |ui| {
+            ui.set_max_width(ui.available_width() - gutter);
+            add(ui)
+        })
+        .inner
+}
+
 /// A page of settings-like content: scrolls, centred, at most `max_width`
 /// wide, with the page's margins.
 pub fn page(ui: &mut egui::Ui, id: &str, max_width: f32, add: impl FnOnce(&mut egui::Ui)) {
-    egui::ScrollArea::vertical().id_salt(id).auto_shrink([false, false]).show(ui, |ui| {
+    scroll(ui, id, |ui| {
         let w = ui.available_width().min(max_width);
         let side = ((ui.available_width() - w) / 2.0).max(0.0);
         ui.horizontal(|ui| {

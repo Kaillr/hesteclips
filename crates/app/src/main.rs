@@ -973,6 +973,9 @@ impl App {
             RecState::Buffering => (true, ACCENT, "Replay buffer on".to_owned(), self.shortcut_keys(A::SaveClip), format!("saves the last {replay}")),
             RecState::Recording => (true, REC_RED, format!("Recording  {}", thumbs::format_duration(elapsed)), self.shortcut_keys(A::ToggleRecord), "stops".to_owned()),
         };
+        // The line under the status is a shortcut and what it does: without a
+        // shortcut set it would be a stray word ("stops").
+        let hint = if hint_keys.is_some() { hint } else { String::new() };
         let tip = match &hint_keys {
             Some(k) => format!("{} {hint}", k.join(" + ")),
             None => hint.clone(),
