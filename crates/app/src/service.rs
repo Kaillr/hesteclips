@@ -117,7 +117,7 @@ impl CaptureService {
                     Cmd::Start(mode, settings) => match recorder.start(mode, &settings) {
                         Ok(()) => send(&evt_tx, Evt::State(Some(mode))),
                         Err(e) => {
-                            send(&evt_tx, Evt::Error(e.to_string()));
+                            send(&evt_tx, Evt::Error(describe(&e)));
                             send(&evt_tx, Evt::State(None));
                         }
                     },
@@ -131,13 +131,13 @@ impl CaptureService {
                                 Ok(path) => send(&evt_tx, Evt::Saved(path)),
                                 Err(e) => {
                                     eprintln!("saving a clip failed: {e:#}");
-                                    send(&evt_tx, Evt::Error(e.to_string()));
+                                    send(&evt_tx, Evt::Error(describe(&e)));
                                 }
                             });
                         }
                         Err(e) => {
                             eprintln!("saving a clip failed: {e:#}");
-                            send(&evt_tx, Evt::Error(e.to_string()));
+                            send(&evt_tx, Evt::Error(describe(&e)));
                         }
                     },
                     Cmd::UpdateVideo(video) => {
@@ -148,7 +148,7 @@ impl CaptureService {
                         match recorder.stop(dir.as_deref()) {
                             Ok(Some(path)) => send(&evt_tx, Evt::Saved(path)),
                             Ok(None) => {}
-                            Err(e) => send(&evt_tx, Evt::Error(e.to_string())),
+                            Err(e) => send(&evt_tx, Evt::Error(describe(&e))),
                         }
                         send(&evt_tx, Evt::State(None));
                     }
@@ -220,4 +220,28 @@ impl Drop for CaptureService {
 
 fn send(tx: &Sender<Evt>, evt: Evt) {
     let _ = tx.send(evt);
+}
+
+/// A capture error as the user should read it. Running out of disk space
+/// otherwise shows as just "couldn't finish <hidden file>": the cause is deep
+/// in the chain, so look for it there and say it plainly.
+fn describe(e: &anyhow::Error) -> String {
+    let full = e.chain().filter_map(|c| c.downcast_ref::<std::io::Error>()).any(|io| {
+        matches!(io.kind(), std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded)
+    });
+    if full { "Your disk is full. Free up some space and try again.".to_owned() } else { e.to_string() }
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::Context;
+
+    /// A full disk deep in the chain is what the user is told, not the outer context.
+    #[test]
+    fn full_disk_is_said_plainly() {
+        let io = std::io::Error::from(std::io::ErrorKind::StorageFull);
+        let e = Err::<(), _>(io).context(r"couldn't finish E:\.clip.mp4").unwrap_err();
+        assert_eq!(super::describe(&e), "Your disk is full. Free up some space and try again.");
+        assert_eq!(super::describe(&anyhow::anyhow!("nothing was recorded")), "nothing was recorded");
+    }
 }
