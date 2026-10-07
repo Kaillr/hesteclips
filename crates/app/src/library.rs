@@ -451,7 +451,7 @@ impl App {
 
     /// ⌘A selects every clip, ⌫ / Delete trashes the selection, Esc clears it.
     fn selection_keys(&mut self, ui: &egui::Ui) -> Option<Action> {
-        if self.rename.is_some() || self.dialog.is_some() || self.collection_dialog.is_some() || ui.ctx().egui_wants_keyboard_input() {
+        if crate::ui_kit::overlay_open(ui.ctx()) || ui.ctx().egui_wants_keyboard_input() {
             return None;
         }
         let cmd = egui::Modifiers::COMMAND;

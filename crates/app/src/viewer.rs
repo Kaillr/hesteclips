@@ -202,7 +202,7 @@ impl Viewer {
             }
             State::Ready(r) => r.ui(ui),
         }
-        if !ctx.egui_wants_keyboard_input() {
+        if !ctx.egui_wants_keyboard_input() && !crate::ui_kit::overlay_open(&ctx) {
             let none = egui::Modifiers::NONE;
             let (esc, prev, next, f, f2, delete) = ctx.input_mut(|i| {
                 (
@@ -447,7 +447,7 @@ impl Ready {
 
         // Scroll over the picture (or the timeline, over or under it) to
         // scrub through the clip.
-        let over = pointer_over(&ctx, preview) || ctx.pointer_hover_pos().is_some_and(|p| p.y > preview.bottom());
+        let over = pointer_over(&ctx, preview) || (!crate::ui_kit::overlay_open(&ctx) && ctx.pointer_hover_pos().is_some_and(|p| p.y > preview.bottom()));
         let mut input = if over { crate::wheel::read(&ctx).scroll } else { Vec2::ZERO };
         input.y += dev_wheel();
         // Down or left (towards you, or swiping left) goes forward, like reading on.
@@ -657,7 +657,7 @@ impl Ready {
     }
 
     fn keyboard(&mut self, ctx: &egui::Context) {
-        if ctx.egui_wants_keyboard_input() {
+        if ctx.egui_wants_keyboard_input() || crate::ui_kit::overlay_open(ctx) {
             return;
         }
         let none = egui::Modifiers::NONE;
@@ -760,8 +760,9 @@ fn dev_wheel() -> f32 {
     due
 }
 
+/// The pointer is over `rect`, with no dialog or menu on top of it.
 fn pointer_over(ctx: &egui::Context, rect: Rect) -> bool {
-    ctx.pointer_hover_pos().is_some_and(|p| rect.contains(p))
+    !crate::ui_kit::overlay_open(ctx) && ctx.pointer_hover_pos().is_some_and(|p| rect.contains(p))
 }
 
 /// The player's volume and mute, as last set (shared by every clip opened).

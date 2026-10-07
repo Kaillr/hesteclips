@@ -832,6 +832,15 @@ impl eframe::App for App {
             egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin { left: ui_kit::PAGE_MARGIN, right: ui_kit::PAGE_MARGIN, top: 0, bottom })
         };
         laps.lap("bars");
+        // A dialog or menu open (now, or drawn last frame): it gets the keys.
+        let overlay = self.rename.is_some()
+            || self.dialog.is_some()
+            || self.collection_dialog.is_some()
+            || self.confirm_delete.is_some()
+            || self.confirm_reset
+            || ctx.memory(|m| m.top_modal_layer().is_some())
+            || ctx.any_popup_open();
+        ui_kit::set_overlay_open(&ctx, overlay);
         // Another page, game or collection starts at the top. Back from the
         // player or editor, the library stays where it was (and shows the clip).
         let view = (self.page, self.library_filter.clone());
@@ -909,7 +918,7 @@ impl eframe::App for App {
 impl App {
     fn capture_bar(&mut self, ui: &mut egui::Ui) {
         // ⌘, opens Settings, as in every Mac app.
-        if !ui.ctx().egui_wants_keyboard_input() && ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Comma)) {
+        if !ui.ctx().egui_wants_keyboard_input() && !ui_kit::overlay_open(ui.ctx()) && ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Comma)) {
             self.page = Page::Settings;
         }
         let compact = ui.available_width() < 820.0;

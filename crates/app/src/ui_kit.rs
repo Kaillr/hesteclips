@@ -141,6 +141,22 @@ pub fn scroll<R>(ui: &mut egui::Ui, id: &str, add: impl FnOnce(&mut egui::Ui) ->
         .inner
 }
 
+fn overlay_id() -> egui::Id {
+    egui::Id::new("ui_kit_overlay_open")
+}
+
+/// Whether a dialog, menu or dropdown is open this frame: it gets the
+/// keyboard, and the page under it must leave keys alone (Esc closing a
+/// dialog mustn't also leave the player). Set once a frame by the app.
+pub fn set_overlay_open(ctx: &egui::Context, open: bool) {
+    ctx.data_mut(|d| d.insert_temp(overlay_id(), open));
+}
+
+/// See [`set_overlay_open`]: pages check this before handling shortcuts.
+pub fn overlay_open(ctx: &egui::Context) -> bool {
+    ctx.data(|d| d.get_temp::<bool>(overlay_id())).unwrap_or(false)
+}
+
 fn scroll_reset_id() -> egui::Id {
     egui::Id::new("ui_kit_scroll_reset")
 }

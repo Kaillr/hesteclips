@@ -550,11 +550,12 @@ impl Ready {
     }
 
     fn keyboard(&mut self, ctx: &egui::Context) {
-        if !ctx.egui_wants_keyboard_input() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::F2)) {
-            self.rename_requested = true;
-        }
-        if ctx.egui_wants_keyboard_input() {
+        // A dialog (its own or the app's) or a menu has the keys.
+        if ctx.egui_wants_keyboard_input() || crate::ui_kit::overlay_open(ctx) || self.save_as.is_some() || self.confirm_discard {
             return;
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::F2)) {
+            self.rename_requested = true;
         }
         let (zoom_in, zoom_out, fit) = ctx.input_mut(|inp| {
             (
@@ -722,7 +723,8 @@ impl Ready {
         // Wheel input glides (see `wheel.rs`): read raw, eased here.
         let ctx = ui.ctx().clone();
         let pointer = ctx.pointer_hover_pos();
-        let input = if pointer.is_some_and(|p| outer.contains(p)) { crate::wheel::read(&ctx) } else { crate::wheel::Input { pinch: 1.0, ..Default::default() } };
+        // Not under a dialog or menu: scrolling it mustn't move the timeline.
+        let input = if pointer.is_some_and(|p| outer.contains(p)) && !crate::ui_kit::overlay_open(&ctx) { crate::wheel::read(&ctx) } else { crate::wheel::Input { pinch: 1.0, ..Default::default() } };
         let scroll = self.glide.step(&ctx, input.scroll);
         let zoom_pts = self.zoom_glide.step1(&ctx, input.zoom);
         let zoom = (ctx.options(|o| o.input_options.scroll_zoom_speed) * zoom_pts).exp() * input.pinch;
