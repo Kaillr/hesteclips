@@ -947,41 +947,19 @@ impl App {
             (Page::Sources, "Sources", Some("What goes into your clips: the picture, your mic, the game's sound".to_owned())),
             (Page::Settings, "Settings", Some(hotkey_label_cmd(","))),
         ];
-        let v = ui.visuals().clone();
-        egui::Frame::new()
-            .fill(v.extreme_bg_color)
-            .corner_radius(8)
-            .inner_margin(egui::Margin::same(3))
-            .show(ui, |ui| {
-                ui.spacing_mut().item_spacing.x = 2.0;
-                for (page, label, tip) in tabs {
-                    // Painted, not an egui Button: a button grows a hover stroke,
-                    // which made the tabs change width under the pointer.
-                    let selected = self.page == page;
-                    let galley = ui.painter().layout_no_wrap(label.to_owned(), egui::FontId::proportional(14.0), Color32::WHITE);
-                    let w = galley.size().x + if compact { 16.0 } else { 28.0 };
-                    let (rect, mut r) = ui.allocate_exact_size(egui::vec2(w, 26.0), egui::Sense::click());
-                    let color = if selected {
-                        v.strong_text_color()
-                    } else if r.hovered() {
-                        v.text_color()
-                    } else {
-                        v.weak_text_color()
-                    };
-                    if selected {
-                        ui.painter().rect_filled(rect, ui_kit::RADIUS, v.widgets.active.weak_bg_fill);
-                    } else if r.hovered() {
-                        ui.painter().rect_filled(rect, ui_kit::RADIUS, ui_kit::hover(&v));
-                    }
-                    ui.painter().galley_with_override_text_color(rect.center() - galley.size() / 2.0, galley, color);
-                    if let Some(tip) = tip {
-                        r = r.on_hover_text(tip);
-                    }
-                    if r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                        self.page = page;
-                    }
-                }
-            });
+        // The same control as the switches on the Sources page.
+        let _ = compact;
+        let labels: Vec<&str> = tabs.iter().map(|(_, l, _)| *l).collect();
+        let chosen = tabs.iter().position(|(p, _, _)| *p == self.page).unwrap_or(usize::MAX);
+        let responses = ui_kit::segmented_with(ui, &labels, chosen, false);
+        for ((page, _, tip), mut r) in tabs.into_iter().zip(responses) {
+            if let Some(tip) = tip {
+                r = r.on_hover_text(tip);
+            }
+            if r.clicked() {
+                self.page = page;
+            }
+        }
     }
 
     /// What capture is doing: a dot and a short line, with the hotkey hint below

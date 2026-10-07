@@ -201,32 +201,42 @@ pub fn danger_button(text: impl Into<String>) -> egui::Button<'static> {
     egui::Button::new(RichText::new(text.into()).color(Color32::WHITE)).fill(DANGER).min_size(Vec2::new(0.0, CONTROL_H))
 }
 
-/// A choice of a few options, side by side in a sunken track, the chosen one
-/// raised: the same look as the page tabs. Equal widths filling the row.
-/// Returns each option's response.
-pub fn segmented(ui: &mut egui::Ui, labels: &[&str], chosen: usize) -> Vec<egui::Response> {
+/// A choice of a few options side by side: the page tabs, and two-way
+/// switches like Whole screen / Games and apps. The same height as a button
+/// (30), on a card's surface, the chosen one filled like a button; hover as
+/// everywhere. `equal`: options share the row's width; else each fits its
+/// text. Returns each option's response.
+pub fn segmented_with(ui: &mut egui::Ui, labels: &[&str], chosen: usize, equal: bool) -> Vec<egui::Response> {
     let v = ui.visuals().clone();
+    let pad = 3.0;
     let mut out = Vec::new();
-    egui::Frame::new().fill(v.extreme_bg_color).corner_radius(8).inner_margin(Margin::same(3)).show(ui, |ui| {
+    egui::Frame::new().fill(surface(&v)).corner_radius(8).inner_margin(Margin::same(pad as i8)).show(ui, |ui| {
         ui.spacing_mut().item_spacing.x = 2.0;
         let n = labels.len().max(1) as f32;
-        let w = ((ui.available_width() - 2.0 * (n - 1.0)) / n).max(60.0);
+        let share = ((ui.available_width() - 2.0 * (n - 1.0)) / n).max(60.0);
         ui.horizontal(|ui| {
             for (i, label) in labels.iter().enumerate() {
-                let (rect, r) = ui.allocate_exact_size(Vec2::new(w, CONTROL_H - 6.0), egui::Sense::click());
+                let galley = ui.painter().layout_no_wrap(label.to_string(), FontId::proportional(14.0), Color32::WHITE);
+                let w = if equal { share } else { galley.size().x + 24.0 };
+                let (rect, r) = ui.allocate_exact_size(Vec2::new(w, CONTROL_H - 2.0 * pad), egui::Sense::click());
                 let on = i == chosen;
                 if on {
-                    ui.painter().rect_filled(rect, RADIUS, v.widgets.active.weak_bg_fill);
+                    ui.painter().rect_filled(rect, RADIUS, v.widgets.inactive.weak_bg_fill);
                 } else if r.hovered() && ui.is_enabled() {
                     ui.painter().rect_filled(rect, RADIUS, hover(&v));
                 }
                 let color = if on { v.strong_text_color() } else if r.hovered() { v.text_color() } else { v.weak_text_color() };
-                ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, *label, FontId::proportional(14.0), color);
-                out.push(r.on_hover_cursor(egui::CursorIcon::PointingHand));
+                ui.painter().galley_with_override_text_color(rect.center() - galley.size() / 2.0, galley, color);
+                out.push(r);
             }
         });
     });
     out
+}
+
+/// [`segmented_with`], the options sharing the row's width.
+pub fn segmented(ui: &mut egui::Ui, labels: &[&str], chosen: usize) -> Vec<egui::Response> {
+    segmented_with(ui, labels, chosen, true)
 }
 
 /// A small "?" that opens the screen's keyboard and mouse shortcuts: what a
