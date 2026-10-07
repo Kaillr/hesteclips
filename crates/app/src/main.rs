@@ -351,6 +351,8 @@ struct App {
     pub(crate) rename: Option<library::Rename>,
     /// Clips selected in the library for a bulk action.
     pub(crate) selection: library::Selection,
+    /// Clips being dragged inside the window, to a game or collection.
+    pub(crate) card_drag: Option<library::CardDrag>,
     /// Library auto-refresh: last folder poll + when the library's folders
     /// last changed, as last seen.
     last_poll: Option<Instant>,
@@ -483,6 +485,7 @@ impl App {
             library_filter: library::Filter::All,
             collections,
             collection_dialog: None,
+            card_drag: None,
             nav: nav::History::default(),
             web_images: Default::default(),
             updater,

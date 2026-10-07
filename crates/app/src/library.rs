@@ -9,6 +9,10 @@
 //! "Awesome ace clutches" (`collections`). A narrow window puts the same list
 //! in a menu on the page's title.
 //!
+//! Dragging clips works like a file manager: inside the window they can be
+//! dropped on a game (moved there) or a collection (added to it); taken out of
+//! the window, they're handed to the OS to drop into any app.
+//!
 //! Selecting works like Photos and Finder: the check circle on a card, ⌘-click
 //! or Shift-click start a selection; while one is active a plain click toggles a
 //! card instead of playing it, and a bar on top acts on all of them.
@@ -127,6 +131,22 @@ fn views(clips: &[clips::Clip], cols: &Collections) -> (Vec<View>, Vec<View>) {
     (games, collections)
 }
 
+/// Clips being dragged inside the window.
+pub(crate) struct CardDrag {
+    files: Vec<PathBuf>,
+    /// The clip the drag started on, for the picture under the pointer.
+    clip: PathBuf,
+    /// What dropping now would do, as the sidebar found it this frame.
+    target: Option<(DropOn, String)>,
+}
+
+/// Where dragged clips can go.
+#[derive(Clone)]
+enum DropOn {
+    View(Filter),
+    NewCollection,
+}
+
 /// The "New collection", "Rename collection" or "Delete collection" dialog.
 pub(crate) struct CollectionDialog {
     kind: CollectionDialogKind,
@@ -195,6 +215,10 @@ impl Selection {
 enum Action {
     /// Drag the file out of the window (to another app / the desktop).
     DragOut(Vec<PathBuf>, Option<PathBuf>),
+    /// Start dragging clips inside the window (from this clip's card).
+    StartDrag(Vec<PathBuf>, PathBuf),
+    /// Dragged clips were dropped here.
+    Drop(Vec<PathBuf>, DropOn),
     Share(PathBuf, ShareChoice),
     Rename(PathBuf),
     Open(PathBuf),
@@ -251,6 +275,9 @@ impl App {
         let clips: Vec<clips::Clip> = self.clips.iter().filter(|c| self.library_filter.matches(c, &self.collections)).cloned().collect();
 
         let mut action = self.selection_keys(ui);
+        if let Some(a) = self.follow_drag(ui.ctx()) {
+            action = Some(a);
+        }
         let wide = ui.available_width() >= SIDEBAR_FROM;
         if wide {
             egui::Panel::left("library_sidebar")
@@ -338,6 +365,10 @@ impl App {
             }
         });
 
+        if let Some(a) = self.finish_drag(ui.ctx()) {
+            action = Some(a);
+        }
+
         match action {
             Some(Action::Open(p)) => self.open_viewer(p),
             Some(Action::OpenExternal(p)) => {
@@ -347,6 +378,14 @@ impl App {
             }
             Some(Action::Share(p, choice)) => self.share(frame, p, choice),
             Some(Action::DragOut(files, preview)) => self.drag_out(ui.ctx(), frame, files, preview),
+            Some(Action::StartDrag(files, clip)) => self.card_drag = Some(CardDrag { files, clip, target: None }),
+            Some(Action::Drop(files, on)) => match on {
+                DropOn::View(Filter::Folder(f)) => self.move_clips(ui.ctx(), &files, Some(f)),
+                DropOn::View(Filter::Loose) => self.move_clips(ui.ctx(), &files, None),
+                DropOn::View(Filter::Collection(id)) => self.put_in_collection(&files, &id, true),
+                DropOn::View(Filter::All) => {}
+                DropOn::NewCollection => self.new_collection_with(files),
+            },
             Some(Action::Edit(p)) => self.open_editor(p),
             Some(Action::Rename(p)) => self.rename_clip(p),
             Some(Action::Trash(p)) => self.trash_clips(&[p]),
@@ -546,7 +585,14 @@ impl App {
             ui.add(egui::Label::new(egui::RichText::new("Keep your best clips together, like \"Ace clutches\".").size(12.0).weak()).wrap());
             ui.add_space(4.0);
         }
-        if new_collection_row(ui).clicked() {
+        let row = new_collection_row(ui);
+        if let Some(drag) = &mut self.card_drag
+            && row.contains_pointer()
+        {
+            drag.target = Some((DropOn::NewCollection, "New collection with it".into()));
+            ui.painter().rect_stroke(row.rect, 7, Stroke::new(2.0, ACCENT), StrokeKind::Inside);
+        }
+        if row.clicked() {
             action = Some(Action::NewCollection(Vec::new()));
         }
         action
@@ -558,10 +604,14 @@ impl App {
         let selected = self.library_filter == view.filter;
         let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 32.0), Sense::click());
         let v = ui.visuals().clone();
+        let drop_here = self.drop_target(ui, rect, &view.filter);
         if selected {
             ui.painter().rect_filled(rect, 7, ACCENT);
-        } else if resp.hovered() {
+        } else if resp.hovered() || drop_here {
             ui.painter().rect_filled(rect, 7, v.widgets.hovered.weak_bg_fill);
+        }
+        if drop_here {
+            ui.painter().rect_stroke(rect, 7, Stroke::new(2.0, ACCENT), StrokeKind::Inside);
         }
         let (text, weak) = if selected { (Color32::WHITE, Color32::from_white_alpha(200)) } else { (v.text_color(), v.weak_text_color()) };
         let icon = Rect::from_center_size(Pos2::new(rect.left() + 20.0, rect.center().y), Vec2::splat(20.0));
@@ -582,6 +632,110 @@ impl App {
             }
         });
         action
+    }
+
+    /// While clips are dragged over this sidebar entry: whether they can go
+    /// there (it's then what a drop does).
+    fn drop_target(&mut self, ui: &egui::Ui, rect: Rect, filter: &Filter) -> bool {
+        let Some(drag) = &mut self.card_drag else { return false };
+        if !ui.rect_contains_pointer(rect) {
+            return false;
+        }
+        let name = |f: &Filter| match f {
+            Filter::Folder(name) => name.clone(),
+            Filter::Loose => "Other".into(),
+            Filter::Collection(id) => self.collections.get(id).map(|c| c.name.clone()).unwrap_or_default(),
+            Filter::All => String::new(),
+        };
+        let label = match filter {
+            Filter::All => return false,
+            Filter::Collection(id) if drag.files.iter().all(|p| self.collections.contains(id, p)) => return false,
+            Filter::Collection(_) => format!("Add to {}", name(filter)),
+            Filter::Folder(_) | Filter::Loose => {
+                let dir = match filter {
+                    Filter::Folder(f) => self.settings.output_dir.join(f),
+                    _ => self.settings.output_dir.clone(),
+                };
+                if drag.files.iter().all(|p| p.parent() == Some(dir.as_path())) {
+                    return false;
+                }
+                format!("Move to {}", name(filter))
+            }
+        };
+        drag.target = Some((DropOn::View(filter.clone()), label));
+        true
+    }
+
+    /// Keep up with clips being dragged: out of the window, they go to the OS
+    /// (to drop into another app); Esc cancels.
+    fn follow_drag(&mut self, ctx: &egui::Context) -> Option<Action> {
+        let drag = self.card_drag.as_mut()?;
+        drag.target = None;
+        // `hover_pos` is gone once the pointer has left the window.
+        let (down, pos, esc) = ctx.input(|i| (i.pointer.primary_down(), i.pointer.hover_pos(), i.key_pressed(egui::Key::Escape)));
+        if esc {
+            self.card_drag = None;
+            ctx.stop_dragging();
+            return None;
+        }
+        let outside = pos.is_none_or(|p| !ctx.content_rect().shrink(2.0).contains(p));
+        if down && outside && share::CAN_DRAG_OUT {
+            let drag = self.card_drag.take()?;
+            let preview = self.clips.iter().find(|c| c.path == drag.clip).and_then(thumbs::cached_jpeg);
+            return Some(Action::DragOut(drag.files, preview));
+        }
+        None
+    }
+
+    /// After the sidebar has looked at the pointer: drop on what it's over when
+    /// the button comes up, else draw the clips under the pointer.
+    fn finish_drag(&mut self, ctx: &egui::Context) -> Option<Action> {
+        let drag = self.card_drag.as_ref()?;
+        if !ctx.input(|i| i.pointer.primary_down()) {
+            let drag = self.card_drag.take()?;
+            return drag.target.map(|(on, _)| Action::Drop(drag.files, on));
+        }
+        let pos = ctx.input(|i| i.pointer.latest_pos())?;
+        ctx.set_cursor_icon(if drag.target.is_some() { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab });
+        let clip = self.clips.iter().find(|c| c.path == drag.clip).cloned();
+        let tex = clip.and_then(|c| self.thumbs.get(ctx, &c).and_then(|t| t.texture.clone()));
+        let (n, label) = (drag.files.len(), drag.target.as_ref().map(|(_, l)| l.clone()));
+        egui::Area::new(egui::Id::new("card_drag_ghost"))
+            .order(egui::Order::Tooltip)
+            .fixed_pos(pos + Vec2::new(12.0, 12.0))
+            .interactable(false)
+            .show(ctx, |ui| {
+                let size = Vec2::new(128.0, 72.0);
+                let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+                let p = ui.painter();
+                // More than one: cards stacked behind.
+                if n > 1 {
+                    p.rect_filled(rect.translate(Vec2::new(5.0, -5.0)), 6, Color32::from_gray(70));
+                }
+                match &tex {
+                    Some(tex) => {
+                        let uv = crate::filmstrip::crop_uv(tex.size_vec2(), size);
+                        egui::Image::from_texture((tex.id(), size)).uv(uv).corner_radius(6).tint(Color32::from_white_alpha(230)).paint_at(ui, rect);
+                    }
+                    None => {
+                        p.rect_filled(rect, 6, Color32::from_gray(40));
+                    }
+                }
+                p.rect_stroke(rect, 6, Stroke::new(1.5, ACCENT), StrokeKind::Inside);
+                if n > 1 {
+                    let c = rect.right_top() + Vec2::new(-2.0, 2.0);
+                    p.circle_filled(c, 11.0, ACCENT);
+                    p.text(c, Align2::CENTER_CENTER, n.to_string(), FontId::proportional(12.0), Color32::WHITE);
+                }
+                if let Some(label) = &label {
+                    let g = p.layout_no_wrap(label.clone(), FontId::proportional(13.0), Color32::WHITE);
+                    let r = Rect::from_min_size(rect.left_bottom() + Vec2::new(0.0, 6.0), g.size() + Vec2::new(14.0, 8.0));
+                    p.rect_filled(r, 6, ACCENT);
+                    p.galley(r.min + Vec2::new(7.0, 4.0), g, Color32::WHITE);
+                }
+            });
+        ctx.request_repaint();
+        None
     }
 
     /// The picture of a view: a game's icon, a collection's newest clip.
@@ -1099,14 +1253,13 @@ impl App {
         // browser… (egui alone can't drag outside its own window).
         // Dragging one of the selected clips takes them all, in library order;
         // any other clip goes alone, as in a file manager.
-        if share::CAN_DRAG_OUT && resp.drag_started() && action.is_none() {
+        if resp.drag_started() && action.is_none() && self.card_drag.is_none() {
             let files = if selected {
                 self.clips.iter().filter(|c| self.selection.paths.contains(&c.path)).map(|c| c.path.clone()).collect()
             } else {
                 vec![clip.path.clone()]
             };
-            let preview = thumbs::cached_jpeg(clip);
-            action = Some(Action::DragOut(files, preview));
+            action = Some(Action::StartDrag(files, clip.path.clone()));
         }
         if resp.clicked() && action.is_none() && render.is_none() {
             action = Some(if modifiers.shift && (selecting || modifiers.command) {
