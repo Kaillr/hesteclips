@@ -356,6 +356,10 @@ struct App {
     pub(crate) selection: library::Selection,
     /// Clips being dragged inside the window, to a game or collection.
     pub(crate) card_drag: Option<library::CardDrag>,
+    /// Clips waiting for "Delete permanently?" to be answered.
+    pub(crate) confirm_delete: Option<Vec<PathBuf>>,
+    /// What was shown last frame, to scroll a new view back to the top.
+    last_view: Option<(Page, library::Filter)>,
     /// Library auto-refresh: last folder poll + when the library's folders
     /// last changed, as last seen.
     last_poll: Option<Instant>,
@@ -489,6 +493,8 @@ impl App {
             collections,
             collection_dialog: None,
             card_drag: None,
+            confirm_delete: None,
+            last_view: None,
             nav: nav::History::default(),
             web_images: Default::default(),
             updater,
@@ -826,6 +832,14 @@ impl eframe::App for App {
             egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin { left: ui_kit::PAGE_MARGIN, right: ui_kit::PAGE_MARGIN, top: 0, bottom })
         };
         laps.lap("bars");
+        // Another page, game or collection starts at the top. Back from the
+        // player or editor, the library stays where it was (and shows the clip).
+        let view = (self.page, self.library_filter.clone());
+        let reset = self.last_view.as_ref().is_some_and(|(page, filter)| {
+            (*page != view.0 && !matches!(page, Page::Edit | Page::View)) || (*filter != view.1 && view.0 == Page::Clips)
+        });
+        ui_kit::set_scroll_reset(&ctx, reset);
+        self.last_view = Some(view);
         egui::CentralPanel::default()
             .frame(central)
             .show(ui, |ui| match self.page {
@@ -846,6 +860,7 @@ impl eframe::App for App {
         self.dialogs(&ctx);
         self.rename_dialog(&ctx);
         self.collection_dialog(&ctx);
+        self.delete_dialog(&ctx);
         ui_kit::pointer_cursor(&ctx);
         laps.lap("dialogs");
 
@@ -1197,6 +1212,7 @@ impl App {
     }
 
     fn viewer_page(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
+        let delete_label = self.delete_label(None);
         let Some(v) = &mut self.viewer else {
             self.page = Page::Clips;
             return;
@@ -1215,6 +1231,7 @@ impl App {
             next: at.and_then(|i| list.get(i + 1)).map(|c| c.path.clone()),
             position: at.map(|i| (i + 1, list.len())),
             collections,
+            delete_label,
         };
         let outcome = v.ui(ui, &nav);
         if let Some((volume, muted)) = viewer::volume(ui.ctx()) {
@@ -1247,6 +1264,10 @@ impl App {
             viewer::ViewerOutcome::Share(choice) => {
                 let clip = v.clip().to_path_buf();
                 self.share(frame, clip, choice);
+            }
+            viewer::ViewerOutcome::Delete => {
+                let clip = v.clip().to_path_buf();
+                self.delete_clips(&[clip]);
             }
             viewer::ViewerOutcome::Rename => {
                 let clip = v.clip().to_path_buf();

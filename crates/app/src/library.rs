@@ -399,7 +399,7 @@ impl App {
             },
             Some(Action::Edit(p)) => self.open_editor(p),
             Some(Action::Rename(p)) => self.rename_clip(p),
-            Some(Action::Trash(p)) => self.trash_clips(&[p]),
+            Some(Action::Trash(p)) => self.delete_clips(&[p]),
             Some(Action::MoveTo(paths, folder)) => self.move_clips(ui.ctx(), &paths, folder),
             Some(Action::MoveSelectedTo(folder)) => {
                 let paths: Vec<PathBuf> = clips.iter().filter(|c| self.selection.paths.contains(&c.path)).map(|c| c.path.clone()).collect();
@@ -443,7 +443,7 @@ impl App {
             Some(Action::TrashSelected) => {
                 // In library order, so the toast and any failure read naturally.
                 let paths: Vec<PathBuf> = self.clips.iter().filter(|c| self.selection.paths.contains(&c.path)).map(|c| c.path.clone()).collect();
-                self.trash_clips(&paths);
+                self.delete_clips(&paths);
             }
             None => {}
         }
@@ -491,7 +491,7 @@ impl App {
                         action = Some(Action::SelectAll);
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let trash = egui::Button::new(egui::RichText::new("Move to Trash").color(Color32::WHITE)).fill(ui.visuals().error_fg_color);
+                        let trash = crate::ui_kit::danger_button(self.delete_label(None));
                         let key = if cfg!(target_os = "macos") { "⌫".to_owned() } else { "Delete".to_owned() };
                         if ui.add(trash).on_hover_text(key).clicked() {
                             action = Some(Action::TrashSelected);
@@ -525,7 +525,59 @@ impl App {
 
     /// Move clips (and their edits) to the Bin. Clips with a save in progress are
     /// left alone: their file is about to be replaced.
-    fn trash_clips(&mut self, paths: &[PathBuf]) {
+    /// Delete clips the way the setting says: to the Recycle Bin at once, or
+    /// for good once "Delete permanently?" is answered.
+    pub(crate) fn delete_clips(&mut self, paths: &[PathBuf]) {
+        if paths.is_empty() {
+            return;
+        }
+        if self.settings.delete_permanently {
+            self.confirm_delete = Some(paths.to_vec());
+        } else {
+            self.delete_now(paths);
+        }
+    }
+
+    /// "Delete permanently?", while clips wait for it.
+    pub(crate) fn delete_dialog(&mut self, ctx: &egui::Context) {
+        let Some(paths) = self.confirm_delete.clone() else { return };
+        let (mut yes, mut no) = (false, false);
+        let modal = egui::Modal::new(egui::Id::new("confirm_delete")).show(ctx, |ui| {
+            ui.set_width(380.0);
+            ui.heading(match paths.as_slice() {
+                [one] => format!("Delete {}?", crate::clips::title_for_stem(&one.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default())),
+                _ => format!("Delete {} clips?", paths.len()),
+            });
+            ui.add_space(6.0);
+            ui.label("It's deleted for good: it can't be brought back.");
+            ui.add_space(12.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                yes = ui.add(crate::ui_kit::danger_button("Delete")).clicked();
+                no = ui.add(crate::ui_kit::button("Cancel", false)).clicked();
+            });
+            // Enter deletes, as the default action of a confirmation.
+            yes |= ui.input(|i| i.key_pressed(egui::Key::Enter));
+        });
+        if yes {
+            self.confirm_delete = None;
+            self.delete_now(&paths);
+        } else if no || modal.should_close() {
+            self.confirm_delete = None;
+        }
+    }
+
+    /// Delete clips now. The player moves on to the next clip if it was
+    /// showing one of them.
+    fn delete_now(&mut self, paths: &[PathBuf]) {
+        let permanently = self.settings.delete_permanently;
+        // Where the player goes if its clip goes: the next clip in what's
+        // shown, else the one before.
+        let after = self.viewer.as_ref().map(|v| v.clip().to_path_buf()).filter(|c| paths.contains(c)).map(|current| {
+            let shown: Vec<&clips::Clip> = self.clips.iter().filter(|c| self.library_filter.matches(c, &self.collections)).collect();
+            let at = shown.iter().position(|c| c.path == current);
+            let left = |c: &&&clips::Clip| !paths.contains(&c.path);
+            at.and_then(|i| shown[i + 1..].iter().find(left).or_else(|| shown[..i].iter().rev().find(left))).map(|c| c.path.clone())
+        });
         let mut library = self.clips.clone();
         let (mut moved, mut busy) = (Vec::new(), 0);
         let mut error = None;
@@ -538,26 +590,50 @@ impl App {
             // Trash against what's left, so duplicates sharing assets let go of them
             // with the last copy.
             let clip = library.remove(i);
-            match store::trash(&clip, &library) {
+            match store::delete(&clip, &library, permanently) {
                 Ok(()) => moved.push(clip.path),
                 Err(e) => {
                     library.insert(i, clip);
-                    error = Some(e.to_string());
+                    error = Some(e);
                 }
             }
         }
         self.collections.forget(&moved);
+        let bin = store::bin_name();
+        let what = match moved.as_slice() {
+            [one] => crate::clips::title_for_stem(&one.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()),
+            _ => format!("{} clips", moved.len()),
+        };
         if let Some(e) = error {
-            self.toast_error(format!("Couldn't move to the Trash: {e}"));
+            self.toast_error(format!("Couldn't delete: {e}"));
         } else if busy > 0 {
             self.toast_error("Clips that are still saving an edit were kept.");
-        } else if let [one] = moved.as_slice() {
-            self.toast(format!("Moved {} to the Trash", crate::file_name(one)));
+        } else if !moved.is_empty() && permanently {
+            self.toast(format!("Deleted {what}"));
         } else if !moved.is_empty() {
-            self.toast(format!("Moved {} clips to the Trash", moved.len()));
+            self.toast(format!("Moved {what} to the {bin}"));
         }
         self.selection.clear();
         self.refresh_clips();
+        if let Some(next) = after {
+            match next {
+                Some(clip) => self.open_viewer(clip),
+                None => {
+                    self.viewer = None;
+                    self.page = crate::Page::Clips;
+                }
+            }
+        }
+    }
+
+    /// "Move to Recycle Bin" or "Delete…" (it asks), for `n` clips if given.
+    pub(crate) fn delete_label(&self, n: Option<usize>) -> String {
+        match (self.settings.delete_permanently, n) {
+            (true, Some(n)) => format!("Delete {n} clips…"),
+            (true, None) => "Delete…".to_owned(),
+            (false, Some(n)) => format!("Move {n} clips to {}", store::bin_name()),
+            (false, None) => format!("Move to {}", store::bin_name()),
+        }
     }
 
     /// The sidebar: all clips, the games, your collections.
@@ -1299,7 +1375,7 @@ impl App {
                         }
                     });
                 }
-                if ui.button(egui::RichText::new(format!("Move {n} clips to Trash")).color(v.error_fg_color)).clicked() {
+                if ui.button(egui::RichText::new(self.delete_label(Some(n))).color(v.error_fg_color)).clicked() {
                     action = Some(Action::TrashSelected);
                 }
                 if ui.button("Deselect all").clicked() {
@@ -1348,7 +1424,7 @@ impl App {
                 action = Some(Action::Share(clip.path.clone(), c));
             }
             ui.separator();
-            if ui.button(egui::RichText::new("Move to Trash").color(v.error_fg_color)).clicked() {
+            if ui.button(egui::RichText::new(self.delete_label(None)).color(v.error_fg_color)).clicked() {
                 action = Some(Action::Trash(clip.path.clone()));
             }
         });

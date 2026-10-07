@@ -191,18 +191,30 @@ pub fn revert(target: &EditTarget) -> std::io::Result<()> {
     std::fs::remove_dir_all(assets_dir(lib, id))
 }
 
-/// Move a clip to the Bin, with its assets unless another copy of the clip
-/// (duplicated in Finder) still uses them.
-pub fn trash(clip: &Clip, library: &[Clip]) -> Result<(), trash::Error> {
-    trash::delete(&clip.path)?;
+/// Delete a clip, with its assets unless another copy of the clip
+/// (duplicated in Finder) still uses them: to the Bin, or for good.
+pub fn delete(clip: &Clip, library: &[Clip], permanently: bool) -> Result<(), String> {
+    let remove = |path: &Path| -> Result<(), String> {
+        if !permanently {
+            return trash::delete(path).map_err(|e| e.to_string());
+        }
+        let r = if path.is_dir() { std::fs::remove_dir_all(path) } else { std::fs::remove_file(path) };
+        r.map_err(|e| e.to_string())
+    };
+    remove(&clip.path)?;
     if let Some(id) = clip.id.as_deref() {
         let shared = library.iter().any(|c| c.path != clip.path && c.id.as_deref() == Some(id));
         let dir = assets_dir(&library_of(&clip.path), id);
         if !shared && dir.exists() {
-            trash::delete(dir)?;
+            remove(&dir)?;
         }
     }
     Ok(())
+}
+
+/// What the OS calls the place deleted files go.
+pub fn bin_name() -> &'static str {
+    if cfg!(windows) { "Recycle Bin" } else { "Trash" }
 }
 
 /// Assets whose clip is gone (deleted in Finder) go to the Bin, so they can still
@@ -231,6 +243,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// Deleting for good removes the clip and its edit, unless a copy of the
+    /// clip still uses the edit.
+    #[test]
+    fn delete_permanently() {
+        let dir = lib("delete");
+        let clip = |name: &str, id: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, b"x").unwrap();
+            Clip { path, name: name.into(), modified: std::time::SystemTime::UNIX_EPOCH, size_bytes: 1, id: Some(id.into()), original: None, folder: None }
+        };
+        let (a, b, c) = (clip("a.mp4", "1111"), clip("b.mp4", "1111"), clip("c.mp4", "2222"));
+        for id in ["1111", "2222"] {
+            std::fs::create_dir_all(assets_dir(&dir, id)).unwrap();
+        }
+        let library = vec![a.clone(), b.clone(), c.clone()];
+        // a's edit is shared with its copy b: kept.
+        delete(&a, &library, true).unwrap();
+        assert!(!a.path.exists() && assets_dir(&dir, "1111").exists());
+        delete(&c, &library, true).unwrap();
+        assert!(!c.path.exists() && !assets_dir(&dir, "2222").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     fn edit(end: f64) -> Edit {

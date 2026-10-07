@@ -48,6 +48,8 @@ pub enum ViewerOutcome {
     InCollection(String, bool),
     /// Make a collection with the clip in it.
     NewCollection,
+    /// Delete the clip (to the Recycle Bin, or for good after asking).
+    Delete,
     /// The picture was dragged: hand the clip to the OS to drop into an app.
     DragOut,
 }
@@ -62,6 +64,8 @@ pub struct Nav {
     pub position: Option<(usize, usize)>,
     /// Your collections: (id, name, whether this clip is in it).
     pub collections: Vec<(String, String, bool)>,
+    /// What deleting does, for its button: "Move to Recycle Bin" or "Delete…".
+    pub delete_label: String,
 }
 
 struct Loaded {
@@ -200,17 +204,21 @@ impl Viewer {
         }
         if !ctx.egui_wants_keyboard_input() {
             let none = egui::Modifiers::NONE;
-            let (esc, prev, next, f, f2) = ctx.input_mut(|i| {
+            let (esc, prev, next, f, f2, delete) = ctx.input_mut(|i| {
                 (
                     i.consume_key(none, Key::Escape),
                     i.consume_key(none, Key::P),
                     i.consume_key(none, Key::N),
                     i.consume_key(none, Key::F),
                     i.consume_key(none, Key::F2),
+                    i.consume_key(none, Key::Delete),
                 )
             });
             if f2 {
                 out = ViewerOutcome::Rename;
+            }
+            if delete {
+                out = ViewerOutcome::Delete;
             }
             if esc {
                 // Out of fullscreen first; out of the viewer after that.
@@ -279,6 +287,10 @@ impl Viewer {
                 });
                 if ui.add(header::button("Edit", false)).on_hover_text("Trim it, adjust its audio, or save it smaller").clicked() {
                     out = ViewerOutcome::Edit;
+                }
+                let delete = header::button("Delete", false);
+                if ui.add(delete).on_hover_text(format!("{}  (Delete)", nav.delete_label)).clicked() {
+                    out = ViewerOutcome::Delete;
                 }
                 let collect = ui.add(header::button("+ Collection", false)).on_hover_text("Add it to a collection of your own, like \"Ace clutches\"");
                 egui::Popup::menu(&collect).show(|ui| {
@@ -531,6 +543,7 @@ impl Ready {
                         ("F", "Fullscreen"),
                         ("P N", "Previous or next clip"),
                         ("F2", "Rename"),
+                        ("Delete", "Delete the clip"),
                         ("Esc", "Back to your clips"),
                     ],
                 );

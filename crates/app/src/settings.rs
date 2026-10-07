@@ -416,6 +416,9 @@ pub struct RecordSettings {
     /// Game folders renamed in the library: the folder a game's clips would
     /// go in (its name, as `clips::folder_name` makes it) → the one they go in.
     pub game_folders: std::collections::BTreeMap<String, String>,
+    /// Deleting a clip removes it for good instead of moving it to the
+    /// Recycle Bin / Trash (then it asks first).
+    pub delete_permanently: bool,
     /// Name clips after what happened in the game ("3 kills on Mirage"), for
     /// games that report it (CS2, Dota 2, League of Legends, osu!).
     pub game_details: bool,
@@ -467,6 +470,7 @@ impl Default for RecordSettings {
             folder_per_game: true,
             game_folders: Default::default(),
             game_details: true,
+            delete_permanently: false,
             game_titles: GameTitles::default(),
             audio_sources: default_sources(),
             limiter: true,

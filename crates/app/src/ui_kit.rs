@@ -123,19 +123,32 @@ pub fn section<R>(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui
 /// the content and the window's edge: never over the content, and the content
 /// doesn't move when the bar widens under the pointer.
 pub fn scroll<R>(ui: &mut egui::Ui, id: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let reset = ui.ctx().data(|d| d.get_temp::<bool>(scroll_reset_id())).unwrap_or(false);
     let gutter = PAGE_MARGIN as f32;
     let mut rect = ui.available_rect_before_wrap();
     rect.max.x += gutter;
     let mut area = ui.new_child(egui::UiBuilder::new().max_rect(rect));
     area.spacing_mut().scroll = egui::style::ScrollStyle { bar_outer_margin: 3.0, bar_inner_margin: 0.0, ..egui::style::ScrollStyle::floating() };
-    egui::ScrollArea::vertical()
-        .id_salt(id)
-        .auto_shrink([false, false])
+    let mut scroll = egui::ScrollArea::vertical().id_salt(id).auto_shrink([false, false]);
+    if reset {
+        scroll = scroll.vertical_scroll_offset(0.0);
+    }
+    scroll
         .show(&mut area, |ui| {
             ui.set_max_width(ui.available_width() - gutter);
             add(ui)
         })
         .inner
+}
+
+fn scroll_reset_id() -> egui::Id {
+    egui::Id::new("ui_kit_scroll_reset")
+}
+
+/// This frame shows a different view than the last (another page, game or
+/// collection): pages scroll back to the top.
+pub fn set_scroll_reset(ctx: &egui::Context, reset: bool) {
+    ctx.data_mut(|d| d.insert_temp(scroll_reset_id(), reset));
 }
 
 /// A page of settings-like content: scrolls, centred, at most `max_width`

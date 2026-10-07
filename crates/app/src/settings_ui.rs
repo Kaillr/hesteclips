@@ -157,6 +157,12 @@ impl App {
                     }
                 }
                 divider(ui);
+                let bin = crate::store::bin_name();
+                let hint = format!("Instead of moving them to the {bin}. You're asked first, as it can't be undone.");
+                row(ui, "Delete clips permanently", Some(&hint), |ui| {
+                    toggle(ui, &mut self.settings.delete_permanently);
+                });
+                divider(ui);
                 row(ui, "File format", Some("MP4 plays everywhere."), |ui| {
                     ui.add_enabled_ui(idle, |ui| {
                         ui.horizontal_wrapped(|ui| {
