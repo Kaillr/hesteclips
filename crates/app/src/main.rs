@@ -542,6 +542,11 @@ impl App {
                 app.new_collection_with(first);
             }
         }
+        // `HESTECLIPS_DEMO_DELETE=<clip>` asks to delete it (nothing is deleted
+        // unless the dialog is answered).
+        if let Some(clip) = std::env::var_os("HESTECLIPS_DEMO_DELETE").map(PathBuf::from) {
+            app.confirm_delete = Some(vec![clip]);
+        }
         // `HESTECLIPS_DEMO_SHARE=<clip>` opens the HesteFiles upload dialog for a clip.
         if let Some(clip) = std::env::var_os("HESTECLIPS_DEMO_SHARE").map(PathBuf::from) {
             app.open_share_dialog(clip);
@@ -1275,8 +1280,9 @@ impl App {
                 self.share(frame, clip, choice);
             }
             viewer::ViewerOutcome::Delete => {
+                // Its button says just "Delete", and the key nothing: ask.
                 let clip = v.clip().to_path_buf();
-                self.delete_clips(&[clip]);
+                self.delete_clips(&[clip], true);
             }
             viewer::ViewerOutcome::Rename => {
                 let clip = v.clip().to_path_buf();

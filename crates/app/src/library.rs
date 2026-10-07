@@ -244,7 +244,9 @@ enum Action {
     Select { path: PathBuf, range: bool },
     SelectAll,
     Deselect,
-    TrashSelected,
+    /// Delete the selected clips; `true`: ask first (a key was pressed, which
+    /// doesn't say what it does).
+    TrashSelected(bool),
     CancelUpload(PathBuf),
 }
 
@@ -399,7 +401,7 @@ impl App {
             },
             Some(Action::Edit(p)) => self.open_editor(p),
             Some(Action::Rename(p)) => self.rename_clip(p),
-            Some(Action::Trash(p)) => self.delete_clips(&[p]),
+            Some(Action::Trash(p)) => self.delete_clips(&[p], false),
             Some(Action::MoveTo(paths, folder)) => self.move_clips(ui.ctx(), &paths, folder),
             Some(Action::MoveSelectedTo(folder)) => {
                 let paths: Vec<PathBuf> = clips.iter().filter(|c| self.selection.paths.contains(&c.path)).map(|c| c.path.clone()).collect();
@@ -440,10 +442,10 @@ impl App {
                     up.cancel();
                 }
             }
-            Some(Action::TrashSelected) => {
+            Some(Action::TrashSelected(ask)) => {
                 // In library order, so the toast and any failure read naturally.
                 let paths: Vec<PathBuf> = self.clips.iter().filter(|c| self.selection.paths.contains(&c.path)).map(|c| c.path.clone()).collect();
-                self.delete_clips(&paths);
+                self.delete_clips(&paths, ask);
             }
             None => {}
         }
@@ -463,7 +465,7 @@ impl App {
             } else if i.consume_key(cmd, egui::Key::Backspace)
                 || i.consume_key(egui::Modifiers::NONE, egui::Key::Backspace)
                 || i.consume_key(egui::Modifiers::NONE, egui::Key::Delete) {
-                Some(Action::TrashSelected)
+                Some(Action::TrashSelected(true))
             } else if i.consume_key(egui::Modifiers::NONE, egui::Key::Escape) {
                 Some(Action::Deselect)
             } else {
@@ -494,7 +496,7 @@ impl App {
                         let trash = crate::ui_kit::danger_button(self.delete_label(None));
                         let key = if cfg!(target_os = "macos") { "⌫".to_owned() } else { "Delete".to_owned() };
                         if ui.add(trash).on_hover_text(key).clicked() {
-                            action = Some(Action::TrashSelected);
+                            action = Some(Action::TrashSelected(false));
                         }
                         if !folders.is_empty() {
                             ui.menu_button("Move to", |ui| {
@@ -525,34 +527,50 @@ impl App {
 
     /// Move clips (and their edits) to the Bin. Clips with a save in progress are
     /// left alone: their file is about to be replaced.
-    /// Delete clips the way the setting says: to the Recycle Bin at once, or
-    /// for good once "Delete permanently?" is answered.
-    pub(crate) fn delete_clips(&mut self, paths: &[PathBuf]) {
+    /// Delete clips the way the setting says: to the Recycle Bin, or for good.
+    /// Asks first when deleting for good, or when `ask` (a key or a plain
+    /// "Delete" button, which don't say where the clip goes); a menu item
+    /// that says "Move to Recycle Bin" just does it.
+    pub(crate) fn delete_clips(&mut self, paths: &[PathBuf], ask: bool) {
         if paths.is_empty() {
             return;
         }
-        if self.settings.delete_permanently {
+        if self.settings.delete_permanently || ask {
             self.confirm_delete = Some(paths.to_vec());
         } else {
             self.delete_now(paths);
         }
     }
 
-    /// "Delete permanently?", while clips wait for it.
+    /// "Move … to the Recycle Bin?" or "Delete … for good?", while clips wait
+    /// for it. Enter confirms.
     pub(crate) fn delete_dialog(&mut self, ctx: &egui::Context) {
         let Some(paths) = self.confirm_delete.clone() else { return };
+        let permanently = self.settings.delete_permanently;
+        let bin = store::bin_name();
+        // A short heading; the clip's name under it, on one line.
+        let (what, name) = match paths.as_slice() {
+            [one] => ("it", Some(crate::clips::title_for_stem(&one.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()))),
+            _ => ("them", None),
+        };
+        let count = if paths.len() == 1 { String::new() } else { format!(" {} clips", paths.len()) };
         let (mut yes, mut no) = (false, false);
         let modal = egui::Modal::new(egui::Id::new("confirm_delete")).show(ctx, |ui| {
             ui.set_width(380.0);
-            ui.heading(match paths.as_slice() {
-                [one] => format!("Delete {}?", crate::clips::title_for_stem(&one.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default())),
-                _ => format!("Delete {} clips?", paths.len()),
-            });
+            ui.heading(if permanently { format!("Delete{count} for good?") } else { format!("Move{count} to the {bin}?") });
             ui.add_space(6.0);
-            ui.label("It's deleted for good: it can't be brought back.");
+            if let Some(name) = &name {
+                ui.add(egui::Label::new(egui::RichText::new(name).strong()).truncate());
+            }
+            if permanently {
+                ui.label(format!("You can't get {what} back."));
+            } else {
+                ui.label(format!("You can get {what} back from the {bin}."));
+            }
             ui.add_space(12.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                yes = ui.add(crate::ui_kit::danger_button("Delete")).clicked();
+                let label = if permanently { "Delete".to_owned() } else { format!("Move to {bin}") };
+                yes = ui.add(crate::ui_kit::danger_button(label)).clicked();
                 no = ui.add(crate::ui_kit::button("Cancel", false)).clicked();
             });
             // Enter deletes, as the default action of a confirmation.
@@ -1376,7 +1394,7 @@ impl App {
                     });
                 }
                 if ui.button(egui::RichText::new(self.delete_label(Some(n))).color(v.error_fg_color)).clicked() {
-                    action = Some(Action::TrashSelected);
+                    action = Some(Action::TrashSelected(false));
                 }
                 if ui.button("Deselect all").clicked() {
                     action = Some(Action::Deselect);
