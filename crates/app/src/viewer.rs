@@ -65,6 +65,8 @@ pub struct Nav {
     pub collections: Vec<(String, String, bool)>,
     /// What deleting does, for its button: "Move to Recycle Bin" or "Delete…".
     pub delete_label: String,
+    /// The clip's edit being saved, 0..=1.
+    pub saving: Option<f32>,
 }
 
 struct Loaded {
@@ -74,6 +76,9 @@ struct Loaded {
 }
 
 enum State {
+    /// The clip's edit is being saved: it opens once it's done (its file
+    /// is about to be replaced, which an open file would block).
+    Saving,
     Loading(Receiver<Result<Loaded, String>>),
     Failed(String),
     Ready(Box<Ready>),
@@ -150,6 +155,16 @@ impl Viewer {
         &self.clip
     }
 
+    /// The clip, while its edit is being saved: the app opens it with
+    /// [`Viewer::open`] when that's done.
+    pub fn saving(clip: &Path) -> Self {
+        Self { clip: clip.to_path_buf(), state: State::Saving }
+    }
+
+    pub fn is_saving(&self) -> bool {
+        matches!(self.state, State::Saving)
+    }
+
     /// The clip was renamed from `from` to `to`: opened again under its new
     /// name (frames are read by path), at the same moment.
     pub fn renamed(&mut self, ctx: &egui::Context, from: &Path, to: &Path) {
@@ -184,6 +199,18 @@ impl Viewer {
         let ctx = ui.ctx().clone();
         let mut out = if is_fullscreen(&ctx) { ViewerOutcome::Stay } else { self.header(ui, nav) };
         match &mut self.state {
+            State::Saving => {
+                let rect = ui.available_rect_before_wrap();
+                let f = nav.saving.unwrap_or(0.0);
+                ui.scope_builder(egui::UiBuilder::new().max_rect(Rect::from_center_size(rect.center(), Vec2::new(280.0, 60.0))), |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.label(RichText::new(format!("Saving your edit…  {:.0}%", f * 100.0)).size(15.0));
+                        ui.add_space(8.0);
+                        ui.add(egui::ProgressBar::new(f).desired_height(4.0).fill(crate::ui_kit::ACCENT));
+                    });
+                });
+                ctx.request_repaint_after(Duration::from_millis(100));
+            }
             State::Loading(_) => {
                 let rect = ui.available_rect_before_wrap();
                 ui.put(Rect::from_center_size(rect.center(), Vec2::splat(24.0)), egui::Spinner::new().size(24.0));
@@ -211,7 +238,7 @@ impl Viewer {
             if f2 {
                 out = ViewerOutcome::Rename;
             }
-            if delete {
+            if delete && !matches!(self.state, State::Saving) {
                 out = ViewerOutcome::Delete;
             }
             if esc {
@@ -269,7 +296,10 @@ impl Viewer {
             }
             ui.add_space(10.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let share = ui.add(header::button("Share", true)).on_hover_text(if crate::share::CAN_DRAG_OUT {
+                // While its edit saves, the clip's file is about to change.
+                let ready = !matches!(self.state, State::Saving);
+                let wait = "Wait for the edit to finish saving";
+                let share = ui.add_enabled(ready, header::button("Share", true)).on_disabled_hover_text(wait).on_hover_text(if crate::share::CAN_DRAG_OUT {
                     "Copy it, send it or upload it — or drag the picture into any app"
                 } else {
                     "Copy it, send it or upload it"
@@ -279,11 +309,11 @@ impl Viewer {
                         out = ViewerOutcome::Share(c);
                     }
                 });
-                if ui.add(header::button("Edit", false)).on_hover_text("Trim it, adjust its audio, or save it smaller").clicked() {
+                if ui.add_enabled(ready, header::button("Edit", false)).on_disabled_hover_text(wait).on_hover_text("Trim it, adjust its audio, or save it smaller").clicked() {
                     out = ViewerOutcome::Edit;
                 }
                 let delete = header::button("Delete", false);
-                if ui.add(delete).on_hover_text(format!("{}  (Delete)", nav.delete_label)).clicked() {
+                if ui.add_enabled(ready, delete).on_disabled_hover_text(wait).on_hover_text(format!("{}  (Delete)", nav.delete_label)).clicked() {
                     out = ViewerOutcome::Delete;
                 }
                 let collect = ui.add(header::button("+ Collection", false)).on_hover_text("Add it to a collection of your own, like \"Ace clutches\"");

@@ -38,20 +38,6 @@ impl Clip {
         NaiveDateTime::parse_from_str(ts.get(..19)?, "%Y-%m-%d_%H-%M-%S").ok()
     }
 
-    /// A file that isn't in the library listing (e.g. an edited clip's original),
-    /// for thumbnails and durations.
-    pub fn at(path: &Path) -> Option<Clip> {
-        let meta = std::fs::metadata(path).ok()?;
-        Some(Clip {
-            path: path.to_path_buf(),
-            name: path.file_name()?.to_string_lossy().into_owned(),
-            modified: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
-            size_bytes: meta.len(),
-            id: None,
-            original: None,
-            folder: None,
-        })
-    }
 
     pub fn day(&self) -> NaiveDate {
         self.captured_at().date()

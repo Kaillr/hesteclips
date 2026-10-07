@@ -358,6 +358,9 @@ struct App {
     pub(crate) card_drag: Option<library::CardDrag>,
     /// Clips waiting for "Delete permanently?" to be answered.
     pub(crate) confirm_delete: Option<Vec<PathBuf>>,
+    /// The editor was opened from the player on this clip: closing it goes
+    /// back there, not to the library (so cleaning up clips flows on).
+    edit_return: Option<PathBuf>,
     /// What was shown last frame, to scroll a new view back to the top.
     last_view: Option<(Page, library::Filter)>,
     /// Library auto-refresh: last folder poll + when the library's folders
@@ -495,6 +498,7 @@ impl App {
             card_drag: None,
             confirm_delete: None,
             last_view: None,
+            edit_return: None,
             nav: nav::History::default(),
             web_images: Default::default(),
             updater,
@@ -541,6 +545,11 @@ impl App {
                 let first = app.clips.first().map(|c| c.path.clone()).into_iter().collect();
                 app.new_collection_with(first);
             }
+        }
+        // `HESTECLIPS_DEMO_SAVING=<clip>` shows the player waiting for its edit.
+        if let Some(clip) = std::env::var_os("HESTECLIPS_DEMO_SAVING").map(PathBuf::from) {
+            app.viewer = Some(viewer::Viewer::saving(&clip));
+            app.page = Page::View;
         }
         // `HESTECLIPS_DEMO_DELETE=<clip>` asks to delete it (nothing is deleted
         // unless the dialog is answered).
@@ -1205,6 +1214,7 @@ impl App {
 
     fn viewer_page(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
         let delete_label = self.delete_label(None);
+        let saving = self.viewer.as_ref().and_then(|v| self.renders.iter().find(|j| !j.as_new && j.source == v.clip())).map(|j| j.progress());
         let Some(v) = &mut self.viewer else {
             self.page = Page::Clips;
             return;
@@ -1224,6 +1234,7 @@ impl App {
             position: at.map(|i| (i + 1, list.len())),
             collections,
             delete_label,
+            saving,
         };
         let outcome = v.ui(ui, &nav);
         if let Some((volume, muted)) = viewer::volume(ui.ctx()) {
@@ -1242,7 +1253,10 @@ impl App {
                 self.reveal_clip = Some(clip.clone());
                 self.viewer = None;
                 self.page = Page::Clips;
-                self.open_editor(clip);
+                self.open_editor(clip.clone());
+                if self.page == Page::Edit {
+                    self.edit_return = Some(clip);
+                }
             }
             viewer::ViewerOutcome::Open(clip) => self.viewer = Some(viewer::Viewer::open(&self.ctx(), &clip)),
             viewer::ViewerOutcome::InCollection(id, add) => {
@@ -1309,9 +1323,22 @@ impl App {
     }
 
     fn close_editor(&mut self) {
+        let clip = self.editor.as_ref().map(|e| e.clip().to_path_buf());
         self.editor = None; // drops the player: stops audio and decoders
         self.page = Page::Clips;
         self.refresh_clips();
+        // Opened from the player: back to it, on this clip (renamed meanwhile,
+        // it's the new name). While its edit saves, the player waits for it.
+        if self.edit_return.take().is_some()
+            && let Some(clip) = clip
+        {
+            if self.renders.iter().any(|j| !j.as_new && j.source == clip) {
+                self.viewer = Some(viewer::Viewer::saving(&clip));
+                self.page = Page::View;
+            } else {
+                self.open_viewer(clip);
+            }
+        }
     }
 
     /// Render an edit in the background. `new_name`: save as a separate clip with
@@ -1396,6 +1423,9 @@ impl App {
             match result {
                 Ok(path) => {
                     proxy::prebuild(&self.ctx(), &path);
+                    if !job.as_new && self.viewer.as_ref().is_some_and(|v| v.is_saving() && v.clip() == job.source) {
+                        self.open_viewer(job.source.clone());
+                    }
                     // Highlight the card that changed: the new clip, or the edited one.
                     let card = if job.as_new { path } else { job.source };
                     self.last_saved = Some((card, Instant::now()));
@@ -1405,6 +1435,10 @@ impl App {
                 }
                 Err(e) => {
                     self.toast_error(format!("Couldn't save the edit: {e}"));
+                    // The player waiting for it shows the clip as it was.
+                    if self.viewer.as_ref().is_some_and(|v| v.is_saving() && v.clip() == job.source) {
+                        self.open_viewer(job.source.clone());
+                    }
                 }
             }
             self.refresh_clips();

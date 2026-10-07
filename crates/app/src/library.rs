@@ -1208,8 +1208,10 @@ impl App {
             }
             None => {
                 p.rect_filled(thumb_rect, RADIUS, v.extreme_bg_color);
-                let icon = if thumb.is_some() { "🎬" } else { "…" };
-                p.text(thumb_rect.center(), Align2::CENTER_CENTER, icon, FontId::proportional(26.0), v.weak_text_color());
+                // Still being made: an ellipsis; none to be had: just the dark frame.
+                if thumb.is_none() {
+                    p.text(thumb_rect.center(), Align2::CENTER_CENTER, "…", FontId::proportional(26.0), v.weak_text_color());
+                }
             }
         }
 
@@ -1272,25 +1274,10 @@ impl App {
         let title = p.layout_job(single_line(&clip.title(), FontId::proportional(14.0), v.strong_text_color(), text_w));
         p.galley(Pos2::new(text_x, title_y), title, v.text_color());
         let ext = clip.path.extension().map(|e| e.to_string_lossy().to_uppercase()).unwrap_or_default();
-        // "trimmed from 0:52" only when the length actually changed (an audio-only
-        // edit keeps it). Probing the original is cached like any thumbnail.
-        let original = clip.original.as_ref().filter(|_| edited).and_then(|p| clips::Clip::at(p));
-        let trimmed_from = if let Some(original) = &original {
-            let _ = self.thumbs.get(&ctx, original);
-            match (self.thumbs.duration_of(original), self.thumbs.duration_of(clip)) {
-                (Some(orig), Some(now)) if orig - now > 0.5 => Some(thumbs::format_duration(Duration::from_secs_f64(orig))),
-                _ => None,
-            }
-        } else {
-            None
-        };
         // The format only when it isn't the usual MP4: on every card it said nothing.
         let mut detail = clip.human_size();
         if ext != "MP4" {
             detail = format!("{detail}  ·  {ext}");
-        }
-        if let Some(orig) = trimmed_from {
-            detail = format!("{detail}  ·  trimmed from {orig}");
         }
         // Every game's clips together: say whose this is.
         if let (Filter::All | Filter::Collection(_), Some(folder)) = (&self.library_filter, &clip.folder) {

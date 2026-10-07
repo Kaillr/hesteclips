@@ -88,9 +88,6 @@ impl Thumbs {
 
 /// Duration in seconds of a clip whose thumbnail has been made (probed then).
 impl Thumbs {
-    pub fn duration_of(&self, clip: &Clip) -> Option<f64> {
-        self.ready.get(&key(clip))?.duration.map(|d| d.as_secs_f64())
-    }
 }
 
 /// The cached thumbnail JPEG for `clip`, if it's been generated.
