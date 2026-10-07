@@ -42,18 +42,22 @@ struct State {
     /// Games by where their app is installed, so the stores' files are read
     /// once per app.
     by_path: HashMap<PathBuf, Option<String>>,
+    /// When the current capture started.
+    started: Option<std::time::Instant>,
 }
 
 /// Notes what's in focus while capture runs.
 #[derive(Clone)]
 pub struct Tracker {
     state: Arc<Mutex<State>>,
+    /// What happens in the games that report it, for clip names.
+    pub events: crate::game_events::Events,
 }
 
 impl Tracker {
     pub fn new() -> Self {
         let state: Arc<Mutex<State>> = Default::default();
-        let tracker = Self { state };
+        let tracker = Self { state, events: crate::game_events::Events::new() };
         let t = tracker.clone();
         std::thread::Builder::new()
             .name("games".into())
@@ -73,6 +77,7 @@ impl Tracker {
             s.recent.clear();
             s.totals.clear();
             s.capturing = Some(capturing);
+            s.started = Some(std::time::Instant::now());
         }
         if s.apps != apps {
             s.apps = apps.to_vec();
@@ -93,6 +98,23 @@ impl Tracker {
             *counts.entry(g).or_default() += 1;
         }
         longest(counts.into_iter().map(|(g, n)| (g.clone(), n)))
+    }
+
+    /// What happened in the game in a replay clip saved now ("3 kills on
+    /// Mirage"), if the game reports it and anything did.
+    pub fn clip_details(&self) -> Option<String> {
+        let secs = match self.state.lock().unwrap().capturing {
+            Some(Capturing::Buffer(secs)) => secs,
+            _ => return None,
+        };
+        let since = std::time::Instant::now().checked_sub(Duration::from_secs(secs.into()))?;
+        self.events.summary(since)
+    }
+
+    /// What happened in the game during the recording that's being stopped.
+    pub fn recording_details(&self) -> Option<String> {
+        let started = self.state.lock().unwrap().started?;
+        self.events.summary(started)
     }
 
     /// The app in focus now and the game it is, if it's one.

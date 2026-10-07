@@ -139,6 +139,11 @@ impl App {
                     toggle(ui, &mut self.settings.folder_per_game);
                 });
                 divider(ui);
+                let hint = "Clips get names like \"3 kills on Mirage\" or \"Pentakill as Jinx\" in Counter-Strike 2, Dota 2 and League of Legends. For CS2 and Dota 2, a small settings file is put in the game's folder; start Dota 2 with -gamestateintegration in its launch options. Restart the game after turning this on.";
+                row(ui, "Name clips after what happened", Some(hint), |ui| {
+                    toggle(ui, &mut self.settings.game_details);
+                });
+                divider(ui);
                 row(ui, "File format", Some("MP4 plays everywhere."), |ui| {
                     ui.add_enabled_ui(idle, |ui| {
                         ui.horizontal_wrapped(|ui| {

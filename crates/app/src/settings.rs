@@ -402,6 +402,9 @@ pub struct RecordSettings {
     /// Game folders renamed in the library: the folder a game's clips would
     /// go in (its name, as `clips::folder_name` makes it) → the one they go in.
     pub game_folders: std::collections::BTreeMap<String, String>,
+    /// Name clips after what happened in the game ("3 kills on Mirage"), for
+    /// games that report it (CS2, Dota 2, League of Legends).
+    pub game_details: bool,
 
     // --- Sources page ---
     pub audio_sources: Vec<AudioSourceCfg>,
@@ -447,6 +450,7 @@ impl Default for RecordSettings {
             output_dir: default_output_dir(),
             folder_per_game: true,
             game_folders: Default::default(),
+            game_details: true,
             audio_sources: default_sources(),
             limiter: true,
             shortcuts: Shortcuts::default(),

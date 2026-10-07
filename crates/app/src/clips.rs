@@ -288,7 +288,9 @@ pub fn day_label(day: NaiveDate) -> String {
 }
 
 /// Friendly title for a file stem: "clip_2026-10-01_14-51-01" → "14:51:01",
-/// "recording_…" → "Recording 14:51:01"; anything else (a renamed clip) as is.
+/// "recording_…" → "Recording 14:51:01", and with what happened in the game
+/// ("clip_… - 3 kills on Mirage") → "3 kills on Mirage · 14:51:01"; anything
+/// else (a renamed clip) as is.
 pub fn title_for_stem(stem: &str) -> String {
     let (kind, rest) = if let Some(r) = stem.strip_prefix("clip_") {
         ("", r)
@@ -301,6 +303,9 @@ pub fn title_for_stem(stem: &str) -> String {
         Some(ts) => {
             let suffix = rest.get(19..).unwrap_or("").trim();
             let time = ts.format("%H:%M:%S");
+            if let Some(details) = suffix.strip_prefix("- ") {
+                return format!("{details} · {kind}{time}");
+            }
             if suffix.is_empty() { format!("{kind}{time}") } else { format!("{kind}{time} {suffix}") }
         }
         None => stem.to_owned(),
@@ -401,6 +406,8 @@ mod tests {
         assert_eq!(title_for_stem("recording_2026-10-01_14-51-01"), "Recording 14:51:01");
         assert_eq!(title_for_stem("clip_2026-10-01_14-51-01 (edit)"), "14:51:01 (edit)");
         assert_eq!(title_for_stem("Ace clutch"), "Ace clutch");
+        assert_eq!(title_for_stem("clip_2026-10-01_14-51-01 - 3 kills on Mirage"), "3 kills on Mirage · 14:51:01");
+        assert_eq!(title_for_stem("recording_2026-10-01_14-51-01 - Ace on Mirage (edit)"), "Ace on Mirage (edit) · Recording 14:51:01");
         assert_eq!(sanitize_name("14:51:01 (edit)"), "14.51.01 (edit)");
     }
 

@@ -17,6 +17,7 @@ mod editor;
 mod export_ui;
 mod filmstrip;
 mod logfile;
+mod game_events;
 mod games;
 mod library;
 #[cfg(target_os = "linux")]
@@ -693,6 +694,7 @@ impl eframe::App for App {
             RecState::Recording => games::Capturing::Record,
         };
         self.games.set(capturing, &self.listed_apps());
+        self.games.events.set_enabled(self.settings.game_details);
         let armed = (self.rec_state == RecState::Buffering && self.recording_shortcut.is_none()).then(|| service::Armed {
             library: self.settings.output_dir.clone(),
             folder_per_game: self.settings.folder_per_game,
@@ -1370,7 +1372,7 @@ impl App {
             RecState::Recording => self.stop(),
             // One keypress should do what the user means: stop buffering, record.
             RecState::Buffering => {
-                self.service.stop(None);
+                self.service.stop(None, None);
                 self.start_recording();
             }
         }
@@ -1408,7 +1410,7 @@ impl App {
         // Its moment is taken at once; the Saved event lands it in the library.
         // Another can be saved while it's still being written.
         let dir = self.clip_folder();
-        self.service.save_clip(dir);
+        self.service.save_clip(dir, self.games.clip_details());
         sound::play_saved(&self.settings.save_sound);
         self.clip_saving();
     }
@@ -1420,12 +1422,13 @@ impl App {
     }
 
     fn stop(&mut self) {
-        let mut dir = None;
+        let (mut dir, mut details) = (None, None);
         if self.rec_state == RecState::Recording {
             self.saving += 1; // finishing the file
             dir = Some(self.clip_folder());
+            details = self.games.recording_details();
         }
-        self.service.stop(dir);
+        self.service.stop(dir, details);
         self.rec_state = RecState::Idle;
         self.rec_started = None;
     }

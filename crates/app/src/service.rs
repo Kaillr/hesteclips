@@ -14,14 +14,15 @@ use capture::{EncodeSettings, Mode};
 
 enum Cmd {
     Start(Mode, EncodeSettings),
-    /// Save the replay buffer as a clip in this folder.
-    SaveClip(PathBuf),
+    /// Save the replay buffer as a clip in this folder, its name ending in what
+    /// happened in the game, if known.
+    SaveClip(PathBuf, Option<String>),
     /// Change what the running capture records, if it can without a restart.
     UpdateVideo(capture::VideoSource),
     /// How far back the running replay buffer reaches.
     ReplaySeconds(u32),
-    /// Stop; a recording goes into this folder.
-    Stop(Option<PathBuf>),
+    /// Stop; a recording goes into this folder, named after what happened.
+    Stop(Option<PathBuf>, Option<String>),
     /// Stop, then signal once the file is finished (app being killed).
     StopAndAck(Sender<()>),
     /// The app is closing: end the thread (dropping the recorder finishes any
@@ -88,7 +89,7 @@ impl QuickSave {
     pub fn save(&self) -> bool {
         let Some(a) = self.armed.lock().ok().and_then(|a| a.clone()) else { return false };
         let dir = crate::games::folder_for(&a.library, a.folder_per_game, &a.game_folders, self.games.clip_game().as_deref());
-        if self.tx.send(Cmd::SaveClip(dir)).is_err() {
+        if self.tx.send(Cmd::SaveClip(dir, self.games.clip_details())).is_err() {
             return false;
         }
         crate::sound::play_saved(&a.sound);
@@ -124,11 +125,11 @@ impl CaptureService {
                     // Save doesn't change capture state — still buffering afterwards.
                     // The clip's moment is taken now; it's written on its own
                     // thread, so this one is free for the next save at once.
-                    Cmd::SaveClip(dir) => match recorder.save_clip(&dir) {
+                    Cmd::SaveClip(dir, details) => match recorder.save_clip(&dir) {
                         Ok(pending) => {
                             let evt_tx = evt_tx.clone();
                             thread::spawn(move || match pending.finish() {
-                                Ok(path) => send(&evt_tx, Evt::Saved(path)),
+                                Ok(path) => send(&evt_tx, Evt::Saved(named(path, details))),
                                 Err(e) => {
                                     eprintln!("saving a clip failed: {e:#}");
                                     send(&evt_tx, Evt::Error(describe(&e)));
@@ -144,9 +145,9 @@ impl CaptureService {
                         recorder.update_video(&video);
                     }
                     Cmd::ReplaySeconds(seconds) => recorder.set_replay_seconds(seconds),
-                    Cmd::Stop(dir) => {
+                    Cmd::Stop(dir, details) => {
                         match recorder.stop(dir.as_deref()) {
-                            Ok(Some(path)) => send(&evt_tx, Evt::Saved(path)),
+                            Ok(Some(path)) => send(&evt_tx, Evt::Saved(named(path, details))),
                             Ok(None) => {}
                             Err(e) => send(&evt_tx, Evt::Error(describe(&e))),
                         }
@@ -173,11 +174,11 @@ impl CaptureService {
         QuickSave { tx, games, armed: Default::default() }
     }
 
-    pub fn save_clip(&self, dir: PathBuf) {
-        self.send(Cmd::SaveClip(dir));
+    pub fn save_clip(&self, dir: PathBuf, details: Option<String>) {
+        self.send(Cmd::SaveClip(dir, details));
     }
-    pub fn stop(&self, dir: Option<PathBuf>) {
-        self.send(Cmd::Stop(dir));
+    pub fn stop(&self, dir: Option<PathBuf>, details: Option<String>) {
+        self.send(Cmd::Stop(dir, details));
     }
     pub fn update_video(&self, video: capture::VideoSource) {
         self.send(Cmd::UpdateVideo(video));
@@ -220,6 +221,30 @@ impl Drop for CaptureService {
 
 fn send(tx: &Sender<Evt>, evt: Evt) {
     let _ = tx.send(evt);
+}
+
+/// A just-saved clip, renamed to end in what happened in the game:
+/// `clip_<time> - 3 kills on Mirage.mp4` (shown as "3 kills on Mirage ·
+/// 18:40:02"). Keeps its name if that can't be done.
+fn named(path: PathBuf, details: Option<String>) -> PathBuf {
+    let Some(details) = details.map(|d| crate::clips::sanitize_name(&d)).filter(|d| !d.is_empty()) else { return path };
+    let (Some(stem), Some(ext)) = (path.file_stem(), path.extension()) else { return path };
+    let to = path.with_file_name(format!("{} - {details}.{}", stem.to_string_lossy(), ext.to_string_lossy()));
+    if to.exists() {
+        return path;
+    }
+    // An antivirus scan can hold a new file open for a moment.
+    for _ in 0..20 {
+        match std::fs::rename(&path, &to) {
+            Ok(()) => return to,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => thread::sleep(Duration::from_millis(100)),
+            Err(e) => {
+                eprintln!("couldn't name {} after the game: {e}", path.display());
+                return path;
+            }
+        }
+    }
+    path
 }
 
 /// A capture error as the user should read it. Running out of disk space
