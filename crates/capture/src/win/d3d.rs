@@ -761,7 +761,7 @@ mod overlay_tests {
 
     #[test]
     fn webcam_box_in_frame() {
-        let p = Placement { x: 0.75, y: 0.5, w: 0.25, h: 0.25, crop: [0.0; 4], flip_h: false, flip_v: false };
+        let p = Placement { x: 0.75, y: 0.5, w: 0.25, h: 0.25, crop: [0.0; 4], flip_h: false, flip_v: false, turns: 0 };
         let (s, d) = overlay_rects(p, (1280, 720), 1920, 1080).unwrap();
         assert_eq!((s.left, s.top, s.right, s.bottom), (0, 0, 1280, 720));
         assert_eq!((d.left, d.top, d.right, d.bottom), (1440, 540, 1920, 810));
@@ -770,7 +770,7 @@ mod overlay_tests {
     #[test]
     fn crop_and_clip_take_the_same_share() {
         // Half off the right edge, with the left quarter of the camera cropped.
-        let p = Placement { x: 0.875, y: 0.0, w: 0.25, h: 0.25, crop: [0.25, 0.0, 0.0, 0.0], flip_h: false, flip_v: false };
+        let p = Placement { x: 0.875, y: 0.0, w: 0.25, h: 0.25, crop: [0.25, 0.0, 0.0, 0.0], flip_h: false, flip_v: false, turns: 0 };
         let (s, d) = overlay_rects(p, (1280, 720), 1920, 1080).unwrap();
         assert_eq!((d.left, d.right), (1680, 1920));
         // Visible camera is 320..1280; half of it shows.

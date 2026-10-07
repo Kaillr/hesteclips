@@ -1,12 +1,14 @@
 //! The webcam on the Sources page: picking a camera and its format, its own
 //! settings window, and placing it on the live preview the way OBS does — drag
 //! to move, any handle to resize (always keeping its shape: it's never
-//! stretched), past the opposite side to flip it, Alt with a handle to crop.
-//! No rotation. Moves snap to the frame's edges and centre (Ctrl to place
+//! stretched), past the opposite side to flip it, Alt with a handle to crop,
+//! right-click to flip or turn it a quarter. Moves snap to the frame's edges and centre (Ctrl to place
 //! freely).
 //!
 //! Placement is fractions of the frame (see `capture::webcam::Placement`); it's
-//! shared with the capture, so what you drag is what's recorded, live.
+//! shared with the capture, so what you drag is what's recorded, live. So is
+//! everything else here: a running capture follows whichever camera is open,
+//! so the camera, its format, and adding or removing it all apply at once.
 
 use capture::webcam::{Placement, Status};
 use egui::{Color32, CursorIcon, Pos2, Rect, RichText, Stroke, vec2};
@@ -37,6 +39,8 @@ pub(crate) struct WebcamView {
     /// camera is still the old one (it takes a moment to reopen), and fitting
     /// to it would shape the box for the format just left.
     fit_from: Option<(u32, u32)>,
+    /// The right-click menu is open (it was opened on the box).
+    menu: bool,
 }
 
 impl WebcamView {
@@ -240,7 +244,6 @@ impl App {
     /// its own settings, reset where it sits, remove it.
     pub(crate) fn webcam_card(&mut self, ui: &mut egui::Ui) {
         let frame = capture::preview::latest();
-        let idle = self.rec_state == crate::RecState::Idle;
         let status = capture::webcam::status();
         let frame_aspect = frame.as_deref().map_or(16.0 / 9.0, |f| f.width as f32 / f.height.max(1) as f32);
 
@@ -262,8 +265,9 @@ impl App {
                 ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
             }
             if let (true, Status::Live { width, height }, Some(w)) = (reopened, &status, self.settings.webcam.as_mut()) {
-                let camera_aspect = *width as f32 / (*height).max(1) as f32;
                 let p = &mut w.placement;
+                let (cw, ch) = if p.turns % 2 == 1 { (*height, *width) } else { (*width, *height) };
+                let camera_aspect = cw as f32 / ch.max(1) as f32;
                 let visible = (1.0 - p.crop[0] - p.crop[2]).max(0.05) / (1.0 - p.crop[1] - p.crop[3]).max(0.05);
                 p.h = p.w * frame_aspect / (camera_aspect * visible);
                 p.frame_aspect = Some(frame_aspect);
@@ -287,16 +291,9 @@ impl App {
                     };
                     crate::sources_ui::status_tag(ui, text, color);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.add_enabled_ui(idle, |ui| {
-                            if ui
-                                .button("Remove")
-                                .on_hover_text("Take the webcam out of your clips")
-                                .on_disabled_hover_text("Stop capturing to remove the webcam.")
-                                .clicked()
-                            {
-                                self.settings.webcam = None;
-                            }
-                        });
+                        if ui.button("Remove").on_hover_text("Take the webcam out of your clips").clicked() {
+                            self.settings.webcam = None;
+                        }
                         ui.add_space(8.0);
                         // Works while capturing too: it only hides it.
                         let mut on = cam.enabled;
@@ -314,7 +311,7 @@ impl App {
             let Some(cam) = cam else {
                 ui.weak("Put your camera in your clips, placed and sized on the preview above.");
                 ui.add_space(8.0);
-                ui.add_enabled_ui(idle, |ui| {
+                {
                     let add = ui.menu_button(RichText::new("➕  Add webcam").size(14.0), |ui| {
                         ui.set_min_width(240.0);
                         if self.webcam_view.cameras.is_empty() {
@@ -337,8 +334,7 @@ impl App {
                     if add.response.clicked() {
                         self.webcam_view.cameras = capture::webcam::list_cameras();
                     }
-                    add.response.on_disabled_hover_text("Stop capturing to add a webcam.");
-                });
+                }
                 return;
             };
 
@@ -356,7 +352,7 @@ impl App {
             }
             egui::Grid::new("webcam_settings").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
                 ui.label("Camera");
-                ui.add_enabled_ui(idle, |ui| {
+                {
                     let combo = egui::ComboBox::from_id_salt("webcam_device").selected_text(&cam.name).width(240.0).truncate().show_ui(ui, |ui| {
                         for c in self.webcam_view.cameras.clone() {
                             if ui.selectable_label(c.id == cam.id, &c.name).clicked() && c.id != cam.id {
@@ -372,8 +368,7 @@ impl App {
                     if combo.response.clicked() {
                         self.webcam_view.cameras = capture::webcam::list_cameras();
                     }
-                    combo.response.on_disabled_hover_text("Stop capturing to switch cameras.");
-                });
+                }
                 ui.end_row();
 
                 ui.label("Format");
@@ -381,7 +376,7 @@ impl App {
                     let formats = capture::webcam::formats(&cam.id);
                     let current = cam.format.map(capture::webcam::Format::from);
                     let label = current.map_or_else(|| "Automatic".to_owned(), |f| f.label());
-                    ui.add_enabled_ui(idle, |ui| {
+                    {
                         egui::ComboBox::from_id_salt("webcam_format")
                             .selected_text(label)
                             .width(240.0)
@@ -403,10 +398,8 @@ impl App {
                                         self.webcam_view.ask_fit();
                                     }
                                 }
-                            })
-                            .response
-                            .on_disabled_hover_text("Stop capturing to change the camera's format.");
-                    });
+                            });
+                    }
                     if capture::webcam::HAS_SETTINGS
                         && ui
                         .button("⚙ Camera settings…")
@@ -421,6 +414,7 @@ impl App {
                 ui.label("Position");
                 ui.horizontal(|ui| {
                     if ui.button("Reset").on_hover_text("Back to the bottom-right corner, uncropped").clicked() {
+                        // Back to upright, too.
                         let camera_aspect = match status {
                             Status::Live { width, height } => width as f32 / height.max(1) as f32,
                             _ => 16.0 / 9.0,
@@ -429,8 +423,9 @@ impl App {
                             w.placement = PlacementCfg::laid_out(Placement::default_for(camera_aspect, frame_aspect), frame_aspect);
                         }
                     }
-                    ui.label(RichText::new("Drag it on the preview to move or resize it").weak()).on_hover_text(
-                        "Drag a corner or edge to resize it, and past the opposite side to flip it. Hold Alt to crop, Ctrl to stop snapping.",
+                    ui.label(RichText::new("Drag it on the preview to move or resize it, right-click to flip or turn it").weak()).on_hover_text(
+                        "Drag a corner or edge to resize it, and past the opposite side to flip it. Hold Alt to crop, Ctrl to stop snapping. \
+                         Right-click it to mirror, flip or turn it a quarter.",
                     );
                 });
                 ui.end_row();
@@ -483,6 +478,42 @@ impl App {
             ui.ctx().set_cursor_icon(h.cursor());
         }
 
+        // Right-click on it: flip or turn it. The menu stays tied to a click
+        // that landed on the box.
+        if response.secondary_clicked() && ui.input(|i| i.pointer.interact_pos()).is_some_and(|at| hit(at).is_some()) {
+            self.webcam_view.menu = true;
+        }
+        if self.webcam_view.menu {
+            let mut keep = false;
+            response.context_menu(|ui| {
+                keep = true;
+                let aspect = frame_rect.width() / frame_rect.height().max(1.0);
+                let mut change = |f: &dyn Fn(Placement) -> Placement| {
+                    if let Some(w) = self.settings.webcam.as_mut() {
+                        w.placement = PlacementCfg::laid_out(f(w.placement.into()), aspect);
+                    }
+                };
+                if ui.button("↻  Turn clockwise").clicked() {
+                    change(&|p| p.turn(1, aspect));
+                    ui.close();
+                }
+                if ui.button("↺  Turn anticlockwise").clicked() {
+                    change(&|p| p.turn(-1, aspect));
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("⇔  Mirror").on_hover_text("Flip left to right").clicked() {
+                    change(&|p| Placement { flip_h: !p.flip_h, ..p });
+                    ui.close();
+                }
+                if ui.button("⇕  Flip upside down").clicked() {
+                    change(&|p| Placement { flip_v: !p.flip_v, ..p });
+                    ui.close();
+                }
+            });
+            self.webcam_view.menu = keep;
+        }
+
         // The box and its handles, over the picture.
         let p: Placement = self.settings.webcam.as_ref().map_or(p, |c| c.placement.into());
         let bx = Rect::from_min_max(to_screen(p.x, p.y), to_screen(p.x + p.w, p.y + p.h));
@@ -519,7 +550,7 @@ mod tests {
     use super::*;
 
     fn at(x: f32, y: f32, w: f32, h: f32) -> Placement {
-        Placement { x, y, w, h, crop: [0.0; 4], flip_h: false, flip_v: false }
+        Placement { x, y, w, h, crop: [0.0; 4], flip_h: false, flip_v: false, turns: 0 }
     }
 
     const PLAIN: Mods = Mods { crop: false, snap: false };

@@ -23,12 +23,15 @@ pub struct Placement {
     pub w: f32,
     pub h: f32,
     /// How much of the camera's picture is cut off at each side: left, top,
-    /// right, bottom, as fractions of its width or height (the camera's own
-    /// sides, before any flip).
+    /// right, bottom, as fractions of its width or height (the sides of the
+    /// picture as turned, before any flip).
     pub crop: [f32; 4],
-    /// Mirrored left to right, and upside down.
+    /// Mirrored left to right, and upside down (after turning).
     pub flip_h: bool,
     pub flip_v: bool,
+    /// Quarter turns clockwise, 0 to 3: the camera's picture is turned first,
+    /// then cropped and flipped.
+    pub turns: u8,
 }
 
 impl Placement {
@@ -39,18 +42,53 @@ impl Placement {
         let h = w * frame_aspect / camera_aspect;
         let margin_x = 0.02;
         let margin_y = margin_x * frame_aspect;
-        Self { x: 1.0 - w - margin_x, y: 1.0 - h - margin_y, w, h, crop: [0.0; 4], flip_h: false, flip_v: false }
+        Self { x: 1.0 - w - margin_x, y: 1.0 - h - margin_y, w, h, crop: [0.0; 4], flip_h: false, flip_v: false, turns: 0 }
     }
 
     /// The webcam switched off: a box of no size, which is never drawn, so a
     /// running capture drops it at once. The camera itself is closed too
     /// ([`keep_open`]) and taken up again when it's switched back on.
     pub fn hidden() -> Self {
-        Self { x: 0.0, y: 0.0, w: 0.0, h: 0.0, crop: [0.0; 4], flip_h: false, flip_v: false }
+        Self { x: 0.0, y: 0.0, w: 0.0, h: 0.0, crop: [0.0; 4], flip_h: false, flip_v: false, turns: 0 }
     }
 
     pub fn is_hidden(&self) -> bool {
         self.w <= 0.0 || self.h <= 0.0
+    }
+
+    /// The size of a camera picture of `size` once turned.
+    pub fn turned(&self, (w, h): (u32, u32)) -> (u32, u32) {
+        if self.turns % 2 == 1 { (h, w) } else { (w, h) }
+    }
+
+    /// Turned a quarter more, clockwise (`by` 1) or anticlockwise (`by` -1),
+    /// in a frame of shape `frame_aspect`: the picture as you see it turns,
+    /// mirrored or not, around the box's centre, and the box takes its new
+    /// shape. The crop stays on the same part of the picture.
+    pub fn turn(&self, by: i8, frame_aspect: f32) -> Self {
+        let mut p = *self;
+        // A mirrored picture turns the other way under its mirror.
+        let by = if self.flip_h != self.flip_v { -by } else { by };
+        p.turns = (self.turns as i8 + by).rem_euclid(4) as u8;
+        let [l, t, r, b] = self.crop;
+        p.crop = if by > 0 { [b, l, t, r] } else { [t, r, b, l] };
+        let (cx, cy) = (self.x + self.w / 2.0, self.y + self.h / 2.0);
+        p.w = self.h / frame_aspect;
+        p.h = self.w * frame_aspect;
+        p.x = cx - p.w / 2.0;
+        p.y = cy - p.h / 2.0;
+        p
+    }
+
+    /// Where a point of the turned picture (`u`, `v`, in its pixels, edges at
+    /// whole numbers) is in the camera's own picture of `size`.
+    pub fn unturn(&self, (u, v): (f32, f32), (w, h): (f32, f32)) -> (f32, f32) {
+        match self.turns % 4 {
+            1 => (v, h - u),
+            2 => (w - u, h - v),
+            3 => (w - v, u),
+            _ => (u, v),
+        }
     }
 
     /// The crop actually drawn, for a camera of `camera` pixels in a frame
@@ -85,7 +123,7 @@ mod tests {
     use super::Placement;
 
     fn p(w: f32, h: f32) -> Placement {
-        Placement { x: 0.0, y: 0.0, w, h, crop: [0.0; 4], flip_h: false, flip_v: false }
+        Placement { x: 0.0, y: 0.0, w, h, crop: [0.0; 4], flip_h: false, flip_v: false, turns: 0 }
     }
 
     #[test]
@@ -103,6 +141,38 @@ mod tests {
         let slow = Format { fps_num: 15, ..f(1920, 1080) };
         let best = [slow, f(1280, 720)].into_iter().max_by_key(|f| f.auto_rank()).unwrap();
         assert_eq!((best.width, best.height), (1280, 720));
+    }
+
+    #[test]
+    fn turning_swaps_the_box_and_comes_back() {
+        let mut q = p(0.25, 0.25);
+        q.x = 0.5;
+        q.y = 0.5;
+        q.crop = [0.1, 0.0, 0.0, 0.0];
+        let t = q.turn(1, 16.0 / 9.0);
+        assert_eq!(t.turns, 1);
+        // The left crop is now at the top; the box is as tall as it was wide, in pixels.
+        assert_eq!(t.crop, [0.0, 0.1, 0.0, 0.0]);
+        assert!((t.h * 1080.0 - q.w * 1920.0).abs() < 1e-3);
+        assert!((t.x + t.w / 2.0 - 0.625).abs() < 1e-6);
+        let back = t.turn(-1, 16.0 / 9.0);
+        assert_eq!(back.turns, 0);
+        assert_eq!(back.crop, q.crop);
+        assert!((back.w - q.w).abs() < 1e-6 && (back.h - q.h).abs() < 1e-6);
+        // Mirrored, a clockwise turn as seen is an anticlockwise one under the mirror.
+        let m = Placement { flip_h: true, ..q };
+        assert_eq!(m.turn(1, 1.0).turns, 3);
+    }
+
+    #[test]
+    fn unturn_maps_corners() {
+        let mut q = p(1.0, 1.0);
+        // 4x2 camera; turned clockwise it's 2x4: its top-right corner is the camera's top-left.
+        q.turns = 1;
+        assert_eq!(q.unturn((2.0, 0.0), (4.0, 2.0)), (0.0, 0.0));
+        assert_eq!(q.unturn((0.0, 4.0), (4.0, 2.0)), (4.0, 2.0));
+        q.turns = 3;
+        assert_eq!(q.unturn((0.0, 4.0), (4.0, 2.0)), (0.0, 0.0));
     }
 
     #[test]

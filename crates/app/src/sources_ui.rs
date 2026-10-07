@@ -61,8 +61,6 @@ pub(crate) struct SourcesView {
     renaming: Option<String>,
 }
 
-/// Why the whole-screen / games-and-apps switch is locked.
-const STOP_TO_SWITCH: &str = "Stop capturing to switch. The list of games and apps can change while you capture.";
 
 impl App {
     pub(crate) fn sources_page(&mut self, ui: &mut egui::Ui) {
@@ -178,11 +176,11 @@ impl App {
             crate::RecState::Idle => {}
             crate::RecState::Buffering => {
                 ui.add_space(10.0);
-                ui.weak("Volume changes apply right away. Adding, removing or changing sources restarts the replay buffer, so what it has kept so far is let go.");
+                ui.weak("Volume and webcam changes apply right away. Adding, removing or changing sources, or switching what to record, restarts the replay buffer, so what it has kept so far is let go.");
             }
             crate::RecState::Recording => {
                 ui.add_space(10.0);
-                ui.weak("Volume changes apply right away. Adding, removing or changing sources applies to your next recording.");
+                ui.weak("Volume and webcam changes apply right away. Adding, removing or changing sources, or switching what to record, applies to your next recording.");
             }
         }
         ui.add_space(16.0);
@@ -317,13 +315,14 @@ impl App {
             });
             ui.add_space(6.0);
 
-            // What to record. Switching kinds needs a fresh start, so it waits
-            // while capturing; the app list below changes live.
+            // What to record. Switching kinds (or displays) restarts the replay
+            // buffer; a recording takes it up next time. The app list below
+            // changes live.
             if capture::APP_CAPTURE {
-                ui.add_enabled_ui(idle, |ui| {
+                {
                     let (screen, apps) = segmented(ui, ["🖥  Whole screen", "🎮  Games and apps"], usize::from(apps_mode));
                     {
-                        if screen.on_hover_text("Everything on one display.").on_disabled_hover_text(STOP_TO_SWITCH).clicked() && apps_mode {
+                        if screen.on_hover_text("Everything on one display.").clicked() && apps_mode {
                             let apps = std::mem::replace(&mut self.settings.capture, CaptureTarget::Screen);
                             if matches!(apps, CaptureTarget::Apps { .. }) {
                                 self.settings.idle_apps = Some(apps);
@@ -331,7 +330,6 @@ impl App {
                         }
                         if apps
                             .on_hover_text("Only the games and apps you pick, following whichever you're using.")
-                            .on_disabled_hover_text(STOP_TO_SWITCH)
                             .clicked()
                             && !apps_mode
                         {
@@ -343,10 +341,14 @@ impl App {
                             self.windowed_apps = capture::list_windowed_apps();
                         }
                     }
-                });
+                }
                 ui.add_space(10.0);
             }
 
+            if self.rec_state == crate::RecState::Recording && self.capture_settings_pending() {
+                ui.colored_label(ui.visuals().warn_fg_color, "Changed while recording: applies to your next recording.");
+                ui.add_space(6.0);
+            }
             self.preview_picture(ui, frame.as_deref());
             ui.add_space(8.0);
 
@@ -368,7 +370,7 @@ impl App {
                     });
                 }
                 _ => {
-                    ui.add_enabled_ui(idle, |ui| {
+                    {
                         ui.horizontal(|ui| {
                             ui.label("Display");
                             let names: Vec<String> = self.screens.iter().map(|d| d.name.clone()).collect();
@@ -378,10 +380,8 @@ impl App {
                                     ui.selectable_value(&mut self.settings.display_index, i, name);
                                 }
                             });
-                        })
-                        .response
-                        .on_disabled_hover_text("Stop capturing to switch displays.");
-                    });
+                        });
+                    }
                 }
             }
         });

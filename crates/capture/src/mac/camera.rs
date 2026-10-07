@@ -115,11 +115,25 @@ fn run(feed: Arc<CameraFeed>) {
             }
         };
         set_status(Status::Live { width, height });
-        // The session runs on its own; watch for it stopping.
+        // The session runs on its own; watch for it stopping. Unplugged, a
+        // session can go on "running" with no pictures, and a camera plugged
+        // back in is a new device it never picks up: no pictures for a few
+        // seconds, or the camera gone, and it's opened again.
+        let device = unsafe { AVCaptureDevice::deviceWithUniqueID(&NSString::from_str(&feed.device)) };
+        let (mut seen, mut since) = (feed.seq.load(Ordering::Relaxed), std::time::Instant::now());
         while !feed.stop.load(Ordering::Relaxed) && unsafe { session.isRunning() } {
             thread::sleep(Duration::from_millis(100));
+            let now = feed.seq.load(Ordering::Relaxed);
+            if now != seen {
+                (seen, since) = (now, std::time::Instant::now());
+            }
+            let gone = device.as_ref().is_none_or(|d| unsafe { !d.isConnected() });
+            if gone || since.elapsed() > Duration::from_secs(3) {
+                break;
+            }
         }
         unsafe { session.stopRunning() };
+        *feed.frame.lock().unwrap() = None;
         if !feed.stop.load(Ordering::Relaxed) {
             set_status(Status::Unavailable("the camera stopped".into()));
             wait_or_stop(&feed, Duration::from_secs(3));
@@ -262,27 +276,28 @@ impl CameraOutput {
     }
 }
 
-/// What a running capture draws: the open camera's newest picture, picking
-/// the camera up again if it's reopened (a new format, or after a dropout).
+/// What a running capture draws: the newest picture of whichever camera
+/// the app keeps open. A new camera or format, the webcam switched off and
+/// on, a dropout: it follows along without the capture restarting.
 pub(crate) struct CameraLayer {
     feed: Option<Arc<CameraFeed>>,
-    device: String,
-    format: Option<Format>,
 }
 
 impl CameraLayer {
+    /// Opens webcam `w` if nothing has yet (the app keeps it open itself)
+    /// and it's switched on.
     pub(crate) fn new(w: &crate::webcam::Webcam) -> Self {
         let hidden = w.placement.lock().unwrap().is_hidden();
         if !hidden && CameraFeed::current(&w.device, w.format).is_none() {
             keep_open(Some((w.device.clone(), w.format)));
         }
-        Self { feed: CameraFeed::current(&w.device, w.format), device: w.device.clone(), format: w.format }
+        Self { feed: None }
     }
 
-    /// The newest picture, if the camera is delivering.
+    /// The newest picture, if a camera is delivering.
     pub(crate) fn latest(&mut self) -> Option<Arc<Frame>> {
         if self.feed.as_ref().is_none_or(|f| f.stop.load(Ordering::Relaxed)) {
-            self.feed = CameraFeed::current(&self.device, self.format);
+            self.feed = CURRENT.lock().unwrap().clone().filter(|f| !f.stop.load(Ordering::Relaxed));
         }
         self.feed.as_ref()?.latest()
     }

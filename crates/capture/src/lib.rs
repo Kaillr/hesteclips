@@ -426,6 +426,10 @@ pub trait Recorder {
     fn update_video(&mut self, _video: &VideoSource) -> bool {
         false
     }
+
+    /// Change how far back the running replay buffer reaches (and Save clip
+    /// saves), without restarting it.
+    fn set_replay_seconds(&mut self, _seconds: u32) {}
 }
 
 #[cfg(test)]

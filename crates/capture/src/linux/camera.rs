@@ -175,27 +175,28 @@ fn stream(feed: &CameraFeed) -> Result<()> {
     }
 }
 
-/// What a running capture draws: the open camera's newest picture, picking
-/// the camera up again if it's reopened (a new format, or after a dropout).
+/// What a running capture draws: the newest picture of whichever camera
+/// the app keeps open. A new camera or format, the webcam switched off and
+/// on, a dropout: it follows along without the capture restarting.
 pub(crate) struct CameraLayer {
     feed: Option<Arc<CameraFeed>>,
-    device: String,
-    format: Option<Format>,
 }
 
 impl CameraLayer {
+    /// Opens webcam `w` if nothing has yet (the app keeps it open itself)
+    /// and it's switched on.
     pub(crate) fn new(w: &crate::webcam::Webcam) -> Self {
         let hidden = w.placement.lock().unwrap().is_hidden();
         if !hidden && CameraFeed::current(&w.device, w.format).is_none() {
             keep_open(Some((w.device.clone(), w.format)));
         }
-        Self { feed: CameraFeed::current(&w.device, w.format), device: w.device.clone(), format: w.format }
+        Self { feed: None }
     }
 
-    /// The newest picture, if the camera is delivering.
+    /// The newest picture, if a camera is delivering.
     pub(crate) fn latest(&mut self) -> Option<Arc<CameraPicture>> {
         if self.feed.as_ref().is_none_or(|f| f.stop.load(Ordering::Relaxed)) {
-            self.feed = CameraFeed::current(&self.device, self.format);
+            self.feed = CURRENT.lock().unwrap().clone().filter(|f| !f.stop.load(Ordering::Relaxed));
         }
         self.feed.as_ref()?.latest()
     }

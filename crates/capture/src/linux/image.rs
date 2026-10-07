@@ -43,11 +43,14 @@ impl Canvas {
             return;
         }
         let (fw, fh) = (self.width as f32, self.height as f32);
-        let crop = place.fill_crop((cam.width, cam.height), (self.width, self.height));
+        // The picture as turned: its size, and where it is in the camera's.
+        let (tw, th) = place.turned((cam.width, cam.height));
+        let crop = place.fill_crop((tw, th), (self.width, self.height));
         let (x0, y0) = (place.x * fw, place.y * fh);
         let (bw, bh) = (place.w * fw, place.h * fh);
         // The part of the camera picture shown, in its pixels.
-        let (cw, ch) = (cam.width as f32, cam.height as f32);
+        let (cw, ch) = (tw as f32, th as f32);
+        let size = (cam.width as f32, cam.height as f32);
         let (u0, u1) = (crop[0] * cw, (1.0 - crop[2]) * cw);
         let (v0, v1) = (crop[1] * ch, (1.0 - crop[3]) * ch);
         let left = x0.max(0.0).floor() as usize;
@@ -70,7 +73,7 @@ impl Canvas {
                 if place.flip_v {
                     fy = 1.0 - fy;
                 }
-                let sy = v0 + fy * (v1 - v0) - 0.5;
+                let v = v0 + fy * (v1 - v0);
                 for x in left..right {
                     let mut fx = (x as f32 + 0.5 - x0) / bw;
                     if !(0.0..1.0).contains(&fx) {
@@ -79,8 +82,8 @@ impl Canvas {
                     if place.flip_h {
                         fx = 1.0 - fx;
                     }
-                    let sx = u0 + fx * (u1 - u0) - 0.5;
-                    let px = cam.sample(sx, sy);
+                    let (sx, sy) = place.unturn((u0 + fx * (u1 - u0), v), size);
+                    let px = cam.sample(sx - 0.5, sy - 0.5);
                     row[x * 4..x * 4 + 4].copy_from_slice(&px);
                 }
             }
@@ -379,7 +382,7 @@ mod tests {
         let mut c = Canvas::new(100, 50);
         c.clear();
         let cam = CameraPicture { width: 16, height: 9, bgra: [200, 100, 50, 255].repeat(16 * 9) };
-        let place = Placement { x: 0.5, y: 0.5, w: 0.5, h: 0.5, crop: [0.0; 4], flip_h: true, flip_v: false };
+        let place = Placement { x: 0.5, y: 0.5, w: 0.5, h: 0.5, crop: [0.0; 4], flip_h: true, flip_v: false, turns: 0 };
         c.draw_camera(&cam, &place);
         let at = |x: usize, y: usize| &c.bgra[(y * 100 + x) * 4..(y * 100 + x) * 4 + 4];
         assert_eq!(at(75, 37), [200, 100, 50, 255]);

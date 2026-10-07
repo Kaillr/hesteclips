@@ -52,8 +52,13 @@ unsafe impl Sync for Gpu {}
 struct Overlay {
     /// The box in the frame: x0, y0, x1, y1 (the part inside the frame).
     dest: [f32; 4],
-    /// The matching part of the camera's picture: x0, y0, x1, y1 (x1 < x0 when mirrored).
+    /// The matching part of the camera's picture as turned: x0, y0, x1, y1
+    /// (x1 < x0 when mirrored).
     src: [f32; 4],
+    /// The camera's own picture size, and quarter turns clockwise.
+    cam: [f32; 2],
+    turns: u32,
+    _pad: u32,
 }
 
 impl Gpu {
@@ -106,7 +111,7 @@ impl Gpu {
                 None => src.clone(),
             };
             // In this plane's pixels: chroma is half size both ways.
-            let o = overlay.map(|o| Overlay { dest: o.dest.map(|v| v * scale), src: o.src.map(|v| v * scale) }).unwrap_or_default();
+            let o = overlay.map(|o| Overlay { dest: o.dest.map(|v| v * scale), src: o.src.map(|v| v * scale), cam: o.cam.map(|v| v * scale), ..o }).unwrap_or_default();
             enc.setComputePipelineState(pipeline);
             unsafe {
                 enc.setTexture_atIndex(Some(&src), 0);
@@ -188,10 +193,12 @@ fn overlay_rects(p: Placement, (cw, ch): (u32, u32), width: u32, height: u32) ->
         Some((v0, v1, a, b))
     };
     // Never stretched: the camera's picture fills the box with its own shape.
+    let cam = [cw as f32, ch as f32];
+    let (cw, ch) = p.turned((cw, ch));
     let [cl, ct, cr, cb] = p.fill_crop((cw, ch), (width, height));
     let (dx0, dx1, sx0, sx1) = axis(p.x * fw, (p.x + p.w) * fw, fw, cl * cw as f32, (1.0 - cr) * cw as f32, p.flip_h)?;
     let (dy0, dy1, sy0, sy1) = axis(p.y * fh, (p.y + p.h) * fh, fh, ct * ch as f32, (1.0 - cb) * ch as f32, p.flip_v)?;
-    Some(Overlay { dest: [dx0, dy0, dx1, dy1], src: [sx0, sy0, sx1, sy1] })
+    Some(Overlay { dest: [dx0, dy0, dx1, dy1], src: [sx0, sy0, sx1, sy1], cam, turns: (p.turns % 4) as u32, _pad: 0 })
 }
 
 /// One kernel per plane: copy the screen's sample, or inside the webcam's
@@ -205,7 +212,20 @@ using namespace metal;
 struct Overlay {
     float4 dest;
     float4 src;
+    float2 cam;
+    uint turns;
+    uint pad;
 };
+
+// A point of the turned picture, in the camera's own.
+float2 unturn(float2 p, constant Overlay& o) {
+    switch (o.turns) {
+        case 1: return float2(p.y, o.cam.y - p.x);
+        case 2: return o.cam - p;
+        case 3: return float2(o.cam.x - p.y, p.x);
+        default: return p;
+    }
+}
 
 template <typename T>
 T resample(texture2d<float, access::read> cam, float2 p0, float2 p1, T zero) {
@@ -244,7 +264,7 @@ kernel void luma(texture2d<float, access::read> screen [[texture(0)]],
     if (p.x >= o.dest.x && p.x < o.dest.z && p.y >= o.dest.y && p.y < o.dest.w) {
         float2 scale = (o.src.zw - o.src.xy) / (o.dest.zw - o.dest.xy);
         float2 p0 = o.src.xy + (p - o.dest.xy) * scale;
-        float y = resample<float2>(cam, p0, p0 + scale, float2(0)).x;
+        float y = resample<float2>(cam, unturn(p0, o), unturn(p0 + scale, o), float2(0)).x;
         out.write(float4(y, 0, 0, 1), gid);
     } else {
         out.write(screen.read(gid), gid);
@@ -261,7 +281,7 @@ kernel void chroma(texture2d<float, access::read> screen [[texture(0)]],
     if (p.x >= o.dest.x && p.x < o.dest.z && p.y >= o.dest.y && p.y < o.dest.w) {
         float2 scale = (o.src.zw - o.src.xy) / (o.dest.zw - o.dest.xy);
         float2 p0 = o.src.xy + (p - o.dest.xy) * scale;
-        float2 cbcr = resample<float2>(cam, p0, p0 + scale, float2(0));
+        float2 cbcr = resample<float2>(cam, unturn(p0, o), unturn(p0 + scale, o), float2(0));
         out.write(float4(cbcr, 0, 1), gid);
     } else {
         out.write(screen.read(gid), gid);
@@ -275,7 +295,7 @@ mod tests {
 
     #[test]
     fn webcam_box_in_frame() {
-        let p = Placement { x: 0.75, y: 0.5, w: 0.25, h: 0.25, crop: [0.0; 4], flip_h: false, flip_v: false };
+        let p = Placement { x: 0.75, y: 0.5, w: 0.25, h: 0.25, crop: [0.0; 4], flip_h: false, flip_v: false, turns: 0 };
         let o = overlay_rects(p, (1280, 720), 1920, 1080).unwrap();
         assert_eq!(o.dest, [1440.0, 540.0, 1920.0, 810.0]);
         assert_eq!(o.src, [0.0, 0.0, 1280.0, 720.0]);
@@ -285,11 +305,52 @@ mod tests {
     fn mirrored_and_clipped() {
         // Half off the right edge, mirrored: the half that shows is the
         // camera's right half, drawn right to left.
-        let p = Placement { x: 0.875, y: 0.0, w: 0.25, h: 0.25, crop: [0.0; 4], flip_h: true, flip_v: false };
+        let p = Placement { x: 0.875, y: 0.0, w: 0.25, h: 0.25, crop: [0.0; 4], flip_h: true, flip_v: false, turns: 0 };
         let o = overlay_rects(p, (1280, 720), 1920, 1080).unwrap();
         assert_eq!(o.dest[0], 1680.0);
         assert_eq!(o.dest[2], 1920.0);
         assert_eq!((o.src[0], o.src[2]), (1280.0, 640.0));
+    }
+
+    #[test]
+    fn turned_picture_takes_the_turned_shape() {
+        // A 1280x720 camera turned a quarter is a 720x1280 picture: here in a
+        // 720x1280-pixel box of a 1920x1080 frame, all of it showing.
+        let p = Placement { x: 0.0, y: 0.0, w: 720.0 / 1920.0, h: 1280.0 / 1080.0, crop: [0.0; 4], flip_h: false, flip_v: false, turns: 1 };
+        let o = overlay_rects(p, (1280, 720), 1920, 1080).unwrap();
+        assert_eq!((o.cam, o.turns), ([1280.0, 720.0], 1));
+        // Clipped by the frame's bottom: 1080 of the 1280 rows show.
+        assert_eq!((o.src[0], o.src[2]), (0.0, 720.0));
+        assert_eq!((o.src[1], o.src[3]), (0.0, 1080.0));
+    }
+
+    /// Turned clockwise on the real GPU: the camera's left half (dark) ends
+    /// up as the picture's top half.
+    #[test]
+    fn compose_turns() {
+        let gpu = Gpu::new().unwrap();
+        let screen = FramePool::new(640, 360).unwrap().take().unwrap();
+        plane_fill(&screen, 100, 128, 128);
+        let cam = FramePool::new(320, 180).unwrap().take().unwrap();
+        plane_fill(&cam, 200, 128, 128);
+        // Left half of the camera dark.
+        unsafe {
+            use objc2_core_video::*;
+            CVPixelBufferLockBaseAddress(&cam, CVPixelBufferLockFlags(0));
+            let base = CVPixelBufferGetBaseAddressOfPlane(&cam, 0) as *mut u8;
+            let stride = CVPixelBufferGetBytesPerRowOfPlane(&cam, 0);
+            for y in 0..180 {
+                std::ptr::write_bytes(base.add(y * stride), 20, 160);
+            }
+            CVPixelBufferUnlockBaseAddress(&cam, CVPixelBufferLockFlags(0));
+        }
+        let out = FramePool::new(640, 360).unwrap().take().unwrap();
+        // A 180x320 box (the turned camera's shape) at the frame's top-left.
+        let p = Placement { x: 0.0, y: 0.0, w: 180.0 / 640.0, h: 320.0 / 360.0, crop: [0.0; 4], flip_h: false, flip_v: false, turns: 1 };
+        gpu.compose(&screen, Some(&cam), p, &out).unwrap();
+        let (y, _) = planes(&out);
+        assert_eq!(y[40 * 640 + 90], 20, "top half is the camera's left");
+        assert_eq!(y[280 * 640 + 90], 200, "bottom half is the camera's right");
     }
 
     #[test]
@@ -310,7 +371,7 @@ mod tests {
         let screen = fill(640, 360, 100, 110, 120);
         let cam = fill(320, 180, 200, 50, 60);
         let out = FramePool::new(640, 360).unwrap().take().unwrap();
-        let p = Placement { x: 0.5, y: 0.5, w: 0.25, h: 0.25, crop: [0.0; 4], flip_h: false, flip_v: false };
+        let p = Placement { x: 0.5, y: 0.5, w: 0.25, h: 0.25, crop: [0.0; 4], flip_h: false, flip_v: false, turns: 0 };
         gpu.compose(&screen, Some(&cam), p, &out).unwrap();
         let (y, c) = planes(&out);
         assert_eq!(y[10 * 640 + 10], 100);

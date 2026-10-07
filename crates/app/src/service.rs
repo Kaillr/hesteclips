@@ -18,6 +18,8 @@ enum Cmd {
     SaveClip(PathBuf),
     /// Change what the running capture records, if it can without a restart.
     UpdateVideo(capture::VideoSource),
+    /// How far back the running replay buffer reaches.
+    ReplaySeconds(u32),
     /// Stop; a recording goes into this folder.
     Stop(Option<PathBuf>),
     /// Stop, then signal once the file is finished (app being killed).
@@ -141,6 +143,7 @@ impl CaptureService {
                     Cmd::UpdateVideo(video) => {
                         recorder.update_video(&video);
                     }
+                    Cmd::ReplaySeconds(seconds) => recorder.set_replay_seconds(seconds),
                     Cmd::Stop(dir) => {
                         match recorder.stop(dir.as_deref()) {
                             Ok(Some(path)) => send(&evt_tx, Evt::Saved(path)),
@@ -178,6 +181,9 @@ impl CaptureService {
     }
     pub fn update_video(&self, video: capture::VideoSource) {
         self.send(Cmd::UpdateVideo(video));
+    }
+    pub fn set_replay_seconds(&self, seconds: u32) {
+        self.send(Cmd::ReplaySeconds(seconds));
     }
 
     fn send(&self, cmd: Cmd) {

@@ -145,6 +145,13 @@ impl Recorder for WinRecorder {
         self.session.is_some()
     }
 
+    fn set_replay_seconds(&mut self, seconds: u32) {
+        self.replay_seconds = seconds;
+        if let Some(session) = self.session.as_ref().filter(|_| self.mode == Some(Mode::ReplayBuffer)) {
+            let _ = session.writer_tx.send(writer::Command::SetWindow(seconds as f64));
+        }
+    }
+
     fn update_video(&mut self, video: &VideoSource) -> bool {
         match (AppsConfig::of(video), self.session.as_ref().and_then(|s| s.apps.as_ref())) {
             (Some(config), Some(list)) => {

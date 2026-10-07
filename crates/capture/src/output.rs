@@ -46,6 +46,9 @@ pub(crate) fn destination(file: &Path, dir: Option<&Path>) -> PathBuf {
 /// Give a just-written file its real name. On Windows, an antivirus scan or the
 /// search indexer often opens a new file for a moment, and renaming it then
 /// fails ("access denied"): keep trying for a couple of seconds.
+///
+/// Into a folder on another drive (the clips folder changed during a
+/// recording), a rename can't go: it's copied there and the original deleted.
 pub(crate) fn finish_rename(from: &Path, to: &Path) -> std::io::Result<()> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
     loop {
@@ -53,6 +56,10 @@ pub(crate) fn finish_rename(from: &Path, to: &Path) -> std::io::Result<()> {
             Ok(()) => return Ok(()),
             Err(e) if std::time::Instant::now() < deadline && e.kind() == std::io::ErrorKind::PermissionDenied => {
                 std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
+                std::fs::copy(from, to)?;
+                return std::fs::remove_file(from);
             }
             Err(e) => return Err(e),
         }

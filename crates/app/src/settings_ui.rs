@@ -36,29 +36,33 @@ impl App {
     }
 
     fn settings_column(&mut self, ui: &mut egui::Ui) {
-        // Capture settings are read when the buffer or a recording starts, so
-        // they're locked while one runs rather than silently not applying.
+        // Capture settings apply to a running replay buffer: the length right
+        // away, the rest by restarting it. A recording takes them up next time.
         let idle = self.rec_state == RecState::Idle;
         match self.rec_state {
             RecState::Idle => {}
             RecState::Buffering => {
                 ui.add_space(12.0);
-                note(ui, "Stop the replay buffer to change the replay length, video quality and saving settings.");
+                note(ui, "Changes apply right away. Video quality and file format restart the replay buffer, so what it has kept so far is let go.");
             }
             RecState::Recording => {
                 ui.add_space(12.0);
-                note(ui, "Stop recording to change the replay length, video quality and saving settings.");
+                note(ui, if self.capture_settings_pending() {
+                    "These changes apply to your next recording."
+                } else {
+                    "Video quality and file format changes apply to your next recording."
+                });
             }
         }
 
         section(ui, "Replay buffer", |ui| {
             row(ui, "Length", Some("How far back Save clip reaches."), |ui| {
-                ui.add_enabled_ui(idle, |ui| ui.horizontal_wrapped(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     for secs in REPLAY_CHOICES {
                         let label = if secs < 60 { format!("{secs} s") } else { format!("{} min", secs / 60) };
                         ui.selectable_value(&mut self.settings.replay_seconds, secs, label);
                     }
-                }));
+                });
                 let size = human_bytes(self.estimated_bytes(self.settings.replay_seconds as f64));
                 ui.weak(format!("A full clip is about {size}"))
                     .on_hover_text(self.estimate_explainer());
@@ -72,7 +76,7 @@ impl App {
         section(ui, "Video quality", |ui| {
             ui.weak("What to record is chosen on the Sources page.");
             ui.add_space(4.0);
-            ui.add_enabled_ui(idle, |ui| {
+            {
                 row(ui, "Resolution", Some("Lower sizes make smaller files."), |ui| {
                     egui::ComboBox::from_id_salt("resolution").selected_text(self.settings.resolution.label()).show_ui(ui, |ui| {
                         for r in OutputResolution::ALL {
@@ -105,11 +109,11 @@ impl App {
                         ui.add_space(4.0);
                         self.advanced(ui);
                     });
-            });
+            }
         });
 
         section(ui, "Saving", |ui| {
-            ui.add_enabled_ui(idle, |ui| {
+            {
                 row(ui, "Clips folder", None, |ui| {
                     ui.vertical(|ui| {
                         ui.add(egui::Label::new(RichText::new(self.settings.output_dir.display().to_string()).monospace().size(12.0)).truncate())
@@ -141,7 +145,7 @@ impl App {
                         }
                     });
                 });
-            });
+            }
         });
 
         section(ui, "Sound", |ui| self.sound_settings(ui));

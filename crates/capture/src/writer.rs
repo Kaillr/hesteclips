@@ -43,6 +43,9 @@ pub(crate) enum Command {
     Media(Media),
     /// Replay buffer: write the last `seconds` to `out`, report the result.
     SaveClip { out: PathBuf, seconds: f64, done: Sender<Result<PathBuf>> },
+    /// Replay buffer: keep this many seconds from now on. Longer fills up as
+    /// it goes; shorter lets the oldest go at the next keyframe.
+    SetWindow(f64),
 }
 
 /// Ask the replay writer behind `tx` for a clip of the last `seconds` in `dir`.
@@ -216,6 +219,7 @@ fn replay_loop(rx: Receiver<Command>, window: f64, layout: Layout, fps: u32) -> 
     while let Ok(cmd) = rx.recv() {
         match cmd {
             Command::Media(m) => ring.push(m),
+            Command::SetWindow(window) => ring.keep = window + 2.0,
             Command::SaveClip { out, seconds, done } => {
                 let items = ring.snapshot(seconds, layout.audio_tracks());
                 let layout = layout.clone();

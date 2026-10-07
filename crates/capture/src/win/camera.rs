@@ -168,66 +168,93 @@ fn wait_or_stop(feed: &CameraFeed, d: Duration) {
     }
 }
 
-/// A capture's copy of the camera on its own GPU: the newest frame is uploaded
-/// each time it's asked for and the camera has a new one.
+/// The webcam layer of a running capture: the newest picture of whichever
+/// camera the app keeps open, turned as placed, in a GPU texture for the
+/// compositor. A new camera or format, the webcam switched off and on, a
+/// dropout: it follows along without the capture restarting.
 pub(crate) struct CameraLayer {
-    /// The camera's feed; `None` (or a stopped one) while the webcam is
-    /// switched off, and found again when the app opens it.
     feed: Option<Arc<CameraFeed>>,
-    device: String,
-    format: Option<crate::webcam::Format>,
+    placement: crate::webcam::SharedPlacement,
+    /// Square, as big as a camera picture can be turned either way: any
+    /// format fits, and only its top-left `content` is drawn.
     pub latest: Arc<Latest>,
-    last: u64,
+    /// The picture last uploaded, and how it was turned.
+    last: (u64, u8),
+    turned: Vec<u8>,
 }
+
+/// The biggest camera picture side drawn, turned or not: 1080p either way
+/// fits; a bigger picture is cut.
+const MAX_SIDE: u32 = 1920;
 
 impl CameraLayer {
     /// For webcam `w`, opening it if nothing has (the app keeps it open
     /// itself), unless it's switched off: then it waits for the app to.
     pub(crate) fn new(gpu: &Gpu, w: &crate::webcam::Webcam) -> Result<Self> {
         let hidden = w.placement.lock().unwrap().is_hidden();
-        let feed = match CameraFeed::current(&w.device, w.format) {
-            Some(f) => f,
-            None if hidden => {
-                // Its size isn't known yet: the format's, else the most
-                // "Automatic" picks (a smaller picture fits, a bigger is cut).
-                let (width, height) = w.format.map_or((1920, 1080), |f| (f.width, f.height));
-                return Ok(Self { feed: None, device: w.device.clone(), format: w.format, latest: Latest::new(gpu, width, height)?, last: 0 });
-            }
-            None => {
-                keep_open(Some((w.device.clone(), w.format)));
-                CameraFeed::current(&w.device, w.format).context("the camera couldn't be opened")?
-            }
-        };
-        // The texture needs the picture's size: wait a moment for the first frame.
-        let deadline = std::time::Instant::now() + Duration::from_secs(3);
-        let (width, height) = loop {
-            if let Some(f) = feed.latest() {
-                break (f.width, f.height);
-            }
-            if std::time::Instant::now() >= deadline {
-                break w.format.map_or((1920, 1080), |f| (f.width, f.height));
-            }
-            thread::sleep(Duration::from_millis(20));
-        };
-        Ok(Self { feed: Some(feed), device: w.device.clone(), format: w.format, latest: Latest::new(gpu, width, height)?, last: 0 })
+        if !hidden && CameraFeed::current(&w.device, w.format).is_none() {
+            keep_open(Some((w.device.clone(), w.format)));
+        }
+        Ok(Self { feed: None, placement: w.placement.clone(), latest: Latest::new(gpu, MAX_SIDE, MAX_SIDE)?, last: (0, 0), turned: Vec::new() })
     }
 
-    /// Upload the camera's newest frame, if it has one we haven't.
+    /// Upload the camera's newest frame, if it has one we haven't (or it's
+    /// turned another way now).
     pub(crate) fn pull(&mut self) {
-        // Switched off and on again: the app opened it anew.
         if self.feed.as_ref().is_none_or(|f| f.stop.load(Ordering::Relaxed)) {
-            if let Some(f) = CameraFeed::current(&self.device, self.format) {
-                self.feed = Some(f);
-                self.last = 0;
-            }
+            self.feed = CURRENT.lock().unwrap().clone().filter(|f| !f.stop.load(Ordering::Relaxed));
+            self.last = (0, 0);
         }
-        let Some(feed) = &self.feed else { return };
-        if let Some(f) = feed.latest() {
-            if f.seq != self.last {
-                self.last = f.seq;
-                self.latest.upload_bgra(f.bgra.as_ptr(), f.width * 4, f.width, f.height);
-            }
+        let Some(f) = self.feed.as_ref().and_then(|feed| feed.latest()) else { return };
+        let turns = self.placement.lock().unwrap().turns % 4;
+        if (f.seq, turns) == self.last {
+            return;
         }
+        self.last = (f.seq, turns);
+        if turns == 0 {
+            self.latest.upload_bgra(f.bgra.as_ptr(), f.width * 4, f.width, f.height);
+            return;
+        }
+        let (w, h) = turn_bgra(&f.bgra, f.width, f.height, turns, &mut self.turned);
+        self.latest.upload_bgra(self.turned.as_ptr(), w * 4, w, h);
+    }
+}
+
+/// `src` (`w`×`h` BGRA rows) turned `turns` quarters clockwise into `out`;
+/// returns the new size.
+fn turn_bgra(src: &[u8], w: u32, h: u32, turns: u8, out: &mut Vec<u8>) -> (u32, u32) {
+    let (w, h) = (w as usize, h as usize);
+    let (ow, oh) = if turns % 2 == 1 { (h, w) } else { (w, h) };
+    out.resize(ow * oh * 4, 0);
+    let px = |x: usize, y: usize| &src[(y * w + x) * 4..][..4];
+    for oy in 0..oh {
+        let row = &mut out[oy * ow * 4..][..ow * 4];
+        for ox in 0..ow {
+            // Where this output pixel was in the camera's picture.
+            let (x, y) = match turns {
+                1 => (oy, h - 1 - ox),
+                2 => (w - 1 - ox, h - 1 - oy),
+                _ => (w - 1 - oy, ox),
+            };
+            row[ox * 4..ox * 4 + 4].copy_from_slice(px(x, y));
+        }
+    }
+    (ow as u32, oh as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn turns_a_picture() {
+        // 2x1: red, blue. Clockwise it's 1x2: red on top.
+        let src = [0, 0, 255, 255, 255, 0, 0, 255];
+        let mut out = Vec::new();
+        assert_eq!(super::turn_bgra(&src, 2, 1, 1, &mut out), (1, 2));
+        assert_eq!(out, [0, 0, 255, 255, 255, 0, 0, 255]);
+        assert_eq!(super::turn_bgra(&src, 2, 1, 3, &mut out), (1, 2));
+        assert_eq!(out, [255, 0, 0, 255, 0, 0, 255, 255]);
+        assert_eq!(super::turn_bgra(&src, 2, 1, 2, &mut out), (2, 1));
+        assert_eq!(out, [255, 0, 0, 255, 0, 0, 255, 255]);
     }
 }
 

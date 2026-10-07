@@ -172,6 +172,9 @@ pub struct PlacementCfg {
     pub flip_h: bool,
     #[serde(default)]
     pub flip_v: bool,
+    /// Quarter turns clockwise.
+    #[serde(default)]
+    pub turns: u8,
     /// The shape (width / height) of the frame this was laid out in. The box
     /// is fractions of the frame, so in a frame of another shape (another
     /// display, an ultrawide) the same fractions are another shape: it's
@@ -220,14 +223,14 @@ impl PlacementCfg {
 
 impl From<PlacementCfg> for capture::webcam::Placement {
     fn from(p: PlacementCfg) -> Self {
-        Self { x: p.x, y: p.y, w: p.w, h: p.h, crop: p.crop, flip_h: p.flip_h, flip_v: p.flip_v }
+        Self { x: p.x, y: p.y, w: p.w, h: p.h, crop: p.crop, flip_h: p.flip_h, flip_v: p.flip_v, turns: p.turns }
     }
 }
 
 impl PlacementCfg {
     /// `p`, laid out in a frame of shape `frame_aspect`.
     pub fn laid_out(p: capture::webcam::Placement, frame_aspect: f32) -> Self {
-        Self { x: p.x, y: p.y, w: p.w, h: p.h, crop: p.crop, flip_h: p.flip_h, flip_v: p.flip_v, frame_aspect: Some(frame_aspect) }
+        Self { x: p.x, y: p.y, w: p.w, h: p.h, crop: p.crop, flip_h: p.flip_h, flip_v: p.flip_v, turns: p.turns, frame_aspect: Some(frame_aspect) }
     }
 }
 
@@ -595,7 +598,7 @@ mod placement_tests {
     use super::PlacementCfg;
 
     fn cfg(x: f32, y: f32, w: f32, h: f32, frame_aspect: Option<f32>) -> PlacementCfg {
-        PlacementCfg { x, y, w, h, crop: [0.0; 4], flip_h: false, flip_v: false, frame_aspect }
+        PlacementCfg { x, y, w, h, crop: [0.0; 4], flip_h: false, flip_v: false, turns: 0, frame_aspect }
     }
 
     fn pixel_aspect(p: &PlacementCfg, frame: f32) -> f32 {

@@ -509,6 +509,12 @@ impl Frames {
             Some((layer, placement, gpu, pool)) => {
                 let p = *placement.lock().unwrap();
                 let cam = if p.is_hidden() { None } else { layer.latest() };
+                // No webcam showing: the screen's own buffer, as without one.
+                if cam.is_none() {
+                    self.last = None;
+                    self.preview.offer(&screen, self.latest.waiting.load(Ordering::Relaxed), self.latest.app.lock().unwrap().clone());
+                    return Some(screen);
+                }
                 let key = (Arc::as_ptr(&screen) as usize, cam.as_ref().map_or(0, |c| c.seq), p);
                 match &self.last {
                     // Nothing changed: the same frame again (the encoder holds it anyway).
