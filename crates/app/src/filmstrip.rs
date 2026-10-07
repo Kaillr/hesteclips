@@ -59,6 +59,16 @@ impl Filmstrip {
         }
     }
 
+    /// The clip's file was renamed: the open decoder keeps reading it; only
+    /// a fallback that opens it again needs the new name.
+    pub fn renamed(&mut self, to: &Path) {
+        match self {
+            #[cfg(hw_decode)]
+            Self::Exact(e) => e.source = to.to_path_buf(),
+            Self::Keys(_) => {}
+        }
+    }
+
     /// The decoded thumbnail nearest `t`, if any (a rough hover preview).
     pub fn near(&self, t: f64) -> Option<&egui::TextureHandle> {
         match self {

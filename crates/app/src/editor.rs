@@ -174,9 +174,11 @@ impl Editor {
         }
         self.target.source = to.to_path_buf();
         match &mut self.state {
+            // Everything open keeps going (sound, picture, waveforms, the
+            // edit); only reopening by name follows.
             State::Ready(r) => {
-                r.player = r.player.reopen(ctx, to);
-                r.strip = Filmstrip::build(ctx, to, &r.info);
+                r.player.renamed(ctx, to);
+                r.strip.renamed(to);
             }
             _ => *self = Self::open(ctx, to, self.preview_share),
         }

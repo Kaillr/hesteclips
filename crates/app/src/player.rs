@@ -140,8 +140,6 @@ struct Shared {
 pub struct Player {
     source: PathBuf,
     info: ClipInfo,
-    /// The decoded sound, kept to open the clip again under a new name.
-    pcm: Arc<Pcm>,
     shared: Arc<Shared>,
     _stream: Option<cpal::Stream>,
     pub audio_error: Option<String>,
@@ -206,31 +204,13 @@ impl Player {
             Err(e) => (None, Some(e)),
         };
 
-        // On-demand exact stills (paused/scrubbing), one worker, newest request wins.
-        let (still_tx, job_rx) = mpsc::channel::<(u64, f64)>();
-        let (done_tx, still_rx) = mpsc::channel();
-        let src = source.to_path_buf();
-        let repaint = ctx.clone();
-        std::thread::spawn(move || {
-            while let Ok(mut job) = job_rx.recv() {
-                while let Ok(newer) = job_rx.try_recv() {
-                    job = newer;
-                }
-                if let Ok(frame) = media::frame_at(&src, job.1, PREVIEW_WIDTH) {
-                    if done_tx.send((job.0, frame)).is_err() {
-                        break;
-                    }
-                    repaint.request_repaint();
-                }
-            }
-        });
+        let (still_tx, still_rx) = still_worker(ctx, source);
 
         let info_fps = info.fps;
         let total_frames = (info.duration * info_fps).floor() as usize;
         Self {
             source: source.to_path_buf(),
             info,
-            pcm,
             shared,
             _stream: stream,
             audio_error,
@@ -257,13 +237,13 @@ impl Player {
         }
     }
 
-    /// The same clip, renamed to `to`: opened again there (frames are read
-    /// by path), at the same moment and mix, paused.
-    pub fn reopen(&self, ctx: &egui::Context, to: &Path) -> Self {
-        let mix = self.shared.mix.lock().unwrap().tracks.clone();
-        let mut p = Self::with_pcm(ctx, to, self.info.clone(), self.pcm.clone(), mix);
-        p.seek(self.time());
-        p
+    /// The clip's file was renamed to `to`. What has it open keeps it open
+    /// (Windows lets an open file be renamed): the sound, the video decoder,
+    /// the scrub preview. Only what opens it again by name follows: nothing
+    /// reloads, nothing stops.
+    pub fn renamed(&mut self, ctx: &egui::Context, to: &Path) {
+        self.source = to.to_path_buf();
+        (self.still_tx, self.still_rx) = still_worker(ctx, to);
     }
 
     pub fn time(&self) -> f64 {
@@ -612,6 +592,29 @@ impl Player {
         self.display = self.texture.as_ref().map(|t| Display::Image(t.id(), t.size_vec2()));
         self.retire(ctx, None);
     }
+}
+
+/// On-demand exact stills (paused/scrubbing): one worker, the newest
+/// request wins. It opens the file by name for each still.
+fn still_worker(ctx: &egui::Context, source: &Path) -> (Sender<(u64, f64)>, Receiver<(u64, media::Frame)>) {
+    let (still_tx, job_rx) = mpsc::channel::<(u64, f64)>();
+    let (done_tx, still_rx) = mpsc::channel();
+    let src = source.to_path_buf();
+    let repaint = ctx.clone();
+    std::thread::spawn(move || {
+        while let Ok(mut job) = job_rx.recv() {
+            while let Ok(newer) = job_rx.try_recv() {
+                job = newer;
+            }
+            if let Ok(frame) = media::frame_at(&src, job.1, PREVIEW_WIDTH) {
+                if done_tx.send((job.0, frame)).is_err() {
+                    break;
+                }
+                repaint.request_repaint();
+            }
+        }
+    });
+    (still_tx, still_rx)
 }
 
 /// The hardware decoder for `source`, on Windows and macOS (unless

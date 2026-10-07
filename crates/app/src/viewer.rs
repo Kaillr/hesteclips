@@ -173,14 +173,10 @@ impl Viewer {
         }
         self.clip = to.to_path_buf();
         match &mut self.state {
+            // Everything open keeps playing; only reopening by name follows.
             State::Ready(r) => {
-                let playing = r.player.is_playing();
-                r.player = r.player.reopen(ctx, to);
-                r.strip = Filmstrip::build(ctx, to, &r.info);
-                r.apply_volume(ctx);
-                if playing {
-                    r.play();
-                }
+                r.player.renamed(ctx, to);
+                r.strip.renamed(to);
             }
             // Still loading from the old name: start again.
             _ => *self = Self::open(ctx, to),
