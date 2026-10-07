@@ -43,6 +43,10 @@ pub enum ViewerOutcome {
     Open(PathBuf),
     Share(crate::library::ShareChoice),
     Rename,
+    /// Put the clip in this collection, or take it out (`false`).
+    InCollection(String, bool),
+    /// Make a collection with the clip in it.
+    NewCollection,
     /// The picture was dragged: hand the clip to the OS to drop into an app.
     DragOut,
 }
@@ -55,6 +59,8 @@ pub struct Nav {
     pub next: Option<PathBuf>,
     /// This clip's place (from 1) and how many there are.
     pub position: Option<(usize, usize)>,
+    /// Your collections: (id, name, whether this clip is in it).
+    pub collections: Vec<(String, String, bool)>,
 }
 
 struct Loaded {
@@ -255,6 +261,23 @@ impl Viewer {
                 egui::Popup::menu(&share).show(|ui| {
                     if let Some(c) = crate::library::share_menu(ui, share.rect.left_bottom()) {
                         out = ViewerOutcome::Share(c);
+                    }
+                });
+                let collect = egui::Button::new(RichText::new("🗂 Collections").size(14.0)).min_size(Vec2::new(0.0, 30.0)).corner_radius(8);
+                let collect = ui.add(collect).on_hover_text("Add it to a collection of your own, like \"Ace clutches\"");
+                egui::Popup::menu(&collect).show(|ui| {
+                    ui.set_min_width(200.0);
+                    for (id, name, inside) in &nav.collections {
+                        let label = if *inside { format!("✔  {name}") } else { format!("     {name}") };
+                        if ui.button(label).on_hover_text(if *inside { "Take out of this collection" } else { "Add to this collection" }).clicked() {
+                            out = ViewerOutcome::InCollection(id.clone(), !inside);
+                        }
+                    }
+                    if !nav.collections.is_empty() {
+                        ui.separator();
+                    }
+                    if ui.button("+  New collection…").clicked() {
+                        out = ViewerOutcome::NewCollection;
                     }
                 });
                 let edit = egui::Button::new(RichText::new("✂ Edit").size(14.0)).min_size(Vec2::new(76.0, 30.0)).corner_radius(8);

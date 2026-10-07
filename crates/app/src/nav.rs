@@ -40,7 +40,7 @@ impl App {
     /// Follow the mouse's back/forward buttons, then note where we are now.
     /// Once a frame, before the page is drawn.
     pub(crate) fn navigate(&mut self, ctx: &egui::Context) {
-        let free = self.page != Page::Edit && self.rename.is_none() && self.dialog.is_none();
+        let free = self.page != Page::Edit && self.rename.is_none() && self.dialog.is_none() && self.collection_dialog.is_none();
         let (back, forward) = ctx.input(|i| (i.pointer.button_pressed(egui::PointerButton::Extra1), i.pointer.button_pressed(egui::PointerButton::Extra2)));
         if free && (back || forward) {
             self.step(back);
@@ -79,7 +79,7 @@ impl App {
         match place {
             Place::Clips(f) => {
                 let mut kept = f.clone();
-                kept.retain(&self.clips);
+                kept.retain(&self.clips, &self.collections);
                 kept == *f
             }
             Place::View(p) => self.clips.iter().any(|c| &c.path == p),

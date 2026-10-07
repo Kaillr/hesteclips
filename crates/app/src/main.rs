@@ -9,6 +9,7 @@
 
 mod away;
 mod clips;
+mod collections;
 mod webcam_ui;
 mod cloud;
 mod cloud_ui;
@@ -356,6 +357,9 @@ struct App {
     library_stamp: Vec<Option<SystemTime>>,
     /// Which of the library's folders (games) the library shows.
     pub(crate) library_filter: library::Filter,
+    /// Your own groups of clips, in the library's `.hesteclips`.
+    pub(crate) collections: collections::Collections,
+    pub(crate) collection_dialog: Option<library::CollectionDialog>,
     /// Where the mouse's back/forward buttons go.
     pub(crate) nav: nav::History,
     /// Games' icons and the HesteFiles profile picture.
@@ -389,6 +393,8 @@ impl App {
         let recovered = capture::output::recover_unfinished(&settings.output_dir);
         let saved_settings = settings.to_json();
         let clips = clips::scan(&settings.output_dir);
+        let mut collections = collections::Collections::load(&settings.output_dir);
+        collections.reconnect(&clips);
         // Assets of clips deleted in Finder go to the Bin.
         store::sweep_orphans(&settings.output_dir, &clips);
         let live_audio = capture::mixer::LiveAudio::new();
@@ -475,6 +481,8 @@ impl App {
             last_poll: None,
             library_stamp: Vec::new(),
             library_filter: library::Filter::All,
+            collections,
+            collection_dialog: None,
             nav: nav::History::default(),
             web_images: Default::default(),
             updater,
@@ -511,6 +519,17 @@ impl App {
                 app.start_render(target, info, edit, Some("Demo highlight".into()));
             }
         }
+        // `HESTECLIPS_DEMO_COLLECTION=<name>` shows a collection; `…_NEW` adds
+        // the "New collection" dialog.
+        if let Some(name) = std::env::var("HESTECLIPS_DEMO_COLLECTION").ok() {
+            if let Some(c) = app.collections.list().iter().find(|c| c.name == name) {
+                app.library_filter = library::Filter::Collection(c.id.clone());
+            }
+            if std::env::var_os("HESTECLIPS_DEMO_COLLECTION_NEW").is_some() {
+                let first = app.clips.first().map(|c| c.path.clone()).into_iter().collect();
+                app.new_collection_with(first);
+            }
+        }
         // `HESTECLIPS_DEMO_SHARE=<clip>` opens the HesteFiles upload dialog for a clip.
         if let Some(clip) = std::env::var_os("HESTECLIPS_DEMO_SHARE").map(PathBuf::from) {
             app.open_share_dialog(clip);
@@ -545,8 +564,12 @@ impl App {
     fn refresh_clips(&mut self) {
         store::set_library(&self.settings.output_dir);
         self.clips = clips::scan(&self.settings.output_dir);
+        if self.collections.library() != self.settings.output_dir {
+            self.collections = collections::Collections::load(&self.settings.output_dir);
+        }
+        self.collections.reconnect(&self.clips);
         self.selection.retain(&self.clips);
-        self.library_filter.retain(&self.clips);
+        self.library_filter.retain(&self.clips, &self.collections);
     }
 
     fn toast(&mut self, text: impl Into<String>) {
@@ -801,6 +824,7 @@ impl eframe::App for App {
         });
         self.dialogs(&ctx);
         self.rename_dialog(&ctx);
+        self.collection_dialog(&ctx);
         laps.lap("dialogs");
 
         // Library auto-refresh: poll the output folder ~once a second and rescan only
@@ -1153,12 +1177,20 @@ impl App {
             self.page = Page::Clips;
             return;
         };
-        // Neighbours in the library's order (newest first), to step through.
-        let at = self.clips.iter().position(|c| c.path == v.clip());
+        // Neighbours among the clips shown in the library (a game's, a
+        // collection's), newest first, to step through; all clips when this one
+        // isn't among them (taken out of the collection meanwhile).
+        let shown: Vec<&clips::Clip> = self.clips.iter().filter(|c| self.library_filter.matches(c, &self.collections)).collect();
+        let list: Vec<&clips::Clip> = if shown.iter().any(|c| c.path == v.clip()) { shown } else { self.clips.iter().collect() };
+        let at = list.iter().position(|c| c.path == v.clip());
+        let mut collections: Vec<(String, String, bool)> =
+            self.collections.list().iter().map(|c| (c.id.clone(), c.name.clone(), self.collections.contains(&c.id, v.clip()))).collect();
+        collections.sort_by_key(|(_, name, _)| name.to_lowercase());
         let nav = viewer::Nav {
-            previous: at.and_then(|i| i.checked_sub(1)).map(|i| self.clips[i].path.clone()),
-            next: at.and_then(|i| self.clips.get(i + 1)).map(|c| c.path.clone()),
-            position: at.map(|i| (i + 1, self.clips.len())),
+            previous: at.and_then(|i| i.checked_sub(1)).map(|i| list[i].path.clone()),
+            next: at.and_then(|i| list.get(i + 1)).map(|c| c.path.clone()),
+            position: at.map(|i| (i + 1, list.len())),
+            collections,
         };
         let outcome = v.ui(ui, &nav);
         if let Some((volume, muted)) = viewer::volume(ui.ctx()) {
@@ -1180,6 +1212,14 @@ impl App {
                 self.open_editor(clip);
             }
             viewer::ViewerOutcome::Open(clip) => self.viewer = Some(viewer::Viewer::open(&self.ctx(), &clip)),
+            viewer::ViewerOutcome::InCollection(id, add) => {
+                let clip = v.clip().to_path_buf();
+                self.put_in_collection(&[clip], &id, add);
+            }
+            viewer::ViewerOutcome::NewCollection => {
+                let clip = v.clip().to_path_buf();
+                self.new_collection_with(vec![clip]);
+            }
             viewer::ViewerOutcome::Share(choice) => {
                 let clip = v.clip().to_path_buf();
                 self.share(frame, clip, choice);
@@ -1485,7 +1525,7 @@ impl App {
                     self.last_saved = Some((path.clone(), Instant::now()));
                     self.refresh_clips();
                     // Showing another game's clips: show this one too.
-                    self.library_filter.reveal(&self.clips, &path);
+                    self.library_filter.reveal(&self.clips, &self.collections, &path);
                 }
                 Evt::Error(e) => {
                     // A start failure is followed by Evt::State(None); a save failure

@@ -4,8 +4,10 @@
 //! else. While a capture is running a placeholder card stands in for the clip, so
 //! a half-written file never shows up as if it were finished.
 //!
-//! Clips in the library's folders (one per game) can be shown one game at a
-//! time, picked from a row of chips on top, and moved between folders.
+//! A sidebar picks what's shown: every clip, one game's (the library's
+//! folders), or one of your collections — your own groups of clips, like
+//! "Awesome ace clutches" (`collections`). A narrow window puts the same list
+//! in a menu on the page's title.
 //!
 //! Selecting works like Photos and Finder: the check circle on a card, ⌘-click
 //! or Shift-click start a selection; while one is active a plain click toggles a
@@ -17,12 +19,16 @@ use std::time::Duration;
 
 use egui::{Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
 
+use crate::collections::Collections;
 use crate::{App, RecState, clips, share, store, thumbs};
 
 const MIN_CARD_WIDTH: f32 = 220.0;
 const GAP: f32 = 14.0;
 const CAPTION_HEIGHT: f32 = 42.0;
 const RADIUS: u8 = 8;
+/// The sidebar's width, and the narrowest page that still gets one.
+const SIDEBAR_W: f32 = 230.0;
+const SIDEBAR_FROM: f32 = 720.0;
 /// How long a freshly saved clip stays highlighted.
 const NEW_HIGHLIGHT: Duration = Duration::from_secs(8);
 
@@ -47,62 +53,93 @@ pub(crate) enum Filter {
     Folder(String),
     /// The clips in the library itself, in no folder.
     Loose,
+    /// One of your collections, by id.
+    Collection(String),
 }
 
 impl Filter {
-    fn matches(&self, clip: &clips::Clip) -> bool {
+    pub(crate) fn matches(&self, clip: &clips::Clip, cols: &Collections) -> bool {
         match self {
             Filter::All => true,
             Filter::Folder(name) => clip.folder.as_ref() == Some(name),
             Filter::Loose => clip.folder.is_none(),
+            Filter::Collection(id) => cols.contains(id, &clip.path),
         }
     }
 
-    /// Back to all clips once none is left to show (the last one moved or deleted).
-    pub fn retain(&mut self, clips: &[clips::Clip]) {
-        if !clips.iter().any(|c| self.matches(c)) {
+    /// Back to all clips once there's nothing left to show: the last clip of a
+    /// game moved or deleted, or the collection deleted. (An emptied collection
+    /// stays: you may be about to fill it.)
+    pub fn retain(&mut self, clips: &[clips::Clip], cols: &Collections) {
+        let gone = match self {
+            Filter::Collection(id) => cols.get(id).is_none(),
+            _ => !clips.iter().any(|c| self.matches(c, cols)),
+        };
+        if gone {
             *self = Filter::All;
         }
     }
 
-    /// Make sure the clip at `path` is shown: all clips, if it's another game's.
-    pub fn reveal(&mut self, clips: &[clips::Clip], path: &Path) {
-        if clips.iter().any(|c| c.path == path && !self.matches(c)) {
+    /// Make sure the clip at `path` is shown: all clips, if it isn't here.
+    pub fn reveal(&mut self, clips: &[clips::Clip], cols: &Collections, path: &Path) {
+        if clips.iter().any(|c| c.path == path && !self.matches(c, cols)) {
             *self = Filter::All;
         }
     }
 }
 
-/// A chip on top of the library: a folder (game) to show the clips of.
-struct Category {
+/// Something to show in the library, as the sidebar lists it.
+struct View {
     filter: Filter,
     label: String,
     count: usize,
 }
 
-/// The chips: All, each folder with clips (the game played last first), and
-/// Other for clips in no folder. None when there are no folders to pick between.
-fn categories(clips: &[clips::Clip]) -> Vec<Category> {
-    let mut cats: Vec<Category> = Vec::new();
+/// What the sidebar lists: the games (the library's folders, the one played
+/// last first, then Other for clips in none) and the collections (by name).
+/// No games when the library has no folders.
+fn views(clips: &[clips::Clip], cols: &Collections) -> (Vec<View>, Vec<View>) {
+    let mut games: Vec<View> = Vec::new();
     let mut loose = 0;
     // Newest first, so a folder's place is its newest clip's.
     for clip in clips {
         match &clip.folder {
-            Some(f) => match cats.iter_mut().find(|c| &c.label == f) {
+            Some(f) => match games.iter_mut().find(|c| &c.label == f) {
                 Some(c) => c.count += 1,
-                None => cats.push(Category { filter: Filter::Folder(f.clone()), label: f.clone(), count: 1 }),
+                None => games.push(View { filter: Filter::Folder(f.clone()), label: f.clone(), count: 1 }),
             },
             None => loose += 1,
         }
     }
-    if cats.is_empty() {
-        return cats;
+    if !games.is_empty() && loose > 0 {
+        games.push(View { filter: Filter::Loose, label: "Other".into(), count: loose });
     }
-    if loose > 0 {
-        cats.push(Category { filter: Filter::Loose, label: "Other".into(), count: loose });
-    }
-    cats.insert(0, Category { filter: Filter::All, label: "All".into(), count: clips.len() });
-    cats
+    let mut collections: Vec<View> = cols
+        .list()
+        .iter()
+        .map(|c| {
+            let filter = Filter::Collection(c.id.clone());
+            let count = clips.iter().filter(|clip| filter.matches(clip, cols)).count();
+            View { filter, label: c.name.clone(), count }
+        })
+        .collect();
+    collections.sort_by_key(|v| v.label.to_lowercase());
+    (games, collections)
+}
+
+/// The "New collection", "Rename collection" or "Delete collection" dialog.
+pub(crate) struct CollectionDialog {
+    kind: CollectionDialogKind,
+    name: String,
+    error: Option<String>,
+    focused: bool,
+}
+
+enum CollectionDialogKind {
+    /// Make one, with these clips in it.
+    New(Vec<PathBuf>),
+    Rename(String),
+    Delete(String),
 }
 
 /// Clips picked for a bulk action.
@@ -171,6 +208,12 @@ enum Action {
     Filter(Filter),
     RenameFolder(String),
     RevealFolder(String),
+    /// Ask for a name, then make a collection with these clips in it.
+    NewCollection(Vec<PathBuf>),
+    /// Put these clips in the collection, or take them out (`false`).
+    InCollection(Vec<PathBuf>, String, bool),
+    RenameCollection(String),
+    DeleteCollection(String),
     /// Toggle a card's selection, or (`range`) select up to it from the anchor.
     Select { path: PathBuf, range: bool },
     SelectAll,
@@ -200,21 +243,47 @@ impl App {
             return;
         }
 
-        // The clips of the game picked on top. Cards borrow a snapshot so
+        // The clips of what's picked in the sidebar. Cards borrow a snapshot so
         // drawing them can still use `&mut self` (thumbnail cache).
-        let cats = categories(&self.clips);
-        let mut folders: Vec<String> = cats.iter().filter_map(|c| if let Filter::Folder(f) = &c.filter { Some(f.clone()) } else { None }).collect();
+        let (games, collections) = views(&self.clips, &self.collections);
+        let mut folders: Vec<String> = games.iter().filter_map(|c| if let Filter::Folder(f) = &c.filter { Some(f.clone()) } else { None }).collect();
         folders.sort_by_key(|f| f.to_lowercase());
-        let clips: Vec<clips::Clip> = self.clips.iter().filter(|c| self.library_filter.matches(c)).cloned().collect();
+        let clips: Vec<clips::Clip> = self.clips.iter().filter(|c| self.library_filter.matches(c, &self.collections)).cloned().collect();
 
         let mut action = self.selection_keys(ui);
+        let wide = ui.available_width() >= SIDEBAR_FROM;
+        if wide {
+            egui::Panel::left("library_sidebar")
+                .resizable(false)
+                .exact_size(SIDEBAR_W)
+                .frame(egui::Frame::NONE.inner_margin(egui::Margin { left: 0, right: 14, top: 8, bottom: 8 }))
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical().id_salt("library_sidebar_scroll").auto_shrink([false, false]).show(ui, |ui| {
+                        if let Some(a) = self.sidebar(ui, &games, &collections) {
+                            action = Some(a);
+                        }
+                    });
+                });
+        }
+        // Clear of the sidebar's line.
+        let mut padded = ui.new_child(egui::UiBuilder::new().max_rect({
+            let r = ui.available_rect_before_wrap();
+            if wide { r.with_min_x(r.min.x + 16.0) } else { r }
+        }));
+        let ui = &mut padded;
+        if let Some(a) = self.view_header(ui, wide, &games, &collections, clips.len()) {
+            action = Some(a);
+        }
         if !self.selection.is_empty() {
             if let Some(a) = self.selection_bar(ui, clips.len(), &folders) {
                 action = Some(a);
             }
         }
-        if let Some(a) = self.category_chips(ui, &cats) {
-            action = Some(a);
+        if clips.is_empty() && placeholders == 0 {
+            if let Filter::Collection(id) = &self.library_filter {
+                let name = self.collections.get(id).map(|c| c.name.clone()).unwrap_or_default();
+                empty_collection(ui, &name);
+            }
         }
 
         // Group into days. The placeholder always belongs to today.
@@ -291,6 +360,15 @@ impl App {
                 self.selection.clear();
             }
             Some(Action::RenameFolder(name)) => self.rename_folder(&name),
+            Some(Action::NewCollection(paths)) => self.new_collection_with(paths),
+            Some(Action::InCollection(paths, id, add)) => self.put_in_collection(&paths, &id, add),
+            Some(Action::RenameCollection(id)) => {
+                let name = self.collections.get(&id).map(|c| c.name.clone()).unwrap_or_default();
+                self.collection_dialog = Some(CollectionDialog { kind: CollectionDialogKind::Rename(id), name, error: None, focused: false });
+            }
+            Some(Action::DeleteCollection(id)) => {
+                self.collection_dialog = Some(CollectionDialog { kind: CollectionDialogKind::Delete(id), name: String::new(), error: None, focused: false });
+            }
             Some(Action::RevealFolder(name)) => {
                 if let Err(e) = clips::open_in_default_app(&self.settings.output_dir.join(name)) {
                     self.toast_error(format!("Couldn't open the folder: {e}"));
@@ -323,7 +401,7 @@ impl App {
 
     /// ⌘A selects every clip, ⌫ / Delete trashes the selection, Esc clears it.
     fn selection_keys(&mut self, ui: &egui::Ui) -> Option<Action> {
-        if self.rename.is_some() || self.dialog.is_some() || ui.ctx().egui_wants_keyboard_input() {
+        if self.rename.is_some() || self.dialog.is_some() || self.collection_dialog.is_some() || ui.ctx().egui_wants_keyboard_input() {
             return None;
         }
         let cmd = egui::Modifiers::COMMAND;
@@ -376,6 +454,17 @@ impl App {
                                 }
                             });
                         }
+                        let selected: Vec<PathBuf> = self.clips.iter().filter(|c| self.selection.paths.contains(&c.path)).map(|c| c.path.clone()).collect();
+                        if let Filter::Collection(id) = &self.library_filter
+                            && ui.button("Remove from collection").clicked()
+                        {
+                            action = Some(Action::InCollection(selected.clone(), id.clone(), false));
+                        }
+                        ui.menu_button("🗂  Add to collection", |ui| {
+                            if let Some(a) = collection_menu(ui, &self.collections, &selected) {
+                                action = Some(a);
+                            }
+                        });
                         if ui.button("Cancel").on_hover_text("Esc").clicked() {
                             action = Some(Action::Deselect);
                         }
@@ -408,6 +497,7 @@ impl App {
                 }
             }
         }
+        self.collections.forget(&moved);
         if let Some(e) = error {
             self.toast_error(format!("Couldn't move to the Trash: {e}"));
         } else if busy > 0 {
@@ -421,50 +511,271 @@ impl App {
         self.refresh_clips();
     }
 
-    /// The row of folders (games) to show the clips of.
-    fn category_chips(&mut self, ui: &mut egui::Ui, cats: &[Category]) -> Option<Action> {
-        if cats.is_empty() {
-            return None;
-        }
+    /// The sidebar: all clips, the games, your collections.
+    fn sidebar(&mut self, ui: &mut egui::Ui, games: &[View], collections: &[View]) -> Option<Action> {
         let mut action = None;
+        let all = View { filter: Filter::All, label: "All clips".into(), count: self.clips.len() };
+        if let Some(a) = self.side_row(ui, &all) {
+            action = Some(a);
+        }
+        if !games.is_empty() {
+            section_label(ui, "Games");
+            for v in games {
+                if let Some(a) = self.side_row(ui, v) {
+                    action = Some(a);
+                }
+            }
+        }
+        ui.add_space(14.0);
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Collections").size(12.0).strong().color(ui.visuals().weak_text_color()));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let plus = egui::Button::new(egui::RichText::new("+").size(14.0)).frame(false);
+                if ui.add(plus).on_hover_text("New collection").clicked() {
+                    action = Some(Action::NewCollection(Vec::new()));
+                }
+            });
+        });
+        ui.add_space(2.0);
+        for v in collections {
+            if let Some(a) = self.side_row(ui, v) {
+                action = Some(a);
+            }
+        }
+        if collections.is_empty() {
+            ui.add(egui::Label::new(egui::RichText::new("Keep your best clips together, like \"Ace clutches\".").size(12.0).weak()).wrap());
+            ui.add_space(4.0);
+        }
+        if ui.add(egui::Button::new(egui::RichText::new("+  New collection").color(ACCENT)).frame(false)).clicked() {
+            action = Some(Action::NewCollection(Vec::new()));
+        }
+        action
+    }
+
+    /// One entry of the sidebar: its picture, name and number of clips.
+    fn side_row(&mut self, ui: &mut egui::Ui, view: &View) -> Option<Action> {
+        let mut action = None;
+        let selected = self.library_filter == view.filter;
+        let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 32.0), Sense::click());
+        let v = ui.visuals().clone();
+        if selected {
+            ui.painter().rect_filled(rect, 7, ACCENT);
+        } else if resp.hovered() {
+            ui.painter().rect_filled(rect, 7, v.widgets.hovered.weak_bg_fill);
+        }
+        let (text, weak) = if selected { (Color32::WHITE, Color32::from_white_alpha(200)) } else { (v.text_color(), v.weak_text_color()) };
+        let icon = Rect::from_center_size(Pos2::new(rect.left() + 20.0, rect.center().y), Vec2::splat(20.0));
+        self.view_icon(ui, &view.filter, icon, text);
+        let count = ui.painter().layout_no_wrap(view.count.to_string(), FontId::proportional(12.0), weak);
+        let count_x = rect.right() - 10.0 - count.size().x;
+        ui.painter().galley(Pos2::new(count_x, rect.center().y - count.size().y / 2.0), count, weak);
+        let label_x = rect.left() + 38.0;
+        let label = ui.painter().layout_job(single_line(&view.label, FontId::proportional(14.0), text, (count_x - label_x - 8.0).max(10.0)));
+        ui.painter().galley(Pos2::new(label_x, rect.center().y - label.size().y / 2.0), label, text);
+        let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+        if resp.clicked() && !selected {
+            action = Some(Action::Filter(view.filter.clone()));
+        }
+        resp.context_menu(|ui| {
+            if let Some(a) = view_menu(ui, &view.filter) {
+                action = Some(a);
+            }
+        });
+        action
+    }
+
+    /// The picture of a view: a game's icon, a collection's newest clip.
+    fn view_icon(&mut self, ui: &mut egui::Ui, filter: &Filter, rect: Rect, color: Color32) {
+        let symbol = |ui: &mut egui::Ui, s: &str| {
+            ui.painter().text(rect.center(), Align2::CENTER_CENTER, s, FontId::proportional(15.0), color);
+        };
+        match filter {
+            Filter::All => symbol(ui, "🎬"),
+            Filter::Loose => symbol(ui, "📂"),
+            Filter::Folder(name) => match self.folder_icon(ui.ctx(), name) {
+                Some(tex) => {
+                    egui::Image::from_texture((tex.id(), rect.size())).corner_radius(4).paint_at(ui, rect);
+                }
+                None if name == clips::DESKTOP => symbol(ui, "🖥"),
+                None => symbol(ui, "🎮"),
+            },
+            Filter::Collection(id) => {
+                let newest = self.clips.iter().find(|c| self.collections.contains(id, &c.path)).cloned();
+                let ctx = ui.ctx().clone();
+                match newest.and_then(|c| self.thumbs.get(&ctx, &c).and_then(|t| t.texture.clone())) {
+                    Some(tex) => {
+                        let r = Rect::from_center_size(rect.center(), Vec2::new(24.0, 18.0));
+                        let uv = crate::filmstrip::crop_uv(tex.size_vec2(), r.size());
+                        egui::Image::from_texture((tex.id(), r.size())).uv(uv).corner_radius(4).paint_at(ui, r);
+                    }
+                    None => symbol(ui, "🗂"),
+                }
+            }
+        }
+    }
+
+    /// The name of what's shown, on top of the clips; a menu of everything to
+    /// show when there's no room for the sidebar.
+    fn view_header(&mut self, ui: &mut egui::Ui, wide: bool, games: &[View], collections: &[View], shown: usize) -> Option<Action> {
+        let mut action = None;
+        let (title, filter) = match &self.library_filter {
+            Filter::All => ("All clips".to_owned(), Filter::All),
+            Filter::Loose => ("Other".to_owned(), Filter::Loose),
+            Filter::Folder(f) => (f.clone(), self.library_filter.clone()),
+            Filter::Collection(id) => (self.collections.get(id).map(|c| c.name.clone()).unwrap_or_default(), self.library_filter.clone()),
+        };
         ui.add_space(8.0);
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
-            for cat in cats {
-                let selected = self.library_filter == cat.filter;
-                let v = ui.visuals();
-                let (text, weak) = if selected { (Color32::WHITE, Color32::from_white_alpha(190)) } else { (v.text_color(), v.weak_text_color()) };
-                let mut job = egui::text::LayoutJob::default();
-                let format = |size: f32, color| egui::TextFormat { font_id: FontId::proportional(size), color, valign: egui::Align::Center, ..Default::default() };
-                job.append(&cat.label, 0.0, format(14.0, text));
-                job.append(&cat.count.to_string(), 7.0, format(12.0, weak));
-                let fill = if selected { ACCENT } else { v.widgets.inactive.weak_bg_fill };
-                let icon = match &cat.filter {
-                    Filter::Folder(name) => self.folder_icon(ui.ctx(), name),
-                    _ => None,
-                };
-                let button = match icon {
-                    Some(tex) => egui::Button::image_and_text(egui::Image::from_texture((tex.id(), Vec2::splat(18.0))).corner_radius(4), job),
-                    None => egui::Button::new(job),
-                };
-                let r = ui.add(button.fill(fill).corner_radius(CornerRadius::same(14)).min_size(Vec2::new(0.0, 28.0)));
-                if r.clicked() && !selected {
-                    action = Some(Action::Filter(cat.filter.clone()));
-                }
-                if let Filter::Folder(name) = &cat.filter {
-                    r.context_menu(|ui| {
-                        if ui.button(format!("📂  {}", crate::reveal_label())).clicked() {
-                            action = Some(Action::RevealFolder(name.clone()));
+        ui.horizontal(|ui| {
+            let heading = egui::RichText::new(&title).size(20.0).strong();
+            if wide {
+                ui.label(heading);
+            } else {
+                // Everything the sidebar would list.
+                ui.menu_button(egui::RichText::new(format!("{title}  ⏷")).size(20.0).strong(), |ui| {
+                    ui.set_min_width(220.0);
+                    let all = View { filter: Filter::All, label: "All clips".into(), count: self.clips.len() };
+                    let mut pick = |ui: &mut egui::Ui, v: &View| {
+                        if ui.selectable_label(self.library_filter == v.filter, format!("{}   {}", v.label, v.count)).clicked() {
+                            action = Some(Action::Filter(v.filter.clone()));
                         }
-                        if ui.button("✏  Rename folder…").clicked() {
-                            action = Some(Action::RenameFolder(name.clone()));
-                        }
-                    });
-                }
+                    };
+                    pick(ui, &all);
+                    if !games.is_empty() {
+                        ui.separator();
+                        ui.weak("Games");
+                        games.iter().for_each(|v| pick(ui, v));
+                    }
+                    ui.separator();
+                    ui.weak("Collections");
+                    collections.iter().for_each(|v| pick(ui, v));
+                    if ui.button("+  New collection…").clicked() {
+                        action = Some(Action::NewCollection(Vec::new()));
+                    }
+                });
+            }
+            ui.weak(if shown == 1 { "1 clip".to_owned() } else { format!("{shown} clips") });
+            if !matches!(filter, Filter::All | Filter::Loose) {
+                ui.menu_button(egui::RichText::new("…").size(18.0), |ui| {
+                    if let Some(a) = view_menu(ui, &filter) {
+                        action = Some(a);
+                    }
+                })
+                .response
+                .on_hover_text("More");
             }
         });
         ui.add_space(2.0);
         action
+    }
+
+    /// Ask for a name for a new collection with these clips in it.
+    pub(crate) fn new_collection_with(&mut self, paths: Vec<PathBuf>) {
+        self.collection_dialog = Some(CollectionDialog { kind: CollectionDialogKind::New(paths), name: String::new(), error: None, focused: false });
+    }
+
+    /// Put clips in a collection, or take them out.
+    pub(crate) fn put_in_collection(&mut self, paths: &[PathBuf], id: &str, add: bool) {
+        let Some(name) = self.collections.get(id).map(|c| c.name.clone()) else { return };
+        if add {
+            let n = self.collections.add(id, paths);
+            match (paths.len(), n) {
+                (_, 0) => self.toast(format!("Already in {name}")),
+                (1, _) => self.toast(format!("Added to {name}")),
+                _ => self.toast(format!("Added {n} clips to {name}")),
+            }
+        } else {
+            self.collections.remove(id, paths);
+            self.toast(if paths.len() == 1 { format!("Removed from {name}") } else { format!("Removed {} clips from {name}", paths.len()) });
+        }
+        self.selection.clear();
+    }
+
+    /// The "New collection", "Rename collection" and "Delete collection" dialogs.
+    pub(crate) fn collection_dialog(&mut self, ctx: &egui::Context) {
+        let Some(d) = &mut self.collection_dialog else { return };
+        let (mut close, mut submit) = (false, false);
+        let modal = egui::Modal::new(egui::Id::new("collection_dialog")).show(ctx, |ui| {
+            ui.set_width(380.0);
+            if let CollectionDialogKind::Delete(id) = &d.kind {
+                let c = self.collections.get(id);
+                ui.heading(format!("Delete “{}”?", c.map_or("", |c| c.name.as_str())));
+                ui.add_space(6.0);
+                ui.label("The collection goes away. Its clips stay in your library.");
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    let delete = egui::Button::new(egui::RichText::new("Delete collection").color(Color32::WHITE)).fill(ui.visuals().error_fg_color);
+                    submit = ui.add(delete).clicked();
+                    close = ui.button("Cancel").clicked();
+                });
+                return;
+            }
+            let (heading, button) = match &d.kind {
+                CollectionDialogKind::New(clips) if clips.len() == 1 => ("New collection".to_owned(), "Create and add the clip".to_owned()),
+                CollectionDialogKind::New(clips) if !clips.is_empty() => ("New collection".to_owned(), format!("Create and add {} clips", clips.len())),
+                CollectionDialogKind::New(_) => ("New collection".to_owned(), "Create".to_owned()),
+                _ => ("Rename collection".to_owned(), "Rename".to_owned()),
+            };
+            ui.heading(heading);
+            ui.add_space(6.0);
+            let out = egui::TextEdit::singleline(&mut d.name).hint_text("Like \"Best of the week\"").desired_width(f32::INFINITY).show(ui);
+            if !d.focused {
+                out.response.request_focus();
+                let mut state = out.state.clone();
+                state.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(d.name.chars().count()))));
+                state.store(ui.ctx(), out.response.id);
+                d.focused = true;
+            }
+            submit = out.response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if let Some(e) = &d.error {
+                ui.colored_label(ui.visuals().error_fg_color, e);
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.add(egui::Button::new(egui::RichText::new(button).color(Color32::WHITE)).fill(ACCENT)).clicked() {
+                    submit = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    close = true;
+                }
+            });
+        });
+        if submit {
+            let d = self.collection_dialog.as_mut().unwrap();
+            match &d.kind {
+                CollectionDialogKind::Delete(id) => {
+                    let id = id.clone();
+                    self.collections.delete(&id);
+                    self.library_filter.retain(&self.clips, &self.collections);
+                    close = true;
+                }
+                CollectionDialogKind::Rename(id) => match crate::collections::check_name(&self.collections, &d.name, Some(id)) {
+                    Ok(name) => {
+                        let id = id.clone();
+                        self.collections.rename(&id, &name);
+                        close = true;
+                    }
+                    Err(e) => d.error = Some(e),
+                },
+                CollectionDialogKind::New(paths) => match crate::collections::check_name(&self.collections, &d.name, None) {
+                    Ok(name) => {
+                        let paths = paths.clone();
+                        let id = self.collections.create(&name);
+                        if paths.is_empty() {
+                            // Made to fill: show it, with how to.
+                            self.library_filter = Filter::Collection(id);
+                            self.selection.clear();
+                        } else {
+                            self.put_in_collection(&paths, &id, true);
+                        }
+                        close = true;
+                    }
+                    Err(e) => d.error = Some(e),
+                },
+            }
+        }
+        if close || (!submit && modal.should_close()) {
+            self.collection_dialog = None;
+        }
     }
 
     /// The game's picture for one of the library's folders, when Discord knows
@@ -521,6 +832,7 @@ impl App {
     /// A clip's file moved (renamed, or to another folder): the player, the
     /// editor and the "new" highlight follow it.
     fn follow_rename(&mut self, ctx: &egui::Context, from: &Path, to: &Path) {
+        self.collections.follow(from, to);
         if let Some((p, _)) = &mut self.last_saved
             && p == from
         {
@@ -728,7 +1040,7 @@ impl App {
             None => format!("{}  ·  {ext}", clip.human_size()),
         };
         // Every game's clips together: say whose this is.
-        if let (Filter::All, Some(folder)) = (&self.library_filter, &clip.folder) {
+        if let (Filter::All | Filter::Collection(_), Some(folder)) = (&self.library_filter, &clip.folder) {
             detail = format!("{folder}  ·  {detail}");
         }
         let meta = p.layout_job(single_line(&detail, FontId::proportional(12.0), v.weak_text_color(), w - 4.0));
@@ -811,6 +1123,17 @@ impl App {
             ui.set_min_width(190.0);
             // Right-clicking one of several selected clips acts on all of them.
             if selected && n > 1 {
+                let paths: Vec<PathBuf> = self.clips.iter().filter(|c| self.selection.paths.contains(&c.path)).map(|c| c.path.clone()).collect();
+                ui.menu_button(format!("🗂  Add {n} clips to collection"), |ui| {
+                    if let Some(a) = collection_menu(ui, &self.collections, &paths) {
+                        action = Some(a);
+                    }
+                });
+                if let Filter::Collection(id) = &self.library_filter
+                    && ui.button(format!("Remove {n} clips from collection")).clicked()
+                {
+                    action = Some(Action::InCollection(paths.clone(), id.clone(), false));
+                }
                 if !folders.is_empty() {
                     ui.menu_button(format!("📁  Move {n} clips to"), |ui| {
                         if let Some(f) = move_menu(ui, folders, None, true) {
@@ -837,6 +1160,16 @@ impl App {
             }
             if ui.button("✏  Rename…").clicked() {
                 action = Some(Action::Rename(clip.path.clone()));
+            }
+            ui.menu_button("🗂  Add to collection", |ui| {
+                if let Some(a) = collection_menu(ui, &self.collections, std::slice::from_ref(&clip.path)) {
+                    action = Some(a);
+                }
+            });
+            if let Filter::Collection(id) = &self.library_filter
+                && ui.button("Remove from collection").clicked()
+            {
+                action = Some(Action::InCollection(vec![clip.path.clone()], id.clone(), false));
             }
             if !folders.is_empty() {
                 ui.menu_button("📁  Move to", |ui| {
@@ -1148,6 +1481,75 @@ fn move_menu(ui: &mut egui::Ui, folders: &[String], current: Option<&str>, offer
         }
     }
     picked
+}
+
+/// A section's name in the sidebar.
+fn section_label(ui: &mut egui::Ui, text: &str) {
+    ui.add_space(14.0);
+    ui.label(egui::RichText::new(text).size(12.0).strong().color(ui.visuals().weak_text_color()));
+    ui.add_space(2.0);
+}
+
+/// What can be done with a game's folder or a collection (right-click, ⋯).
+fn view_menu(ui: &mut egui::Ui, filter: &Filter) -> Option<Action> {
+    let mut action = None;
+    match filter {
+        Filter::Folder(name) => {
+            if ui.button(format!("📂  {}", crate::reveal_label())).clicked() {
+                action = Some(Action::RevealFolder(name.clone()));
+            }
+            if ui.button("✏  Rename folder…").clicked() {
+                action = Some(Action::RenameFolder(name.clone()));
+            }
+        }
+        Filter::Collection(id) => {
+            if ui.button("✏  Rename collection…").clicked() {
+                action = Some(Action::RenameCollection(id.clone()));
+            }
+            if ui.button(egui::RichText::new("🗑  Delete collection…").color(ui.visuals().error_fg_color)).clicked() {
+                action = Some(Action::DeleteCollection(id.clone()));
+            }
+        }
+        Filter::All | Filter::Loose => {}
+    }
+    action
+}
+
+/// Pick a collection to put clips in: each one, ticked when they're all in it
+/// already (picking it then takes them out), and a new one.
+fn collection_menu(ui: &mut egui::Ui, cols: &Collections, paths: &[PathBuf]) -> Option<Action> {
+    let mut action = None;
+    ui.set_min_width(200.0);
+    let mut list: Vec<_> = cols.list().iter().collect();
+    list.sort_by_key(|c| c.name.to_lowercase());
+    for c in list {
+        let all_in = !paths.is_empty() && paths.iter().all(|p| cols.contains(&c.id, p));
+        let label = if all_in { format!("✔  {}", c.name) } else { format!("     {}", c.name) };
+        let tip = if all_in { "Take out of this collection" } else { "Add to this collection" };
+        if ui.button(label).on_hover_text(tip).clicked() {
+            action = Some(Action::InCollection(paths.to_vec(), c.id.clone(), !all_in));
+        }
+    }
+    if !cols.list().is_empty() {
+        ui.separator();
+    }
+    if ui.button("+  New collection…").clicked() {
+        action = Some(Action::NewCollection(paths.to_vec()));
+    }
+    action
+}
+
+/// A collection with no clips yet: how to fill it.
+fn empty_collection(ui: &mut egui::Ui, name: &str) {
+    ui.vertical_centered(|ui| {
+        ui.add_space(ui.available_height() * 0.22);
+        ui.label(egui::RichText::new("🗂").size(40.0));
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new(format!("Nothing in {name} yet")).size(18.0).strong());
+        ui.add_space(4.0);
+        ui.weak("Right-click a clip and choose Add to collection,");
+        ui.weak("or select a few clips and use Add to collection on top.");
+    });
 }
 
 fn file_name_of(path: &Path) -> String {
