@@ -20,6 +20,7 @@ use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use media::pcm::Pcm;
 use media::{ClipInfo, PREVIEW_RATE, TrackEdit};
 
 use crate::proxy::Proxy;
@@ -48,7 +49,7 @@ impl Video {
 }
 
 /// `HESTECLIPS_DEBUG_VIDEO=1`: log what playback does, with times.
-fn debug() -> bool {
+pub fn debug() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("HESTECLIPS_DEBUG_VIDEO").is_some())
 }
@@ -140,7 +141,7 @@ pub struct Player {
     source: PathBuf,
     info: ClipInfo,
     /// The decoded sound, kept to open the clip again under a new name.
-    pcm: Arc<Vec<Vec<f32>>>,
+    pcm: Arc<Pcm>,
     shared: Arc<Shared>,
     _stream: Option<cpal::Stream>,
     pub audio_error: Option<String>,
@@ -185,12 +186,13 @@ pub struct Player {
 }
 
 impl Player {
-    /// `pcm[i]` is source track `i` as interleaved stereo at [`PREVIEW_RATE`].
-    pub fn new(ctx: &egui::Context, source: &Path, info: ClipInfo, pcm: Vec<Vec<f32>>, gains: Vec<TrackEdit>) -> Self {
-        Self::with_pcm(ctx, source, info, Arc::new(pcm), gains)
+    /// `pcm` track `i` is source track `i` as interleaved stereo at
+    /// [`PREVIEW_RATE`]; it may still be filling in (it plays as it's decoded).
+    pub fn new(ctx: &egui::Context, source: &Path, info: ClipInfo, pcm: Arc<Pcm>, gains: Vec<TrackEdit>) -> Self {
+        Self::with_pcm(ctx, source, info, pcm, gains)
     }
 
-    fn with_pcm(ctx: &egui::Context, source: &Path, info: ClipInfo, pcm: Arc<Vec<Vec<f32>>>, gains: Vec<TrackEdit>) -> Self {
+    fn with_pcm(ctx: &egui::Context, source: &Path, info: ClipInfo, pcm: Arc<Pcm>, gains: Vec<TrackEdit>) -> Self {
         let n = pcm.len();
         let shared = Arc::new(Shared {
             pos: AtomicU64::new(0),
@@ -720,20 +722,20 @@ impl Scrub {
     }
 
     /// Source frame `i` of every track, mixed with this slice's gains.
-    fn sample(&self, pcm: &[Vec<f32>], i: usize) -> (f32, f32) {
+    fn sample(&self, pcm: &Pcm, i: usize) -> (f32, f32) {
         let (mut l, mut r) = (0.0, 0.0);
-        for (t, track) in pcm.iter().enumerate() {
-            if let Some(s) = track.get(2 * i..2 * i + 2) {
+        for (t, track) in pcm.tracks().iter().enumerate() {
+            if let Some((a, b)) = track.frame(i) {
                 let g = self.gains.get(t).copied().unwrap_or(1.0);
-                l += s[0] * g;
-                r += s[1] * g;
+                l += a * g;
+                r += b * g;
             }
         }
         (l, r)
     }
 
     /// The next half slice into `made`, the slice taken near `target`.
-    fn make(&mut self, pcm: &[Vec<f32>], tracks: &[TrackEdit], target: usize) {
+    fn make(&mut self, pcm: &Pcm, tracks: &[TrackEdit], target: usize) {
         self.gains.clear();
         self.gains.extend(tracks.iter().map(|tr| tr.gain_at(target as f64 / PREVIEW_RATE as f64)));
         let start = match self.prev {
@@ -787,12 +789,12 @@ impl Scrub {
             self.made.push_back(((t.0 * fade_out + l * fade_in) * norm, (t.1 * fade_out + r * fade_in) * norm));
             self.tail[k] = self.sample(pcm, start + Self::HOP + k);
         }
-        for (t, track) in pcm.iter().enumerate() {
+        for (t, track) in pcm.tracks().iter().enumerate() {
             let g = self.gains.get(t).copied().unwrap_or(1.0);
             let peak = (start..start + Self::HOP)
                 .step_by(8)
-                .filter_map(|i| track.get(2 * i..2 * i + 2))
-                .map(|s| s[0].abs().max(s[1].abs()) * g)
+                .filter_map(|i| track.frame(i))
+                .map(|(l, r)| l.abs().max(r.abs()) * g)
                 .fold(0.0f32, f32::max);
             self.track_peak[t] = peak;
         }
@@ -801,7 +803,7 @@ impl Scrub {
 
     /// Fill `out` following the playhead at `target` (source frames); `active`
     /// false fades out. Returns the master's (peak, rms) and each track's.
-    fn render(&mut self, out: &mut [f32], channels: usize, pcm: &[Vec<f32>], tracks: &[TrackEdit], target: f64, active: bool) -> (f32, f32, Vec<(f32, f32)>) {
+    fn render(&mut self, out: &mut [f32], channels: usize, pcm: &Pcm, tracks: &[TrackEdit], target: f64, active: bool) -> (f32, f32, Vec<(f32, f32)>) {
         let frames = out.len() / channels.max(1);
         if (target - self.last_target).abs() >= 1.0 {
             self.still = 0.0;
@@ -856,7 +858,7 @@ impl Scrub {
 }
 
 /// Opens the default output device and mixes the tracks into it.
-fn start_audio(shared: Arc<Shared>, pcm: Arc<Vec<Vec<f32>>>) -> Result<cpal::Stream, String> {
+fn start_audio(shared: Arc<Shared>, pcm: Arc<Pcm>) -> Result<cpal::Stream, String> {
     let device = cpal::default_host().default_output_device().ok_or("no audio output device")?;
     let supported = device.default_output_config().map_err(|e| e.to_string())?;
     let channels = supported.channels() as usize;
@@ -931,12 +933,12 @@ fn start_audio(shared: Arc<Shared>, pcm: Arc<Vec<Vec<f32>>>) -> Result<cpal::Str
                         gains = tracks.iter().map(|tr| tr.gain_at(t)).collect();
                         next_eval = pos + 256;
                     }
-                    let i = pos as usize * 2;
                     let (mut l, mut r) = (0.0f32, 0.0f32);
-                    for (t, track) in pcm.iter().enumerate() {
-                        if i + 1 < track.len() {
+                    for (t, track) in pcm.tracks().iter().enumerate() {
+                        // Not decoded yet (just opened, jumped far ahead): silence.
+                        if let Some((a, b)) = track.frame(pos as usize) {
                             let g = gains.get(t).copied().unwrap_or(1.0);
-                            let (tl, tr) = (track[i] * g, track[i + 1] * g);
+                            let (tl, tr) = (a * g, b * g);
                             l += tl;
                             r += tr;
                             let a = tl.abs().max(tr.abs());
@@ -1055,6 +1057,7 @@ mod tests {
     /// Scrub with the playhead moving at `speed` × real time for `secs`;
     /// returns the left channel out, at 48 kHz.
     fn scrub(pcm: &[Vec<f32>], speed: f64, secs: f64, start: f64) -> Vec<f32> {
+        let pcm = &*Pcm::from_tracks(pcm.to_vec());
         let rate = 48_000.0;
         let mut s = Scrub::new(rate);
         let tracks = [TrackEdit { index: 0, gain: 1.0, muted: false, points: Vec::new() }];
@@ -1099,6 +1102,7 @@ mod tests {
         let end = still[still.len() - 2400..].iter().fold(0.0f32, |a, &b| a.max(b.abs()));
         assert!(end < 1e-3, "still playing when the playhead stands still ({end})");
 
+        let pcm = Pcm::from_tracks(pcm);
         let rate = 48_000.0;
         let mut s = Scrub::new(rate);
         let tracks = [TrackEdit { index: 0, gain: 1.0, muted: false, points: Vec::new() }];

@@ -6,6 +6,8 @@
 //!
 //! Backed by the `ffmpeg`/`ffprobe` binaries ([`ffmpeg`], [`ffprobe`]).
 
+pub mod pcm;
+
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};

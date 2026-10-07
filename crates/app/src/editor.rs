@@ -9,6 +9,7 @@
 //! renders the edited file in the background; the original is never touched.
 
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
 
 use egui::{Align2, Color32, FontId, Key, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Vec2};
@@ -51,9 +52,10 @@ pub enum EditorOutcome {
 
 struct Loaded {
     info: ClipInfo,
-    pcm: Vec<Vec<f32>>,
-    /// Per source track, for drawing.
-    waves: Vec<Waveform>,
+    /// Every source track, filling in as it's decoded.
+    pcm: Arc<media::pcm::Pcm>,
+    /// Per source track, for drawing, once they're all decoded.
+    waves: Receiver<Vec<Waveform>>,
 }
 
 enum State {
@@ -68,7 +70,9 @@ struct Ready {
     edit: Edit,
     /// What was last saved, to know whether there are unsaved changes.
     saved: Edit,
+    /// Empty until the sound is all decoded (`waves_rx`).
     waves: Vec<Waveform>,
+    waves_rx: Receiver<Vec<Waveform>>,
     strip: Filmstrip,
     /// Smoothed meter values (peak, rms) per track, then master; and peak holds.
     meters: Vec<Meter>,
@@ -139,26 +143,22 @@ impl Editor {
         std::thread::spawn(move || {
             let result = (|| -> Result<Loaded, String> {
                 let info = media::probe(&src).map_err(|e| e.to_string())?;
-                // Every track at once: each is its own ffmpeg.
-                let jobs: Vec<_> = info
-                    .source_tracks()
-                    .iter()
-                    .map(|track| {
-                        let (src, index) = (src.clone(), track.index);
-                        std::thread::spawn(move || {
-                            let samples = media::decode_audio(&src, index).map_err(|e| e.to_string())?;
-                            let wave = Waveform::new(&samples, media::PREVIEW_RATE);
-                            Ok::<_, String>((samples, wave))
-                        })
-                    })
-                    .collect();
-                let mut pcm = Vec::new();
-                let mut waves = Vec::new();
-                for job in jobs {
-                    let (samples, wave) = job.join().map_err(|_| "decoding the audio failed".to_owned())??;
-                    pcm.push(samples);
-                    waves.push(wave);
-                }
+                // Every track at once, playable as it's decoded; the
+                // waveforms follow once it's all there.
+                let tracks: Vec<usize> = info.source_tracks().iter().map(|t| t.index).collect();
+                let (waves_tx, waves) = mpsc::channel();
+                let ctx = repaint.clone();
+                let pcm = media::pcm::decode_streaming(&src, &tracks, info.duration, move |pcm, result| {
+                    if let Err(e) = result {
+                        eprintln!("decoding the sound: {e:#}");
+                    }
+                    let built: Vec<Waveform> = std::thread::scope(|s| {
+                        let jobs: Vec<_> = pcm.tracks().iter().map(|t| s.spawn(|| Waveform::new(&t.to_vec(), media::PREVIEW_RATE))).collect();
+                        jobs.into_iter().map(|j| j.join().unwrap_or_else(|_| Waveform::new(&[], media::PREVIEW_RATE))).collect()
+                    });
+                    let _ = waves_tx.send(built);
+                    ctx.request_repaint();
+                });
                 Ok(Loaded { info, pcm, waves })
             })();
             let _ = tx.send(result);
@@ -261,7 +261,8 @@ impl Ready {
             player,
             saved: edit.clone(),
             edit,
-            waves: l.waves,
+            waves: Vec::new(),
+            waves_rx: l.waves,
             strip,
             meters: vec![Meter::default(); n],
             master: Meter::default(),
@@ -283,6 +284,9 @@ impl Ready {
         // The clip as named in the library; decoding uses `target.source`.
         let source = target.clip.as_path();
         let ctx = ui.ctx().clone();
+        if let Ok(waves) = self.waves_rx.try_recv() {
+            self.waves = waves;
+        }
         self.keyboard(&ctx);
         self.player.set_mix(self.edit.tracks.clone());
 

@@ -18,10 +18,12 @@
 //! session's clips can be reviewed one after another.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use egui::{Align2, Color32, FontId, Key, Pos2, Rect, RichText, Sense, Stroke, Vec2};
+use media::pcm::Pcm;
 use media::{ClipInfo, TrackEdit};
 
 use crate::filmstrip::Filmstrip;
@@ -64,9 +66,10 @@ pub struct Nav {
 
 struct Loaded {
     info: ClipInfo,
-    pcm: Vec<f32>,
-    /// The mix, for the timeline.
-    wave: Waveform,
+    /// The mix, filling in as it's decoded (it plays from the start at once).
+    pcm: Arc<Pcm>,
+    /// The mix's waveform, once it's all decoded.
+    wave: Receiver<Waveform>,
 }
 
 enum State {
@@ -84,7 +87,9 @@ struct Ready {
     info: ClipInfo,
     player: Player,
     strip: Filmstrip,
-    wave: Waveform,
+    /// `None` while the sound is still being decoded.
+    wave: Option<Waveform>,
+    wave_rx: Receiver<Waveform>,
     /// Dragging on the timeline, and whether it was playing when the drag began.
     dragging: Option<bool>,
     /// Last scroll-scrub, and whether it was playing before scrolling began.
@@ -106,18 +111,35 @@ struct Ready {
 
 impl Viewer {
     pub fn open(ctx: &egui::Context, clip: &Path) -> Self {
+        if crate::player::debug() {
+            eprintln!("{:>8.3} viewer: opening {}", crate::player::uptime(), clip.display());
+        }
         let (tx, rx) = mpsc::channel();
         let src = clip.to_path_buf();
         let repaint = ctx.clone();
         std::thread::spawn(move || {
             let result = (|| -> Result<Loaded, String> {
                 let info = media::probe(&src).map_err(|e| e.to_string())?;
-                // Track 1 is the mix in our clips; in any other file it's simply the first.
-                let pcm = match info.audio.first() {
-                    Some(a) => media::decode_audio(&src, a.index).map_err(|e| e.to_string())?,
-                    None => Vec::new(),
-                };
-                let wave = Waveform::new(&pcm, media::PREVIEW_RATE);
+                // Track 1 is the mix in our clips; in any other file it's simply
+                // the first. Playing starts with what's decoded: no waiting for
+                // the whole file to be read.
+                let tracks: Vec<usize> = info.audio.first().map(|a| a.index).into_iter().collect();
+                let (wave_tx, wave) = mpsc::channel();
+                let ctx = repaint.clone();
+                if crate::player::debug() {
+                    eprintln!("{:>8.3} viewer: clip read", crate::player::uptime());
+                }
+                let pcm = media::pcm::decode_streaming(&src, &tracks, info.duration, move |pcm, result| {
+                    if let Err(e) = result {
+                        eprintln!("decoding the sound: {e:#}");
+                    }
+                    if crate::player::debug() {
+                        eprintln!("{:>8.3} viewer: sound all decoded", crate::player::uptime());
+                    }
+                    let samples = pcm.tracks().first().map(|t| t.to_vec()).unwrap_or_default();
+                    let _ = wave_tx.send(Waveform::new(&samples, media::PREVIEW_RATE));
+                    ctx.request_repaint();
+                });
                 Ok(Loaded { info, pcm, wave })
             })();
             let _ = tx.send(result);
@@ -289,8 +311,7 @@ impl Viewer {
 impl Ready {
     fn new(ctx: &egui::Context, clip: &Path, l: Loaded) -> Self {
         let volume = volume(ctx).unwrap_or((1.0, false));
-        let tracks = if l.pcm.is_empty() { Vec::new() } else { vec![l.pcm] };
-        let mut player = Player::new(ctx, clip, l.info.clone(), tracks, Vec::new());
+        let mut player = Player::new(ctx, clip, l.info.clone(), l.pcm, Vec::new());
         // Dev aid: `HESTECLIPS_START_AT=<seconds>` starts there (to check a
         // stretch of a clip without scrubbing to it).
         if let Some(t) = std::env::var("HESTECLIPS_START_AT").ok().and_then(|s| s.parse::<f64>().ok()) {
@@ -302,7 +323,8 @@ impl Ready {
             strip: Filmstrip::build(ctx, clip, &l.info),
             info: l.info,
             player,
-            wave: l.wave,
+            wave: None,
+            wave_rx: l.wave,
             dragging: None,
             scrolled: None,
             glide: Default::default(),
@@ -516,11 +538,17 @@ impl Ready {
         p.rect_filled(video, 4, v.extreme_bg_color);
         self.strip.paint(ui, video, 0.0, dur, dur);
         p.rect_filled(audio, 4, v.extreme_bg_color);
-        if self.wave.is_empty() {
-            p.text(audio.center(), Align2::CENTER_CENTER, "No sound", FontId::proportional(12.0), Color32::from_gray(110));
-        } else {
+        if let Ok(wave) = self.wave_rx.try_recv() {
+            self.wave = Some(wave);
+        }
+        match &self.wave {
+            // Still being decoded (it already plays): drawn when it's all there.
+            None => {}
+            Some(w) if w.is_empty() => {
+                p.text(audio.center(), Align2::CENTER_CENTER, "No sound", FontId::proportional(12.0), Color32::from_gray(110));
+            }
             // Coloured like the meters, so loud moments stand out.
-            self.wave.paint(&ui.painter_at(audio), audio, (0.0, dur), |_| 1.0, |_, rms| zone(meter::to_db(rms)));
+            Some(w) => w.paint(&ui.painter_at(audio), audio, (0.0, dur), |_| 1.0, |_, rms| zone(meter::to_db(rms))),
         }
 
         // Already-played part of the levels, lightly marked, so where you are reads at a glance.
