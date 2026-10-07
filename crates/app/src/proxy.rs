@@ -119,8 +119,11 @@ impl Build {
         let complete = self.complete.load(Ordering::Relaxed) && !self.stop.load(Ordering::Relaxed);
         if let (true, Some(path)) = (complete, &self.cache) {
             let t = std::time::Instant::now();
-            let f = self.frames.lock().unwrap();
-            match cache::save(path, &f) {
+            // A copy of the list (the pictures are shared, not copied), so the
+            // lock isn't held while hundreds of MB go to disk: the player reads
+            // these every frame, and froze for seconds while it was.
+            let frames = self.frames.lock().unwrap().frames.clone();
+            match cache::save(path, &frames) {
                 Err(e) => eprintln!("scrub proxy: couldn't keep it: {e}"),
                 Ok(()) if std::env::var_os("HESTECLIPS_DEBUG_VIDEO").is_some() => {
                     eprintln!("{:>8.3} scrub proxy: kept on disk in {:.0} ms", crate::player::uptime(), t.elapsed().as_secs_f64() * 1000.0);
@@ -678,13 +681,12 @@ mod cache {
         dir().join(format!("{key:016x}.proxy"))
     }
 
-    pub fn save(path: &Path, store: &Store) -> std::io::Result<()> {
+    pub fn save(path: &Path, frames: &[Option<Jpeg>]) -> std::io::Result<()> {
         std::fs::create_dir_all(dir())?;
         // Each frame once, however many slots show it.
         let mut index = HashMap::<*const u8, u32>::new();
         let mut unique: Vec<&Jpeg> = Vec::new();
-        let slots: Vec<u32> = store
-            .frames
+        let slots: Vec<u32> = frames
             .iter()
             .map(|f| match f {
                 None => u32::MAX,
@@ -796,7 +798,7 @@ mod cache {
             store.set(1, &a);
             store.set(3, &j(2));
             let path = std::env::temp_dir().join(format!("hesteclips-proxy-test-{}.proxy", std::process::id()));
-            save(&path, &store).unwrap();
+            save(&path, &store.frames).unwrap();
             let back = load(&path, 4).expect("reads back");
             assert_eq!(back.ready, 3);
             assert_eq!(back.frames[1].as_deref(), Some(&[1u8, 1, 1][..]));
