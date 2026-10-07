@@ -1,4 +1,4 @@
-//! `HESTEFILES_TOKEN=… cargo run -p hestefiles --example upload -- <file> [base_id] [path] [name]`
+//! `HESTEFILES_TOKEN=… [HESTEFILES_PUBLIC=1] cargo run -p hestefiles --example upload -- <file> [base_id] [path] [name]`
 use std::sync::atomic::AtomicBool;
 
 fn main() {
@@ -9,7 +9,8 @@ fn main() {
     let base = args.next().unwrap_or_else(|| "root".into());
     let path = args.next().unwrap_or_default();
     let name = args.next().unwrap_or_else(|| file.file_name().unwrap().to_string_lossy().into_owned());
+    let public = std::env::var_os("HESTEFILES_PUBLIC").is_some();
     let t = std::time::Instant::now();
-    let result = client.upload(&file, &base, &path, &name, &AtomicBool::new(false), |p| eprintln!("{p:?}"));
+    let result = client.upload(&file, &base, &path, &name, public, &AtomicBool::new(false), |p| eprintln!("{p:?}"));
     println!("{result:?} in {:.1}s", t.elapsed().as_secs_f64());
 }

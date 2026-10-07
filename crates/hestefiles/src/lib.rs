@@ -276,15 +276,20 @@ impl Client {
     /// `progress` is called as chunks go up and while the server merges them;
     /// setting `cancel` stops between chunks. A chunk that fails for a network
     /// reason is retried a few times before giving up.
+    ///
+    /// With `make_public`, the file gets a public link anyone can view and
+    /// download it with, which is returned.
+    #[allow(clippy::too_many_arguments)]
     pub fn upload(
         &self,
         file: &Path,
         base_folder_id: &str,
         path: &str,
         filename: &str,
+        make_public: bool,
         cancel: &AtomicBool,
         mut progress: impl FnMut(UploadProgress),
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         let mut f = std::fs::File::open(file)?;
         let size = f.metadata()?.len();
         let chunk = self.chunk_size().unwrap_or(MAX_CHUNK);
@@ -296,6 +301,7 @@ impl Client {
             path: &'a str,
             size: u64,
             chunk_size: u64,
+            make_public: bool,
         }
         #[derive(Deserialize)]
         struct Prepared {
@@ -306,7 +312,7 @@ impl Client {
             self.agent
                 .post(format!("{}/prepare_upload", self.base_url))
                 .header("X-AccountToken", &self.token)
-                .send_json(Prepare { filename, base_folder_id, path: path.trim_matches('/'), size, chunk_size: chunk })?,
+                .send_json(Prepare { filename, base_folder_id, path: path.trim_matches('/'), size, chunk_size: chunk, make_public })?,
         )?;
 
         // The server doesn't check chunk sizes, so send exactly `chunk` bytes
@@ -343,6 +349,9 @@ impl Client {
             percent: f64,
             error: bool,
             done: bool,
+            /// Set once done, when the upload asked to be made public.
+            #[serde(default)]
+            public_link: Option<String>,
         }
         let started = Instant::now();
         loop {
@@ -358,7 +367,7 @@ impl Client {
             }
             progress(UploadProgress::Merging { percent: status.percent.clamp(0.0, 100.0) as u8 });
             if status.done {
-                return Ok(());
+                return Ok(status.public_link);
             }
             // Merging is quick (a few MB a second at worst); don't wait forever.
             if started.elapsed() > Duration::from_secs(600) {

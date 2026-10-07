@@ -247,6 +247,11 @@ impl App {
                     subfolder = Some(game.clone());
                 }
             }
+            ui.add_space(if game.is_some() { 2.0 } else { 8.0 });
+            let mut public = self.cloud.public_links;
+            ui.checkbox(&mut public, "Make a public link")
+                .on_hover_text("Anyone with the link can watch and download the clip. It's copied for you when the upload is done.");
+            self.cloud.set_public_links(public);
             ui.add_space(12.0);
             let busy = self.cloud.upload_for(&share.clip).is_some();
             ui.horizontal(|ui| {
@@ -258,7 +263,7 @@ impl App {
                     .on_disabled_hover_text(if busy { "This clip is already uploading." } else { "Choose a folder you can save into." });
                 if r.clicked() {
                     if let Some(to) = destination.clone() {
-                        self.cloud.upload(share.clip.clone(), to, subfolder.clone());
+                        self.cloud.upload(share.clip.clone(), to, subfolder.clone(), public);
                         keep_open = false;
                     }
                 }

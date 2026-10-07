@@ -65,6 +65,9 @@ struct Config {
     /// Upload clips into a folder for their game (inside the folder picked).
     #[serde(default = "yes")]
     game_folders: bool,
+    /// Give uploads a public link (copied when done), as last chosen.
+    #[serde(default)]
+    public_links: bool,
 }
 
 fn yes() -> bool {
@@ -73,7 +76,7 @@ fn yes() -> bool {
 
 impl Default for Config {
     fn default() -> Self {
-        Self { default_folder: None, game_folders: true }
+        Self { default_folder: None, game_folders: true, public_links: false }
     }
 }
 
@@ -100,7 +103,8 @@ enum Evt {
     /// A folder made in the browser: where, its name, and whether it was
     /// there already.
     FolderMade { parent: FolderRef, name: String, result: Result<bool, String> },
-    Uploaded { id: u64, result: Result<(), String> },
+    /// Its public link, when one was asked for.
+    Uploaded { id: u64, result: Result<Option<String>, String> },
 }
 
 /// A clip on its way to HesteFiles.
@@ -132,7 +136,8 @@ impl Upload {
 
 /// How an upload ended, for the app to tell the user.
 pub enum UploadDone {
-    Uploaded { clip: PathBuf, to: FolderRef },
+    /// `link`: the public link, when one was asked for.
+    Uploaded { clip: PathBuf, to: FolderRef, link: Option<String> },
     Failed { clip: PathBuf, error: String },
     Cancelled { clip: PathBuf },
 }
@@ -167,6 +172,8 @@ pub struct Cloud {
     pub default_folder: Option<FolderRef>,
     /// Upload clips into a folder for their game, as last chosen.
     pub game_folders: bool,
+    /// Give uploads a public link, as last chosen.
+    pub public_links: bool,
     pub browser: FolderBrowser,
     pub uploads: Vec<Upload>,
     next_upload: u64,
@@ -191,6 +198,7 @@ impl Cloud {
             token_input: String::new(),
             default_folder: config.default_folder,
             game_folders: config.game_folders,
+            public_links: config.public_links,
             browser: FolderBrowser::default(),
             uploads: Vec::new(),
             next_upload: 0,
@@ -259,8 +267,16 @@ impl Cloud {
         }
     }
 
+    pub fn set_public_links(&mut self, on: bool) {
+        if self.public_links != on {
+            self.public_links = on;
+            self.save_config();
+        }
+    }
+
     fn save_config(&self) {
-        let config = Config { default_folder: self.default_folder.clone(), game_folders: self.game_folders };
+        let config =
+            Config { default_folder: self.default_folder.clone(), game_folders: self.game_folders, public_links: self.public_links };
         if let (Some(path), Ok(json)) = (config_path(), serde_json::to_vec_pretty(&config)) {
             if let Some(dir) = path.parent() {
                 let _ = std::fs::create_dir_all(dir);
@@ -318,7 +334,7 @@ impl Cloud {
                     let Some(i) = self.uploads.iter().position(|u| u.id == id) else { continue };
                     let up = self.uploads.remove(i);
                     self.finished.push(match result {
-                        Ok(()) => UploadDone::Uploaded { clip: up.clip, to: up.to },
+                        Ok(link) => UploadDone::Uploaded { clip: up.clip, to: up.to, link },
                         Err(_) if up.cancel.load(Ordering::Relaxed) => UploadDone::Cancelled { clip: up.clip },
                         Err(error) => UploadDone::Failed { clip: up.clip, error },
                     });
@@ -330,8 +346,8 @@ impl Cloud {
     /// Start uploading `clip` into `to` in the background. Its progress shows on
     /// the clip's card; how it ended comes back from [`Cloud::take_finished`].
     /// Upload `clip` to `to`, or to a folder named `subfolder` in it (made if
-    /// it isn't there; a game's).
-    pub fn upload(&mut self, clip: PathBuf, to: FolderRef, subfolder: Option<String>) {
+    /// it isn't there; a game's). With `public`, it gets a public link.
+    pub fn upload(&mut self, clip: PathBuf, to: FolderRef, subfolder: Option<String>, public: bool) {
         let Some(client) = self.client.clone() else { return };
         let id = self.next_upload;
         self.next_upload += 1;
@@ -347,7 +363,7 @@ impl Cloud {
                 None => Ok(()),
             };
             let result = made
-                .and_then(|()| client.upload(&clip, &to.base_id, &to.path, &name, &cancel, |p| {
+                .and_then(|()| client.upload(&clip, &to.base_id, &to.path, &name, public, &cancel, |p| {
                     // Sending is ~95% of the bar; the server's merge fills the rest.
                     let f = match p {
                         UploadProgress::Sending { sent, total } => 0.95 * sent as f32 / total.max(1) as f32,

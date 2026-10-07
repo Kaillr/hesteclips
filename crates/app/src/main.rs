@@ -1292,8 +1292,12 @@ impl App {
     fn pump_uploads(&mut self) {
         for done in self.cloud.take_finished() {
             match done {
-                cloud::UploadDone::Uploaded { clip, to } => {
+                cloud::UploadDone::Uploaded { clip, to, link: None } => {
                     self.toast(format!("Uploaded {} to {}", file_name(&clip), to.display()));
+                }
+                cloud::UploadDone::Uploaded { clip, link: Some(link), .. } => {
+                    self.ctx().copy_text(link);
+                    self.toast(format!("Uploaded {}. Public link copied", file_name(&clip)));
                 }
                 cloud::UploadDone::Failed { clip, error } => {
                     self.toast_error(format!("Couldn't upload {}: {error}", file_name(&clip)));
