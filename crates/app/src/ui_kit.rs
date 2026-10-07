@@ -55,8 +55,10 @@ pub fn apply(ctx: &egui::Context) {
         v.widgets.inactive.fg_stroke.color = text;
         v.weak_text_color = Some(weak);
         v.selection.bg_fill = ACCENT.gamma_multiply(if dark { 0.55 } else { 0.35 });
-        // The outline of a focused text field.
-        v.selection.stroke = Stroke::new(1.0, ACCENT);
+        // egui uses this for the text on a selected option *and* a focused
+        // field's outline: light, so selected text reads on the blue
+        // (an accent colour here made it blue on blue).
+        v.selection.stroke = Stroke::new(1.0, if dark { Color32::from_gray(235) } else { Color32::from_gray(20) });
         v.hyperlink_color = ACCENT;
         v.window_corner_radius = CornerRadius::same(CARD_RADIUS);
         v.menu_corner_radius = CornerRadius::same(8);
