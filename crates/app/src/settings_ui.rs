@@ -139,7 +139,7 @@ impl App {
                     toggle(ui, &mut self.settings.folder_per_game);
                 });
                 divider(ui);
-                let hint = "Clips get names like \"3 kills on Mirage\", \"Pentakill as Jinx\" or \"98.52% FC · 412pp · +HDDT · FREEDOM DiVE [FOUR DIMENSIONS]\". Clips where nothing happened keep their usual name.";
+                let hint = "Clips get names like \"3 kills on Mirage\", \"Pentakill as Jinx\" or \"412pp · 98.52% FC · +HDDT · FREEDOM DiVE [FOUR DIMENSIONS]\". Clips where nothing happened keep their usual name.";
                 row(ui, "Name clips after what happened", Some(hint), |ui| {
                     toggle(ui, &mut self.settings.game_details);
                 });

@@ -1,4 +1,4 @@
-//! osu!: what was played in a clip, for its name — "98.52% FC · 412pp ·
+//! osu!: what was played in a clip, for its name — "412pp · 98.52% FC ·
 //! +HDDT · Freedom Dive [FOUR DIMENSIONS]".
 //!
 //! osu! has no API of its own; tosu (or the older gosumemory) reads it and
@@ -186,16 +186,17 @@ fn name(play: &Play, f: &GameTitles) -> String {
     let stats = play.stats.as_ref();
     match play.outcome {
         Outcome::Passed => {
+            // pp, then misses, then accuracy.
             if let Some(s) = stats {
+                if f.osu_pp && s.pp > 0.0 {
+                    parts.push(format!("{:.0}pp", s.pp));
+                }
                 if f.osu_accuracy {
-                    let fc = s.misses == 0 && s.slider_breaks == 0;
-                    parts.push(format!("{}{}", accuracy(s.accuracy), if fc { " FC" } else { "" }));
                     if s.misses > 0 {
                         parts.push(if s.misses == 1 { "1 miss".into() } else { format!("{} misses", s.misses) });
                     }
-                }
-                if f.osu_pp && s.pp > 0.0 {
-                    parts.push(format!("{:.0}pp", s.pp));
+                    let fc = s.misses == 0 && s.slider_breaks == 0;
+                    parts.push(format!("{}{}", accuracy(s.accuracy), if fc { " FC" } else { "" }));
                 }
             }
         }
@@ -475,7 +476,7 @@ mod tests {
             t.update(at(s), other());
         }
         let title = t.title(at(0), at(55), &fields());
-        assert_eq!(title.as_deref(), Some("98.52% FC · 412pp · +HDDT · FREEDOM DiVE [FOUR DIMENSIONS]"));
+        assert_eq!(title.as_deref(), Some("412pp · 98.52% FC · +HDDT · FREEDOM DiVE [FOUR DIMENSIONS]"));
         // Long after, nothing of it is in the clip.
         assert_eq!(t.title(at(100), at(130), &fields()), None);
     }
@@ -529,7 +530,7 @@ mod tests {
             on_results: false,
         };
         let title = name(&play, &fields());
-        assert!(title.starts_with("97.10% · 3 misses · 350pp · aaa"), "{title}");
+        assert!(title.starts_with("350pp · 3 misses · 97.10% · aaa"), "{title}");
         assert_eq!(title.chars().count(), MAX_TITLE);
         assert!(title.ends_with('…'));
     }
