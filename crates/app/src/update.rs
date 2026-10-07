@@ -2,7 +2,7 @@
 //!
 //! Releases are published to GitHub by the release workflow and installed with
 //! Velopack (per user, no admin prompt). The installed app checks in the
-//! background, downloads a new version quietly and installs it the next time
+//! background (at launch, then every half hour), downloads a new version quietly and installs it the next time
 //! you quit — nothing ever interrupts a game or a recording. Once one is
 //! downloaded, an "Update ready" button offers to restart into it now.
 //!
@@ -25,11 +25,15 @@ use std::time::Duration;
 /// Where releases are published.
 pub const REPO: &str = "https://github.com/Kaillr/hesteclips";
 
-/// First check after launch: late enough not to slow start-up.
-const FIRST_CHECK_AFTER: Duration = Duration::from_secs(10);
-/// Then this often while the app runs (a guess: often enough that an app left
-/// open for days still finds updates, rare enough to be no load on GitHub).
-const CHECK_EVERY: Duration = Duration::from_secs(4 * 60 * 60);
+/// First check after launch: right away, but after the window is up.
+const FIRST_CHECK_AFTER: Duration = Duration::from_secs(3);
+/// Then this often while the app runs, so a release made while it's open is
+/// found the same session (GitHub allows 60 unauthenticated API calls an hour
+/// per address; this is 2). A guess, like the retry below.
+const CHECK_EVERY: Duration = Duration::from_secs(30 * 60);
+/// After a failed check (offline, GitHub busy): try again soon rather than
+/// at the next regular check.
+const RETRY_AFTER: Duration = Duration::from_secs(2 * 60);
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Status {
@@ -189,13 +193,19 @@ fn run(m: velopack::UpdateManager, shared: Arc<Mutex<Shared>>, check_now: mpsc::
         }
         set(Status::Checking);
         let update = match m.check_for_updates() {
-            Ok(velopack::UpdateCheck::UpdateAvailable(info)) => info,
+            Ok(velopack::UpdateCheck::UpdateAvailable(info)) => {
+                eprintln!("{} update check: {} is out, downloading it", clock(), info.TargetFullRelease.Version);
+                info
+            }
             Ok(_) => {
+                eprintln!("{} update check: up to date ({})", clock(), m.get_current_version_as_string());
                 set(Status::UpToDate);
                 continue;
             }
             Err(e) => {
+                eprintln!("{} update check failed: {e}", clock());
                 set(Status::Failed(format!("Couldn't check for updates: {e}")));
+                wait = RETRY_AFTER;
                 continue;
             }
         };
@@ -220,7 +230,17 @@ fn run(m: velopack::UpdateManager, shared: Arc<Mutex<Shared>>, check_now: mpsc::
                 s.ready = Some(asset);
                 ctx.request_repaint();
             }
-            Err(e) => set(Status::Failed(format!("Couldn't download the update: {e}"))),
+            Err(e) => {
+                eprintln!("{} update download failed: {e}", clock());
+                set(Status::Failed(format!("Couldn't download the update: {e}")));
+                wait = RETRY_AFTER;
+            }
         }
     }
+}
+
+/// The time of day, for the log.
+#[cfg(windows)]
+fn clock() -> String {
+    chrono::Local::now().format("%H:%M:%S").to_string()
 }
