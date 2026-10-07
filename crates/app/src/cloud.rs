@@ -432,7 +432,7 @@ impl Cloud {
 
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
-            if ui.link("☁ HesteFiles").clicked() {
+            if ui.link("HesteFiles").clicked() {
                 go = Some(None);
             }
             if let Some(at) = &self.browser.at {
@@ -475,10 +475,10 @@ impl Cloud {
                 },
                 Some(at) => {
                     if let Some(parent) = at.parent() {
-                        if ui.selectable_label(false, "⬆ ..").clicked() {
+                        if ui.selectable_label(false, "..").clicked() {
                             go = Some(Some(parent));
                         }
-                    } else if ui.selectable_label(false, "⬆ All folders").clicked() {
+                    } else if ui.selectable_label(false, "All folders").clicked() {
                         go = Some(None);
                     }
                     match &self.browser.listing {
@@ -493,7 +493,7 @@ impl Cloud {
                         }
                         Some(Ok((names, _))) => {
                             for name in names {
-                                if ui.selectable_label(false, format!("📁 {name}")).clicked() {
+                                if ui.selectable_label(false, format!("{name}")).clicked() {
                                     go = Some(Some(at.child(name)));
                                 }
                             }
@@ -520,7 +520,7 @@ impl Cloud {
     fn new_folder_ui(&mut self, ui: &mut egui::Ui, at: &FolderRef) {
         ui.add_space(4.0);
         let Some(n) = &mut self.browser.new_folder else {
-            if ui.button("➕  New folder").clicked() {
+            if ui.button("New folder").clicked() {
                 self.browser.new_folder = Some(NewFolder::default());
             }
             return;

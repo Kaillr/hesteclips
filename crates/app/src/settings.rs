@@ -301,14 +301,6 @@ impl AudioSourceCfg {
             noise_removal: false,
         }
     }
-
-    pub fn icon(&self) -> &'static str {
-        match self.kind {
-            SourceKind::Microphone { .. } => "🎤",
-            SourceKind::Desktop { .. } => "🖥",
-            SourceKind::App { .. } => "🎮",
-        }
-    }
 }
 
 /// A short random-ish id for a new source.

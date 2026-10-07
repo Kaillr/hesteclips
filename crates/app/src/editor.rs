@@ -15,7 +15,7 @@ use std::sync::mpsc::{self, Receiver};
 use egui::{Align2, Color32, FontId, Key, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Vec2};
 use media::{ClipInfo, Edit};
 
-use crate::library::{ACCENT, REC_RED};
+use crate::library::REC_RED;
 use crate::filmstrip::Filmstrip;
 use crate::player::Player;
 use crate::waveform::Waveform;
@@ -339,7 +339,7 @@ impl Ready {
                     self.save_as = Some((suggested, None));
                 }
                 // How the saved file is made: applies to Done and Save as new.
-                let export = crate::header::button(&format!("⚙ Export: {}", crate::export_ui::summary(&self.info, &self.edit)), false)
+                let export = crate::header::button(&format!("Export: {}", crate::export_ui::summary(&self.info, &self.edit)), false)
                     .selected(self.edit.output != media::Output::default());
                 let export = ui.add(export).on_hover_text("Export settings: resolution, frame rate, quality, a size to fit under, audio tracks");
                 if export.clicked() {
@@ -364,7 +364,7 @@ impl Ready {
                 }
                 let has_saved_edit = target.source != target.clip;
                 if (has_saved_edit || changed)
-                    && ui.add(crate::header::button("↺ Revert", false)).on_hover_text("Undo every edit and go back to the original recording").clicked()
+                    && ui.add(crate::header::button("Revert", false)).on_hover_text("Undo every edit and go back to the original recording").clicked()
                 {
                     self.player.pause();
                     outcome = EditorOutcome::Reverted(target.clone());
@@ -374,7 +374,7 @@ impl Ready {
                 }
                 ui.add_space(12.0);
                 let stem = source.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-                if crate::header::title(ui, &crate::clips::title_for_stem(&stem), Some("✂ Editing")) {
+                if crate::header::title(ui, &crate::clips::title_for_stem(&stem), Some("Editing")) {
                     outcome = EditorOutcome::Rename;
                 }
             });
@@ -472,10 +472,9 @@ impl Ready {
                 if let Some(e) = err.as_ref() {
                     ui.colored_label(ui.visuals().error_fg_color, e);
                 }
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    let save = egui::Button::new(RichText::new("Save new clip").color(Color32::WHITE)).fill(ACCENT);
-                    if ui.add(save).clicked() {
+                ui.add_space(12.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add(crate::ui_kit::button("Save new clip", true)).clicked() {
                         submit = true;
                     }
                     if ui.button("Cancel").clicked() {
@@ -504,18 +503,18 @@ impl Ready {
                 ui.set_width(340.0);
                 ui.heading("Discard changes?");
                 ui.label("Your changes to this clip haven't been saved.");
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Save").clicked() {
+                ui.add_space(12.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add(crate::ui_kit::button("Save", true)).clicked() {
                         self.player.pause();
                         outcome = self.save(target, None);
                         self.confirm_discard = false;
                     }
-                    if ui.button("Discard").clicked() {
-                        outcome = EditorOutcome::Close;
+                    if ui.add(crate::ui_kit::button("Keep editing", false)).clicked() {
                         self.confirm_discard = false;
                     }
-                    if ui.button("Keep editing").clicked() {
+                    if ui.add(crate::ui_kit::button("Discard", false)).clicked() {
+                        outcome = EditorOutcome::Close;
                         self.confirm_discard = false;
                     }
                 });
@@ -774,7 +773,7 @@ impl Ready {
 
         // --- Video lane ---
         let video = Rect::from_min_size(Pos2::new(lanes.left(), ruler.bottom()), Vec2::new(lanes.width(), video_h));
-        lane_header(&p, &v, Rect::from_min_max(Pos2::new(outer.left(), video.top()), Pos2::new(lanes.left() - 6.0, video.bottom())), "🎬 Video", None);
+        lane_header(&p, &v, Rect::from_min_max(Pos2::new(outer.left(), video.top()), Pos2::new(lanes.left() - 6.0, video.bottom())), "Video", None);
         p.rect_filled(video, 4, v.extreme_bg_color);
         self.strip.paint(ui, video, v0, v0 + span, dur);
         // Scrub-proxy progress: a thin bar until every frame is scrubbable.
@@ -867,7 +866,7 @@ impl Ready {
             } else {
                 format!("{} keyframes", track.points.len())
             };
-            lane_header(&ap, &v, head, &format!("🔊 {name}"), Some(&db_text));
+            lane_header(&ap, &v, head, &format!("{name}"), Some(&db_text));
             // Detached child Uis so these overlay buttons don't affect layout,
             // clipped like the lanes when scrolled partly out of view.
             let mut put = |rect: Rect, b: egui::Button| {
@@ -1073,7 +1072,23 @@ impl Ready {
             };
             ui.label(RichText::new(txt).size(12.0).color(color));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.weak("Ctrl+scroll to zoom, Shift+scroll to pan · drag the yellow line to set volume · double-click to add a keyframe · right-click one to remove it");
+                crate::ui_kit::shortcuts_button(
+                    ui,
+                    &[
+                        ("Space", "Play or pause"),
+                        ("← →", "One frame back or ahead"),
+                        ("Shift + ← →", "One second back or ahead"),
+                        ("I  O", "Set the start or end here"),
+                        ("Home End", "Go to the start or end"),
+                        ("Ctrl + scroll", "Zoom the timeline"),
+                        ("+  −  \\", "Zoom in, out, or to fit"),
+                        ("Shift + scroll", "Move along the timeline"),
+                        ("Drag the yellow line", "Change a track's volume"),
+                        ("Double-click it", "Add a volume point"),
+                        ("Right-click a point", "Remove it"),
+                        ("F2", "Rename"),
+                    ],
+                );
             });
         });
     }

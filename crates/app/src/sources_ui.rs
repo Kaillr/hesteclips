@@ -89,23 +89,12 @@ impl App {
             ui.ctx().request_repaint_after(Duration::from_millis(16));
         }
 
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            // Centred column that follows the window, up to a comfortable width.
-            let width = ui.available_width().min(MAX_WIDTH);
-            let pad = ((ui.available_width() - width) / 2.0).max(0.0);
-            ui.horizontal(|ui| {
-                ui.add_space(pad);
-                ui.vertical(|ui| {
-                    ui.set_width(width);
-                    self.sources_column(ui, now, dt);
-                });
-            });
-        });
+        crate::ui_kit::page(ui, "sources_page", MAX_WIDTH, |ui| self.sources_column(ui, now, dt));
         self.live_audio.set_limiter(self.settings.limiter);
     }
 
     fn sources_column(&mut self, ui: &mut egui::Ui, now: Instant, dt: f32) {
-        ui.add_space(12.0);
+        ui.add_space(16.0);
         if capture::preview::AVAILABLE {
             self.video_card(ui);
             ui.add_space(12.0);
@@ -119,14 +108,14 @@ impl App {
         ui.add_space(18.0);
 
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Audio sources").size(16.0).strong());
+            ui.label(RichText::new("Audio sources").size(15.0).strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("⟳ Refresh devices").on_hover_text("Look again for microphones you've plugged in.").clicked() {
+                if ui.button("Refresh devices").on_hover_text("Look again for microphones you've plugged in.").clicked() {
                     self.refresh_audio_devices();
                 }
             });
         });
-        ui.weak("Aim for speech peaking around -12 dB and staying out of the red.");
+        crate::ui_kit::hint(ui, "Aim for speech peaking around -12 dB, out of the red.");
         ui.add_space(8.0);
 
         let mut remove = None;
@@ -177,7 +166,7 @@ impl App {
 
         if self.rec_state != crate::RecState::Idle {
             ui.add_space(10.0);
-            ui.weak(match self.rec_state {
+            crate::ui_kit::hint(ui, match self.rec_state {
                 crate::RecState::Recording => "Volume, mute and noise removal change right away. Stop recording to add, remove or change sources.",
                 _ => "Volume, mute and noise removal change right away. Stop the replay buffer to add, remove or change sources.",
             });
@@ -236,7 +225,7 @@ impl App {
         // Wraps onto two lines in a narrow window.
         ui.add_enabled_ui(idle, |ui| ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("Add").strong());
-            if ui.button("🎤 Microphone").clicked() {
+            if ui.button("Microphone").clicked() {
                 let n = self.settings.audio_sources.iter().filter(|s| matches!(s.kind, SourceKind::Microphone { .. })).count();
                 let name = if n == 0 { "Microphone".to_owned() } else { format!("Microphone {}", n + 1) };
                 self.settings.audio_sources.push(AudioSourceCfg::new(
@@ -244,7 +233,7 @@ impl App {
                     SourceKind::Microphone { device: capture::audio::DEFAULT_DEVICE.into() },
                 ));
             }
-            let menu = ui.menu_button("🎮 App", |ui| {
+            let menu = ui.menu_button("App", |ui| {
                 ui.set_min_width(240.0);
                 ui.weak("Record one app on its own — a game, Discord, music.");
                 ui.separator();
@@ -278,7 +267,7 @@ impl App {
                 self.sources_view.apps = capture::list_apps();
             }
             let has_desktop = self.settings.audio_sources.iter().any(|s| matches!(s.kind, SourceKind::Desktop { .. }));
-            if !has_desktop && ui.button("🖥 Desktop sound").clicked() {
+            if !has_desktop && ui.button("Desktop sound").clicked() {
                 self.settings
                     .audio_sources
                     .push(AudioSourceCfg::new("Desktop", SourceKind::Desktop { exclude_apps: true }));
@@ -314,7 +303,7 @@ impl App {
 
         card(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("🖵 Video").size(16.0).strong());
+                ui.label(RichText::new("Video").size(15.0).strong());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if let Some(f) = &frame {
                         let rate = self.sources_view.preview_rate.2;
@@ -333,7 +322,7 @@ impl App {
             let stop_first = self.stop_first();
             if capture::APP_CAPTURE {
                 ui.add_enabled_ui(idle, |ui| {
-                    let (screen, apps) = segmented(ui, ["🖥  Whole screen", "🎮  Games and apps"], usize::from(apps_mode));
+                    let (screen, apps) = segmented(ui, ["Whole screen", "Games and apps"], usize::from(apps_mode));
                     {
                         if screen.on_hover_text("Everything on one display.").on_disabled_hover_text(stop_first).clicked() && apps_mode {
                             let apps = std::mem::replace(&mut self.settings.capture, CaptureTarget::Screen);
@@ -564,7 +553,7 @@ impl App {
             list.remove(i);
         }
         ui.add_space(8.0);
-        let add = ui.menu_button(RichText::new("➕  Add game or app").size(14.0), |ui| {
+        let add = ui.menu_button(RichText::new("Add game or app").size(14.0), |ui| {
             ui.set_min_width(260.0);
             ui.weak("Open apps with a window");
             ui.separator();
@@ -605,7 +594,7 @@ impl App {
             ui.add_space(6.0);
             ui.horizontal_wrapped(|ui| {
                 let names = if silent.len() == 1 { format!("{}'s sound isn't", silent[0].name) } else { "Their sound isn't".to_owned() };
-                ui.label(RichText::new(format!("🔈 {names} in your clips yet.")).color(weak));
+                ui.label(RichText::new(format!("{names} in your clips yet.")).color(weak));
                 if ui.link("Add it to the audio sources").clicked() {
                     for a in &silent {
                         self.settings
@@ -641,7 +630,7 @@ impl App {
         let limiting = self.settings.limiter && view.limiting_at.is_some_and(|t| now - t < LIMIT_HOLD);
         card(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("🔊 Clip mix").size(16.0).strong())
+                ui.label(RichText::new("Clip mix").size(15.0).strong())
                     .on_hover_text("Every source marked \"In the clip\", mixed: what people hear when you share a clip.");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     meter::fixed_label(ui, 64.0, &format!("{} dB", view.master.readout()), view.master.readout_color(ui.visuals()), "Highest peak in the last 3 seconds (dBFS)");
@@ -769,7 +758,7 @@ fn source_card(
                     *renaming = None;
                 }
             } else {
-                let title = RichText::new(format!("{} {}", source.icon(), source.name)).size(15.0).strong();
+                let title = RichText::new(&source.name).size(14.0).strong();
                 let title = if source.enabled { title } else { title.weak() };
                 let r = ui.add(egui::Label::new(title).truncate().sense(Sense::click()));
                 if r.on_hover_text("Double-click to rename").double_clicked() {
@@ -897,14 +886,14 @@ fn source_card(
                 );
                 ui.add_space(8.0);
                 let on = listening.is_some();
-                let r = ui.selectable_label(on, "🎧 Listen").on_hover_text(
+                let r = ui.selectable_label(on, "Listen").on_hover_text(
                     "Hear this microphone live, at its volume, to check it works and how it sounds. Use headphones: speakers would feed back into it.",
                 );
                 if r.clicked() {
                     action = CardAction::Listen;
                 }
                 if let Some(Some(ms)) = listening {
-                    ui.weak(format!("≈ {ms:.0} ms delay")).on_hover_text("From the microphone to your ears, as the devices report it (their hardware adds a little).");
+                    ui.weak(format!("{ms:.0} ms delay")).on_hover_text("From the microphone to your ears, as the devices report it (their hardware adds a little).");
                 }
             }
         });
@@ -972,19 +961,7 @@ fn status_badge(ui: &mut egui::Ui, status: SourceStatus) {
 /// A two-way switch: equal halves, the chosen one filled. Returns both
 /// halves' responses.
 pub(crate) fn segmented(ui: &mut egui::Ui, labels: [&str; 2], chosen: usize) -> (egui::Response, egui::Response) {
-    let gap = 4.0;
-    let w = ((ui.available_width() - gap) / 2.0).max(60.0);
-    let mut out = Vec::new();
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = gap;
-        for (i, label) in labels.iter().enumerate() {
-            let on = i == chosen;
-            let text = RichText::new(*label).size(14.0).color(if on { Color32::WHITE } else { ui.visuals().text_color() });
-            let mut b = egui::Button::new(text).min_size(egui::vec2(w, 32.0)).corner_radius(6);
-            b = if on { b.fill(ACCENT.gamma_multiply(0.8)) } else { b.fill(ui.visuals().extreme_bg_color) };
-            out.push(ui.add(b));
-        }
-    });
+    let mut out = crate::ui_kit::segmented(ui, &labels, chosen);
     let second = out.pop().unwrap();
     (out.pop().unwrap(), second)
 }
@@ -1046,10 +1023,7 @@ pub(crate) fn remove_button(ui: &mut egui::Ui) -> egui::Response {
 }
 
 pub(crate) fn card(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
-    egui::Frame::group(ui.style()).inner_margin(egui::Margin::same(12)).corner_radius(8).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        add(ui);
-    });
+    crate::ui_kit::card(ui, add);
 }
 
 pub(crate) fn from_db(db: f32) -> f32 {

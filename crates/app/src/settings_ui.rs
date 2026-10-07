@@ -21,18 +21,7 @@ const LABEL_W: f32 = 210.0;
 
 impl App {
     pub(crate) fn settings_page(&mut self, ui: &mut egui::Ui) {
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            // Centred column that follows the window, up to a comfortable width.
-            let width = ui.available_width().min(MAX_WIDTH);
-            let pad = ((ui.available_width() - width) / 2.0).max(0.0);
-            ui.horizontal(|ui| {
-                ui.add_space(pad);
-                ui.vertical(|ui| {
-                    ui.set_width(width);
-                    self.settings_column(ui);
-                });
-            });
-        });
+        crate::ui_kit::page(ui, "settings_page", MAX_WIDTH, |ui| self.settings_column(ui));
     }
 
     fn settings_column(&mut self, ui: &mut egui::Ui) {
@@ -67,7 +56,7 @@ impl App {
                     .on_hover_text(self.estimate_explainer());
             });
             divider(ui);
-            row(ui, "Start when HesteClips opens", Some("So you never miss a moment."), |ui| {
+            row(ui, "Start when HesteClips opens", None, |ui| {
                 toggle(ui, &mut self.settings.auto_start_buffer);
             });
         });
@@ -76,7 +65,7 @@ impl App {
             ui.weak("What to record is chosen on the Sources page.");
             ui.add_space(4.0);
             ui.add_enabled_ui(idle, |ui| {
-                row(ui, "Resolution", Some("Lower sizes make smaller files."), |ui| {
+                row(ui, "Resolution", None, |ui| {
                     egui::ComboBox::from_id_salt("resolution").selected_text(self.settings.resolution.label()).show_ui(ui, |ui| {
                         for r in OutputResolution::ALL {
                             ui.selectable_value(&mut self.settings.resolution, r, r.label());
@@ -93,7 +82,7 @@ impl App {
                     });
                 });
                 divider(ui);
-                row(ui, "Bitrate", Some("Higher keeps fast motion sharp and makes bigger files."), |ui| {
+                row(ui, "Bitrate", Some("Higher keeps fast motion sharp; files get bigger."), |ui| {
                     ui.add(egui::Slider::new(&mut self.settings.video_bitrate_mbps, 5..=150).suffix(" Mbps"));
                     let per_min = human_bytes(self.estimated_bytes(60.0));
                     ui.weak(format!("About {per_min} per minute"))
@@ -134,18 +123,18 @@ impl App {
                     });
                 });
                 divider(ui);
-                let hint = "Clips go in a folder named after the game you're playing, like osu!, and the library sorts them the same way. Clips with no game go in Desktop.";
+                let hint = "Named after the game, like osu!. Clips with no game go in Desktop.";
                 row(ui, "A folder per game", Some(hint), |ui| {
                     toggle(ui, &mut self.settings.folder_per_game);
                 });
                 divider(ui);
-                let hint = "Clips get names like \"3 kills on Mirage\", \"Pentakill as Jinx\" or \"412pp · 98.52% FC · +HDDT · FREEDOM DiVE [FOUR DIMENSIONS]\". Clips where nothing happened keep their usual name.";
+                let hint = "Like \"3 kills on Mirage\" or \"412pp · 98.52% FC · +HDDT · FREEDOM DiVE\". Clips where nothing happened keep their time.";
                 row(ui, "Name clips after what happened", Some(hint), |ui| {
                     toggle(ui, &mut self.settings.game_details);
                 });
                 if self.settings.game_details {
                     let t = &mut self.settings.game_titles;
-                    let hint = "For CS2 and Dota 2, a small settings file is put in the game's folder: restart the game after turning them on. Dota 2 also needs -gamestateintegration in its launch options.";
+                    let hint = "CS2 and Dota 2 get a small file in their game folder: restart them after turning this on. Dota 2 also needs -gamestateintegration in its launch options.";
                     row(ui, "Games", Some(hint), |ui| {
                         ui.horizontal_wrapped(|ui| {
                             ui.checkbox(&mut t.cs2, "Counter-Strike 2");
@@ -155,7 +144,7 @@ impl App {
                         });
                     });
                     if t.osu {
-                        let hint = "Scores come from tosu (or gosumemory), which has to be running. Without it, osu! stable clips are named after the map only.";
+                        let hint = "Scores need tosu running. Without it, osu! stable clips get the map's name only.";
                         row(ui, "In osu! names", Some(hint), |ui| {
                             ui.horizontal_wrapped(|ui| {
                                 ui.checkbox(&mut t.osu_accuracy, "Accuracy").on_hover_text("98.52% FC, misses, and the combo mid-play");
@@ -207,7 +196,7 @@ impl App {
         });
 
         section(ui, "Voice", |ui| {
-            let hint = "While the replay buffer runs, say it and a clip is saved, like pressing the shortcut. HesteClips listens on this computer, to your microphone from the Sources page, for this phrase only.";
+            let hint = "While the replay buffer runs, saying it saves a clip. Listening happens on this computer, for this phrase only.";
             row(ui, "Say \"hashtag HesteClip that\"", Some(hint), |ui| {
                 ui.horizontal(|ui| {
                     toggle(ui, &mut self.settings.voice_clip);
@@ -228,7 +217,7 @@ impl App {
         section(ui, "HesteFiles", |ui| self.hestefiles_settings(ui));
 
         section(ui, "Discord", |ui| {
-            let hint = "While the replay buffer or a recording runs, your Discord profile shows what you're clipping, like \"Clipping osu!\". Needs the Discord app running on this computer.";
+            let hint = "Your profile shows \"Clipping osu!\" while capturing. Needs Discord running.";
             row(ui, "Show as your Discord activity", Some(hint), |ui| {
                 ui.horizontal(|ui| {
                     toggle(ui, &mut self.settings.discord_presence);
@@ -248,7 +237,7 @@ impl App {
 
 
         section(ui, "Reset", |ui| {
-            row(ui, "Reset all settings", Some("Replay buffer, video, saving and shortcuts go back to their defaults. Your clips, clips folder, audio sources and HesteFiles account are kept."), |ui| {
+            row(ui, "Reset all settings", Some("Your clips, clips folder, sources and HesteFiles account are kept."), |ui| {
                 let reset = egui::Button::new(RichText::new("Reset to defaults…").color(ui.visuals().error_fg_color));
                 if ui.add_enabled(idle, reset).on_disabled_hover_text("Stop capturing first").clicked() {
                     self.confirm_reset = true;
@@ -298,7 +287,7 @@ impl App {
             });
         });
         divider(ui);
-        row(ui, "Update automatically", Some("New versions download in the background and install when you quit — never in the middle of a game or recording."), |ui| {
+        row(ui, "Update automatically", Some("They install when you quit, never mid-game."), |ui| {
             toggle(ui, &mut self.settings.auto_update);
         });
     }
@@ -307,7 +296,7 @@ impl App {
     /// each with a way to hear it.
     fn sound_settings(&mut self, ui: &mut egui::Ui) {
         let cfg = &mut self.settings.save_sound;
-        row(ui, "Play a sound when a clip is saved", Some("So you know it worked without leaving the game. It's never recorded into your clips."), |ui| {
+        row(ui, "Play a sound when a clip is saved", Some("Never recorded into your clips."), |ui| {
             toggle(ui, &mut cfg.enabled);
         });
         divider(ui);
@@ -376,7 +365,7 @@ impl App {
     }
 
     fn advanced(&mut self, ui: &mut egui::Ui) {
-        row(ui, "Encoder", Some("Hardware encoding barely touches your game's frame rate."), |ui| {
+        row(ui, "Encoder", Some("Hardware encoding barely affects your game's frame rate."), |ui| {
             egui::ComboBox::from_id_salt("encoder").selected_text(self.settings.encoder.label()).show_ui(ui, |ui| {
                 for e in [Encoder::Auto, Encoder::Hardware, Encoder::Software] {
                     ui.selectable_value(&mut self.settings.encoder, e, e.label());
@@ -385,7 +374,7 @@ impl App {
         });
 
         divider(ui);
-        row(ui, "Keyframe interval", Some("Shorter makes edits save faster and files a little bigger."), |ui| {
+        row(ui, "Keyframe interval", Some("Shorter: edits save faster, files get a little bigger."), |ui| {
             ui.add(egui::Slider::new(&mut self.settings.keyframe_interval_secs, 1..=10).suffix(" s"));
         });
     }
@@ -521,11 +510,10 @@ impl App {
             ui.heading("Reset all settings?");
             ui.add_space(4.0);
             ui.label("Replay buffer, video, saving and shortcuts go back to their defaults.");
-            ui.weak("Your clips, clips folder, sources and HesteFiles account are kept.");
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                let reset = egui::Button::new(RichText::new("Reset").color(Color32::WHITE)).fill(ui.visuals().error_fg_color);
-                if ui.add(reset).clicked() {
+            crate::ui_kit::hint(ui, "Your clips, clips folder, sources and HesteFiles account are kept.");
+            ui.add_space(12.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.add(crate::ui_kit::danger_button("Reset")).clicked() {
                     let mut fresh = settings::RecordSettings::default();
                     fresh.output_dir = self.settings.output_dir.clone();
                     fresh.game_folders = std::mem::take(&mut self.settings.game_folders);
@@ -553,17 +541,7 @@ impl App {
 
 /// A titled block on the settings page.
 pub(crate) fn section(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
-    ui.add_space(18.0);
-    ui.label(RichText::new(title).size(16.0).strong());
-    ui.add_space(6.0);
-    card(ui, add);
-}
-
-fn card(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
-    egui::Frame::group(ui.style()).inner_margin(egui::Margin::symmetric(14, 10)).corner_radius(8).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        add(ui);
-    });
+    crate::ui_kit::section(ui, title, add);
 }
 
 /// One setting: label (and hint) on the left, control on the right; stacked when
@@ -571,12 +549,12 @@ fn card(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
 pub(crate) fn row(ui: &mut egui::Ui, label: &str, hint: Option<&str>, control: impl FnOnce(&mut egui::Ui)) {
     let narrow = ui.available_width() < NARROW;
     let labels = |ui: &mut egui::Ui| {
-        ui.label(RichText::new(label).strong());
+        ui.label(label);
         if let Some(h) = hint {
-            ui.add(egui::Label::new(RichText::new(h).size(12.0).weak()).wrap());
+            crate::ui_kit::hint(ui, h);
         }
     };
-    ui.add_space(4.0);
+    ui.add_space(6.0);
     if narrow {
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 2.0;
@@ -598,21 +576,20 @@ pub(crate) fn row(ui: &mut egui::Ui, label: &str, hint: Option<&str>, control: i
             ui.vertical(|ui| control(ui));
         });
     }
-    ui.add_space(4.0);
+    ui.add_space(6.0);
 }
 
 fn divider(ui: &mut egui::Ui) {
-    ui.add_space(2.0);
     let r = ui.available_rect_before_wrap();
-    ui.painter().hline(r.x_range(), r.top(), egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color.gamma_multiply(0.6)));
-    ui.add_space(3.0);
+    ui.painter().hline(r.x_range(), r.top(), egui::Stroke::new(1.0, crate::ui_kit::line(ui.visuals().dark_mode)));
+    ui.add_space(1.0);
 }
 
 fn note(ui: &mut egui::Ui, text: &str) {
     egui::Frame::new()
         .fill(ui.visuals().warn_fg_color.gamma_multiply(0.12))
-        .corner_radius(6)
-        .inner_margin(egui::Margin::symmetric(10, 6))
+        .corner_radius(crate::ui_kit::RADIUS)
+        .inner_margin(egui::Margin::symmetric(12, 8))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.colored_label(ui.visuals().warn_fg_color, text);

@@ -36,8 +36,8 @@ const SIDEBAR_FROM: f32 = 720.0;
 /// How long a freshly saved clip stays highlighted.
 const NEW_HIGHLIGHT: Duration = Duration::from_secs(8);
 
-pub(crate) const REC_RED: Color32 = Color32::from_rgb(235, 72, 72);
-pub(crate) const ACCENT: Color32 = Color32::from_rgb(90, 150, 255);
+pub(crate) const REC_RED: Color32 = crate::ui_kit::DANGER;
+pub(crate) const ACCENT: Color32 = crate::ui_kit::ACCENT;
 
 /// The "Rename clip" dialog, or "Rename folder" for one of the library's folders.
 pub(crate) struct Rename {
@@ -480,7 +480,6 @@ impl App {
         ui.add_space(8.0);
         egui::Frame::new()
             .fill(ACCENT.gamma_multiply(0.16))
-            .stroke(Stroke::new(1.0, ACCENT.gamma_multiply(0.6)))
             .corner_radius(CornerRadius::same(RADIUS))
             .inner_margin(egui::Margin::symmetric(12, 8))
             .show(ui, |ui| {
@@ -492,13 +491,13 @@ impl App {
                         action = Some(Action::SelectAll);
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let trash = egui::Button::new(egui::RichText::new("🗑  Move to Trash").color(Color32::WHITE)).fill(ui.visuals().error_fg_color);
+                        let trash = egui::Button::new(egui::RichText::new("Move to Trash").color(Color32::WHITE)).fill(ui.visuals().error_fg_color);
                         let key = if cfg!(target_os = "macos") { "⌫".to_owned() } else { "Delete".to_owned() };
                         if ui.add(trash).on_hover_text(key).clicked() {
                             action = Some(Action::TrashSelected);
                         }
                         if !folders.is_empty() {
-                            ui.menu_button("📁  Move to", |ui| {
+                            ui.menu_button("Move to", |ui| {
                                 if let Some(f) = move_menu(ui, folders, None, true) {
                                     action = Some(Action::MoveSelectedTo(f));
                                 }
@@ -860,11 +859,10 @@ impl App {
                 ui.heading(format!("Delete “{}”?", c.map_or("", |c| c.name.as_str())));
                 ui.add_space(6.0);
                 ui.label("The collection goes away. Its clips stay in your library.");
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    let delete = egui::Button::new(egui::RichText::new("Delete collection").color(Color32::WHITE)).fill(ui.visuals().error_fg_color);
-                    submit = ui.add(delete).clicked();
-                    close = ui.button("Cancel").clicked();
+                ui.add_space(12.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    submit = ui.add(crate::ui_kit::danger_button("Delete collection")).clicked();
+                    close = ui.add(crate::ui_kit::button("Cancel", false)).clicked();
                 });
                 return;
             }
@@ -888,12 +886,12 @@ impl App {
             if let Some(e) = &d.error {
                 ui.colored_label(ui.visuals().error_fg_color, e);
             }
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if ui.add(egui::Button::new(egui::RichText::new(button).color(Color32::WHITE)).fill(ACCENT)).clicked() {
+            ui.add_space(12.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.add(crate::ui_kit::button(button, true)).clicked() {
                     submit = true;
                 }
-                if ui.button("Cancel").clicked() {
+                if ui.add(crate::ui_kit::button("Cancel", false)).clicked() {
                     close = true;
                 }
             });
@@ -1137,7 +1135,7 @@ impl App {
         } else if let Some(up) = self.cloud.upload_for(&clip.path) {
             // Uploading: a slim bar along the bottom and a label, without hiding the clip.
             let f = up.progress();
-            let label = if up.merging() { "Finishing upload…".to_owned() } else { format!("☁ Uploading  {:.0}%", f * 100.0) };
+            let label = if up.merging() { "Finishing upload…".to_owned() } else { format!("Uploading  {:.0}%", f * 100.0) };
             badge(p, thumb_rect.left_top() + Vec2::new(6.0, 6.0), Align2::LEFT_TOP, &label, Color32::from_black_alpha(190));
             progress_bar(p, thumb_rect, f, ACCENT);
             ui.ctx().request_repaint();
@@ -1194,10 +1192,14 @@ impl App {
         } else {
             None
         };
-        let mut detail = match trimmed_from {
-            Some(orig) => format!("{}  ·  {ext}  ·  trimmed from {orig}", clip.human_size()),
-            None => format!("{}  ·  {ext}", clip.human_size()),
-        };
+        // The format only when it isn't the usual MP4: on every card it said nothing.
+        let mut detail = clip.human_size();
+        if ext != "MP4" {
+            detail = format!("{detail}  ·  {ext}");
+        }
+        if let Some(orig) = trimmed_from {
+            detail = format!("{detail}  ·  trimmed from {orig}");
+        }
         // Every game's clips together: say whose this is.
         if let (Filter::All | Filter::Collection(_), Some(folder)) = (&self.library_filter, &clip.folder) {
             detail = format!("{folder}  ·  {detail}");
@@ -1235,10 +1237,10 @@ impl App {
                         .corner_radius(CornerRadius::same(6)),
                 )
             };
-            if overlay_button(ui, edit_rect, "✂ Edit", Color32::from_black_alpha(170)).clicked() {
+            if overlay_button(ui, edit_rect, "Edit", Color32::from_black_alpha(170)).clicked() {
                 action = Some(Action::Edit(clip.path.clone()));
             }
-            let share_btn = overlay_button(ui, share_rect, "📤 Share", ACCENT);
+            let share_btn = overlay_button(ui, share_rect, "Share", ACCENT);
             egui::Popup::menu(&share_btn).id(share_id).show(|ui| {
                 if let Some(c) = share_menu(ui, share_btn.rect.left_bottom()) {
                     action = Some(Action::Share(clip.path.clone(), c));
@@ -1293,13 +1295,13 @@ impl App {
                     action = Some(Action::InCollection(paths.clone(), id.clone(), false));
                 }
                 if !folders.is_empty() {
-                    ui.menu_button(format!("📁  Move {n} clips to"), |ui| {
+                    ui.menu_button(format!("Move {n} clips to"), |ui| {
                         if let Some(f) = move_menu(ui, folders, None, true) {
                             action = Some(Action::MoveSelectedTo(f));
                         }
                     });
                 }
-                if ui.button(egui::RichText::new(format!("🗑  Move {n} clips to Trash")).color(v.error_fg_color)).clicked() {
+                if ui.button(egui::RichText::new(format!("Move {n} clips to Trash")).color(v.error_fg_color)).clicked() {
                     action = Some(Action::TrashSelected);
                 }
                 if ui.button("Deselect all").clicked() {
@@ -1307,16 +1309,16 @@ impl App {
                 }
                 return;
             }
-            if ui.button("▶  Play").clicked() {
+            if ui.button("Play").clicked() {
                 action = Some(Action::Open(clip.path.clone()));
             }
-            if ui.button("↗  Open in default player").clicked() {
+            if ui.button("Open in default player").clicked() {
                 action = Some(Action::OpenExternal(clip.path.clone()));
             }
-            if ui.button("✂  Edit…").clicked() {
+            if ui.button("Edit…").clicked() {
                 action = Some(Action::Edit(clip.path.clone()));
             }
-            if ui.button("✏  Rename…").clicked() {
+            if ui.button("Rename…").clicked() {
                 action = Some(Action::Rename(clip.path.clone()));
             }
             ui.menu_button("+  Add to collection", |ui| {
@@ -1330,25 +1332,25 @@ impl App {
                 action = Some(Action::InCollection(vec![clip.path.clone()], id.clone(), false));
             }
             if !folders.is_empty() {
-                ui.menu_button("📁  Move to", |ui| {
+                ui.menu_button("Move to", |ui| {
                     if let Some(f) = move_menu(ui, folders, clip.folder.as_deref(), clip.folder.is_some()) {
                         action = Some(Action::MoveTo(vec![clip.path.clone()], f));
                     }
                 });
             }
-            if !selected && ui.button("☑  Select").clicked() {
+            if !selected && ui.button("Select").clicked() {
                 action = Some(Action::Select { path: clip.path.clone(), range: false });
             }
             ui.separator();
             if uploading {
-                if ui.button("✕  Cancel upload").clicked() {
+                if ui.button("Cancel upload").clicked() {
                     action = Some(Action::CancelUpload(clip.path.clone()));
                 }
             } else if let Some(c) = share_menu(ui, ui.ctx().pointer_latest_pos().unwrap_or_default()) {
                 action = Some(Action::Share(clip.path.clone(), c));
             }
             ui.separator();
-            if ui.button(egui::RichText::new("🗑  Move to Trash").color(v.error_fg_color)).clicked() {
+            if ui.button(egui::RichText::new("Move to Trash").color(v.error_fg_color)).clicked() {
                 action = Some(Action::Trash(clip.path.clone()));
             }
         });
@@ -1427,12 +1429,12 @@ impl App {
             if let Some(e) = &r.error {
                 ui.colored_label(ui.visuals().error_fg_color, e);
             }
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if ui.add(egui::Button::new(egui::RichText::new("Rename").color(Color32::WHITE)).fill(ACCENT)).clicked() {
+            ui.add_space(12.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.add(crate::ui_kit::button("Rename", true)).clicked() {
                     submit = true;
                 }
-                if ui.button("Cancel").clicked() {
+                if ui.add(crate::ui_kit::button("Cancel", false)).clicked() {
                     close = true;
                 }
             });
@@ -1488,19 +1490,19 @@ pub(crate) fn share_menu(ui: &mut egui::Ui, anchor: Pos2) -> Option<ShareChoice>
     let mut choice = None;
     ui.set_min_width(230.0);
     let paste = crate::hotkey_label_cmd("V");
-    if ui.button("📋  Copy clip").on_hover_text(format!("Then paste it into Discord, a chat or a folder ({paste})")).clicked() {
+    if ui.button("Copy clip").on_hover_text(format!("Then paste it into Discord, a chat or a folder ({paste})")).clicked() {
         choice = Some(ShareChoice::Copy);
     }
     if share::HAS_SHARE_SHEET && ui.button(share::SHARE_SHEET_LABEL).clicked() {
         choice = Some(ShareChoice::Sheet(anchor));
     }
-    if ui.button("☁  Upload to HesteFiles…").clicked() {
+    if ui.button("Upload to HesteFiles…").clicked() {
         choice = Some(ShareChoice::Upload);
     }
-    if ui.button(format!("📂  {}", crate::reveal_label())).clicked() {
+    if ui.button(format!("{}", crate::reveal_label())).clicked() {
         choice = Some(ShareChoice::Reveal);
     }
-    if ui.button("🎵  Save audio as MP3…").on_hover_text("Just the clip's sound, saved where you pick").clicked() {
+    if ui.button("Save audio as MP3…").on_hover_text("Just the clip's sound, saved where you pick").clicked() {
         choice = Some(ShareChoice::Mp3);
     }
     if share::CAN_DRAG_OUT {
@@ -1581,7 +1583,7 @@ impl App {
 
 /// The "Edited" marker in a card's caption: a small accent pill. Returns its width.
 fn edited_pill(p: &egui::Painter, at: Pos2) -> f32 {
-    let galley = p.layout_no_wrap("✂ Edited".to_owned(), FontId::proportional(11.5), Color32::WHITE);
+    let galley = p.layout_no_wrap("Edited".to_owned(), FontId::proportional(11.5), Color32::WHITE);
     let rect = Rect::from_min_size(at, galley.size() + Vec2::new(12.0, 3.0));
     p.rect_filled(rect, 8, ACCENT);
     p.galley(rect.min + Vec2::new(6.0, 1.5), galley, Color32::WHITE);
@@ -1735,18 +1737,18 @@ fn view_menu(ui: &mut egui::Ui, filter: &Filter) -> Option<Action> {
     let mut action = None;
     match filter {
         Filter::Folder(name) => {
-            if ui.button(format!("📂  {}", crate::reveal_label())).clicked() {
+            if ui.button(format!("{}", crate::reveal_label())).clicked() {
                 action = Some(Action::RevealFolder(name.clone()));
             }
-            if ui.button("✏  Rename folder…").clicked() {
+            if ui.button("Rename folder…").clicked() {
                 action = Some(Action::RenameFolder(name.clone()));
             }
         }
         Filter::Collection(id) => {
-            if ui.button("✏  Rename collection…").clicked() {
+            if ui.button("Rename collection…").clicked() {
                 action = Some(Action::RenameCollection(id.clone()));
             }
-            if ui.button(egui::RichText::new("🗑  Delete collection…").color(ui.visuals().error_fg_color)).clicked() {
+            if ui.button(egui::RichText::new("Delete collection…").color(ui.visuals().error_fg_color)).clicked() {
                 action = Some(Action::DeleteCollection(id.clone()));
             }
         }

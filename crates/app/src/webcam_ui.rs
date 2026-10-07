@@ -279,7 +279,7 @@ impl App {
         crate::sources_ui::card(ui, |ui| {
             let cam = self.settings.webcam.clone();
             ui.horizontal(|ui| {
-                ui.label(RichText::new("📷 Webcam").size(16.0).strong());
+                ui.label(RichText::new("Webcam").size(15.0).strong());
                 if let Some(cam) = &cam {
                     ui.add_space(6.0);
                     let (color, text) = match &status {
@@ -309,10 +309,10 @@ impl App {
             ui.add_space(6.0);
 
             let Some(cam) = cam else {
-                ui.weak("Put your camera in your clips, placed and sized on the preview above.");
+                crate::ui_kit::hint(ui, "Put your camera in your clips, placed and sized on the preview above.");
                 ui.add_space(8.0);
                 {
-                    let add = ui.menu_button(RichText::new("➕  Add webcam").size(14.0), |ui| {
+                    let add = ui.menu_button(RichText::new("Add webcam").size(14.0), |ui| {
                         ui.set_min_width(240.0);
                         if self.webcam_view.cameras.is_empty() {
                             ui.weak("No cameras found.");
@@ -339,8 +339,7 @@ impl App {
             };
 
             if !cam.enabled {
-                ui.weak("Off: not in your clips, and the camera is closed. Its place and settings are kept.");
-                ui.add_space(4.0);
+                // The "Off" tag by the title says it all.
             } else if let Status::Unavailable(why) = &status {
                 // Under the "Not working" tag: just why, as a sentence.
                 let mut why = why.clone();
@@ -388,7 +387,7 @@ impl App {
                                     self.webcam_view.ask_fit();
                                 }
                                 if formats.is_empty() {
-                                    ui.weak("The camera's formats show once it's open.");
+                                    crate::ui_kit::hint(ui, "The camera's formats show once it's open.");
                                 }
                                 for f in formats {
                                     if ui.selectable_label(current == Some(f), f.label()).clicked() && current != Some(f) {
@@ -402,7 +401,7 @@ impl App {
                     }
                     if capture::webcam::HAS_SETTINGS
                         && ui
-                        .button("⚙ Camera settings…")
+                        .button("Camera settings…")
                         .on_hover_text("The camera's own settings: exposure, focus, white balance and more. They apply to the camera right away, in every app.")
                         .clicked()
                     {
@@ -423,7 +422,7 @@ impl App {
                             w.placement = PlacementCfg::laid_out(Placement::default_for(camera_aspect, frame_aspect), frame_aspect);
                         }
                     }
-                    ui.label(RichText::new("Drag it on the preview to move or resize it, right-click to flip or turn it").weak()).on_hover_text(
+                    crate::ui_kit::hint(ui, "Drag it on the preview to move or resize it; right-click to flip or turn it.").on_hover_text(
                         "Drag a corner or edge to resize it, and past the opposite side to flip it. Hold Alt to crop, Ctrl to stop snapping. \
                          Right-click it to mirror, flip or turn it a quarter.",
                     );
@@ -493,20 +492,20 @@ impl App {
                         w.placement = PlacementCfg::laid_out(f(w.placement.into()), aspect);
                     }
                 };
-                if ui.button("↻  Turn clockwise").clicked() {
+                if ui.button("Turn clockwise").clicked() {
                     change(&|p| p.turn(1, aspect));
                     ui.close();
                 }
-                if ui.button("↺  Turn anticlockwise").clicked() {
+                if ui.button("Turn anticlockwise").clicked() {
                     change(&|p| p.turn(-1, aspect));
                     ui.close();
                 }
                 ui.separator();
-                if ui.button("⇔  Mirror").on_hover_text("Flip left to right").clicked() {
+                if ui.button("Mirror").on_hover_text("Flip left to right").clicked() {
                     change(&|p| Placement { flip_h: !p.flip_h, ..p });
                     ui.close();
                 }
-                if ui.button("⇕  Flip upside down").clicked() {
+                if ui.button("Flip upside down").clicked() {
                     change(&|p| Placement { flip_v: !p.flip_v, ..p });
                     ui.close();
                 }

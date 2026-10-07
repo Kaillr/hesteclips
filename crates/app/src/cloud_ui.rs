@@ -101,7 +101,7 @@ impl App {
             ui.label("Default clips folder");
             ui.horizontal(|ui| {
                 match &self.cloud.default_folder {
-                    Some(f) => ui.label(format!("📁 {}", f.display())),
+                    Some(f) => ui.label(format!("{}", f.display())),
                     None => ui.weak("Not set"),
                 };
                 let connected = self.cloud.is_connected();
@@ -152,20 +152,20 @@ impl App {
         let resp = egui::Modal::new(egui::Id::new("pick_default_folder")).show(ctx, |ui| {
             ui.set_width(460.0);
             ui.heading("Default clips folder");
-            ui.weak("Shared clips go here unless you pick another folder.");
+            crate::ui_kit::hint(ui, "Shared clips go here unless you pick another folder.");
             ui.add_space(6.0);
             self.cloud.browser_ui(ui);
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
+            ui.add_space(12.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let selection = self.cloud.browser_selection();
                 if ui
-                    .add_enabled(selection.is_some(), egui::Button::new("Use this folder"))
+                    .add_enabled(selection.is_some(), crate::ui_kit::button("Use this folder", true))
                     .clicked()
                 {
                     self.cloud.set_default_folder(selection);
                     keep_open = false;
                 }
-                if ui.button("Cancel").clicked() {
+                if ui.add(crate::ui_kit::button("Cancel", false)).clicked() {
                     keep_open = false;
                 }
             });
@@ -186,7 +186,7 @@ impl App {
             ui.set_width(460.0);
             ui.heading("Upload to HesteFiles");
             ui.add_space(4.0);
-            ui.label(egui::RichText::new(format!("🎬  {}", file_name(&share.clip))).strong());
+            ui.label(egui::RichText::new(format!("{}", file_name(&share.clip))).strong());
             ui.add_space(10.0);
 
             if !self.cloud.is_connected() {
@@ -213,7 +213,7 @@ impl App {
                     ShareTarget::Custom => self.cloud.browser_selection(),
                 };
                 match &current {
-                    Some(f) => ui.label(egui::RichText::new(format!("📁 {}", f.display())).strong()),
+                    Some(f) => ui.label(egui::RichText::new(format!("{}", f.display())).strong()),
                     None => ui.label(egui::RichText::new("Choose a folder below").color(ui.visuals().warn_fg_color)),
                 };
                 if !share.picking && ui.link("Change").clicked() {
@@ -260,10 +260,8 @@ impl App {
             self.cloud.set_public_links(public);
             ui.add_space(12.0);
             let busy = self.cloud.upload_for(&share.clip).is_some();
-            ui.horizontal(|ui| {
-                let upload = egui::Button::new(egui::RichText::new("☁  Upload").color(egui::Color32::WHITE))
-                    .fill(crate::library::ACCENT)
-                    .min_size(egui::vec2(96.0, 28.0));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let upload = crate::ui_kit::button("Upload", true).min_size(egui::vec2(96.0, crate::ui_kit::CONTROL_H));
                 let r = ui
                     .add_enabled(destination.is_some() && !busy, upload)
                     .on_disabled_hover_text(if busy { "This clip is already uploading." } else { "Choose a folder you can save into." });
@@ -273,12 +271,12 @@ impl App {
                         keep_open = false;
                     }
                 }
-                if ui.button("Cancel").clicked() {
+                if ui.add(crate::ui_kit::button("Cancel", false)).clicked() {
                     keep_open = false;
                 }
             });
-            ui.add_space(4.0);
-            ui.weak("If a file with this name is already there, HesteFiles keeps both.");
+            ui.add_space(6.0);
+            crate::ui_kit::hint(ui, "If a file with this name is already there, HesteFiles keeps both.");
         });
         (keep_open && !resp.should_close()).then_some(share)
     }
@@ -291,26 +289,23 @@ fn public_link_dialog(ctx: &egui::Context, clip: PathBuf, link: String, mut copi
         ui.set_width(460.0);
         ui.heading("Public link ready");
         ui.add_space(4.0);
-        ui.label(egui::RichText::new(format!("🎬  {}", file_name(&clip))).strong());
+        ui.label(egui::RichText::new(format!("{}", file_name(&clip))).strong());
         ui.add_space(4.0);
-        ui.weak("Anyone with this link can watch and download the clip.");
+        crate::ui_kit::hint(ui, "Anyone with this link can watch and download the clip.");
         ui.add_space(10.0);
         let mut shown = link.as_str();
         ui.add(egui::TextEdit::singleline(&mut shown).desired_width(f32::INFINITY));
         ui.add_space(12.0);
-        ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let text = if copied { "✔  Copied" } else { "Copy link" };
-            let copy = egui::Button::new(egui::RichText::new(text).color(egui::Color32::WHITE))
-                .fill(crate::library::ACCENT)
-                .min_size(egui::vec2(96.0, 28.0));
-            if ui.add(copy).clicked() {
+            if ui.add(crate::ui_kit::button(text, true).min_size(egui::vec2(96.0, crate::ui_kit::CONTROL_H))).clicked() {
                 ui.ctx().copy_text(link.clone());
                 copied = true;
             }
-            if ui.button("Open in browser").clicked() {
+            if ui.add(crate::ui_kit::button("Open in browser", false)).clicked() {
                 ui.ctx().open_url(egui::OpenUrl::new_tab(&link));
             }
-            if ui.button("Close").clicked() {
+            if ui.add(crate::ui_kit::button("Close", false)).clicked() {
                 keep_open = false;
             }
         });

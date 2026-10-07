@@ -40,6 +40,7 @@ mod sound;
 mod sources_ui;
 mod store;
 mod thumbs;
+mod ui_kit;
 mod update;
 #[cfg(hw_decode)]
 mod gpu_frames;
@@ -134,6 +135,7 @@ fn main() -> eframe::Result<()> {
         Box::new(|cc| {
             #[cfg(hw_decode)]
             gpu_frames::init(cc.wgpu_render_state.as_ref(), &cc.egui_ctx);
+            ui_kit::apply(&cc.egui_ctx);
             Ok(Box::new(App::new(cc.egui_ctx.clone())))
         }),
     );
@@ -777,25 +779,37 @@ impl eframe::App for App {
         // The editor and viewer get the whole window; capture keeps running
         // underneath and the hotkeys still work.
         if !matches!(self.page, Page::Edit | Page::View) {
-            egui::Panel::top("capture_bar")
-                .frame(
-                    egui::Frame::new()
-                        .fill(ui.visuals().panel_fill)
-                        .inner_margin(egui::Margin::symmetric(16, 10))
-                        .stroke(egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color)),
-                )
+            // Flush with the window; a hairline under it, nothing around it.
+            let bar = egui::Panel::top("capture_bar")
+                .show_separator_line(false)
+                .frame(egui::Frame::new().fill(ui.visuals().panel_fill).inner_margin(egui::Margin::symmetric(ui_kit::PAGE_MARGIN, 10)))
                 .show(ui, |ui| self.capture_bar(ui));
+            let r = bar.response.rect;
+            ui.painter().hline(r.x_range(), r.bottom(), egui::Stroke::new(1.0, ui_kit::line(ui.visuals().dark_mode)));
         }
 
+        // A message floats over the bottom of the page for a few seconds,
+        // without pushing anything around.
         if let Some(toast) = &self.toast {
             if toast.at.elapsed() < TOAST_FOR {
                 let (text, error) = (toast.text.clone(), toast.error);
-                egui::Panel::bottom("toast").show(ui, |ui| {
-                    ui.add_space(2.0);
-                    let color = if error { ui.visuals().error_fg_color } else { ui.visuals().text_color() };
-                    ui.colored_label(color, text);
-                    ui.add_space(2.0);
-                });
+                egui::Area::new(egui::Id::new("toast"))
+                    .order(egui::Order::Foreground)
+                    .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -20.0))
+                    .interactable(false)
+                    .show(&ctx, |ui| {
+                        let v = ui.visuals().clone();
+                        egui::Frame::new()
+                            .fill(v.window_fill)
+                            .stroke(egui::Stroke::new(1.0, ui_kit::line(v.dark_mode)))
+                            .corner_radius(ui_kit::CARD_RADIUS)
+                            .shadow(v.popup_shadow)
+                            .inner_margin(egui::Margin::symmetric(16, 10))
+                            .show(ui, |ui| {
+                                let color = if error { ui_kit::DANGER } else { v.strong_text_color() };
+                                ui.add(egui::Label::new(RichText::new(text).color(color)).wrap_mode(egui::TextWrapMode::Extend));
+                            });
+                    });
             } else {
                 self.toast = None;
             }
@@ -806,7 +820,10 @@ impl eframe::App for App {
         let central = if edge_to_edge {
             egui::Frame::NONE.fill(egui::Color32::BLACK)
         } else {
-            egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin::symmetric(16, 4))
+            // Pages that scroll run to the window's bottom edge; the player
+            // and editor keep a margin under their controls.
+            let bottom = if matches!(self.page, Page::Edit | Page::View) { 12 } else { 0 };
+            egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin { left: ui_kit::PAGE_MARGIN, right: ui_kit::PAGE_MARGIN, top: 0, bottom })
         };
         laps.lap("bars");
         egui::CentralPanel::default()
@@ -892,28 +909,28 @@ impl App {
         });
     }
 
-    /// Clips · Sources · Settings, as one segmented control. Icons only when narrow.
+    /// Clips · Sources · Settings, as one segmented control: words, which
+    /// fit even narrow (icons were guesswork).
     fn nav_tabs(&mut self, ui: &mut egui::Ui, compact: bool) {
         let tabs = [
-            (Page::Clips, "🎬", "Clips", "Your clips".to_owned()),
-            (Page::Sources, "🎤", "Sources", "What goes into your clips: mic, desktop sound, apps, with live levels".to_owned()),
-            (Page::Settings, "⚙", "Settings", format!("Settings ({})", hotkey_label_cmd(","))),
+            (Page::Clips, "Clips", None),
+            (Page::Sources, "Sources", Some("What goes into your clips: the picture, your mic, the game's sound".to_owned())),
+            (Page::Settings, "Settings", Some(hotkey_label_cmd(","))),
         ];
         let v = ui.visuals().clone();
         egui::Frame::new()
             .fill(v.extreme_bg_color)
-            .corner_radius(9)
+            .corner_radius(8)
             .inner_margin(egui::Margin::same(3))
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
-                for (page, icon, label, tip) in tabs {
+                for (page, label, tip) in tabs {
                     // Painted, not an egui Button: a button grows a hover stroke,
                     // which made the tabs change width under the pointer.
                     let selected = self.page == page;
-                    let text = if compact { icon.to_owned() } else { format!("{icon}  {label}") };
-                    let galley = ui.painter().layout_no_wrap(text, egui::FontId::proportional(14.0), Color32::WHITE);
-                    let w = if compact { 34.0 } else { galley.size().x + 22.0 };
-                    let (rect, mut r) = ui.allocate_exact_size(egui::vec2(w, 28.0), egui::Sense::click());
+                    let galley = ui.painter().layout_no_wrap(label.to_owned(), egui::FontId::proportional(14.0), Color32::WHITE);
+                    let w = galley.size().x + if compact { 16.0 } else { 28.0 };
+                    let (rect, mut r) = ui.allocate_exact_size(egui::vec2(w, 26.0), egui::Sense::click());
                     let color = if selected {
                         v.strong_text_color()
                     } else if r.hovered() {
@@ -922,12 +939,12 @@ impl App {
                         v.weak_text_color()
                     };
                     if selected {
-                        ui.painter().rect_filled(rect, 7, v.widgets.active.weak_bg_fill);
+                        ui.painter().rect_filled(rect, ui_kit::RADIUS, v.widgets.active.weak_bg_fill);
                     } else if r.hovered() {
-                        ui.painter().rect_filled(rect, 7, v.widgets.hovered.weak_bg_fill.gamma_multiply(0.5));
+                        ui.painter().rect_filled(rect, ui_kit::RADIUS, ui_kit::hover(&v));
                     }
                     ui.painter().galley_with_override_text_color(rect.center() - galley.size() / 2.0, galley, color);
-                    if compact || page == Page::Settings {
+                    if let Some(tip) = tip {
                         r = r.on_hover_text(tip);
                     }
                     if r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
@@ -945,7 +962,7 @@ impl App {
         use settings::ShortcutAction as A;
         // The hint: the shortcut (drawn as keycaps) and what it does.
         let (live, color, title, hint_keys, hint) = match self.rec_state {
-            RecState::Idle => (false, ui.visuals().weak_text_color(), "Not recording".to_owned(), self.shortcut_keys(A::ToggleBuffer), "starts the replay buffer".to_owned()),
+            RecState::Idle => (false, ui.visuals().weak_text_color(), "Not recording".to_owned(), None, String::new()),
             RecState::Buffering if self.saving > 0 => (
                 true,
                 ACCENT,
@@ -972,10 +989,15 @@ impl App {
             } else {
                 ui.painter().circle_stroke(rect.center(), 5.0, egui::Stroke::new(1.5, color));
             }
+            let title = RichText::new(&title).size(14.0).strong().color(if live { color } else { ui.visuals().text_color() });
+            if compact || hint.is_empty() {
+                ui.label(title).on_hover_text(&tip);
+                return;
+            }
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 2.0;
-                ui.label(RichText::new(&title).size(14.0).strong().color(if live { color } else { ui.visuals().text_color() }));
-                if !compact {
+                ui.label(title);
+                {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 5.0;
                         if let Some(k) = &hint_keys {
@@ -992,20 +1014,14 @@ impl App {
 
     /// The one or two buttons that make sense right now; the primary one rightmost.
     fn capture_actions(&mut self, ui: &mut egui::Ui, compact: bool) {
-        let button = |text: &str, fill: Option<Color32>| {
-            let mut rt = RichText::new(text.to_owned()).size(14.0);
-            if fill.is_some() {
-                rt = rt.color(Color32::WHITE);
-            }
-            let mut b = egui::Button::new(rt).min_size(egui::vec2(0.0, 32.0)).corner_radius(8);
-            if let Some(f) = fill {
-                b = b.fill(f);
-            }
-            b
+        let button = |text: &str, fill: Option<Color32>| match fill {
+            Some(c) if c == REC_RED => ui_kit::danger_button(text),
+            Some(_) => ui_kit::button(text, true),
+            None => ui_kit::button(text, false),
         };
         match self.rec_state {
             RecState::Idle => {
-                let start = if compact { "⏺  Replay buffer" } else { "⏺  Start replay buffer" };
+                let start = if compact { "Replay buffer" } else { "Start replay buffer" };
                 if ui
                     .add(button(start, Some(ACCENT)))
                     .on_hover_text(format!("Keep the last {} ready to save ({})", thumbs::format_duration(Duration::from_secs(self.settings.replay_seconds.into())), self.shortcut_label(settings::ShortcutAction::ToggleBuffer)))
@@ -1019,7 +1035,7 @@ impl App {
             }
             RecState::Buffering => {
                 if ui
-                    .add(button("💾  Save clip", Some(ACCENT)))
+                    .add(button("Save clip", Some(ACCENT)))
                     .on_hover_text(self.shortcut_label(settings::ShortcutAction::SaveClip))
                     .clicked()
                 {
@@ -1030,7 +1046,7 @@ impl App {
                 }
             }
             RecState::Recording => {
-                let stop = if compact { "⏹  Stop" } else { "⏹  Stop recording" };
+                let stop = if compact { "Stop" } else { "Stop recording" };
                 if ui.add(button(stop, Some(REC_RED))).on_hover_text(self.shortcut_label(settings::ShortcutAction::ToggleRecord)).clicked() {
                     self.stop();
                 }
@@ -1102,7 +1118,7 @@ impl App {
             return;
         };
         ui.add_space(6.0);
-        let text = if compact { "⬆" } else { "⬆  Update ready" };
+        let text = if compact { "⬆" } else { "Update ready" };
         let button = egui::Button::new(RichText::new(text).size(13.0).color(ACCENT))
             .fill(ACCENT.gamma_multiply(0.15))
             .stroke(egui::Stroke::NONE)

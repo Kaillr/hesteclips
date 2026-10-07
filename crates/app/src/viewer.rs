@@ -267,7 +267,7 @@ impl Viewer {
             }
             ui.add_space(10.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let share = ui.add(header::button("📤 Share", true)).on_hover_text(if crate::share::CAN_DRAG_OUT {
+                let share = ui.add(header::button("Share", true)).on_hover_text(if crate::share::CAN_DRAG_OUT {
                     "Copy it, send it or upload it — or drag the picture into any app"
                 } else {
                     "Copy it, send it or upload it"
@@ -277,7 +277,7 @@ impl Viewer {
                         out = ViewerOutcome::Share(c);
                     }
                 });
-                if ui.add(header::button("✂ Edit", false)).on_hover_text("Trim it, adjust its audio, or save it smaller").clicked() {
+                if ui.add(header::button("Edit", false)).on_hover_text("Trim it, adjust its audio, or save it smaller").clicked() {
                     out = ViewerOutcome::Edit;
                 }
                 let collect = ui.add(header::button("+ Collection", false)).on_hover_text("Add it to a collection of your own, like \"Ace clutches\"");
@@ -517,8 +517,23 @@ impl Ready {
                     }
                     self.apply_volume(ui.ctx());
                 }
-                ui.add_space(12.0);
-                ui.weak("Scroll to scrub \u{b7} arrow keys jump 5 s \u{b7} , and . step one frame");
+                ui.add_space(8.0);
+                crate::ui_kit::shortcuts_button(
+                    ui,
+                    &[
+                        ("Space or K", "Play or pause"),
+                        ("← →", "Back or ahead 5 seconds"),
+                        ("J L", "Back or ahead 10 seconds"),
+                        (", .", "One frame back or ahead"),
+                        ("Home End", "Start or end"),
+                        ("Scroll", "Scrub"),
+                        ("M", "Mute"),
+                        ("F", "Fullscreen"),
+                        ("P N", "Previous or next clip"),
+                        ("F2", "Rename"),
+                        ("Esc", "Back to your clips"),
+                    ],
+                );
             });
         });
         outer.width()

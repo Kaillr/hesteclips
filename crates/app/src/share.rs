@@ -107,7 +107,7 @@ pub const HAS_SHARE_SHEET: bool = cfg!(any(target_os = "macos", target_os = "win
 
 /// The share sheet's menu entry, naming what it offers on this platform.
 pub const SHARE_SHEET_LABEL: &str =
-    if cfg!(target_os = "macos") { "📤  AirDrop, Messages, Mail…" } else { "📤  Share (Nearby Share, Mail…)" };
+    if cfg!(target_os = "macos") { "AirDrop, Messages, Mail…" } else { "Share (Nearby Share, Mail…)" };
 
 /// Open the macOS share sheet for `file`, anchored at `at` (window points from the
 /// top-left, as egui reports them).
