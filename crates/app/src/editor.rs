@@ -142,9 +142,15 @@ impl Editor {
                 // Every track at once, playable as it's decoded; the
                 // waveforms follow once it's all there.
                 let tracks: Vec<usize> = info.source_tracks().iter().map(|t| t.index).collect();
+                if crate::player::debug() {
+                    eprintln!("{:>8.3} editor: clip read, decoding {} tracks", crate::player::uptime(), tracks.len());
+                }
                 let pcm = media::pcm::decode_streaming(&src, &tracks, info.duration, |_, result| {
                     if let Err(e) = result {
                         eprintln!("decoding the sound: {e:#}");
+                    }
+                    if crate::player::debug() {
+                        eprintln!("{:>8.3} editor: sound all decoded", crate::player::uptime());
                     }
                 });
                 Ok(Loaded { info, pcm })

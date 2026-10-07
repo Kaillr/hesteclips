@@ -20,6 +20,17 @@ use anyhow::{Context, Result};
 
 use crate::PREVIEW_RATE;
 
+/// Sound being decoded right now, by any clip.
+static DECODING: AtomicUsize = AtomicUsize::new(0);
+
+/// Some clip's sound is being decoded. Work that reads whole clips in the
+/// background (scrub previews) waits for it: sharing a hard drive, they made
+/// each other several times slower (12 s for a 2-minute clip's sound); one
+/// after the other, the second reads the file from memory.
+pub fn busy() -> bool {
+    DECODING.load(Ordering::Relaxed) > 0
+}
+
 /// One track: interleaved stereo at [`PREVIEW_RATE`].
 pub struct PcmTrack {
     samples: Box<[AtomicU32]>,
@@ -119,6 +130,7 @@ pub fn decode_streaming(source: &Path, indices: &[usize], duration: f64, finishe
         return pcm;
     }
     let (source, indices, out) = (source.to_path_buf(), indices.to_vec(), pcm.clone());
+    DECODING.fetch_add(1, Ordering::Relaxed);
     std::thread::Builder::new()
         .name("decode audio".into())
         .spawn(move || {
@@ -138,6 +150,7 @@ pub fn decode_streaming(source: &Path, indices: &[usize], duration: f64, finishe
                 }
             }
             out.done.store(true, Ordering::Release);
+            DECODING.fetch_sub(1, Ordering::Relaxed);
             finished(&out, result);
         })
         .expect("spawn audio decoder");

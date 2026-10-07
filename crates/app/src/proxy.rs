@@ -196,6 +196,12 @@ fn start(ctx: &egui::Context, b: &Arc<Build>) {
             return;
         }
     }
+    // The sound first: building reads the whole clip too, and on a hard drive
+    // the two made each other several times slower. After it, the clip is in
+    // memory and building is quick.
+    while media::pcm::busy() && !b.stop.load(Ordering::Relaxed) {
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
     #[cfg(hw_decode)]
     if std::env::var_os("HESTECLIPS_NO_HW_DECODE").is_none() && hw::build(ctx, b) {
         return;
