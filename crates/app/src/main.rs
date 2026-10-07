@@ -299,6 +299,9 @@ struct App {
     pub(crate) windowed_apps: Vec<capture::Device>,
     /// What the running capture records, to send it list changes live.
     capturing_video: Option<capture::VideoSource>,
+    /// The audio sources the running capture records, and since when the
+    /// Sources page has asked for different ones.
+    capturing_audio: Option<(Vec<capture::sources::AudioSource>, Option<Instant>)>,
     /// Shown instead of a game or app while you're tabbed out.
     pub(crate) away_screen: std::sync::Arc<capture::StillImage>,
     /// Where the webcam sits, shared with a running capture so dragging it
@@ -435,6 +438,7 @@ impl App {
             frame_size: None,
             windowed_apps: Vec::new(),
             capturing_video: None,
+            capturing_audio: None,
             away_screen: away::screen(),
             webcam_placement: std::sync::Arc::new(std::sync::Mutex::new(capture::webcam::Placement::default_for(16.0 / 9.0, 16.0 / 9.0))),
             webcam_view: Default::default(),
@@ -696,6 +700,7 @@ impl eframe::App for App {
         self.ensure_video_preview();
         laps.lap("video preview");
         self.sync_capture_video();
+        self.sync_capture_audio();
         self.refit_webcam();
         laps.lap("webcam fit");
         if let Some(w) = &self.settings.webcam {
@@ -1365,6 +1370,7 @@ impl App {
     fn start_replay_buffer(&mut self) {
         self.refresh_audio_devices();
         self.capturing_video = Some(self.video_source());
+        self.capturing_audio = Some((self.capture_sources(), None));
         // Optimistic state; a State/Error event confirms or corrects it.
         self.service.start(capture::Mode::ReplayBuffer, self.encode_settings());
         self.rec_state = RecState::Buffering;
@@ -1374,6 +1380,7 @@ impl App {
     fn start_recording(&mut self) {
         self.refresh_audio_devices();
         self.capturing_video = Some(self.video_source());
+        self.capturing_audio = Some((self.capture_sources(), None));
         self.service.start(capture::Mode::Record, self.encode_settings());
         self.rec_state = RecState::Recording;
         self.rec_started = Some(Instant::now());
@@ -1420,6 +1427,29 @@ impl App {
         if both_apps && self.capturing_video.as_ref() != Some(&now) {
             self.service.update_video(now.clone());
             self.capturing_video = Some(now);
+        }
+    }
+
+    /// Audio sources added, removed or changed while the replay buffer runs
+    /// reach it by restarting it: which sources and tracks a clip has is fixed
+    /// when its capture starts. Waits until the changes settle, so a rename
+    /// typed letter by letter restarts once. A recording is left alone — it
+    /// would be cut in two — and picks the changes up next time.
+    /// Not cleared while idle: a restart passes through idle on its way.
+    fn sync_capture_audio(&mut self) {
+        if self.rec_state == RecState::Idle {
+            return;
+        }
+        let now = self.capture_sources();
+        let Some((running, changed)) = &mut self.capturing_audio else { return };
+        if *running == now {
+            *changed = None;
+            return;
+        }
+        let since = *changed.get_or_insert_with(Instant::now);
+        if self.rec_state == RecState::Buffering && since.elapsed() > Duration::from_millis(1500) {
+            self.service.stop(None);
+            self.start_replay_buffer();
         }
     }
 

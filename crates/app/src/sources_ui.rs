@@ -174,9 +174,16 @@ impl App {
         self.keep_listening();
         self.add_source_buttons(ui);
 
-        if self.rec_state != crate::RecState::Idle {
-            ui.add_space(10.0);
-            ui.weak("Volume changes apply right away. Adding or removing sources applies the next time you start the buffer or a recording.");
+        match self.rec_state {
+            crate::RecState::Idle => {}
+            crate::RecState::Buffering => {
+                ui.add_space(10.0);
+                ui.weak("Volume changes apply right away. Adding, removing or changing sources restarts the replay buffer, so what it has kept so far is let go.");
+            }
+            crate::RecState::Recording => {
+                ui.add_space(10.0);
+                ui.weak("Volume changes apply right away. Adding, removing or changing sources applies to your next recording.");
+            }
         }
         ui.add_space(16.0);
     }
