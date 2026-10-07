@@ -530,8 +530,8 @@ impl App {
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Collections").size(12.0).strong().color(ui.visuals().weak_text_color()));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let plus = egui::Button::new(egui::RichText::new("+").size(14.0)).frame(false);
-                if ui.add(plus).on_hover_text("New collection").clicked() {
+                let plus = egui::Button::new(egui::RichText::new("+").size(15.0)).fill(Color32::TRANSPARENT).min_size(Vec2::splat(22.0)).corner_radius(5);
+                if ui.add(plus).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("New collection").clicked() {
                     action = Some(Action::NewCollection(Vec::new()));
                 }
             });
@@ -546,7 +546,7 @@ impl App {
             ui.add(egui::Label::new(egui::RichText::new("Keep your best clips together, like \"Ace clutches\".").size(12.0).weak()).wrap());
             ui.add_space(4.0);
         }
-        if ui.add(egui::Button::new(egui::RichText::new("+  New collection").color(ACCENT)).frame(false)).clicked() {
+        if new_collection_row(ui).clicked() {
             action = Some(Action::NewCollection(Vec::new()));
         }
         action
@@ -1481,6 +1481,20 @@ fn move_menu(ui: &mut egui::Ui, folders: &[String], current: Option<&str>, offer
         }
     }
     picked
+}
+
+/// "+ New collection" at the end of the sidebar: a row like the others,
+/// lit up on hover.
+fn new_collection_row(ui: &mut egui::Ui) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 32.0), Sense::click());
+    let v = ui.visuals();
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, 7, v.widgets.hovered.weak_bg_fill);
+    }
+    let color = if resp.hovered() { ACCENT.gamma_multiply(1.15) } else { ACCENT };
+    ui.painter().text(Pos2::new(rect.left() + 20.0, rect.center().y), Align2::CENTER_CENTER, "+", FontId::proportional(18.0), color);
+    ui.painter().text(Pos2::new(rect.left() + 38.0, rect.center().y), Align2::LEFT_CENTER, "New collection", FontId::proportional(14.0), color);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 /// A section's name in the sidebar.
