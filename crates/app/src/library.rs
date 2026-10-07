@@ -99,9 +99,9 @@ struct View {
     count: usize,
 }
 
-/// What the sidebar lists: the games (the library's folders, the one played
-/// last first, then Other for clips in none) and the collections (by name).
-/// No games when the library has no folders.
+/// What the sidebar lists: the games (the library's folders, by name, with
+/// Desktop and then Other — clips in no folder — last, as they aren't games)
+/// and the collections (by name). No games when the library has no folders.
 fn views(clips: &[clips::Clip], cols: &Collections) -> (Vec<View>, Vec<View>) {
     let mut games: Vec<View> = Vec::new();
     let mut loose = 0;
@@ -115,6 +115,8 @@ fn views(clips: &[clips::Clip], cols: &Collections) -> (Vec<View>, Vec<View>) {
             None => loose += 1,
         }
     }
+    // A fixed order, so nothing moves when a clip is saved.
+    games.sort_by_key(|v| (v.label == clips::DESKTOP, v.label.to_lowercase()));
     if !games.is_empty() && loose > 0 {
         games.push(View { filter: Filter::Loose, label: "Other".into(), count: loose });
     }
@@ -280,10 +282,19 @@ impl App {
         }
         let wide = ui.available_width() >= SIDEBAR_FROM;
         if wide {
+            // A card of its own, a shade off the page, instead of a line.
+            let fill = if ui.visuals().dark_mode { Color32::from_white_alpha(7) } else { Color32::from_black_alpha(9) };
             egui::Panel::left("library_sidebar")
                 .resizable(false)
+                .show_separator_line(false)
                 .exact_size(SIDEBAR_W)
-                .frame(egui::Frame::NONE.inner_margin(egui::Margin { left: 0, right: 14, top: 8, bottom: 8 }))
+                .frame(
+                    egui::Frame::new()
+                        .fill(fill)
+                        .corner_radius(10)
+                        .inner_margin(egui::Margin::same(8))
+                        .outer_margin(egui::Margin { left: 0, right: 0, top: 8, bottom: 8 }),
+                )
                 .show(ui, |ui| {
                     egui::ScrollArea::vertical().id_salt("library_sidebar_scroll").auto_shrink([false, false]).show(ui, |ui| {
                         if let Some(a) = self.sidebar(ui, &games, &collections) {
@@ -565,24 +576,17 @@ impl App {
                 }
             }
         }
-        ui.add_space(14.0);
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Collections").size(12.0).strong().color(ui.visuals().weak_text_color()));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let plus = egui::Button::new(egui::RichText::new("+").size(15.0)).fill(Color32::TRANSPARENT).min_size(Vec2::splat(22.0)).corner_radius(5);
-                if ui.add(plus).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("New collection").clicked() {
-                    action = Some(Action::NewCollection(Vec::new()));
-                }
-            });
-        });
-        ui.add_space(2.0);
+        section_label(ui, "Collections");
         for v in collections {
             if let Some(a) = self.side_row(ui, v) {
                 action = Some(a);
             }
         }
         if collections.is_empty() {
-            ui.add(egui::Label::new(egui::RichText::new("Keep your best clips together, like \"Ace clutches\".").size(12.0).weak()).wrap());
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                ui.add(egui::Label::new(egui::RichText::new("Keep your best clips together, like \"Ace clutches\".").size(12.0).weak()).wrap());
+            });
             ui.add_space(4.0);
         }
         let row = new_collection_row(ui);
@@ -590,7 +594,7 @@ impl App {
             && row.contains_pointer()
         {
             drag.target = Some((DropOn::NewCollection, "New collection with it".into()));
-            ui.painter().rect_stroke(row.rect, 7, Stroke::new(2.0, ACCENT), StrokeKind::Inside);
+            ui.painter().rect_stroke(row.rect, ROW_RADIUS, Stroke::new(1.5, ACCENT), StrokeKind::Inside);
         }
         if row.clicked() {
             action = Some(Action::NewCollection(Vec::new()));
@@ -602,24 +606,26 @@ impl App {
     fn side_row(&mut self, ui: &mut egui::Ui, view: &View) -> Option<Action> {
         let mut action = None;
         let selected = self.library_filter == view.filter;
-        let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 32.0), Sense::click());
+        let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_H), Sense::click());
         let v = ui.visuals().clone();
         let drop_here = self.drop_target(ui, rect, &view.filter);
+        // Selected: a soft tint and a stronger name, not a solid block.
         if selected {
-            ui.painter().rect_filled(rect, 7, ACCENT);
+            ui.painter().rect_filled(rect, ROW_RADIUS, ACCENT.gamma_multiply(0.22));
         } else if resp.hovered() || drop_here {
-            ui.painter().rect_filled(rect, 7, v.widgets.hovered.weak_bg_fill);
+            ui.painter().rect_filled(rect, ROW_RADIUS, row_hover(&v));
         }
         if drop_here {
-            ui.painter().rect_stroke(rect, 7, Stroke::new(2.0, ACCENT), StrokeKind::Inside);
+            ui.painter().rect_stroke(rect, ROW_RADIUS, Stroke::new(1.5, ACCENT), StrokeKind::Inside);
         }
-        let (text, weak) = if selected { (Color32::WHITE, Color32::from_white_alpha(200)) } else { (v.text_color(), v.weak_text_color()) };
-        let icon = Rect::from_center_size(Pos2::new(rect.left() + 20.0, rect.center().y), Vec2::splat(20.0));
-        self.view_icon(ui, &view.filter, icon, text);
-        let count = ui.painter().layout_no_wrap(view.count.to_string(), FontId::proportional(12.0), weak);
-        let count_x = rect.right() - 10.0 - count.size().x;
-        ui.painter().galley(Pos2::new(count_x, rect.center().y - count.size().y / 2.0), count, weak);
-        let label_x = rect.left() + 38.0;
+        let text = if selected { v.strong_text_color() } else { v.text_color() };
+        let icon_color = if selected { ACCENT } else { v.weak_text_color() };
+        let icon = Rect::from_center_size(Pos2::new(rect.left() + 8.0 + ICON / 2.0, rect.center().y), Vec2::splat(ICON));
+        self.view_icon(ui, &view.filter, icon, icon_color);
+        let count = ui.painter().layout_no_wrap(view.count.to_string(), FontId::proportional(12.0), v.weak_text_color());
+        let count_x = rect.right() - 8.0 - count.size().x;
+        ui.painter().galley(Pos2::new(count_x, rect.center().y - count.size().y / 2.0), count, v.weak_text_color());
+        let label_x = rect.left() + 8.0 + ICON + 10.0;
         let label = ui.painter().layout_job(single_line(&view.label, FontId::proportional(14.0), text, (count_x - label_x - 8.0).max(10.0)));
         ui.painter().galley(Pos2::new(label_x, rect.center().y - label.size().y / 2.0), label, text);
         let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -740,29 +746,28 @@ impl App {
 
     /// The picture of a view: a game's icon, a collection's newest clip.
     fn view_icon(&mut self, ui: &mut egui::Ui, filter: &Filter, rect: Rect, color: Color32) {
-        let symbol = |ui: &mut egui::Ui, s: &str| {
-            ui.painter().text(rect.center(), Align2::CENTER_CENTER, s, FontId::proportional(15.0), color);
-        };
+        // Every icon is the same square: a picture (a game's logo, a
+        // collection's newest clip) fills it; otherwise a line drawing.
+        let p = ui.painter().clone();
         match filter {
-            Filter::All => symbol(ui, "🎬"),
-            Filter::Loose => symbol(ui, "📂"),
+            Filter::All => glyph_grid(&p, rect, color),
+            Filter::Loose => glyph_folder(&p, rect, color),
             Filter::Folder(name) => match self.folder_icon(ui.ctx(), name) {
                 Some(tex) => {
-                    egui::Image::from_texture((tex.id(), rect.size())).corner_radius(4).paint_at(ui, rect);
+                    egui::Image::from_texture((tex.id(), rect.size())).corner_radius(5).paint_at(ui, rect);
                 }
-                None if name == clips::DESKTOP => symbol(ui, "🖥"),
-                None => symbol(ui, "🎮"),
+                None if name == clips::DESKTOP => glyph_monitor(&p, rect, color),
+                None => glyph_folder(&p, rect, color),
             },
             Filter::Collection(id) => {
                 let newest = self.clips.iter().find(|c| self.collections.contains(id, &c.path)).cloned();
                 let ctx = ui.ctx().clone();
                 match newest.and_then(|c| self.thumbs.get(&ctx, &c).and_then(|t| t.texture.clone())) {
                     Some(tex) => {
-                        let r = Rect::from_center_size(rect.center(), Vec2::new(24.0, 18.0));
-                        let uv = crate::filmstrip::crop_uv(tex.size_vec2(), r.size());
-                        egui::Image::from_texture((tex.id(), r.size())).uv(uv).corner_radius(4).paint_at(ui, r);
+                        let uv = crate::filmstrip::crop_uv(tex.size_vec2(), rect.size());
+                        egui::Image::from_texture((tex.id(), rect.size())).uv(uv).corner_radius(5).paint_at(ui, rect);
                     }
-                    None => collection_glyph(ui.painter(), rect, color),
+                    None => collection_glyph(&p, rect, color),
                 }
             }
         }
@@ -1639,15 +1644,65 @@ fn move_menu(ui: &mut egui::Ui, folders: &[String], current: Option<&str>, offer
 /// "+ New collection" at the end of the sidebar: a row like the others,
 /// lit up on hover.
 fn new_collection_row(ui: &mut egui::Ui) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 32.0), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_H), Sense::click());
     let v = ui.visuals();
     if resp.hovered() {
-        ui.painter().rect_filled(rect, 7, v.widgets.hovered.weak_bg_fill);
+        ui.painter().rect_filled(rect, ROW_RADIUS, row_hover(v));
     }
-    let color = if resp.hovered() { ACCENT.gamma_multiply(1.15) } else { ACCENT };
-    ui.painter().text(Pos2::new(rect.left() + 20.0, rect.center().y), Align2::CENTER_CENTER, "+", FontId::proportional(18.0), color);
-    ui.painter().text(Pos2::new(rect.left() + 38.0, rect.center().y), Align2::LEFT_CENTER, "New collection", FontId::proportional(14.0), color);
+    // Quiet until pointed at: it's an action, not a place.
+    let color = if resp.hovered() { v.strong_text_color() } else { v.weak_text_color() };
+    let icon = Rect::from_center_size(Pos2::new(rect.left() + 8.0 + ICON / 2.0, rect.center().y), Vec2::splat(ICON));
+    let (c, h) = (icon.center(), ICON * 0.3);
+    let line = Stroke::new(1.5, color);
+    ui.painter().line_segment([c - Vec2::new(h, 0.0), c + Vec2::new(h, 0.0)], line);
+    ui.painter().line_segment([c - Vec2::new(0.0, h), c + Vec2::new(0.0, h)], line);
+    ui.painter().text(Pos2::new(rect.left() + 8.0 + ICON + 10.0, rect.center().y), Align2::LEFT_CENTER, "New collection", FontId::proportional(14.0), color);
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Sidebar rows: their height, corners, and the size of their icon.
+const ROW_H: f32 = 30.0;
+const ROW_RADIUS: u8 = 6;
+const ICON: f32 = 20.0;
+
+fn row_hover(v: &egui::Visuals) -> Color32 {
+    if v.dark_mode { Color32::from_white_alpha(10) } else { Color32::from_black_alpha(12) }
+}
+
+/// "All clips": a grid of four.
+fn glyph_grid(p: &egui::Painter, rect: Rect, color: Color32) {
+    let r = rect.shrink(3.0);
+    let gap = 2.5;
+    let cell = (r.width() - gap) / 2.0;
+    for (x, y) in [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)] {
+        let min = r.min + Vec2::new(x * (cell + gap), y * (cell + gap));
+        p.rect_stroke(Rect::from_min_size(min, Vec2::splat(cell)), 2, Stroke::new(1.4, color), StrokeKind::Inside);
+    }
+}
+
+/// Desktop: a monitor on its stand.
+fn glyph_monitor(p: &egui::Painter, rect: Rect, color: Color32) {
+    let line = Stroke::new(1.4, color);
+    let screen = Rect::from_min_max(rect.min + Vec2::new(2.0, 3.0), Pos2::new(rect.right() - 2.0, rect.bottom() - 6.0));
+    p.rect_stroke(screen, 2, line, StrokeKind::Inside);
+    let foot = rect.bottom() - 2.5;
+    p.line_segment([Pos2::new(rect.center().x, screen.bottom()), Pos2::new(rect.center().x, foot)], line);
+    p.line_segment([Pos2::new(rect.center().x - 4.0, foot), Pos2::new(rect.center().x + 4.0, foot)], line);
+}
+
+/// Other (clips in no folder): a folder.
+fn glyph_folder(p: &egui::Painter, rect: Rect, color: Color32) {
+    let r = rect.shrink2(Vec2::new(2.0, 4.0));
+    let tab = r.left() + r.width() * 0.4;
+    let points = vec![
+        Pos2::new(r.left(), r.bottom()),
+        Pos2::new(r.left(), r.top()),
+        Pos2::new(tab - 2.0, r.top()),
+        Pos2::new(tab + 1.0, r.top() + 2.5),
+        Pos2::new(r.right(), r.top() + 2.5),
+        Pos2::new(r.right(), r.bottom()),
+    ];
+    p.add(egui::Shape::closed_line(points, Stroke::new(1.4, color)));
 }
 
 /// A collection's picture when it has no clips: a small stack of cards.
@@ -1667,9 +1722,12 @@ fn collection_glyph(p: &egui::Painter, rect: Rect, color: Color32) {
 
 /// A section's name in the sidebar.
 fn section_label(ui: &mut egui::Ui, text: &str) {
-    ui.add_space(14.0);
-    ui.label(egui::RichText::new(text).size(12.0).strong().color(ui.visuals().weak_text_color()));
-    ui.add_space(2.0);
+    ui.add_space(16.0);
+    ui.horizontal(|ui| {
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new(text.to_uppercase()).size(11.0).extra_letter_spacing(0.8).color(ui.visuals().weak_text_color()));
+    });
+    ui.add_space(4.0);
 }
 
 /// What can be done with a game's folder or a collection (right-click, ⋯).
