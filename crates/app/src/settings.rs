@@ -277,8 +277,9 @@ pub struct AudioSourceCfg {
     pub volume_db: f32,
     #[serde(default)]
     pub muted: bool,
-    /// A microphone's background noise (fans, keyboard, hum) removed.
-    #[serde(default = "yes")]
+    /// A microphone's background noise (fans, keyboard, hum) removed. Off
+    /// unless turned on.
+    #[serde(default)]
     pub noise_removal: bool,
 }
 
@@ -297,7 +298,7 @@ impl AudioSourceCfg {
             own_track: true,
             volume_db: 0.0,
             muted: false,
-            noise_removal: true,
+            noise_removal: false,
         }
     }
 
