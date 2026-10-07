@@ -277,6 +277,9 @@ pub struct AudioSourceCfg {
     pub volume_db: f32,
     #[serde(default)]
     pub muted: bool,
+    /// A microphone's background noise (fans, keyboard, hum) removed.
+    #[serde(default = "yes")]
+    pub noise_removal: bool,
 }
 
 fn yes() -> bool {
@@ -294,6 +297,7 @@ impl AudioSourceCfg {
             own_track: true,
             volume_db: 0.0,
             muted: false,
+            noise_removal: true,
         }
     }
 

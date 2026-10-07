@@ -112,6 +112,9 @@ impl AudioCapture {
         let mut system_sources = Vec::new();
         for (source, feed) in sources.iter().zip(&feeds) {
             let channel = live.channel(&source.id);
+            if matches!(source.kind, SourceKind::Microphone { .. }) {
+                feed.denoise_with(channel.denoise_flag());
+            }
             match &source.kind {
                 #[cfg(not(target_os = "linux"))]
                 SourceKind::Microphone { device } => match start_mic(device, feed.clone()) {

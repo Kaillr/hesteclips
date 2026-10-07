@@ -401,7 +401,9 @@ impl App {
         let (mp3_tx, mp3_rx) = std::sync::mpsc::channel();
         live_audio.set_limiter(settings.limiter);
         for s in &settings.audio_sources {
-            live_audio.channel(&s.id).set_volume(sources_ui::from_db(s.volume_db), s.muted);
+            let channel = live_audio.channel(&s.id);
+            channel.set_volume(sources_ui::from_db(s.volume_db), s.muted);
+            channel.set_denoise(s.noise_removal);
         }
         let updater = update::Updater::new(ctx.clone(), settings.auto_update);
         let mut app = Self {

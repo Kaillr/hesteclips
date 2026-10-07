@@ -143,6 +143,9 @@ pub struct Channel {
     /// [`RATE`], when set: for listening to the microphone ("hashtag
     /// HesteClip that").
     tap: Mutex<Option<std::sync::mpsc::Sender<Vec<f32>>>>,
+    /// Noise removal on its sound (a microphone's): shared with its feed,
+    /// which does it as the sound arrives.
+    denoise: Arc<AtomicBool>,
 }
 
 impl Channel {
@@ -154,7 +157,18 @@ impl Channel {
             meter: Meter::default(),
             input: Meter::default(),
             tap: Mutex::new(None),
+            denoise: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Remove background noise (fans, keyboards, hum) from its sound. Takes
+    /// effect immediately, even mid-recording.
+    pub fn set_denoise(&self, on: bool) {
+        self.denoise.store(on, Ordering::Relaxed);
+    }
+
+    pub(crate) fn denoise_flag(&self) -> Arc<AtomicBool> {
+        self.denoise.clone()
     }
 
     /// Hand the source's sound, mono at [`RATE`], to `tap` (`None`: stop).
@@ -293,6 +307,8 @@ struct FeedState {
     /// Output frames still to discard: resampler delay, or audio that arrived
     /// after the mixer had already moved past it.
     skip_out: i64,
+    /// Noise removal, when this feed is a microphone's.
+    denoise: Option<Denoise>,
 }
 
 impl SourceFeed {
@@ -313,9 +329,18 @@ impl SourceFeed {
                 out: VecDeque::new(),
                 out_base: 0,
                 skip_out: 0,
+                denoise: None,
             }),
             children: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Remove noise from this feed's sound while `on` is set (it can change
+    /// at any moment). Delays it by one RNNoise frame, 10 ms, whether on or
+    /// off, so switching doesn't shift it in time.
+    pub(crate) fn denoise_with(&self, on: Arc<AtomicBool>) {
+        let mut st = self.st.lock().unwrap();
+        st.denoise = Some(Denoise::new(on));
     }
 
     /// A new feed (at `rate`) whose audio is added to this one's.
@@ -344,7 +369,8 @@ impl SourceFeed {
             st.next_in = Some(expected);
             st.out.clear();
             st.out_base = (expected as f64 * RATE as f64 / rate).round() as i64;
-            st.skip_out = st.resampler.as_ref().map_or(0, |r| r.output_delay() as i64);
+            st.skip_out = st.resampler.as_ref().map_or(0, |r| r.output_delay() as i64)
+                + if st.denoise.is_some() { Denoise::DELAY as i64 } else { 0 };
         }
         let drift = expected - st.next_in.unwrap();
         let tolerance = (Self::TOLERANCE * rate) as i64;
@@ -461,6 +487,10 @@ impl FeedState {
     }
 
     fn append(&mut self, frames: impl Iterator<Item = [f32; 2]>) {
+        let frames: Vec<[f32; 2]> = match self.denoise.as_mut() {
+            Some(d) => d.process(frames),
+            None => frames.collect(),
+        };
         for f in frames {
             if self.skip_out > 0 {
                 self.skip_out -= 1;
@@ -468,6 +498,74 @@ impl FeedState {
                 self.out.push_back(f);
             }
         }
+    }
+}
+
+/// RNNoise on a feed's 48 kHz sound, in its 10 ms frames: both sides are
+/// made one (a microphone is mono) and cleaned together. RNNoise hands each
+/// frame back one frame later, so the sound always comes out a frame late,
+/// on or off, and turning it on or off never shifts it; across a switch it
+/// fades from one to the other over a frame.
+pub(crate) struct Denoise {
+    on: Arc<AtomicBool>,
+    state: Box<nnnoiseless::DenoiseState<'static>>,
+    /// Waiting for a full frame.
+    pending: Vec<[f32; 2]>,
+    /// The previous frame as it came: what RNNoise's output lines up with.
+    dry: Vec<[f32; 2]>,
+    /// Whether the last frame was cleaned.
+    was_on: bool,
+}
+
+impl Denoise {
+    pub(crate) const FRAME: usize = nnnoiseless::DenoiseState::FRAME_SIZE;
+    /// How late the sound comes out, in frames of sound.
+    const DELAY: usize = Self::FRAME;
+
+    pub(crate) fn new(on: Arc<AtomicBool>) -> Self {
+        Self {
+            on,
+            state: nnnoiseless::DenoiseState::new(),
+            pending: Vec::with_capacity(Self::FRAME * 2),
+            dry: vec![[0.0; 2]; Self::FRAME],
+            was_on: false,
+        }
+    }
+
+    /// Mono sound in, mono out (a frame late).
+    pub(crate) fn process_mono(&mut self, samples: &[f32]) -> Vec<f32> {
+        self.process(samples.iter().map(|&s| [s, s])).into_iter().map(|f| f[0]).collect()
+    }
+
+    fn process(&mut self, frames: impl Iterator<Item = [f32; 2]>) -> Vec<[f32; 2]> {
+        self.pending.extend(frames);
+        let whole = self.pending.len() / Self::FRAME * Self::FRAME;
+        let mut out = Vec::with_capacity(whole);
+        let mut input = [0f32; Self::FRAME];
+        let mut cleaned = [0f32; Self::FRAME];
+        for chunk in self.pending[..whole].chunks_exact(Self::FRAME) {
+            // Run even while off, so it knows the noise the moment it's turned on.
+            for (i, f) in input.iter_mut().zip(chunk) {
+                *i = (f[0] + f[1]) * 0.5 * 32768.0;
+            }
+            self.state.process_frame(&mut cleaned, &input);
+            let on = self.on.load(Ordering::Relaxed);
+            for (k, (f, c)) in self.dry.iter().zip(&cleaned).enumerate() {
+                let c = (c / 32768.0).clamp(-1.0, 1.0);
+                let t = (k + 1) as f32 / Self::FRAME as f32;
+                let wet = match (self.was_on, on) {
+                    (true, true) => 1.0,
+                    (false, false) => 0.0,
+                    (false, true) => t,
+                    (true, false) => 1.0 - t,
+                };
+                out.push([f[0] + (c - f[0]) * wet, f[1] + (c - f[1]) * wet]);
+            }
+            self.dry.copy_from_slice(chunk);
+            self.was_on = on;
+        }
+        self.pending.drain(..whole);
+        out
     }
 }
 
@@ -651,6 +749,60 @@ mod tests {
         let c = Arc::new(Clock::default());
         c.set(1000.0);
         c
+    }
+
+    /// Hiss under a voice that comes and goes: the hiss between words much
+    /// quieter, and the sound a frame late, on or off.
+    #[test]
+    fn denoise_removes_noise_and_keeps_timing() {
+        let on = Arc::new(AtomicBool::new(true));
+        let mut seed = 1u32;
+        let mut noise = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            (seed >> 8) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0
+        };
+        // 4 s: a voice-like buzz (150 Hz and its harmonics) for half of each
+        // second, over hiss throughout.
+        let input: Vec<[f32; 2]> = (0..192_000)
+            .map(|i| {
+                let t = i as f32 / RATE as f32;
+                let voiced = t.fract() < 0.5;
+                let buzz: f32 = if voiced { (1..15).map(|h| (std::f32::consts::TAU * 150.0 * h as f32 * t).sin() / h as f32).sum::<f32>() * 0.1 } else { 0.0 };
+                let v = buzz + noise() * 0.02;
+                [v, v]
+            })
+            .collect();
+        let mut d = Denoise::new(on.clone());
+        let out = d.process(input.iter().copied());
+        assert_eq!(out.len(), input.len());
+        let rms = |s: &[[f32; 2]]| (s.iter().map(|f| f[0] * f[0]).sum::<f32>() / s.len() as f32).sqrt();
+        // A gap between words (well inside it), and a word, in the last second.
+        let gap = 3 * 48_000 + 30_000..3 * 48_000 + 46_000;
+        let word = 3 * 48_000 + 4_000..3 * 48_000 + 20_000;
+        let (before, after) = (rms(&input[gap.clone()]), rms(&out[gap]));
+        assert!(after < before * 0.2, "hiss between words {before} -> {after}");
+        let (before, after) = (rms(&input[word.clone()]), rms(&out[word]));
+        assert!(after > before * 0.5, "voice {before} -> {after}");
+
+        // Off: the sound as it came, a frame late.
+        on.store(false, Ordering::Relaxed);
+        let mut d = Denoise::new(on);
+        let out = d.process(input.iter().copied());
+        assert_eq!(out[Denoise::DELAY..], input[..input.len() - Denoise::DELAY]);
+    }
+
+    #[test]
+    fn denoised_feed_stays_on_time() {
+        let feed = SourceFeed::new(RATE, clock_at_zero());
+        feed.denoise_with(Arc::new(AtomicBool::new(false)));
+        // 30 ms of ones, captured 20 ms after t0: still at 20 ms, though it
+        // comes out of the denoiser a frame late.
+        feed.push(1000.02, &vec![1.0; 1440 * 2], 2);
+        feed.push(1000.05, &vec![0.0; 960 * 2], 2);
+        let out = feed.take(0, 3840);
+        assert!(out[..960].iter().all(|f| f[0] == 0.0));
+        assert!(out[960..2400].iter().all(|f| f[0] == 1.0), "{:?}", &out[950..970]);
+        assert!(out[2400..2880].iter().all(|f| f[0] == 0.0));
     }
 
     #[test]

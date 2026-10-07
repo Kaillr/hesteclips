@@ -74,14 +74,21 @@ impl MicMonitor {
         let in_buffer = match in_stream_config.buffer_size {
             cpal::BufferSize::Fixed(n) => n as f32 / in_rate,
             cpal::BufferSize::Default => 0.01,
-        };
+        } + crate::mixer::Denoise::FRAME as f32 / in_rate;
 
         let q = queue.clone();
+        // You hear it as it's recorded: with noise removal, cleaned (switching
+        // fades, as in the recording). It always comes a frame, 10 ms, later.
+        let mut denoise = crate::mixer::Denoise::new(channel.denoise_flag());
+        let mut mono = Vec::new();
         let in_stream = input.build_input_stream::<f32, _, _>(
             in_stream_config,
             move |data, _| {
+                mono.clear();
+                mono.extend(data.chunks(in_channels).map(|f| f.iter().sum::<f32>() / in_channels as f32));
+                let out = denoise.process_mono(&mono);
                 let mut q = q.lock().unwrap();
-                q.extend(data.chunks(in_channels).map(|f| f.iter().sum::<f32>() / in_channels as f32));
+                q.extend(out);
                 let excess = q.len().saturating_sub(max_queue);
                 q.drain(..excess);
             },

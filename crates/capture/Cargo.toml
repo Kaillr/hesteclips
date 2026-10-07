@@ -7,6 +7,8 @@ edition = "2024"
 anyhow = "1.0.104"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 rubato = "5.0.1"
+# Microphone noise removal (RNNoise, in Rust).
+nnnoiseless = { version = "0.5", default-features = false }
 # Mics on macOS and Windows (Linux records them from PipeWire, like the
 # rest), and "Listen" everywhere.
 cpal = "0.18.2"

@@ -160,6 +160,7 @@ impl App {
             // Volume applies live, even mid-recording.
             let s = &self.settings.audio_sources[i];
             channel.set_volume(from_db(s.volume_db), s.muted);
+            channel.set_denoise(s.noise_removal);
             ui.add_space(8.0);
         }
         if let Some(i) = remove {
@@ -869,6 +870,9 @@ fn source_card(
                     .on_disabled_hover_text("Add an app as its own source to use this.");
             }
             if matches!(source.kind, SourceKind::Microphone { .. }) {
+                ui.checkbox(&mut source.noise_removal, "Remove background noise").on_hover_text(
+                    "Takes out steady sounds behind your voice — fans, a keyboard, hum, traffic — and keeps your voice. Done on this computer, as it records.",
+                );
                 ui.add_space(8.0);
                 let on = listening.is_some();
                 let r = ui.selectable_label(on, "🎧 Listen").on_hover_text(
