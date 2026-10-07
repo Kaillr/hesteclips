@@ -809,18 +809,16 @@ impl App {
                     if ui.button("+  New collection…").clicked() {
                         action = Some(Action::NewCollection(Vec::new()));
                     }
+                    // No sidebar to right-click: what it would offer for this view.
+                    if !matches!(filter, Filter::All | Filter::Loose) {
+                        ui.separator();
+                        if let Some(a) = view_menu(ui, &filter) {
+                            action = Some(a);
+                        }
+                    }
                 });
             }
             ui.weak(if shown == 1 { "1 clip".to_owned() } else { format!("{shown} clips") });
-            if !matches!(filter, Filter::All | Filter::Loose) {
-                ui.menu_button(egui::RichText::new("…").size(18.0), |ui| {
-                    if let Some(a) = view_menu(ui, &filter) {
-                        action = Some(a);
-                    }
-                })
-                .response
-                .on_hover_text("More");
-            }
         });
         ui.add_space(2.0);
         action
@@ -1707,19 +1705,25 @@ fn glyph_folder(p: &egui::Painter, rect: Rect, color: Color32) {
     p.add(egui::Shape::closed_line(points, Stroke::new(1.4, color)));
 }
 
-/// A collection's picture when it has no clips: a small stack of cards.
+/// A collection's picture when it has no clips: the square its newest
+/// clip's picture fills, empty (dashed).
 fn collection_glyph(p: &egui::Painter, rect: Rect, color: Color32) {
-    let s = rect.width().min(rect.height());
-    let card = Vec2::new(s * 0.8, s * 0.56);
-    let front = Rect::from_center_size(rect.center() + Vec2::new(-s * 0.06, s * 0.1), card);
-    let back = front.translate(Vec2::new(s * 0.12, -s * 0.18));
-    let r = (s * 0.12) as u8;
-    let line = Stroke::new((s / 14.0).max(1.2), color);
-    // Only the back card's edges that show above and beside the front one,
-    // so it works on any background.
-    let corners = vec![Pos2::new(back.left(), front.top()), back.left_top(), back.right_top(), Pos2::new(back.right(), back.bottom())];
-    p.add(egui::Shape::line(corners, line));
-    p.rect_stroke(front, r, line, StrokeKind::Middle);
+    let r = rect.shrink(1.5);
+    // Rounded corners drawn as short arcs, dashes along the straight sides.
+    let k = 4.0;
+    let corner = |c: Pos2, from: f32| -> Vec<Pos2> {
+        (0..=4).map(|i| {
+            let a = from + i as f32 * std::f32::consts::FRAC_PI_8;
+            c + Vec2::new(a.cos(), a.sin()) * k
+        }).collect()
+    };
+    let mut path = Vec::new();
+    path.extend(corner(Pos2::new(r.right() - k, r.top() + k), -std::f32::consts::FRAC_PI_2));
+    path.extend(corner(Pos2::new(r.right() - k, r.bottom() - k), 0.0));
+    path.extend(corner(Pos2::new(r.left() + k, r.bottom() - k), std::f32::consts::FRAC_PI_2));
+    path.extend(corner(Pos2::new(r.left() + k, r.top() + k), std::f32::consts::PI));
+    path.push(path[0]);
+    p.extend(egui::Shape::dashed_line(&path, Stroke::new(1.3, color), 3.0, 2.5));
 }
 
 /// A section's name in the sidebar.
@@ -1784,14 +1788,10 @@ fn collection_menu(ui: &mut egui::Ui, cols: &Collections, paths: &[PathBuf]) -> 
 /// A collection with no clips yet: how to fill it.
 fn empty_collection(ui: &mut egui::Ui, name: &str) {
     ui.vertical_centered(|ui| {
-        ui.add_space(ui.available_height() * 0.22);
-        let (r, _) = ui.allocate_exact_size(Vec2::splat(48.0), Sense::hover());
-        collection_glyph(ui.painter(), r, ui.visuals().weak_text_color());
-        ui.add_space(8.0);
+        ui.add_space(ui.available_height() * 0.28);
         ui.label(egui::RichText::new(format!("Nothing in {name} yet")).size(18.0).strong());
-        ui.add_space(4.0);
-        ui.weak("Right-click a clip and choose Add to collection,");
-        ui.weak("or select a few clips and use Add to collection on top.");
+        ui.add_space(6.0);
+        ui.weak("Drag clips onto it in the sidebar, or right-click a clip and choose Add to collection.");
     });
 }
 
