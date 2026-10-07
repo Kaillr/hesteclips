@@ -95,6 +95,10 @@ impl MicMonitor {
         let step = in_rate / out_rate;
         let mut pos = 0.0f32;
         let mut last = 0.0f32;
+        // The queue's length swings by a buffer from callback to callback:
+        // averaged over about a second, and the number shown only moves when
+        // that moves by a whole millisecond.
+        let mut smooth = 0.0f32;
         let (q, lat) = (queue, latency_us.clone());
         let out_stream = output.build_output_stream::<f32, _, _>(
             out_stream_config,
@@ -120,7 +124,12 @@ impl MicMonitor {
                 // buffer is heard.
                 let ts = info.timestamp();
                 let ahead = ts.playback.duration_since(ts.callback).as_secs_f32();
-                lat.store(((in_buffer + queued + ahead) * 1e6) as u32, Ordering::Relaxed);
+                let now = in_buffer + queued + ahead;
+                smooth = if smooth == 0.0 { now } else { smooth + (now - smooth) * 0.02 };
+                let shown = lat.load(Ordering::Relaxed) as f32 / 1e6;
+                if (smooth - shown).abs() >= 0.001 {
+                    lat.store(((smooth * 1000.0).round() * 1000.0) as u32, Ordering::Relaxed);
+                }
             },
             |e| eprintln!("mic monitor (output): {e}"),
             None,
