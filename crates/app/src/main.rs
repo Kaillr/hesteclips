@@ -330,6 +330,9 @@ struct App {
     cloud: cloud::Cloud,
     /// Open modal, if any.
     dialog: Option<cloud_ui::Dialog>,
+    /// Public links of finished uploads, each shown in its own dialog once
+    /// nothing else is open: (clip, link).
+    public_links: std::collections::VecDeque<(PathBuf, String)>,
     toast: Option<Toast>,
     editor: Option<editor::Editor>,
     viewer: Option<viewer::Viewer>,
@@ -455,6 +458,7 @@ impl App {
             last_saved: None,
             cloud: cloud::Cloud::new(ctx),
             dialog: None,
+            public_links: Default::default(),
             toast: None,
             editor: None,
             viewer: None,
@@ -1295,10 +1299,7 @@ impl App {
                 cloud::UploadDone::Uploaded { clip, to, link: None } => {
                     self.toast(format!("Uploaded {} to {}", file_name(&clip), to.display()));
                 }
-                cloud::UploadDone::Uploaded { clip, link: Some(link), .. } => {
-                    self.ctx().copy_text(link);
-                    self.toast(format!("Uploaded {}. Public link copied", file_name(&clip)));
-                }
+                cloud::UploadDone::Uploaded { clip, link: Some(link), .. } => self.public_links.push_back((clip, link)),
                 cloud::UploadDone::Failed { clip, error } => {
                     self.toast_error(format!("Couldn't upload {}: {error}", file_name(&clip)));
                 }

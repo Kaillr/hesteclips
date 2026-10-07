@@ -9,6 +9,8 @@ pub(crate) enum Dialog {
     /// Folders-only browser for choosing the default clips folder.
     PickDefaultFolder,
     Share(ShareDialog),
+    /// An upload's public link, to copy or open.
+    PublicLink { clip: PathBuf, link: String, copied: bool },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -133,10 +135,14 @@ impl App {
     }
 
     pub(crate) fn dialogs(&mut self, ctx: &egui::Context) {
+        if self.dialog.is_none() {
+            self.dialog = self.public_links.pop_front().map(|(clip, link)| Dialog::PublicLink { clip, link, copied: false });
+        }
         let Some(dialog) = self.dialog.take() else { return };
         self.dialog = match dialog {
             Dialog::PickDefaultFolder => self.pick_default_folder_dialog(ctx),
             Dialog::Share(share) => self.share_dialog(ctx, share).map(Dialog::Share),
+            Dialog::PublicLink { clip, link, copied } => public_link_dialog(ctx, clip, link, copied),
         };
     }
 
@@ -250,7 +256,7 @@ impl App {
             ui.add_space(if game.is_some() { 2.0 } else { 8.0 });
             let mut public = self.cloud.public_links;
             ui.checkbox(&mut public, "Make a public link")
-                .on_hover_text("Anyone with the link can watch and download the clip. It's copied for you when the upload is done.");
+                .on_hover_text("Anyone with the link can watch and download the clip. It's shown when the upload is done.");
             self.cloud.set_public_links(public);
             ui.add_space(12.0);
             let busy = self.cloud.upload_for(&share.clip).is_some();
@@ -276,4 +282,38 @@ impl App {
         });
         (keep_open && !resp.should_close()).then_some(share)
     }
+}
+
+/// An upload is done and has a public link: show it, with a button to copy it.
+fn public_link_dialog(ctx: &egui::Context, clip: PathBuf, link: String, mut copied: bool) -> Option<Dialog> {
+    let mut keep_open = true;
+    let resp = egui::Modal::new(egui::Id::new("public_link")).show(ctx, |ui| {
+        ui.set_width(460.0);
+        ui.heading("Public link ready");
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new(format!("🎬  {}", file_name(&clip))).strong());
+        ui.add_space(4.0);
+        ui.weak("Anyone with this link can watch and download the clip.");
+        ui.add_space(10.0);
+        let mut shown = link.as_str();
+        ui.add(egui::TextEdit::singleline(&mut shown).desired_width(f32::INFINITY));
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            let text = if copied { "✔  Copied" } else { "Copy link" };
+            let copy = egui::Button::new(egui::RichText::new(text).color(egui::Color32::WHITE))
+                .fill(crate::library::ACCENT)
+                .min_size(egui::vec2(96.0, 28.0));
+            if ui.add(copy).clicked() {
+                ui.ctx().copy_text(link.clone());
+                copied = true;
+            }
+            if ui.button("Open in browser").clicked() {
+                ui.ctx().open_url(egui::OpenUrl::new_tab(&link));
+            }
+            if ui.button("Close").clicked() {
+                keep_open = false;
+            }
+        });
+    });
+    (keep_open && !resp.should_close()).then_some(Dialog::PublicLink { clip, link, copied })
 }
