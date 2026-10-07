@@ -263,7 +263,7 @@ impl Viewer {
                         out = ViewerOutcome::Share(c);
                     }
                 });
-                let collect = egui::Button::new(RichText::new("🗂 Collections").size(14.0)).min_size(Vec2::new(0.0, 30.0)).corner_radius(8);
+                let collect = egui::Button::new(RichText::new("+ Collection").size(14.0)).min_size(Vec2::new(0.0, 30.0)).corner_radius(8);
                 let collect = ui.add(collect).on_hover_text("Add it to a collection of your own, like \"Ace clutches\"");
                 egui::Popup::menu(&collect).show(|ui| {
                     ui.set_min_width(200.0);

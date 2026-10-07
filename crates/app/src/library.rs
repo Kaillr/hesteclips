@@ -460,7 +460,7 @@ impl App {
                         {
                             action = Some(Action::InCollection(selected.clone(), id.clone(), false));
                         }
-                        ui.menu_button("🗂  Add to collection", |ui| {
+                        ui.menu_button("+  Add to collection", |ui| {
                             if let Some(a) = collection_menu(ui, &self.collections, &selected) {
                                 action = Some(a);
                             }
@@ -608,7 +608,7 @@ impl App {
                         let uv = crate::filmstrip::crop_uv(tex.size_vec2(), r.size());
                         egui::Image::from_texture((tex.id(), r.size())).uv(uv).corner_radius(4).paint_at(ui, r);
                     }
-                    None => symbol(ui, "🗂"),
+                    None => collection_glyph(ui.painter(), rect, color),
                 }
             }
         }
@@ -1124,7 +1124,7 @@ impl App {
             // Right-clicking one of several selected clips acts on all of them.
             if selected && n > 1 {
                 let paths: Vec<PathBuf> = self.clips.iter().filter(|c| self.selection.paths.contains(&c.path)).map(|c| c.path.clone()).collect();
-                ui.menu_button(format!("🗂  Add {n} clips to collection"), |ui| {
+                ui.menu_button(format!("+  Add {n} clips to collection"), |ui| {
                     if let Some(a) = collection_menu(ui, &self.collections, &paths) {
                         action = Some(a);
                     }
@@ -1161,7 +1161,7 @@ impl App {
             if ui.button("✏  Rename…").clicked() {
                 action = Some(Action::Rename(clip.path.clone()));
             }
-            ui.menu_button("🗂  Add to collection", |ui| {
+            ui.menu_button("+  Add to collection", |ui| {
                 if let Some(a) = collection_menu(ui, &self.collections, std::slice::from_ref(&clip.path)) {
                     action = Some(a);
                 }
@@ -1497,6 +1497,21 @@ fn new_collection_row(ui: &mut egui::Ui) -> egui::Response {
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
+/// A collection's picture when it has no clips: a small stack of cards.
+fn collection_glyph(p: &egui::Painter, rect: Rect, color: Color32) {
+    let s = rect.width().min(rect.height());
+    let card = Vec2::new(s * 0.8, s * 0.56);
+    let front = Rect::from_center_size(rect.center() + Vec2::new(-s * 0.06, s * 0.1), card);
+    let back = front.translate(Vec2::new(s * 0.12, -s * 0.18));
+    let r = (s * 0.12) as u8;
+    let line = Stroke::new((s / 14.0).max(1.2), color);
+    // Only the back card's edges that show above and beside the front one,
+    // so it works on any background.
+    let corners = vec![Pos2::new(back.left(), front.top()), back.left_top(), back.right_top(), Pos2::new(back.right(), back.bottom())];
+    p.add(egui::Shape::line(corners, line));
+    p.rect_stroke(front, r, line, StrokeKind::Middle);
+}
+
 /// A section's name in the sidebar.
 fn section_label(ui: &mut egui::Ui, text: &str) {
     ui.add_space(14.0);
@@ -1557,7 +1572,8 @@ fn collection_menu(ui: &mut egui::Ui, cols: &Collections, paths: &[PathBuf]) -> 
 fn empty_collection(ui: &mut egui::Ui, name: &str) {
     ui.vertical_centered(|ui| {
         ui.add_space(ui.available_height() * 0.22);
-        ui.label(egui::RichText::new("🗂").size(40.0));
+        let (r, _) = ui.allocate_exact_size(Vec2::splat(48.0), Sense::hover());
+        collection_glyph(ui.painter(), r, ui.visuals().weak_text_color());
         ui.add_space(8.0);
         ui.label(egui::RichText::new(format!("Nothing in {name} yet")).size(18.0).strong());
         ui.add_space(4.0);
