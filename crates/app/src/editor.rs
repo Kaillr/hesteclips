@@ -18,7 +18,6 @@ use media::{ClipInfo, Edit};
 use crate::library::REC_RED;
 use crate::filmstrip::Filmstrip;
 use crate::player::Player;
-use crate::waveform::Waveform;
 use crate::store::{self, EditTarget};
 
 const WAVE_BLUE: Color32 = Color32::from_rgb(70, 130, 220);
@@ -54,8 +53,6 @@ struct Loaded {
     info: ClipInfo,
     /// Every source track, filling in as it's decoded.
     pcm: Arc<media::pcm::Pcm>,
-    /// Per source track, for drawing, once they're all decoded.
-    waves: Receiver<Vec<Waveform>>,
 }
 
 enum State {
@@ -70,9 +67,8 @@ struct Ready {
     edit: Edit,
     /// What was last saved, to know whether there are unsaved changes.
     saved: Edit,
-    /// Empty until the sound is all decoded (`waves_rx`).
-    waves: Vec<Waveform>,
-    waves_rx: Receiver<Vec<Waveform>>,
+    /// Per source track, growing as the sound is decoded.
+    waves: Vec<Arc<crate::waveform::Live>>,
     strip: Filmstrip,
     /// Smoothed meter values (peak, rms) per track, then master; and peak holds.
     meters: Vec<Meter>,
@@ -146,20 +142,12 @@ impl Editor {
                 // Every track at once, playable as it's decoded; the
                 // waveforms follow once it's all there.
                 let tracks: Vec<usize> = info.source_tracks().iter().map(|t| t.index).collect();
-                let (waves_tx, waves) = mpsc::channel();
-                let ctx = repaint.clone();
-                let pcm = media::pcm::decode_streaming(&src, &tracks, info.duration, move |pcm, result| {
+                let pcm = media::pcm::decode_streaming(&src, &tracks, info.duration, |_, result| {
                     if let Err(e) = result {
                         eprintln!("decoding the sound: {e:#}");
                     }
-                    let built: Vec<Waveform> = std::thread::scope(|s| {
-                        let jobs: Vec<_> = pcm.tracks().iter().map(|t| s.spawn(|| Waveform::new(&t.to_vec(), media::PREVIEW_RATE))).collect();
-                        jobs.into_iter().map(|j| j.join().unwrap_or_else(|_| Waveform::new(&[], media::PREVIEW_RATE))).collect()
-                    });
-                    let _ = waves_tx.send(built);
-                    ctx.request_repaint();
                 });
-                Ok(Loaded { info, pcm, waves })
+                Ok(Loaded { info, pcm })
             })();
             let _ = tx.send(result);
             repaint.request_repaint();
@@ -251,6 +239,7 @@ impl Ready {
         edit.end = edit.end.min(l.info.duration);
         let gains = edit.tracks.clone();
         let n = l.pcm.len();
+        let waves = (0..n).map(|i| crate::waveform::follow(l.pcm.clone(), i, ctx)).collect();
         let mut player = Player::new(ctx, source, l.info.clone(), l.pcm, gains);
         player.seek(edit.start);
 
@@ -261,8 +250,7 @@ impl Ready {
             player,
             saved: edit.clone(),
             edit,
-            waves: Vec::new(),
-            waves_rx: l.waves,
+            waves,
             strip,
             meters: vec![Meter::default(); n],
             master: Meter::default(),
@@ -284,9 +272,6 @@ impl Ready {
         // The clip as named in the library; decoding uses `target.source`.
         let source = target.clip.as_path();
         let ctx = ui.ctx().clone();
-        if let Ok(waves) = self.waves_rx.try_recv() {
-            self.waves = waves;
-        }
         self.keyboard(&ctx);
         self.player.set_mix(self.edit.tracks.clone());
 

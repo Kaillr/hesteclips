@@ -8,8 +8,9 @@
 //! On Windows and macOS the pictures are exact frames from the GPU's video decoder, in
 //! stretches of a fixed number of frames laid end to end from the clip's
 //! start (the last one to its end), as many frames as fit a thumbnail at
-//! this zoom: they stay put while panning. A picture not decoded yet shows
-//! the nearest one that is, then its own (once, a few ms later).
+//! this zoom: they stay put while panning. A picture shows only its own frame:
+//! until that's decoded (a few ms), its place stays empty. (Showing the
+//! nearest decoded one meanwhile made the strip flicker through wrong frames.)
 //!
 //! Elsewhere (or if the decoder can't open the clip) the pictures are the
 //! clip's keyframes, from `media::keyframe_strip`: the ones to show are
@@ -237,7 +238,7 @@ mod exact {
                 .iter()
                 .map(|&(a, b, i)| {
                     let end = if b >= frames { dur } else { b as f64 / self.fps };
-                    (a as f64 / self.fps, end, self.nearest(i))
+                    (a as f64 / self.fps, end, self.thumbs.get(&i).map(|e| &e.0))
                 })
                 .collect();
             paint_cells(ui, lane, from, to, &drawn);

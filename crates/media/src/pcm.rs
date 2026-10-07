@@ -52,6 +52,12 @@ impl PcmTrack {
         Some((l, r))
     }
 
+    /// Samples `from..to` (clamped to what's decoded), as plain samples.
+    pub fn copy(&self, from: usize, to: usize) -> Vec<f32> {
+        let to = to.min(self.len());
+        self.samples[from.min(to)..to].iter().map(|s| f32::from_bits(s.load(Ordering::Relaxed))).collect()
+    }
+
     /// What's decoded, as plain samples (for the waveform).
     pub fn to_vec(&self) -> Vec<f32> {
         self.samples[..self.len()].iter().map(|s| f32::from_bits(s.load(Ordering::Relaxed))).collect()

@@ -56,19 +56,66 @@ pub struct Waveform {
     rate: f64,
     /// `levels[0]` is the finest.
     levels: Vec<Vec<Bucket>>,
+    /// Samples not yet a whole finest bucket (while it's still being fed).
+    pending: Vec<f32>,
 }
 
 impl Waveform {
     /// From interleaved stereo at `rate` Hz (channels are combined: peaks from
     /// either side, loudness from both).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(stereo: &[f32], rate: u32) -> Self {
-        let base: Vec<Bucket> = media::sample_peaks(stereo, BASE * 2).into_iter().map(|[min, max, ms]| Bucket { min, max, ms }).collect();
-        let mut levels = vec![base];
-        while levels.last().is_some_and(|l| l.len() > 1) {
-            let next = levels.last().unwrap().chunks(FACTOR).map(Bucket::merge).collect();
-            levels.push(next);
+        let mut w = Self::empty(rate);
+        w.extend(stereo);
+        w.finish();
+        w
+    }
+
+    /// Nothing yet: fed with [`Self::extend`] as the sound is decoded.
+    pub fn empty(rate: u32) -> Self {
+        Self { rate: rate as f64, levels: vec![Vec::new()], pending: Vec::new() }
+    }
+
+    /// The next samples (interleaved stereo, after what came before). Only the
+    /// newest bucket of each level is redone, so feeding it as it decodes
+    /// costs the same as building it at once.
+    pub fn extend(&mut self, stereo: &[f32]) {
+        self.pending.extend_from_slice(stereo);
+        let whole = self.pending.len() / (BASE * 2) * (BASE * 2);
+        if whole == 0 {
+            return;
         }
-        Self { rate: rate as f64, levels }
+        let new = media::sample_peaks(&self.pending[..whole], BASE * 2).into_iter().map(|[min, max, ms]| Bucket { min, max, ms });
+        self.levels[0].extend(new);
+        self.pending.drain(..whole);
+        self.rebuild_tail();
+    }
+
+    /// The end of the sound: its last, partial bucket too.
+    pub fn finish(&mut self) {
+        if !self.pending.is_empty() {
+            let rest = std::mem::take(&mut self.pending);
+            let new = media::sample_peaks(&rest, BASE * 2).into_iter().map(|[min, max, ms]| Bucket { min, max, ms });
+            self.levels[0].extend(new);
+            self.rebuild_tail();
+        }
+    }
+
+    /// Bring the coarser levels up to date with the finest: each level's last
+    /// bucket (it may have been partial) and anything after it is redone.
+    fn rebuild_tail(&mut self) {
+        let mut l = 0;
+        while self.levels[l].len() > 1 {
+            if self.levels.len() == l + 1 {
+                self.levels.push(Vec::new());
+            }
+            let keep = self.levels[l + 1].len().saturating_sub(1);
+            let new: Vec<Bucket> = self.levels[l][keep * FACTOR..].chunks(FACTOR).map(Bucket::merge).collect();
+            self.levels[l + 1].truncate(keep);
+            self.levels[l + 1].extend(new);
+            l += 1;
+        }
+        self.levels.truncate(l + 1);
     }
 
     pub fn is_empty(&self) -> bool {
@@ -159,9 +206,87 @@ fn push_column(mesh: &mut Mesh, x: f32, top: f32, bottom: f32, color: Color32, f
     }
 }
 
+/// A waveform drawn as its sound is decoded: filled in by a thread that
+/// follows the decoder, so the graph grows with the sound instead of
+/// appearing all at once after it.
+pub struct Live {
+    wave: std::sync::Mutex<Waveform>,
+    done: std::sync::atomic::AtomicBool,
+}
+
+impl Live {
+    /// Paint what's there (see [`Waveform::paint`]).
+    pub fn paint(&self, p: &Painter, lane: Rect, view: (f64, f64), gain_at: impl Fn(f64) -> f32, color: impl Fn(f32, f32) -> Color32) {
+        if let Ok(w) = self.wave.lock() {
+            w.paint(p, lane, view, gain_at, color);
+        }
+    }
+
+    /// Fully decoded, and there's no sound at all.
+    pub fn is_silent_file(&self) -> bool {
+        self.done.load(std::sync::atomic::Ordering::Acquire) && self.wave.lock().is_ok_and(|w| w.is_empty())
+    }
+}
+
+/// Follow track `track` of `pcm` as it's decoded.
+pub fn follow(pcm: std::sync::Arc<media::pcm::Pcm>, track: usize, ctx: &egui::Context) -> std::sync::Arc<Live> {
+    use std::sync::atomic::Ordering;
+    let live = std::sync::Arc::new(Live { wave: std::sync::Mutex::new(Waveform::empty(media::PREVIEW_RATE)), done: Default::default() });
+    let (out, ctx) = (live.clone(), ctx.clone());
+    std::thread::Builder::new()
+        .name("waveform".into())
+        .spawn(move || {
+            let mut read = 0;
+            loop {
+                // Done first: everything decoded by then is in `len`.
+                let done = pcm.is_done();
+                let Some(t) = pcm.tracks().get(track) else { break };
+                let len = t.len();
+                if len > read {
+                    let chunk = t.copy(read, len);
+                    read = len;
+                    if let Ok(mut w) = out.wave.lock() {
+                        w.extend(&chunk);
+                    }
+                    ctx.request_repaint();
+                }
+                if done {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(60));
+            }
+            if let Ok(mut w) = out.wave.lock() {
+                w.finish();
+            }
+            out.done.store(true, Ordering::Release);
+            ctx.request_repaint();
+        })
+        .expect("spawn waveform thread");
+    live
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fed_in_pieces_is_the_same() {
+        let stereo: Vec<f32> = (0..2 * 48_000 * 3 + 37).map(|i| ((i as f32) * 0.013).sin() * (i % 7) as f32 / 7.0).collect();
+        let whole = Waveform::new(&stereo, 48_000);
+        let mut fed = Waveform::empty(48_000);
+        // Odd-sized pieces, like the decoder's.
+        for piece in stereo.chunks(4097) {
+            fed.extend(piece);
+        }
+        fed.finish();
+        assert_eq!(whole.levels.len(), fed.levels.len());
+        for (a, b) in whole.levels.iter().zip(&fed.levels) {
+            assert_eq!(a.len(), b.len());
+            for (x, y) in a.iter().zip(b) {
+                assert!((x.min - y.min).abs() < 1e-6 && (x.max - y.max).abs() < 1e-6 && (x.ms - y.ms).abs() < 1e-6);
+            }
+        }
+    }
 
     #[test]
     fn ranges_summarise_exactly() {

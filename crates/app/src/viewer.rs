@@ -29,7 +29,6 @@ use media::{ClipInfo, TrackEdit};
 use crate::filmstrip::Filmstrip;
 use crate::meter;
 use crate::player::Player;
-use crate::waveform::Waveform;
 
 /// Scrolling keeps showing quick proxy frames until it's been still this long.
 const SCROLL_SETTLE: Duration = Duration::from_millis(200);
@@ -72,8 +71,6 @@ struct Loaded {
     info: ClipInfo,
     /// The mix, filling in as it's decoded (it plays from the start at once).
     pcm: Arc<Pcm>,
-    /// The mix's waveform, once it's all decoded.
-    wave: Receiver<Waveform>,
 }
 
 enum State {
@@ -91,9 +88,8 @@ struct Ready {
     info: ClipInfo,
     player: Player,
     strip: Filmstrip,
-    /// `None` while the sound is still being decoded.
-    wave: Option<Waveform>,
-    wave_rx: Receiver<Waveform>,
+    /// The mix's waveform, growing as the sound is decoded.
+    wave: Arc<crate::waveform::Live>,
     /// Dragging on the timeline, and whether it was playing when the drag began.
     dragging: Option<bool>,
     /// Last scroll-scrub, and whether it was playing before scrolling began.
@@ -128,24 +124,22 @@ impl Viewer {
                 // the first. Playing starts with what's decoded: no waiting for
                 // the whole file to be read.
                 let tracks: Vec<usize> = info.audio.first().map(|a| a.index).into_iter().collect();
-                let (wave_tx, wave) = mpsc::channel();
-                let ctx = repaint.clone();
                 if crate::player::debug() {
                     eprintln!("{:>8.3} viewer: clip read", crate::player::uptime());
                 }
-                let pcm = media::pcm::decode_streaming(&src, &tracks, info.duration, move |pcm, result| {
+                let pcm = media::pcm::decode_streaming(&src, &tracks, info.duration, move |_, result| {
                     if let Err(e) = result {
                         eprintln!("decoding the sound: {e:#}");
                     }
                     if crate::player::debug() {
                         eprintln!("{:>8.3} viewer: sound all decoded", crate::player::uptime());
                     }
-                    let samples = pcm.tracks().first().map(|t| t.to_vec()).unwrap_or_default();
-                    let _ = wave_tx.send(Waveform::new(&samples, media::PREVIEW_RATE));
-                    ctx.request_repaint();
                 });
-                Ok(Loaded { info, pcm, wave })
+                Ok(Loaded { info, pcm })
             })();
+            if let Err(e) = &result {
+                eprintln!("couldn't open {} in the player: {e}", src.display());
+            }
             let _ = tx.send(result);
             repaint.request_repaint();
         });
@@ -323,6 +317,7 @@ impl Viewer {
 impl Ready {
     fn new(ctx: &egui::Context, clip: &Path, l: Loaded) -> Self {
         let volume = volume(ctx).unwrap_or((1.0, false));
+        let wave = crate::waveform::follow(l.pcm.clone(), 0, ctx);
         let mut player = Player::new(ctx, clip, l.info.clone(), l.pcm, Vec::new());
         // Dev aid: `HESTECLIPS_START_AT=<seconds>` starts there (to check a
         // stretch of a clip without scrubbing to it).
@@ -335,8 +330,7 @@ impl Ready {
             strip: Filmstrip::build(ctx, clip, &l.info),
             info: l.info,
             player,
-            wave: None,
-            wave_rx: l.wave,
+            wave,
             dragging: None,
             scrolled: None,
             glide: Default::default(),
@@ -566,17 +560,12 @@ impl Ready {
         p.rect_filled(video, 4, v.extreme_bg_color);
         self.strip.paint(ui, video, 0.0, dur, dur);
         p.rect_filled(audio, 4, v.extreme_bg_color);
-        if let Ok(wave) = self.wave_rx.try_recv() {
-            self.wave = Some(wave);
-        }
-        match &self.wave {
-            // Still being decoded (it already plays): drawn when it's all there.
-            None => {}
-            Some(w) if w.is_empty() => {
-                p.text(audio.center(), Align2::CENTER_CENTER, "No sound", FontId::proportional(12.0), Color32::from_gray(110));
-            }
-            // Coloured like the meters, so loud moments stand out.
-            Some(w) => w.paint(&ui.painter_at(audio), audio, (0.0, dur), |_| 1.0, |_, rms| zone(meter::to_db(rms))),
+        if self.wave.is_silent_file() {
+            p.text(audio.center(), Align2::CENTER_CENTER, "No sound", FontId::proportional(12.0), Color32::from_gray(110));
+        } else {
+            // Coloured like the meters, so loud moments stand out; it grows
+            // as the sound is decoded.
+            self.wave.paint(&ui.painter_at(audio), audio, (0.0, dur), |_| 1.0, |_, rms| zone(meter::to_db(rms)));
         }
 
         // Already-played part of the levels, lightly marked, so where you are reads at a glance.
