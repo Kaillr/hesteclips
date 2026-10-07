@@ -20,6 +20,7 @@ mod filmstrip;
 mod logfile;
 mod game_events;
 mod games;
+mod header;
 mod osu_plays;
 mod library;
 #[cfg(target_os = "linux")]

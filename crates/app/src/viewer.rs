@@ -25,7 +25,6 @@ use egui::{Align2, Color32, FontId, Key, Pos2, Rect, RichText, Sense, Stroke, Ve
 use media::{ClipInfo, TrackEdit};
 
 use crate::filmstrip::Filmstrip;
-use crate::library::ACCENT;
 use crate::meter;
 use crate::player::Player;
 use crate::waveform::Waveform;
@@ -224,36 +223,29 @@ impl Viewer {
     }
 
     fn header(&mut self, ui: &mut egui::Ui, nav: &Nav) -> ViewerOutcome {
+        use crate::header;
         let mut out = ViewerOutcome::Stay;
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            if ui.button(RichText::new("‹ Clips").size(15.0)).on_hover_text("Back to your clips  (Esc)").clicked() {
+            ui.set_min_height(header::HEIGHT);
+            if header::back(ui).clicked() {
                 out = ViewerOutcome::Close;
             }
             ui.add_space(6.0);
-            let stem = self.clip.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-            let title = ui.add(egui::Label::new(RichText::new(crate::clips::title_for_stem(&stem)).size(18.0).strong()).truncate().sense(Sense::click()));
-            if title.on_hover_text("Double-click to rename").double_clicked() {
-                out = ViewerOutcome::Rename;
-            }
-            ui.add_space(10.0);
-            // Step through the library without leaving the viewer.
-            let step = |s: &str| egui::Button::new(RichText::new(s).size(14.0)).min_size(Vec2::new(0.0, 28.0)).corner_radius(6);
-            if ui.add_enabled(nav.previous.is_some(), step("‹ Previous clip")).on_hover_text("P").clicked() {
+            // Step through the clips you're browsing. Before the name, so they
+            // stay put whatever its length.
+            if ui.add_enabled(nav.previous.is_some(), header::icon("‹")).on_hover_text("Previous clip  (P)").clicked() {
                 out = nav.previous.clone().map_or(ViewerOutcome::Stay, ViewerOutcome::Open);
             }
-            if ui.add_enabled(nav.next.is_some(), step("Next clip ›")).on_hover_text("N").clicked() {
+            if ui.add_enabled(nav.next.is_some(), header::icon("›")).on_hover_text("Next clip  (N)").clicked() {
                 out = nav.next.clone().map_or(ViewerOutcome::Stay, ViewerOutcome::Open);
             }
             if let Some((i, n)) = nav.position {
                 ui.weak(format!("{i} of {n}"));
             }
+            ui.add_space(10.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let share = egui::Button::new(RichText::new("📤 Share").size(14.0).color(Color32::WHITE))
-                    .fill(ACCENT)
-                    .min_size(Vec2::new(86.0, 30.0))
-                    .corner_radius(8);
-                let share = ui.add(share).on_hover_text(if crate::share::CAN_DRAG_OUT {
+                let share = ui.add(header::button("📤 Share", true)).on_hover_text(if crate::share::CAN_DRAG_OUT {
                     "Copy it, send it or upload it — or drag the picture into any app"
                 } else {
                     "Copy it, send it or upload it"
@@ -263,8 +255,10 @@ impl Viewer {
                         out = ViewerOutcome::Share(c);
                     }
                 });
-                let collect = egui::Button::new(RichText::new("+ Collection").size(14.0)).min_size(Vec2::new(0.0, 30.0)).corner_radius(8);
-                let collect = ui.add(collect).on_hover_text("Add it to a collection of your own, like \"Ace clutches\"");
+                if ui.add(header::button("✂ Edit", false)).on_hover_text("Trim it, adjust its audio, or save it smaller").clicked() {
+                    out = ViewerOutcome::Edit;
+                }
+                let collect = ui.add(header::button("+ Collection", false)).on_hover_text("Add it to a collection of your own, like \"Ace clutches\"");
                 egui::Popup::menu(&collect).show(|ui| {
                     ui.set_min_width(200.0);
                     for (id, name, inside) in &nav.collections {
@@ -280,12 +274,9 @@ impl Viewer {
                         out = ViewerOutcome::NewCollection;
                     }
                 });
-                let edit = egui::Button::new(RichText::new("✂ Edit").size(14.0)).min_size(Vec2::new(76.0, 30.0)).corner_radius(8);
-                if ui.add(edit).on_hover_text("Trim it, adjust its audio, or save it smaller").clicked() {
-                    out = ViewerOutcome::Edit;
-                }
-                let rename = egui::Button::new(RichText::new("✏ Rename").size(14.0)).min_size(Vec2::new(0.0, 30.0)).corner_radius(8);
-                if ui.add(rename).on_hover_text("Rename this clip  (F2)").clicked() {
+                ui.add_space(12.0);
+                let stem = self.clip.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                if header::title(ui, &crate::clips::title_for_stem(&stem), None) {
                     out = ViewerOutcome::Rename;
                 }
             });

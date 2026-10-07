@@ -306,38 +306,25 @@ impl Ready {
         // --- Header ---
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            if ui.button(RichText::new("‹ Clips").size(15.0)).clicked() {
+            ui.set_min_height(crate::header::HEIGHT);
+            if crate::header::back(ui).clicked() {
                 if self.dirty() {
                     self.confirm_discard = true;
                 } else {
                     outcome = EditorOutcome::Close;
                 }
             }
-            ui.add_space(6.0);
-            ui.label(RichText::new("Edit clip").size(18.0).strong());
-            let stem = source.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-            let name = ui.add(egui::Label::new(RichText::new(crate::clips::title_for_stem(&stem)).size(15.0).weak()).truncate().sense(Sense::click()));
-            if name.on_hover_text("Double-click to rename").double_clicked() {
-                outcome = EditorOutcome::Rename;
-            }
-            if ui.add(egui::Button::new("✏").frame(false)).on_hover_text("Rename this clip  (F2)").clicked() {
-                outcome = EditorOutcome::Rename;
-            }
+            ui.add_space(10.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let changed = !self.edit.is_identity(&self.info);
-                let done = egui::Button::new(RichText::new("Done").size(15.0).color(Color32::WHITE))
-                    .fill(ACCENT)
-                    .min_size(Vec2::new(80.0, 30.0))
-                    .corner_radius(8);
-                if ui.add(done).on_hover_text("Save the edit to this clip. The original recording is kept, so you can change it later.").clicked() {
+                if ui.add(crate::header::button("Done", true)).on_hover_text("Save the edit to this clip. The original recording is kept, so you can change it later.").clicked() {
                     self.player.pause();
                     outcome = self.save(target, None);
                 }
                 // A real button, not hidden in a menu: keeping the original clip and
                 // making a second one is a common need (two highlights from one recording).
-                let save_new = egui::Button::new(RichText::new("Save as new clip…").size(14.0)).min_size(Vec2::new(0.0, 30.0)).corner_radius(8);
                 if ui
-                    .add_enabled(changed, save_new)
+                    .add_enabled(changed, crate::header::button("Save as new clip…", false))
                     .on_hover_text("Keep this clip unchanged and save the edit as a separate clip")
                     .on_disabled_hover_text("Trim, change the audio or the export settings first")
                     .clicked()
@@ -348,9 +335,7 @@ impl Ready {
                     self.save_as = Some((suggested, None));
                 }
                 // How the saved file is made: applies to Done and Save as new.
-                let export = egui::Button::new(RichText::new(format!("⚙ Export: {}", crate::export_ui::summary(&self.info, &self.edit))).size(14.0))
-                    .min_size(Vec2::new(0.0, 30.0))
-                    .corner_radius(8)
+                let export = crate::header::button(&format!("⚙ Export: {}", crate::export_ui::summary(&self.info, &self.edit)), false)
                     .selected(self.edit.output != media::Output::default());
                 let export = ui.add(export).on_hover_text("Export settings: resolution, frame rate, quality, a size to fit under, audio tracks");
                 if export.clicked() {
@@ -375,13 +360,18 @@ impl Ready {
                 }
                 let has_saved_edit = target.source != target.clip;
                 if (has_saved_edit || changed)
-                    && ui.button(RichText::new("↺ Revert").size(14.0)).on_hover_text("Undo every edit and go back to the original recording").clicked()
+                    && ui.add(crate::header::button("↺ Revert", false)).on_hover_text("Undo every edit and go back to the original recording").clicked()
                 {
                     self.player.pause();
                     outcome = EditorOutcome::Reverted(target.clone());
                 }
                 if self.dirty() {
                     ui.weak("Unsaved changes");
+                }
+                ui.add_space(12.0);
+                let stem = source.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                if crate::header::title(ui, &crate::clips::title_for_stem(&stem), Some("✂ Editing")) {
+                    outcome = EditorOutcome::Rename;
                 }
             });
         });
