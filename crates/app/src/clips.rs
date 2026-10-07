@@ -13,6 +13,10 @@ pub struct Clip {
     pub path: PathBuf,
     pub name: String,
     pub modified: SystemTime,
+    /// When the file itself was written. A saved edit keeps the clip's
+    /// modified time (its date in the library) but is a new file: caches
+    /// tell the two apart by this.
+    pub created: Option<SystemTime>,
     pub size_bytes: u64,
     /// Permanent id from the file's metadata, once the clip has been edited.
     pub id: Option<String>,
@@ -139,6 +143,7 @@ fn scan_dir(lib: &Path, dir: &Path, folder: Option<&str>, any_edits: bool) -> Ve
             Some(Clip {
                 name: path.file_name()?.to_string_lossy().into_owned(),
                 modified: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+                created: meta.created().ok(),
                 size_bytes: meta.len(),
                 id,
                 original,

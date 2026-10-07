@@ -100,6 +100,7 @@ fn key(clip: &Clip) -> u64 {
     let mut h = DefaultHasher::new();
     clip.path.hash(&mut h);
     clip.modified.hash(&mut h);
+    clip.created.hash(&mut h);
     clip.size_bytes.hash(&mut h);
     h.finish()
 }

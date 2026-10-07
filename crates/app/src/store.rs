@@ -212,6 +212,25 @@ pub fn delete(clip: &Clip, library: &[Clip], permanently: bool) -> Result<(), St
     Ok(())
 }
 
+/// Edited clips saved before edits kept their clip's date show as made the
+/// day they were edited. Their untouched original still has the real date:
+/// give it back. Returns how many were fixed.
+pub fn restore_edit_dates(clips: &[Clip]) -> usize {
+    let mut fixed = 0;
+    for clip in clips {
+        let Some(original) = &clip.original else { continue };
+        let Ok(made) = std::fs::metadata(original).and_then(|m| m.modified()) else { continue };
+        let off = clip.modified.duration_since(made).or_else(|e| Ok::<_, ()>(e.duration())).unwrap_or_default();
+        if off < std::time::Duration::from_secs(60) {
+            continue;
+        }
+        if std::fs::File::options().write(true).open(&clip.path).and_then(|f| f.set_modified(made)).is_ok() {
+            fixed += 1;
+        }
+    }
+    fixed
+}
+
 /// What the OS calls the place deleted files go.
 pub fn bin_name() -> &'static str {
     if cfg!(windows) { "Recycle Bin" } else { "Trash" }
@@ -253,7 +272,7 @@ mod tests {
         let clip = |name: &str, id: &str| {
             let path = dir.join(name);
             std::fs::write(&path, b"x").unwrap();
-            Clip { path, name: name.into(), modified: std::time::SystemTime::UNIX_EPOCH, size_bytes: 1, id: Some(id.into()), original: None, folder: None }
+            Clip { path, name: name.into(), modified: std::time::SystemTime::UNIX_EPOCH, created: None, size_bytes: 1, id: Some(id.into()), original: None, folder: None }
         };
         let (a, b, c) = (clip("a.mp4", "1111"), clip("b.mp4", "1111"), clip("c.mp4", "2222"));
         for id in ["1111", "2222"] {
@@ -265,6 +284,25 @@ mod tests {
         assert!(!a.path.exists() && assets_dir(&dir, "1111").exists());
         delete(&c, &library, true).unwrap();
         assert!(!c.path.exists() && !assets_dir(&dir, "2222").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An edited clip dated the day it was edited gets its original's date.
+    #[test]
+    fn edit_dates_come_back() {
+        let dir = lib("dates");
+        let (clip_path, original) = (dir.join("a.mp4"), dir.join("original.mp4"));
+        std::fs::write(&clip_path, b"edit").unwrap();
+        std::fs::write(&original, b"orig").unwrap();
+        let made = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_790_000_000);
+        std::fs::File::options().write(true).open(&original).unwrap().set_modified(made).unwrap();
+        let modified = std::fs::metadata(&clip_path).unwrap().modified().unwrap();
+        let clip = Clip { path: clip_path.clone(), name: "a.mp4".into(), modified, created: None, size_bytes: 4, id: None, original: Some(original), folder: None };
+        assert_eq!(restore_edit_dates(std::slice::from_ref(&clip)), 1);
+        assert_eq!(std::fs::metadata(&clip_path).unwrap().modified().unwrap(), made);
+        // Already right: left alone.
+        let clip = Clip { modified: made, ..clip };
+        assert_eq!(restore_edit_dates(&[clip]), 0);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

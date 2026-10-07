@@ -670,7 +670,7 @@ mod cache {
     pub fn key(source: &Path, fps: f64, total: usize) -> Option<u64> {
         let meta = std::fs::metadata(source).ok()?;
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        (MAGIC, source, meta.len(), meta.modified().ok()?, fps.to_bits(), total, super::QUALITY).hash(&mut h);
+        (MAGIC, source, meta.len(), meta.modified().ok()?, meta.created().ok(), fps.to_bits(), total, super::QUALITY).hash(&mut h);
         Some(h.finish())
     }
 

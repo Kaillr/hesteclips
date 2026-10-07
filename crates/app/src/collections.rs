@@ -212,7 +212,7 @@ mod tests {
         Clip {
             name: path.file_name().unwrap().to_string_lossy().into_owned(),
             path,
-            modified: std::time::SystemTime::UNIX_EPOCH,
+            modified: std::time::SystemTime::UNIX_EPOCH, created: None,
             size_bytes: 0,
             id: None,
             original: None,

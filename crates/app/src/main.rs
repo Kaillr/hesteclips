@@ -404,7 +404,10 @@ impl App {
         store::set_library(&settings.output_dir);
         let recovered = capture::output::recover_unfinished(&settings.output_dir);
         let saved_settings = settings.to_json();
-        let clips = clips::scan(&settings.output_dir);
+        let mut clips = clips::scan(&settings.output_dir);
+        if store::restore_edit_dates(&clips) > 0 {
+            clips = clips::scan(&settings.output_dir);
+        }
         let mut collections = collections::Collections::load(&settings.output_dir);
         collections.reconnect(&clips);
         // Assets of clips deleted in Finder go to the Bin.
@@ -1378,6 +1381,9 @@ impl App {
         });
         let tx = self.render_tx.clone();
         let ctx = self.ctx();
+        // When the clip was made: the saved edit (or new clip) keeps it, so it
+        // stays on its day in the library instead of jumping to today.
+        let made = std::fs::metadata(&target.clip).and_then(|m| m.modified()).ok();
         std::thread::spawn(move || {
             let report = |f: f32| {
                 progress.store(f.to_bits(), std::sync::atomic::Ordering::Relaxed);
@@ -1394,6 +1400,11 @@ impl App {
                     committed.map(|()| target.clip.clone())
                 }
             };
+            if let (Ok(path), Some(made)) = (&result, made) {
+                if let Err(e) = std::fs::File::options().write(true).open(path).and_then(|f| f.set_modified(made)) {
+                    eprintln!("couldn't keep the clip's date on {}: {e}", path.display());
+                }
+            }
             let _ = tx.send((id, result));
             ctx.request_repaint();
         });

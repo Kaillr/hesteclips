@@ -1894,7 +1894,7 @@ mod tests {
         clips::Clip {
             path: PathBuf::from(name),
             name: name.into(),
-            modified: std::time::SystemTime::UNIX_EPOCH,
+            modified: std::time::SystemTime::UNIX_EPOCH, created: None,
             size_bytes: 0,
             id: None,
             original: None,
