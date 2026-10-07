@@ -846,6 +846,7 @@ impl eframe::App for App {
         self.dialogs(&ctx);
         self.rename_dialog(&ctx);
         self.collection_dialog(&ctx);
+        ui_kit::pointer_cursor(&ctx);
         laps.lap("dialogs");
 
         // Library auto-refresh: poll the output folder ~once a second and rescan only

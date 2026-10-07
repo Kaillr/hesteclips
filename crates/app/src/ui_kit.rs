@@ -228,3 +228,20 @@ pub fn shortcuts_button(ui: &mut egui::Ui, rows: &[(&str, &str)]) -> egui::Respo
     });
     r
 }
+
+/// The pointing hand over anything that can be clicked. egui only does it
+/// for plain buttons; this covers every other widget (checkboxes, dropdowns,
+/// options, sliders, drawn rows and tiles). Call once a frame, after the UI:
+/// a cursor something else asked for (text, resize, hidden) is kept. Large
+/// areas (a dialog's backdrop, a video picture) are left alone.
+pub fn pointer_cursor(ctx: &egui::Context) {
+    if ctx.output(|o| o.cursor_icon) != egui::CursorIcon::Default {
+        return;
+    }
+    let screen = ctx.content_rect().area();
+    let hovered: Vec<egui::Id> = ctx.interaction_snapshot(|s| s.hovered.iter().copied().collect());
+    let clickable = hovered.into_iter().filter_map(|id| ctx.read_response(id)).any(|r| r.enabled() && r.sense.senses_click() && r.rect.area() < screen / 4.0);
+    if clickable {
+        ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+}
