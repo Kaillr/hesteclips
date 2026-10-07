@@ -359,6 +359,28 @@ fn migrate(old: &[LegacyAudioTrack]) -> Vec<AudioSourceCfg> {
     out
 }
 
+/// Which games name clips after what happened, and what osu!'s names show.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GameTitles {
+    pub cs2: bool,
+    pub dota2: bool,
+    pub league: bool,
+    pub osu: bool,
+    /// Accuracy, FC and misses (and combo mid-play).
+    pub osu_accuracy: bool,
+    pub osu_pp: bool,
+    pub osu_mods: bool,
+    pub osu_stars: bool,
+    pub osu_artist: bool,
+}
+
+impl Default for GameTitles {
+    fn default() -> Self {
+        Self { cs2: true, dota2: true, league: true, osu: true, osu_accuracy: true, osu_pp: true, osu_mods: true, osu_stars: false, osu_artist: false }
+    }
+}
+
 /// Persisted to `<config_dir>/hesteclips/settings.json`. `#[serde(default)]` lets
 /// older files load after new fields are added.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -403,8 +425,10 @@ pub struct RecordSettings {
     /// go in (its name, as `clips::folder_name` makes it) → the one they go in.
     pub game_folders: std::collections::BTreeMap<String, String>,
     /// Name clips after what happened in the game ("3 kills on Mirage"), for
-    /// games that report it (CS2, Dota 2, League of Legends).
+    /// games that report it (CS2, Dota 2, League of Legends, osu!).
     pub game_details: bool,
+    /// Which games, and what goes in osu!'s names.
+    pub game_titles: GameTitles,
 
     // --- Sources page ---
     pub audio_sources: Vec<AudioSourceCfg>,
@@ -451,6 +475,7 @@ impl Default for RecordSettings {
             folder_per_game: true,
             game_folders: Default::default(),
             game_details: true,
+            game_titles: GameTitles::default(),
             audio_sources: default_sources(),
             limiter: true,
             shortcuts: Shortcuts::default(),

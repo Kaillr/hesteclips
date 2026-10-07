@@ -19,6 +19,7 @@ mod filmstrip;
 mod logfile;
 mod game_events;
 mod games;
+mod osu_plays;
 mod library;
 #[cfg(target_os = "linux")]
 mod linux_desktop;
@@ -694,7 +695,7 @@ impl eframe::App for App {
             RecState::Recording => games::Capturing::Record,
         };
         self.games.set(capturing, &self.listed_apps());
-        self.games.events.set_enabled(self.settings.game_details);
+        self.games.events.set_options(self.settings.game_details.then(|| self.settings.game_titles.clone()));
         let armed = (self.rec_state == RecState::Buffering && self.recording_shortcut.is_none()).then(|| service::Armed {
             library: self.settings.output_dir.clone(),
             folder_per_game: self.settings.folder_per_game,

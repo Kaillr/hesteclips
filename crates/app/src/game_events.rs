@@ -9,19 +9,22 @@
 //!   reads it when started with `-gamestateintegration`.
 //! - **League of Legends**: its Live Client Data API, a local web server the
 //!   game runs during a match, polled once a second.
+//! - **osu!**: through tosu or gosumemory (`osu_plays`).
 //!
 //! Each kill becomes an event with the moment it happened; a clip's name sums
-//! up the events inside it. A clip with none keeps its usual name.
+//! up the events inside it (osu!: the play on screen longest in it). A clip
+//! with none keeps its usual name.
 
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
+
+use crate::settings::GameTitles;
 
 /// Where CS2 and Dota 2 post their state. Fixed: it's written into their
 /// config files. (Picked to be unlikely to clash; nothing special about it.)
@@ -65,6 +68,7 @@ struct State {
     cs2: Cs2Tracker,
     dota: DotaTracker,
     league: LeagueTracker,
+    osu: crate::osu_plays::Tracker,
 }
 
 impl State {
@@ -80,30 +84,41 @@ impl State {
 #[derive(Clone)]
 pub struct Events {
     state: Arc<Mutex<State>>,
-    enabled: Arc<AtomicBool>,
-    /// What the config files were last made to match (`None`: not yet).
-    installed: Arc<Mutex<Option<bool>>>,
+    /// Which games name clips (`None`: none).
+    options: Arc<Mutex<Option<GameTitles>>>,
+    /// Whether CS2's and Dota 2's config files were last put in (`None`: not
+    /// looked at yet).
+    installed: Arc<Mutex<Option<(bool, bool)>>>,
 }
 
 impl Events {
     pub fn new() -> Self {
-        let events = Self { state: Default::default(), enabled: Default::default(), installed: Default::default() };
+        let events = Self { state: Default::default(), options: Default::default(), installed: Default::default() };
         let e = events.clone();
         std::thread::Builder::new().name("game state".into()).spawn(move || serve_gsi(&e)).expect("spawn game state thread");
         let e = events.clone();
         std::thread::Builder::new().name("league".into()).spawn(move || poll_league(&e)).expect("spawn league thread");
+        let e = events.clone();
+        std::thread::Builder::new().name("osu".into()).spawn(move || poll_osu(&e)).expect("spawn osu thread");
         events
     }
 
-    /// Turn it on or off (cheap when unchanged). Puts the config files in the
-    /// games' folders, or takes them out again.
-    pub fn set_enabled(&self, on: bool) {
-        self.enabled.store(on, Ordering::Relaxed);
+    /// Which games name clips (`None`: none); cheap when unchanged. Puts the
+    /// config files in CS2's and Dota 2's folders, or takes them out again.
+    pub fn set_options(&self, options: Option<GameTitles>) {
+        let valve = options.as_ref().map_or((false, false), |o| (o.cs2, o.dota2));
+        {
+            let mut current = self.options.lock().unwrap();
+            if *current != options {
+                *current = options;
+            }
+        }
         let mut installed = self.installed.lock().unwrap();
-        if *installed != Some(on) {
-            *installed = Some(on);
+        if *installed != Some(valve) {
+            *installed = Some(valve);
             std::thread::spawn(move || {
                 for (dir, game) in valve_cfg_dirs() {
+                    let on = if game == Game::Cs2 { valve.0 } else { valve.1 };
                     if let Err(e) = set_cfg(&dir, game, on) {
                         eprintln!("game state config in {}: {e}", dir.display());
                     }
@@ -112,14 +127,40 @@ impl Events {
         }
     }
 
+    /// Whether names come from this game.
+    fn on(&self, game: impl Fn(&GameTitles) -> bool) -> bool {
+        self.options.lock().unwrap().as_ref().is_some_and(game)
+    }
+
     /// What happened since `since`, as a short name, if anything did.
     pub fn summary(&self, since: Instant) -> Option<String> {
-        if !self.enabled.load(Ordering::Relaxed) {
-            return None;
-        }
+        let options = self.options.lock().unwrap().clone()?;
         let s = self.state.lock().unwrap();
-        let events: Vec<&Event> = s.events.iter().filter(|e| e.at >= since).collect();
+        if options.osu
+            && let Some(title) = s.osu.title(since, Instant::now(), &options)
+        {
+            return Some(title);
+        }
+        let on = |g: Game| match g {
+            Game::Cs2 => options.cs2,
+            Game::Dota2 => options.dota2,
+            Game::League => options.league,
+        };
+        let events: Vec<&Event> = s.events.iter().filter(|e| e.at >= since && on(e.game)).collect();
         summarize(&events)
+    }
+}
+
+/// Read osu! twice a second while its names are wanted.
+fn poll_osu(events: &Events) {
+    let mut reader = crate::osu_plays::Reader::new();
+    loop {
+        std::thread::sleep(Duration::from_millis(500));
+        if !events.on(|o| o.osu) {
+            continue;
+        }
+        let reading = reader.read();
+        events.state.lock().unwrap().osu.update(Instant::now(), reading);
     }
 }
 
@@ -315,14 +356,14 @@ fn serve_connection(stream: TcpStream, events: &Events) -> std::io::Result<()> {
 
 /// Note the kills in one posted game state (`request`: its request line).
 fn record_post(events: &Events, request: &str, body: &[u8]) {
-    if !events.enabled.load(Ordering::Relaxed) {
+    let cs2 = request.split_whitespace().nth(1).unwrap_or("").starts_with("/cs2");
+    if !events.on(|o| if cs2 { o.cs2 } else { o.dota2 }) {
         return;
     }
     let Ok(state) = serde_json::from_slice::<Value>(body) else { return };
     if state["auth"]["token"].as_str() != Some(GSI_TOKEN) {
         return;
     }
-    let cs2 = request.split_whitespace().nth(1).unwrap_or("").starts_with("/cs2");
     let mut s = events.state.lock().unwrap();
     let s = &mut *s;
     let now = Instant::now();
@@ -472,7 +513,7 @@ fn poll_league(events: &Events) {
         .build()
         .into();
     loop {
-        if !events.enabled.load(Ordering::Relaxed) {
+        if !events.on(|o| o.league) {
             std::thread::sleep(Duration::from_secs(5));
             continue;
         }
@@ -628,7 +669,7 @@ mod tests {
     /// The server takes a post the way CS2 sends it and records the kill.
     #[test]
     fn gsi_post() {
-        let events = Events { state: Default::default(), enabled: Arc::new(AtomicBool::new(true)), installed: Default::default() };
+        let events = Events { state: Default::default(), options: Arc::new(Mutex::new(Some(GameTitles::default()))), installed: Default::default() };
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let e = events.clone();

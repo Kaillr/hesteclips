@@ -139,10 +139,34 @@ impl App {
                     toggle(ui, &mut self.settings.folder_per_game);
                 });
                 divider(ui);
-                let hint = "Clips get names like \"3 kills on Mirage\" or \"Pentakill as Jinx\" in Counter-Strike 2, Dota 2 and League of Legends. For CS2 and Dota 2, a small settings file is put in the game's folder; start Dota 2 with -gamestateintegration in its launch options. Restart the game after turning this on.";
+                let hint = "Clips get names like \"3 kills on Mirage\", \"Pentakill as Jinx\" or \"98.52% FC · 412pp · +HDDT · FREEDOM DiVE [FOUR DIMENSIONS]\". Clips where nothing happened keep their usual name.";
                 row(ui, "Name clips after what happened", Some(hint), |ui| {
                     toggle(ui, &mut self.settings.game_details);
                 });
+                if self.settings.game_details {
+                    let t = &mut self.settings.game_titles;
+                    let hint = "For CS2 and Dota 2, a small settings file is put in the game's folder: restart the game after turning them on. Dota 2 also needs -gamestateintegration in its launch options.";
+                    row(ui, "Games", Some(hint), |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.checkbox(&mut t.cs2, "Counter-Strike 2");
+                            ui.checkbox(&mut t.dota2, "Dota 2");
+                            ui.checkbox(&mut t.league, "League of Legends");
+                            ui.checkbox(&mut t.osu, "osu!");
+                        });
+                    });
+                    if t.osu {
+                        let hint = "Scores come from tosu (or gosumemory), which has to be running. Without it, osu! stable clips are named after the map only.";
+                        row(ui, "In osu! names", Some(hint), |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.checkbox(&mut t.osu_accuracy, "Accuracy").on_hover_text("98.52% FC, misses, and the combo mid-play");
+                                ui.checkbox(&mut t.osu_pp, "pp");
+                                ui.checkbox(&mut t.osu_mods, "Mods");
+                                ui.checkbox(&mut t.osu_stars, "Star rating");
+                                ui.checkbox(&mut t.osu_artist, "Artist");
+                            });
+                        });
+                    }
+                }
                 divider(ui);
                 row(ui, "File format", Some("MP4 plays everywhere."), |ui| {
                     ui.add_enabled_ui(idle, |ui| {
