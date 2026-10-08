@@ -1,6 +1,7 @@
 //! HesteFiles UI: the account/default-folder settings section, the folder picker
 //! and the share dialog.
 
+use crate::ui_kit::Dismissed as _;
 use std::path::PathBuf;
 
 use crate::{App, cloud, file_name};
@@ -170,7 +171,7 @@ impl App {
                 }
             });
         });
-        (keep_open && !resp.should_close()).then_some(Dialog::PickDefaultFolder)
+        (keep_open && !resp.dismissed()).then_some(Dialog::PickDefaultFolder)
     }
 
     /// Upload a clip to HesteFiles.
@@ -278,7 +279,7 @@ impl App {
             ui.add_space(6.0);
             crate::ui_kit::hint(ui, "If a file with this name is already there, HesteFiles keeps both.");
         });
-        (keep_open && !resp.should_close()).then_some(share)
+        (keep_open && !resp.dismissed()).then_some(share)
     }
 }
 
@@ -310,5 +311,5 @@ fn public_link_dialog(ctx: &egui::Context, clip: PathBuf, link: String, mut copi
             }
         });
     });
-    (keep_open && !resp.should_close()).then_some(Dialog::PublicLink { clip, link, copied })
+    (keep_open && !resp.dismissed()).then_some(Dialog::PublicLink { clip, link, copied })
 }

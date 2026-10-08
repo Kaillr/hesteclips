@@ -5,6 +5,7 @@
 //! left, the control on the right. In a narrow window the control moves under
 //! its label. Things that reset or remove live in their own section at the end.
 
+use crate::ui_kit::Dismissed as _;
 use egui::{Color32, RichText};
 
 use crate::settings::{self, Container, Encoder, FPS_CHOICES, OutputResolution, ShortcutAction};
@@ -574,7 +575,7 @@ impl App {
                 }
             });
         });
-        if modal.should_close() {
+        if modal.dismissed() {
             self.confirm_reset = false;
         }
     }

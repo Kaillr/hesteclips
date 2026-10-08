@@ -8,6 +8,7 @@
 //! Edits are non-destructive (see the `media` crate): Done saves the sidecar and
 //! renders the edited file in the background; the original is never touched.
 
+use crate::ui_kit::Dismissed as _;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
@@ -500,7 +501,7 @@ impl Ready {
                     }
                     Err(e) => *err = Some(e),
                 }
-            } else if close || modal.should_close() {
+            } else if close || modal.dismissed() {
                 self.save_as = None;
             }
         }
@@ -560,7 +561,7 @@ impl Ready {
                     }
                 });
             });
-            if modal.should_close() {
+            if modal.dismissed() {
                 self.free_up = None;
             }
             if let Some(how) = choice {
@@ -597,7 +598,7 @@ impl Ready {
                     }
                 });
             });
-            if modal.should_close() {
+            if modal.dismissed() {
                 self.confirm_discard = false;
             }
         }

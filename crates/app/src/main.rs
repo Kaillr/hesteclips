@@ -54,6 +54,7 @@ mod viewer;
 mod waveform;
 mod wheel;
 
+use crate::ui_kit::Dismissed as _;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -1074,7 +1075,7 @@ impl App {
             self.settings.close_asked = true;
             self.settings.close_to_tray = keep;
             if keep { self.hide_window(ctx) } else { self.quit(ctx) }
-        } else if modal.should_close() {
+        } else if modal.dismissed() {
             self.close_dialog = false;
         }
     }

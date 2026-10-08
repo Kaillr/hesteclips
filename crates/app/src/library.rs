@@ -17,6 +17,7 @@
 //! or Shift-click start a selection; while one is active a plain click toggles a
 //! card instead of playing it, and a bar on top acts on all of them.
 
+use crate::ui_kit::Dismissed as _;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -579,7 +580,7 @@ impl App {
         if yes {
             self.confirm_delete = None;
             self.delete_now(&paths);
-        } else if no || modal.should_close() {
+        } else if no || modal.dismissed() {
             self.confirm_delete = None;
         }
     }
@@ -1032,7 +1033,7 @@ impl App {
                 },
             }
         }
-        if close || (!submit && modal.should_close()) {
+        if close || (!submit && modal.dismissed()) {
             self.collection_dialog = None;
         }
     }
@@ -1556,7 +1557,7 @@ impl App {
                 Err(e) => r.error = Some(e),
             }
         }
-        if close || (!submit && modal.should_close()) {
+        if close || (!submit && modal.dismissed()) {
             self.rename = None;
         }
     }

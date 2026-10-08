@@ -305,6 +305,21 @@ fn press_id() -> egui::Id {
     egui::Id::new("ui_kit_lenient_press")
 }
 
+/// A dialog's way out besides its buttons: Esc. A click outside it does
+/// nothing (egui's `should_close` also closes on one, so a click meant for
+/// the page behind made the dialog vanish).
+pub trait Dismissed {
+    fn dismissed(&self) -> bool;
+}
+
+impl<T> Dismissed for egui::ModalResponse<T> {
+    fn dismissed(&self) -> bool {
+        self.is_top_modal
+            && !self.any_popup_open
+            && (self.response.should_close() || self.response.ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)))
+    }
+}
+
 /// Call once a frame, after the UI.
 pub fn lenient_clicks(ctx: &egui::Context) {
     let (pressed, released, pos) = ctx.input(|i| (i.pointer.primary_pressed(), i.pointer.primary_released(), i.pointer.latest_pos()));
@@ -351,13 +366,44 @@ pub fn replay_click(ctx: &egui::Context, raw: &mut egui::RawInput) {
 mod tests {
     use super::*;
 
+    /// A dialog keeps the page behind it from being clicked, and a click
+    /// out there doesn't close it; Esc does.
+    #[test]
+    fn dialogs_hold_until_esc() {
+        let ctx = egui::Context::default();
+        let (mut clicks, mut closed) = (0, 0);
+        let frame = |events: Vec<egui::Event>, clicks: &mut i32, closed: &mut i32| {
+            let mut raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0))), events, ..Default::default() };
+            replay_click(&ctx, &mut raw);
+            let mut out = ctx.run_ui(raw, |ui| {
+                if ui.put(egui::Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(60.0, 30.0)), egui::Button::new("Back")).clicked() {
+                    *clicks += 1;
+                }
+                if egui::Modal::new(egui::Id::new("dialog")).show(ui.ctx(), |ui| ui.label("A dialog")).dismissed() {
+                    *closed += 1;
+                }
+                lenient_clicks(ui.ctx());
+            });
+            out.textures_delta.clear();
+        };
+        let at = egui::pos2(30.0, 25.0);
+        let button = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+        for events in [vec![egui::Event::PointerMoved(at)], vec![], vec![button(true)], vec![button(false)], vec![], vec![]] {
+            frame(events, &mut clicks, &mut closed);
+        }
+        assert_eq!((clicks, closed), (0, 0), "the click behind it neither lands nor closes it");
+        let esc = egui::Event::Key { key: egui::Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() };
+        frame(vec![esc], &mut clicks, &mut closed);
+        assert_eq!(closed, 1);
+    }
+
     /// Pressed on a button, moved 20 points, let go over it: egui alone
     /// doesn't click; with the replay, it does (once).
     #[test]
     fn a_wobbly_click_still_clicks() {
         let ctx = egui::Context::default();
         let mut clicks = 0;
-        let mut frame = |events: Vec<egui::Event>, clicks: &mut i32| {
+        let frame = |events: Vec<egui::Event>, clicks: &mut i32| {
             let mut raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 300.0))), events, ..Default::default() };
             replay_click(&ctx, &mut raw);
             let mut out = ctx.run_ui(raw, |ui| {
@@ -382,3 +428,4 @@ mod tests {
         assert_eq!(clicks, 1, "once");
     }
 }
+
