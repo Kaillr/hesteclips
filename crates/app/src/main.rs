@@ -366,8 +366,8 @@ struct App {
     viewer: Option<viewer::Viewer>,
     /// Edits being rendered in the background, with live progress.
     pub(crate) renders: Vec<RenderJob>,
-    render_tx: std::sync::mpsc::Sender<(u64, Result<PathBuf, String>)>,
-    render_rx: std::sync::mpsc::Receiver<(u64, Result<PathBuf, String>)>,
+    render_tx: std::sync::mpsc::Sender<RenderDone>,
+    render_rx: std::sync::mpsc::Receiver<RenderDone>,
     /// Clips' sound being saved as MP3s, when done.
     mp3_tx: std::sync::mpsc::Sender<Result<PathBuf, String>>,
     mp3_rx: std::sync::mpsc::Receiver<Result<PathBuf, String>>,
@@ -567,8 +567,8 @@ impl App {
                 let mut edit = media::Edit::new(&info);
                 edit.start = info.snap(info.duration * 0.1);
                 edit.end = info.snap(info.duration * 0.9);
-                app.start_render(target.clone(), info.clone(), edit.clone(), None);
-                app.start_render(target, info, edit, Some("Demo highlight".into()));
+                app.start_render(target.clone(), info.clone(), edit.clone(), None, None);
+                app.start_render(target, info, edit, Some("Demo highlight".into()), None);
             }
         }
         // `HESTECLIPS_DEMO_COLLECTION=<name>` shows a collection; `…_NEW` adds
@@ -1478,9 +1478,14 @@ impl App {
                     self.rename_clip(clip);
                 }
             }
-            editor::EditorOutcome::Saved { target, info, edit, new_name } => {
-                self.start_render(target, info, edit, new_name);
+            editor::EditorOutcome::Saved { target, info, edit, new_name, then } => {
+                self.start_render(target, info, edit, new_name, then);
                 self.close_editor();
+            }
+            editor::EditorOutcome::FreeUp(target, how) => {
+                // Closed first: the editor reads the original.
+                self.close_editor();
+                self.start_free_up(target, how);
             }
         }
     }
@@ -1506,7 +1511,7 @@ impl App {
 
     /// Render an edit in the background. `new_name`: save as a separate clip with
     /// that name instead of updating this clip's edit.
-    fn start_render(&mut self, target: store::EditTarget, info: media::ClipInfo, edit: media::Edit, new_name: Option<String>) {
+    fn start_render(&mut self, target: store::EditTarget, info: media::ClipInfo, edit: media::Edit, new_name: Option<String>, then: Option<store::FreeUp>) {
         let ext = target.clip.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or("mp4".into());
         // In place: render into the clip's asset folder, then swap it in (see
         // `store::commit_render`). As new: straight to the new file, no history.
@@ -1544,6 +1549,7 @@ impl App {
         // When the clip was made: the saved edit (or new clip) keeps it, so it
         // stays on its day in the library instead of jumping to today.
         let made = std::fs::metadata(&target.clip).and_then(|m| m.modified()).ok();
+        let permanently = self.settings.delete_permanently;
         std::thread::spawn(move || {
             let report = |f: f32| {
                 progress.store(f.to_bits(), std::sync::atomic::Ordering::Relaxed);
@@ -1565,10 +1571,37 @@ impl App {
                     eprintln!("couldn't keep the clip's date on {}: {e}", path.display());
                 }
             }
-            let _ = tx.send((id, result));
+            // Saved: now the original it keeps can be trimmed or deleted.
+            let freed = match (&result, then) {
+                (Ok(_), Some(how)) => Some((how, store::free_up(&store::EditTarget::of(&target.clip), how, permanently))),
+                _ => None,
+            };
+            let _ = tx.send(RenderDone { id, result, freed });
             ctx.request_repaint();
         });
         self.refresh_clips();
+    }
+
+    /// Trim or delete an edited clip's original, in the background. The clip
+    /// shows as saving meanwhile.
+    fn start_free_up(&mut self, target: store::EditTarget, how: store::FreeUp) {
+        let id = self.next_render_id;
+        self.next_render_id += 1;
+        self.renders.push(RenderJob {
+            id,
+            source: target.clip.clone(),
+            dest: target.clip.clone(),
+            as_new: false,
+            progress: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        });
+        let tx = self.render_tx.clone();
+        let ctx = self.ctx();
+        let permanently = self.settings.delete_permanently;
+        std::thread::spawn(move || {
+            let freed = store::free_up(&target, how, permanently);
+            let _ = tx.send(RenderDone { id, result: Ok(target.clip.clone()), freed: Some((how, freed)) });
+            ctx.request_repaint();
+        });
     }
 
     /// Tell the user how background uploads ended.
@@ -1588,8 +1621,25 @@ impl App {
     }
 
     fn pump_renders(&mut self) {
-        while let Ok((id, result)) = self.render_rx.try_recv() {
+        while let Ok(RenderDone { id, result, freed }) = self.render_rx.try_recv() {
             let Some(i) = self.renders.iter().position(|j| j.id == id) else { continue };
+            match freed {
+                Some((how, Ok(bytes))) => {
+                    let what = if how == store::FreeUp::Trim { "Trimmed the original" } else { "Deleted the original" };
+                    let bin = if how == store::FreeUp::Delete && !self.settings.delete_permanently {
+                        format!(" (empty the {} to get the space back)", store::bin_name())
+                    } else {
+                        String::new()
+                    };
+                    if bytes == 0 && how == store::FreeUp::Trim {
+                        self.toast("The original is already as short as this edit");
+                    } else {
+                        self.toast(format!("{what}: freed {}{bin}", export_ui::human_bytes(bytes)));
+                    }
+                }
+                Some((_, Err(e))) => self.toast_error(format!("Couldn't free up the space: {e}")),
+                None => {}
+            }
             let job = self.renders.remove(i);
             match result {
                 Ok(path) => {
@@ -1615,6 +1665,14 @@ impl App {
             self.refresh_clips();
         }
     }
+}
+
+/// A background render (or freeing up an original) finished: the clip, and
+/// how freeing up space after it went.
+struct RenderDone {
+    id: u64,
+    result: Result<PathBuf, String>,
+    freed: Option<(store::FreeUp, Result<u64, String>)>,
 }
 
 /// A background render, shown in the library with a progress bar.

@@ -563,6 +563,20 @@ pub fn fit_kbps(mb: u32, duration: f64, audio_kbps: u32) -> u32 {
 }
 
 impl Edit {
+    /// The same edit of a copy of the source whose time `by` seconds is the
+    /// source's time zero (one trimmed to start `by` in).
+    pub fn shifted(&self, by: f64) -> Self {
+        let mut e = self.clone();
+        e.start = (e.start - by).max(0.0);
+        e.end = (e.end - by).max(e.start);
+        for t in &mut e.tracks {
+            for p in &mut t.points {
+                p.t -= by;
+            }
+        }
+        e
+    }
+
     /// The identity edit for a clip: full length, every source at unity.
     pub fn new(info: &ClipInfo) -> Self {
         Self {
@@ -800,6 +814,19 @@ pub fn keyframe_times(source: &Path) -> Result<Vec<f64>> {
     keys.sort_by(f64::total_cmp);
     keys.dedup();
     Ok(keys)
+}
+
+/// Copy `from`..`to` of `source` to `dest` without re-encoding: every track,
+/// the clip tag and the track names. `from` should be a keyframe (a copy can
+/// only start on one). Returns where `from` landed in the copy.
+pub fn trim_copy(source: &Path, from: f64, to: f64, dest: &Path) -> Result<f64> {
+    run(ffmpeg()
+        .args(["-hide_banner", "-loglevel", "error", "-y"])
+        .args(["-ss", &format!("{from:.6}"), "-to", &format!("{to:.6}"), "-i"])
+        .arg(source)
+        .args(["-map", "0", "-c", "copy", "-map_metadata", "0", "-avoid_negative_ts", "make_zero"])
+        .arg(dest))?;
+    keyframe_times(dest)?.first().copied().context("the copy has no picture")
 }
 
 /// Render `edit` of `source` to `dest` (written to a hidden partial first, so a

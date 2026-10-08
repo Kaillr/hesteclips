@@ -43,7 +43,10 @@ pub enum EditorOutcome {
     Close,
     /// Saved: render `edit` of the clip in the background — as this clip's edit,
     /// or (`new_name`) as a separate new clip, leaving this clip as it was.
-    Saved { target: EditTarget, info: ClipInfo, edit: Edit, new_name: Option<String> },
+    /// `then`: free up the original's space once it's saved.
+    Saved { target: EditTarget, info: ClipInfo, edit: Edit, new_name: Option<String>, then: Option<store::FreeUp> },
+    /// Free up the space the (saved) edit's original takes.
+    FreeUp(EditTarget, store::FreeUp),
     Reverted(EditTarget),
     /// Rename the clip (the edit stays open).
     Rename,
@@ -85,6 +88,8 @@ struct Ready {
     /// The whole clip until you zoom in.
     view: (f64, f64),
     confirm_discard: bool,
+    /// The "Free up space" dialog: the original's size in bytes.
+    free_up: Option<u64>,
     /// "Save as new clip" dialog: the name being typed, and any problem with it.
     save_as: Option<(String, Option<String>)>,
     /// F2 was pressed.
@@ -269,6 +274,7 @@ impl Ready {
             zoom_glide: Default::default(),
             view: (0.0, full),
             confirm_discard: false,
+            free_up: None,
             save_as: None,
             rename_requested: false,
             export_shown: false,
@@ -356,6 +362,14 @@ impl Ready {
                     self.export_open = false;
                 }
                 let has_saved_edit = target.source != target.clip;
+                // Only for a real edit: an unchanged one has nothing to keep.
+                if changed
+                    && ui.add(crate::header::button("Free up space…", false)).on_hover_text("Trim or delete the original recording this edit keeps").clicked()
+                {
+                    self.player.pause();
+                    let original = if has_saved_edit { &target.source } else { &target.clip };
+                    self.free_up = Some(std::fs::metadata(original).map(|m| m.len()).unwrap_or(0));
+                }
                 if (has_saved_edit || changed)
                     && ui.add(crate::header::button("Revert", false)).on_hover_text("Undo every edit and go back to the original recording").clicked()
                 {
@@ -491,6 +505,77 @@ impl Ready {
             }
         }
 
+        if let Some(bytes) = self.free_up {
+            let needs_save = self.dirty() || target.source == target.clip;
+            // Roughly what a trim keeps: the edit's share of the length.
+            let kept = ((self.edit.end + 1.0).min(self.info.duration) - self.edit.start) / self.info.duration.max(1e-6);
+            let trim_frees = (bytes as f64 * (1.0 - kept.clamp(0.0, 1.0))) as u64;
+            let mut choice = None;
+            let modal = egui::Modal::new(egui::Id::new("free_up")).show(&ctx, |ui| {
+                ui.set_width(420.0);
+                ui.heading("Free up space");
+                ui.label(format!(
+                    "The original recording ({}) is kept so you can change this edit later.",
+                    crate::export_ui::human_bytes(bytes)
+                ));
+                if needs_save {
+                    crate::ui_kit::hint(ui, "Your changes are saved first.");
+                }
+                ui.add_space(8.0);
+                let option = |ui: &mut egui::Ui, title: &str, text: &str, button: egui::Button<'static>| {
+                    crate::ui_kit::card(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let w = ui.available_width() - 150.0;
+                            ui.vertical(|ui| {
+                                ui.set_width(w);
+                                ui.strong(title);
+                                crate::ui_kit::hint(ui, text);
+                            });
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui.add(button).clicked()).inner
+                        })
+                        .inner
+                    })
+                };
+                if option(
+                    ui,
+                    &format!("Trim the original · frees about {}", crate::export_ui::human_bytes(trim_frees)),
+                    "Keeps only the part this edit uses. You can still change the edit within it, but not bring back what's cut.",
+                    crate::ui_kit::button("Trim original", false),
+                ) {
+                    choice = Some(store::FreeUp::Trim);
+                }
+                ui.add_space(6.0);
+                if option(
+                    ui,
+                    &format!("Delete the original · frees {}", crate::export_ui::human_bytes(bytes)),
+                    "Keeps only the saved clip. The edit can't be changed or reverted afterwards.",
+                    crate::ui_kit::danger_button("Delete original"),
+                ) {
+                    choice = Some(store::FreeUp::Delete);
+                }
+                ui.add_space(12.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add(crate::ui_kit::button("Cancel", false)).clicked() {
+                        self.free_up = None;
+                    }
+                });
+            });
+            if modal.should_close() {
+                self.free_up = None;
+            }
+            if let Some(how) = choice {
+                self.free_up = None;
+                outcome = if needs_save {
+                    match self.save(target, None) {
+                        EditorOutcome::Saved { target, info, edit, new_name, .. } => EditorOutcome::Saved { target, info, edit, new_name, then: Some(how) },
+                        other => other,
+                    }
+                } else {
+                    EditorOutcome::FreeUp(target.clone(), how)
+                };
+            }
+        }
+
         if self.confirm_discard {
             let modal = egui::Modal::new(egui::Id::new("discard_edit")).show(&ctx, |ui| {
                 ui.set_width(340.0);
@@ -539,12 +624,12 @@ impl Ready {
             };
         }
         self.saved = self.edit.clone();
-        EditorOutcome::Saved { target: target.clone(), info: self.info.clone(), edit: self.edit.clone(), new_name }
+        EditorOutcome::Saved { target: target.clone(), info: self.info.clone(), edit: self.edit.clone(), new_name, then: None }
     }
 
     fn keyboard(&mut self, ctx: &egui::Context) {
         // A dialog (its own or the app's) or a menu has the keys.
-        if ctx.egui_wants_keyboard_input() || crate::ui_kit::overlay_open(ctx) || self.save_as.is_some() || self.confirm_discard {
+        if ctx.egui_wants_keyboard_input() || crate::ui_kit::overlay_open(ctx) || self.save_as.is_some() || self.confirm_discard || self.free_up.is_some() {
             return;
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::F2)) {

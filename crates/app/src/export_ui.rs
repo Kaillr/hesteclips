@@ -182,7 +182,7 @@ fn mbps(kbps: u32) -> String {
     if kbps >= 10_000 { format!("{:.0} Mbps", kbps as f32 / 1000.0) } else { format!("{:.1} Mbps", kbps as f32 / 1000.0) }
 }
 
-fn human_bytes(b: u64) -> String {
+pub(crate) fn human_bytes(b: u64) -> String {
     let mb = b as f64 / 1024.0 / 1024.0;
     if mb >= 1024.0 { format!("{:.1} GB", mb / 1024.0) } else if mb >= 10.0 { format!("{mb:.0} MB") } else { format!("{mb:.1} MB") }
 }

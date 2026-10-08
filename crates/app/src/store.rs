@@ -191,6 +191,91 @@ pub fn revert(target: &EditTarget) -> std::io::Result<()> {
     std::fs::remove_dir_all(assets_dir(lib, id))
 }
 
+/// What to do with an edited clip's original to save space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FreeUp {
+    /// Keep only what the edit uses (from the keyframe before its start to a
+    /// moment after its end), copied without re-encoding. The edit can still
+    /// be changed within that.
+    Trim,
+    /// Delete the original and the edit: the saved clip is all that's left,
+    /// as if it had been recorded that way.
+    Delete,
+}
+
+/// Seconds kept after the edit's end when trimming the original.
+const TRIM_MARGIN: f64 = 1.0;
+
+/// Free up the space an edited clip's original takes (see [`FreeUp`]).
+/// Returns how many bytes it freed. `permanently`: deleting skips the Bin.
+pub fn free_up(target: &EditTarget, how: FreeUp, permanently: bool) -> Result<u64, String> {
+    let id = target.id.as_deref().ok_or("this clip has no original")?;
+    let lib = target.library();
+    let original = find_original(lib, id).ok_or("this clip has no original")?;
+    let size = |p: &Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+    match how {
+        FreeUp::Delete => {
+            let dir = assets_dir(lib, id);
+            let freed = std::fs::read_dir(&dir).map(|d| d.flatten().map(|e| size(&e.path())).sum()).unwrap_or(0);
+            // The editor or player that just closed may still hold the
+            // original open for a moment.
+            let mut tries = 0;
+            loop {
+                let r = if permanently { std::fs::remove_dir_all(&dir).map_err(|e| e.to_string()) } else { trash::delete(&dir).map_err(|e| e.to_string()) };
+                match r {
+                    Ok(()) => return Ok(freed),
+                    Err(_) if tries < 20 => {
+                        tries += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        FreeUp::Trim => {
+            let edit = load_edit(target).ok_or("this clip's edit is missing")?;
+            let info = media::probe(&original).map_err(|e| e.to_string())?;
+            // A copy can only start on a keyframe: the last one at or before the cut.
+            let keys = media::keyframe_times(&original).map_err(|e| e.to_string())?;
+            let from = keys.iter().copied().filter(|&k| k <= edit.start + 1e-6).last().unwrap_or(0.0);
+            let to = (edit.end + TRIM_MARGIN).min(info.duration);
+            if from < 0.5 && to >= info.duration - 0.5 {
+                return Ok(0);
+            }
+            let ext = original.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or("mp4".into());
+            let trimmed = assets_dir(lib, id).join(format!("trimmed.{ext}"));
+            let at = match media::trim_copy(&original, from, to, &trimmed) {
+                Ok(at) => at,
+                Err(e) => {
+                    let _ = std::fs::remove_file(&trimmed);
+                    return Err(e.to_string());
+                }
+            };
+            let before = size(&original);
+            let edit = edit.shifted(from - at);
+            // The edit first: should the swap fail, the old edit goes back.
+            let old = std::fs::read(edit_path(lib, id)).map_err(|e| e.to_string())?;
+            std::fs::write(edit_path(lib, id), serde_json::to_vec_pretty(&edit).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+            let mut tries = 0;
+            loop {
+                match std::fs::rename(&trimmed, &original) {
+                    Ok(()) => break,
+                    Err(_) if tries < 20 => {
+                        tries += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    Err(e) => {
+                        let _ = std::fs::write(edit_path(lib, id), old);
+                        let _ = std::fs::remove_file(&trimmed);
+                        return Err(e.to_string());
+                    }
+                }
+            }
+            Ok(before.saturating_sub(size(&original)))
+        }
+    }
+}
+
 /// Delete a clip, with its assets unless another copy of the clip
 /// (duplicated in Finder) still uses them: to the Bin, or for good.
 pub fn delete(clip: &Clip, library: &[Clip], permanently: bool) -> Result<(), String> {
@@ -413,5 +498,76 @@ mod tests {
         assert!(!valid_id("../../etc"));
         assert!(!valid_id("short"));
         assert!(!valid_id("has space in it"));
+    }
+}
+
+#[cfg(test)]
+mod free_up_tests {
+    use super::*;
+
+    /// A 10 s clip with a keyframe every second and the clip tag, made by ffmpeg.
+    fn video(path: &Path, id: &str) {
+        let ok = media::ffmpeg()
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=320x240:rate=30:duration=10"])
+            .args(["-f", "lavfi", "-i", "sine=frequency=440:duration=10"])
+            .args(["-map", "0", "-map", "1", "-c:v", "libx264", "-g", "30", "-c:a", "aac"])
+            .args(["-metadata", &format!("comment=hesteclips:mix=1 id={id}")])
+            .arg(path)
+            .status()
+            .unwrap();
+        assert!(ok.success());
+    }
+
+    fn setup(name: &str) -> (PathBuf, EditTarget) {
+        let dir = std::env::temp_dir().join(format!("hc-free-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let id = "abcdef12";
+        let clip = dir.join("clip.mp4");
+        video(&clip, id);
+        let assets = create_assets_dir(&dir, id).unwrap();
+        video(&assets.join("original.mp4"), id);
+        let edit = Edit {
+            start: 4.3,
+            end: 6.0,
+            tracks: vec![media::TrackEdit { index: 1, gain: 1.0, muted: false, points: vec![media::VolumePoint { t: 5.0, db: -6.0 }] }],
+            output: Default::default(),
+        };
+        std::fs::write(edit_path(&dir, id), serde_json::to_vec(&edit).unwrap()).unwrap();
+        let target = EditTarget { clip: clip.clone(), source: assets.join("original.mp4"), id: Some(id.into()), library: dir.clone() };
+        (dir, target)
+    }
+
+    /// Trimming keeps the keyframe before the cut to a second after it, and
+    /// moves the edit along so it shows the same moments.
+    #[test]
+    fn trim_keeps_the_edit_in_place() {
+        let (dir, target) = setup("trim");
+        let freed = free_up(&target, FreeUp::Trim, true).unwrap();
+        assert!(freed > 0);
+        let original = find_original(&dir, "abcdef12").unwrap();
+        let info = media::probe(&original).unwrap();
+        assert!((info.duration - 3.0).abs() < 0.15, "kept {} s", info.duration);
+        assert_eq!(read_id(&original).as_deref(), Some("abcdef12"), "the clip tag survives");
+        let edit = load_edit(&target).unwrap();
+        let at = media::keyframe_times(&original).unwrap()[0];
+        assert!((edit.start - (0.3 + at)).abs() < 0.02, "start {}", edit.start);
+        assert!((edit.end - (2.0 + at)).abs() < 0.02, "end {}", edit.end);
+        assert!((edit.tracks[0].points[0].t - (1.0 + at)).abs() < 0.02);
+        // Again: nothing more to cut.
+        assert_eq!(free_up(&target, FreeUp::Trim, true).unwrap(), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Deleting leaves the clip as a plain clip: nothing to revert to.
+    #[test]
+    fn delete_leaves_the_clip() {
+        let (dir, target) = setup("delete");
+        assert!(free_up(&target, FreeUp::Delete, true).unwrap() > 0);
+        assert!(target.clip.exists() && !assets_dir(&dir, "abcdef12").exists());
+        let again = EditTarget::of(&target.clip);
+        assert_eq!(again.source, target.clip);
+        assert!(load_edit(&again).is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
