@@ -1361,8 +1361,18 @@ impl App {
         if viewer::volume(&self.ctx()).is_none() {
             viewer::set_volume(&self.ctx(), (self.settings.player_volume.clamp(0.0, 1.0), self.settings.player_muted));
         }
-        self.viewer = Some(viewer::Viewer::open(&self.ctx(), &clip));
+        self.viewer = Some(self.viewer_for(&clip));
         self.page = Page::View;
+    }
+
+    /// A viewer for this clip: its "Saving your edit" screen while an edit
+    /// of it is still being written, the clip otherwise.
+    fn viewer_for(&self, clip: &std::path::Path) -> viewer::Viewer {
+        if self.renders.iter().any(|j| !j.as_new && j.source == clip) {
+            viewer::Viewer::saving(clip)
+        } else {
+            viewer::Viewer::open(&self.ctx(), clip)
+        }
     }
 
     fn viewer_page(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
@@ -1411,7 +1421,7 @@ impl App {
                     self.edit_return = Some(clip);
                 }
             }
-            viewer::ViewerOutcome::Open(clip) => self.viewer = Some(viewer::Viewer::open(&self.ctx(), &clip)),
+            viewer::ViewerOutcome::Open(clip) => self.viewer = Some(self.viewer_for(&clip)),
             viewer::ViewerOutcome::InCollection(id, add) => {
                 let clip = v.clip().to_path_buf();
                 self.put_in_collection(&[clip], &id, add);
@@ -1689,10 +1699,10 @@ impl App {
         self.clip_saving();
     }
 
-    /// A clip is being saved: a card for it in the library, shown.
+    /// A clip is being saved: a card for it in the library (the page you're
+    /// on stays).
     fn clip_saving(&mut self) {
         self.saving += 1;
-        self.page = Page::Clips;
     }
 
     fn stop(&mut self) {
