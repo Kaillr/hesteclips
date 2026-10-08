@@ -3,12 +3,18 @@
 //! Args are sources: `mic:<device>`, `desktop`, `desktop-excl` (desktop minus app
 //! sources), `app:<bundle id or exe>`. Append `@mix`, `@track` to limit where it
 //! goes (default both). Env: REPLAY=1, SECS=n, EXT=mov, HEIGHT=n (0 = native),
-//! FPS=n, SOFTWARE=1, SCREEN=<id>, WEBCAM=<id|1>, WEBCAM_FORMAT=WxH, APP=<exe>[,<exe>…] (record those apps' windows,
+//! FPS=n, SOFTWARE=1, LIST=1 (list the inputs), SWITCH_MIC=<device> (the first source, a mic, switches to it halfway), SCREEN=<id>, WEBCAM=<id|1>, WEBCAM_FORMAT=WxH, APP=<exe>[,<exe>…] (record those apps' windows,
 //! following focus).
 use capture::sources::{AudioSource, SourceKind};
 use capture::{EncodeSettings, Mode, mixer::LiveAudio};
 
 fn main() -> anyhow::Result<()> {
+    if std::env::var("LIST").is_ok() {
+        let d = capture::audio::list_audio_devices();
+        println!("inputs: {:?}
+default: {:?}", d.inputs.iter().map(|i| &i.name).collect::<Vec<_>>(), d.default_input);
+        return Ok(());
+    }
     let sources: Vec<AudioSource> = std::env::args()
         .skip(1)
         .enumerate()
@@ -70,7 +76,13 @@ fn main() -> anyhow::Result<()> {
         sources: sources.clone(),
     })?;
     let secs: u64 = std::env::var("SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
-    for _ in 0..secs * 2 {
+    for tick in 0..secs * 2 {
+        // SWITCH_MIC=<device>: the first source (a mic) switches to it halfway.
+        if tick == secs
+            && let Some(device) = env("SWITCH_MIC")
+        {
+            println!("switching s0 to {device}: {}", rec.set_mic("s0", &device));
+        }
         std::thread::sleep(std::time::Duration::from_millis(500));
         let mut line = String::new();
         for s in &sources {

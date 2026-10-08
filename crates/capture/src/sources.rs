@@ -84,9 +84,45 @@ pub(crate) struct AudioCapture {
     /// One per source, in the order given.
     pub feeds: Vec<Arc<SourceFeed>>,
     #[cfg(not(target_os = "linux"))]
-    mics: Vec<cpal::Stream>,
+    mics: Vec<Mic>,
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     system: Option<SystemAudio>,
+}
+
+/// A microphone source. Its device's sound goes into a feed of its own
+/// (at the device's rate) inside the source's, so the device can be switched
+/// while capturing: the source, and its track, stay.
+#[cfg(not(target_os = "linux"))]
+struct Mic {
+    id: String,
+    device: String,
+    feed: Arc<SourceFeed>,
+    channel: Arc<crate::mixer::Channel>,
+    /// The device's stream and the feed it fills, while it's open.
+    open: Option<(cpal::Stream, Arc<SourceFeed>)>,
+}
+
+#[cfg(not(target_os = "linux"))]
+impl Mic {
+    fn open(&mut self) {
+        if let Some((stream, child)) = self.open.take() {
+            drop(stream);
+            self.feed.remove_child(&child);
+        }
+        let child = self.feed.add_child(native_rate(&SourceKind::Microphone { device: self.device.clone() }));
+        child.denoise_with(self.channel.denoise_flag());
+        match start_mic(&self.device, child.clone()) {
+            Ok(stream) => {
+                self.channel.set_status(SourceStatus::Live);
+                self.open = Some((stream, child));
+            }
+            Err(e) => {
+                eprintln!("microphone \"{}\": {e}", self.device);
+                self.feed.remove_child(&child);
+                self.channel.set_status(SourceStatus::Unavailable);
+            }
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -102,9 +138,15 @@ impl AudioCapture {
     /// running) doesn't fail the capture: its status says why and its track is
     /// silent until it can.
     pub(crate) fn start(sources: &[AudioSource], live: &LiveAudio, clock: Arc<Clock>) -> Result<Self> {
+        // A mic's own feed is inside its source's (see `Mic`): that one is at
+        // the mixer's rate.
         let feeds: Vec<Arc<SourceFeed>> = sources
             .iter()
-            .map(|s| SourceFeed::new(native_rate(&s.kind), clock.clone()))
+            .map(|s| match s.kind {
+                #[cfg(not(target_os = "linux"))]
+                SourceKind::Microphone { .. } => SourceFeed::new(crate::mixer::RATE, clock.clone()),
+                _ => SourceFeed::new(native_rate(&s.kind), clock.clone()),
+            })
             .collect();
         #[cfg(not(target_os = "linux"))]
         let mut mics = Vec::new();
@@ -112,21 +154,17 @@ impl AudioCapture {
         let mut system_sources = Vec::new();
         for (source, feed) in sources.iter().zip(&feeds) {
             let channel = live.channel(&source.id);
+            #[cfg(target_os = "linux")]
             if matches!(source.kind, SourceKind::Microphone { .. }) {
                 feed.denoise_with(channel.denoise_flag());
             }
             match &source.kind {
                 #[cfg(not(target_os = "linux"))]
-                SourceKind::Microphone { device } => match start_mic(device, feed.clone()) {
-                    Ok(stream) => {
-                        channel.set_status(SourceStatus::Live);
-                        mics.push(stream);
-                    }
-                    Err(e) => {
-                        eprintln!("microphone \"{device}\": {e}");
-                        channel.set_status(SourceStatus::Unavailable);
-                    }
-                },
+                SourceKind::Microphone { device } => {
+                    let mut mic = Mic { id: source.id.clone(), device: device.clone(), feed: feed.clone(), channel, open: None };
+                    mic.open();
+                    mics.push(mic);
+                }
                 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
                 _ => system_sources.push((source.clone(), feed.clone(), channel)),
                 #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
@@ -147,6 +185,22 @@ impl AudioCapture {
             #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
             system,
         })
+    }
+
+    /// Switch the microphone of the source `id` to `device`, without stopping
+    /// anything. False if that source isn't a mic here (on Linux mics are
+    /// PipeWire streams, set at the start).
+    pub(crate) fn set_mic(&mut self, id: &str, device: &str) -> bool {
+        #[cfg(not(target_os = "linux"))]
+        if let Some(mic) = self.mics.iter_mut().find(|m| m.id == id) {
+            if mic.device != device {
+                mic.device = device.to_owned();
+                mic.open();
+            }
+            return true;
+        }
+        let _ = (id, device);
+        false
     }
 
     pub(crate) fn stop(mut self) {

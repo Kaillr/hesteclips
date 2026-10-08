@@ -430,6 +430,12 @@ pub trait Recorder {
     /// Change how far back the running replay buffer reaches (and Save clip
     /// saves), without restarting it.
     fn set_replay_seconds(&mut self, _seconds: u32) {}
+
+    /// Switch the running capture's microphone source `id` to `device`
+    /// (its track stays). Returns whether it was applied.
+    fn set_mic(&mut self, _id: &str, _device: &str) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

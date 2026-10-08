@@ -174,6 +174,10 @@ impl Recorder for SckRecorder {
     fn update_video(&mut self, video: &crate::VideoSource) -> bool {
         self.session.as_ref().and_then(|s| s.video.as_ref()).is_some_and(|p| p.update(video))
     }
+
+    fn set_mic(&mut self, id: &str, device: &str) -> bool {
+        self.session.as_mut().and_then(|s| s.audio.as_mut()).is_some_and(|a| a.set_mic(id, device))
+    }
 }
 
 impl Drop for SckRecorder {

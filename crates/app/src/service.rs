@@ -21,6 +21,8 @@ enum Cmd {
     UpdateVideo(capture::VideoSource),
     /// How far back the running replay buffer reaches.
     ReplaySeconds(u32),
+    /// Switch a microphone source (by id) to another device.
+    SetMic(String, String),
     /// Stop; a recording goes into this folder, named after what happened.
     Stop(Option<PathBuf>, Option<String>),
     /// Stop, then signal once the file is finished (app being killed).
@@ -145,6 +147,11 @@ impl CaptureService {
                         recorder.update_video(&video);
                     }
                     Cmd::ReplaySeconds(seconds) => recorder.set_replay_seconds(seconds),
+                    Cmd::SetMic(id, device) => {
+                        if !recorder.set_mic(&id, &device) {
+                            eprintln!("couldn't switch the microphone of {id} while capturing");
+                        }
+                    }
                     Cmd::Stop(dir, details) => {
                         match recorder.stop(dir.as_deref()) {
                             Ok(Some(path)) => send(&evt_tx, Evt::Saved(named(path, details))),
@@ -182,6 +189,9 @@ impl CaptureService {
     }
     pub fn update_video(&self, video: capture::VideoSource) {
         self.send(Cmd::UpdateVideo(video));
+    }
+    pub fn set_mic(&self, id: String, device: String) {
+        self.send(Cmd::SetMic(id, device));
     }
     pub fn set_replay_seconds(&self, seconds: u32) {
         self.send(Cmd::ReplaySeconds(seconds));

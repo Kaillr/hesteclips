@@ -161,6 +161,10 @@ impl Recorder for WinRecorder {
             _ => false,
         }
     }
+
+    fn set_mic(&mut self, id: &str, device: &str) -> bool {
+        self.session.as_mut().and_then(|s| s.audio.as_mut()).is_some_and(|a| a.set_mic(id, device))
+    }
 }
 
 impl Drop for WinRecorder {

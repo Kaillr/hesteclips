@@ -166,10 +166,9 @@ impl App {
 
         if self.rec_state != crate::RecState::Idle {
             ui.add_space(10.0);
-            crate::ui_kit::hint(ui, match self.rec_state {
-                crate::RecState::Recording => "Volume, mute and noise removal change right away. Stop recording to add, remove or change sources.",
-                _ => "Volume, mute and noise removal change right away. Stop the replay buffer to add, remove or change sources.",
-            });
+            let mic = if cfg!(target_os = "linux") { ", noise removal" } else { ", noise removal and which microphone" };
+            let stop = if self.rec_state == crate::RecState::Recording { "Stop recording" } else { "Stop the replay buffer" };
+            crate::ui_kit::hint(ui, &format!("Volume, mute{mic} change right away. {stop} to add, remove or turn off sources."));
         }
         ui.add_space(16.0);
     }
@@ -744,6 +743,9 @@ fn source_card(
     locked: Option<&str>,
 ) -> CardAction {
     let mut action = CardAction::None;
+    // A mic can switch device while capturing (its track stays); on Linux
+    // mics are set when capture starts.
+    let picker_locked = locked.filter(|_| cfg!(target_os = "linux") || !matches!(source.kind, SourceKind::Microphone { .. }));
     card(ui, |ui| {
         let narrow = ui.available_width() < NARROW;
         // --- Header: on/off, name, status · what it captures, menu ---
@@ -785,16 +787,16 @@ fn source_card(
                     }
                 });
                 if !narrow {
-                    ui.add_enabled_ui(locked.is_none(), |ui| source_picker(ui, source, devices, 220.0))
+                    ui.add_enabled_ui(picker_locked.is_none(), |ui| source_picker(ui, source, devices, 220.0))
                         .response
-                        .on_disabled_hover_text(locked.unwrap_or_default());
+                        .on_disabled_hover_text(picker_locked.unwrap_or_default());
                 }
             });
         });
         if narrow {
-            ui.add_enabled_ui(locked.is_none(), |ui| source_picker(ui, source, devices, ui.available_width().min(320.0)))
+            ui.add_enabled_ui(picker_locked.is_none(), |ui| source_picker(ui, source, devices, ui.available_width().min(320.0)))
                 .response
-                .on_disabled_hover_text(locked.unwrap_or_default());
+                .on_disabled_hover_text(picker_locked.unwrap_or_default());
         }
         if !source.enabled {
             return;

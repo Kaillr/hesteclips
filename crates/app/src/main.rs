@@ -328,6 +328,9 @@ struct App {
     pub(crate) windowed_apps: Vec<capture::Device>,
     /// What the running capture records, to send it list changes live.
     capturing_video: Option<capture::VideoSource>,
+    /// The audio sources the running capture started with (mics follow
+    /// device changes).
+    capturing_sources: Vec<capture::sources::AudioSource>,
     /// The replay length the running capture keeps, to send it changes live.
     capturing_replay: Option<u32>,
     /// Shown instead of a game or app while you're tabbed out.
@@ -496,6 +499,7 @@ impl App {
             frame_size: None,
             windowed_apps: Vec::new(),
             capturing_video: None,
+            capturing_sources: Vec::new(),
             capturing_replay: None,
             away_screen: away::screen(),
             webcam_placement: std::sync::Arc::new(std::sync::Mutex::new(capture::webcam::Placement::default_for(16.0 / 9.0, 16.0 / 9.0))),
@@ -977,6 +981,7 @@ impl App {
         self.ensure_level_monitor();
         self.ensure_video_preview();
         self.sync_capture_video();
+        self.sync_capture_mics();
         self.sync_capture_settings();
         self.refit_webcam();
         *self.webcam_placement.lock().unwrap() = match &self.settings.webcam {
@@ -1732,6 +1737,7 @@ impl App {
     fn start_replay_buffer(&mut self) {
         self.refresh_audio_devices();
         self.capturing_video = Some(self.video_source());
+        self.capturing_sources = self.capture_sources();
         self.capturing_replay = Some(self.settings.replay_seconds);
         // Optimistic state; a State/Error event confirms or corrects it.
         self.service.start(capture::Mode::ReplayBuffer, self.encode_settings());
@@ -1742,6 +1748,7 @@ impl App {
     fn start_recording(&mut self) {
         self.refresh_audio_devices();
         self.capturing_video = Some(self.video_source());
+        self.capturing_sources = self.capture_sources();
         self.capturing_replay = Some(self.settings.replay_seconds);
         self.service.start(capture::Mode::Record, self.encode_settings());
         self.rec_state = RecState::Recording;
@@ -1790,6 +1797,37 @@ impl App {
         if both_apps && self.capturing_video.as_ref() != Some(&now) {
             self.service.update_video(now.clone());
             self.capturing_video = Some(now);
+        }
+    }
+
+    /// A microphone source switched to another device reaches the running
+    /// capture right away: its track stays, only where its sound comes from
+    /// changes. Anything else about the sources waits for the next start.
+    fn sync_capture_mics(&mut self) {
+        if self.rec_state == RecState::Idle {
+            return;
+        }
+        use capture::sources::SourceKind::Microphone;
+        let now = self.capture_sources();
+        if now.len() != self.capturing_sources.len() {
+            return;
+        }
+        let mut switched = Vec::new();
+        for (new, old) in now.iter().zip(&self.capturing_sources) {
+            if new.id != old.id || new.in_mix != old.in_mix || new.own_track != old.own_track {
+                return;
+            }
+            match (&new.kind, &old.kind) {
+                (Microphone { device: a }, Microphone { device: b }) if a != b => switched.push((new.id.clone(), a.clone())),
+                (a, b) if a != b => return,
+                _ => {}
+            }
+        }
+        for (id, device) in switched {
+            self.service.set_mic(id, device);
+        }
+        for (old, new) in self.capturing_sources.iter_mut().zip(now) {
+            old.kind = new.kind;
         }
     }
 
