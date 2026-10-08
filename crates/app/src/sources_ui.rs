@@ -339,7 +339,7 @@ impl App {
                                 .settings
                                 .idle_apps
                                 .take()
-                                .unwrap_or(CaptureTarget::Apps { apps: Vec::new(), away_screen: true, game_capture: true });
+                                .unwrap_or(CaptureTarget::Apps { apps: Vec::new(), away_screen: true });
                             self.windowed_apps = capture::list_windowed_apps();
                         }
                     }
@@ -351,7 +351,7 @@ impl App {
             ui.add_space(8.0);
 
             match self.settings.capture.clone() {
-                CaptureTarget::Apps { apps, away_screen, game_capture } if capture::APP_CAPTURE => self.app_list(ui, apps, away_screen, game_capture, frame.as_deref()),
+                CaptureTarget::Apps { apps, away_screen } if capture::APP_CAPTURE => self.app_list(ui, apps, away_screen, frame.as_deref()),
                 // Linux on Wayland: the desktop's own dialog picks the screen (once; it's remembered).
                 _ if cfg!(target_os = "linux") && !capture::screens_listed() => {
                     ui.add_enabled_ui(idle, |ui| {
@@ -487,12 +487,11 @@ impl App {
     /// open (and which is being recorded) and a remove button, then a way to
     /// add more. Right-clicking one has its game capture option. Changes apply
     /// right away, even while capturing.
-    fn app_list(&mut self, ui: &mut egui::Ui, apps: Vec<CaptureApp>, away_screen: bool, game_capture: bool, frame: Option<&capture::preview::PreviewFrame>) {
+    fn app_list(&mut self, ui: &mut egui::Ui, apps: Vec<CaptureApp>, away_screen: bool, frame: Option<&capture::preview::PreviewFrame>) {
         let showing = frame.filter(|f| !f.waiting).and_then(|f| f.app.clone());
         let capturing = self.rec_state != crate::RecState::Idle;
         let mut list = apps.clone();
         let mut away = away_screen;
-        let mut hook = game_capture;
         let hook_available = capture::game_hook_available();
         let mut remove = None;
         let mut toggle_always = None;
@@ -563,8 +562,11 @@ impl App {
                                         .color(meter::YELLOW),
                                     );
                                 }
-                                None if open => {
+                                None if open && self.settings.game_capture => {
                                     ui.weak("No anti-cheat found. Game capture is used on its own when Windows' capture can't see this game.");
+                                }
+                                None if open => {
+                                    ui.weak("No anti-cheat found. Game capture is off in Settings, except for games set to always use it.");
                                 }
                                 None => {
                                     ui.weak("Open it to check it for anti-cheat.");
@@ -649,16 +651,11 @@ impl App {
              Off: they keep the last picture (black if there's none yet). \
              A window that's still on screen keeps being recorded either way.",
         );
-        if hook_available {
-            ui.checkbox(&mut hook, "Use game capture for games that need it").on_hover_text(
-                "Windows' own capture can't see some games: fullscreen OpenGL games like osu! record one frozen picture,                  and Geometry Dash loses its cursor. For those, HesteClips loads OBS Studio's game capture into the game.                  It's never used on a game with anti-cheat, unless you right-click the game and choose to always use it.",
-            );
-        }
         if list.len() > 1 {
             ui.label(RichText::new("Records the one you're using, and keeps it while you click into something else as long as it's on screen.").size(12.0).weak());
         }
-        if list != apps || away != away_screen || hook != game_capture {
-            self.settings.capture = CaptureTarget::Apps { apps: list, away_screen: away, game_capture: hook };
+        if list != apps || away != away_screen {
+            self.settings.capture = CaptureTarget::Apps { apps: list, away_screen: away };
         }
     }
 

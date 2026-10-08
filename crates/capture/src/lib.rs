@@ -121,7 +121,7 @@ pub fn output_size(w: u32, h: u32, target_height: Option<u32>) -> (u32, u32) {
 /// the screen has been picked in the system's dialog once).
 pub fn frame_size(source: &VideoSource, target_height: Option<u32>) -> Option<(u32, u32)> {
     let id = match source {
-        VideoSource::Screen { id } => Some(id.as_str()),
+        VideoSource::Screen { id, .. } => Some(id.as_str()),
         VideoSource::Apps { .. } => None,
     };
     #[cfg(target_os = "macos")]
@@ -142,8 +142,10 @@ pub fn frame_size(source: &VideoSource, target_height: Option<u32>) -> Option<(u
 /// overlays (a webcam) will go on top of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VideoSource {
-    /// A whole display, by backend id (see [`list_screens`]).
-    Screen { id: String },
+    /// A whole display, by backend id (see [`list_screens`]). A game that
+    /// needs the game capture hook, fullscreen and in focus on it, is recorded
+    /// through the hook while it is.
+    Screen { id: String, hook: GameHook },
     /// Games and apps, by executable name (see [`list_windowed_apps`]): records
     /// whichever of them was last in focus, for as long as it's showing, even
     /// while you click into something else. When it stops showing (minimized,
@@ -155,7 +157,7 @@ pub enum VideoSource {
 }
 
 /// When a game is recorded through the game capture hook (Windows) instead
-/// of Windows' own capture, which can't see some games (exclusive fullscreen
+/// of Windows' own capture (whether recording games and apps or the screen), which can't see some games (exclusive fullscreen
 /// OpenGL records one frozen frame) and loses the cursor in others. The hook
 /// is OBS Studio's, loaded into the game; it's never used on a game with
 /// anti-cheat unless it's in `always`.

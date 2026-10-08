@@ -522,6 +522,13 @@ pub(crate) fn window_app_path(hwnd: HWND) -> Option<std::path::PathBuf> {
     image_path(pid).map(Into::into)
 }
 
+/// Whether a window covers `monitor` (a fullscreen game on it).
+pub(crate) fn fullscreen_on(hwnd: HWND, monitor: HMONITOR) -> bool {
+    use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromWindow};
+    let on = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) } == monitor;
+    on && covers_display(hwnd)
+}
+
 /// Whether a window covers its whole display (a fullscreen game).
 pub(crate) fn covers_display(hwnd: HWND) -> bool {
     use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow};

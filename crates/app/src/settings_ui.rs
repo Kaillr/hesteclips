@@ -132,6 +132,21 @@ impl App {
                         .on_hover_text(self.estimate_explainer());
                 });
                 divider(ui);
+                if capture::game_hook_available() {
+                    row(
+                        ui,
+                        "Game capture",
+                        Some(
+                            "For games Windows can't record properly: fullscreen games like osu! that record frozen, \
+                             or Geometry Dash, which loses its cursor. Uses OBS Studio's game capture. \
+                             Never on games with anti-cheat, unless you right-click one in Sources to always use it.",
+                        ),
+                        |ui| {
+                            toggle(ui, &mut self.settings.game_capture);
+                        },
+                    );
+                    divider(ui);
+                }
                 egui::CollapsingHeader::new(RichText::new("Advanced").strong())
                     .id_salt("video_advanced")
                     .default_open(false)

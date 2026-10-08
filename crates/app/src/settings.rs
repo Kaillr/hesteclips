@@ -142,10 +142,6 @@ pub enum CaptureTarget {
         apps: Vec<CaptureApp>,
         #[serde(default = "yes")]
         away_screen: bool,
-        /// Record games Windows' own capture can't see properly through
-        /// the game capture hook, where it's safe (see `capture::GameHook`).
-        #[serde(default = "yes")]
-        game_capture: bool,
     },
     /// One app, from before several could be chosen; read only, turned into
     /// `Apps` on load.
@@ -550,6 +546,12 @@ pub struct RecordSettings {
     pub audio_sources: Vec<AudioSourceCfg>,
     /// Keep the clip's mix from clipping when sources add up too loud.
     pub limiter: bool,
+    /// Record games Windows' own capture can't see properly (exclusive
+    /// fullscreen, a lost cursor) through the game capture hook, where it's
+    /// safe: never on games with anti-cheat unless a game in the list asks
+    /// for it (see `capture::GameHook`). Recording the screen or games and
+    /// apps alike.
+    pub game_capture: bool,
 
     // --- Shortcuts ---
     pub shortcuts: Shortcuts,
@@ -598,6 +600,7 @@ impl Default for RecordSettings {
             game_titles: GameTitles::default(),
             audio_sources: default_sources(),
             limiter: true,
+            game_capture: true,
             shortcuts: Shortcuts::default(),
             save_sound: SaveSound::default(),
             editor_preview_share: 0.5,
@@ -731,7 +734,6 @@ impl RecordSettings {
             self.capture = CaptureTarget::Apps {
                 apps: vec![CaptureApp { id: id.clone(), name: name.clone(), always_game_capture: false }],
                 away_screen: true,
-                game_capture: true,
             };
         }
     }
@@ -826,7 +828,6 @@ mod tests {
             CaptureTarget::Apps {
                 apps: vec![CaptureApp { id: "game.exe".into(), name: "Game".into(), always_game_capture: false }],
                 away_screen: true,
-                game_capture: true,
             }
         );
         let round: RecordSettings = serde_json::from_str(&s.to_json()).unwrap();

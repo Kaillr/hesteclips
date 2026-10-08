@@ -158,7 +158,7 @@ fn display_pixels(display: &SCDisplay) -> (usize, usize) {
 pub(crate) fn plan(source: &VideoSource, target_height: Option<u32>) -> Result<(Retained<SCShareableContent>, Retained<SCDisplay>, (usize, usize))> {
     let content = shareable_content()?;
     let id = match source {
-        VideoSource::Screen { id } => id.as_str(),
+        VideoSource::Screen { id, .. } => id.as_str(),
         VideoSource::Apps { .. } => "",
     };
     let display = pick_display(&content, id).context("no display to capture")?;

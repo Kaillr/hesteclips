@@ -406,7 +406,7 @@ mod tests {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor { backends: wgpu::Backends::METAL, ..wgpu::InstanceDescriptor::new_without_display_handle() });
         let adapter = pollster::block_on(instance.request_adapter(&Default::default())).expect("adapter");
         let (device, _queue) = pollster::block_on(adapter.request_device(&Default::default())).expect("device");
-        let preview = capture::preview::VideoPreview::start(&capture::VideoSource::Screen { id: String::new() }, Some(720), 30, None, None);
+        let preview = capture::preview::VideoPreview::start(&capture::VideoSource::Screen { id: String::new(), hook: Default::default() }, Some(720), 30, None, None);
         let frame = (0..100)
             .find_map(|_| {
                 capture::preview::request();

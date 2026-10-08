@@ -329,7 +329,8 @@ impl Session {
 
 /// Where a session's picture comes from: a display, or an app's window.
 enum PictureSource {
-    Screen(windows::Graphics::Capture::GraphicsCaptureItem),
+    /// A display (and which), and when to switch to the game capture hook.
+    Screen(windows::Graphics::Capture::GraphicsCaptureItem, windows::Win32::Graphics::Gdi::HMONITOR, crate::GameHook),
     /// The apps to follow, changeable while capturing.
     Apps(AppList),
 }
@@ -368,10 +369,11 @@ impl PictureSource {
     /// display's — so it can't change mid-file, whatever the windows do.
     fn plan(source: &VideoSource) -> Result<(Self, (u32, u32))> {
         Ok(match source {
-            VideoSource::Screen { id } => {
-                let item = d3d::monitor_item(system::find_monitor(id))?;
+            VideoSource::Screen { id, hook } => {
+                let monitor = system::find_monitor(id);
+                let item = d3d::monitor_item(monitor)?;
                 let size = item.Size()?;
-                (PictureSource::Screen(item), (size.Width.max(2) as u32, size.Height.max(2) as u32))
+                (PictureSource::Screen(item, monitor, hook.clone()), (size.Width.max(2) as u32, size.Height.max(2) as u32))
             }
             VideoSource::Apps { .. } => {
                 let (_, w, h) = system::primary_monitor();
@@ -387,7 +389,7 @@ impl PictureSource {
         // can be on any display — on a portrait one, taller than the frame — so
         // it gets room for a window on the biggest of them.
         let (copy_w, copy_h) = match &self {
-            PictureSource::Screen(_) => (width, height),
+            PictureSource::Screen(..) => (width, height),
             PictureSource::Apps(_) => {
                 let (w, h) = system::largest_display_box();
                 (w.max(width), h.max(height))
@@ -405,8 +407,8 @@ impl PictureSource {
                 }
                 Video::follow_apps(gpu.clone(), latest.clone(), list, fps, away)
             }
-            PictureSource::Screen(item) => {
-                let video = Video::Screen { _capture: d3d::Capture::start(gpu, &item, &latest, None, fps)? };
+            PictureSource::Screen(item, monitor, hook) => {
+                let capture = d3d::Capture::start(gpu, &item, &latest, None, fps)?;
                 // Wait for the first frame so a capture that can't see the screen
                 // fails here, visibly, instead of producing an empty file.
                 let deadline = Instant::now() + Duration::from_secs(3);
@@ -416,7 +418,7 @@ impl PictureSource {
                     }
                     thread::sleep(Duration::from_millis(10));
                 }
-                video
+                Video::follow_screen(gpu.clone(), latest.clone(), item, monitor, capture, fps, hook)
             }
         };
         Ok(Picture { video, latest })
@@ -426,7 +428,7 @@ impl PictureSource {
     fn apps(&self) -> Option<AppList> {
         match self {
             PictureSource::Apps(list) => Some(list.clone()),
-            PictureSource::Screen(_) => None,
+            PictureSource::Screen(..) => None,
         }
     }
 }
@@ -549,8 +551,9 @@ const FROZEN: Duration = Duration::from_secs(4);
 /// Keeps the picture coming: one capture of a display, or the windows of a set
 /// of apps, following focus between them and each as it closes and reopens.
 enum Video {
-    /// Held to keep the capture running.
-    Screen { _capture: d3d::Capture },
+    /// A display, or (while one's fullscreen on it and needs it) a game
+    /// through the hook; or the apps followed. Both on their own thread.
+    Screen { stop: Arc<AtomicBool>, thread: JoinHandle<()> },
     App { stop: Arc<AtomicBool>, thread: JoinHandle<()> },
 }
 
@@ -732,11 +735,103 @@ impl Video {
         Video::App { stop, thread }
     }
 
+    /// Record a display: Windows' capture of it, except while a game that
+    /// needs the game capture hook (see [`hook::plan`]) is fullscreen and in
+    /// focus on it. Windows' capture of the display is stopped meanwhile: while
+    /// it runs, some games lose their cursor.
+    fn follow_screen(
+        gpu: d3d::Gpu,
+        latest: Arc<d3d::Latest>,
+        item: windows::Graphics::Capture::GraphicsCaptureItem,
+        monitor: windows::Win32::Graphics::Gdi::HMONITOR,
+        first: d3d::Capture,
+        fps: u32,
+        settings: crate::GameHook,
+    ) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let (item, monitor, first) = (d3d::Shared(item), d3d::Shared(monitor), d3d::Shared(first));
+        let thread = thread::spawn(move || {
+            // Whole wrappers (they make these Send), not their fields.
+            let (item, monitor, first) = (item, monitor, first);
+            let (item, monitor) = (item.0, monitor.0);
+            system::com_init();
+            let mut display = Some(first.0);
+            let mut hooked: Option<(windows::Win32::Foundation::HWND, String, hook::HookCapture)> = None;
+            // How to capture each game window, worked out once.
+            let mut plans: std::collections::HashMap<usize, hook::Plan> = Default::default();
+            let mut hook_failed: std::collections::HashSet<usize> = Default::default();
+            let mut frozen: std::collections::HashSet<String> = Default::default();
+            while !stop2.load(Ordering::Relaxed) {
+                // A fullscreen window in focus on this display.
+                let game = system::foreground_app()
+                    .filter(|f| f.main && !system::window_hidden(f.hwnd) && system::fullscreen_on(f.hwnd, monitor))
+                    .map(|f| (f.hwnd, f.exe));
+                let plan = game.as_ref().map(|(h, exe)| {
+                    *plans.entry(h.0 as usize).or_insert_with(|| {
+                        let (plan, why) = hook::plan(exe, *h, &settings);
+                        eprintln!("{exe} fullscreen: {} ({why})", if plan == hook::Plan::Hook { "the game capture hook" } else { "Windows' capture" });
+                        plan
+                    })
+                });
+                // The hook stopped on a game that's still open: the display
+                // for it from now on.
+                if let Some((h, exe, capture)) = &hooked
+                    && let Some(why) = capture.ended()
+                {
+                    if system::window_alive(*h) {
+                        eprintln!("{exe}: the game capture hook stopped ({why}); recording the display");
+                        hook_failed.insert(h.0 as usize);
+                    }
+                    hooked = None;
+                }
+                let want = game.clone().filter(|(h, exe)| {
+                    let hook = plan == Some(hook::Plan::Hook) || plan == Some(hook::Plan::Watch) && frozen.contains(&exe.to_lowercase());
+                    hook && !hook_failed.contains(&(h.0 as usize))
+                });
+                match &want {
+                    Some((h, exe)) if hooked.as_ref().is_none_or(|(hh, ..)| hh != h) => {
+                        hooked = None;
+                        display = None;
+                        eprintln!("recording {exe} with the game capture hook while it's fullscreen");
+                        match hook::HookCapture::start(&gpu, *h, &latest, fps) {
+                            Ok(capture) => hooked = Some((*h, exe.clone(), capture)),
+                            Err(e) => {
+                                eprintln!("{exe}: can't start the game capture hook: {e:#}");
+                                hook_failed.insert(h.0 as usize);
+                            }
+                        }
+                    }
+                    None if hooked.is_some() => hooked = None,
+                    _ => {}
+                }
+                if hooked.is_none() && display.is_none() {
+                    match d3d::Capture::start(&gpu, &item, &latest, None, fps) {
+                        Ok(c) => display = Some(c),
+                        Err(e) => eprintln!("can't record the display: {e:#}"),
+                    }
+                }
+                // Windows' capture sends nothing new while a fullscreen game
+                // is in focus: it can't see it (exclusive fullscreen).
+                if let (Some(capture), Some((_, exe)), Some(hook::Plan::Watch)) = (&display, &game, plan)
+                    && capture.since_last_frame() > FROZEN
+                    && frozen.insert(exe.to_lowercase())
+                {
+                    eprintln!("{exe}: Windows' capture shows nothing new for {FROZEN:?} in fullscreen; switching to the game capture hook");
+                }
+                let until = Instant::now() + Self::RESCAN;
+                while Instant::now() < until && !stop2.load(Ordering::Relaxed) {
+                    thread::sleep(Duration::from_millis(20));
+                }
+            }
+        });
+        Video::Screen { stop, thread }
+    }
+
     fn stop(self) {
-        if let Video::App { stop, thread } = self {
-            stop.store(true, Ordering::Relaxed);
-            let _ = thread.join();
-        }
+        let (Video::App { stop, thread } | Video::Screen { stop, thread }) = self;
+        stop.store(true, Ordering::Relaxed);
+        let _ = thread.join();
     }
 }
 

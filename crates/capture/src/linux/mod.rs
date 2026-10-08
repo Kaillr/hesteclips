@@ -251,7 +251,7 @@ const MIX_LATENCY: f64 = 0.3;
 /// The screen, for a video source: games and apps can't be recorded here.
 fn open_screen(source: &VideoSource) -> Result<Arc<screen::Screen>> {
     match source {
-        VideoSource::Screen { id } => screen::acquire(id),
+        VideoSource::Screen { id, .. } => screen::acquire(id),
         VideoSource::Apps { .. } => bail!("recording games and apps isn't available on Linux — record the screen instead"),
     }
 }
