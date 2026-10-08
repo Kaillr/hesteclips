@@ -217,6 +217,13 @@ impl Recorder for LinuxRecorder {
     fn is_running(&self) -> bool {
         self.session.is_some()
     }
+
+    fn set_replay_seconds(&mut self, seconds: u32) {
+        self.replay_seconds = seconds;
+        if let Some(session) = self.session.as_ref().filter(|_| self.mode == Some(Mode::ReplayBuffer)) {
+            let _ = session.writer_tx.send(writer::Command::SetWindow(seconds as f64));
+        }
+    }
 }
 
 impl Drop for LinuxRecorder {
@@ -233,13 +240,6 @@ enum Target {
     /// Straight to this (hidden, partial) file.
     Record(PathBuf),
     /// An in-memory ring of this many seconds.
-
-    fn set_replay_seconds(&mut self, seconds: u32) {
-        self.replay_seconds = seconds;
-        if let Some(session) = self.session.as_ref().filter(|_| self.mode == Some(Mode::ReplayBuffer)) {
-            let _ = session.writer_tx.send(writer::Command::SetWindow(seconds as f64));
-        }
-    }
     Replay(f64),
 }
 
