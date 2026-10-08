@@ -145,15 +145,7 @@ impl App {
                     });
                     if t.osu {
                         let hint = "Scores need tosu running. Without it, osu! stable clips get the map's name only.";
-                        row(ui, "In osu! names", Some(hint), |ui| {
-                            ui.horizontal_wrapped(|ui| {
-                                ui.checkbox(&mut t.osu_accuracy, "Accuracy").on_hover_text("98.52% FC, misses, and the combo mid-play");
-                                ui.checkbox(&mut t.osu_pp, "pp");
-                                ui.checkbox(&mut t.osu_mods, "Mods");
-                                ui.checkbox(&mut t.osu_stars, "Star rating");
-                                ui.checkbox(&mut t.osu_artist, "Artist");
-                            });
-                        });
+                        row(ui, "In osu! names", Some(hint), |ui| osu_parts_editor(ui, t));
                     }
                 }
                 divider(ui);
@@ -600,6 +592,67 @@ fn note(ui: &mut egui::Ui, text: &str) {
             ui.set_width(ui.available_width());
             ui.colored_label(ui.visuals().warn_fg_color, text);
         });
+}
+
+/// The parts of an osu! clip's name: each on or off, in the order dragged
+/// (by the handle), with what the name looks like underneath.
+fn osu_parts_editor(ui: &mut egui::Ui, t: &mut crate::settings::GameTitles) {
+    use crate::settings::OsuPart;
+    const ROW: f32 = 28.0;
+    let parts = t.osu_parts();
+    let drag_id = ui.id().with("osu_parts_drag");
+    let mut dragging: Option<usize> = ui.data(|d| d.get_temp(drag_id));
+    let top = ui.cursor().top();
+    let mut order = parts.clone();
+    for (i, part) in parts.iter().enumerate() {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width().min(360.0), ROW), egui::Sense::hover());
+        let v = ui.visuals().clone();
+        if dragging == Some(i) {
+            ui.painter().rect_filled(rect, crate::ui_kit::RADIUS, crate::ui_kit::hover(&v));
+        }
+        // The handle: six dots.
+        let handle = egui::Rect::from_min_size(rect.min, egui::vec2(22.0, ROW));
+        let h = ui.interact(handle, ui.id().with(("osu_part", i)), egui::Sense::drag()).on_hover_cursor(egui::CursorIcon::Grab).on_hover_text("Drag to reorder");
+        let dot = if h.hovered() || dragging == Some(i) { v.text_color() } else { v.weak_text_color() };
+        for (dx, dy) in [(0.0, -4.0), (0.0, 0.0), (0.0, 4.0), (5.0, -4.0), (5.0, 0.0), (5.0, 4.0)] {
+            ui.painter().circle_filled(handle.center() + egui::vec2(dx - 2.5, dy), 1.3, dot);
+        }
+        if h.drag_started() {
+            dragging = Some(i);
+        }
+        let mut inner = ui.new_child(egui::UiBuilder::new().max_rect(rect.with_min_x(handle.right() + 4.0)).layout(egui::Layout::left_to_right(egui::Align::Center)));
+        inner.checkbox(t.osu_on_mut(*part), part.label());
+        if *part == OsuPart::Map && t.osu_map {
+            inner.add_space(8.0);
+            inner.checkbox(&mut t.osu_artist, "With the artist");
+        }
+    }
+    // While dragging, the row moves to where the pointer is.
+    if let Some(from) = dragging {
+        if ui.input(|i| i.pointer.primary_down()) {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            if let Some(p) = ui.input(|i| i.pointer.latest_pos()) {
+                let to = (((p.y - top) / (ROW + ui.spacing().item_spacing.y)).floor().max(0.0) as usize).min(order.len() - 1);
+                if to != from {
+                    let part = order.remove(from);
+                    order.insert(to, part);
+                    t.osu_order = order;
+                    dragging = Some(to);
+                }
+            }
+        } else {
+            dragging = None;
+        }
+    }
+    ui.data_mut(|d| match dragging {
+        Some(i) => {
+            d.insert_temp(drag_id, i);
+        }
+        None => d.remove::<usize>(drag_id),
+    });
+    ui.add_space(4.0);
+    let example = crate::osu_plays::example(t);
+    crate::ui_kit::hint(ui, &format!("Like: {}", if example.is_empty() { "(nothing)".into() } else { example }));
 }
 
 /// An on/off switch, like the system's.

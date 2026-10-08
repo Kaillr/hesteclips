@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use crate::settings::GameTitles;
+use crate::settings::{GameTitles, OsuPart};
 
 /// Where tosu and gosumemory serve osu!'s state.
 const TOSU: &str = "http://127.0.0.1:24050";
@@ -179,58 +179,64 @@ impl Tracker {
 
 fn name(play: &Play, f: &GameTitles) -> String {
     let mut parts: Vec<String> = Vec::new();
+    // What kind of clip it is comes first, whatever the order.
     if let Some(player) = &play.other_player {
         parts.push(player.clone());
     }
     let percent = |p: Option<f64>| p.map(|p| format!(" at {:.0}%", (p * 100.0).clamp(0.0, 99.0))).unwrap_or_default();
-    let stats = play.stats.as_ref();
     match play.outcome {
-        Outcome::Passed => {
-            // pp, then misses, then accuracy.
-            if let Some(s) = stats {
-                if f.osu_pp && s.pp > 0.0 {
-                    parts.push(format!("{:.0}pp", s.pp));
-                }
-                if f.osu_accuracy {
-                    if s.misses > 0 {
-                        parts.push(if s.misses == 1 { "1 miss".into() } else { format!("{} misses", s.misses) });
-                    }
-                    let fc = s.misses == 0 && s.slider_breaks == 0;
-                    parts.push(format!("{}{}", accuracy(s.accuracy), if fc { " FC" } else { "" }));
-                }
-            }
-        }
         Outcome::Failed => parts.push(format!("Failed{}", percent(play.progress))),
         // Without tosu nothing tells a quit from a pass: say nothing.
         Outcome::Quit if play.progress.is_some() => parts.push(format!("Quit{}", percent(play.progress))),
-        Outcome::Quit => {}
-        Outcome::Playing => {
-            if let Some(s) = stats
-                && f.osu_accuracy
-            {
-                parts.push(accuracy(s.accuracy));
-                parts.push(format!("{}x", s.combo));
+        _ => {}
+    }
+    let stats = play.stats.as_ref();
+    // A score's numbers: a pass's, or so far mid-play (no pp: it's partial).
+    let scored = matches!(play.outcome, Outcome::Passed | Outcome::Playing);
+    for part in f.osu_parts().into_iter().filter(|p| f.osu_on(*p)) {
+        match part {
+            OsuPart::Pp => {
+                if let Some(s) = stats.filter(|s| play.outcome == Outcome::Passed && s.pp > 0.0) {
+                    parts.push(format!("{:.0}pp", s.pp));
+                }
+            }
+            OsuPart::Misses => {
+                if let Some(s) = stats.filter(|s| scored && s.misses > 0) {
+                    parts.push(if s.misses == 1 { "1 miss".into() } else { format!("{} misses", s.misses) });
+                }
+            }
+            OsuPart::Accuracy => match (play.outcome, stats) {
+                (Outcome::Passed, Some(s)) => {
+                    let fc = s.misses == 0 && s.slider_breaks == 0;
+                    parts.push(format!("{}{}", accuracy(s.accuracy), if fc { " FC" } else { "" }));
+                }
+                (Outcome::Playing, Some(s)) => {
+                    parts.push(accuracy(s.accuracy));
+                    parts.push(format!("{}x", s.combo));
+                }
+                _ => {}
+            },
+            OsuPart::Mods => {
+                if let Some(mods) = stats.map(|s| s.mods.trim()).filter(|m| !m.is_empty() && *m != "NM") {
+                    parts.push(format!("+{mods}"));
+                }
+            }
+            OsuPart::Stars => {
+                if let Some(stars) = play.map.stars.filter(|s| *s > 0.0) {
+                    parts.push(format!("{stars:.2}★"));
+                }
+            }
+            OsuPart::Map => {
+                let m = &play.map;
+                parts.push(match (f.osu_artist && !m.artist.is_empty(), m.version.is_empty()) {
+                    (true, false) => format!("{} - {} [{}]", m.artist, m.title, m.version),
+                    (true, true) => format!("{} - {}", m.artist, m.title),
+                    (false, false) => format!("{} [{}]", m.title, m.version),
+                    (false, true) => m.title.clone(),
+                });
             }
         }
     }
-    if f.osu_mods
-        && let Some(mods) = stats.map(|s| s.mods.trim()).filter(|m| !m.is_empty() && *m != "NM")
-    {
-        parts.push(format!("+{mods}"));
-    }
-    if f.osu_stars
-        && let Some(stars) = play.map.stars.filter(|s| *s > 0.0)
-    {
-        parts.push(format!("{stars:.2}★"));
-    }
-    let m = &play.map;
-    let map = match (f.osu_artist && !m.artist.is_empty(), m.version.is_empty()) {
-        (true, false) => format!("{} - {} [{}]", m.artist, m.title, m.version),
-        (true, true) => format!("{} - {}", m.artist, m.title),
-        (false, false) => format!("{} [{}]", m.title, m.version),
-        (false, true) => m.title.clone(),
-    };
-    parts.push(map);
     let full = parts.join(" · ");
     if full.chars().count() <= MAX_TITLE {
         return full;
@@ -238,6 +244,23 @@ fn name(play: &Play, f: &GameTitles) -> String {
     let mut cut: String = full.chars().take(MAX_TITLE - 1).collect();
     cut.truncate(cut.trim_end().len());
     cut + "…"
+}
+
+/// What a passed play's name looks like with these settings (for Settings).
+pub fn example(f: &GameTitles) -> String {
+    let now = Instant::now();
+    let play = Play {
+        map: Map { artist: "xi".into(), title: "FREEDOM DiVE".into(), version: "FOUR DIMENSIONS".into(), stars: Some(7.83) },
+        other_player: None,
+        start: now,
+        end: now,
+        stats: Some(Stats { accuracy: 97.1, misses: 3, slider_breaks: 0, combo: 1200, pp: 412.0, mods: "HDDT".into() }),
+        progress: Some(1.0),
+        failed: false,
+        outcome: Outcome::Passed,
+        on_results: false,
+    };
+    name(&play, f)
 }
 
 /// "98.52%", "100%".
@@ -533,6 +556,20 @@ mod tests {
         assert!(title.starts_with("350pp · 3 misses · 97.10% · aaa"), "{title}");
         assert_eq!(title.chars().count(), MAX_TITLE);
         assert!(title.ends_with('…'));
+    }
+
+    /// The parts follow the order and switches from Settings.
+    #[test]
+    fn parts_in_the_chosen_order() {
+        use crate::settings::OsuPart;
+        assert_eq!(example(&GameTitles::default()), "412pp · 3 misses · 97.10% · +HDDT · FREEDOM DiVE [FOUR DIMENSIONS]");
+        let f = GameTitles {
+            osu_order: vec![OsuPart::Map, OsuPart::Accuracy, OsuPart::Pp],
+            osu_misses: false,
+            osu_mods: false,
+            ..GameTitles::default()
+        };
+        assert_eq!(example(&f), "FREEDOM DiVE [FOUR DIMENSIONS] · 97.10% · 412pp");
     }
 
     #[test]

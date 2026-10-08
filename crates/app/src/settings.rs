@@ -359,17 +359,97 @@ pub struct GameTitles {
     pub dota2: bool,
     pub league: bool,
     pub osu: bool,
-    /// Accuracy, FC and misses (and combo mid-play).
+    /// Accuracy and FC (and the combo mid-play).
     pub osu_accuracy: bool,
+    pub osu_misses: bool,
     pub osu_pp: bool,
     pub osu_mods: bool,
     pub osu_stars: bool,
+    pub osu_map: bool,
     pub osu_artist: bool,
+    /// The order of the parts of an osu! name, as dragged in Settings.
+    pub osu_order: Vec<OsuPart>,
 }
 
 impl Default for GameTitles {
     fn default() -> Self {
-        Self { cs2: true, dota2: true, league: true, osu: true, osu_accuracy: true, osu_pp: true, osu_mods: true, osu_stars: false, osu_artist: false }
+        Self {
+            cs2: true,
+            dota2: true,
+            league: true,
+            osu: true,
+            osu_accuracy: true,
+            osu_misses: true,
+            osu_pp: true,
+            osu_mods: true,
+            osu_stars: false,
+            osu_map: true,
+            osu_artist: false,
+            osu_order: OsuPart::ALL.to_vec(),
+        }
+    }
+}
+
+/// A part of an osu! clip's name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OsuPart {
+    Pp,
+    Misses,
+    Accuracy,
+    Mods,
+    Stars,
+    Map,
+}
+
+impl OsuPart {
+    pub const ALL: [OsuPart; 6] = [OsuPart::Pp, OsuPart::Misses, OsuPart::Accuracy, OsuPart::Mods, OsuPart::Stars, OsuPart::Map];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            OsuPart::Pp => "pp",
+            OsuPart::Misses => "Misses",
+            OsuPart::Accuracy => "Accuracy",
+            OsuPart::Mods => "Mods",
+            OsuPart::Stars => "Star rating",
+            OsuPart::Map => "Map",
+        }
+    }
+}
+
+impl GameTitles {
+    /// The parts in their order: each once, any missing (an older settings
+    /// file) at the end.
+    pub fn osu_parts(&self) -> Vec<OsuPart> {
+        let mut parts: Vec<OsuPart> = Vec::new();
+        for p in self.osu_order.iter().chain(OsuPart::ALL.iter()) {
+            if !parts.contains(p) {
+                parts.push(*p);
+            }
+        }
+        parts
+    }
+
+    pub fn osu_on(&self, part: OsuPart) -> bool {
+        match part {
+            OsuPart::Pp => self.osu_pp,
+            OsuPart::Misses => self.osu_misses,
+            OsuPart::Accuracy => self.osu_accuracy,
+            OsuPart::Mods => self.osu_mods,
+            OsuPart::Stars => self.osu_stars,
+            OsuPart::Map => self.osu_map,
+        }
+    }
+
+    pub fn osu_on_mut(&mut self, part: OsuPart) -> &mut bool {
+        match part {
+            OsuPart::Pp => &mut self.osu_pp,
+            OsuPart::Misses => &mut self.osu_misses,
+            OsuPart::Accuracy => &mut self.osu_accuracy,
+            OsuPart::Mods => &mut self.osu_mods,
+            OsuPart::Stars => &mut self.osu_stars,
+            OsuPart::Map => &mut self.osu_map,
+        }
     }
 }
 
