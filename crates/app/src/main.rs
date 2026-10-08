@@ -888,6 +888,7 @@ impl eframe::App for App {
         self.collection_dialog(&ctx);
         self.delete_dialog(&ctx);
         ui_kit::pointer_cursor(&ctx);
+        ui_kit::lenient_clicks(&ctx);
         laps.lap("dialogs");
 
         // Library auto-refresh: poll the output folder ~once a second and rescan only
@@ -923,6 +924,10 @@ impl eframe::App for App {
         } else {
             ctx.request_repaint_after(Duration::from_millis(300));
         }
+    }
+
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        ui_kit::replay_click(ctx, raw_input);
     }
 
     fn on_exit(&mut self) {

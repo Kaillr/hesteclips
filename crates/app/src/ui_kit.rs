@@ -286,3 +286,99 @@ pub fn pointer_cursor(ctx: &egui::Context) {
         ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
     }
 }
+
+/// A press that should still count as a click: pressed on a button (or any
+/// click-only control) and let go over it, but moved more than egui allows
+/// for a click (6 points) on the way. Browsers and the OS click then; egui
+/// doesn't, so buttons felt unresponsive. Found after the frame by
+/// [`lenient_clicks`], replayed as a clean click next frame by
+/// [`replay_click`] (from the app's `raw_input_hook`). Drags are untouched:
+/// only controls that can't be dragged are considered.
+#[derive(Clone, Copy)]
+struct Press {
+    widget: egui::Id,
+    /// Where it'll be clicked: where it was let go.
+    at: Option<egui::Pos2>,
+}
+
+fn press_id() -> egui::Id {
+    egui::Id::new("ui_kit_lenient_press")
+}
+
+/// Call once a frame, after the UI.
+pub fn lenient_clicks(ctx: &egui::Context) {
+    let (pressed, released, pos) = ctx.input(|i| (i.pointer.primary_pressed(), i.pointer.primary_released(), i.pointer.latest_pos()));
+    let click_only = |id: egui::Id| ctx.read_response(id).filter(|r| r.enabled() && r.sense.senses_click() && !r.sense.senses_drag());
+    if pressed {
+        let hovered: Vec<egui::Id> = ctx.interaction_snapshot(|s| s.hovered.iter().copied().collect());
+        let widget = hovered.into_iter().find(|id| click_only(*id).is_some());
+        ctx.data_mut(|d| match widget {
+            Some(widget) => {
+                d.insert_temp(press_id(), Press { widget, at: None });
+            }
+            None => d.remove::<Press>(press_id()),
+        });
+    }
+    if released {
+        let Some(press) = ctx.data(|d| d.get_temp::<Press>(press_id())) else { return };
+        let clicked = ctx.interaction_snapshot(|s| s.clicked == Some(press.widget));
+        let over = pos.zip(click_only(press.widget)).is_some_and(|(p, r)| r.rect.contains(p));
+        ctx.data_mut(|d| match (clicked, over, pos) {
+            (false, true, Some(at)) => {
+                d.insert_temp(press_id(), Press { at: Some(at), ..press });
+            }
+            _ => d.remove::<Press>(press_id()),
+        });
+        if !clicked && over {
+            ctx.request_repaint();
+        }
+    }
+}
+
+/// Call from the app's `raw_input_hook`: a click [`lenient_clicks`] found
+/// becomes a press and release in place, which egui clicks.
+pub fn replay_click(ctx: &egui::Context, raw: &mut egui::RawInput) {
+    let Some(Press { at: Some(at), .. }) = ctx.data(|d| d.get_temp::<Press>(press_id())) else { return };
+    ctx.data_mut(|d| d.remove::<Press>(press_id()));
+    let modifiers = ctx.input(|i| i.modifiers);
+    raw.events.push(egui::Event::PointerMoved(at));
+    for pressed in [true, false] {
+        raw.events.push(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pressed on a button, moved 20 points, let go over it: egui alone
+    /// doesn't click; with the replay, it does (once).
+    #[test]
+    fn a_wobbly_click_still_clicks() {
+        let ctx = egui::Context::default();
+        let mut clicks = 0;
+        let mut frame = |events: Vec<egui::Event>, clicks: &mut i32| {
+            let mut raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 300.0))), events, ..Default::default() };
+            replay_click(&ctx, &mut raw);
+            let mut out = ctx.run_ui(raw, |ui| {
+                if ui.put(egui::Rect::from_min_size(egui::pos2(20.0, 20.0), egui::vec2(160.0, 30.0)), egui::Button::new("Save")).clicked() {
+                    *clicks += 1;
+                }
+                lenient_clicks(ui.ctx());
+            });
+            out.textures_delta.clear();
+        };
+        let at = |x: f32| egui::pos2(x, 35.0);
+        let button = |x: f32, pressed: bool| egui::Event::PointerButton { pos: at(x), button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+        frame(vec![egui::Event::PointerMoved(at(40.0))], &mut clicks);
+        frame(vec![egui::Event::PointerMoved(at(40.0))], &mut clicks);
+        frame(vec![button(40.0, true)], &mut clicks);
+        frame(vec![egui::Event::PointerMoved(at(60.0))], &mut clicks);
+        frame(vec![button(60.0, false)], &mut clicks);
+        assert_eq!(clicks, 0, "egui alone doesn't click after that much movement");
+        frame(vec![], &mut clicks);
+        assert_eq!(clicks, 1, "the replay clicks");
+        frame(vec![], &mut clicks);
+        assert_eq!(clicks, 1, "once");
+    }
+}
