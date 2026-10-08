@@ -1120,7 +1120,13 @@ impl App {
         let _ = compact;
         let labels: Vec<&str> = tabs.iter().map(|(_, l, _)| *l).collect();
         let chosen = tabs.iter().position(|(p, _, _)| *p == self.page).unwrap_or(usize::MAX);
-        let responses = ui_kit::segmented_with(ui, &labels, chosen, false);
+        // As wide as the library's sidebar below, the two lined up.
+        let responses = ui
+            .allocate_ui(egui::vec2(library::SIDEBAR_W, ui_kit::CONTROL_H), |ui| {
+                ui.set_width(library::SIDEBAR_W);
+                ui_kit::segmented(ui, &labels, chosen)
+            })
+            .inner;
         for ((page, _, tip), mut r) in tabs.into_iter().zip(responses) {
             if let Some(tip) = tip {
                 r = r.on_hover_text(tip);

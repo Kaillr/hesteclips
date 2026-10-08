@@ -32,7 +32,7 @@ const GAP: f32 = 14.0;
 const CAPTION_HEIGHT: f32 = 42.0;
 const RADIUS: u8 = 8;
 /// The sidebar's width, and the narrowest page that still gets one.
-const SIDEBAR_W: f32 = 230.0;
+pub(crate) const SIDEBAR_W: f32 = 230.0;
 const SIDEBAR_FROM: f32 = 720.0;
 /// How long a freshly saved clip stays highlighted.
 const NEW_HIGHLIGHT: Duration = Duration::from_secs(8);
@@ -295,7 +295,9 @@ impl App {
                     egui::Frame::new()
                         .fill(fill)
                         .corner_radius(10)
-                        .inner_margin(egui::Margin::same(8))
+                        // Rows inset like the page tabs above, so the chosen
+                        // row lines up with the chosen tab.
+                        .inner_margin(egui::Margin::symmetric(crate::ui_kit::SEGMENT_PAD as i8, 8))
                         .outer_margin(egui::Margin { left: 0, right: 0, top: 8, bottom: 8 }),
                 )
                 .show(ui, |ui| {

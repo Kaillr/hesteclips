@@ -208,9 +208,12 @@ pub fn danger_button(text: impl Into<String>) -> egui::Button<'static> {
 /// (30), on a card's surface, the chosen one filled like a button; hover as
 /// everywhere. `equal`: options share the row's width; else each fits its
 /// text. Returns each option's response.
+/// Space between a [`segmented`] control's edge and its options.
+pub const SEGMENT_PAD: f32 = 3.0;
+
 pub fn segmented_with(ui: &mut egui::Ui, labels: &[&str], chosen: usize, equal: bool) -> Vec<egui::Response> {
     let v = ui.visuals().clone();
-    let pad = 3.0;
+    let pad = SEGMENT_PAD;
     let mut out = Vec::new();
     egui::Frame::new().fill(surface(&v)).corner_radius(8).inner_margin(Margin::same(pad as i8)).show(ui, |ui| {
         ui.spacing_mut().item_spacing.x = 2.0;
