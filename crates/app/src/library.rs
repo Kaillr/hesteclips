@@ -1145,9 +1145,9 @@ impl App {
             ui.add_space(4.0);
             let hint = match self.rec_state {
                 RecState::Buffering => format!(
-                    "The replay buffer is running. Press {} or Save clip to keep the last {} seconds.",
+                    "The replay buffer is running. Press {} or Save clip to keep the last {}.",
                     self.shortcut_label(crate::settings::ShortcutAction::SaveClip),
-                    self.settings.replay_seconds
+                    crate::settings_ui::length_words(self.settings.replay_seconds)
                 ),
                 RecState::Recording => "Recording… stop it to see your clip here.".to_owned(),
                 RecState::Idle => format!(

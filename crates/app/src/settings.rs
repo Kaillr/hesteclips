@@ -88,43 +88,67 @@ pub enum RateControl {
 }
 
 /// Output resolution. `Native` records at the capture source's resolution;
-/// the others downscale on encode.
+/// the others downscale on encode (never up: a smaller display stays its size).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OutputResolution {
     Native,
+    P480,
     P720,
+    P900,
     P1080,
     P1440,
     P2160,
+    /// Any height, in pixels (the width follows the display's shape).
+    Custom(u32),
 }
 
 impl OutputResolution {
-    pub fn label(self) -> &'static str {
+    pub fn label(self) -> String {
         match self {
-            OutputResolution::Native => "Native (match source)",
-            OutputResolution::P720 => "720p",
-            OutputResolution::P1080 => "1080p",
-            OutputResolution::P1440 => "1440p",
-            OutputResolution::P2160 => "2160p (4K)",
+            OutputResolution::Native => "Native".into(),
+            OutputResolution::P2160 => "2160p (4K)".into(),
+            OutputResolution::Custom(h) => format!("{h}p (custom)"),
+            r => format!("{}p", r.height().unwrap_or(0)),
         }
     }
+
+    /// What it's good for, next to it in the list.
+    pub fn note(self) -> &'static str {
+        match self {
+            OutputResolution::Native => "every pixel of your display",
+            OutputResolution::P2160 => "for 4K displays",
+            OutputResolution::P1440 => "sharp, bigger files",
+            OutputResolution::P1080 => "sharp, good for sharing",
+            OutputResolution::P900 => "",
+            OutputResolution::P720 => "small files, quick to upload",
+            OutputResolution::P480 => "smallest files",
+            OutputResolution::Custom(_) => "",
+        }
+    }
+
     /// Target height in pixels, or `None` for native (no rescale).
     pub fn height(self) -> Option<u32> {
         match self {
             OutputResolution::Native => None,
+            OutputResolution::P480 => Some(480),
             OutputResolution::P720 => Some(720),
+            OutputResolution::P900 => Some(900),
             OutputResolution::P1080 => Some(1080),
             OutputResolution::P1440 => Some(1440),
             OutputResolution::P2160 => Some(2160),
+            OutputResolution::Custom(h) => Some(h),
         }
     }
 
-    pub const ALL: [OutputResolution; 5] = [
+    /// The choices in the list, best first (a custom height is set apart).
+    pub const PRESETS: [OutputResolution; 7] = [
         OutputResolution::Native,
-        OutputResolution::P720,
-        OutputResolution::P1080,
-        OutputResolution::P1440,
         OutputResolution::P2160,
+        OutputResolution::P1440,
+        OutputResolution::P1080,
+        OutputResolution::P900,
+        OutputResolution::P720,
+        OutputResolution::P480,
     ];
 }
 
@@ -700,7 +724,7 @@ impl Shortcuts {
 }
 
 /// Common frame-rate choices for the picker.
-pub const FPS_CHOICES: [u32; 5] = [30, 60, 120, 144, 240];
+pub const FPS_CHOICES: [u32; 6] = [30, 60, 120, 144, 165, 240];
 
 /// `~/Movies/hesteclips` on macOS, the platform video dir elsewhere, falling back
 /// to the current dir if none is known.

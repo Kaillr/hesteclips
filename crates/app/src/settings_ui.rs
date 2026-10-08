@@ -12,7 +12,7 @@ use crate::settings::{self, Container, Encoder, FPS_CHOICES, OutputResolution, S
 use crate::{App, RecState, reveal_label, shortcuts};
 
 /// Replay lengths offered as one-click choices (seconds).
-const REPLAY_CHOICES: [u32; 6] = [15, 30, 60, 120, 180, 300];
+const REPLAY_CHOICES: [u32; 8] = [15, 30, 60, 120, 300, 600, 1200, 1800];
 /// The page's content column never gets wider than this.
 const MAX_WIDTH: f32 = 760.0;
 /// Below this content width, controls go under their labels.
@@ -45,22 +45,54 @@ impl App {
         }
 
         section(ui, "Replay buffer", |ui| {
-            row(ui, "Length", Some("How far back Save clip reaches."), |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    for secs in REPLAY_CHOICES {
-                        let label = if secs < 60 { format!("{secs} s") } else { format!("{} min", secs / 60) };
-                        ui.selectable_value(&mut self.settings.replay_seconds, secs, label);
-                    }
-                });
-                let size = human_bytes(self.estimated_bytes(self.settings.replay_seconds as f64));
-                ui.weak(format!("A full clip is about {size}"))
-                    .on_hover_text(self.estimate_explainer());
-            });
+            row(ui, "Length", Some("How far back Save clip reaches."), |ui| self.replay_length(ui));
             divider(ui);
             row(ui, "Start when HesteClips opens", None, |ui| {
                 toggle(ui, &mut self.settings.auto_start_buffer);
             });
         });
+
+        section(ui, "Video quality", |ui| {
+            ui.weak("What to record is chosen on the Sources page.");
+            ui.add_space(4.0);
+            ui.add_enabled_ui(idle, |ui| {
+                row(ui, "Resolution", Some("Lower makes smaller files, quicker to share. Native keeps every pixel."), |ui| self.resolution_choice(ui));
+                divider(ui);
+                row(
+                    ui,
+                    "Frame rate",
+                    Some("60 is smooth for most clips. Higher suits high-refresh screens and slow motion, and needs a higher bitrate."),
+                    |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            for f in FPS_CHOICES {
+                                ui.selectable_value(&mut self.settings.fps, f, format!("{f}"));
+                            }
+                            ui.add(egui::DragValue::new(&mut self.settings.fps).range(10..=360).suffix(" fps"))
+                                .on_hover_text("Any frame rate from 10 to 360: drag, or click and type");
+                        });
+                    },
+                );
+                divider(ui);
+                row(ui, "Bitrate", Some("How much detail each second gets. Fast motion needs more; files grow with it."), |ui| self.bitrate_choice(ui));
+                divider(ui);
+                egui::CollapsingHeader::new(RichText::new("Advanced").strong())
+                    .id_salt("video_advanced")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        ui.weak("Tuned for clips already. Change these only if you know you need to.");
+                        ui.add_space(4.0);
+                        self.advanced(ui);
+                    });
+            })
+            .response
+            .on_disabled_hover_text(stop_first);
+        });
+
+        if capture::game_hook_available() {
+            section(ui, "Game capture", |ui| {
+                ui.add_enabled_ui(idle, |ui| self.game_capture_settings(ui)).response.on_disabled_hover_text(stop_first);
+            });
+        }
 
         section(ui, "Starting and closing", |ui| {
             // Read from the system each time it's shown: it's the truth.
@@ -103,53 +135,6 @@ impl App {
                 }
             });
         });
-
-        section(ui, "Video quality", |ui| {
-            ui.weak("What to record is chosen on the Sources page.");
-            ui.add_space(4.0);
-            ui.add_enabled_ui(idle, |ui| {
-                row(ui, "Resolution", None, |ui| {
-                    egui::ComboBox::from_id_salt("resolution").selected_text(self.settings.resolution.label()).show_ui(ui, |ui| {
-                        for r in OutputResolution::ALL {
-                            ui.selectable_value(&mut self.settings.resolution, r, r.label());
-                        }
-                    });
-                });
-                divider(ui);
-                row(ui, "Frame rate", None, |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        for f in FPS_CHOICES {
-                            ui.selectable_value(&mut self.settings.fps, f, format!("{f}"));
-                        }
-                        ui.weak("fps");
-                    });
-                });
-                divider(ui);
-                row(ui, "Bitrate", Some("Higher keeps fast motion sharp; files get bigger."), |ui| {
-                    ui.add(egui::Slider::new(&mut self.settings.video_bitrate_mbps, 5..=150).suffix(" Mbps"));
-                    let per_min = human_bytes(self.estimated_bytes(60.0));
-                    ui.weak(format!("About {per_min} per minute"))
-                        .on_hover_text(self.estimate_explainer());
-                });
-                divider(ui);
-                egui::CollapsingHeader::new(RichText::new("Advanced").strong())
-                    .id_salt("video_advanced")
-                    .default_open(false)
-                    .show(ui, |ui| {
-                        ui.weak("Tuned for clips already. Change these only if you know you need to.");
-                        ui.add_space(4.0);
-                        self.advanced(ui);
-                    });
-            })
-            .response
-            .on_disabled_hover_text(stop_first);
-        });
-
-        if capture::game_hook_available() {
-            section(ui, "Game capture", |ui| {
-                ui.add_enabled_ui(idle, |ui| self.game_capture_settings(ui)).response.on_disabled_hover_text(stop_first);
-            });
-        }
 
         section(ui, "Saving", |ui| {
             {
@@ -296,6 +281,97 @@ impl App {
     }
 
     /// Which version this is, what the updater is up to, and whether it runs on its own.
+    /// The replay length: common ones a click away, any other typed in, and
+    /// what it costs (it's all kept in memory while the buffer runs).
+    fn replay_length(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            for secs in REPLAY_CHOICES {
+                ui.selectable_value(&mut self.settings.replay_seconds, secs, length_label(secs));
+            }
+            ui.add(
+                egui::DragValue::new(&mut self.settings.replay_seconds)
+                    .range(5..=3600)
+                    .speed(1.0)
+                    .custom_formatter(|v, _| clock_label(v as u32))
+                    .custom_parser(parse_length),
+            )
+            .on_hover_text("Any length from 5 seconds to an hour: drag, or click and type (90, 2:30, 5 min)");
+        });
+        let bytes = self.estimated_bytes(self.settings.replay_seconds as f64);
+        ui.weak(format!("A full clip is about {}, kept in memory while the buffer runs", human_bytes(bytes)))
+            .on_hover_text(self.estimate_explainer());
+        if let Some(total) = capture::total_memory().filter(|&t| bytes > t as f64 / 4.0) {
+            ui.label(
+                RichText::new(format!(
+                    "That's over a quarter of this computer's memory ({}). Games may slow down; a shorter length or a lower bitrate uses less.",
+                    human_bytes(total as f64)
+                ))
+                .color(crate::meter::YELLOW),
+            );
+        }
+    }
+
+    /// The size recordings come out at with the chosen resolution, when the
+    /// display is known.
+    fn recorded_size(&self) -> Option<(u32, u32)> {
+        capture::frame_size(&self.video_source(), self.settings.resolution.height())
+    }
+
+    /// The resolution: the usual ones with what they're good for, or any
+    /// height; and the size that comes out.
+    fn resolution_choice(&mut self, ui: &mut egui::Ui) {
+        let current = self.settings.resolution;
+        egui::ComboBox::from_id_salt("resolution").selected_text(current.label()).width(170.0).show_ui(ui, |ui| {
+            for r in OutputResolution::PRESETS {
+                let text = if r.note().is_empty() { r.label() } else { format!("{}  ·  {}", r.label(), r.note()) };
+                ui.selectable_value(&mut self.settings.resolution, r, text);
+            }
+            let custom = matches!(current, OutputResolution::Custom(_));
+            if ui.selectable_label(custom, "Custom height…").clicked() && !custom {
+                self.settings.resolution = OutputResolution::Custom(current.height().unwrap_or(1080));
+            }
+        });
+        if let OutputResolution::Custom(h) = &mut self.settings.resolution {
+            ui.add(egui::DragValue::new(h).range(144..=4320).suffix("p")).on_hover_text("The height in pixels; the width follows your display's shape");
+        }
+        if let Some((w, h)) = self.recorded_size() {
+            let native = capture::frame_size(&self.video_source(), None);
+            let note = match native {
+                // Never made bigger than the display.
+                Some((_, nh)) if self.settings.resolution.height().is_some_and(|t| t > nh) => format!("Records at {w}×{h}: your display's size, it isn't made bigger"),
+                _ => format!("Records at {w}×{h}"),
+            };
+            ui.weak(note);
+        }
+    }
+
+    /// A bitrate that looks good for the recorded size and frame rate, in
+    /// Mbps (H.264 at about 0.12 bits a pixel each frame, a guess tuned for
+    /// fast game footage), rounded to something readable.
+    fn recommended_mbps(&self) -> Option<u32> {
+        let (w, h) = self.recorded_size()?;
+        Some(round_mbps(w as f64 * h as f64 * self.settings.fps as f64 * 0.12 / 1e6))
+    }
+
+    /// The bitrate: three starting points worked out for your resolution and
+    /// frame rate, or any rate from 1 to 300 Mbps.
+    fn bitrate_choice(&mut self, ui: &mut egui::Ui) {
+        if let Some(rec) = self.recommended_mbps() {
+            ui.horizontal_wrapped(|ui| {
+                for (name, mbps, what) in [
+                    ("Smaller", round_mbps(rec as f64 * 0.5), "Smaller files, softer in fast motion"),
+                    ("Balanced", rec, "Looks good in fast motion at this size and frame rate"),
+                    ("High", round_mbps(rec as f64 * 2.0), "For footage you'll edit or upload in full quality"),
+                ] {
+                    ui.selectable_value(&mut self.settings.video_bitrate_mbps, mbps, format!("{name} · {mbps}")).on_hover_text(what);
+                }
+            });
+        }
+        ui.add(egui::Slider::new(&mut self.settings.video_bitrate_mbps, 1..=300).logarithmic(true).suffix(" Mbps"));
+        let per_min = human_bytes(self.estimated_bytes(60.0));
+        ui.weak(format!("About {per_min} per minute")).on_hover_text(self.estimate_explainer());
+    }
+
     /// Game capture: on or off, and the games with anti-cheat it may be used
     /// on anyway.
     fn game_capture_settings(&mut self, ui: &mut egui::Ui) {
@@ -798,5 +874,79 @@ fn human_bytes(b: f64) -> String {
         format!("{:.0} MB", b / MB)
     } else {
         format!("{:.1} MB", b / MB)
+    }
+}
+
+/// A replay length for its button: "30 s", "2 min", "1 h".
+fn length_label(secs: u32) -> String {
+    match secs {
+        s if s < 60 => format!("{s} s"),
+        s if s % 3600 == 0 => format!("{} h", s / 3600),
+        s if s % 60 == 0 => format!("{} min", s / 60),
+        s => format!("{}:{:02}", s / 60, s % 60),
+    }
+}
+
+/// A length in words, for sentences: "30 seconds", "2 minutes 30 seconds", "1 hour".
+pub(crate) fn length_words(secs: u32) -> String {
+    let plural = |n: u32, unit: &str| if n == 1 { format!("1 {unit}") } else { format!("{n} {unit}s") };
+    let (h, m, s) = (secs / 3600, secs / 60 % 60, secs % 60);
+    let parts: Vec<String> = [(h, "hour"), (m, "minute"), (s, "second")].into_iter().filter(|(n, _)| *n > 0).map(|(n, u)| plural(n, u)).collect();
+    if parts.is_empty() { "0 seconds".into() } else { parts.join(" ") }
+}
+
+/// A length as minutes and seconds ("2:30"), for the typed-in value.
+fn clock_label(secs: u32) -> String {
+    format!("{}:{:02}", secs / 60, secs % 60)
+}
+
+/// A typed length, in seconds: "90", "2:30", "5 min", "45s", "1h".
+fn parse_length(text: &str) -> Option<f64> {
+    let t = text.trim().to_lowercase();
+    if let Some((m, s)) = t.split_once(':') {
+        return Some(m.trim().parse::<f64>().ok()? * 60.0 + s.trim().parse::<f64>().ok()?);
+    }
+    let digits: String = t.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+    let n: f64 = digits.parse().ok()?;
+    let unit = t[digits.len()..].trim();
+    match unit {
+        "" | "s" | "sec" | "secs" | "second" | "seconds" => Some(n),
+        "m" | "min" | "mins" | "minute" | "minutes" => Some(n * 60.0),
+        "h" | "hr" | "hour" | "hours" => Some(n * 3600.0),
+        _ => None,
+    }
+}
+
+/// A bitrate rounded to something readable: whole Mbps under 20, else to 5.
+fn round_mbps(mbps: f64) -> u32 {
+    if mbps < 20.0 { (mbps.round() as u32).max(2) } else { ((mbps / 5.0).round() * 5.0) as u32 }
+}
+
+#[cfg(test)]
+mod length_tests {
+    use super::*;
+
+    #[test]
+    fn typed_lengths() {
+        assert_eq!(parse_length("90"), Some(90.0));
+        assert_eq!(parse_length("2:30"), Some(150.0));
+        assert_eq!(parse_length("5 min"), Some(300.0));
+        assert_eq!(parse_length("45s"), Some(45.0));
+        assert_eq!(parse_length("1h"), Some(3600.0));
+        assert_eq!(parse_length("soon"), None);
+        assert_eq!(length_label(30), "30 s");
+        assert_eq!(length_label(1200), "20 min");
+        assert_eq!(length_label(150), "2:30");
+        assert_eq!(clock_label(75), "1:15");
+        assert_eq!(length_words(150), "2 minutes 30 seconds");
+        assert_eq!(length_words(3600), "1 hour");
+        assert_eq!(length_words(1), "1 second");
+    }
+
+    #[test]
+    fn readable_bitrates() {
+        assert_eq!(round_mbps(12.4), 12);
+        assert_eq!(round_mbps(26.5), 25);
+        assert_eq!(round_mbps(0.4), 2);
     }
 }
