@@ -46,7 +46,8 @@ enum Game {
 
 #[derive(Debug, Clone, PartialEq)]
 enum Kind {
-    Kill { headshot: bool },
+    /// `round`: CS2's round number (0 elsewhere).
+    Kill { headshot: bool, round: u64 },
     /// CS2: all five of the other team in one round.
     Ace,
     /// League: two to five champions in a row.
@@ -172,9 +173,22 @@ fn summarize(events: &[&Event]) -> Option<String> {
         .filter(|(_, n)| *n > 0)
         .max_by_key(|(_, n)| *n)?
         .0;
-    let events: Vec<&&Event> = events.iter().filter(|e| e.game == game).collect();
+    let mut events: Vec<&&Event> = events.iter().filter(|e| e.game == game).collect();
+    // CS2: a clip can span rounds, and "6 kills" can't happen in one. Name
+    // it after its best round (the latest of equals).
+    if game == Game::Cs2 {
+        let mut per_round = std::collections::BTreeMap::<u64, usize>::new();
+        for e in &events {
+            if let Kind::Kill { round, .. } = e.kind {
+                *per_round.entry(round).or_default() += 1;
+            }
+        }
+        if let Some(best) = per_round.iter().max_by_key(|(r, n)| (**n, **r)).map(|(r, _)| *r) {
+            events.retain(|e| !matches!(e.kind, Kind::Kill { round, .. } if round != best));
+        }
+    }
     let kills = events.iter().filter(|e| matches!(e.kind, Kind::Kill { .. })).count();
-    let headshots = events.iter().filter(|e| matches!(e.kind, Kind::Kill { headshot: true })).count();
+    let headshots = events.iter().filter(|e| matches!(e.kind, Kind::Kill { headshot: true, .. })).count();
     let context = events.iter().rev().find_map(|e| e.context.clone());
     let kills_text = |n: usize| if n == 1 { "1 kill".to_owned() } else { format!("{n} kills") };
     let what = match game {
@@ -402,12 +416,13 @@ impl Cs2Tracker {
         ) else {
             return Vec::new();
         };
+        let round = state["map"]["round"].as_u64().unwrap_or(0);
         let mut found = Vec::new();
         let new_kills = self.kills.map_or(0, |k| kills.saturating_sub(k));
         // Headshots this round, beyond those already counted (it resets each round).
         let new_hs = if round_kills >= self.round_kills { round_hs.saturating_sub(self.round_hs) } else { round_hs };
         for k in 0..new_kills {
-            found.push((Kind::Kill { headshot: k < new_hs }, self.map.clone()));
+            found.push((Kind::Kill { headshot: k < new_hs, round }, self.map.clone()));
         }
         if self.kills.is_some() && round_kills >= 5 && self.round_kills < 5 {
             found.push((Kind::Ace, self.map.clone()));
@@ -450,7 +465,7 @@ impl DotaTracker {
         let hero = state["hero"]["name"].as_str().map(hero_name);
         let new = self.kills.map_or(0, |k| kills.saturating_sub(k));
         self.kills = Some(kills);
-        (0..new).map(|_| (Kind::Kill { headshot: false }, hero.clone())).collect()
+        (0..new).map(|_| (Kind::Kill { headshot: false, round: 0 }, hero.clone())).collect()
     }
 }
 
@@ -569,7 +584,7 @@ impl LeagueTracker {
             self.last_id = Some(id);
             let ago = Duration::from_secs_f64((game_time - e["EventTime"].as_f64().unwrap_or(game_time)).max(0.0));
             let kind = match e["EventName"].as_str() {
-                Some("ChampionKill") if is_me(&e["KillerName"]) => Kind::Kill { headshot: false },
+                Some("ChampionKill") if is_me(&e["KillerName"]) => Kind::Kill { headshot: false, round: 0 },
                 Some("Multikill") if is_me(&e["KillerName"]) => Kind::Multikill(e["KillStreak"].as_u64().unwrap_or(0) as u32),
                 _ => continue,
             };
@@ -585,9 +600,13 @@ mod tests {
     use serde_json::json;
 
     fn cs_state(kills: u64, round_kills: u64, hs: u64) -> Value {
+        cs_state_in(0, kills, round_kills, hs)
+    }
+
+    fn cs_state_in(round: u64, kills: u64, round_kills: u64, hs: u64) -> Value {
         json!({
             "provider": {"steamid": "1"},
-            "map": {"name": "de_mirage"},
+            "map": {"name": "de_mirage", "round": round},
             "player": {"steamid": "1", "state": {"round_kills": round_kills, "round_killhs": hs}, "match_stats": {"kills": kills}},
             "auth": {"token": GSI_TOKEN}
         })
@@ -611,6 +630,18 @@ mod tests {
         let mut other = cs_state(20, 2, 0);
         other["player"]["steamid"] = json!("2");
         assert!(t.update(&other).is_empty());
+    }
+
+    #[test]
+    fn cs2_names_the_best_round() {
+        let mut t = Cs2Tracker::default();
+        t.update(&cs_state_in(3, 10, 0, 0));
+        // Round 3: 4 kills, 4 headshots; round 4: 2 kills, 1 headshot.
+        let mut found = t.update(&cs_state_in(3, 14, 4, 4));
+        found.extend(t.update(&cs_state_in(4, 15, 1, 0)));
+        found.extend(t.update(&cs_state_in(4, 16, 2, 1)));
+        assert_eq!(found.len(), 6);
+        assert_eq!(summary_of(found, Game::Cs2).as_deref(), Some("4 kills (4 headshots) on Mirage"));
     }
 
     #[test]
