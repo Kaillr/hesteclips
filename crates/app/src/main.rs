@@ -239,20 +239,23 @@ impl App {
     }
 }
 
-/// egui's bundled fonts have no ⌘ ⌥ ⌃ ⇧ ⌫, which macOS writes every shortcut
-/// with. Use the system's symbol font as a fallback for those (it's only
+/// egui's bundled fonts have no arrows (← →), nor the ⌘ ⌥ ⌃ ⇧ ⌫ macOS writes
+/// every shortcut with. Use the system's symbol font as a fallback (it's only
 /// consulted for characters the bundled fonts lack).
 fn add_symbol_font(ctx: &egui::Context) {
-    #[cfg(target_os = "macos")]
-    if let Ok(bytes) = std::fs::read("/System/Library/Fonts/Apple Symbols.ttf") {
-        use egui::epaint::text::{FontInsert, FontPriority, InsertFontFamily};
-        let families = [egui::FontFamily::Proportional, egui::FontFamily::Monospace]
-            .map(|family| InsertFontFamily { family, priority: FontPriority::Lowest })
-            .to_vec();
-        ctx.add_font(FontInsert::new("apple-symbols", egui::FontData::from_owned(bytes), families));
-    }
-    #[cfg(not(target_os = "macos"))]
-    let _ = ctx;
+    let candidates: &[&str] = if cfg!(target_os = "macos") {
+        &["/System/Library/Fonts/Apple Symbols.ttf"]
+    } else if cfg!(target_os = "windows") {
+        &[r"C:\Windows\Fonts\seguisym.ttf"]
+    } else {
+        &["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/TTF/DejaVuSans.ttf", "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf"]
+    };
+    let Some(bytes) = candidates.iter().find_map(|p| std::fs::read(p).ok()) else { return };
+    use egui::epaint::text::{FontInsert, FontPriority, InsertFontFamily};
+    let families = [egui::FontFamily::Proportional, egui::FontFamily::Monospace]
+        .map(|family| InsertFontFamily { family, priority: FontPriority::Lowest })
+        .to_vec();
+    ctx.add_font(FontInsert::new("system-symbols", egui::FontData::from_owned(bytes), families));
 }
 
 /// An in-app shortcut with the platform's command key, as text: "Cmd + A" / "Ctrl + A".

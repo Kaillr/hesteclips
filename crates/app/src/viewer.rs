@@ -224,8 +224,8 @@ impl Viewer {
             let (esc, prev, next, f, f2, delete) = ctx.input_mut(|i| {
                 (
                     i.consume_key(none, Key::Escape),
-                    i.consume_key(none, Key::P),
-                    i.consume_key(none, Key::N),
+                    i.consume_key(none, Key::Q),
+                    i.consume_key(none, Key::E),
                     i.consume_key(none, Key::F),
                     i.consume_key(none, Key::F2),
                     i.consume_key(none, Key::Delete),
@@ -281,10 +281,10 @@ impl Viewer {
             ui.add_space(6.0);
             // Step through the clips you're browsing. Before the name, so they
             // stay put whatever its length.
-            if ui.add_enabled(nav.previous.is_some(), header::icon("‹")).on_hover_text("Previous clip  (P)").clicked() {
+            if ui.add_enabled(nav.previous.is_some(), header::icon("‹")).on_hover_text("Previous clip  (Q)").clicked() {
                 out = nav.previous.clone().map_or(ViewerOutcome::Stay, ViewerOutcome::Open);
             }
-            if ui.add_enabled(nav.next.is_some(), header::icon("›")).on_hover_text("Next clip  (N)").clicked() {
+            if ui.add_enabled(nav.next.is_some(), header::icon("›")).on_hover_text("Next clip  (E)").clicked() {
                 out = nav.next.clone().map_or(ViewerOutcome::Stay, ViewerOutcome::Open);
             }
             if let Some((i, n)) = nav.position {
@@ -561,7 +561,7 @@ impl Ready {
                         ("Scroll", "Scrub"),
                         ("M", "Mute"),
                         ("F", "Fullscreen"),
-                        ("P N", "Previous or next clip"),
+                        ("Q E", "Previous or next clip"),
                         ("F2", "Rename"),
                         ("Delete", "Delete the clip"),
                         ("Esc", "Back to your clips"),
