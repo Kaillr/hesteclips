@@ -314,21 +314,6 @@ impl App {
             if wide { r.with_min_x(r.min.x + 16.0) } else { r }
         }));
         let ui = &mut padded;
-        if let Some(a) = self.view_header(ui, wide, &games, &collections, clips.len()) {
-            action = Some(a);
-        }
-        if !self.selection.is_empty() {
-            if let Some(a) = self.selection_bar(ui, clips.len(), &folders) {
-                action = Some(a);
-            }
-        }
-        if clips.is_empty() && placeholders == 0 {
-            if let Filter::Collection(id) = &self.library_filter {
-                let name = self.collections.get(id).map(|c| c.name.clone()).unwrap_or_default();
-                empty_collection(ui, &name);
-            }
-        }
-
         // Group into days. The placeholder always belongs to today.
         let mut groups: Vec<(chrono::NaiveDate, Vec<Card>)> = Vec::new();
         let mut live: Vec<Card> = new_renders.into_iter().map(Card::NewRender).collect();
@@ -346,6 +331,26 @@ impl App {
             }
         }
 
+        // A clip being brought back into view unfolds its day.
+        if let Some(day) = self.reveal_clip.as_ref().and_then(|p| clips.iter().find(|c| &c.path == p)).map(|c| c.day()) {
+            self.collapsed_days.remove(&day);
+        }
+        let days: Vec<chrono::NaiveDate> = groups.iter().map(|(d, _)| *d).collect();
+        if let Some(a) = self.view_header(ui, wide, &games, &collections, clips.len(), &days) {
+            action = Some(a);
+        }
+        if !self.selection.is_empty() {
+            if let Some(a) = self.selection_bar(ui, clips.len(), &folders) {
+                action = Some(a);
+            }
+        }
+        if clips.is_empty() && placeholders == 0 {
+            if let Filter::Collection(id) = &self.library_filter {
+                let name = self.collections.get(id).map(|c| c.name.clone()).unwrap_or_default();
+                empty_collection(ui, &name);
+            }
+        }
+
         crate::ui_kit::scroll(ui, "library_clips", |ui| {
             let avail = ui.available_width();
             let cols = (((avail + GAP) / (MIN_CARD_WIDTH + GAP)).floor() as usize).max(1);
@@ -353,13 +358,18 @@ impl App {
 
             for (day, cards) in &groups {
                 ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(clips::day_label(*day)).strong().size(15.0));
-                    let n = cards.iter().filter(|c| matches!(c, Card::Clip(_))).count();
-                    if n > 0 {
-                        ui.weak(if n == 1 { "1 clip".to_owned() } else { format!("{n} clips") });
+                let n = cards.iter().filter(|c| matches!(c, Card::Clip(_))).count();
+                let collapsed = self.collapsed_days.contains(day);
+                if day_header(ui, &clips::day_label(*day), n, collapsed).clicked() {
+                    if collapsed {
+                        self.collapsed_days.remove(day);
+                    } else {
+                        self.collapsed_days.insert(*day);
                     }
-                });
+                }
+                if collapsed {
+                    continue;
+                }
                 ui.add_space(6.0);
                 for row in cards.chunks(cols) {
                     ui.horizontal(|ui| {
@@ -881,7 +891,7 @@ impl App {
 
     /// The name of what's shown, on top of the clips; a menu of everything to
     /// show when there's no room for the sidebar.
-    fn view_header(&mut self, ui: &mut egui::Ui, wide: bool, games: &[View], collections: &[View], shown: usize) -> Option<Action> {
+    fn view_header(&mut self, ui: &mut egui::Ui, wide: bool, games: &[View], collections: &[View], shown: usize, days: &[chrono::NaiveDate]) -> Option<Action> {
         let mut action = None;
         let (title, filter) = match &self.library_filter {
             Filter::All => ("All clips".to_owned(), Filter::All),
@@ -926,6 +936,21 @@ impl App {
                 });
             }
             ui.weak(if shown == 1 { "1 clip".to_owned() } else { format!("{shown} clips") });
+            // Fold every day away, or open them all again.
+            if days.len() > 1 {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let all_folded = days.iter().all(|d| self.collapsed_days.contains(d));
+                    if all_folded {
+                        if ui.add(crate::ui_kit::button("Expand all", false)).clicked() {
+                            for d in days {
+                                self.collapsed_days.remove(d);
+                            }
+                        }
+                    } else if ui.add(crate::ui_kit::button("Collapse all", false)).clicked() {
+                        self.collapsed_days.extend(days.iter().copied());
+                    }
+                });
+            }
         });
         ui.add_space(2.0);
         action
@@ -1950,4 +1975,29 @@ mod tests {
         s.clear();
         assert!(s.is_empty());
     }
+}
+
+/// A day's heading in the library: click it to fold its clips away or open
+/// them again. An arrow shows which (down: open).
+fn day_header(ui: &mut egui::Ui, label: &str, clips: usize, collapsed: bool) -> egui::Response {
+    let r = ui
+        .horizontal(|ui| {
+            let (arrow, _) = ui.allocate_exact_size(Vec2::new(14.0, 18.0), Sense::hover());
+            ui.label(egui::RichText::new(label).strong().size(15.0));
+            if clips > 0 {
+                ui.weak(if clips == 1 { "1 clip".to_owned() } else { format!("{clips} clips") });
+            }
+            arrow
+        });
+    let resp = ui.interact(r.response.rect, ui.id().with(("day", label)), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+    let v = ui.visuals();
+    let color = if resp.hovered() { v.strong_text_color() } else { v.weak_text_color() };
+    let c = r.inner.center();
+    let points = if collapsed {
+        vec![Pos2::new(c.x - 3.0, c.y - 5.0), Pos2::new(c.x + 3.0, c.y), Pos2::new(c.x - 3.0, c.y + 5.0)]
+    } else {
+        vec![Pos2::new(c.x - 5.0, c.y - 3.0), Pos2::new(c.x + 5.0, c.y - 3.0), Pos2::new(c.x, c.y + 3.0)]
+    };
+    ui.painter().add(egui::Shape::convex_polygon(points, color, Stroke::NONE));
+    resp
 }

@@ -311,6 +311,8 @@ struct App {
     pub(crate) confirm_reset: bool,
     /// Scroll the library to this clip next time it's shown.
     pub(crate) reveal_clip: Option<PathBuf>,
+    /// Days folded away in the library (until the app closes).
+    pub(crate) collapsed_days: std::collections::HashSet<chrono::NaiveDate>,
     /// Adding a custom clip-saved sound failed: why.
     pub(crate) sound_error: Option<String>,
     /// Screen-recording permission, re-checked each poll so the banner clears the
@@ -482,6 +484,7 @@ impl App {
             confirm_reset: false,
             sound_error: None,
             reveal_clip: None,
+            collapsed_days: Default::default(),
             permission: capture::screen_permission(),
             ffmpeg_problem: {
                 let problem = std::sync::Arc::new(std::sync::OnceLock::new());
