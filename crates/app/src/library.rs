@@ -932,15 +932,19 @@ impl App {
                 });
             }
             ui.weak(if shown == 1 { "1 clip".to_owned() } else { format!("{shown} clips") });
-            // Fold every day away, or open them all again.
+            // Fold every day away, or open them all again: quiet text by the
+            // count, a view option, not an action beside the capture buttons.
             if days.len() > 1 {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let all_folded = days.iter().all(|d| self.folded.contains(d));
-                    let label = if all_folded { "Expand all" } else { "Collapse all" };
-                    if ui.add(crate::ui_kit::button(label, false)).clicked() {
-                        self.folded.set_all(days, !all_folded);
-                    }
-                });
+                ui.weak("·");
+                let all_folded = days.iter().all(|d| self.folded.contains(d));
+                let label = if all_folded { "Expand all" } else { "Collapse all" };
+                let galley = ui.painter().layout_no_wrap(label.to_owned(), egui::TextStyle::Body.resolve(ui.style()), Color32::PLACEHOLDER);
+                let (rect, r) = ui.allocate_exact_size(galley.size(), Sense::click());
+                let color = if r.hovered() { ui.visuals().strong_text_color() } else { ui.visuals().weak_text_color() };
+                ui.painter().galley_with_override_text_color(rect.min, galley, color);
+                if r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    self.folded.set_all(days, !all_folded);
+                }
             }
         });
         ui.add_space(2.0);
