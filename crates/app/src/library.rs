@@ -390,6 +390,9 @@ impl App {
                     ui.add_space(GAP);
                 }
             }
+            // Room under the last day, as on the other pages: the list ends
+            // visibly instead of running into the window's edge.
+            ui.add_space(24.0);
         });
 
         if let Some(a) = self.finish_drag(ui.ctx()) {
