@@ -333,7 +333,7 @@ impl App {
 
         // A clip being brought back into view unfolds its day.
         if let Some(day) = self.reveal_clip.as_ref().and_then(|p| clips.iter().find(|c| &c.path == p)).map(|c| c.day()) {
-            self.collapsed_days.remove(&day);
+            self.folded.set(day, false);
         }
         let days: Vec<chrono::NaiveDate> = groups.iter().map(|(d, _)| *d).collect();
         if let Some(a) = self.view_header(ui, wide, &games, &collections, clips.len(), &days) {
@@ -359,13 +359,9 @@ impl App {
             for (day, cards) in &groups {
                 ui.add_space(10.0);
                 let n = cards.iter().filter(|c| matches!(c, Card::Clip(_))).count();
-                let collapsed = self.collapsed_days.contains(day);
+                let collapsed = self.folded.contains(day);
                 if day_header(ui, &clips::day_label(*day), n, collapsed).clicked() {
-                    if collapsed {
-                        self.collapsed_days.remove(day);
-                    } else {
-                        self.collapsed_days.insert(*day);
-                    }
+                    self.folded.set(*day, !collapsed);
                 }
                 if collapsed {
                     continue;
@@ -939,15 +935,10 @@ impl App {
             // Fold every day away, or open them all again.
             if days.len() > 1 {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let all_folded = days.iter().all(|d| self.collapsed_days.contains(d));
-                    if all_folded {
-                        if ui.add(crate::ui_kit::button("Expand all", false)).clicked() {
-                            for d in days {
-                                self.collapsed_days.remove(d);
-                            }
-                        }
-                    } else if ui.add(crate::ui_kit::button("Collapse all", false)).clicked() {
-                        self.collapsed_days.extend(days.iter().copied());
+                    let all_folded = days.iter().all(|d| self.folded.contains(d));
+                    let label = if all_folded { "Expand all" } else { "Collapse all" };
+                    if ui.add(crate::ui_kit::button(label, false)).clicked() {
+                        self.folded.set_all(days, !all_folded);
                     }
                 });
             }
@@ -2000,4 +1991,89 @@ fn day_header(ui: &mut egui::Ui, label: &str, clips: usize, collapsed: bool) -> 
     };
     ui.painter().add(egui::Shape::convex_polygon(points, color, Stroke::NONE));
     resp
+}
+
+/// The days folded away in the library, kept in its `.hesteclips` folder so
+/// they stay folded next time. A new day starts open.
+pub(crate) struct FoldedDays {
+    lib: PathBuf,
+    days: HashSet<chrono::NaiveDate>,
+}
+
+impl FoldedDays {
+    pub(crate) fn load(lib: &Path) -> Self {
+        let days = std::fs::read(Self::file(lib))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Vec<String>>(&b).ok())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
+            .collect();
+        Self { lib: lib.to_path_buf(), days }
+    }
+
+    fn file(lib: &Path) -> PathBuf {
+        lib.join(store::DIR).join("folded-days.json")
+    }
+
+    pub(crate) fn library(&self) -> &Path {
+        &self.lib
+    }
+
+    pub(crate) fn contains(&self, day: &chrono::NaiveDate) -> bool {
+        self.days.contains(day)
+    }
+
+    /// Fold a day away (`true`) or open it.
+    pub(crate) fn set(&mut self, day: chrono::NaiveDate, folded: bool) {
+        self.set_all(&[day], folded);
+    }
+
+    pub(crate) fn set_all(&mut self, days: &[chrono::NaiveDate], folded: bool) {
+        let before = self.days.len();
+        for d in days {
+            if folded {
+                self.days.insert(*d);
+            } else {
+                self.days.remove(d);
+            }
+        }
+        if self.days.len() != before {
+            self.save();
+        }
+    }
+
+    fn save(&self) {
+        let path = Self::file(&self.lib);
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let mut days: Vec<String> = self.days.iter().map(|d| d.format("%Y-%m-%d").to_string()).collect();
+        days.sort();
+        if let Ok(json) = serde_json::to_vec_pretty(&days) {
+            // Written aside, then swapped in: never half a file.
+            let tmp = path.with_extension("json.tmp");
+            if std::fs::write(&tmp, json).is_ok() && std::fs::rename(&tmp, &path).is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod folded_tests {
+    use super::*;
+
+    #[test]
+    fn folded_days_stay_folded() {
+        let lib = std::env::temp_dir().join(format!("hc-folded-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&lib);
+        let (a, b) = (chrono::NaiveDate::from_ymd_opt(2026, 10, 5).unwrap(), chrono::NaiveDate::from_ymd_opt(2026, 10, 6).unwrap());
+        let mut f = FoldedDays::load(&lib);
+        f.set_all(&[a, b], true);
+        f.set(b, false);
+        let again = FoldedDays::load(&lib);
+        assert!(again.contains(&a) && !again.contains(&b));
+        std::fs::remove_dir_all(&lib).unwrap();
+    }
 }

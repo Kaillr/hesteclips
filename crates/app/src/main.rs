@@ -311,8 +311,8 @@ struct App {
     pub(crate) confirm_reset: bool,
     /// Scroll the library to this clip next time it's shown.
     pub(crate) reveal_clip: Option<PathBuf>,
-    /// Days folded away in the library (until the app closes).
-    pub(crate) collapsed_days: std::collections::HashSet<chrono::NaiveDate>,
+    /// Days folded away in the library.
+    pub(crate) folded: library::FoldedDays,
     /// Adding a custom clip-saved sound failed: why.
     pub(crate) sound_error: Option<String>,
     /// Screen-recording permission, re-checked each poll so the banner clears the
@@ -440,6 +440,7 @@ impl App {
             clips = clips::scan(&settings.output_dir);
         }
         let mut collections = collections::Collections::load(&settings.output_dir);
+        let folded = library::FoldedDays::load(&settings.output_dir);
         collections.reconnect(&clips);
         // Assets of clips deleted in Finder go to the Bin.
         store::sweep_orphans(&settings.output_dir, &clips);
@@ -484,7 +485,7 @@ impl App {
             confirm_reset: false,
             sound_error: None,
             reveal_clip: None,
-            collapsed_days: Default::default(),
+            folded,
             permission: capture::screen_permission(),
             ffmpeg_problem: {
                 let problem = std::sync::Arc::new(std::sync::OnceLock::new());
@@ -641,6 +642,9 @@ impl App {
         self.clips = clips::scan(&self.settings.output_dir);
         if self.collections.library() != self.settings.output_dir {
             self.collections = collections::Collections::load(&self.settings.output_dir);
+        }
+        if self.folded.library() != self.settings.output_dir {
+            self.folded = library::FoldedDays::load(&self.settings.output_dir);
         }
         self.collections.reconnect(&self.clips);
         self.selection.retain(&self.clips);
@@ -1668,6 +1672,7 @@ impl App {
                     let card = if job.as_new { path } else { job.source };
                     self.last_saved = Some((card, Instant::now()));
                     if job.as_new {
+                        self.folded.set(chrono::Local::now().date_naive(), false);
                         self.toast(format!("Saved as new clip “{}”", file_stem(&job.dest)));
                     }
                 }
@@ -1870,6 +1875,8 @@ impl App {
                 }
                 Evt::Saved(path) => {
                     self.saving = self.saving.saturating_sub(1);
+                    // A new clip is never hidden in a folded Today.
+                    self.folded.set(chrono::Local::now().date_naive(), false);
                     self.toast(format!("Saved {}", file_name(&path)));
                     // Scrub frames ready before it's opened.
                     proxy::prebuild(&self.ctx(), &path);
