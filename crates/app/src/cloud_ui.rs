@@ -259,6 +259,8 @@ impl App {
             ui.checkbox(&mut public, "Make a public link")
                 .on_hover_text("Anyone with the link can watch and download the clip. It's shown when the upload is done.");
             self.cloud.set_public_links(public);
+            ui.add_space(6.0);
+            crate::ui_kit::hint(ui, "If a file with this name is already there, HesteFiles keeps both.");
             ui.add_space(12.0);
             let busy = self.cloud.upload_for(&share.clip).is_some();
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -276,8 +278,6 @@ impl App {
                     keep_open = false;
                 }
             });
-            ui.add_space(6.0);
-            crate::ui_kit::hint(ui, "If a file with this name is already there, HesteFiles keeps both.");
         });
         (keep_open && !resp.dismissed()).then_some(share)
     }
