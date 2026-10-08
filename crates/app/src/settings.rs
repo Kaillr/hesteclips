@@ -267,9 +267,16 @@ impl PlacementCfg {
 pub struct CaptureApp {
     pub id: String,
     pub name: String,
-    /// Always through the game capture hook, even with anti-cheat: asked for.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub always_game_capture: bool,
+}
+
+/// A game with anti-cheat that game capture may be used on anyway (the user
+/// accepted the risk), by executable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AllowedGame {
+    pub id: String,
+    pub name: String,
+    /// The anti-cheat it was found to use, to show.
+    pub anticheat: String,
 }
 
 /// Where an audio source's sound comes from.
@@ -548,10 +555,12 @@ pub struct RecordSettings {
     pub limiter: bool,
     /// Record games Windows' own capture can't see properly (exclusive
     /// fullscreen, a lost cursor) through the game capture hook, where it's
-    /// safe: never on games with anti-cheat unless a game in the list asks
-    /// for it (see `capture::GameHook`). Recording the screen or games and
+    /// safe: never on games with anti-cheat unless allowed below (see
+    /// `capture::GameHook`). Recording the screen or games and
     /// apps alike.
     pub game_capture: bool,
+    /// Games with anti-cheat game capture may be used on anyway.
+    pub game_capture_allowed: Vec<AllowedGame>,
 
     // --- Shortcuts ---
     pub shortcuts: Shortcuts,
@@ -601,6 +610,7 @@ impl Default for RecordSettings {
             audio_sources: default_sources(),
             limiter: true,
             game_capture: true,
+            game_capture_allowed: Vec::new(),
             shortcuts: Shortcuts::default(),
             save_sound: SaveSound::default(),
             editor_preview_share: 0.5,
@@ -732,7 +742,7 @@ impl RecordSettings {
     fn upgrade_capture(&mut self) {
         if let CaptureTarget::App { id, name } = &self.capture {
             self.capture = CaptureTarget::Apps {
-                apps: vec![CaptureApp { id: id.clone(), name: name.clone(), always_game_capture: false }],
+                apps: vec![CaptureApp { id: id.clone(), name: name.clone() }],
                 away_screen: true,
             };
         }
@@ -826,7 +836,7 @@ mod tests {
         assert_eq!(
             s.capture,
             CaptureTarget::Apps {
-                apps: vec![CaptureApp { id: "game.exe".into(), name: "Game".into(), always_game_capture: false }],
+                apps: vec![CaptureApp { id: "game.exe".into(), name: "Game".into() }],
                 away_screen: true,
             }
         );

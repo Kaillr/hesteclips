@@ -160,19 +160,20 @@ pub enum VideoSource {
 /// of Windows' own capture (whether recording games and apps or the screen), which can't see some games (exclusive fullscreen
 /// OpenGL records one frozen frame) and loses the cursor in others. The hook
 /// is OBS Studio's, loaded into the game; it's never used on a game with
-/// anti-cheat unless it's in `always`.
+/// anti-cheat unless it's in `allowed`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GameHook {
-    /// Where it's needed: games known to need it, and games Windows' capture
-    /// turns out to freeze on. Never on a game with anti-cheat.
+    /// Where it's needed: games known to need it, and games that turn out to
+    /// be exclusive fullscreen. Never on a game with anti-cheat.
     pub auto: bool,
-    /// Always for these (by executable name), anti-cheat or not: asked for.
-    pub always: Vec<String>,
+    /// Games with anti-cheat (by executable name) it may be used on anyway,
+    /// where they need it: the user accepted the risk.
+    pub allowed: Vec<String>,
 }
 
 impl Default for GameHook {
     fn default() -> Self {
-        Self { auto: true, always: Vec::new() }
+        Self { auto: true, allowed: Vec::new() }
     }
 }
 
@@ -189,19 +190,22 @@ pub fn game_hook_available() -> bool {
     }
 }
 
-/// The anti-cheat a running app uses, if any can be told ("BattlEye"), by its
-/// executable name. None too when it isn't running (it's looked for where
-/// it's installed).
-pub fn app_anticheat(exe: &str) -> Option<String> {
+/// The running apps with a window that use anti-cheat (as far as can be
+/// told), and which ("BattlEye").
+pub fn running_anticheat_apps() -> Vec<(Device, String)> {
     #[cfg(target_os = "windows")]
     {
-        let path = win::system::running_app_path(exe)?;
-        win::anticheat::anticheat(&path)
+        list_windowed_apps()
+            .into_iter()
+            .filter_map(|app| {
+                let ac = win::anticheat::anticheat(&win::system::running_app_path(&app.id)?)?;
+                Some((app, ac))
+            })
+            .collect()
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = exe;
-        None
+        Vec::new()
     }
 }
 

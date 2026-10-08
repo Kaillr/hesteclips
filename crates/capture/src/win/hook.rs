@@ -76,14 +76,16 @@ pub(crate) fn plan(exe: &str, window: HWND, settings: &crate::GameHook) -> (Plan
     if !available() {
         return (Plan::Wgc, "the hook's files aren't there".into());
     }
-    if settings.always.iter().any(|a| a.eq_ignore_ascii_case(exe)) {
-        return (Plan::Hook, "always hooked (asked for)".into());
+    // For testing: `HESTECLIPS_FORCE_HOOK=<exe>[,…]` hooks those whatever they are.
+    if std::env::var("HESTECLIPS_FORCE_HOOK").is_ok_and(|v| v.split(',').any(|e| e.eq_ignore_ascii_case(exe))) {
+        return (Plan::Hook, "forced (HESTECLIPS_FORCE_HOOK)".into());
     }
     if !settings.auto {
         return (Plan::Wgc, "the hook is off".into());
     }
+    let allowed = settings.allowed.iter().any(|a| a.eq_ignore_ascii_case(exe));
     let anticheat = super::system::window_app_path(window).and_then(|p| super::anticheat::anticheat(&p));
-    if let Some(ac) = anticheat {
+    if let Some(ac) = anticheat.filter(|_| !allowed) {
         return (Plan::Wgc, format!("uses {ac}"));
     }
     if NEEDS_HOOK.iter().any(|n| n.eq_ignore_ascii_case(exe)) {

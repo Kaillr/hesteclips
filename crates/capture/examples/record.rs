@@ -4,8 +4,8 @@
 //! sources), `app:<bundle id or exe>`. Append `@mix`, `@track` to limit where it
 //! goes (default both). Env: REPLAY=1, SECS=n, EXT=mov, HEIGHT=n (0 = native),
 //! FPS=n, SOFTWARE=1, LIST=1 (list the inputs), SWITCH_MIC=<device> (the first source, a mic, switches to it halfway), SCREEN=<id>, WEBCAM=<id|1>, WEBCAM_FORMAT=WxH, APP=<exe>[,<exe>…] (record those apps' windows,
-//! following focus), HOOK=1|0 (always or never the game capture hook; with
-//! the screen, ALWAYS=<exe>[,…] says for which games).
+//! following focus), HOOK=0 (never the game capture hook), ALLOW=<exe>[,…]
+//! (games with anti-cheat it may be used on), HESTECLIPS_FORCE_HOOK=<exe>[,…] (always, for testing).
 use capture::sources::{AudioSource, SourceKind};
 use capture::{EncodeSettings, Mode, mixer::LiveAudio};
 
@@ -54,12 +54,11 @@ default: {:?}", d.inputs.iter().map(|i| &i.name).collect::<Vec<_>>(), d.default_
         use_hardware: env("SOFTWARE").is_none(),
         replay_seconds: 5,
         video: {
-            // HOOK=1: always through the game capture hook (the APP ones, or
-            // with ALWAYS=<exe>,… the screen's); HOOK=0: never.
-            let always = env("ALWAYS").or(env("APP")).filter(|_| env("HOOK").as_deref() == Some("1"));
+            // HOOK=0: never the game capture hook. ALLOW=<exe>[,…]: games
+            // with anti-cheat it may be used on.
             let hook = capture::GameHook {
                 auto: env("HOOK").is_none_or(|v| v != "0"),
-                always: always.map(|a| a.split(',').map(str::to_owned).collect()).unwrap_or_default(),
+                allowed: env("ALLOW").map(|a| a.split(',').map(str::to_owned).collect()).unwrap_or_default(),
             };
             match env("APP") {
                 Some(ids) => capture::VideoSource::Apps {

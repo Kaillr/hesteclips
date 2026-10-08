@@ -492,9 +492,7 @@ impl App {
         let capturing = self.rec_state != crate::RecState::Idle;
         let mut list = apps.clone();
         let mut away = away_screen;
-        let hook_available = capture::game_hook_available();
         let mut remove = None;
-        let mut toggle_always = None;
         let weak = ui.visuals().weak_text_color();
         egui::Frame::new()
             .fill(ui.visuals().extreme_bg_color)
@@ -532,10 +530,6 @@ impl App {
                         ui.label(RichText::new(&app.name).size(14.0).strong()).on_hover_text(&app.id);
                         ui.add_space(4.0);
                         status_tag(ui, status, color);
-                        if hook_available && app.always_game_capture {
-                            ui.add_space(2.0);
-                            status_tag(ui, "Game capture", weak);
-                        }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.add_space(4.0);
                             if remove_button(ui).on_hover_text(format!("Stop recording {}", app.name)).clicked() {
@@ -543,37 +537,6 @@ impl App {
                             }
                         });
                     });
-                    if hook_available {
-                        row.response.interact(Sense::click()).context_menu(|ui| {
-                            ui.set_max_width(300.0);
-                            let mut always = app.always_game_capture;
-                            if ui.checkbox(&mut always, "Always use game capture").changed() {
-                                toggle_always = Some(i);
-                                ui.close();
-                            }
-                            ui.add_space(2.0);
-                            match capture::app_anticheat(&app.id) {
-                                Some(ac) => {
-                                    ui.label(
-                                        RichText::new(format!(
-                                            "{} uses {ac}. Anti-cheat can close the game, or flag your account, when game capture is loaded into it.",
-                                            app.name
-                                        ))
-                                        .color(meter::YELLOW),
-                                    );
-                                }
-                                None if open && self.settings.game_capture => {
-                                    ui.weak("No anti-cheat found. Game capture is used on its own when Windows' capture can't see this game.");
-                                }
-                                None if open => {
-                                    ui.weak("No anti-cheat found. Game capture is off in Settings, except for games set to always use it.");
-                                }
-                                None => {
-                                    ui.weak("Open it to check it for anti-cheat.");
-                                }
-                            }
-                        });
-                    }
                     // Rows divided by a hairline, highlighted under the pointer.
                     let rect = row.response.rect;
                     if ui.rect_contains_pointer(rect) {
@@ -589,9 +552,6 @@ impl App {
         if let Some(i) = remove {
             list.remove(i);
         }
-        if let Some(app) = toggle_always.and_then(|i| list.get_mut(i)) {
-            app.always_game_capture = !app.always_game_capture;
-        }
         ui.add_space(8.0);
         let add = ui.menu_button(RichText::new("Add game or app").size(14.0), |ui| {
             ui.set_min_width(260.0);
@@ -605,7 +565,7 @@ impl App {
                     }
                     any = true;
                     if ui.button(&app.name).on_hover_text(&app.id).clicked() {
-                        list.push(CaptureApp { id: app.id, name: app.name, always_game_capture: false });
+                        list.push(CaptureApp { id: app.id, name: app.name });
                         ui.close();
                     }
                 }

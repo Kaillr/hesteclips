@@ -13,6 +13,9 @@ fn main() {
         let _ = capture::foreground_exe();
     }
     println!("front: {:?}, {:?} per call", capture::foreground_exe(), t.elapsed() / 100);
+    for (app, ac) in capture::running_anticheat_apps() {
+        println!("anti-cheat: {} ({}) uses {ac}", app.name, app.id);
+    }
     #[cfg(target_os = "macos")]
     capture::mac::bench_windows();
 }

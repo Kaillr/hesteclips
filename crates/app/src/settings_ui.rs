@@ -133,18 +133,7 @@ impl App {
                 });
                 divider(ui);
                 if capture::game_hook_available() {
-                    row(
-                        ui,
-                        "Game capture",
-                        Some(
-                            "For games Windows can't record properly: fullscreen games like osu! that record frozen, \
-                             or Geometry Dash, which loses its cursor. Uses OBS Studio's game capture. \
-                             Never on games with anti-cheat, unless you right-click one in Sources to always use it.",
-                        ),
-                        |ui| {
-                            toggle(ui, &mut self.settings.game_capture);
-                        },
-                    );
+                    self.game_capture_settings(ui);
                     divider(ui);
                 }
                 egui::CollapsingHeader::new(RichText::new("Advanced").strong())
@@ -305,6 +294,71 @@ impl App {
     }
 
     /// Which version this is, what the updater is up to, and whether it runs on its own.
+    /// Game capture: on or off, and the games with anti-cheat it may be used
+    /// on anyway.
+    fn game_capture_settings(&mut self, ui: &mut egui::Ui) {
+        row(
+            ui,
+            "Game capture",
+            Some(
+                "For games Windows can't record properly: exclusive fullscreen games like osu! that record frozen, \
+                 or Geometry Dash, which loses its cursor. Uses OBS Studio's game capture.",
+            ),
+            |ui| {
+                toggle(ui, &mut self.settings.game_capture);
+            },
+        );
+        if !self.settings.game_capture {
+            return;
+        }
+        divider(ui);
+        row(
+            ui,
+            "Games with anti-cheat",
+            Some(
+                "Left alone unless you add them here. Anti-cheat can close the game, \
+                 or flag your account, when something is loaded into it.",
+            ),
+            |ui| {
+                let mut remove = None;
+                for (i, game) in self.settings.game_capture_allowed.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.label(&game.name).on_hover_text(&game.id);
+                        ui.weak(&game.anticheat);
+                        if crate::sources_ui::remove_button(ui).on_hover_text(format!("Leave {} alone again", game.name)).clicked() {
+                            remove = Some(i);
+                        }
+                    });
+                }
+                if let Some(i) = remove {
+                    self.settings.game_capture_allowed.remove(i);
+                }
+                let add = ui.menu_button("Add a game", |ui| {
+                    ui.set_min_width(260.0);
+                    ui.weak("Open games with anti-cheat");
+                    ui.separator();
+                    let mut any = false;
+                    for (app, ac) in self.anticheat_apps.clone() {
+                        if self.settings.game_capture_allowed.iter().any(|g| g.id.eq_ignore_ascii_case(&app.id)) {
+                            continue;
+                        }
+                        any = true;
+                        if ui.button(format!("{}  ({ac})", app.name)).on_hover_text(&app.id).clicked() {
+                            self.settings.game_capture_allowed.push(settings::AllowedGame { id: app.id, name: app.name, anticheat: ac });
+                            ui.close();
+                        }
+                    }
+                    if !any {
+                        ui.weak("No other game with anti-cheat is open. Start the game, then add it here.");
+                    }
+                });
+                if add.response.clicked() {
+                    self.anticheat_apps = capture::running_anticheat_apps();
+                }
+            },
+        );
+    }
+
     fn update_settings(&mut self, ui: &mut egui::Ui) {
         use crate::update::Status;
         let status = self.updater.status();

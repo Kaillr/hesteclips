@@ -328,6 +328,9 @@ struct App {
     /// Apps with a window, for the games-and-apps list: to add, and to show
     /// which are open. Refreshed while the Sources page shows.
     pub(crate) windowed_apps: Vec<capture::Device>,
+    /// Running games with anti-cheat, for adding to game capture's allowed
+    /// list (looked up when its menu opens).
+    pub(crate) anticheat_apps: Vec<(capture::Device, String)>,
     /// What the running capture records, to send it list changes live.
     capturing_video: Option<capture::VideoSource>,
     /// The audio sources the running capture started with (mics follow
@@ -502,6 +505,7 @@ impl App {
             screens: capture::list_screens(),
             frame_size: None,
             windowed_apps: Vec::new(),
+            anticheat_apps: Vec::new(),
             capturing_video: None,
             capturing_sources: Vec::new(),
             capturing_replay: None,
@@ -731,17 +735,12 @@ impl App {
         }
     }
 
-    /// When to use the game capture hook: the setting, and the games in the
-    /// games and apps list (kept while the screen is recorded) asked to
-    /// always use it.
+    /// When to use the game capture hook: the setting, and the games with
+    /// anti-cheat it's allowed on.
     fn game_hook(&self) -> capture::GameHook {
-        let apps = match (&self.settings.capture, &self.settings.idle_apps) {
-            (settings::CaptureTarget::Apps { apps, .. }, _) | (_, Some(settings::CaptureTarget::Apps { apps, .. })) => apps.as_slice(),
-            _ => &[],
-        };
         capture::GameHook {
             auto: self.settings.game_capture,
-            always: apps.iter().filter(|a| a.always_game_capture).map(|a| a.id.clone()).collect(),
+            allowed: self.settings.game_capture_allowed.iter().map(|g| g.id.clone()).collect(),
         }
     }
 
