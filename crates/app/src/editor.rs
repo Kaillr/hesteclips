@@ -382,7 +382,7 @@ impl Ready {
                 }
                 ui.add_space(12.0);
                 let stem = source.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-                if crate::header::title(ui, &crate::clips::title_for_stem(&stem), Some("Editing")) {
+                if crate::header::title(ui, &crate::clips::title_for_stem(&stem)) {
                     outcome = EditorOutcome::Rename;
                 }
             });

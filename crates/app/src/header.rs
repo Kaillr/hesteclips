@@ -34,19 +34,11 @@ pub fn icon(text: &str) -> egui::Button<'static> {
 }
 
 /// The clip's name in what room is left, with a pencil to rename it. Put it
-/// last, inside the right-to-left part holding the actions. `tag`: a small
-/// label before it (the editor's "Editing"). Whether a rename was asked for.
-pub fn title(ui: &mut egui::Ui, name: &str, tag: Option<&str>) -> bool {
+/// last, inside the right-to-left part holding the actions. Whether a
+/// rename was asked for.
+pub fn title(ui: &mut egui::Ui, name: &str) -> bool {
     let mut rename = false;
     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-        if let Some(tag) = tag {
-            egui::Frame::new()
-                .fill(ACCENT.gamma_multiply(0.22))
-                .corner_radius(6)
-                .inner_margin(egui::Margin::symmetric(8, 3))
-                .show(ui, |ui| ui.label(RichText::new(tag).size(13.0).color(ACCENT)));
-            ui.add_space(4.0);
-        }
         // Leave room for the pencil after the (possibly shortened) name.
         let room = (ui.available_width() - 36.0).max(40.0);
         let label = ui

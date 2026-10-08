@@ -330,7 +330,7 @@ impl Viewer {
                 });
                 ui.add_space(12.0);
                 let stem = self.clip.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-                if header::title(ui, &crate::clips::title_for_stem(&stem), None) {
+                if header::title(ui, &crate::clips::title_for_stem(&stem)) {
                     out = ViewerOutcome::Rename;
                 }
             });
