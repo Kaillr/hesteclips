@@ -321,7 +321,12 @@ impl App {
             live.insert(0, Card::Placeholder);
         }
         if !live.is_empty() {
-            groups.push((chrono::Local::now().date_naive(), live));
+            // Something new is on its way: Today opens to show it coming.
+            let today = chrono::Local::now().date_naive();
+            if self.folded.contains(&today) {
+                self.folded.set(today, false);
+            }
+            groups.push((today, live));
         }
         for clip in &clips {
             let day = clip.day();
