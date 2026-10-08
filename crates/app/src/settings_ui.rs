@@ -36,11 +36,11 @@ impl App {
             RecState::Idle => {}
             RecState::Buffering => {
                 ui.add_space(12.0);
-                note(ui, "Stop the replay buffer to change video quality or file format. The rest changes right away.");
+                note(ui, "Stop the replay buffer to change video quality, game capture or file format. The rest changes right away.");
             }
             RecState::Recording => {
                 ui.add_space(12.0);
-                note(ui, "Stop recording to change video quality or file format. The rest changes right away.");
+                note(ui, "Stop recording to change video quality, game capture or file format. The rest changes right away.");
             }
         }
 
@@ -132,10 +132,6 @@ impl App {
                         .on_hover_text(self.estimate_explainer());
                 });
                 divider(ui);
-                if capture::game_hook_available() {
-                    self.game_capture_settings(ui);
-                    divider(ui);
-                }
                 egui::CollapsingHeader::new(RichText::new("Advanced").strong())
                     .id_salt("video_advanced")
                     .default_open(false)
@@ -148,6 +144,12 @@ impl App {
             .response
             .on_disabled_hover_text(stop_first);
         });
+
+        if capture::game_hook_available() {
+            section(ui, "Game capture", |ui| {
+                ui.add_enabled_ui(idle, |ui| self.game_capture_settings(ui)).response.on_disabled_hover_text(stop_first);
+            });
+        }
 
         section(ui, "Saving", |ui| {
             {
@@ -299,10 +301,10 @@ impl App {
     fn game_capture_settings(&mut self, ui: &mut egui::Ui) {
         row(
             ui,
-            "Game capture",
+            "Use game capture",
             Some(
                 "For games Windows can't record properly: exclusive fullscreen games like osu! that record frozen, \
-                 or Geometry Dash, which loses its cursor. Uses OBS Studio's game capture.",
+                 or Geometry Dash, which loses its cursor. Uses OBS Studio's game capture, only where it's needed.",
             ),
             |ui| {
                 toggle(ui, &mut self.settings.game_capture);
@@ -314,10 +316,10 @@ impl App {
         divider(ui);
         row(
             ui,
-            "Games with anti-cheat",
+            "Allow on games with anti-cheat",
             Some(
-                "Left alone unless you add them here. Anti-cheat can close the game, \
-                 or flag your account, when something is loaded into it.",
+                "Game capture leaves games with anti-cheat alone unless you add them here. \
+                 Anti-cheat can close the game, or flag your account, when game capture is loaded into it.",
             ),
             |ui| {
                 let mut remove = None;
@@ -325,7 +327,7 @@ impl App {
                     ui.horizontal(|ui| {
                         ui.label(&game.name).on_hover_text(&game.id);
                         ui.weak(&game.anticheat);
-                        if crate::sources_ui::remove_button(ui).on_hover_text(format!("Leave {} alone again", game.name)).clicked() {
+                        if crate::sources_ui::remove_button(ui).on_hover_text(format!("No game capture on {} again", game.name)).clicked() {
                             remove = Some(i);
                         }
                     });
