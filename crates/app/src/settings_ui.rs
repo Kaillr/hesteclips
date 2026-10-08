@@ -61,6 +61,35 @@ impl App {
             });
         });
 
+        section(ui, "Starting and closing", |ui| {
+            // Read from the system each time it's shown: it's the truth.
+            let mut on = crate::autostart::is_on();
+            let hint = if crate::tray::AVAILABLE { "Starts in the tray, ready to clip." } else { "Ready to clip when you log in." };
+            row(ui, crate::autostart::label(), Some(hint), |ui| {
+                if toggle(ui, &mut on).changed() {
+                    if let Err(e) = crate::autostart::set(on) {
+                        self.toast_error(format!("Couldn't change that: {e}"));
+                    }
+                }
+            });
+            if crate::tray::AVAILABLE {
+                divider(ui);
+                let place = if cfg!(target_os = "macos") { "menu bar" } else { "tray" };
+                let hint = format!("In the {place}, the replay buffer and shortcuts keep working.");
+                row(ui, "Closing the window", Some(&hint), |ui| {
+                    let keep = format!("Keeps it in the {place}");
+                    let chosen = usize::from(!self.settings.close_to_tray);
+                    let r = crate::ui_kit::segmented_with(ui, &[keep.as_str(), "Quits"], chosen, false);
+                    for (i, r) in r.into_iter().enumerate() {
+                        if r.clicked() {
+                            self.settings.close_to_tray = i == 0;
+                            self.settings.close_asked = true;
+                        }
+                    }
+                });
+            }
+        });
+
         section(ui, "Video quality", |ui| {
             ui.weak("What to record is chosen on the Sources page.");
             ui.add_space(4.0);
@@ -268,6 +297,8 @@ impl App {
                             .add_enabled(!recording, egui::Button::new("Restart now"))
                             .on_disabled_hover_text("Finish your recording first");
                         if restart.clicked() && self.updater.install_on_exit(true) {
+                            // Really quit (not to the tray).
+                            self.quitting = true;
                             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                         }
                     }

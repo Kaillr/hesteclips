@@ -7,6 +7,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // no console window on release Windows
 
+mod autostart;
 mod away;
 mod clips;
 mod collections;
@@ -40,6 +41,7 @@ mod sound;
 mod sources_ui;
 mod store;
 mod thumbs;
+mod tray;
 mod ui_kit;
 mod update;
 #[cfg(hw_decode)]
@@ -94,6 +96,22 @@ fn main() -> eframe::Result<()> {
     // place now. Does nothing in a development build.
     #[cfg(windows)]
     velopack::VelopackApp::build().run();
+    // One HesteClips at a time: another launch shows the running one and
+    // exits. (Not for development test instances, which run beside it.)
+    let test_instance = std::env::vars_os().any(|(k, _)| {
+        let k = k.to_string_lossy();
+        ["HESTECLIPS_OPEN_", "HESTECLIPS_DEMO_", "HESTECLIPS_LIBRARY", "HESTECLIPS_SETTINGS"].iter().any(|p| k.starts_with(p))
+    });
+    let instance = if test_instance {
+        None
+    } else {
+        match tray::claim() {
+            Some(listener) => listener,
+            None => return Ok(()),
+        }
+    };
+    // Started with the computer: straight to the tray.
+    let background = tray::AVAILABLE && std::env::args().any(|a| a == autostart::BACKGROUND);
     // Before anything talks to the desktop portal (screen capture, shortcuts),
     // which wants to know who we are, and needs our `.desktop` file for that.
     #[cfg(target_os = "linux")]
@@ -115,6 +133,7 @@ fn main() -> eframe::Result<()> {
         .and_then(|s| s.split_once('x').and_then(|(w, h)| Some([w.parse().ok()?, h.parse().ok()?])))
         .unwrap_or([1040.0, 700.0]);
     let viewport = egui::ViewportBuilder::default()
+        .with_visible(!background)
         .with_inner_size(size)
         .with_min_inner_size([560.0, 420.0])
         .with_title("HesteClips")
@@ -136,7 +155,7 @@ fn main() -> eframe::Result<()> {
             #[cfg(hw_decode)]
             gpu_frames::init(cc.wgpu_render_state.as_ref(), &cc.egui_ctx);
             ui_kit::apply(&cc.egui_ctx);
-            Ok(Box::new(App::new(cc.egui_ctx.clone())))
+            Ok(Box::new(App::new(cc.egui_ctx.clone(), instance)))
         }),
     );
     // The app is gone by now (capture stopped, files finished): an update
@@ -197,7 +216,7 @@ enum RecState {
 /// while running. Release bundles use `assets/hesteclips.icns` instead. On
 /// Windows, where icons are small, the glyph without the macOS plate
 /// (`assets/icon-windows.svg`).
-fn app_icon() -> egui::IconData {
+pub(crate) fn app_icon() -> egui::IconData {
     #[cfg(windows)]
     let png = include_bytes!("../assets/icon-windows-256.png");
     #[cfg(not(windows))]
@@ -361,6 +380,12 @@ struct App {
     /// The editor was opened from the player on this clip: closing it goes
     /// back there, not to the library (so cleaning up clips flows on).
     edit_return: Option<PathBuf>,
+    /// The tray icon, where there is one: closing the window hides it there.
+    tray: Option<tray::Tray>,
+    /// Quitting for real (closing mustn't just hide the window then).
+    quitting: bool,
+    /// The first close: ask whether to keep running in the tray.
+    close_dialog: bool,
     /// What was shown last frame, to scroll a new view back to the top.
     last_view: Option<(Page, library::Filter)>,
     /// Library auto-refresh: last folder poll + when the library's folders
@@ -392,7 +417,7 @@ struct App {
 }
 
 impl App {
-    fn new(ctx: egui::Context) -> Self {
+    fn new(ctx: egui::Context, instance: Option<std::net::TcpListener>) -> Self {
         add_symbol_font(&ctx);
         // Dark, always: the app is designed dark. On Wayland this also makes
         // the window's frame (drawn by winit, light by default) dark, as egui
@@ -429,6 +454,11 @@ impl App {
             channel.set_denoise(s.noise_removal);
         }
         let updater = update::Updater::new(ctx.clone(), settings.auto_update);
+        let (tray_tx, tray_rx) = std::sync::mpsc::channel();
+        if let Some(listener) = instance {
+            tray::serve(listener, &ctx, tray_tx.clone());
+        }
+        let tray = tray::Tray::new(&ctx, &app_icon(), tray_tx, tray_rx);
         let mut app = Self {
             page: Page::Clips,
             rec_state: RecState::Idle,
@@ -501,6 +531,9 @@ impl App {
             card_drag: None,
             confirm_delete: None,
             last_view: None,
+            tray,
+            quitting: false,
+            close_dialog: false,
             edit_return: None,
             nav: nav::History::default(),
             web_images: Default::default(),
@@ -708,84 +741,6 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         let mut laps = Laps::start();
 
-        // Global shortcuts: these fire even while a game is focused. Paused while
-        // the Settings recorder listens, so pressing the current key rebinds it
-        // instead of starting a recording.
-        let pressed = match &mut self.hotkeys {
-            Ok(h) => {
-                h.sync(&self.settings.shortcuts);
-                h.pressed()
-            }
-            Err(_) => Vec::new(),
-        };
-        for (action, saved) in pressed {
-            if self.recording_shortcut.is_some() {
-                continue;
-            }
-            match action {
-                settings::ShortcutAction::ToggleBuffer => self.toggle_buffer(),
-                settings::ShortcutAction::ToggleRecord => self.toggle_record(),
-                // Saved already, the moment the key went down.
-                settings::ShortcutAction::SaveClip if saved => self.clip_saving(),
-                settings::ShortcutAction::SaveClip => self.save_clip(),
-            }
-        }
-
-        // "Hashtag HesteClip that": saved already, as it was said.
-        for _ in 0..self.voice.heard() {
-            self.clip_saving();
-        }
-        let listen = self.settings.voice_clip && self.rec_state == RecState::Buffering && self.recording_shortcut.is_none();
-        let mic = listen.then(|| self.voice_mic()).flatten();
-        self.voice.listen(mic.as_deref());
-        laps.lap("shortcuts");
-        self.pump_capture_events();
-        laps.lap("capture events");
-        let capturing = match self.rec_state {
-            RecState::Idle => games::Capturing::Off,
-            RecState::Buffering => games::Capturing::Buffer(self.settings.replay_seconds),
-            RecState::Recording => games::Capturing::Record,
-        };
-        self.games.set(capturing, &self.listed_apps());
-        self.games.events.set_options(self.settings.game_details.then(|| self.settings.game_titles.clone()));
-        let armed = (self.rec_state == RecState::Buffering && self.recording_shortcut.is_none()).then(|| service::Armed {
-            library: self.settings.output_dir.clone(),
-            folder_per_game: self.settings.folder_per_game,
-            game_folders: self.settings.game_folders.clone(),
-            sound: self.settings.save_sound.clone(),
-        });
-        self.quick_save.arm(armed);
-        self.updater.set_auto(self.settings.auto_update);
-        self.cloud.poll();
-        self.pump_uploads();
-        self.pump_renders();
-        self.pump_mp3s();
-        laps.lap("games, uploads, renders");
-        // Every frame, not just while the Sources page draws: leaving the page must
-        // stop the meters' capture, or macOS keeps showing its recording indicator.
-        self.ensure_level_monitor();
-        laps.lap("level monitor");
-        self.ensure_video_preview();
-        laps.lap("video preview");
-        self.sync_capture_video();
-        self.sync_capture_settings();
-        self.refit_webcam();
-        laps.lap("webcam fit");
-        *self.webcam_placement.lock().unwrap() = match &self.settings.webcam {
-            Some(w) if w.enabled => w.placement.into(),
-            _ => capture::webcam::Placement::hidden(),
-        };
-        // Keep the webcam open whenever one is set up and on, previewed or
-        // recorded or not: closing a camera can reset its own settings. Off,
-        // it's closed (its light goes out); a capture takes it up again.
-        let on = self.settings.webcam.as_ref().is_some_and(|w| w.enabled);
-        let camera = self.webcam_source().filter(|_| on).map(|w| (w.device, w.format));
-        if camera != self.kept_camera {
-            capture::webcam::keep_open(camera.clone());
-            self.kept_camera = camera;
-        }
-        laps.lap("webcam");
-
         self.navigate(&ctx);
 
         // Hearing a microphone is for the Sources page only: never left on.
@@ -855,6 +810,7 @@ impl eframe::App for App {
             || self.collection_dialog.is_some()
             || self.confirm_delete.is_some()
             || self.confirm_reset
+            || self.close_dialog
             || ctx.memory(|m| m.top_modal_layer().is_some())
             || ctx.any_popup_open();
         ui_kit::set_overlay_open(&ctx, overlay);
@@ -887,6 +843,7 @@ impl eframe::App for App {
         self.rename_dialog(&ctx);
         self.collection_dialog(&ctx);
         self.delete_dialog(&ctx);
+        self.close_dialog(&ctx);
         ui_kit::pointer_cursor(&ctx);
         ui_kit::lenient_clicks(&ctx);
         laps.lap("dialogs");
@@ -930,9 +887,176 @@ impl eframe::App for App {
         ui_kit::replay_click(ctx, raw_input);
     }
 
+    /// What runs every frame whether the window shows or not (it's hidden
+    /// in the tray): shortcuts, voice, capture events, saves and uploads.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.background(ctx);
+        self.pump_tray(ctx);
+        self.handle_close(ctx);
+        // A steady tick, also while hidden (nothing else wakes it then).
+        ctx.request_repaint_after(if self.rec_state != RecState::Idle { Duration::from_millis(100) } else { Duration::from_millis(300) });
+    }
+
     fn on_exit(&mut self) {
         // A downloaded update goes in once we're gone: the next launch is the new version.
         self.updater.install_on_exit(false);
+    }
+}
+
+// --- Running in the background: the tray, closing the window ---
+impl App {
+    fn background(&mut self, _ctx: &egui::Context) {
+        // Global shortcuts: these fire even while a game is focused. Paused while
+        // the Settings recorder listens, so pressing the current key rebinds it
+        // instead of starting a recording.
+        let pressed = match &mut self.hotkeys {
+            Ok(h) => {
+                h.sync(&self.settings.shortcuts);
+                h.pressed()
+            }
+            Err(_) => Vec::new(),
+        };
+        for (action, saved) in pressed {
+            if self.recording_shortcut.is_some() {
+                continue;
+            }
+            match action {
+                settings::ShortcutAction::ToggleBuffer => self.toggle_buffer(),
+                settings::ShortcutAction::ToggleRecord => self.toggle_record(),
+                // Saved already, the moment the key went down.
+                settings::ShortcutAction::SaveClip if saved => self.clip_saving(),
+                settings::ShortcutAction::SaveClip => self.save_clip(),
+            }
+        }
+
+        // "Hashtag HesteClip that": saved already, as it was said.
+        for _ in 0..self.voice.heard() {
+            self.clip_saving();
+        }
+        let listen = self.settings.voice_clip && self.rec_state == RecState::Buffering && self.recording_shortcut.is_none();
+        let mic = listen.then(|| self.voice_mic()).flatten();
+        self.voice.listen(mic.as_deref());
+        self.pump_capture_events();
+        let capturing = match self.rec_state {
+            RecState::Idle => games::Capturing::Off,
+            RecState::Buffering => games::Capturing::Buffer(self.settings.replay_seconds),
+            RecState::Recording => games::Capturing::Record,
+        };
+        self.games.set(capturing, &self.listed_apps());
+        self.games.events.set_options(self.settings.game_details.then(|| self.settings.game_titles.clone()));
+        let armed = (self.rec_state == RecState::Buffering && self.recording_shortcut.is_none()).then(|| service::Armed {
+            library: self.settings.output_dir.clone(),
+            folder_per_game: self.settings.folder_per_game,
+            game_folders: self.settings.game_folders.clone(),
+            sound: self.settings.save_sound.clone(),
+        });
+        self.quick_save.arm(armed);
+        self.updater.set_auto(self.settings.auto_update);
+        self.cloud.poll();
+        self.pump_uploads();
+        self.pump_renders();
+        self.pump_mp3s();
+        // Every frame, not just while the Sources page draws: leaving the page must
+        // stop the meters' capture, or macOS keeps showing its recording indicator.
+        self.ensure_level_monitor();
+        self.ensure_video_preview();
+        self.sync_capture_video();
+        self.sync_capture_settings();
+        self.refit_webcam();
+        *self.webcam_placement.lock().unwrap() = match &self.settings.webcam {
+            Some(w) if w.enabled => w.placement.into(),
+            _ => capture::webcam::Placement::hidden(),
+        };
+        // Keep the webcam open whenever one is set up and on, previewed or
+        // recorded or not: closing a camera can reset its own settings. Off,
+        // it's closed (its light goes out); a capture takes it up again.
+        let on = self.settings.webcam.as_ref().is_some_and(|w| w.enabled);
+        let camera = self.webcam_source().filter(|_| on).map(|w| (w.device, w.format));
+        if camera != self.kept_camera {
+            capture::webcam::keep_open(camera.clone());
+            self.kept_camera = camera;
+        }
+    }
+
+    /// Do what the tray (or another launch) asked.
+    fn pump_tray(&mut self, ctx: &egui::Context) {
+        let Some(tray) = &self.tray else { return };
+        tray.update(self.rec_state == RecState::Buffering);
+        for cmd in tray.take() {
+            match cmd {
+                tray::Cmd::Open => self.show_window(ctx),
+                tray::Cmd::SaveClip => self.save_clip(),
+                tray::Cmd::ToggleBuffer => self.toggle_buffer(),
+                tray::Cmd::Quit => self.quit(ctx),
+            }
+        }
+    }
+
+    /// Closing the window: hidden in the tray (as chosen; asked the first
+    /// time), or quit.
+    fn handle_close(&mut self, ctx: &egui::Context) {
+        if self.quitting || self.tray.is_none() || !ctx.input(|i| i.viewport().close_requested()) {
+            return;
+        }
+        if self.settings.close_asked && !self.settings.close_to_tray {
+            return; // closes
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        if self.settings.close_asked {
+            self.hide_window(ctx);
+        } else {
+            self.close_dialog = true;
+        }
+    }
+
+    fn hide_window(&mut self, ctx: &egui::Context) {
+        // Nothing to watch while hidden: stop playing, close the preview.
+        if matches!(self.page, Page::View | Page::Sources) {
+            self.viewer = None;
+            self.page = Page::Clips;
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+    }
+
+    fn show_window(&mut self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+
+    fn quit(&mut self, ctx: &egui::Context) {
+        self.quitting = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
+    /// The first close, with a tray: keep running there, or quit?
+    fn close_dialog(&mut self, ctx: &egui::Context) {
+        if !self.close_dialog {
+            return;
+        }
+        let (mut keep, mut quit) = (false, false);
+        let modal = egui::Modal::new(egui::Id::new("close_dialog")).show(ctx, |ui| {
+            ui.set_width(400.0);
+            ui.heading("Keep HesteClips running?");
+            ui.add_space(6.0);
+            let place = if cfg!(target_os = "macos") { "menu bar" } else { "tray" };
+            ui.label(format!("In the {place}, your replay buffer and shortcuts keep working, so you can still save clips."));
+            ui_kit::hint(ui, "You can change this in Settings.");
+            ui.add_space(12.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                keep = ui.add(ui_kit::button(format!("Keep running in the {place}"), true)).clicked();
+                quit = ui.add(ui_kit::button("Quit", false)).clicked();
+            });
+        });
+        if keep || quit {
+            self.close_dialog = false;
+            self.settings.close_asked = true;
+            self.settings.close_to_tray = keep;
+            if keep { self.hide_window(ctx) } else { self.quit(ctx) }
+        } else if modal.should_close() {
+            self.close_dialog = false;
+        }
     }
 }
 
@@ -1164,6 +1288,8 @@ impl App {
             .on_hover_text(tip)
             .on_disabled_hover_text(format!("HesteClips {version} is ready. It installs when you quit, or restart once your recording is done."));
         if r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() && self.updater.install_on_exit(true) {
+            // Really quit (not to the tray): the update goes in, then it starts again.
+            self.quitting = true;
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }

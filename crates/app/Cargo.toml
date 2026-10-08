@@ -42,6 +42,8 @@ ureq = { version = "3.4.2", features = ["json"] }
 # window, which eframe doesn't have.
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 drag = "2"
+# The tray / menu bar icon (closing the window keeps HesteClips running).
+tray-icon = "0.21"
 
 # Linux: global shortcuts through the desktop portal (Wayland has no other
 # way), and showing a clip in the file manager.

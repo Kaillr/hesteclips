@@ -496,6 +496,11 @@ pub struct RecordSettings {
     /// Game folders renamed in the library: the folder a game's clips would
     /// go in (its name, as `clips::folder_name` makes it) → the one they go in.
     pub game_folders: std::collections::BTreeMap<String, String>,
+    /// Closing the window keeps HesteClips running in the tray (where
+    /// there is one) instead of quitting.
+    pub close_to_tray: bool,
+    /// The first close asked which (then it just does it).
+    pub close_asked: bool,
     /// Deleting a clip removes it for good instead of moving it to the
     /// Recycle Bin / Trash (then it asks first).
     pub delete_permanently: bool,
@@ -551,6 +556,8 @@ impl Default for RecordSettings {
             game_folders: Default::default(),
             game_details: true,
             delete_permanently: false,
+            close_to_tray: true,
+            close_asked: false,
             game_titles: GameTitles::default(),
             audio_sources: default_sources(),
             limiter: true,
