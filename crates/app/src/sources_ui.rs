@@ -822,8 +822,13 @@ fn source_card(
                 source.muted = !source.muted;
             }
             ui.spacing_mut().slider_width = fader_w;
+            // Every tenth of a dB, as the value next to it shows. egui's
+            // "smart aim" picks the simplest number under the pointer, which
+            // here was almost always a whole dB (or ±0.1 next to 0).
             let slider = egui::Slider::new(&mut source.volume_db, FADER_MIN_DB..=FADER_MAX_DB)
                 .show_value(false)
+                .smart_aim(false)
+                .step_by(0.1)
                 .clamping(egui::SliderClamping::Always);
             let r = ui.add(slider).on_hover_text("Volume (gain). Double-click to reset to 0 dB.");
             // A slider only senses drags, so it never reports a double-click itself.
