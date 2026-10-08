@@ -357,7 +357,8 @@ impl Cloud {
         self.uploads.push(Upload { id, clip: clip.clone(), to: to.clone(), progress: progress.clone(), merging: merging.clone(), cancel: cancel.clone() });
         let ctx = self.ctx.clone();
         self.spawn(move || {
-            let name = clip.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            // Without what HesteFiles doesn't allow (osu! names have a "%").
+            let name = hestefiles::file_name(&clip.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
             let made = match &subfolder {
                 Some(folder) => client.new_folder(&parent.base_id, &parent.path, folder).map(|_| ()),
                 None => Ok(()),

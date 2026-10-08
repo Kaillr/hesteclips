@@ -122,7 +122,7 @@ pub struct Directory {
 /// Largest chunk the server accepts.
 pub const MAX_CHUNK: u64 = 2 * 1024 * 1024;
 
-/// Characters HesteFiles doesn't allow in a folder's name.
+/// Characters HesteFiles doesn't allow in a file's or folder's name.
 pub const FORBIDDEN: &[char] = &['\\', '/', ':', '*', '?', '<', '>', '%', '|', '"', '\'', '`'];
 
 /// A folder name HesteFiles takes, made from `name`: without the characters
@@ -135,8 +135,30 @@ pub fn folder_name(name: &str) -> Option<String> {
     (!name.is_empty()).then_some(name)
 }
 
+/// A file name HesteFiles takes, made from `name`: the same characters
+/// left out as in [`folder_name`] ("87.00%" → "87.00"), the extension kept.
+pub fn file_name(name: &str) -> String {
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() && !ext.is_empty() && ext.len() <= 5 => (stem, Some(ext)),
+        _ => (name, None),
+    };
+    let stem = folder_name(stem).unwrap_or_else(|| "clip".to_owned());
+    match ext.and_then(folder_name) {
+        Some(ext) => format!("{stem}.{ext}"),
+        None => stem,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn file_names() {
+        use super::file_name;
+        assert_eq!(file_name("clip - 63 misses · 87.00% · +NFDA · METALIN [OVERFLOWING].mp4"), "clip - 63 misses · 87.00 · +NFDA · METALIN [OVERFLOWING].mp4");
+        assert_eq!(file_name("Ace: \"clutch\".mp4"), "Ace clutch.mp4");
+        assert_eq!(file_name("%%%.mp4"), "clip.mp4");
+    }
+
     #[test]
     fn folder_names() {
         use super::folder_name;
