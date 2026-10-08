@@ -267,7 +267,7 @@ impl Player {
     /// Jump to `t` (seconds). Keeps playing if it was.
     pub fn seek(&mut self, t: f64) {
         let t = t.clamp(0.0, self.info.duration);
-        self.shared.pos.store((t * PREVIEW_RATE as f64) as u64, Ordering::Relaxed);
+        self.shared.pos.store(to_samples(t), Ordering::Relaxed);
         self.decoder = None; // restarts from the new position if playing
         if self.is_playing() {
             if let Some(v) = self.hw() {
@@ -1044,9 +1044,31 @@ impl Drop for FrameStream {
     }
 }
 
+/// The position, in samples, for a seek to `t` seconds: rounded up, so it's
+/// never before `t`. Rounded down, a frame's start at a rate that isn't a
+/// whole number (59.9 fps) came back a hair before the frame, in the frame
+/// ahead of it, and stepping a frame forward from there stayed put.
+fn to_samples(t: f64) -> u64 {
+    (t * PREVIEW_RATE as f64).ceil() as u64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A seek to a frame reads back as that frame, at rates that aren't
+    /// whole numbers too.
+    #[test]
+    fn seeking_to_a_frame_lands_on_it() {
+        for fps in [60.0, 107760.0 / 1799.0, 43128.0 / 719.0, 30000.0 / 1001.0, 144.0] {
+            let info = ClipInfo { duration: 120.0, fps, width: 2, height: 2, video_kbps: None, audio: Vec::new(), id: None };
+            for k in 0..(120.0 * fps) as u64 - 1 {
+                let t = info.snap(k as f64 / fps + 1e-9) + 1e-6;
+                let back = to_samples(t) as f64 / PREVIEW_RATE as f64;
+                assert_eq!(info.frame_index(back), k, "frame {k} at {fps} fps");
+            }
+        }
+    }
 
     /// A stereo tone at `hz`, `secs` long, at the source rate.
     fn tone(hz: f64, secs: f64) -> Vec<f32> {
