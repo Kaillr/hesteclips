@@ -90,6 +90,19 @@ impl App {
             }
         });
 
+        section(ui, "Look", |ui| {
+            row(ui, "Theme", None, |ui| {
+                let labels = settings::Theme::ALL.map(settings::Theme::label);
+                let chosen = settings::Theme::ALL.iter().position(|t| *t == self.settings.theme).unwrap_or(0);
+                for (i, r) in crate::ui_kit::segmented_with(ui, &labels, chosen, false).into_iter().enumerate() {
+                    if r.clicked() {
+                        self.settings.theme = settings::Theme::ALL[i];
+                        ui.ctx().set_theme(self.settings.theme.preference());
+                    }
+                }
+            });
+        });
+
         section(ui, "Video quality", |ui| {
             ui.weak("What to record is chosen on the Sources page.");
             ui.add_space(4.0);

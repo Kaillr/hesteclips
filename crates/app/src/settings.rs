@@ -24,6 +24,33 @@ impl Encoder {
     }
 }
 
+/// Light or dark look: the system's, or one chosen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Theme {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+impl Theme {
+    pub const ALL: [Theme; 3] = [Theme::System, Theme::Light, Theme::Dark];
+    pub fn label(self) -> &'static str {
+        match self {
+            Theme::System => "System",
+            Theme::Light => "Light",
+            Theme::Dark => "Dark",
+        }
+    }
+    pub fn preference(self) -> egui::ThemePreference {
+        match self {
+            Theme::System => egui::ThemePreference::System,
+            Theme::Light => egui::ThemePreference::Light,
+            Theme::Dark => egui::ThemePreference::Dark,
+        }
+    }
+}
+
 /// File format for recordings. Both survive a crash mid-recording (written as
 /// fragmented files). MKV used to be offered; old settings load as MP4.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -496,6 +523,8 @@ pub struct RecordSettings {
     /// Game folders renamed in the library: the folder a game's clips would
     /// go in (its name, as `clips::folder_name` makes it) → the one they go in.
     pub game_folders: std::collections::BTreeMap<String, String>,
+    /// Light, dark, or the system's.
+    pub theme: Theme,
     /// Closing the window keeps HesteClips running in the tray (where
     /// there is one) instead of quitting.
     pub close_to_tray: bool,
@@ -556,6 +585,7 @@ impl Default for RecordSettings {
             game_folders: Default::default(),
             game_details: true,
             delete_permanently: false,
+            theme: Theme::System,
             close_to_tray: true,
             close_asked: false,
             game_titles: GameTitles::default(),
