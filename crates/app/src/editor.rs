@@ -925,9 +925,9 @@ impl Ready {
             lp.rect_filled(Rect::from_x_y_ranges(xp..=xp + frame_w, body.y_range()), 0, Color32::from_white_alpha(16));
         }
         lp.vline(xp, ruler.top()..=body.bottom(), Stroke::new(1.5, Color32::WHITE));
-        let head = xp + frame_w.max(0.0) / 2.0;
+        // The marker points at the line, not the middle of the frame.
         lp.add(egui::Shape::convex_polygon(
-            vec![Pos2::new(head - 6.0, ruler.top()), Pos2::new(head + 6.0, ruler.top()), Pos2::new(head, ruler.top() + 8.0)],
+            vec![Pos2::new(xp - 6.0, ruler.top()), Pos2::new(xp + 6.0, ruler.top()), Pos2::new(xp, ruler.top() + 8.0)],
             Color32::WHITE,
             Stroke::NONE,
         ));
