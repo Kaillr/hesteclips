@@ -719,9 +719,13 @@ impl App {
 
     pub(crate) fn video_source(&self) -> capture::VideoSource {
         match &self.settings.capture {
-            settings::CaptureTarget::Apps { apps, away_screen } if capture::APP_CAPTURE => capture::VideoSource::Apps {
+            settings::CaptureTarget::Apps { apps, away_screen, game_capture } if capture::APP_CAPTURE => capture::VideoSource::Apps {
                 ids: apps.iter().map(|a| a.id.clone()).collect(),
                 away_when_unfocused: *away_screen,
+                hook: capture::GameHook {
+                    auto: *game_capture,
+                    always: apps.iter().filter(|a| a.always_game_capture).map(|a| a.id.clone()).collect(),
+                },
             },
             _ => capture::VideoSource::Screen {
                 id: self.screens.get(self.settings.display_index).map(|d| d.id.clone()).unwrap_or_else(|| "0".to_owned()),

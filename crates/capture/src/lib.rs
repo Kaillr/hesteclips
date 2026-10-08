@@ -27,6 +27,7 @@ pub mod output;
 pub mod preview;
 pub mod webcam;
 pub mod sources;
+pub mod stores;
 
 #[cfg(target_os = "macos")]
 pub mod mac;
@@ -150,7 +151,56 @@ pub enum VideoSource {
     /// (`away_when_unfocused`) or keeps its last picture. Fitted into a frame
     /// the size of the main display. The away screen also shows while none of
     /// them is open; each is picked up as soon as it opens.
-    Apps { ids: Vec<String>, away_when_unfocused: bool },
+    Apps { ids: Vec<String>, away_when_unfocused: bool, hook: GameHook },
+}
+
+/// When a game is recorded through the game capture hook (Windows) instead
+/// of Windows' own capture, which can't see some games (exclusive fullscreen
+/// OpenGL records one frozen frame) and loses the cursor in others. The hook
+/// is OBS Studio's, loaded into the game; it's never used on a game with
+/// anti-cheat unless it's in `always`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GameHook {
+    /// Where it's needed: games known to need it, and games Windows' capture
+    /// turns out to freeze on. Never on a game with anti-cheat.
+    pub auto: bool,
+    /// Always for these (by executable name), anti-cheat or not: asked for.
+    pub always: Vec<String>,
+}
+
+impl Default for GameHook {
+    fn default() -> Self {
+        Self { auto: true, always: Vec::new() }
+    }
+}
+
+/// Whether the game capture hook can be used here (Windows, with its files
+/// next to the app).
+pub fn game_hook_available() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        win::hook::available()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
+    }
+}
+
+/// The anti-cheat a running app uses, if any can be told ("BattlEye"), by its
+/// executable name. None too when it isn't running (it's looked for where
+/// it's installed).
+pub fn app_anticheat(exe: &str) -> Option<String> {
+    #[cfg(target_os = "windows")]
+    {
+        let path = win::system::running_app_path(exe)?;
+        win::anticheat::anticheat(&path)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = exe;
+        None
+    }
 }
 
 /// A still picture shown instead of an app (see [`EncodeSettings::away_screen`]).

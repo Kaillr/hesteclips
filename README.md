@@ -20,6 +20,7 @@
 - **Non-destructive editor** — trim frame-accurately, rebalance each audio track, and draw volume changes on the timeline. Your original recording is never modified, and you can revert any time.
 - **Fast saving** — edits only re-encode the few frames around each cut; the rest is copied as-is, so saving a trim takes seconds.
 - **Clip library** — your clips grouped by day, with thumbnails, quick playback, rename, drag-and-drop into any app (macOS and Windows), and sharing (copy, the system share sheet: AirDrop/Messages/Mail on macOS, Nearby Share/Mail on Windows).
+- **Game capture (Windows)** — games Windows' own capture can't see properly (fullscreen OpenGL games like osu! record one frozen picture; Geometry Dash loses its cursor) are recorded through [OBS Studio](https://obsproject.com)'s game capture hook instead. Never on games with anti-cheat (found from the anti-cheat's files, [AreWeAntiCheatYet](https://areweanticheatyet.com)'s list and a few known games) unless you ask for it: right-click a game in *Sources*.
 - **High quality** — hardware H.264 encoding (VideoToolbox on macOS; NVENC/AMF/Quick Sync through Media Foundation on Windows; NVENC or VA-API through ffmpeg on Linux, x264 when there's no GPU encoder) at native resolution or downscaled, up to 240 fps, with multi-track AAC audio in MP4 or MOV.
 
 ## Platform support
@@ -43,6 +44,7 @@
 - macOS 13 (Ventura) or later, Windows 10 version 2004 or later (Windows 11 recommended — it hides the yellow capture border), or Linux with PipeWire and an xdg-desktop-portal for your desktop (GNOME, KDE Plasma, wlroots, Hyprland)
 - [ffmpeg](https://ffmpeg.org) on your `PATH` (or next to the app; the release packages include it) — used by the editor, thumbnails and playback, and on Linux for encoding too (`brew install ffmpeg` / `winget install Gyan.FFmpeg`). On Linux it must be able to encode and decode H.264: Fedora's own `ffmpeg-free` can't, so use RPM Fusion's (`sudo dnf swap ffmpeg-free ffmpeg --allowerasing`); Debian, Ubuntu and Arch's `ffmpeg` can.
 - [Rust](https://rustup.rs) (stable) to build from source
+- On Windows, for game capture: `pwsh scripts/fetch-game-hook.ps1` puts OBS Studio's hook files (signed, GPLv2, run as separate programs) in `targetgame-hook`, where a development build finds them. Without them, games are recorded with Windows' capture only.
 - On Linux, to build: a C compiler, clang, and the PipeWire, D-Bus and ALSA headers (Fedora: `sudo dnf install gcc clang-devel pipewire-devel dbus-devel alsa-lib-devel`; Debian/Ubuntu: `sudo apt install build-essential libclang-dev libpipewire-0.3-dev libdbus-1-dev libasound2-dev`)
 
 ## Getting started
@@ -84,4 +86,4 @@ Hotkeys work while other apps (and games) are focused. On Windows and Linux use 
 
 ## Releasing
 
-Releases are cut by hand: *Actions → Release → Run workflow* on `main`. [semantic-release](https://semantic-release.gitbook.io) picks the version from the [Conventional Commits](https://www.conventionalcommits.org) since the last tag — `fix:` → patch, `feat:` → minor, `feat!:` or a `BREAKING CHANGE:` footer → major; `chore:`, `docs:`, `refactor:`, `ci:` and the like don't release on their own. `scripts/release.ps1` builds the app, bundles ffmpeg and packs it with [Velopack](https://velopack.io) into the installer and the (delta) update packages the installed app updates from. `scripts/release-mac.sh` and `scripts/release-linux.sh` build the macOS `.dmg` and the Linux tarball, ffmpeg included, and add them to the release.
+Releases are cut by hand: *Actions → Release → Run workflow* on `main`. [semantic-release](https://semantic-release.gitbook.io) picks the version from the [Conventional Commits](https://www.conventionalcommits.org) since the last tag — `fix:` → patch, `feat:` → minor, `feat!:` or a `BREAKING CHANGE:` footer → major; `chore:`, `docs:`, `refactor:`, `ci:` and the like don't release on their own. `scripts/release.ps1` builds the app, bundles ffmpeg and OBS Studio's game capture hook, and packs it with [Velopack](https://velopack.io) into the installer and the (delta) update packages the installed app updates from. `scripts/release-mac.sh` and `scripts/release-linux.sh` build the macOS `.dmg` and the Linux tarball, ffmpeg included, and add them to the release.

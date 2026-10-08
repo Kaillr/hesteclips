@@ -142,6 +142,10 @@ pub enum CaptureTarget {
         apps: Vec<CaptureApp>,
         #[serde(default = "yes")]
         away_screen: bool,
+        /// Record games Windows' own capture can't see properly through
+        /// the game capture hook, where it's safe (see `capture::GameHook`).
+        #[serde(default = "yes")]
+        game_capture: bool,
     },
     /// One app, from before several could be chosen; read only, turned into
     /// `Apps` on load.
@@ -267,6 +271,9 @@ impl PlacementCfg {
 pub struct CaptureApp {
     pub id: String,
     pub name: String,
+    /// Always through the game capture hook, even with anti-cheat: asked for.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub always_game_capture: bool,
 }
 
 /// Where an audio source's sound comes from.
@@ -721,7 +728,11 @@ impl RecordSettings {
     /// A single chosen app (from before several could be) becomes a list of one.
     fn upgrade_capture(&mut self) {
         if let CaptureTarget::App { id, name } = &self.capture {
-            self.capture = CaptureTarget::Apps { apps: vec![CaptureApp { id: id.clone(), name: name.clone() }], away_screen: true };
+            self.capture = CaptureTarget::Apps {
+                apps: vec![CaptureApp { id: id.clone(), name: name.clone(), always_game_capture: false }],
+                away_screen: true,
+                game_capture: true,
+            };
         }
     }
 
@@ -812,7 +823,11 @@ mod tests {
         assert_eq!(s.fps, 144, "the rest of the settings survive");
         assert_eq!(
             s.capture,
-            CaptureTarget::Apps { apps: vec![CaptureApp { id: "game.exe".into(), name: "Game".into() }], away_screen: true }
+            CaptureTarget::Apps {
+                apps: vec![CaptureApp { id: "game.exe".into(), name: "Game".into(), always_game_capture: false }],
+                away_screen: true,
+                game_capture: true,
+            }
         );
         let round: RecordSettings = serde_json::from_str(&s.to_json()).unwrap();
         assert_eq!(round.capture, s.capture);

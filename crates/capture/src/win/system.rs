@@ -510,8 +510,48 @@ pub(crate) fn client_area_in_capture(hwnd: HWND) -> Option<(u32, u32, u32, u32)>
     }
 }
 
+/// The full path of a running app, by executable name.
+pub(crate) fn running_app_path(exe: &str) -> Option<std::path::PathBuf> {
+    processes().iter().filter(|p| p.exe.eq_ignore_ascii_case(exe)).find_map(|p| image_path(p.pid)).map(Into::into)
+}
+
+/// The full path of the app a window belongs to.
+pub(crate) fn window_app_path(hwnd: HWND) -> Option<std::path::PathBuf> {
+    let mut pid = 0;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+    image_path(pid).map(Into::into)
+}
+
+/// Whether a window covers its whole display (a fullscreen game).
+pub(crate) fn covers_display(hwnd: HWND) -> bool {
+    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow};
+    unsafe {
+        let previous = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        let mut r = RECT::default();
+        let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        let covers = GetWindowRect(hwnd, &mut r).is_ok()
+            && GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut info).as_bool()
+            && r.left <= info.rcMonitor.left
+            && r.top <= info.rcMonitor.top
+            && r.right >= info.rcMonitor.right
+            && r.bottom >= info.rcMonitor.bottom;
+        SetThreadDpiAwarenessContext(previous);
+        covers
+    }
+}
+
+/// A command for a helper program, run without a console window (this is a
+/// GUI app: each run would otherwise flash one).
+pub(crate) fn hidden_command(exe: &std::path::Path) -> std::process::Command {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd
+}
+
 /// Full path of a process's executable.
-fn image_path(pid: u32) -> Option<String> {
+pub(crate) fn image_path(pid: u32) -> Option<String> {
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
         let mut buf = [0u16; 1024];

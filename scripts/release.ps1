@@ -1,6 +1,7 @@
-# Builds the Windows release into Releases/: the app with a pinned ffmpeg next
-# to it, packed by Velopack into an installer (HesteClips-win-Setup.exe), a
-# portable zip, and the full + delta packages the installed app updates from.
+# Builds the Windows release into Releases/: the app with a pinned ffmpeg and
+# OBS Studio's game capture hook next to it, packed by Velopack into an
+# installer (HesteClips-win-Setup.exe), a portable zip, and the full + delta
+# packages the installed app updates from.
 #
 # The release workflow runs this with the version semantic-release picked, and
 # publishes Releases/* once every platform has built. It also runs locally:
@@ -52,6 +53,10 @@ Expand-Archive $zip $unzipped
 $ffmpegDir = Join-Path $unzipped "ffmpeg-$ffmpegVersion-essentials_build"
 Copy-Item "$ffmpegDir\bin\ffmpeg.exe", "$ffmpegDir\bin\ffprobe.exe" $stage
 Copy-Item "$ffmpegDir\LICENSE" (Join-Path $stage 'ffmpeg-LICENSE.txt')
+
+# Game capture for games Windows' own capture can't see: OBS Studio's hook,
+# its signed files unchanged (see fetch-game-hook.ps1).
+& (Join-Path $PSScriptRoot 'fetch-game-hook.ps1') -Dest (Join-Path $stage 'game-hook')
 
 # The previous release, so the update to this one can be a small delta. None
 # the first time.

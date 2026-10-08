@@ -839,6 +839,7 @@ dependencies = [
  "pipewire",
  "pollster 1.0.1",
  "rubato",
+ "serde_json",
  "wayland-client",
  "wayland-protocols-wlr",
  "windows 0.62.2",

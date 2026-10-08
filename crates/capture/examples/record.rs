@@ -4,7 +4,7 @@
 //! sources), `app:<bundle id or exe>`. Append `@mix`, `@track` to limit where it
 //! goes (default both). Env: REPLAY=1, SECS=n, EXT=mov, HEIGHT=n (0 = native),
 //! FPS=n, SOFTWARE=1, LIST=1 (list the inputs), SWITCH_MIC=<device> (the first source, a mic, switches to it halfway), SCREEN=<id>, WEBCAM=<id|1>, WEBCAM_FORMAT=WxH, APP=<exe>[,<exe>…] (record those apps' windows,
-//! following focus).
+//! following focus), HOOK=1|0 (with APP: always or never the game capture hook).
 use capture::sources::{AudioSource, SourceKind};
 use capture::{EncodeSettings, Mode, mixer::LiveAudio};
 
@@ -56,6 +56,11 @@ default: {:?}", d.inputs.iter().map(|i| &i.name).collect::<Vec<_>>(), d.default_
             Some(ids) => capture::VideoSource::Apps {
                 ids: ids.split(',').map(str::to_owned).collect(),
                 away_when_unfocused: env("AWAY").is_some(),
+                // HOOK=1: always through the game capture hook; HOOK=0: never.
+                hook: capture::GameHook {
+                    auto: env("HOOK").is_none_or(|v| v != "0"),
+                    always: if env("HOOK").as_deref() == Some("1") { ids.split(',').map(str::to_owned).collect() } else { Vec::new() },
+                },
             },
             None => capture::VideoSource::Screen { id: env("SCREEN").unwrap_or_default() },
         },

@@ -19,13 +19,17 @@
 //! WASAPI use: the first video frame is t=0.
 
 mod aac;
+pub mod anticheat;
 mod camera;
+mod cursor;
 mod d3d;
 pub mod decode;
 pub(crate) mod direct;
 mod h264;
+pub mod hook;
 mod loopback;
-mod system;
+mod quad;
+pub(crate) mod system;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -336,13 +340,14 @@ enum PictureSource {
 struct AppsConfig {
     ids: Vec<String>,
     away_when_unfocused: bool,
+    hook: crate::GameHook,
 }
 
 impl AppsConfig {
     fn of(source: &VideoSource) -> Option<Self> {
         match source {
-            VideoSource::Apps { ids, away_when_unfocused } => {
-                Some(Self { ids: ids.clone(), away_when_unfocused: *away_when_unfocused })
+            VideoSource::Apps { ids, away_when_unfocused, hook } => {
+                Some(Self { ids: ids.clone(), away_when_unfocused: *away_when_unfocused, hook: hook.clone() })
             }
             VideoSource::Screen { .. } => None,
         }
@@ -520,6 +525,27 @@ impl Drop for PreviewCapture {
     }
 }
 
+/// One app window's capture: Windows' own (also watched for freezing, when
+/// the hook may take over), or the game capture hook.
+enum WindowCapture {
+    Wgc(d3d::Capture, bool),
+    Hook(hook::HookCapture),
+}
+
+impl WindowCapture {
+    fn is_closed(&self) -> bool {
+        match self {
+            WindowCapture::Wgc(c, _) => c.is_closed(),
+            WindowCapture::Hook(h) => h.ended().is_some(),
+        }
+    }
+}
+
+/// How long Windows' capture of a fullscreen game in focus may send nothing
+/// before the game capture hook takes over (a guess: a game's picture
+/// rarely stands still that long, and a wrong switch only costs a moment).
+const FROZEN: Duration = Duration::from_secs(4);
+
 /// Keeps the picture coming: one capture of a display, or the windows of a set
 /// of apps, following focus between them and each as it closes and reopens.
 enum Video {
@@ -540,7 +566,12 @@ impl Video {
             let mut config = AppsConfig::default();
             // The listed app last in focus: recorded until another one is.
             let mut active: Option<String> = None;
-            let mut current: Option<(windows::Win32::Foundation::HWND, String, d3d::Capture)> = None;
+            let mut current: Option<(windows::Win32::Foundation::HWND, String, WindowCapture)> = None;
+            // Windows the hook failed on (it couldn't load, or stopped): Windows'
+            // capture for them instead.
+            let mut hook_failed: std::collections::HashSet<usize> = Default::default();
+            // Apps Windows' capture froze on: hooked from then on.
+            let mut frozen: std::collections::HashSet<String> = Default::default();
             // A window that couldn't be captured, so it's reported once.
             let mut failed = None;
             // The away screen is up (so it's uploaded once, not every tick).
@@ -573,6 +604,29 @@ impl Video {
                 let focused = foreground.as_ref().and_then(|f| Some((f.hwnd, listed(&f.exe)?, f.main)));
                 if let Some((_, app, _)) = &focused {
                     active = Some(app.clone());
+                }
+                // The hook stopped on a window that's still open: Windows'
+                // capture for it instead.
+                if let Some((h, app, WindowCapture::Hook(hooked))) = &current
+                    && let Some(why) = hooked.ended()
+                {
+                    if system::window_alive(*h) {
+                        eprintln!("{app}: the game capture hook stopped ({why}); recording it with Windows' capture");
+                        hook_failed.insert(h.0 as usize);
+                    }
+                    current = None;
+                }
+                // Windows' capture of a fullscreen game in focus sends nothing:
+                // it can't see the game (exclusive fullscreen). The hook can.
+                if let Some((h, app, WindowCapture::Wgc(capture, true))) = &current
+                    && focused.as_ref().is_some_and(|(f, _, _)| f == h)
+                    && !system::window_hidden(*h)
+                    && capture.since_last_frame() > FROZEN
+                    && system::covers_display(*h)
+                {
+                    eprintln!("{app}: Windows' capture shows nothing new for {FROZEN:?} in fullscreen; switching to the game capture hook");
+                    frozen.insert(app.to_lowercase());
+                    current = None;
                 }
                 // Keep the window being recorded while it's still the active
                 // app's, open, and shown (or focused): switching costs a moment,
@@ -608,7 +662,22 @@ impl Video {
                                 held = true;
                             }
                             Some((h, app)) => {
-                                match d3d::window_item(h).and_then(|item| d3d::Capture::start(&gpu, &item, &latest, Some(h), fps)) {
+                                let (mut plan, mut why) = hook::plan(&app, h, &config.hook);
+                                if plan == hook::Plan::Watch && frozen.contains(&app.to_lowercase()) {
+                                    plan = hook::Plan::Hook;
+                                }
+                                if plan == hook::Plan::Hook && hook_failed.contains(&(h.0 as usize)) {
+                                    plan = hook::Plan::Wgc;
+                                    why = "the hook failed on this window".into();
+                                }
+                                eprintln!("recording {app} with {} ({why})", if plan == hook::Plan::Hook { "the game capture hook" } else { "Windows' capture" });
+                                let started = match plan {
+                                    hook::Plan::Hook => hook::HookCapture::start(&gpu, h, &latest, fps).map(WindowCapture::Hook),
+                                    p => d3d::window_item(h)
+                                        .and_then(|item| d3d::Capture::start(&gpu, &item, &latest, Some(h), fps))
+                                        .map(|c| WindowCapture::Wgc(c, p == hook::Plan::Watch)),
+                                };
+                                match started {
                                     Ok(capture) => {
                                         latest.set_app(Some(app.clone()));
                                         active = Some(app.clone());

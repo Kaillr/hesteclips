@@ -264,6 +264,14 @@ impl Latest {
         self.has_frame.store(true, Ordering::Release);
     }
 
+    /// A new picture was drawn into `texture` (by the game capture hook), its
+    /// valid part `size` from the top-left corner.
+    pub(crate) fn mark_frame(&self, size: (u32, u32)) {
+        *self.content.lock().unwrap() = (size.0.min(self.width), size.1.min(self.height));
+        self.waiting.store(false, Ordering::Release);
+        self.has_frame.store(true, Ordering::Release);
+    }
+
     /// Show black, as a full-size frame.
     pub(crate) fn clear(&self) -> Result<()> {
         unsafe {
@@ -286,6 +294,8 @@ pub(crate) struct Capture {
     item: GraphicsCaptureItem,
     closed_token: i64,
     closed: Arc<AtomicBool>,
+    /// When the last frame arrived (when it started, before the first).
+    last_frame: Arc<Mutex<std::time::Instant>>,
 }
 unsafe impl Send for Capture {}
 
@@ -339,6 +349,8 @@ impl Capture {
         let gpu2 = gpu.clone();
         let device2 = Shared(winrt_device);
         let window2 = Shared(window);
+        let last_frame = Arc::new(Mutex::new(std::time::Instant::now()));
+        let last_frame2 = last_frame.clone();
         pool.FrameArrived(&TypedEventHandler::<Direct3D11CaptureFramePool, IInspectable>::new(move |pool, _| {
             // Whole captures: the wrappers are what make these Send.
             let (gpu2, device2, window2) = (&gpu2, &device2, &window2);
@@ -376,6 +388,7 @@ impl Capture {
             })();
             let _ = frame.Close();
             if let Ok(Some(size)) = copied {
+                *last_frame2.lock().unwrap() = std::time::Instant::now();
                 *latest2.content.lock().unwrap() = size;
                 latest2.waiting.store(false, Ordering::Release);
                 latest2.has_frame.store(true, Ordering::Release);
@@ -396,7 +409,14 @@ impl Capture {
             Ok(())
         }))?;
         session.StartCapture()?;
-        Ok(Self { pool, session, item: item.clone(), closed_token, closed })
+        Ok(Self { pool, session, item: item.clone(), closed_token, closed, last_frame })
+    }
+
+    /// How long since the last frame (since the capture started, before the
+    /// first): a window that's showing and sends nothing for long may be one
+    /// Windows can't see (exclusive fullscreen).
+    pub(crate) fn since_last_frame(&self) -> std::time::Duration {
+        self.last_frame.lock().unwrap().elapsed()
     }
 
     /// The captured window closed; this capture will deliver nothing more.

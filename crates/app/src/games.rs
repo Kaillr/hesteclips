@@ -204,13 +204,11 @@ pub fn installed_game(exe: &Path) -> Option<String> {
     };
     // The game's folder must hold the app, not be it.
     let folder = |i: usize| (i + 1 < parts.len()).then(|| parts[i].clone());
-    if let Some(i) = after("steamapps", Some("common")) {
-        let dir = folder(i)?;
-        let steamapps: PathBuf = parts[..i - 1].iter().collect();
-        return Some(steam_name(&steamapps, &dir).unwrap_or(dir));
+    if let Some((_, dir)) = capture::stores::steam_dir(exe) {
+        return Some(capture::stores::steam_game(exe).map(|g| g.name).unwrap_or(dir));
     }
-    if let Some(name) = epic_name(exe) {
-        return Some(name);
+    if let Some(game) = capture::stores::epic_game(exe) {
+        return Some(game.name);
     }
     if let Some(i) = after("GOG Galaxy", Some("Games")).or_else(|| after("GOG Games", None)) {
         return folder(i);
@@ -219,62 +217,6 @@ pub fn installed_game(exe: &Path) -> Option<String> {
         return folder(i);
     }
     None
-}
-
-/// Steam's name for the game installed in `steamapps/common/<dir>`, from its
-/// `appmanifest_<id>.acf` ("installdir" → "name").
-fn steam_name(steamapps: &Path, dir: &str) -> Option<String> {
-    for entry in std::fs::read_dir(steamapps).ok()?.flatten() {
-        let file = entry.file_name().to_string_lossy().into_owned();
-        if !(file.starts_with("appmanifest_") && file.ends_with(".acf")) {
-            continue;
-        }
-        let Ok(text) = std::fs::read_to_string(entry.path()) else { continue };
-        let fields = acf_fields(&text);
-        if fields.get("installdir").is_some_and(|d| d.eq_ignore_ascii_case(dir)) {
-            return fields.get("name").cloned();
-        }
-    }
-    None
-}
-
-/// The top-level `"key"  "value"` pairs of a Steam `.acf` file (the first of
-/// each key: the app's own come before its nested sections').
-fn acf_fields(text: &str) -> HashMap<String, String> {
-    let mut fields = HashMap::new();
-    for line in text.lines() {
-        let quoted: Vec<&str> = line.split('"').skip(1).step_by(2).collect();
-        if let [key, value] = quoted[..] {
-            fields.entry(key.to_lowercase()).or_insert_with(|| value.to_owned());
-        }
-    }
-    fields
-}
-
-/// The Epic launcher's name for the game installed where `exe` is, from its
-/// install manifests (`ProgramData\Epic\EpicGamesLauncher\Data\Manifests`).
-fn epic_name(exe: &Path) -> Option<String> {
-    #[cfg(windows)]
-    {
-        let data = std::env::var_os("ProgramData")?;
-        let dir = Path::new(&data).join("Epic").join("EpicGamesLauncher").join("Data").join("Manifests");
-        let exe = exe.to_string_lossy().to_lowercase();
-        for entry in std::fs::read_dir(dir).ok()?.flatten() {
-            let Ok(text) = std::fs::read_to_string(entry.path()) else { continue };
-            let Ok(item) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
-            let (Some(name), Some(at)) = (item["DisplayName"].as_str(), item["InstallLocation"].as_str()) else { continue };
-            let at = at.trim_end_matches(['\\', '/']).to_lowercase();
-            if !at.is_empty() && exe.starts_with(&at) && exe[at.len()..].starts_with(['\\', '/']) {
-                return Some(name.to_owned());
-            }
-        }
-        None
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = exe;
-        None
-    }
 }
 
 #[cfg(test)]
