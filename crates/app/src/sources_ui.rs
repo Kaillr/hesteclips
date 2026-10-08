@@ -617,33 +617,6 @@ impl App {
         if add.response.clicked() {
             self.windowed_apps = capture::list_windowed_apps();
         }
-        // Their sound usually belongs with their picture: a suggestion, not
-        // another button that looks like adding a game.
-        let silent: Vec<CaptureApp> = list
-            .iter()
-            .filter(|a| {
-                !self
-                    .settings
-                    .audio_sources
-                    .iter()
-                    .any(|s| matches!(&s.kind, SourceKind::App { bundle_id, .. } if bundle_id.eq_ignore_ascii_case(&a.id)))
-            })
-            .cloned()
-            .collect();
-        if !silent.is_empty() {
-            ui.add_space(6.0);
-            ui.horizontal_wrapped(|ui| {
-                let names = if silent.len() == 1 { format!("{}'s sound isn't", silent[0].name) } else { "Their sound isn't".to_owned() };
-                ui.label(RichText::new(format!("{names} in your clips yet.")).color(weak));
-                if ui.link("Add it to the audio sources").clicked() {
-                    for a in &silent {
-                        self.settings
-                            .audio_sources
-                            .push(AudioSourceCfg::new(&a.name, SourceKind::App { bundle_id: a.id.clone(), app_name: a.name.clone() }));
-                    }
-                }
-            });
-        }
         ui.add_space(8.0);
         ui.checkbox(&mut away, "Show \u{201c}Tabbed out\u{201d} when it's minimized").on_hover_text(
             "When the game or app you were in stops showing (most games minimize when you alt-tab), \
