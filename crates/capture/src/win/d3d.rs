@@ -157,6 +157,10 @@ pub(crate) struct Latest {
     waiting: AtomicBool,
     /// The app being captured (its executable), when capturing apps.
     app: Mutex<Option<String>>,
+    /// The last real picture, kept while a still (the away screen) covers it,
+    /// so turning the away screen off can bring it back: a minimized window
+    /// sends no new frames. With its valid size.
+    saved: Mutex<Option<(ID3D11Texture2D, (u32, u32))>>,
     gpu: Gpu,
 }
 unsafe impl Send for Latest {}
@@ -173,6 +177,7 @@ impl Latest {
             has_frame: AtomicBool::new(false),
             waiting: AtomicBool::new(false),
             app: Mutex::new(None),
+            saved: Mutex::new(None),
             gpu: gpu.clone(),
         }))
     }
@@ -203,6 +208,18 @@ impl Latest {
         if image.width > self.width || image.height > self.height || image.bgra.len() < (image.width * image.height * 4) as usize {
             return self.clear();
         }
+        // Covering a real picture: keep it, to bring back (`restore`).
+        if self.has_frame.load(Ordering::Acquire) && !self.waiting.load(Ordering::Acquire) {
+            let bind = (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32;
+            let mut saved = self.saved.lock().unwrap();
+            if saved.is_none() {
+                *saved = Some((self.gpu.texture(self.width, self.height, DXGI_FORMAT_B8G8R8A8_UNORM, bind, D3D11_USAGE_DEFAULT, 0)?, (0, 0)));
+            }
+            if let Some((copy, size)) = saved.as_mut() {
+                unsafe { self.gpu.context.CopyResource(&*copy, &self.texture) };
+                *size = self.content();
+            }
+        }
         let region = D3D11_BOX { left: 0, top: 0, front: 0, right: image.width, bottom: image.height, back: 1 };
         unsafe {
             self.gpu.context.UpdateSubresource(&self.texture, 0, Some(&region), image.bgra.as_ptr().cast(), image.width * 4, 0);
@@ -211,6 +228,17 @@ impl Latest {
         self.waiting.store(true, Ordering::Release);
         self.has_frame.store(true, Ordering::Release);
         Ok(())
+    }
+
+    /// Bring back the picture a still covered (see `saved`). False if there's
+    /// none (nothing was showing before it).
+    pub(crate) fn restore(&self) -> bool {
+        let saved = self.saved.lock().unwrap();
+        let Some((copy, size)) = saved.as_ref().filter(|(_, s)| s.0 > 0) else { return false };
+        unsafe { self.gpu.context.CopyResource(&self.texture, copy) };
+        *self.content.lock().unwrap() = *size;
+        self.waiting.store(false, Ordering::Release);
+        true
     }
 
     /// A new picture from the CPU (a webcam frame): `width`×`height` BGRA rows

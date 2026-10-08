@@ -606,6 +606,10 @@ impl Video {
                     if system::window_hidden(*h) {
                         if config.away_when_unfocused {
                             show_away(&mut away_up);
+                        } else if away_up && latest.restore() {
+                            // Turned off while tabbed out: its last picture again.
+                            latest.set_app(Some(app.clone()));
+                            away_up = false;
                         }
                     } else if away_up {
                         // Showing again: its next frame replaces the away screen.
