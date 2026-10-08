@@ -305,18 +305,15 @@ fn press_id() -> egui::Id {
     egui::Id::new("ui_kit_lenient_press")
 }
 
-/// A dialog's way out besides its buttons: Esc. A click outside it does
-/// nothing (egui's `should_close` also closes on one, so a click meant for
-/// the page behind made the dialog vanish).
+/// A dialog's ways out besides its buttons: Esc, or a click outside it
+/// (which closes it and does nothing else: the page behind isn't clicked).
 pub trait Dismissed {
     fn dismissed(&self) -> bool;
 }
 
 impl<T> Dismissed for egui::ModalResponse<T> {
     fn dismissed(&self) -> bool {
-        self.is_top_modal
-            && !self.any_popup_open
-            && (self.response.should_close() || self.response.ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)))
+        self.should_close()
     }
 }
 
@@ -366,10 +363,9 @@ pub fn replay_click(ctx: &egui::Context, raw: &mut egui::RawInput) {
 mod tests {
     use super::*;
 
-    /// A dialog keeps the page behind it from being clicked, and a click
-    /// out there doesn't close it; Esc does.
+    /// A click outside a dialog closes it without clicking the page behind.
     #[test]
-    fn dialogs_hold_until_esc() {
+    fn a_click_outside_closes_a_dialog() {
         let ctx = egui::Context::default();
         let (mut clicks, mut closed) = (0, 0);
         let frame = |events: Vec<egui::Event>, clicks: &mut i32, closed: &mut i32| {
@@ -391,10 +387,8 @@ mod tests {
         for events in [vec![egui::Event::PointerMoved(at)], vec![], vec![button(true)], vec![button(false)], vec![], vec![]] {
             frame(events, &mut clicks, &mut closed);
         }
-        assert_eq!((clicks, closed), (0, 0), "the click behind it neither lands nor closes it");
-        let esc = egui::Event::Key { key: egui::Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() };
-        frame(vec![esc], &mut clicks, &mut closed);
-        assert_eq!(closed, 1);
+        assert_eq!(clicks, 0, "the click behind it doesn't land");
+        assert_eq!(closed, 1, "it closes the dialog");
     }
 
     /// Pressed on a button, moved 20 points, let go over it: egui alone

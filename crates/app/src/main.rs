@@ -1056,7 +1056,7 @@ impl App {
         if !self.close_dialog {
             return;
         }
-        let (mut keep, mut quit) = (false, false);
+        let (mut keep, mut quit, mut cancel) = (false, false, false);
         let modal = egui::Modal::new(egui::Id::new("close_dialog")).show(ctx, |ui| {
             ui.set_width(400.0);
             ui.heading("Keep HesteClips running?");
@@ -1068,6 +1068,7 @@ impl App {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 keep = ui.add(ui_kit::button(format!("Keep running in the {place}"), true)).clicked();
                 quit = ui.add(ui_kit::button("Quit", false)).clicked();
+                cancel = ui.add(ui_kit::button("Cancel", false)).clicked();
             });
         });
         if keep || quit {
@@ -1075,7 +1076,8 @@ impl App {
             self.settings.close_asked = true;
             self.settings.close_to_tray = keep;
             if keep { self.hide_window(ctx) } else { self.quit(ctx) }
-        } else if modal.dismissed() {
+        } else if cancel || modal.dismissed() {
+            // Nothing decided: the window stays, and it asks again next time.
             self.close_dialog = false;
         }
     }
