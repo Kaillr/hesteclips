@@ -138,6 +138,19 @@ impl Build {
 /// Builds under way or in use, by cache key (one per clip).
 static BUILDS: Mutex<Option<HashMap<u64, Weak<Build>>>> = Mutex::new(None);
 
+/// Stop building `source`'s preview (it's about to be deleted: its decoder
+/// has the file open).
+pub fn release(source: &Path) {
+    let builds = BUILDS.lock().unwrap();
+    for b in builds.iter().flat_map(|m| m.values()).filter_map(Weak::upgrade).filter(|b| b.source == source) {
+        b.stop.store(true, Ordering::Relaxed);
+        if let Some(mut c) = b.child.lock().unwrap().take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+}
+
 /// While anyone watches a build, background builds wait (the decoder is
 /// theirs, and the CPU mostly is).
 #[cfg(hw_decode)]

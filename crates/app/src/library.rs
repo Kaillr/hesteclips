@@ -596,6 +596,16 @@ impl App {
             let left = |c: &&&clips::Clip| !paths.contains(&c.path);
             at.and_then(|i| shown[i + 1..].iter().find(left).or_else(|| shown[..i].iter().rev().find(left))).map(|c| c.path.clone())
         });
+        // Let go of the clips first: Windows won't delete a file that's open,
+        // and while a clip loads its sound decoders, scrub preview and the
+        // player all have it open.
+        if after.is_some() {
+            self.viewer = None;
+        }
+        for p in paths {
+            media::pcm::release(p);
+            crate::proxy::release(p);
+        }
         let mut library = self.clips.clone();
         let (mut moved, mut busy) = (Vec::new(), 0);
         let mut error = None;
@@ -608,7 +618,7 @@ impl App {
             // Trash against what's left, so duplicates sharing assets let go of them
             // with the last copy.
             let clip = library.remove(i);
-            match store::delete(&clip, &library, permanently) {
+            match delete_when_free(&clip, &library, permanently) {
                 Ok(()) => moved.push(clip.path),
                 Err(e) => {
                     library.insert(i, clip);
@@ -1805,6 +1815,21 @@ fn collection_glyph(p: &egui::Painter, rect: Rect, color: Color32) {
     path.extend(corner(Pos2::new(r.left() + k, r.top() + k), std::f32::consts::PI));
     path.push(path[0]);
     p.extend(egui::Shape::dashed_line(&path, Stroke::new(1.3, color), 3.0, 2.5));
+}
+
+/// Delete a clip, waiting a moment if it's still open (decoders closing
+/// after being told to stop: a few ms, rarely more).
+fn delete_when_free(clip: &clips::Clip, library: &[clips::Clip], permanently: bool) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        match store::delete(clip, library, permanently) {
+            // "Used by another process" (os error 32; 0x80070020 through the Recycle Bin).
+            Err(e) if (e.contains("os error 32") || e.contains("used by another process") || e.contains("-2147024864")) && std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            r => return r,
+        }
+    }
 }
 
 /// A section's name in the sidebar.

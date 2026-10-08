@@ -23,6 +23,19 @@ use crate::PREVIEW_RATE;
 /// Sound being decoded right now, by any clip.
 static DECODING: AtomicUsize = AtomicUsize::new(0);
 
+/// Files whose sound is being decoded, and the flag that stops it.
+static RUNNING: std::sync::Mutex<Vec<(std::path::PathBuf, Arc<AtomicBool>)>> = std::sync::Mutex::new(Vec::new());
+
+/// Stop decoding `source`'s sound (it's about to be deleted: Windows won't
+/// delete a file ffmpeg has open). What's decoded stays.
+pub fn release(source: &Path) {
+    for (path, cancel) in RUNNING.lock().unwrap().iter() {
+        if path == source {
+            cancel.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Some clip's sound is being decoded. Work that reads whole clips in the
 /// background (scrub previews) waits for it: sharing a hard drive, they made
 /// each other several times slower (12 s for a 2-minute clip's sound); one
@@ -131,6 +144,8 @@ pub fn decode_streaming(source: &Path, indices: &[usize], duration: f64, finishe
     }
     let (source, indices, out) = (source.to_path_buf(), indices.to_vec(), pcm.clone());
     DECODING.fetch_add(1, Ordering::Relaxed);
+    let cancel = Arc::new(AtomicBool::new(false));
+    RUNNING.lock().unwrap().push((source.clone(), cancel.clone()));
     std::thread::Builder::new()
         .name("decode audio".into())
         .spawn(move || {
@@ -138,8 +153,8 @@ pub fn decode_streaming(source: &Path, indices: &[usize], duration: f64, finishe
                 .iter()
                 .enumerate()
                 .map(|(k, &i)| {
-                    let (source, out) = (source.clone(), out.clone());
-                    std::thread::spawn(move || decode_track(&source, i, &out.tracks[k]))
+                    let (source, out, cancel) = (source.clone(), out.clone(), cancel.clone());
+                    std::thread::spawn(move || decode_track(&source, i, &out.tracks[k], &cancel))
                 })
                 .collect();
             let mut result = Ok(());
@@ -150,6 +165,7 @@ pub fn decode_streaming(source: &Path, indices: &[usize], duration: f64, finishe
                 }
             }
             out.done.store(true, Ordering::Release);
+            RUNNING.lock().unwrap().retain(|(_, c)| !Arc::ptr_eq(c, &cancel));
             DECODING.fetch_sub(1, Ordering::Relaxed);
             finished(&out, result);
         })
@@ -159,7 +175,7 @@ pub fn decode_streaming(source: &Path, indices: &[usize], duration: f64, finishe
 
 /// Decode one track into `out` as it comes (the same ffmpeg command as
 /// [`crate::decode_audio`]).
-fn decode_track(source: &Path, index: usize, out: &PcmTrack) -> Result<()> {
+fn decode_track(source: &Path, index: usize, out: &PcmTrack, cancel: &AtomicBool) -> Result<()> {
     let mut child = crate::ffmpeg()
         .args(["-hide_banner", "-loglevel", "error", "-vn", "-i"])
         .arg(source)
@@ -176,6 +192,11 @@ fn decode_track(source: &Path, index: usize, out: &PcmTrack) -> Result<()> {
     let (mut have, mut written) = (0usize, 0usize);
     let capacity = out.samples.len();
     loop {
+        if cancel.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(());
+        }
         let read = stdout.read(&mut buf[have..])?;
         if read == 0 {
             break;
