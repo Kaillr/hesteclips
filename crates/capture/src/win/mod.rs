@@ -283,28 +283,39 @@ impl Session {
 
     /// Stop capturing and finish the file (record) or drop the ring (replay).
     fn finish(mut self) -> Result<()> {
+        // Each step logged with its time: a step that never ends is a frozen
+        // quit, and the log then says which.
+        let t = Instant::now();
+        let step = |what: &str| eprintln!("stopping capture: {what} ({} ms)", t.elapsed().as_millis());
         // The pacer flushes the video encoder on its way out.
         if let Some((stop, handle)) = self.pacer.take() {
             stop.store(true, Ordering::Relaxed);
             let _ = handle.join();
         }
+        step("frame pacer stopped");
         if let Some(video) = self.video.take() {
             video.stop();
         }
+        step("video capture stopped");
         if let Some(audio) = self.audio.take() {
             audio.stop();
         }
+        step("audio capture stopped");
         // The mixer writes what's left and drops its senders; the AAC threads then
         // flush and exit.
         if let Some((stop, handle)) = self.mixer.take() {
             stop.store(true, Ordering::Relaxed);
             let _ = handle.join();
         }
+        step("mixer stopped");
         for h in self.encoders.drain(..) {
             let _ = h.join();
         }
+        step("audio encoders stopped");
         drop(self.writer_tx);
-        self.writer.take().map_or(Ok(()), Writer::join)
+        let r = self.writer.take().map_or(Ok(()), Writer::join);
+        step("file writer done");
+        r
     }
 }
 

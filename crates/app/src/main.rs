@@ -582,6 +582,11 @@ impl App {
                 app.new_collection_with(first);
             }
         }
+        // `HESTECLIPS_DEV_BUFFER_QUIT=<secs>`: start the replay buffer, quit
+        // after that long (to check quitting while capturing).
+        if std::env::var_os("HESTECLIPS_DEV_BUFFER_QUIT").is_some() {
+            app.start_replay_buffer();
+        }
         // `HESTECLIPS_DEMO_SAVING=<clip>` shows the player waiting for its edit.
         if let Some(clip) = std::env::var_os("HESTECLIPS_DEMO_SAVING").map(PathBuf::from) {
             app.viewer = Some(viewer::Viewer::saving(&clip));
@@ -890,6 +895,15 @@ impl eframe::App for App {
     /// What runs every frame whether the window shows or not (it's hidden
     /// in the tray): shortcuts, voice, capture events, saves and uploads.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        static LAUNCHED: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        let launched = *LAUNCHED.get_or_init(Instant::now);
+        if let Some(secs) = std::env::var("HESTECLIPS_DEV_BUFFER_QUIT").ok().and_then(|s| s.parse::<f64>().ok())
+            && !self.quitting
+            && launched.elapsed().as_secs_f64() > secs
+        {
+            eprintln!("dev: quitting");
+            self.quit(ctx);
+        }
         self.background(ctx);
         self.pump_tray(ctx);
         self.handle_close(ctx);
@@ -898,6 +912,7 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self) {
+        eprintln!("quitting");
         // A downloaded update goes in once we're gone: the next launch is the new version.
         self.updater.install_on_exit(false);
     }
@@ -999,7 +1014,9 @@ impl App {
             return;
         }
         if self.settings.close_asked && !self.settings.close_to_tray {
-            return; // closes
+            // Closes: out of sight while it shuts down.
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            return;
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         if self.settings.close_asked {
@@ -1024,9 +1041,12 @@ impl App {
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
     }
 
-    fn quit(&mut self, ctx: &egui::Context) {
+    /// Quit for real. The window goes at once: stopping capture and finishing
+    /// a recording can take a moment, and a window that doesn't respond
+    /// meanwhile looks frozen.
+    pub(crate) fn quit(&mut self, ctx: &egui::Context) {
         self.quitting = true;
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
 
@@ -1289,8 +1309,7 @@ impl App {
             .on_disabled_hover_text(format!("HesteClips {version} is ready. It installs when you quit, or restart once your recording is done."));
         if r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() && self.updater.install_on_exit(true) {
             // Really quit (not to the tray): the update goes in, then it starts again.
-            self.quitting = true;
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            self.quit(ui.ctx());
         }
     }
 

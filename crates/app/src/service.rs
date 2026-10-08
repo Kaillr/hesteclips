@@ -207,14 +207,29 @@ impl Drop for CaptureService {
     /// the recorder (which finishes any recording), and we wait for that so the
     /// process doesn't exit mid-write.
     fn drop(&mut self) {
+        let t = std::time::Instant::now();
+        eprintln!("quitting: stopping capture");
         if let Some(tx) = self.cmd_tx.take() {
             let _ = tx.send(Cmd::Quit);
         }
         if let Some(hook) = STOP_HOOK.get() {
             let _ = hook.lock().map(|mut h| *h = None);
         }
+        // Wait for the file to be finished, but never forever: a capture
+        // thread that won't stop froze the app on quit (and kept an update
+        // from installing). A recording is crash-safe up to its last second
+        // anyway, and a replay buffer is only in memory.
         if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+            let limit = std::time::Duration::from_secs(10);
+            while !thread.is_finished() && t.elapsed() < limit {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            if thread.is_finished() {
+                let _ = thread.join();
+                eprintln!("quitting: capture stopped ({} ms)", t.elapsed().as_millis());
+            } else {
+                eprintln!("quitting: capture didn't stop within {} s; quitting anyway", limit.as_secs());
+            }
         }
     }
 }

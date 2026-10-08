@@ -298,8 +298,7 @@ impl App {
                             .on_disabled_hover_text("Finish your recording first");
                         if restart.clicked() && self.updater.install_on_exit(true) {
                             // Really quit (not to the tray).
-                            self.quitting = true;
-                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                            self.quit(ui.ctx());
                         }
                     }
                     Status::Unavailable => {}
