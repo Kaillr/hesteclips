@@ -25,6 +25,7 @@ mod cursor;
 mod d3d;
 pub mod decode;
 pub(crate) mod direct;
+pub mod gpu;
 mod h264;
 pub mod hook;
 mod loopback;
@@ -543,10 +544,26 @@ impl WindowCapture {
     }
 }
 
-/// How long Windows' capture of a fullscreen game in focus may send nothing
-/// before the game capture hook takes over (a guess: a game's picture
-/// rarely stands still that long, and a wrong switch only costs a moment).
-const FROZEN: Duration = Duration::from_secs(4);
+/// Exclusive fullscreen: a fullscreen game in focus is drawing (on the
+/// graphics card, `gpu`) while Windows' capture has had nothing from it for
+/// this long. Windows' capture gets a frame for every frame a window
+/// presents, the same picture again too (measured: a still window drawn 180
+/// times a second, 180 frames a second), so a game on a still screen isn't
+/// mistaken for this; one that stops drawing isn't busy on the graphics card.
+const FROZEN: Duration = Duration::from_secs(2);
+
+/// Percent of the graphics card's 3D engine that counts as drawing. A guess:
+/// a window that does nothing but clear itself every frame measured 1%, one
+/// that doesn't draw 0.
+const DRAWING: f64 = 0.3;
+
+/// Whether a fullscreen game's window that Windows' capture has had
+/// nothing from for `FROZEN` is drawing all the same (`gpu`, sampled every
+/// call while it's watched): exclusive fullscreen.
+fn unseen_but_drawing(gpu: &mut Option<gpu::GpuUse>, window: windows::Win32::Foundation::HWND, since_last_frame: Duration) -> Option<f64> {
+    let percent = gpu.as_mut()?.percent(system::window_pid(window));
+    (since_last_frame > FROZEN && percent > DRAWING).then_some(percent)
+}
 
 /// Keeps the picture coming: one capture of a display, or the windows of a set
 /// of apps, following focus between them and each as it closes and reopens.
@@ -575,6 +592,7 @@ impl Video {
             let mut hook_failed: std::collections::HashSet<usize> = Default::default();
             // Apps Windows' capture froze on: hooked from then on.
             let mut frozen: std::collections::HashSet<String> = Default::default();
+            let mut gpu_use = gpu::GpuUse::new();
             // A window that couldn't be captured, so it's reported once.
             let mut failed = None;
             // The away screen is up (so it's uploaded once, not every tick).
@@ -622,12 +640,12 @@ impl Video {
                 // Windows' capture of a fullscreen game in focus sends nothing:
                 // it can't see the game (exclusive fullscreen). The hook can.
                 if let Some((h, app, WindowCapture::Wgc(capture, true))) = &current
+                    && let Some(percent) = unseen_but_drawing(&mut gpu_use, *h, capture.since_last_frame())
                     && focused.as_ref().is_some_and(|(f, _, _)| f == h)
                     && !system::window_hidden(*h)
-                    && capture.since_last_frame() > FROZEN
                     && system::covers_display(*h)
                 {
-                    eprintln!("{app}: Windows' capture shows nothing new for {FROZEN:?} in fullscreen; switching to the game capture hook");
+                    eprintln!("{app}: drawing ({percent:.1}% of the graphics card) but Windows' capture has had nothing for {FROZEN:?}: exclusive fullscreen; switching to the game capture hook");
                     frozen.insert(app.to_lowercase());
                     current = None;
                 }
@@ -762,6 +780,7 @@ impl Video {
             let mut plans: std::collections::HashMap<usize, hook::Plan> = Default::default();
             let mut hook_failed: std::collections::HashSet<usize> = Default::default();
             let mut frozen: std::collections::HashSet<String> = Default::default();
+            let mut gpu_use = gpu::GpuUse::new();
             while !stop2.load(Ordering::Relaxed) {
                 // A fullscreen window in focus on this display.
                 let game = system::foreground_app()
@@ -813,11 +832,11 @@ impl Video {
                 }
                 // Windows' capture sends nothing new while a fullscreen game
                 // is in focus: it can't see it (exclusive fullscreen).
-                if let (Some(capture), Some((_, exe)), Some(hook::Plan::Watch)) = (&display, &game, plan)
-                    && capture.since_last_frame() > FROZEN
+                if let (Some(capture), Some((h, exe)), Some(hook::Plan::Watch)) = (&display, &game, plan)
+                    && let Some(percent) = unseen_but_drawing(&mut gpu_use, *h, capture.since_last_frame())
                     && frozen.insert(exe.to_lowercase())
                 {
-                    eprintln!("{exe}: Windows' capture shows nothing new for {FROZEN:?} in fullscreen; switching to the game capture hook");
+                    eprintln!("{exe}: drawing ({percent:.1}% of the graphics card) but Windows' capture has had nothing for {FROZEN:?}: exclusive fullscreen; switching to the game capture hook");
                 }
                 let until = Instant::now() + Self::RESCAN;
                 while Instant::now() < until && !stop2.load(Ordering::Relaxed) {

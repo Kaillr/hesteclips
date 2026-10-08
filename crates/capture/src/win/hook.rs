@@ -89,7 +89,7 @@ pub(crate) fn plan(exe: &str, window: HWND, settings: &crate::GameHook) -> (Plan
     if NEEDS_HOOK.iter().any(|n| n.eq_ignore_ascii_case(exe)) {
         return (Plan::Hook, "a game that needs it".into());
     }
-    (Plan::Watch, "no anti-cheat found; hooked if Windows' capture freezes".into())
+    (Plan::Watch, "no anti-cheat found; hooked if it turns out to be exclusive fullscreen".into())
 }
 
 // ---------------------------------------------------------------------------

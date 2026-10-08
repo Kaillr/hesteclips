@@ -351,6 +351,7 @@ impl Capture {
         let window2 = Shared(window);
         let last_frame = Arc::new(Mutex::new(std::time::Instant::now()));
         let last_frame2 = last_frame.clone();
+        let counted2 = Mutex::new((std::time::Instant::now(), 0u32));
         pool.FrameArrived(&TypedEventHandler::<Direct3D11CaptureFramePool, IInspectable>::new(move |pool, _| {
             // Whole captures: the wrappers are what make these Send.
             let (gpu2, device2, window2) = (&gpu2, &device2, &window2);
@@ -388,6 +389,15 @@ impl Capture {
             })();
             let _ = frame.Close();
             if let Ok(Some(size)) = copied {
+                // `HESTECLIPS_WGC_LOG=1`: how many frames arrive each second.
+                if std::env::var_os("HESTECLIPS_WGC_LOG").is_some() {
+                    let mut c = counted2.lock().unwrap();
+                    c.1 += 1;
+                    if c.0.elapsed() >= std::time::Duration::from_secs(1) {
+                        eprintln!("wgc: {} frames in {:.2?}", c.1, c.0.elapsed());
+                        *c = (std::time::Instant::now(), 0);
+                    }
+                }
                 *last_frame2.lock().unwrap() = std::time::Instant::now();
                 *latest2.content.lock().unwrap() = size;
                 latest2.waiting.store(false, Ordering::Release);

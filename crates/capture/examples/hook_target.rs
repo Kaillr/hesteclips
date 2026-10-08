@@ -19,6 +19,8 @@ fn main() -> windows::core::Result<()> {
 
     let secs: f64 = std::env::var("SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(10.0);
     let gl = std::env::var("GL").is_ok_and(|v| v == "1");
+    // STATIC=1: the same picture every frame (still presented each frame).
+    let still = std::env::var("STATIC").is_ok_and(|v| v == "1");
     let (w, h) = (800, 600);
     let hwnd = unsafe {
         let instance = GetModuleHandleW(None)?;
@@ -136,7 +138,7 @@ fn main() -> windows::core::Result<()> {
                 break;
             }
         }
-        draw(start.elapsed().as_secs_f32());
+        draw(if still { 0.0 } else { start.elapsed().as_secs_f32() });
     }
     Ok(())
 }

@@ -522,6 +522,13 @@ pub(crate) fn window_app_path(hwnd: HWND) -> Option<std::path::PathBuf> {
     image_path(pid).map(Into::into)
 }
 
+/// The process a window belongs to.
+pub(crate) fn window_pid(hwnd: HWND) -> u32 {
+    let mut pid = 0;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+    pid
+}
+
 /// Whether a window covers `monitor` (a fullscreen game on it).
 pub(crate) fn fullscreen_on(hwnd: HWND, monitor: HMONITOR) -> bool {
     use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromWindow};
