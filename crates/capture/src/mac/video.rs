@@ -212,9 +212,10 @@ impl Picture {
         // Games and apps start on the away screen (the stream shows the
         // display until a window is picked, but nothing of it is used).
         let apps = AppsConfig::of(source);
-        if apps.is_some() {
+        if let Some(apps) = &apps {
             out.paused.store(true, Ordering::Relaxed);
-            show_away(&latest, away.as_ref(), width, height);
+            // Black with the away screen off.
+            show_away(&latest, away.as_ref().filter(|_| apps.away_when_unfocused), width, height);
         }
         let filter = unsafe { SCContentFilter::initWithDisplay_excludingWindows(SCContentFilter::alloc(), display, &NSArray::new()) };
         let stream = unsafe { SCStream::initWithFilter_configuration_delegate(SCStream::alloc(), &filter, &config, None) };
@@ -333,13 +334,29 @@ fn follow_apps(
     let mut current: Option<(u32, String)> = None;
     // A window that couldn't be captured, so it's reported once.
     let mut failed: Option<u32> = None;
-    let mut away_up = true;
+    // Started on the away screen, or on black with it off (`held`).
+    let mut away_up = list.lock().unwrap().away_when_unfocused;
+    // Nothing listed is open and the away screen is off: the last picture
+    // (or black) stays.
+    let mut held = !away_up;
     latest.waiting.store(true, Ordering::Relaxed);
     let put_away = |away_up: &mut bool| {
         if !*away_up {
             out.paused.store(true, Ordering::Relaxed);
             show_away(&latest, away.as_ref(), width, height);
             *away_up = true;
+        }
+    };
+    let hold = |away_up: &mut bool, held: &mut bool| {
+        if !*held {
+            out.paused.store(true, Ordering::Relaxed);
+            if *away_up || latest.frame.lock().unwrap().is_none() {
+                show_away(&latest, None, width, height);
+            }
+            *latest.app.lock().unwrap() = None;
+            latest.waiting.store(true, Ordering::Relaxed);
+            *away_up = false;
+            *held = true;
         }
     };
     while !stop.load(Ordering::Relaxed) {
@@ -370,7 +387,11 @@ fn follow_apps(
             if !same {
                 current = None;
                 match target.filter(|(w, _)| failed != Some(w.id)) {
-                    None => put_away(&mut away_up),
+                    None if config.away_when_unfocused => {
+                        held = false;
+                        put_away(&mut away_up);
+                    }
+                    None => hold(&mut away_up, &mut held),
                     Some((w, app)) => match record_window(&stream, w.id) {
                         Ok(()) => {
                             *latest.app.lock().unwrap() = Some(app.clone());
@@ -380,6 +401,7 @@ fn follow_apps(
                             out.paused.store(false, Ordering::Relaxed);
                             latest.waiting.store(false, Ordering::Relaxed);
                             away_up = false;
+                            held = false;
                         }
                         Err(e) => {
                             eprintln!("can't record {app}'s window: {e:#}");
@@ -387,6 +409,15 @@ fn follow_apps(
                         }
                     },
                 }
+            }
+        }
+        // The setting changed while nothing listed is open.
+        if current.is_none() {
+            if config.away_when_unfocused && held {
+                held = false;
+                put_away(&mut away_up);
+            } else if !config.away_when_unfocused && away_up {
+                hold(&mut away_up, &mut held);
             }
         }
         // Tabbed out: the recorded window isn't showing anymore (minimized,

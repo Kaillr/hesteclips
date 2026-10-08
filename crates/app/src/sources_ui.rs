@@ -607,9 +607,9 @@ impl App {
         ui.add_space(8.0);
         ui.checkbox(&mut away, "Show \u{201c}Tabbed out\u{201d} when it's minimized").on_hover_text(
             "When the game or app you were in stops showing (most games minimize when you alt-tab), \
-             clips show the HesteClips logo with \u{201c}Tabbed out\u{201d}. Off: they keep its last picture. \
-             A window that's still on screen keeps being recorded either way, \
-             and that screen also shows while none of them is open.",
+             clips show the HesteClips logo with \u{201c}Tabbed out\u{201d}, as they do while none of them is open. \
+             Off: they keep the last picture (black if there's none yet). \
+             A window that's still on screen keeps being recorded either way.",
         );
         if list.len() > 1 {
             ui.label(RichText::new("Records the one you're using, and keeps it while you click into something else as long as it's on screen.").size(12.0).weak());

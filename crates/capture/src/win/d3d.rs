@@ -241,6 +241,18 @@ impl Latest {
         true
     }
 
+    /// Nothing's being recorded, but the picture stays as it is: the last
+    /// one shown (black if there's none, or if a still covered it and
+    /// nothing was showing before).
+    pub(crate) fn hold(&self) -> Result<()> {
+        let still_up = self.waiting.load(Ordering::Acquire);
+        if !self.has_frame.load(Ordering::Acquire) || still_up && !self.restore() {
+            return self.clear();
+        }
+        self.waiting.store(true, Ordering::Release);
+        Ok(())
+    }
+
     /// A new picture from the CPU (a webcam frame): `width`×`height` BGRA rows
     /// `pitch` bytes apart, starting at `data`.
     pub(crate) fn upload_bgra(&self, data: *const u8, pitch: u32, width: u32, height: u32) {

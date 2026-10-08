@@ -387,8 +387,10 @@ impl PictureSource {
         let latest = d3d::Latest::new(gpu, copy_w, copy_h)?;
         let video = match self {
             PictureSource::Apps(list) => {
-                // The away screen until one of the apps' windows shows up.
-                match &away {
+                // The away screen (black with it off) until one of the
+                // apps' windows shows up.
+                let on = list.lock().unwrap().away_when_unfocused;
+                match away.as_ref().filter(|_| on) {
                     Some(image) => latest.show_still(image)?,
                     None => latest.clear()?,
                 }
@@ -539,6 +541,9 @@ impl Video {
             let mut failed = None;
             // The away screen is up (so it's uploaded once, not every tick).
             let mut away_up = false;
+            // Nothing listed is open and the away screen is off: the last
+            // picture (or black) stays.
+            let mut held = false;
             let show_away = |away_up: &mut bool| {
                 if !*away_up {
                     let _ = match &away {
@@ -590,7 +595,14 @@ impl Video {
                         current = None;
                         match target.filter(|(h, _)| failed != Some(*h)) {
                             // Nothing listed is open.
-                            None => show_away(&mut away_up),
+                            None if config.away_when_unfocused => show_away(&mut away_up),
+                            None if held => {}
+                            None => {
+                                let _ = latest.hold();
+                                latest.set_app(None);
+                                away_up = false;
+                                held = true;
+                            }
                             Some((h, app)) => {
                                 match d3d::window_item(h).and_then(|item| d3d::Capture::start(&gpu, &item, &latest, Some(h), fps)) {
                                     Ok(capture) => {
@@ -598,6 +610,7 @@ impl Video {
                                         active = Some(app.clone());
                                         current = Some((h, app, capture));
                                         away_up = false;
+                                        held = false;
                                     }
                                     Err(e) => {
                                         eprintln!("can't record {app}'s window: {e:#}");
@@ -607,6 +620,15 @@ impl Video {
                             }
                         }
                     }
+                }
+                // The setting changed while nothing listed is open.
+                if current.is_none() && config.away_when_unfocused && held {
+                    held = false;
+                    show_away(&mut away_up);
+                } else if current.is_none() && !config.away_when_unfocused && away_up {
+                    let _ = latest.hold();
+                    away_up = false;
+                    held = true;
                 }
                 // Tabbed out: the recorded window isn't showing anymore
                 // (minimized, as games are when you alt-tab, or hidden). Just
