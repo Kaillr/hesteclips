@@ -165,6 +165,20 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(App::new(cc.egui_ctx.clone(), instance)))
         }),
     );
+    // The window couldn't open because a system library is missing: say
+    // which, in words (the error itself is a wall of text). Desktops have
+    // them all; a minimal install may not.
+    #[cfg(target_os = "linux")]
+    if let Err(e) = &result {
+        // The library is named in the inner error, which only the debug form shows.
+        let text = format!("{e:?}");
+        if let Some(lib) = text.split(|c: char| c.is_whitespace() || c == '(' || c == ':').find(|w| w.starts_with("lib") && w.contains(".so")) {
+            eprintln!(
+                "HesteClips can't open its window: {lib} is missing. Install your distro's package for it \
+                 (libXcursor, libXrandr, libXi, libxkbcommon-x11 and Vulkan or OpenGL drivers are needed on X11)."
+            );
+        }
+    }
     // The app is gone by now (capture stopped, files finished): an update
     // can go in.
     update::apply_queued();

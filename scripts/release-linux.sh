@@ -73,8 +73,11 @@ somewhere else, then run it once from its new place). It keeps itself up to
 date, as long as this folder is yours to write to (in your home folder, not
 /opt).
 
-Needs PipeWire and an xdg-desktop-portal for your desktop. ffmpeg is
-included (ffmpeg, ffprobe and lib/, GPL: see ffmpeg-LICENSE.txt).
+Needs a recent Linux (glibc 2.39+: Ubuntu 24.04, Fedora 40, Debian 13, Arch,
+CachyOS or newer) with PipeWire, as desktops have them. ffmpeg is included
+(ffmpeg, ffprobe and lib/, GPL: see ffmpeg-LICENSE.txt). If it doesn't start,
+run it from a terminal: it says what's missing. Its log is in
+~/.local/share/hesteclips/logs.
 
 https://github.com/Kaillr/hesteclips
 EOF
