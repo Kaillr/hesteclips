@@ -816,10 +816,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "ashpd",
+ "async-io",
  "block2 0.6.2",
  "chrono",
  "cpal",
  "dispatch2",
+ "futures-util",
  "libc",
  "nnnoiseless",
  "objc2 0.6.4",

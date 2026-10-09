@@ -1,7 +1,8 @@
 //! The screen's picture, read into memory: from the X server on an X11
 //! session (`super::x11`), copied from the compositor on wlroots-style
 //! Wayland desktops (`super::wlr`), else from a PipeWire video node: KWin's
-//! own on KDE Plasma (`super::kwin`), or the portal's.
+//! own on KDE Plasma (`super::kwin`), Mutter's on GNOME (`super::mutter`), or
+//! the portal's.
 //!
 //! One cast serves everything that wants the screen: the Sources preview and
 //! a recording share it, and it lives on for a few seconds after the last one
@@ -25,7 +26,7 @@ use pipewire as pw;
 use pw::spa;
 
 use super::portal::{self, Cast};
-use super::{kwin, wlr, x11};
+use super::{kwin, mutter, wlr, x11};
 
 /// Which way round a frame's colour bytes are.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,7 +134,7 @@ impl Latest {
 /// A running screen cast.
 pub(crate) struct Screen {
     pub latest: Arc<Latest>,
-    /// The screen asked for (on X11 and wlroots a monitor; the portal picks its own).
+    /// The screen asked for (a monitor; the portal picks its own).
     id: String,
     stop: Stop,
     thread: Mutex<Option<JoinHandle<()>>>,
@@ -165,6 +166,8 @@ pub(crate) fn acquire(id: &str) -> Result<Arc<Screen>> {
         Screen::start_direct(id, wlr::Grab::open, wlr::run).inspect_err(|e| eprintln!("Wayland screen copy: {e:#}; trying the desktop portal")).ok()
     } else if kwin::available() {
         Screen::start_kwin(id).inspect_err(|e| eprintln!("KDE screen stream: {e:#}; trying the desktop portal")).ok()
+    } else if mutter::available() {
+        Screen::start_mutter(id).inspect_err(|e| eprintln!("GNOME screen stream: {e:#}; trying the desktop portal")).ok()
     } else {
         None
     };
@@ -216,6 +219,19 @@ impl Screen {
         let latest = Arc::new(Latest::default());
         let ended = Arc::downgrade(&latest);
         let cast = kwin::Cast::open(id, move |why| {
+            if let Some(l) = ended.upgrade() {
+                l.end(why);
+            }
+        })?;
+        let node = cast.node;
+        Self::start_pipewire(id, None, node, latest, move || drop(cast))
+    }
+
+    /// Mutter's stream: the node is on the session's own PipeWire.
+    fn start_mutter(id: &str) -> Result<Self> {
+        let latest = Arc::new(Latest::default());
+        let ended = Arc::downgrade(&latest);
+        let cast = mutter::Cast::open(id, move |why| {
             if let Some(l) = ended.upgrade() {
                 l.end(why);
             }
