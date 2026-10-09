@@ -118,7 +118,7 @@ fn main() -> eframe::Result<()> {
         }
     };
     // Started with the computer: straight to the tray.
-    let background = tray::AVAILABLE && std::env::args().any(|a| a == autostart::BACKGROUND);
+    let background = std::env::args().any(|a| a == autostart::BACKGROUND) && tray::available();
     // Before anything talks to the desktop portal (screen capture, shortcuts),
     // which wants to know who we are, and needs our `.desktop` file for that.
     #[cfg(target_os = "linux")]

@@ -1,9 +1,12 @@
-//! The tray icon (Windows) / menu bar icon (macOS): HesteClips keeps running
-//! there when its window is closed, so the replay buffer and shortcuts keep
-//! working. Its menu: open the window, save a clip, start or stop the replay
-//! buffer, quit. Clicking the icon opens the window.
+//! The tray icon (Windows, Linux) / menu bar icon (macOS): HesteClips keeps
+//! running there when its window is closed, so the replay buffer and
+//! shortcuts keep working. Its menu: open the window, save a clip, start or
+//! stop the replay buffer, quit. Clicking the icon opens the window.
 //!
-//! Linux has none yet (the tray library needs GTK there): closing quits.
+//! On Linux it's a StatusNotifierItem on the session bus, which KDE, XFCE,
+//! Cinnamon, Hyprland's and Sway's bars and most others show (GNOME with its
+//! AppIndicator extension, which Ubuntu has). Where nothing shows it, there's
+//! no tray, and closing the window quits as before.
 
 use std::sync::mpsc::{self, Receiver};
 
@@ -17,13 +20,28 @@ pub enum Cmd {
     Quit,
 }
 
-/// Whether this platform has a tray here.
-pub const AVAILABLE: bool = cfg!(any(windows, target_os = "macos"));
+/// Whether there's a tray here: always on Windows and macOS; on Linux when
+/// the desktop shows tray icons (asked once).
+pub fn available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        linux::host_present()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        cfg!(any(windows, target_os = "macos"))
+    }
+}
 
 pub struct Tray {
     rx: Receiver<Cmd>,
     #[cfg(any(windows, target_os = "macos"))]
     inner: Inner,
+    #[cfg(target_os = "linux")]
+    inner: ksni::blocking::Handle<linux::Item>,
+    /// What the menu shows now, so it's only changed when it changes.
+    #[cfg(target_os = "linux")]
+    buffering: std::cell::Cell<bool>,
 }
 
 #[cfg(any(windows, target_os = "macos"))]
@@ -76,7 +94,12 @@ impl Tray {
             }));
             Some(Self { rx, inner: Inner { _icon: tray, save, buffer, buffering: Default::default() } })
         }
-        #[cfg(not(any(windows, target_os = "macos")))]
+        #[cfg(target_os = "linux")]
+        {
+            let inner = linux::spawn(ctx, icon, tx)?;
+            Some(Self { rx, inner, buffering: Default::default() })
+        }
+        #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
         {
             let _ = (ctx, icon, tx, rx);
             None
@@ -99,8 +122,115 @@ impl Tray {
                 i.buffer.set_text(if buffering { "Stop replay buffer" } else { "Start replay buffer" });
             }
         }
-        #[cfg(not(any(windows, target_os = "macos")))]
+        // Only when it changed: each update tells the desktop to redraw the menu.
+        #[cfg(target_os = "linux")]
+        if self.buffering.replace(buffering) != buffering {
+            self.inner.update(|item| item.buffering = buffering);
+        }
+        #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
         let _ = buffering;
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod linux {
+    use std::sync::mpsc;
+
+    use ksni::blocking::TrayMethods;
+
+    use super::Cmd;
+
+    /// Whether something on the desktop shows tray icons: the
+    /// StatusNotifierWatcher is on the session bus. Asked once.
+    pub fn host_present() -> bool {
+        static PRESENT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *PRESENT.get_or_init(|| {
+            pollster::block_on(async {
+                let bus = ashpd::zbus::Connection::session().await.ok()?;
+                let dbus = ashpd::zbus::fdo::DBusProxy::new(&bus).await.ok()?;
+                let name = ashpd::zbus::names::BusName::try_from("org.kde.StatusNotifierWatcher").ok()?;
+                dbus.name_has_owner(name).await.ok()
+            })
+            .unwrap_or(false)
+        })
+    }
+
+    /// The tray item: what it shows, and where its clicks go.
+    pub struct Item {
+        icon: Vec<ksni::Icon>,
+        tx: mpsc::Sender<Cmd>,
+        ctx: egui::Context,
+        pub buffering: bool,
+    }
+
+    impl Item {
+        fn send(&self, cmd: Cmd) {
+            let _ = self.tx.send(cmd);
+            self.ctx.request_repaint();
+        }
+    }
+
+    impl ksni::Tray for Item {
+        fn id(&self) -> String {
+            crate::portal_shortcuts::APP_ID.into()
+        }
+        fn title(&self) -> String {
+            "HesteClips".into()
+        }
+        fn icon_pixmap(&self) -> Vec<ksni::Icon> {
+            self.icon.clone()
+        }
+        fn tool_tip(&self) -> ksni::ToolTip {
+            ksni::ToolTip { title: "HesteClips".into(), ..Default::default() }
+        }
+        /// A left click opens the window.
+        fn activate(&mut self, _x: i32, _y: i32) {
+            self.send(Cmd::Open);
+        }
+        fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
+            use ksni::menu::StandardItem;
+            let item = |label: &str, enabled: bool, cmd: Cmd| {
+                StandardItem { label: label.into(), enabled, activate: Box::new(move |this: &mut Self| this.send(cmd)), ..Default::default() }.into()
+            };
+            vec![
+                item("Open HesteClips", true, Cmd::Open),
+                ksni::MenuItem::Separator,
+                item("Save clip", self.buffering, Cmd::SaveClip),
+                item(if self.buffering { "Stop replay buffer" } else { "Start replay buffer" }, true, Cmd::ToggleBuffer),
+                ksni::MenuItem::Separator,
+                item("Quit HesteClips", true, Cmd::Quit),
+            ]
+        }
+        /// The desktop stopped showing tray icons (its panel restarted, say):
+        /// keep the item, it comes back when the panel does.
+        fn watcher_offline(&self, _reason: ksni::OfflineReason) -> bool {
+            true
+        }
+    }
+
+    /// Put the item in the tray. `None` where nothing shows tray icons.
+    pub fn spawn(ctx: &egui::Context, icon: &egui::IconData, tx: mpsc::Sender<Cmd>) -> Option<ksni::blocking::Handle<Item>> {
+        if !host_present() {
+            eprintln!("no tray icon: this desktop doesn't show tray icons (on GNOME, the AppIndicator extension adds them); closing the window quits");
+            return None;
+        }
+        // Trays show 16–48 px: a few sizes (sent again with every change, so
+        // not the 1024 px original), ARGB32 in network byte order as
+        // StatusNotifierItem wants it.
+        let full = image::RgbaImage::from_raw(icon.width, icon.height, icon.rgba.clone())?;
+        let sizes = [22, 32, 48, 64].map(|size| {
+            let small = image::imageops::resize(&full, size, size, image::imageops::FilterType::Lanczos3);
+            let data = small.pixels().flat_map(|p| [p[3], p[0], p[1], p[2]]).collect();
+            ksni::Icon { width: size as i32, height: size as i32, data }
+        });
+        let item = Item { icon: sizes.to_vec(), tx, ctx: ctx.clone(), buffering: false };
+        match item.spawn() {
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                eprintln!("no tray icon: {e}");
+                None
+            }
+        }
     }
 }
 

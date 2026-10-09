@@ -97,7 +97,7 @@ impl App {
         section(ui, "Starting and closing", |ui| {
             // Read from the system each time it's shown: it's the truth.
             let mut on = crate::autostart::is_on();
-            let hint = if crate::tray::AVAILABLE { "Starts in the tray, ready to clip." } else { "Ready to clip when you log in." };
+            let hint = if crate::tray::available() { "Starts in the tray, ready to clip." } else { "Ready to clip when you log in." };
             row(ui, crate::autostart::label(), Some(hint), |ui| {
                 if toggle(ui, &mut on).changed() {
                     if let Err(e) = crate::autostart::set(on) {
@@ -105,7 +105,7 @@ impl App {
                     }
                 }
             });
-            if crate::tray::AVAILABLE {
+            if self.tray.is_some() {
                 divider(ui);
                 let place = if cfg!(target_os = "macos") { "menu bar" } else { "tray" };
                 let hint = format!("In the {place}, the replay buffer and shortcuts keep working.");
