@@ -1,6 +1,7 @@
 //! The screen's picture, read into memory: from the X server on an X11
 //! session (`super::x11`), copied from the compositor on wlroots-style
-//! Wayland desktops (`super::wlr`), else from the portal's PipeWire video node.
+//! Wayland desktops (`super::wlr`), else from a PipeWire video node: KWin's
+//! own on KDE Plasma (`super::kwin`), or the portal's.
 //!
 //! One cast serves everything that wants the screen: the Sources preview and
 //! a recording share it, and it lives on for a few seconds after the last one
@@ -13,6 +14,7 @@
 //! copies them out for us): 4 bytes a pixel, BGRx or RGBx.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::os::fd::OwnedFd;
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::{self, JoinHandle};
@@ -23,7 +25,7 @@ use pipewire as pw;
 use pw::spa;
 
 use super::portal::{self, Cast};
-use super::{wlr, x11};
+use super::{kwin, wlr, x11};
 
 /// Which way round a frame's colour bytes are.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,6 +141,7 @@ pub(crate) struct Screen {
 
 /// How to stop a cast's thread.
 enum Stop {
+    /// A PipeWire stream (the portal's, KWin's).
     Portal(Mutex<Option<pw::channel::Sender<()>>>),
     /// A source that reads the screen itself (X11, wlroots).
     Direct(Arc<AtomicBool>),
@@ -160,6 +163,8 @@ pub(crate) fn acquire(id: &str) -> Result<Arc<Screen>> {
         Screen::start_direct(id, x11::Grab::open, x11::run).inspect_err(|e| eprintln!("X11 screen capture: {e:#}; trying the desktop portal")).ok()
     } else if wlr::available() {
         Screen::start_direct(id, wlr::Grab::open, wlr::run).inspect_err(|e| eprintln!("Wayland screen copy: {e:#}; trying the desktop portal")).ok()
+    } else if kwin::available() {
+        Screen::start_kwin(id).inspect_err(|e| eprintln!("KDE screen stream: {e:#}; trying the desktop portal")).ok()
     } else {
         None
     };
@@ -202,16 +207,35 @@ pub(crate) fn release(screen: Arc<Screen>) {
 impl Screen {
     fn start_portal(id: &str) -> Result<Self> {
         let (cast, fd) = Cast::open()?;
+        let node = cast.node;
+        Self::start_pipewire(id, Some(fd), node, Arc::new(Latest::default()), move || cast.close())
+    }
+
+    /// KWin's stream: the node is on the session's own PipeWire.
+    fn start_kwin(id: &str) -> Result<Self> {
         let latest = Arc::new(Latest::default());
+        let ended = Arc::downgrade(&latest);
+        let cast = kwin::Cast::open(id, move |why| {
+            if let Some(l) = ended.upgrade() {
+                l.end(why);
+            }
+        })?;
+        let node = cast.node;
+        Self::start_pipewire(id, None, node, latest, move || drop(cast))
+    }
+
+    /// Read a PipeWire video node on its own thread: on the remote behind
+    /// `fd` (the portal's), else the session's PipeWire. `done` runs when the
+    /// reading stops.
+    fn start_pipewire(id: &str, fd: Option<OwnedFd>, node: u32, latest: Arc<Latest>, done: impl FnOnce() + Send + 'static) -> Result<Self> {
         let (ready_tx, ready_rx) = mpsc::channel::<Result<pw::channel::Sender<()>>>();
         let latest2 = latest.clone();
         let thread = thread::Builder::new().name("screen".into()).spawn(move || {
-            let node = cast.node;
             if let Err(e) = run(fd, node, &latest2, &ready_tx) {
                 latest2.end(format!("{e:#}"));
                 let _ = ready_tx.send(Err(e));
             }
-            cast.close();
+            done();
         })?;
         let stop = ready_rx.recv_timeout(Duration::from_secs(10)).map_err(|_| anyhow!("PipeWire didn't open the screen"))??;
         Ok(Self { latest, id: id.to_owned(), stop: Stop::Portal(Mutex::new(Some(stop))), thread: Mutex::new(Some(thread)) })
@@ -262,11 +286,14 @@ struct StreamState {
 
 /// Read the cast until told to stop (or it ends). Sends the stopper once the
 /// stream is connected.
-fn run(fd: std::os::fd::OwnedFd, node: u32, latest: &Arc<Latest>, ready: &mpsc::Sender<Result<pw::channel::Sender<()>>>) -> Result<()> {
+fn run(fd: Option<OwnedFd>, node: u32, latest: &Arc<Latest>, ready: &mpsc::Sender<Result<pw::channel::Sender<()>>>) -> Result<()> {
     pw::init();
     let mainloop = pw::main_loop::MainLoopRc::new(None)?;
     let context = pw::context::ContextRc::new(&mainloop, None)?;
-    let core = context.connect_fd_rc(fd, None)?;
+    let core = match fd {
+        Some(fd) => context.connect_fd_rc(fd, None)?,
+        None => context.connect_rc(None)?,
+    };
     let stream = pw::stream::StreamRc::new(
         core.clone(),
         "hesteclips-screen",

@@ -104,7 +104,13 @@ mod imp {
                 _ => Ok(()),
             };
         }
-        let desktop = format!("[Desktop Entry]\nType=Application\nName=HesteClips\nExec=\"{}\" {}\nX-GNOME-Autostart-enabled=true\n", exe.display(), super::BACKGROUND);
+        // KDE gives its screencast to the first entry it finds whose Exec is
+        // us, so this one asks for it too, like the app's own entry.
+        let desktop = format!(
+            "[Desktop Entry]\nType=Application\nName=HesteClips\nExec=\"{}\" {}\nX-GNOME-Autostart-enabled=true\nX-KDE-Wayland-Interfaces=zkde_screencast_unstable_v1\n",
+            exe.display(),
+            super::BACKGROUND
+        );
         std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
         std::fs::write(path, desktop).map_err(|e| e.to_string())
     }

@@ -64,7 +64,7 @@ impl Output {
         let name = self.name.clone()?;
         let (w, h) = self.size?;
         let label = match &self.description {
-            Some(d) if !d.is_empty() && *d != name => format!("{name} ({d})"),
+            Some(d) if !d.trim().is_empty() && d.trim() != name => format!("{name} ({})", d.trim()),
             _ => name.clone(),
         };
         Some(Monitor { id: format!("wl:{name}"), name: label, width: w as u32, height: h as u32, x: self.position.0, y: self.position.1 })

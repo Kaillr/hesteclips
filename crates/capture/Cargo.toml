@@ -82,7 +82,8 @@ libc = "0.2"
 
 
 # Linux: the screen from the X server on X11 (no dialog, any desktop), or
-# copied from the compositor on Sway, Hyprland and their kin (no dialog), else
+# copied from the compositor on Sway, Hyprland and their kin, or streamed by
+# KWin on KDE Plasma (no dialog either), else
 # through the xdg-desktop-portal, its pictures and all audio through
 # PipeWire. Encoding is done by ffmpeg, which the app ships with anyway.
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -92,3 +93,4 @@ pollster = "1"
 x11rb = { version = "0.13", features = ["randr", "shm", "xfixes"] }
 wayland-client = "0.31"
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+wayland-protocols-plasma = { version = "0.3", features = ["client"] }

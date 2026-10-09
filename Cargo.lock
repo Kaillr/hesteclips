@@ -841,6 +841,7 @@ dependencies = [
  "rubato",
  "serde_json",
  "wayland-client",
+ "wayland-protocols-plasma",
  "wayland-protocols-wlr",
  "windows 0.62.2",
  "windows-core 0.62.2",
