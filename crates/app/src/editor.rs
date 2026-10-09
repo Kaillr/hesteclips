@@ -80,6 +80,8 @@ struct Ready {
     dragging: Option<Drag>,
     /// Was playing when a playhead or trim drag began: carry on after it.
     resume: bool,
+    /// While the selection is dragged: how far into it it was grabbed.
+    grab_offset: f64,
     /// How far the audio tracks are scrolled up when they don't all fit.
     lane_scroll: f32,
     /// Wheel scrolling and Ctrl+wheel zoom, eased out over a few frames.
@@ -270,6 +272,7 @@ impl Ready {
             master: Meter::default(),
             dragging: None,
             resume: false,
+            grab_offset: 0.0,
             lane_scroll: 0.0,
             glide: Default::default(),
             zoom_glide: Default::default(),
@@ -911,6 +914,19 @@ impl Ready {
         lp.rect_stroke(Rect::from_min_max(Pos2::new(xi, video.top()), Pos2::new(xo, video.bottom())), 3, Stroke::new(2.5, HOT_YELLOW), StrokeKind::Inside);
         lp.vline(xi, body.y_range(), Stroke::new(1.5, HOT_YELLOW));
         lp.vline(xo, body.y_range(), Stroke::new(1.5, HOT_YELLOW));
+        // The frame's top and bottom bars move the whole selection (its length
+        // kept), as Vegas and Windows' trimmer let you.
+        let grab = 7.0;
+        let move_bars = [
+            Rect::from_x_y_ranges(xi + handle_w..=xo - handle_w, video.top() - 2.0..=video.top() + grab),
+            Rect::from_x_y_ranges(xi + handle_w..=xo - handle_w, video.bottom() - grab..=video.bottom() + 2.0),
+        ];
+        let over_bar = |pos: Pos2| xo - xi > 2.0 * handle_w && move_bars.iter().any(|r| r.contains(pos));
+        if self.dragging == Some(Drag::Range) || ui.input(|i| i.pointer.hover_pos()).is_some_and(|p| over_bar(p) && self.dragging.is_none()) {
+            for r in move_bars {
+                lp.rect_filled(r.shrink2(Vec2::new(0.0, 2.0)), 0, HOT_YELLOW.gamma_multiply(0.35));
+            }
+        }
         for h in [in_handle, out_handle] {
             lp.rect_filled(h, 2, HOT_YELLOW);
             lp.vline(h.center().x, h.center().y - 7.0..=h.center().y + 7.0, Stroke::new(2.0, Color32::from_black_alpha(160)));
@@ -981,6 +997,9 @@ impl Ready {
             if out_handle.expand(5.0).contains(pos) {
                 return Some(Drag::Out);
             }
+            if over_bar(pos) {
+                return Some(Drag::Range);
+            }
             for (i, lane) in lane_rects.iter().enumerate() {
                 if !lane.contains(pos) || !audio_view.contains(pos) {
                     continue;
@@ -1000,6 +1019,7 @@ impl Ready {
         if let Some(pos) = pointer {
             match hit(pos, self) {
                 Some(Drag::In | Drag::Out) => ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal),
+                Some(Drag::Range) => ui.ctx().set_cursor_icon(if self.dragging.is_some() { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab }),
                 Some(Drag::Point(..)) => ui.ctx().set_cursor_icon(egui::CursorIcon::Grab),
                 Some(Drag::Line(_)) => ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical),
                 _ => {}
@@ -1020,9 +1040,11 @@ impl Ready {
             if let Some(pos) = ui.input(|i| i.pointer.press_origin()).or(resp.interact_pointer_pos()) {
                 let d = hit(pos, self).unwrap_or(Drag::Playhead);
                 self.dragging = Some(d);
+                // Where in the selection it was grabbed, so it moves with the pointer.
+                self.grab_offset = self.info.snap(t_of(pos.x)) - self.edit.start;
                 // Moving the playhead or a trim pauses while you drag and carries on
                 // after; shaping the volume never interrupts playback.
-                if matches!(d, Drag::In | Drag::Out | Drag::Playhead) {
+                if matches!(d, Drag::In | Drag::Out | Drag::Range | Drag::Playhead) {
                     self.resume = self.player.is_playing();
                     self.player.pause();
                 }
@@ -1030,7 +1052,7 @@ impl Ready {
         }
         if let (Some(pos), Some(d)) = (resp.interact_pointer_pos(), self.dragging) {
             // Dragging the playhead or a trim past either end scrolls a zoomed timeline.
-            if matches!(d, Drag::In | Drag::Out | Drag::Playhead) && resp.dragged() {
+            if matches!(d, Drag::In | Drag::Out | Drag::Range | Drag::Playhead) && resp.dragged() {
                 let over = if pos.x > lanes.right() { pos.x - lanes.right() } else if pos.x < lanes.left() { pos.x - lanes.left() } else { 0.0 };
                 if over != 0.0 {
                     self.view.0 = (self.view.0 + (over / lanes.width()) as f64 * self.view.1 * 0.1).clamp(0.0, (dur - self.view.1).max(0.0));
@@ -1047,6 +1069,14 @@ impl Ready {
                     Drag::Out => {
                         self.edit.end = (t + fd).clamp(self.edit.start + fd, self.info.duration);
                         self.player.seek(self.edit.end - fd);
+                    }
+                    Drag::Range => {
+                        // Same length, slid along the clip, stopping at its ends.
+                        let len = self.edit.end - self.edit.start;
+                        let start = self.info.snap((t - self.grab_offset).clamp(0.0, (self.info.duration - len).max(0.0)));
+                        self.edit.start = start;
+                        self.edit.end = (start + len).min(self.info.duration);
+                        self.player.seek(self.edit.start);
                     }
                     Drag::Playhead => self.player.seek(t + 1e-6),
                     Drag::Line(i) => {
@@ -1179,6 +1209,8 @@ impl Ready {
 enum Drag {
     In,
     Out,
+    /// The whole selection, its length kept.
+    Range,
     Playhead,
     /// Whole volume line of track i.
     Line(usize),
