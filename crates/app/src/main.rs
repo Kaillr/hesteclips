@@ -86,7 +86,7 @@ fn main() -> eframe::Result<()> {
     }
     // An installed app has no console: what it prints goes to its log file
     // (`HESTECLIPS_LOG=1` does the same in a development build, to check it).
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     if cfg!(not(debug_assertions)) || std::env::var_os("HESTECLIPS_LOG").is_some() {
         logfile::start();
     }
