@@ -187,7 +187,7 @@ pub(crate) struct AppsConfig {
 impl AppsConfig {
     pub(crate) fn of(source: &VideoSource) -> Option<Self> {
         match source {
-            VideoSource::Apps { ids, away_when_unfocused } => Some(Self { ids: ids.clone(), away_when_unfocused: *away_when_unfocused }),
+            VideoSource::Apps { ids, away_when_unfocused, .. } => Some(Self { ids: ids.clone(), away_when_unfocused: *away_when_unfocused }),
             VideoSource::Screen { .. } => None,
         }
     }
