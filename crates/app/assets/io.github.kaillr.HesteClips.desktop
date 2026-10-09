@@ -10,4 +10,4 @@ Categories=AudioVideo;Video;Recorder;
 Keywords=clip;replay;record;screen;capture;game;
 StartupWMClass=io.github.kaillr.HesteClips
 SingleMainWindow=true
-X-KDE-Wayland-Interfaces=zkde_screencast_unstable_v1
+X-KDE-Wayland-Interfaces=zkde_screencast_unstable_v1,org_kde_plasma_window_management

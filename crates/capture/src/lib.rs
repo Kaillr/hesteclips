@@ -276,7 +276,11 @@ pub fn foreground_exe() -> Option<String> {
     {
         mac::windows::foreground_exe()
     }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    #[cfg(target_os = "linux")]
+    {
+        linux::focus::foreground_app_path().map(|(id, _)| id)
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     {
         None
     }
@@ -299,7 +303,11 @@ pub fn foreground_app_path() -> Option<(String, PathBuf)> {
     {
         mac::windows::foreground_app_path()
     }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    #[cfg(target_os = "linux")]
+    {
+        linux::focus::foreground_app_path()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     {
         None
     }

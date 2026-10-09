@@ -2,7 +2,8 @@
 //! protocol (what Plasma's portal uses underneath): no dialog, and every
 //! monitor is known, so they're listed in the app.
 //!
-//! KWin hands it only to apps whose `.desktop` file lists it under
+//! KWin hands it (and its window list, `super::kwin_windows`) only to apps
+//! whose `.desktop` file lists it under
 //! `X-KDE-Wayland-Interfaces` (found by matching its `Exec=` to our
 //! executable), which ours does (`linux_desktop.rs` in the app writes it,
 //! pointing at wherever we run from). Plasma 6.8 and later let any app that

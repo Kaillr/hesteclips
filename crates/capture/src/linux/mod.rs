@@ -32,11 +32,14 @@ pub mod audio;
 mod camera;
 pub mod ffmpeg;
 mod image;
+pub mod focus;
 mod kwin;
+mod kwin_windows;
 mod mutter;
 mod portal;
 mod screen;
 mod wlr;
+mod wlr_windows;
 mod x11;
 
 use std::path::{Path, PathBuf};

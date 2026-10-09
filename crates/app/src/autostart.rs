@@ -104,10 +104,10 @@ mod imp {
                 _ => Ok(()),
             };
         }
-        // KDE gives its screencast to the first entry it finds whose Exec is
-        // us, so this one asks for it too, like the app's own entry.
+        // KDE gives its screencast and window list to the first entry it finds
+        // whose Exec is us, so this one asks for them too, like the app's own.
         let desktop = format!(
-            "[Desktop Entry]\nType=Application\nName=HesteClips\nExec=\"{}\" {}\nX-GNOME-Autostart-enabled=true\nX-KDE-Wayland-Interfaces=zkde_screencast_unstable_v1\n",
+            "[Desktop Entry]\nType=Application\nName=HesteClips\nExec=\"{}\" {}\nX-GNOME-Autostart-enabled=true\nX-KDE-Wayland-Interfaces=zkde_screencast_unstable_v1,org_kde_plasma_window_management\n",
             exe.display(),
             super::BACKGROUND
         );
