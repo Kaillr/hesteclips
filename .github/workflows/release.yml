@@ -136,7 +136,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: linux
-          path: Releases/HesteClips-linux-x64.tar.gz
+          path: Releases/HesteClips-linux-x64.tar.gz*
           if-no-files-found: error
 
   mac:

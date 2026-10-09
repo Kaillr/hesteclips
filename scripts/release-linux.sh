@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Builds the Linux release into Releases/: HesteClips-linux-x64.tar.gz, the app
-# with its desktop entry and icon. Unpack it anywhere and run ./hesteclips; on
+# with its desktop entry and icon, and its checksum (.sha256, for the app's
+# updater). Unpack it anywhere and run ./hesteclips; on
 # first launch it adds itself to the desktop's apps (linux_desktop.rs).
 # ffmpeg is included, so there's nothing else to install.
 #
@@ -68,7 +69,9 @@ HesteClips $version for Linux (x86-64)
 
 Run ./hesteclips. The first time, it adds itself to your desktop's apps, so
 after that you can start it from there (move this folder first if you want it
-somewhere else, then run it once from its new place).
+somewhere else, then run it once from its new place). It keeps itself up to
+date, as long as this folder is yours to write to (in your home folder, not
+/opt).
 
 Needs PipeWire and an xdg-desktop-portal for your desktop. ffmpeg is
 included (ffmpeg, ffprobe and lib/, GPL: see ffmpeg-LICENSE.txt).
@@ -77,4 +80,6 @@ https://github.com/Kaillr/hesteclips
 EOF
 
 tar -C "$work" -czf "$out/$name.tar.gz" "$name"
+# The app's updater checks the download against this before installing it.
+(cd "$out" && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
 echo "built $out/$name.tar.gz"

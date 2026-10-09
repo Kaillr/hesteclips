@@ -46,13 +46,15 @@ drag = "2"
 tray-icon = "0.21"
 
 # Linux: global shortcuts through the desktop portal (Wayland has no other
-# way), showing a clip in the file manager, and the log file (libc).
+# way), showing a clip in the file manager, the log file (libc), and checking
+# downloaded updates (sha2).
 [target.'cfg(target_os = "linux")'.dependencies]
 ashpd = { version = "0.13", default-features = false, features = ["async-io", "global_shortcuts"] }
 async-io = "2"
 futures-util = { version = "0.3", default-features = false }
 libc = "0.2"
 pollster = "1"
+sha2 = "0.11"
 
 # Windows-only: drawing decoded frames straight from the GPU (gpu_frames.rs).
 [target.'cfg(windows)'.dependencies]

@@ -44,6 +44,8 @@ mod thumbs;
 mod tray;
 mod ui_kit;
 mod update;
+#[cfg(target_os = "linux")]
+mod update_linux;
 #[cfg(hw_decode)]
 mod gpu_frames;
 #[cfg(hw_decode)]
@@ -97,6 +99,10 @@ fn main() -> eframe::Result<()> {
     // place now. Does nothing in a development build.
     #[cfg(windows)]
     velopack::VelopackApp::build().run();
+    #[cfg(target_os = "linux")]
+    if update_linux::apply_pending_at_launch() {
+        return Ok(());
+    }
     // One HesteClips at a time: another launch shows the running one and
     // exits. (Not for development test instances, which run beside it.)
     let test_instance = std::env::vars_os().any(|(k, _)| {

@@ -6,6 +6,10 @@
 //! you quit — nothing ever interrupts a game or a recording. Once one is
 //! downloaded, an "Update ready" button offers to restart into it now.
 //!
+//! On Linux there's no installer: the release tarball, unpacked anywhere the
+//! user can write to, updates its own folder the same way
+//! (`crate::update_linux`).
+//!
 //! A copy run from the build folder (`cargo run`) isn't installed, so it has
 //! nothing to update: [`Status::Unavailable`].
 //!
@@ -16,8 +20,8 @@
 //! mid-way through stopping a capture and finishing its file, looked like a
 //! crash.
 
-// Only the installed Windows app updates itself so far.
-#![cfg_attr(not(windows), allow(dead_code))]
+// The installed Windows app and the unpacked Linux one update themselves.
+#![cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
 
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
@@ -65,19 +69,25 @@ struct Shared {
     /// The downloaded update.
     #[cfg(windows)]
     ready: Option<velopack::VelopackAsset>,
+    /// The downloaded update, unpacked.
+    #[cfg(target_os = "linux")]
+    ready: Option<std::path::PathBuf>,
 }
 
 /// The update to install once the app has shut down, and whether to start
 /// the new version after.
 #[cfg(windows)]
 static QUEUED: Mutex<Option<(velopack::UpdateManager, velopack::VelopackAsset, bool)>> = Mutex::new(None);
+/// On Linux: the unpacked update, the folder it replaces, and whether to restart.
+#[cfg(target_os = "linux")]
+static QUEUED: Mutex<Option<(std::path::PathBuf, std::path::PathBuf, bool)>> = Mutex::new(None);
 
 impl Updater {
     pub fn new(ctx: egui::Context, auto: bool) -> Self {
         let shared = Arc::new(Mutex::new(Shared {
             status: Status::Unavailable,
             auto,
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "linux"))]
             ready: None,
         }));
         #[cfg(windows)]
@@ -104,7 +114,31 @@ impl Updater {
             });
             Self { manager, shared, check_now }
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "linux")]
+        {
+            let check_now = crate::update_linux::install_dir().map(|dir| {
+                {
+                    let mut s = shared.lock().unwrap();
+                    s.status = Status::Idle;
+                    if !crate::update_linux::writable(&dir) {
+                        s.status = Status::Failed(format!("Can't update here: {} isn't yours to write to", dir.display()));
+                    } else if let Some((unpacked, version)) = crate::update_linux::pending(&dir) {
+                        // Downloaded last time, but the app didn't quit normally.
+                        s.status = Status::Ready(version);
+                        s.ready = Some(unpacked);
+                    }
+                }
+                let (tx, rx) = mpsc::channel();
+                let shared = shared.clone();
+                std::thread::Builder::new()
+                    .name("updates".into())
+                    .spawn(move || run_linux(dir, shared, rx, ctx))
+                    .expect("spawn update thread");
+                tx
+            });
+            Self { shared, check_now }
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             let _ = ctx;
             Self { shared, check_now: None }
@@ -150,6 +184,16 @@ impl Updater {
                 return true;
             }
         }
+        #[cfg(target_os = "linux")]
+        {
+            let s = self.shared.lock().unwrap();
+            if let (Some(unpacked), Some(dir)) = (&s.ready, crate::update_linux::install_dir()) {
+                let mut queued = QUEUED.lock().unwrap();
+                let restart = restart || queued.as_ref().is_some_and(|(_, _, r)| *r);
+                *queued = Some((unpacked.clone(), dir, restart));
+                return true;
+            }
+        }
         let _ = restart;
         false
     }
@@ -165,6 +209,12 @@ pub fn apply_queued() {
         if let Err(e) = m.wait_exit_then_apply_updates(&asset, !restart, restart, Vec::<String>::new()) {
             eprintln!("couldn't install the update: {e}");
         }
+    }
+    #[cfg(target_os = "linux")]
+    if let Some((unpacked, dir, restart)) = QUEUED.lock().ok().and_then(|mut q| q.take())
+        && let Err(e) = crate::update_linux::apply(&unpacked, &dir, restart)
+    {
+        eprintln!("couldn't install the update: {e:#}");
     }
 }
 
@@ -239,8 +289,70 @@ fn run(m: velopack::UpdateManager, shared: Arc<Mutex<Shared>>, check_now: mpsc::
     }
 }
 
+/// The background thread on Linux: like [`run`], with the release tarball.
+#[cfg(target_os = "linux")]
+fn run_linux(dir: std::path::PathBuf, shared: Arc<Mutex<Shared>>, check_now: mpsc::Receiver<()>, ctx: egui::Context) {
+    let set = |status: Status| {
+        shared.lock().unwrap().status = status;
+        ctx.request_repaint();
+    };
+    let mut wait = FIRST_CHECK_AFTER;
+    loop {
+        let asked = match check_now.recv_timeout(wait) {
+            Ok(()) => true,
+            Err(mpsc::RecvTimeoutError::Timeout) => false,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        };
+        wait = CHECK_EVERY;
+        {
+            let s = shared.lock().unwrap();
+            if (!asked && !s.auto) || s.ready.is_some() {
+                continue;
+            }
+        }
+        if !crate::update_linux::writable(&dir) {
+            set(Status::Failed(format!("Can't update here: {} isn't yours to write to", dir.display())));
+            continue;
+        }
+        set(Status::Checking);
+        let current = env!("CARGO_PKG_VERSION");
+        let release = match crate::update_linux::check(current) {
+            Ok(Some(r)) => {
+                eprintln!("{} update check: {} is out, downloading it", clock(), r.version);
+                r
+            }
+            Ok(None) => {
+                eprintln!("{} update check: up to date ({current})", clock());
+                set(Status::UpToDate);
+                continue;
+            }
+            Err(e) => {
+                eprintln!("{} update check failed: {e:#}", clock());
+                set(Status::Failed(format!("Couldn't check for updates: {e:#}")));
+                wait = RETRY_AFTER;
+                continue;
+            }
+        };
+        set(Status::Downloading(0));
+        let result = crate::update_linux::download(&release, &dir, |p| set(Status::Downloading(p)));
+        match result {
+            Ok(unpacked) => {
+                let mut s = shared.lock().unwrap();
+                s.status = Status::Ready(release.version.clone());
+                s.ready = Some(unpacked);
+                ctx.request_repaint();
+            }
+            Err(e) => {
+                eprintln!("{} update download failed: {e:#}", clock());
+                set(Status::Failed(format!("Couldn't download the update: {e:#}")));
+                wait = RETRY_AFTER;
+            }
+        }
+    }
+}
+
 /// The time of day, for the log.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn clock() -> String {
     chrono::Local::now().format("%H:%M:%S").to_string()
 }

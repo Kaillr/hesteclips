@@ -2460,6 +2460,7 @@ dependencies = [
  "rfd",
  "serde",
  "serde_json",
+ "sha2",
  "tract-onnx",
  "trash",
  "tray-icon",
