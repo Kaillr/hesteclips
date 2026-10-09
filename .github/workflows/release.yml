@@ -4,22 +4,36 @@
 #    minor, fix: → patch, BREAKING CHANGE → major) and says what the next
 #    version is, without releasing anything. No release-worthy commits → the
 #    rest is skipped.
-# 2. windows, linux, mac: build that version, all at once (installer and
-#    update packages, HesteClips-linux-x64.tar.gz, HesteClips-mac-arm64.dmg).
-# 3. publish: only once all three built, semantic-release tags vX.Y.Z and
-#    publishes the GitHub release with everything on it, which the installed
-#    apps update from. A failed build means no release, never half of one.
+# 2. windows, linux, mac: build that version for the platforms ticked when
+#    running it (installer and update packages, HesteClips-linux-x64.tar.gz,
+#    HesteClips-mac-arm64.dmg), all at once.
+# 3. publish: only once every ticked build is done, semantic-release tags
+#    vX.Y.Z and publishes the GitHub release with everything on it, which the
+#    installed apps update from. A failed build means no release, never half
+#    of one.
 #
-# Given a tag, only the Linux and macOS packages are built, for that existing
-# release, and added to it.
+# Given a tag, the ticked platforms are built for that existing release and
+# added to it.
 name: Release
 
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Only add the Linux and macOS packages to this existing release (e.g. v1.3.0)
+        description: Only add the ticked platforms to this existing release (e.g. v1.3.0)
         required: false
+      windows:
+        description: Windows
+        type: boolean
+        default: true
+      linux:
+        description: Linux
+        type: boolean
+        default: false
+      mac:
+        description: macOS
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -68,7 +82,7 @@ jobs:
 
   windows:
     needs: version
-    if: needs.version.outputs.version != '' && inputs.tag == ''
+    if: needs.version.outputs.version != '' && inputs.windows
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
@@ -99,7 +113,7 @@ jobs:
 
   linux:
     needs: version
-    if: needs.version.outputs.version != ''
+    if: needs.version.outputs.version != '' && inputs.linux
     # 24.04, not older: the pipewire crate needs PipeWire 1.0's headers. The
     # binary then needs glibc 2.39+ (Ubuntu 24.04, Fedora 40, Debian 13, Arch).
     runs-on: ubuntu-24.04
@@ -127,7 +141,7 @@ jobs:
 
   mac:
     needs: version
-    if: needs.version.outputs.version != ''
+    if: needs.version.outputs.version != '' && inputs.mac
     # Apple Silicon. Free for a public repo, like the others.
     runs-on: macos-15
     steps:
@@ -154,12 +168,12 @@ jobs:
 
   publish:
     needs: [version, windows, linux, mac]
-    # Every build that ran succeeded (Windows is skipped when adding to an
-    # existing release).
+    # At least one platform ticked, and every build that ran succeeded (the
+    # unticked ones are skipped).
     if: >-
       always() && needs.version.outputs.version != '' &&
-      needs.linux.result == 'success' && needs.mac.result == 'success' &&
-      (inputs.tag != '' || needs.windows.result == 'success')
+      (inputs.windows || inputs.linux || inputs.mac) &&
+      !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
