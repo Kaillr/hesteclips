@@ -653,6 +653,11 @@ impl App {
         if open_sources {
             app.page = Page::Sources;
         }
+        // `HESTECLIPS_OPEN_VOICE_REVIEW=1` opens the voice samples review.
+        let open_review = std::env::var_os("HESTECLIPS_OPEN_VOICE_REVIEW").is_some();
+        if open_review {
+            app.open_voice_review();
+        }
         // `HESTECLIPS_OPEN_SETTINGS=1` opens on Settings.
         if std::env::var_os("HESTECLIPS_OPEN_SETTINGS").is_some() {
             app.page = Page::Settings;
@@ -661,7 +666,7 @@ impl App {
             app.toast("Recovered a recording that was cut off last time");
         }
         // Never miss a moment: arm the buffer on launch (unless it can't work yet).
-        if app.settings.auto_start_buffer && !open_sources && app.permission != capture::Permission::Denied {
+        if app.settings.auto_start_buffer && !open_sources && !open_review && app.permission != capture::Permission::Denied {
             app.start_replay_buffer();
         }
         app

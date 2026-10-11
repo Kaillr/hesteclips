@@ -119,6 +119,16 @@ impl Review {
         }
     }
 
+    /// Move on without answering: the next one not yet answered, else the next.
+    fn skip(&mut self) {
+        let Some(i) = self.index() else { return };
+        let n = self.list.len();
+        let target = (i + 1..n).chain(0..i).find(|&j| self.list[j].meta.label == Label::Unreviewed).or((n > 1).then_some((i + 1) % n));
+        if let Some(j) = target {
+            self.select_index(j);
+        }
+    }
+
     fn remove(&mut self) {
         let Some(i) = self.index() else { return };
         voice_samples::delete(&self.list[i].meta.id);
@@ -208,131 +218,88 @@ impl App {
             r.remove();
         }
 
-        ui_kit::page(ui, "voice_review", 760.0, |ui| {
-            ui.add_space(12.0);
+        ui_kit::page(ui, "voice_review", 720.0, |ui| {
+            let top = ui.allocate_space(vec2(1.0, 1.0)).1;
+            ui.add_space(8.0);
+            let total = r.list.len();
+            let answered = r.list.iter().filter(|s| s.meta.label != Label::Unreviewed).count();
+
+            // Where you are, and how far along.
             ui.horizontal(|ui| {
-                if ui.add(ui_kit::button("Back to settings", false)).clicked() {
+                if ui.add(egui::Button::new(RichText::new("\u{2039}  Settings").color(ui.visuals().weak_text_color())).frame(false)).clicked() {
                     back = true;
                 }
-                ui.add_space(8.0);
-                ui.label(RichText::new("Voice samples").size(20.0).strong());
             });
-            ui.add_space(6.0);
-            ui_kit::hint(
-                ui,
-                "Short sounds from your microphone, kept when \"hashtag HesteClip that\" saved a clip or nearly did, \
-                 and around clips you saved by hand. Listen, trim each to the part that matters, and say whether it should save a clip. \
-                 They stay on this computer, and the ones nobody has listened to are deleted after two weeks.",
-            );
-            if !collecting {
-                ui.add_space(4.0);
-                ui_kit::hint(ui, "Keeping new samples is off. Turn it on under Voice in Settings.");
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Voice samples").size(22.0).strong());
+                if total > 0 {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.weak(format!("{answered} of {total} answered"));
+                    });
+                }
+            });
+            if total > 0 {
+                ui.add_space(8.0);
+                ui.add(egui::ProgressBar::new(answered as f32 / total as f32).desired_height(4.0).fill(ui_kit::ACCENT).corner_radius(2));
             }
+            ui.add_space(16.0);
 
-            if r.list.is_empty() {
-                ui.add_space(16.0);
-                ui_kit::card(ui, |ui| ui.weak("No samples yet. They appear as you use the voice command while the replay buffer runs."));
+            if total == 0 {
+                ui_kit::card(ui, |ui| {
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("No samples yet").size(16.0).strong());
+                    ui.add_space(4.0);
+                    if collecting {
+                        ui.weak("They appear while the replay buffer runs, when the voice command saves a clip or nearly does.");
+                    } else {
+                        ui.weak("Turn on \"Keep samples to improve it\" under Voice in Settings, and they appear while the replay buffer runs.");
+                    }
+                    ui.add_space(8.0);
+                });
                 return;
             }
 
-            let to_hear = r.list.iter().filter(|s| s.meta.label == Label::Unreviewed).count();
-            let said = r.list.iter().filter(|s| s.meta.label == Label::Trigger).count();
-            let other = r.list.iter().filter(|s| s.meta.label == Label::Ignore).count();
-            ui.add_space(14.0);
-            ui.weak(format!("{to_hear} to listen to · {said} should save a clip · {other} shouldn't"));
-            ui.add_space(8.0);
-
-            // The one being judged.
             if let Some(s) = r.current().cloned() {
+                ui_kit::card(ui, |ui| self.review_card(ui, &mut r, &s, &mut say));
+            } else {
                 ui_kit::card(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(s.meta.kind.describe()).strong());
-                        ui.weak(format!("· {}", when(&s)));
-                        if s.meta.kind != Kind::ByHand {
-                            ui.weak(format!("· the detector was {:.0}% sure", s.meta.score * 100.0));
-                        }
-                    });
                     ui.add_space(8.0);
-                    let mut toggle = false;
-                    if let (Some(wave), Some(sound)) = (&r.wave, &r.sound) {
-                        if sound.is_playing() {
-                            ctx.request_repaint();
-                        }
-                        let before = r.trim;
-                        waveform(ui, wave, s.secs, &mut r.trim, s.meta.moment, sound);
-                        if r.trim != before && s.meta.label != Label::Unreviewed {
-                            if let Some(i) = r.index() {
-                                r.list[i].meta.trim = Some(r.trim);
-                                voice_samples::save_meta(&r.list[i].meta);
-                            }
-                        }
-                        ui.add_space(6.0);
-                        ui.horizontal(|ui| {
-                            let label = if sound.is_playing() { "Stop" } else { "Play highlighted part" };
-                            toggle = ui.add(ui_kit::button(label, false)).on_hover_text("Space").clicked();
-                            ui.weak(format!("{:.1} s of {:.1} s", r.trim.1 - r.trim.0, s.secs));
-                            if ui.small_button("Highlight all").clicked() {
-                                r.trim = (0.0, s.secs);
-                            }
-                        });
-                        if let Some(e) = &sound.error {
-                            ui.colored_label(ui.visuals().warn_fg_color, format!("Can't play: {e}"));
-                        }
-                        ui.add_space(2.0);
-                        ui_kit::hint(
-                            ui,
-                            "Drag the ends of the highlight so it holds just the phrase, or just the sound that fooled it. Drag over the sound to scrub. Only the highlighted part is ever shared.",
-                        );
-                    } else {
-                        ui.colored_label(ui.visuals().warn_fg_color, "This sample's sound can't be read.");
-                    }
-                    if toggle {
-                        r.play_or_stop();
-                    }
-
-                    ui.add_space(12.0);
-                    ui.label("Should the highlighted part save a clip?");
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.add(ui_kit::button("Should save a clip", true)).on_hover_text("Y").clicked() {
-                                r.judge(Label::Trigger);
-                            }
-                            if ui.add(ui_kit::button("Shouldn't save a clip", false)).on_hover_text("N").clicked() {
-                                r.judge(Label::Ignore);
-                            }
-                            if ui.add(ui_kit::button("Delete", false)).on_hover_text("Deletes it for good (Delete)").clicked() {
-                                r.remove();
-                            }
-                            let verdict = match s.meta.label {
-                                Label::Unreviewed => "",
-                                Label::Trigger => "Marked: should save a clip",
-                                Label::Ignore => "Marked: shouldn't save a clip",
-                            };
-                            ui.weak(verdict);
-                        });
-                    });
+                    ui.label(RichText::new("All caught up").size(18.0).strong());
                     ui.add_space(4.0);
-                    ui_kit::hint(ui, "Space plays · Y should save a clip · N shouldn't · Delete removes it · arrows move between samples");
+                    ui.weak("Every sample has an answer. Pick one below to change it, or share them to help improve the detector.");
+                    ui.add_space(8.0);
                 });
-            } else if to_hear == 0 {
-                ui_kit::card(ui, |ui| ui.label("Every sample has an answer. Pick one below to change it."));
             }
 
             // Sharing.
-            ui_kit::section(ui, "Share", |ui| {
-                let ready = r.list.iter().filter(|s| s.shareable()).count();
+            let ready = r.list.iter().filter(|s| s.shareable()).count();
+            ui.add_space(24.0);
+            ui.label(RichText::new("Help improve the detector").size(15.0).strong());
+            ui.add_space(8.0);
+            ui_kit::card(ui, |ui| {
                 ui_kit::hint(
                     ui,
-                    "To help improve the detector, export what you've judged to one zip file and send it yourself; nothing is uploaded. \
-                     It holds the highlighted part of each sample and your answer, with no name and nothing else. \
-                     Delete any sample you don't want to share; ones you haven't judged are left out.",
+                    "Export your answers as one zip file and send it to the developer yourself. It holds only the highlighted part of each sample and your answer, with no name. Nothing is uploaded. Delete any sample you don't want to share.",
                 );
-                ui.add_space(8.0);
+                ui.add_space(10.0);
                 ui.horizontal(|ui| {
-                    ui.weak(format!("{ready} ready to share"));
+                    if r.confirm_delete_all {
+                        if ui.add(ui_kit::danger_button(format!("Delete all {total}"))).clicked() {
+                            voice_samples::delete_all();
+                            r.list.clear();
+                            r.deselect();
+                            r.confirm_delete_all = false;
+                        }
+                        if ui.add(ui_kit::button("Cancel", false)).clicked() {
+                            r.confirm_delete_all = false;
+                        }
+                    } else if ui.add(egui::Button::new(RichText::new("Delete all").color(ui_kit::DANGER)).frame(false)).clicked() {
+                        r.confirm_delete_all = true;
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.add_enabled(ready > 0, ui_kit::button("Export…", true)).clicked() {
+                        let label = if ready == 0 { "Export".to_owned() } else { format!("Export {ready}") };
+                        if ui.add_enabled(ready > 0, ui_kit::button(label, true)).clicked() {
                             let picked = rfd::FileDialog::new().set_file_name("hesteclips-voice-samples.zip").add_filter("Zip file", &["zip"]).save_file();
                             if let Some(path) = picked {
                                 say = Some(match voice_samples::export(&path, &r.list) {
@@ -341,41 +308,42 @@ impl App {
                                 });
                             }
                         }
-                        if r.confirm_delete_all {
-                            if ui.add(ui_kit::danger_button(format!("Delete all {}", r.list.len()))).clicked() {
-                                voice_samples::delete_all();
-                                r.list.clear();
-                                r.deselect();
-                                r.confirm_delete_all = false;
-                            }
-                            if ui.add(ui_kit::button("Cancel", false)).clicked() {
-                                r.confirm_delete_all = false;
-                            }
-                        } else if ui.add(ui_kit::button("Delete all…", false)).clicked() {
-                            r.confirm_delete_all = true;
-                        }
                     });
                 });
             });
 
-            // All of them.
-            ui_kit::section(ui, "All samples", |ui| {
-                let mut pick = None;
+            // All of them, out of the way until wanted.
+            ui.add_space(24.0);
+            let mut pick = None;
+            egui::CollapsingHeader::new(RichText::new(format!("All samples ({total})")).size(15.0).strong()).default_open(false).show(ui, |ui| {
+                ui.add_space(4.0);
                 for s in &r.list {
-                    let verdict = match s.meta.label {
-                        Label::Unreviewed => "not listened to",
-                        Label::Trigger => "should save a clip",
-                        Label::Ignore => "shouldn't save a clip",
-                    };
-                    let text = format!("{}   {}   ·   {verdict}", when(s), s.meta.kind.describe());
-                    if ui.selectable_label(r.selected.as_deref() == Some(&s.meta.id), text).clicked() {
+                    let selected = r.selected.as_deref() == Some(&s.meta.id);
+                    let row = ui.horizontal(|ui| {
+                        let (dot, _) = ui.allocate_exact_size(vec2(14.0, 18.0), Sense::hover());
+                        let center = dot.center();
+                        let weak = ui.visuals().weak_text_color();
+                        match s.meta.label {
+                            Label::Trigger => ui.painter().circle_filled(center, 4.5, ui_kit::ACCENT),
+                            Label::Ignore => ui.painter().circle_filled(center, 4.5, weak),
+                            Label::Unreviewed => ui.painter().circle_stroke(center, 4.0, Stroke::new(1.5, weak)),
+                        };
+                        let answer = match s.meta.label {
+                            Label::Unreviewed => "Not answered",
+                            Label::Trigger => "Should save a clip",
+                            Label::Ignore => "Shouldn't save a clip",
+                        };
+                        ui.selectable_label(selected, format!("{}   {}   ·   {answer}", when(s), s.meta.kind.describe())).clicked()
+                    });
+                    if row.inner {
                         pick = Some(s.meta.id.clone());
                     }
                 }
-                if let Some(id) = pick {
-                    r.select(&id);
-                }
             });
+            if let Some(id) = pick {
+                r.select(&id);
+                ui.scroll_to_rect(top, Some(egui::Align::TOP));
+            }
         });
 
         self.voice_review = r;
@@ -390,7 +358,141 @@ impl App {
             self.page = Page::Settings;
         }
     }
+
+    /// The task: hear it, decide.
+    fn review_card(&mut self, ui: &mut egui::Ui, r: &mut Review, s: &Sample, say: &mut Option<(String, bool)>) {
+        let ctx = ui.ctx().clone();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(s.meta.kind.describe()).size(16.0).strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.weak(when(s));
+            });
+        });
+        if s.meta.kind != Kind::ByHand {
+            ui.weak(format!("The detector was {:.0}% sure", s.meta.score * 100.0));
+        }
+        ui.add_space(12.0);
+
+        let mut toggle = false;
+        if let (Some(wave), Some(sound)) = (&r.wave, &r.sound) {
+            if sound.is_playing() {
+                ctx.request_repaint();
+            }
+            let before = r.trim;
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.add_space((WAVE_H - 48.0) / 2.0);
+                    toggle = play_button(ui, sound.is_playing()).clicked();
+                });
+                ui.add_space(4.0);
+                waveform(ui, wave, s.secs, &mut r.trim, s.meta.moment, sound);
+            });
+            if r.trim != before && s.meta.label != Label::Unreviewed {
+                if let Some(i) = r.index() {
+                    r.list[i].meta.trim = Some(r.trim);
+                    voice_samples::save_meta(&r.list[i].meta);
+                }
+            }
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.weak(format!("Highlighted {:.1} s of {:.1} s. Drag its ends to choose what to judge, or drag over the sound to scrub.", r.trim.1 - r.trim.0, s.secs));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add(egui::Button::new(RichText::new("Select all").color(ui_kit::ACCENT)).frame(false)).clicked() {
+                        r.trim = (0.0, s.secs);
+                    }
+                });
+            });
+            if let Some(e) = &sound.error {
+                ui.colored_label(ui.visuals().warn_fg_color, format!("Can't play: {e}"));
+            }
+        } else {
+            ui.colored_label(ui.visuals().warn_fg_color, "This sample's sound can't be read.");
+        }
+        if toggle {
+            r.play_or_stop();
+        }
+
+        ui.add_space(20.0);
+        ui.label(RichText::new("Should this save a clip?").size(18.0).strong());
+        ui.add_space(10.0);
+        let gap = 12.0;
+        let w = (ui.available_width() - gap) / 2.0;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = gap;
+            let chosen = |l: Label| s.meta.label == l;
+            let answer = |ui: &mut egui::Ui, text: &str, primary: bool, on: bool| {
+                let mut b = egui::Button::new(RichText::new(text).size(16.0).color(if primary { Color32::WHITE } else { ui.visuals().text_color() }));
+                if primary {
+                    b = b.fill(ui_kit::ACCENT);
+                }
+                if on {
+                    b = b.stroke(Stroke::new(2.0, if primary { Color32::WHITE } else { ui_kit::ACCENT }));
+                }
+                ui.add_sized([w, 48.0], b).clicked()
+            };
+            if answer(ui, "No", false, chosen(Label::Ignore)) {
+                r.judge(Label::Ignore);
+            }
+            if answer(ui, "Yes, save a clip", true, chosen(Label::Trigger)) {
+                r.judge(Label::Trigger);
+            }
+        });
+        ui.add_space(6.0);
+        ui_kit::hint(ui, "Yes means a clip should be saved here, because the phrase was said clearly enough. Anything else is a no.");
+
+        ui.add_space(14.0);
+        ui.horizontal(|ui| {
+            for (key, what) in [("Y", "Yes"), ("N", "No"), ("Space", "Play"), ("\u{2190} \u{2192}", "Move"), ("Del", "Delete")] {
+                keycap(ui, key);
+                ui.add_space(-2.0);
+                ui.label(RichText::new(what).size(12.0).color(ui.visuals().weak_text_color()));
+                ui.add_space(8.0);
+            }
+        });
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            if ui.add(egui::Button::new(RichText::new("Delete sample").color(ui_kit::DANGER)).frame(false)).clicked() {
+                r.remove();
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.add(ui_kit::button("Skip", false)).clicked() {
+                    r.skip();
+                }
+            });
+        });
+        let _ = say;
+    }
 }
+
+/// A key as it looks on a keyboard.
+fn keycap(ui: &mut egui::Ui, key: &str) {
+    let v = ui.visuals().clone();
+    egui::Frame::new()
+        .fill(ui_kit::hover(&v))
+        .stroke(Stroke::new(1.0, ui_kit::line(v.dark_mode)))
+        .corner_radius(4)
+        .inner_margin(egui::Margin::symmetric(6, 1))
+        .show(ui, |ui| ui.label(RichText::new(key).size(11.0).monospace().color(v.strong_text_color())));
+}
+
+/// A round play/stop button.
+fn play_button(ui: &mut egui::Ui, playing: bool) -> egui::Response {
+    let (rect, r) = ui.allocate_exact_size(vec2(48.0, 48.0), Sense::click());
+    let c = rect.center();
+    let p = ui.painter();
+    p.circle_filled(c, 24.0, if r.hovered() { ui_kit::ACCENT.gamma_multiply(0.85) } else { ui_kit::ACCENT });
+    if playing {
+        for dx in [-6.0, 2.0] {
+            p.rect_filled(Rect::from_min_size(pos2(c.x + dx, c.y - 8.0), vec2(4.0, 16.0)), 1.0, Color32::WHITE);
+        }
+    } else {
+        p.add(egui::Shape::convex_polygon(vec![pos2(c.x - 6.0, c.y - 10.0), pos2(c.x - 6.0, c.y + 10.0), pos2(c.x + 10.0, c.y)], Color32::WHITE, Stroke::NONE));
+    }
+    r.on_hover_text("Play the highlighted part (Space)")
+}
+
+/// The waveform's height.
+const WAVE_H: f32 = 120.0;
 
 /// A snippet drawn by the editor's waveform, the highlighted part bright and
 /// the rest dim, with a handle on each end of the highlight to drag, a mark
@@ -398,7 +500,7 @@ impl App {
 /// scrubs: the sound follows, at its own pitch.
 fn waveform(ui: &mut egui::Ui, wave: &Waveform, secs: f32, trim: &mut (f32, f32), moment: Option<f32>, sound: &SoundPlayer) {
     let secs = secs.max(0.01);
-    let (rect, body) = ui.allocate_exact_size(vec2(ui.available_width(), 110.0), Sense::click_and_drag());
+    let (rect, body) = ui.allocate_exact_size(vec2(ui.available_width(), WAVE_H), Sense::click_and_drag());
     let v = ui.visuals().clone();
     let p = ui.painter_at(rect);
     p.rect_filled(rect, ui_kit::RADIUS, v.extreme_bg_color);
@@ -410,6 +512,7 @@ fn waveform(ui: &mut egui::Ui, wave: &Waveform, secs: f32, trim: &mut (f32, f32)
     let dim = v.weak_text_color().gamma_multiply(0.6);
     wave.paint(&p, lane, (0.0, secs as f64), |_| 1.0, |_, _| dim);
     let bright = Rect::from_x_y_ranges(x_of(trim.0)..=x_of(trim.1), rect.y_range());
+    p.rect_filled(bright, 0.0, ui_kit::ACCENT.gamma_multiply(0.12));
     wave.paint(&p.with_clip_rect(bright), lane, (0.0, secs as f64), |_| 1.0, |_, _| ui_kit::ACCENT);
 
     if let Some(m) = moment {

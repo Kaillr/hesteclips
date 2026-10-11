@@ -43,9 +43,9 @@ pub enum Kind {
 impl Kind {
     pub fn describe(self) -> &'static str {
         match self {
-            Kind::Fired => "A clip was saved by voice here",
-            Kind::Almost => "Nearly saved a clip here",
-            Kind::ByHand => "Around a clip you saved by hand",
+            Kind::Fired => "Saved a clip by voice",
+            Kind::Almost => "Nearly saved a clip by voice",
+            Kind::ByHand => "You saved a clip by hand",
         }
     }
 }
