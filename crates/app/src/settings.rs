@@ -530,9 +530,10 @@ pub struct RecordSettings {
     /// Index into the runtime-detected display list.
     pub display_index: usize,
     pub fps: u32,
-    /// Record the average of several looks at the screen per frame (live
-    /// frame blending), for smoother, motion-blurred video.
-    pub frame_blend: bool,
+    /// Live frame blending: look at the screen this many times a second and
+    /// record the average of the looks in each frame (a whole multiple of
+    /// `fps`), for smoother, motion-blurred video. 0 is off.
+    pub blend_fps: u32,
     pub resolution: OutputResolution,
     pub video_bitrate_mbps: u32,
 
@@ -616,7 +617,7 @@ impl Default for RecordSettings {
             webcam: None,
             display_index: 0,
             fps: 60,
-            frame_blend: false,
+            blend_fps: 0,
             resolution: OutputResolution::Native,
             video_bitrate_mbps: 40,
 
@@ -732,9 +733,19 @@ impl Shortcuts {
 }
 
 /// Common frame-rate choices for the picker.
-/// Looks at the screen per frame with frame blending on. A guess: 4 is smooth
-/// at 60 fps without the GPU copying much more than the game draws.
-pub const BLEND_SAMPLES: u32 = 4;
+/// The blend rates offered for a frame rate: whole multiples of it, up to a
+/// rate the screen and the GPU copying can plausibly keep up with (a guess).
+pub fn blend_choices(fps: u32) -> Vec<u32> {
+    (2..=8).map(|k| fps * k).filter(|&r| r <= 960).collect()
+}
+
+impl RecordSettings {
+    /// Looks at the screen per recorded frame: the blend rate over the frame
+    /// rate, 1 (no blending) when off or no longer a multiple above it.
+    pub fn blend_samples(&self) -> u32 {
+        if self.blend_fps == 0 { 1 } else { (self.blend_fps as f64 / self.fps.max(1) as f64).round().max(1.0) as u32 }
+    }
+}
 
 pub const FPS_CHOICES: [u32; 6] = [30, 60, 120, 144, 165, 240];
 

@@ -24,7 +24,10 @@ pub fn summary(info: &ClipInfo, edit: &Edit) -> String {
         parts.push(format!("{}p", o.height.unwrap()));
     }
     if o.fps.is_some_and(|f| (f as f64) < info.fps - 0.5) {
-        parts.push(format!("{} fps{}", o.fps.unwrap(), if o.blend { " blended" } else { "" }));
+        parts.push(match o.blend_fps {
+            Some(b) => format!("{} fps blended from {b}", o.fps.unwrap()),
+            None => format!("{} fps", o.fps.unwrap()),
+        });
     }
     if let Some(mb) = o.max_mb {
         parts.push(format!("under {mb} MB"));
@@ -88,11 +91,24 @@ pub fn ui(ui: &mut egui::Ui, info: &ClipInfo, edit: &mut Edit) -> bool {
         });
         ui.end_row();
 
-        if o.fps.is_some_and(|f| (f as f64) < info.fps - 0.5) || (o.fps.is_none() && auto.is_some_and(|(_, f)| f < info.fps - 0.5)) {
-            ui.label("Frame blending");
-            crate::sources_ui::toggle(ui, &mut o.blend).on_hover_text("Mix the frames that fall into each new one for smoother motion, instead of dropping the extra ones. Takes a little longer");
-            ui.end_row();
-        }
+        ui.label("Frame blending");
+        let out = auto.map_or(o.fps.filter(|&f| (f as f64) < info.fps - 0.5), |(_, f)| Some(f.round() as u32).filter(|&f| (f as f64) < info.fps - 0.5).or(o.fps)).unwrap_or(src);
+        let rates = if out < src { media::blend_rates(out, info.fps) } else { Vec::new() };
+        let shown = match o.blend_fps.filter(|b| rates.contains(b)) {
+            Some(b) => format!("From {b} fps"),
+            None => "Off".to_owned(),
+        };
+        ui.add_enabled_ui(!rates.is_empty(), |ui| {
+            egui::ComboBox::from_id_salt("export_blend").width(170.0).selected_text(shown).show_ui(ui, |ui| {
+                ui.selectable_value(&mut o.blend_fps, None, "Off").on_hover_text("Drop the in-between frames");
+                for b in &rates {
+                    ui.selectable_value(&mut o.blend_fps, Some(*b), format!("From {b} fps")).on_hover_text("Each frame is the average of the recording's frames in its slot, for smoother motion");
+                }
+            });
+        })
+        .response
+        .on_disabled_hover_text("Blending mixes frames down to a lower frame rate: pick one above first");
+        ui.end_row();
 
         ui.label("Fit under");
         let shown = match o.max_mb {

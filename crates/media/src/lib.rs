@@ -445,14 +445,22 @@ pub struct Output {
     /// Only the mix (track 1), not each source on its own track too.
     #[serde(default)]
     pub mix_only: bool,
-    /// When the frame rate drops, blend the frames that fall in each new one
-    /// (smooth, like motion blur) instead of dropping the in-between ones.
+    /// Frame blending: the rate the picture is mixed down from (a whole
+    /// multiple of the frame rate, below the source's), each new frame the
+    /// average of the frames in its slot, like motion blur. `None` just
+    /// drops the in-between frames.
     #[serde(default)]
-    pub blend: bool,
+    pub blend_fps: Option<u32>,
 }
 
 /// AAC bitrate of each audio track a render writes.
 pub const RENDER_AUDIO_KBPS: u32 = 192;
+
+/// The rates a clip of `src_fps` can be blended down from for output at
+/// `out` fps: whole multiples of it, up to the clip's own rate.
+pub fn blend_rates(out: u32, src_fps: f64) -> Vec<u32> {
+    (2..).map(|k| out * k).take_while(|&r| out > 0 && r as f64 <= src_fps + 0.5).collect()
+}
 
 impl Output {
     /// The settings that actually change something for `info` (a height or
@@ -464,9 +472,11 @@ impl Output {
             video_kbps: self.video_kbps.filter(|&k| info.video_kbps.is_none_or(|src| k < src)),
             max_mb: self.max_mb,
             mix_only: self.mix_only,
-            blend: self.blend,
+            blend_fps: None,
         };
         e.fit_picture(info);
+        let out = e.fps.map_or(info.fps, f64::from).round() as u32;
+        e.blend_fps = self.blend_fps.filter(|b| e.fps.is_some() && blend_rates(out, info.fps).contains(b));
         e
     }
 
@@ -938,9 +948,18 @@ fn render_video(source: &Path, info: &ClipInfo, edit: &Edit, plan: &Plan, work: 
     let mut filters = Vec::new();
     if output.fps.is_some() {
         let rate = edit.output.frame_rate(info);
-        // `framerate` mixes the neighbouring source frames by how close they
-        // are; `fps` just picks one.
-        filters.push(if output.blend { format!("framerate=fps={rate}:scene=100") } else { format!("fps={rate}") });
+        match output.blend_fps {
+            // Frames at the blend rate, each output frame the average of the
+            // ones ending at its time.
+            Some(b) => {
+                if (b as f64) < info.fps - 0.5 {
+                    filters.push(format!("fps={b}"));
+                }
+                filters.push(format!("tmix=frames={}", (b as f64 / rate).round() as u32));
+                filters.push(format!("fps={rate}"));
+            }
+            None => filters.push(format!("fps={rate}")),
+        }
     }
     if output.height.is_some() {
         let (w, h) = edit.output.size(info);

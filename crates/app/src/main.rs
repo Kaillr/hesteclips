@@ -704,7 +704,7 @@ impl App {
             output_dir: self.settings.output_dir.clone(),
             container_ext: self.settings.container.ext().to_owned(),
             fps: self.settings.fps,
-            blend_samples: if self.settings.frame_blend { settings::BLEND_SAMPLES } else { 1 },
+            blend_samples: self.settings.blend_samples(),
             video_bitrate_kbps: self.settings.video_bitrate_mbps * 1000,
             target_height: self.settings.resolution.height(),
             keyframe_interval_secs: self.settings.keyframe_interval_secs,
@@ -1279,7 +1279,7 @@ impl App {
         let tip = format!(
             "{} frames skipped so far: the video encoder couldn't keep up, so the clip stutters. Try a lower resolution, frame rate or bitrate{}.",
             self.skipped_seen.0,
-            if self.settings.frame_blend { ", or turn off frame blending" } else { "" }
+            if self.settings.blend_samples() > 1 { ", or turn off frame blending" } else { "" }
         );
         ui.label(RichText::new("Skipping frames").size(13.0).strong().color(amber)).on_hover_text(tip);
         ui.ctx().request_repaint_after(SHOW_FOR.saturating_sub(at.elapsed()));

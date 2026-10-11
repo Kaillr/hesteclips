@@ -77,10 +77,8 @@ impl App {
                     row(
                         ui,
                         "Frame blending",
-                        Some("Mixes several looks at the screen into each frame for smoother motion, like motion blur. Most noticeable when the game runs faster than the frame rate."),
-                        |ui| {
-                            toggle(ui, &mut self.settings.frame_blend);
-                        },
+                        Some("Looks at the screen this often and records the average of the looks in each frame: smooth motion, like motion blur. Best when the game runs at least that fast."),
+                        |ui| self.blend_choice(ui),
                     );
                 }
                 divider(ui);
@@ -577,6 +575,22 @@ impl App {
                 }
             });
         });
+    }
+
+    /// Off, or the rate the screen is looked at: whole multiples of the frame rate.
+    fn blend_choice(&mut self, ui: &mut egui::Ui) {
+        let choices = settings::blend_choices(self.settings.fps);
+        let samples = self.settings.blend_samples();
+        let shown = if samples > 1 { format!("{} fps", self.settings.fps * samples) } else { "Off".to_owned() };
+        egui::ComboBox::from_id_salt("blend_fps").selected_text(shown).show_ui(ui, |ui| {
+            ui.selectable_value(&mut self.settings.blend_fps, 0, "Off");
+            for r in choices {
+                ui.selectable_value(&mut self.settings.blend_fps, r, format!("{r} fps"));
+            }
+        });
+        if samples > 1 {
+            self.settings.blend_fps = self.settings.fps * samples;
+        }
     }
 
     fn advanced(&mut self, ui: &mut egui::Ui) {
