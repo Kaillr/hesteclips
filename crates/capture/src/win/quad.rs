@@ -16,6 +16,8 @@ use super::d3d::Gpu;
 const SHADER: &str = r"
 cbuffer Place : register(b0) { float4 rect; float4 uv_rect; };
 Texture2D image : register(t0);
+Texture2D other : register(t1);
+cbuffer Block : register(b1) { float4 area; };
 SamplerState linear_clamp : register(s0);
 struct V { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
 V vs(uint id : SV_VertexID) {
@@ -26,6 +28,22 @@ V vs(uint id : SV_VertexID) {
     return o;
 }
 float4 ps(V i) : SV_Target { return image.Sample(linear_clamp, i.uv); }
+// Whether the two pictures differ, in each block of `area.z` texels square
+// (within `area.xy`, the valid part): 1/255 or more if any texel's colour does.
+float4 ps_diff(V i) : SV_Target {
+    int2 origin = int2(i.pos.xy) * (int)area.z;
+    float most = 0;
+    [loop] for (int y = 0; y < (int)area.z; y++) {
+        [loop] for (int x = 0; x < (int)area.z; x++) {
+            int2 at = origin + int2(x, y);
+            if (at.x < (int)area.x && at.y < (int)area.y) {
+                float3 d = abs(image.Load(int3(at, 0)).rgb - other.Load(int3(at, 0)).rgb);
+                most = max(most, max(d.r, max(d.g, d.b)));
+            }
+        }
+    }
+    return float4(most, most, most, 1);
+}
 float4 ps_opaque(V i) : SV_Target { return float4(image.Sample(linear_clamp, i.uv).rgb, 1); }
 ";
 
@@ -34,6 +52,8 @@ pub(crate) struct Quad {
     vs: ID3D11VertexShader,
     ps: ID3D11PixelShader,
     ps_opaque: ID3D11PixelShader,
+    ps_diff: ID3D11PixelShader,
+    block: ID3D11Buffer,
     blend: ID3D11BlendState,
     /// Mixes by a constant (the blend factor) instead of the picture's alpha.
     mix: ID3D11BlendState,
@@ -74,6 +94,7 @@ impl Quad {
         let vs_code = compile(s!("vs"), s!("vs_4_0"))?;
         let ps_code = compile(s!("ps"), s!("ps_4_0"))?;
         let ps_opaque_code = compile(s!("ps_opaque"), s!("ps_4_0"))?;
+        let ps_diff_code = compile(s!("ps_diff"), s!("ps_4_0"))?;
         unsafe {
             let mut vs = None;
             dev.CreateVertexShader(bytes(&vs_code), None, Some(&mut vs))?;
@@ -81,6 +102,11 @@ impl Quad {
             dev.CreatePixelShader(bytes(&ps_code), None, Some(&mut ps))?;
             let mut ps_opaque = None;
             dev.CreatePixelShader(bytes(&ps_opaque_code), None, Some(&mut ps_opaque))?;
+            let mut ps_diff = None;
+            dev.CreatePixelShader(bytes(&ps_diff_code), None, Some(&mut ps_diff))?;
+            let block_desc = D3D11_BUFFER_DESC { ByteWidth: 16, Usage: D3D11_USAGE_DEFAULT, BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32, ..Default::default() };
+            let mut block = None;
+            dev.CreateBuffer(&block_desc, None, Some(&mut block))?;
             // Straight alpha over the picture; the picture stays opaque.
             let mut blend_desc = D3D11_BLEND_DESC::default();
             blend_desc.RenderTarget[0] = D3D11_RENDER_TARGET_BLEND_DESC {
@@ -116,6 +142,8 @@ impl Quad {
                 vs: vs.context("no vertex shader")?,
                 ps: ps.context("no pixel shader")?,
                 ps_opaque: ps_opaque.context("no pixel shader")?,
+                ps_diff: ps_diff.context("no pixel shader")?,
+                block: block.context("no constant buffer")?,
                 blend: blend.context("no blend state")?,
                 mix: mix.context("no blend state")?,
                 sampler: sampler.context("no sampler")?,
@@ -140,6 +168,35 @@ impl Quad {
             clip: RECT { left: 0, top: 0, right: size.0 as i32, bottom: size.1 as i32 },
         };
         self.run(gpu, target, size, source, &at, true, Some(weight));
+    }
+
+    /// Whether `now` and `before` (both `size` valid, as big as their
+    /// textures) differ: drawn into `target` (`out` pixels), each pixel the
+    /// largest colour difference in a block of them, nonzero where they do.
+    pub(crate) fn difference(&self, gpu: &Gpu, target: &ID3D11RenderTargetView, out: (u32, u32), now: &ID3D11ShaderResourceView, before: &ID3D11ShaderResourceView, size: (u32, u32)) {
+        let block = size.0.div_ceil(out.0).max(size.1.div_ceil(out.1)).max(1);
+        let place = [-1.0f32, 1.0, 1.0, -1.0, 0.0, 0.0, 1.0, 1.0];
+        let area = [size.0 as f32, size.1 as f32, block as f32, 0.0];
+        let _lock = gpu.exclusive();
+        let ctx = &gpu.context;
+        unsafe {
+            ctx.UpdateSubresource(&self.place, 0, None, place.as_ptr().cast(), 0, 0);
+            ctx.UpdateSubresource(&self.block, 0, None, area.as_ptr().cast(), 0, 0);
+            ctx.RSSetScissorRects(Some(&[RECT { left: 0, top: 0, right: out.0 as i32, bottom: out.1 as i32 }]));
+            ctx.RSSetViewports(Some(&[D3D11_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: out.0 as f32, Height: out.1 as f32, MinDepth: 0.0, MaxDepth: 1.0 }]));
+            ctx.OMSetRenderTargets(Some(&[Some(target.clone())]), None);
+            ctx.OMSetBlendState(None, None, 0xffff_ffff);
+            ctx.IASetInputLayout(None);
+            ctx.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+            ctx.VSSetShader(&self.vs, None);
+            ctx.VSSetConstantBuffers(0, Some(&[Some(self.place.clone())]));
+            ctx.PSSetShader(&self.ps_diff, None);
+            ctx.PSSetConstantBuffers(1, Some(&[Some(self.block.clone())]));
+            ctx.PSSetShaderResources(0, Some(&[Some(now.clone()), Some(before.clone())]));
+            ctx.Draw(4, 0);
+            ctx.OMSetRenderTargets(None, None);
+            ctx.PSSetShaderResources(0, Some(&[None, None]));
+        }
     }
 
     #[allow(clippy::too_many_arguments)]

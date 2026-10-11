@@ -191,8 +191,25 @@ pub(crate) struct Latest {
     frames: Mutex<u64>,
     arrived: std::sync::atomic::AtomicU64,
     wake: std::sync::Condvar,
+    /// Every picture, not just the newest, for a consumer that wants them
+    /// all (frame blending on the game capture), while `wants_queue`.
+    queue: Mutex<std::collections::VecDeque<Queued>>,
+    wants_queue: AtomicBool,
     gpu: Gpu,
 }
+
+/// A picture that came up, kept for the frame blending: its own texture.
+pub(crate) struct Queued {
+    pub texture: ID3D11Texture2D,
+    pub view: windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView,
+    pub size: (u32, u32),
+    /// When it came up, host seconds.
+    pub at: f64,
+}
+
+/// Pictures waiting beyond this are dropped, oldest first (the consumer is
+/// far behind).
+pub(crate) const QUEUE_MAX: usize = 7;
 unsafe impl Send for Latest {}
 unsafe impl Sync for Latest {}
 
@@ -211,6 +228,8 @@ impl Latest {
             frames: Mutex::new(0),
             arrived: std::sync::atomic::AtomicU64::new(0),
             wake: std::sync::Condvar::new(),
+            queue: Mutex::new(std::collections::VecDeque::new()),
+            wants_queue: AtomicBool::new(false),
             gpu: gpu.clone(),
         }))
     }
@@ -221,11 +240,36 @@ impl Latest {
 
     /// The picture just changed: count it and time it, and wake anyone waiting.
     pub(crate) fn note_frame(&self) {
+        self.note_frame_at(super::system::host_now());
+    }
+
+    /// As [`Self::note_frame`], for a picture that came up at `at` (host seconds).
+    pub(crate) fn note_frame_at(&self, at: f64) {
         let mut n = self.frames.lock().unwrap();
         *n += 1;
-        self.arrived.store(super::system::host_now().to_bits(), Ordering::Release);
+        self.arrived.store(at.to_bits(), Ordering::Release);
         drop(n);
         self.wake.notify_all();
+    }
+
+    pub(crate) fn set_wants_queue(&self, on: bool) {
+        self.wants_queue.store(on, Ordering::Release);
+    }
+
+    pub(crate) fn wants_queue(&self) -> bool {
+        self.wants_queue.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn push_queued(&self, q: Queued) {
+        let mut queue = self.queue.lock().unwrap();
+        queue.push_back(q);
+        while queue.len() > QUEUE_MAX {
+            queue.pop_front();
+        }
+    }
+
+    pub(crate) fn drain_queue(&self) -> Vec<Queued> {
+        self.queue.lock().unwrap().drain(..).collect()
     }
 
     /// Pictures so far, and when the last arrived.
@@ -324,10 +368,15 @@ impl Latest {
     /// A new picture was drawn into `texture` (by the game capture hook), its
     /// valid part `size` from the top-left corner.
     pub(crate) fn mark_frame(&self, size: (u32, u32)) {
+        self.mark_frame_at(size, super::system::host_now());
+    }
+
+    /// As [`Self::mark_frame`], for a picture that came up at `at` (host seconds).
+    pub(crate) fn mark_frame_at(&self, size: (u32, u32), at: f64) {
         *self.content.lock().unwrap() = (size.0.min(self.width), size.1.min(self.height));
         self.waiting.store(false, Ordering::Release);
         self.has_frame.store(true, Ordering::Release);
-        self.note_frame();
+        self.note_frame_at(at);
     }
 
     /// Show black, as a full-size frame.

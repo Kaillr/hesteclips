@@ -21,6 +21,7 @@
 mod aac;
 pub mod anticheat;
 mod camera;
+mod changes;
 mod cursor;
 mod d3d;
 pub mod decode;
@@ -286,6 +287,7 @@ impl Session {
             // With blending, frames come from an average of the pictures shown
             // during them, not the newest picture.
             let blend = if s.blend_samples > 1 { Some(FrameBlend::new(&gpu, &latest)?) } else { None };
+            latest.set_wants_queue(blend.is_some());
             let converter_source = blend.as_ref().map_or(&latest, |b| &b.average);
             let converter = d3d::Converter::new(&gpu, converter_source, overlay.clone(), &encoder.pool.textures, true, width, height, s.fps)?;
             let preview = d3d::Previewer::new(&gpu, &latest, overlay, width, height, s.fps, crate::preview::new_producer())?;
@@ -892,10 +894,14 @@ fn spawn_aac(track: usize, mut enc: AacEncoder, rx: mpsc::Receiver<Vec<f32>>, ou
 struct FrameBlend {
     quad: quad::Quad,
     gpu: d3d::Gpu,
-    /// The picture that's currently up, copied (the capture overwrites the
-    /// shared one as soon as the next arrives), and its valid size.
-    held: Arc<d3d::Latest>,
+    /// The picture that's currently up: a copy of the capture's (which it
+    /// overwrites as soon as the next arrives), or one the capture handed
+    /// over whole (`Queued`); and its valid size.
+    own: Arc<d3d::Latest>,
+    own_view: windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView,
     held_view: windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView,
+    /// Keeps a handed-over picture's texture from going away.
+    held_keep: Option<windows::Win32::Graphics::Direct3D11::ID3D11Texture2D>,
     held_size: (u32, u32),
     /// The average so far, drawn into; the converter reads it.
     average: Arc<d3d::Latest>,
@@ -907,12 +913,15 @@ struct FrameBlend {
 impl FrameBlend {
     fn new(gpu: &d3d::Gpu, latest: &Arc<d3d::Latest>) -> Result<Self> {
         let average = d3d::Latest::new(gpu, latest.width, latest.height)?;
-        let held = d3d::Latest::new(gpu, latest.width, latest.height)?;
+        let own = d3d::Latest::new(gpu, latest.width, latest.height)?;
+        let own_view = quad::shader_view(gpu, &own.texture)?;
         Ok(Self {
             quad: quad::Quad::new(gpu)?,
             gpu: gpu.clone(),
-            held_view: quad::shader_view(gpu, &held.texture)?,
-            held,
+            held_view: own_view.clone(),
+            own_view,
+            own,
+            held_keep: None,
             held_size: (latest.width, latest.height),
             target: quad::target_view(gpu, &average.texture)?,
             average,
@@ -922,8 +931,17 @@ impl FrameBlend {
 
     /// The screen just changed: keep the new picture as the one that's up.
     fn hold(&mut self, latest: &d3d::Latest) {
-        unsafe { self.gpu.context.CopyResource(&self.held.texture, &latest.texture) };
+        unsafe { self.gpu.context.CopyResource(&self.own.texture, &latest.texture) };
+        self.held_view = self.own_view.clone();
+        self.held_keep = None;
         self.held_size = latest.content();
+    }
+
+    /// The same, for a picture the capture handed over whole.
+    fn hold_queued(&mut self, q: d3d::Queued) {
+        self.held_view = q.view;
+        self.held_keep = Some(q.texture);
+        self.held_size = q.size;
     }
 
     /// Add the picture that's up, for `seconds`, to the average.
@@ -933,7 +951,7 @@ impl FrameBlend {
         }
         self.weight += seconds;
         // Mixing in by seconds / total so far keeps it the weighted average.
-        self.quad.average(&self.gpu, &self.target, (self.held.width, self.held.height), &self.held_view, (seconds / self.weight) as f32);
+        self.quad.average(&self.gpu, &self.target, (self.own.width, self.own.height), &self.held_view, (seconds / self.weight) as f32);
     }
 
     /// The frame is done: its average is ready for the converter; the next
@@ -945,22 +963,27 @@ impl FrameBlend {
 }
 
 /// What the blending saw, printed every few seconds (to the log): how many
-/// pictures arrived, how evenly, and how many went into each frame, to tell a
+/// pictures arrived, how evenly, and how many went into each frame (by the
+/// time they came up), and how many came too late for their frame, to tell a
 /// capture that delivers unevenly from a blend that's wrong.
 struct BlendStats {
+    t0: f64,
+    fps: f64,
     since: Instant,
     pictures: u32,
     last: f64,
     gap: (f64, f64),
+    frame: i64,
     in_frame: u32,
     per_frame: (u32, u32),
     frames: u32,
     missed: u32,
+    late: u32,
 }
 
 impl BlendStats {
-    fn new() -> Self {
-        Self { since: Instant::now(), pictures: 0, last: 0.0, gap: (f64::MAX, 0.0), in_frame: 0, per_frame: (u32::MAX, 0), frames: 0, missed: 0 }
+    fn new(t0: f64, fps: u32) -> Self {
+        Self { t0, fps: fps as f64, since: Instant::now(), pictures: 0, last: 0.0, gap: (f64::MAX, 0.0), frame: -1, in_frame: 0, per_frame: (u32::MAX, 0), frames: 0, missed: 0, late: 0 }
     }
 
     fn arrival(&mut self, at: f64) {
@@ -970,30 +993,50 @@ impl BlendStats {
         }
         self.last = at;
         self.pictures += 1;
+        let frame = ((at - self.t0) * self.fps).floor() as i64;
+        if frame > self.frame {
+            if self.frame >= 0 {
+                self.per_frame = (self.per_frame.0.min(self.in_frame), self.per_frame.1.max(self.in_frame));
+                self.frames += 1;
+                // Frames between got nothing.
+                let skipped = (frame - self.frame - 1) as u32;
+                self.missed += skipped;
+                self.frames += skipped;
+                if skipped > 0 {
+                    self.per_frame.0 = 0;
+                }
+            }
+            self.frame = frame;
+            self.in_frame = 0;
+        }
         self.in_frame += 1;
-    }
-
-    fn frame_done(&mut self) {
-        self.per_frame = (self.per_frame.0.min(self.in_frame), self.per_frame.1.max(self.in_frame));
-        self.missed += (self.in_frame == 0) as u32;
-        self.in_frame = 0;
-        self.frames += 1;
         if self.since.elapsed() >= Duration::from_secs(5) {
             let secs = self.since.elapsed().as_secs_f64();
             eprintln!(
-                "frame blending: {:.0} pictures/s, {:.2}-{:.2} ms apart; {}-{} per frame, {} frames without a new picture, over {} frames",
+                "frame blending: {:.0} pictures/s, {:.2}-{:.2} ms apart; {}-{} per frame, {} frames without a new picture, {} pictures too late for their frame, over {} frames",
                 self.pictures as f64 / secs,
                 self.gap.0,
                 self.gap.1,
-                self.per_frame.0,
+                self.per_frame.0.min(self.per_frame.1),
                 self.per_frame.1,
                 self.missed,
+                self.late,
                 self.frames
             );
-            *self = Self { last: self.last, ..Self::new() };
+            *self = Self { last: self.last, frame: self.frame, in_frame: self.in_frame, ..Self::new(self.t0, self.fps as u32) };
         }
     }
+
+    /// A picture arrived after its frame had been closed.
+    fn too_late(&mut self) {
+        self.late += 1;
+    }
 }
+
+/// How long after a frame's time it's closed: a picture is known to be new a
+/// few milliseconds after it showed (the game capture compares it with the last
+/// one), and one that came up inside the frame must still get in. A guess.
+const BLEND_LATE: f64 = 0.012;
 
 /// Like [`spawn_pacer`], for frame blending: instead of looking at the screen
 /// on a clock, every new picture is added to the frame it falls in, as it
@@ -1020,7 +1063,7 @@ fn spawn_blend_pacer(
         let mut up_since = t0;
         let mut have_picture = false;
         let (mut seen, _) = latest.arrivals();
-        let mut stats = BlendStats::new();
+        let mut stats = BlendStats::new(t0, fps);
         if latest.has_frame() {
             blend.hold(&latest);
             have_picture = true;
@@ -1032,7 +1075,6 @@ fn spawn_blend_pacer(
             if have_picture {
                 blend.add(end - up_since.max(t0 + *next as f64 / fps_f));
                 blend.finish();
-                stats.frame_done();
                 if let Some(c) = camera.as_mut() {
                     c.pull();
                 }
@@ -1061,30 +1103,42 @@ fn spawn_blend_pacer(
         };
 
         while !stop2.load(Ordering::Relaxed) {
-            let frame_end = t0 + (next + 1) as f64 / fps_f;
+            let frame_end = t0 + (next + 1) as f64 / fps_f + BLEND_LATE;
             let wait = frame_end - host_now();
             if wait > 0.0 {
                 latest.wait_for_frame(seen, Duration::from_secs_f64(wait.min(0.05)));
             }
+            // Every picture the capture handed over, in order; else the newest.
+            let queued = latest.drain_queue();
             let (count, arrived) = latest.arrivals();
-            if count != seen {
-                seen = count;
+            let mut arrivals: Vec<(f64, Option<d3d::Queued>)> = queued.into_iter().map(|q| (q.at, Some(q))).collect();
+            if arrivals.is_empty() && count != seen {
+                arrivals.push((arrived, None));
+            }
+            seen = count;
+            for (at, picture) in arrivals {
                 // Frames that ended before the picture arrived took the old one.
                 let mut burst = 0;
-                while t0 + (next + 1) as f64 / fps_f <= arrived && burst < fps * 2 {
+                while t0 + (next + 1) as f64 / fps_f <= at && burst < fps * 2 {
                     close(&mut blend, &mut up_since, &mut next, have_picture, &mut stats);
                     burst += 1;
                 }
                 if have_picture {
-                    blend.add(arrived - up_since.max(t0 + next as f64 / fps_f));
+                    blend.add(at - up_since.max(t0 + next as f64 / fps_f));
                 }
-                blend.hold(&latest);
-                stats.arrival(arrived);
+                match picture {
+                    Some(q) => blend.hold_queued(q),
+                    None => blend.hold(&latest),
+                }
+                stats.arrival(at);
+                if at < t0 + next as f64 / fps_f {
+                    stats.too_late();
+                }
                 have_picture = true;
-                up_since = arrived;
+                up_since = at;
             }
             let mut burst = 0;
-            while t0 + (next + 1) as f64 / fps_f <= host_now() && burst < fps * 2 {
+            while t0 + (next + 1) as f64 / fps_f + BLEND_LATE <= host_now() && burst < fps * 2 {
                 close(&mut blend, &mut up_since, &mut next, have_picture, &mut stats);
                 burst += 1;
             }

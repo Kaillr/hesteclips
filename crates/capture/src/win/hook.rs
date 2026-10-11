@@ -409,6 +409,7 @@ fn run(dir: &Path, gpu: &Gpu, window: HWND, latest: &Arc<Latest>, fps: u32, stop
     // "ready" signal. Asking it to stop makes it start over, and signal again.
     let mut nudged = false;
     let quad = Quad::new(gpu)?;
+    let mut changes = super::changes::Changes::new(gpu, latest.width, latest.height)?;
     let target = super::quad::target_view(gpu, &latest.texture)?;
     let mut cursor = super::cursor::CursorLayer::new();
     let every = Duration::from_secs_f64(1.0 / (2.0 * fps.max(1) as f64));
@@ -453,15 +454,23 @@ fn run(dir: &Path, gpu: &Gpu, window: HWND, latest: &Arc<Latest>, fps: u32, stop
         // Minimized or tabbed out: the game draws nothing new, and the away
         // screen (or the last picture) is up instead.
         if let Some(s) = source.as_ref().filter(|_| !super::system::window_hidden(window)) {
-            match s.copy(gpu, &quad, &target, latest, &mutexes) {
+            // Into a slot of its own: whether it's new is known a few
+            // milliseconds on (`Changes`), and the picture is kept till then.
+            let (i, picture, slot_target) = changes.slot();
+            match s.copy(gpu, &quad, &slot_target, &picture, &mutexes) {
                 Ok(Some(size)) => {
-                    cursor.draw(gpu, &quad, latest, &target, window, pid, size);
+                    let mut at = windows::Win32::Foundation::POINT::default();
+                    let _ = unsafe { windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut at) };
+                    changes.submit(gpu, &quad, i, size, (at.x, at.y));
                     unsafe { gpu.context.Flush() };
-                    latest.mark_frame(size);
                 }
                 Ok(None) => {}
                 Err(e) => eprintln!("game hook: {e:#}"),
             }
+        }
+        // What's new goes up, with the cursor drawn on it.
+        if let Err(e) = changes.resolve(gpu, latest, &target, &mut |rtv, size| cursor.draw(gpu, &quad, latest, rtv, window, pid, size)) {
+            eprintln!("game hook: {e:#}");
         }
         next += every;
         let now = Instant::now();
