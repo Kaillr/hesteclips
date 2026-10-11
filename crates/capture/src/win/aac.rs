@@ -124,6 +124,27 @@ impl AacEncoder {
         Ok(())
     }
 
+    /// The end of the sound: the packets the encoder still holds (the last
+    /// partial block, padded with silence).
+    pub(crate) fn finish(&mut self) -> Vec<AacPacket> {
+        let mut out = Vec::new();
+        let drained = (|| -> Result<()> {
+            unsafe {
+                self.mft.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0)?;
+                self.mft.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0)?;
+            }
+            while let Some(data) = self.output()? {
+                out.push(AacPacket { data, frame: self.next_frame });
+                self.next_frame += AAC_FRAMES;
+            }
+            Ok(())
+        })();
+        if let Err(e) = drained {
+            eprintln!("AAC encoder: {e:#}");
+        }
+        out
+    }
+
     /// One encoded packet, or None when the encoder needs more input.
     fn output(&mut self) -> Result<Option<Vec<u8>>> {
         unsafe {
@@ -148,5 +169,47 @@ impl AacEncoder {
             buffer.Unlock()?;
             Ok(Some(data))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Where a click comes out after encoding and decoding (ffmpeg, from
+    /// ADTS): the encoder's delay, which players don't take off unless the
+    /// file says so. `cargo test -p capture aac_delay -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs ffmpeg on the PATH"]
+    fn aac_delay() {
+        let mut enc = AacEncoder::new(192_000).unwrap();
+        let at = 4_800usize; // 100 ms in
+        let total = 48_000usize + 300; // not a whole number of packets
+        let mut pcm = vec![0f32; total * 2];
+        for k in 0..48 {
+            pcm[(at + k) * 2] = 0.9;
+            pcm[(at + k) * 2 + 1] = 0.9;
+        }
+        let mut packets = Vec::new();
+        for block in pcm.chunks(960) {
+            packets.extend(enc.push(block));
+        }
+        let before = packets.len();
+        packets.extend(enc.finish());
+        println!("{} packets, {} from the drain, for {} frames ({:.2} packets)", packets.len(), packets.len() - before, total, total as f64 / 1024.0);
+        // ADTS: AAC-LC, 48 kHz (index 3), stereo.
+        let mut adts = Vec::new();
+        for p in &packets {
+            let len = p.data.len() + 7;
+            adts.extend_from_slice(&[0xFF, 0xF1, 0x4C, 0x80 | ((len >> 11) & 3) as u8, ((len >> 3) & 0xFF) as u8, (((len & 7) << 5) | 0x1F) as u8, 0xFC]);
+            adts.extend_from_slice(&p.data);
+        }
+        let path = std::env::temp_dir().join(format!("hc-aac-delay-{}.aac", std::process::id()));
+        std::fs::write(&path, &adts).unwrap();
+        let out = std::process::Command::new("ffmpeg").args(["-v", "error", "-i"]).arg(&path).args(["-f", "f32le", "-ac", "1", "-"]).output().unwrap();
+        let _ = std::fs::remove_file(&path);
+        let samples: Vec<f32> = out.stdout.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+        let first = samples.iter().position(|s| s.abs() > 0.3).expect("the click");
+        println!("decoded {} frames; click at {first}, sent at {at}: {} frames late", samples.len(), first as i64 - at as i64);
     }
 }
