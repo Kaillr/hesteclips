@@ -409,10 +409,10 @@ fn run(dir: &Path, gpu: &Gpu, window: HWND, latest: &Arc<Latest>, fps: u32, stop
     // "ready" signal. Asking it to stop makes it start over, and signal again.
     let mut nudged = false;
     let quad = Quad::new(gpu)?;
-    let mut changes = super::changes::Changes::new(gpu, latest.width, latest.height)?;
     let target = super::quad::target_view(gpu, &latest.texture)?;
     let mut cursor = super::cursor::CursorLayer::new();
     let every = Duration::from_secs_f64(1.0 / (2.0 * fps.max(1) as f64));
+    let mut changes = super::changes::Changes::new(gpu, latest.width, latest.height, every.as_secs_f64())?;
     let mut next = Instant::now();
     let result = loop {
         if stop.load(Ordering::Relaxed) {
@@ -469,9 +469,7 @@ fn run(dir: &Path, gpu: &Gpu, window: HWND, latest: &Arc<Latest>, fps: u32, stop
             }
         }
         // What's new goes up, with the cursor drawn on it.
-        if let Err(e) = changes.resolve(gpu, latest, &target, &mut |rtv, size| cursor.draw(gpu, &quad, latest, rtv, window, pid, size)) {
-            eprintln!("game hook: {e:#}");
-        }
+        changes.resolve(gpu, latest, &target, &mut |rtv, size| cursor.draw(gpu, &quad, latest, rtv, window, pid, size));
         next += every;
         let now = Instant::now();
         if next > now {

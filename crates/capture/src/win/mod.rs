@@ -292,7 +292,7 @@ impl Session {
             let converter = d3d::Converter::new(&gpu, converter_source, overlay.clone(), &encoder.pool.textures, true, width, height, s.fps)?;
             let preview = d3d::Previewer::new(&gpu, &latest, overlay, width, height, s.fps, crate::preview::new_producer())?;
             session.pacer = Some(match blend {
-                Some(blend) => spawn_blend_pacer(s.fps, latest, blend, converter, encoder, preview, camera, clock),
+                Some(blend) => spawn_blend_pacer(s.fps, looks_per_second, latest, blend, converter, encoder, preview, camera, clock),
                 None => spawn_pacer(s.fps, latest, converter, encoder, preview, camera, clock),
             });
             Ok(())
@@ -886,17 +886,28 @@ fn spawn_aac(track: usize, mut enc: AacEncoder, rx: mpsc::Receiver<Vec<f32>>, ou
 // Pacer: constant frame rate
 // ---------------------------------------------------------------------------
 
-/// Live frame blending: each recorded frame is the average of every picture
-/// the screen showed during its slot, each weighed by how long it was up
-/// (so a steady 300 pictures a second give equal weights, and a stall just
-/// holds one picture). Sampling the screen on a clock instead would catch some
-/// pictures twice and miss others, differently each frame.
+/// Live frame blending, made of whole pictures: a game at 300 fps recorded at
+/// 60 shows 5 pictures in each frame's time, and the frame is their average,
+/// each weighed the same. Two things keep that the same in every frame:
+///
+/// - The frame boundaries are kept halfway between the game's pictures
+///   (locked to its pace). A picture's time is only known to a millisecond or
+///   so (when the capture noticed it); with a boundary next to a picture, that
+///   would send it to one frame or the next by chance, 4 pictures in one frame
+///   and 6 in the next, which shows as stutter.
+/// - A picture that stays up longer than one step of the pace (the game
+///   hitched, or the capture missed the next one) counts once per step it
+///   was up, so a frame always covers its whole time.
+///
+/// The pace is measured from the pictures, starting at the blend rate. Frames
+/// are made `BLEND_LATE` after their time, so that pictures noticed late
+/// still get into theirs.
 struct FrameBlend {
     quad: quad::Quad,
     gpu: d3d::Gpu,
-    /// The picture that's currently up: a copy of the capture's (which it
-    /// overwrites as soon as the next arrives), or one the capture handed
-    /// over whole (`Queued`); and its valid size.
+    /// The picture that's up: a copy of the capture's newest (for one it puts
+    /// up without queueing, a still), or one it handed over whole
+    /// (`Queued`); and its valid size.
     own: Arc<d3d::Latest>,
     own_view: windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView,
     held_view: windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView,
@@ -906,8 +917,8 @@ struct FrameBlend {
     /// The average so far, drawn into; the converter reads it.
     average: Arc<d3d::Latest>,
     target: windows::Win32::Graphics::Direct3D11::ID3D11RenderTargetView,
-    /// How much time the average holds so far, in seconds.
-    weight: f64,
+    /// Steps of pictures in the average so far.
+    count: u32,
 }
 
 impl FrameBlend {
@@ -925,11 +936,11 @@ impl FrameBlend {
             held_size: (latest.width, latest.height),
             target: quad::target_view(gpu, &average.texture)?,
             average,
-            weight: 0.0,
+            count: 0,
         })
     }
 
-    /// The screen just changed: keep the new picture as the one that's up.
+    /// The capture's newest picture is the one that's up now (copied).
     fn hold(&mut self, latest: &d3d::Latest) {
         unsafe { self.gpu.context.CopyResource(&self.own.texture, &latest.texture) };
         self.held_view = self.own_view.clone();
@@ -944,206 +955,266 @@ impl FrameBlend {
         self.held_size = q.size;
     }
 
-    /// Add the picture that's up, for `seconds`, to the average.
-    fn add(&mut self, seconds: f64) {
-        if seconds <= 0.0 {
+    /// Add the picture that's up, `steps` times, to the frame's average.
+    fn add(&mut self, steps: u32) {
+        if steps == 0 {
             return;
         }
-        self.weight += seconds;
-        // Mixing in by seconds / total so far keeps it the weighted average.
-        self.quad.average(&self.gpu, &self.target, (self.own.width, self.own.height), &self.held_view, (seconds / self.weight) as f32);
+        self.count += steps;
+        // Mixing in by its share of the total so far keeps it the average.
+        self.quad.average(&self.gpu, &self.target, (self.own.width, self.own.height), &self.held_view, steps as f32 / self.count as f32);
     }
 
-    /// The frame is done: its average is ready for the converter; the next
-    /// one starts empty.
-    fn finish(&mut self) {
+    /// The frame is done: its average is ready for the converter, and the next
+    /// starts empty. How many steps it holds (None: nothing, no picture yet).
+    fn finish(&mut self) -> Option<u32> {
+        if self.count == 0 {
+            return None;
+        }
         self.average.mark_frame(self.held_size);
-        self.weight = 0.0;
+        Some(std::mem::take(&mut self.count))
     }
 }
 
-/// What the blending saw, printed every few seconds (to the log): how many
-/// pictures arrived, how evenly, and how many went into each frame (by the
-/// time they came up), and how many came too late for their frame, to tell a
-/// capture that delivers unevenly from a blend that's wrong.
-struct BlendStats {
+/// How long after a frame's time it's made: the game capture knows a picture
+/// is new a few milliseconds after it came up (it compares it with the last),
+/// and it must still get into its frame. A guess.
+const BLEND_LATE: f64 = 0.012;
+/// How much of the way the boundaries move toward halfway between pictures,
+/// on each picture. A guess: slow enough that the noise in pictures' times
+/// averages out (a few hundred milliseconds), quick enough to follow a game
+/// that drifts.
+const PHASE_GAIN: f64 = 0.03;
+
+/// The picture that's up: when it came up, and how many steps of it have
+/// gone into frames.
+struct Held {
+    at: f64,
+    added: u32,
+}
+
+struct BlendPacer {
     t0: f64,
-    fps: f64,
+    frame_len: f64,
+    /// The game's pace: seconds between its pictures.
+    step: f64,
+    /// Frame `k` covers from `t0 + k * frame_len + phase` to the next.
+    phase: f64,
+    /// The frame being filled.
+    next: i64,
+    held: Option<Held>,
+    blend: FrameBlend,
+    converter: d3d::Converter,
+    encoder: h264::Encoder,
+    preview: d3d::Previewer,
+    camera: Option<camera::CameraLayer>,
+    dropped: u64,
+    stats: BlendStats,
+}
+
+impl BlendPacer {
+    fn boundary(&self, k: i64) -> f64 {
+        self.t0 + k as f64 * self.frame_len + self.phase
+    }
+
+    /// Add the steps of the picture that's up from before `until`, no more
+    /// than `limit` of them in all, into the frames they fall in.
+    fn fill(&mut self, until: f64, limit: u32) {
+        let Some(mut held) = self.held.take() else { return };
+        while held.added < limit {
+            let from = held.at + held.added as f64 * self.step;
+            if from >= until {
+                break;
+            }
+            while from >= self.boundary(self.next + 1) {
+                self.close();
+            }
+            let end = until.min(self.boundary(self.next + 1));
+            let steps = (((end - from) / self.step).ceil() as u32).clamp(1, limit - held.added);
+            self.blend.add(steps);
+            held.added += steps;
+        }
+        self.held = Some(held);
+    }
+
+    /// The frame being filled is done: encode it.
+    fn close(&mut self) {
+        // A frame with no step of its own (between a long-held picture's
+        // last step and the next picture) shows the one that's up.
+        if self.blend.count == 0 && self.held.is_some() {
+            self.blend.add(1);
+        }
+        if let Some(steps) = self.blend.finish() {
+            self.stats.frame(steps, (self.frame_len / self.step).round() as u32, self.step);
+            if let Some(c) = self.camera.as_mut() {
+                c.pull();
+            }
+            match self.encoder.pool.take() {
+                Some(slot) => match self.converter.convert(slot) {
+                    Ok(()) => self.encoder.encode(slot, self.next),
+                    Err(e) => {
+                        self.encoder.pool.give(slot);
+                        eprintln!("{e:#}");
+                    }
+                },
+                None => {
+                    self.dropped += 1;
+                    crate::FRAMES_SKIPPED.fetch_add(1, Ordering::Relaxed);
+                    if self.dropped.is_power_of_two() {
+                        eprintln!("video encoder is behind: {} frames skipped", self.dropped);
+                    }
+                }
+            }
+            if let Err(e) = self.preview.submit() {
+                eprintln!("preview: {e:#}");
+            }
+        }
+        self.next += 1;
+    }
+
+    /// A new picture came up at `at`: the one before it is done (all its
+    /// steps go in), and the boundaries move toward halfway between pictures.
+    fn arrive(&mut self, at: f64, picture: Option<d3d::Queued>, latest: &d3d::Latest) {
+        if at < self.boundary(self.next) {
+            self.stats.late += 1;
+        }
+        if let Some(held) = &self.held {
+            let gap = at - held.at;
+            let steps = ((gap / self.step).round() as u32).max(1);
+            self.stats.filled += steps - 1;
+            // Follow the pace from gaps of one step (not hitches).
+            if gap > self.step * 0.5 && gap < self.step * 1.5 {
+                self.step += (gap - self.step) * 0.01;
+            }
+            self.fill(f64::INFINITY, steps);
+        }
+        let k = ((at - self.t0 - self.phase) / self.frame_len).round() as i64;
+        let steps_after = (at - self.boundary(k)) / self.step;
+        // How far from halfway between two boundaries' worth of steps, -0.5 to 0.5.
+        let off = steps_after - steps_after.floor() - 0.5;
+        self.phase += off * self.step * PHASE_GAIN;
+        // A whole step either way is the same lock, one picture over: a game
+        // a little off the blend rate gets a frame of one more or less now and
+        // then, as it must.
+        if self.phase > self.step / 2.0 {
+            self.phase -= self.step;
+        } else if self.phase < -self.step / 2.0 {
+            self.phase += self.step;
+        }
+        match picture {
+            Some(q) => self.blend.hold_queued(q),
+            None => self.blend.hold(latest),
+        }
+        self.held = Some(Held { at, added: 0 });
+        self.stats.pictures += 1;
+    }
+}
+
+/// What the blending saw, printed every few seconds (to the log): the game's
+/// pictures and pace, how many went into each frame, how many were filled in
+/// (a picture held over more than one step: the game hitched, or the capture
+/// missed one), and how many came too late for their frame.
+struct BlendStats {
     since: Instant,
     pictures: u32,
-    last: f64,
-    gap: (f64, f64),
-    frame: i64,
-    in_frame: u32,
-    per_frame: (u32, u32),
     frames: u32,
-    missed: u32,
+    exact: u32,
+    fewest: u32,
+    most: u32,
+    filled: u32,
     late: u32,
 }
 
 impl BlendStats {
-    fn new(t0: f64, fps: u32) -> Self {
-        Self { t0, fps: fps as f64, since: Instant::now(), pictures: 0, last: 0.0, gap: (f64::MAX, 0.0), frame: -1, in_frame: 0, per_frame: (u32::MAX, 0), frames: 0, missed: 0, late: 0 }
+    fn new() -> Self {
+        Self { since: Instant::now(), pictures: 0, frames: 0, exact: 0, fewest: u32::MAX, most: 0, filled: 0, late: 0 }
     }
 
-    fn arrival(&mut self, at: f64) {
-        if self.last > 0.0 {
-            let g = (at - self.last) * 1000.0;
-            self.gap = (self.gap.0.min(g), self.gap.1.max(g));
-        }
-        self.last = at;
-        self.pictures += 1;
-        let frame = ((at - self.t0) * self.fps).floor() as i64;
-        if frame > self.frame {
-            if self.frame >= 0 {
-                self.per_frame = (self.per_frame.0.min(self.in_frame), self.per_frame.1.max(self.in_frame));
-                self.frames += 1;
-                // Frames between got nothing.
-                let skipped = (frame - self.frame - 1) as u32;
-                self.missed += skipped;
-                self.frames += skipped;
-                if skipped > 0 {
-                    self.per_frame.0 = 0;
-                }
-            }
-            self.frame = frame;
-            self.in_frame = 0;
-        }
-        self.in_frame += 1;
+    fn frame(&mut self, steps: u32, expected: u32, step: f64) {
+        self.frames += 1;
+        self.exact += (steps == expected) as u32;
+        self.fewest = self.fewest.min(steps);
+        self.most = self.most.max(steps);
         if self.since.elapsed() >= Duration::from_secs(5) {
-            let secs = self.since.elapsed().as_secs_f64();
             eprintln!(
-                "frame blending: {:.0} pictures/s, {:.2}-{:.2} ms apart; {}-{} per frame, {} frames without a new picture, {} pictures too late for their frame, over {} frames",
-                self.pictures as f64 / secs,
-                self.gap.0,
-                self.gap.1,
-                self.per_frame.0.min(self.per_frame.1),
-                self.per_frame.1,
-                self.missed,
+                "frame blending: {:.0} pictures/s, game pace {:.1} fps; {}-{} per frame, {:.0}% of frames exactly {expected}; {} filled in, {} too late, over {} frames",
+                self.pictures as f64 / self.since.elapsed().as_secs_f64(),
+                1.0 / step,
+                self.fewest,
+                self.most,
+                self.exact as f64 * 100.0 / self.frames as f64,
+                self.filled,
                 self.late,
                 self.frames
             );
-            *self = Self { last: self.last, frame: self.frame, in_frame: self.in_frame, ..Self::new(self.t0, self.fps as u32) };
+            *self = Self::new();
         }
-    }
-
-    /// A picture arrived after its frame had been closed.
-    fn too_late(&mut self) {
-        self.late += 1;
     }
 }
 
-/// How long after a frame's time it's closed: a picture is known to be new a
-/// few milliseconds after it showed (the game capture compares it with the last
-/// one), and one that came up inside the frame must still get in. A guess.
-const BLEND_LATE: f64 = 0.012;
-
-/// Like [`spawn_pacer`], for frame blending: instead of looking at the screen
-/// on a clock, every new picture is added to the frame it falls in, as it
-/// arrives, weighed by how long it stays up.
+/// Like [`spawn_pacer`], for frame blending (see [`FrameBlend`]): every new
+/// picture is added, as it comes, to the frames it falls in.
+#[allow(clippy::too_many_arguments)]
 fn spawn_blend_pacer(
     fps: u32,
+    blend_rate: u32,
     latest: Arc<d3d::Latest>,
-    mut blend: FrameBlend,
+    blend: FrameBlend,
     converter: d3d::Converter,
     encoder: h264::Encoder,
     preview: d3d::Previewer,
-    mut camera: Option<camera::CameraLayer>,
+    camera: Option<camera::CameraLayer>,
     clock: Arc<Clock>,
 ) -> (Arc<AtomicBool>, JoinHandle<()>) {
     let stop = Arc::new(AtomicBool::new(false));
     let stop2 = stop.clone();
     let handle = thread::spawn(move || {
-        let fps_f = fps as f64;
         let t0 = host_now();
         clock.set(t0);
-        let mut next: i64 = 0; // the frame being made: seconds next/fps .. (next+1)/fps after t0
-        let mut dropped = 0u64;
-        // When the picture that's up came up (not before the frame began).
-        let mut up_since = t0;
-        let mut have_picture = false;
-        let (mut seen, _) = latest.arrivals();
-        let mut stats = BlendStats::new(t0, fps);
-        if latest.has_frame() {
-            blend.hold(&latest);
-            have_picture = true;
-        }
-
-        // The frame ends: encode it, and begin the next.
-        let mut close = |blend: &mut FrameBlend, up_since: &mut f64, next: &mut i64, have_picture: bool| {
-            let end = t0 + (*next + 1) as f64 / fps_f;
-            if have_picture {
-                blend.add(end - up_since.max(t0 + *next as f64 / fps_f));
-                blend.finish();
-                if let Some(c) = camera.as_mut() {
-                    c.pull();
-                }
-                match encoder.pool.take() {
-                    Some(slot) => match converter.convert(slot) {
-                        Ok(()) => encoder.encode(slot, *next),
-                        Err(e) => {
-                            encoder.pool.give(slot);
-                            eprintln!("{e:#}");
-                        }
-                    },
-                    None => {
-                        dropped += 1;
-                        crate::FRAMES_SKIPPED.fetch_add(1, Ordering::Relaxed);
-                        if dropped.is_power_of_two() {
-                            eprintln!("video encoder is behind: {dropped} frames skipped");
-                        }
-                    }
-                }
-                if let Err(e) = preview.submit() {
-                    eprintln!("preview: {e:#}");
-                }
-            }
-            *up_since = end;
-            *next += 1;
+        let mut p = BlendPacer {
+            t0,
+            frame_len: 1.0 / fps.max(1) as f64,
+            step: 1.0 / blend_rate.max(1) as f64,
+            phase: 0.0,
+            next: 0,
+            held: None,
+            blend,
+            converter,
+            encoder,
+            preview,
+            camera,
+            dropped: 0,
+            stats: BlendStats::new(),
         };
-
+        if latest.has_frame() {
+            p.blend.hold(&latest);
+            p.held = Some(Held { at: t0, added: 0 });
+        }
+        let mut others = latest.others();
         while !stop2.load(Ordering::Relaxed) {
-            let frame_end = t0 + (next + 1) as f64 / fps_f + BLEND_LATE;
-            let wait = frame_end - host_now();
-            if wait > 0.0 {
+            let (seen, _) = latest.arrivals();
+            let wait = p.boundary(p.next + 1) + BLEND_LATE - host_now();
+            if wait > 0.0 && latest.queue_len() == 0 {
                 latest.wait_for_frame(seen, Duration::from_secs_f64(wait.min(0.05)));
             }
-            // Every picture the capture handed over, in order; else the newest.
-            let queued = latest.drain_queue();
-            let (count, arrived) = latest.arrivals();
-            let mut arrivals: Vec<(f64, Option<d3d::Queued>)> = queued.into_iter().map(|q| (q.at, Some(q))).collect();
-            if arrivals.is_empty() && count != seen {
-                arrivals.push((arrived, None));
+            for q in latest.drain_queue() {
+                p.arrive(q.at, Some(q), &latest);
             }
-            seen = count;
-            for (at, picture) in arrivals {
-                // Frames that ended before the picture arrived took the old one.
-                let mut burst = 0;
-                while t0 + (next + 1) as f64 / fps_f <= at && burst < fps * 2 {
-                    close(&mut blend, &mut up_since, &mut next, have_picture);
-                    burst += 1;
-                }
-                if have_picture {
-                    blend.add(at - up_since.max(t0 + next as f64 / fps_f));
-                }
-                match picture {
-                    Some(q) => blend.hold_queued(q),
-                    None => blend.hold(&latest),
-                }
-                stats.arrival(at);
-                if at < t0 + next as f64 / fps_f {
-                    stats.too_late();
-                }
-                have_picture = true;
-                up_since = at;
+            // Put up some other way (a still): take it from the capture.
+            let now_others = latest.others();
+            if now_others != others {
+                others = now_others;
+                p.arrive(host_now(), None, &latest);
             }
             let mut burst = 0;
-            while t0 + (next + 1) as f64 / fps_f + BLEND_LATE <= host_now() && burst < fps * 2 {
-                close(&mut blend, &mut up_since, &mut next, have_picture);
+            while p.boundary(p.next + 1) + BLEND_LATE <= host_now() && burst < fps * 2 {
+                let end = p.boundary(p.next + 1);
+                p.fill(end, u32::MAX);
+                p.close();
                 burst += 1;
             }
         }
-        encoder.finish();
+        p.encoder.finish();
     });
     (stop, handle)
 }

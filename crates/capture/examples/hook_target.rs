@@ -2,6 +2,9 @@
 //! half, blue bottom half (so a picture upside down shows), a white bar
 //! moving across (so frames differ), with Direct3D 11 or (`GL=1`) OpenGL,
 //! the way osu! and Geometry Dash draw. Closes after `SECS` seconds (10).
+//! `FPS=n`: exactly n pictures a second, the bar 4 px further in each (to
+//! check frame blending: each recorded frame should show the bar's
+//! positions in its time, evenly).
 //!
 //!   cargo run -p capture --example hook_target
 //!   APP=hook_target.exe HOOK=1 SECS=5 HEIGHT=0 cargo run -p capture --example record
@@ -45,6 +48,8 @@ fn main() -> windows::core::Result<()> {
     };
 
     let start = std::time::Instant::now();
+    let cap: Option<f64> = std::env::var("FPS").ok().and_then(|s| s.parse().ok());
+    let mut shown = 0u64;
     let mut draw: Box<dyn FnMut(f32)> = if gl {
         use windows::Win32::Graphics::Gdi::HDC;
         use windows::Win32::Graphics::OpenGL::*;
@@ -138,7 +143,19 @@ fn main() -> windows::core::Result<()> {
                 break;
             }
         }
-        draw(if still { 0.0 } else { start.elapsed().as_secs_f32() });
+        let t = match cap {
+            // The bar moves 200 px a second of `t`: 4 px a picture.
+            Some(fps) => {
+                let due = shown as f64 / fps;
+                while start.elapsed().as_secs_f64() < due {
+                    std::hint::spin_loop();
+                }
+                shown += 1;
+                shown as f32 / 50.0
+            }
+            None => start.elapsed().as_secs_f32(),
+        };
+        draw(if still { 0.0 } else { t });
     }
     Ok(())
 }

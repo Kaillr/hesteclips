@@ -186,15 +186,21 @@ pub(crate) struct Latest {
     /// sends no new frames. With its valid size.
     saved: Mutex<Option<(ID3D11Texture2D, (u32, u32))>>,
     /// How many new pictures there have been, and when (host seconds, as f64
-    /// bits) the last one arrived: frame blending weighs each picture by how
-    /// long it was up, so it needs the real arrival times.
+    /// bits) the last one came up, to wake a consumer waiting for one.
     frames: Mutex<u64>,
     arrived: std::sync::atomic::AtomicU64,
+    /// How many of those were changes put up some other way than `mark` (a
+    /// still, black): a consumer of the queue takes those from `texture`.
+    others: std::sync::atomic::AtomicU64,
     wake: std::sync::Condvar,
-    /// Every picture, not just the newest, for a consumer that wants them
-    /// all (frame blending on the game capture), while `wants_queue`.
+    /// Every picture, not just the newest, each copied into a texture of its
+    /// own, for a consumer that needs them all (frame blending) while
+    /// `wants_queue`: between two of its looks the capture can bring several.
     queue: Mutex<std::collections::VecDeque<Queued>>,
     wants_queue: AtomicBool,
+    /// The textures the queue's pictures are copied into, taken in turn
+    /// (made the first time they're needed), and which is next.
+    pool: Mutex<(Vec<(ID3D11Texture2D, ID3D11ShaderResourceView)>, usize)>,
     gpu: Gpu,
 }
 
@@ -209,7 +215,10 @@ pub(crate) struct Queued {
 
 /// Pictures waiting beyond this are dropped, oldest first (the consumer is
 /// far behind).
-pub(crate) const QUEUE_MAX: usize = 7;
+const QUEUE_MAX: usize = 7;
+/// Textures for the queue: the ones waiting, the one the consumer holds, and
+/// one being written.
+const POOL: usize = QUEUE_MAX + 3;
 unsafe impl Send for Latest {}
 unsafe impl Sync for Latest {}
 
@@ -227,9 +236,11 @@ impl Latest {
             saved: Mutex::new(None),
             frames: Mutex::new(0),
             arrived: std::sync::atomic::AtomicU64::new(0),
+            others: std::sync::atomic::AtomicU64::new(0),
             wake: std::sync::Condvar::new(),
             queue: Mutex::new(std::collections::VecDeque::new()),
             wants_queue: AtomicBool::new(false),
+            pool: Mutex::new((Vec::new(), 0)),
             gpu: gpu.clone(),
         }))
     }
@@ -238,9 +249,16 @@ impl Latest {
         self.has_frame.load(Ordering::Acquire)
     }
 
-    /// The picture just changed: count it and time it, and wake anyone waiting.
+    /// The picture just changed (a still, black): count it and time it, and
+    /// wake anyone waiting.
     pub(crate) fn note_frame(&self) {
+        self.others.fetch_add(1, Ordering::AcqRel);
         self.note_frame_at(super::system::host_now());
+    }
+
+    /// Changes put up other than by `mark`, so far (see `others`).
+    pub(crate) fn others(&self) -> u64 {
+        self.others.load(Ordering::Acquire)
     }
 
     /// As [`Self::note_frame`], for a picture that came up at `at` (host seconds).
@@ -260,12 +278,32 @@ impl Latest {
         self.wants_queue.load(Ordering::Acquire)
     }
 
-    pub(crate) fn push_queued(&self, q: Queued) {
+    /// Copy the picture now in `texture` into the queue.
+    fn queue_picture(&self, size: (u32, u32), at: f64) -> Result<()> {
+        let mut pool = self.pool.lock().unwrap();
+        if pool.0.is_empty() {
+            let bind = (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32;
+            for _ in 0..POOL {
+                let texture = self.gpu.texture(self.width, self.height, DXGI_FORMAT_B8G8R8A8_UNORM, bind, D3D11_USAGE_DEFAULT, 0)?;
+                let view = super::quad::shader_view(&self.gpu, &texture)?;
+                pool.0.push((texture, view));
+            }
+        }
+        let i = pool.1;
+        pool.1 = (i + 1) % POOL;
+        let (texture, view) = pool.0[i].clone();
+        drop(pool);
+        unsafe { self.gpu.context.CopyResource(&texture, &self.texture) };
         let mut queue = self.queue.lock().unwrap();
-        queue.push_back(q);
+        queue.push_back(Queued { texture, view, size, at });
         while queue.len() > QUEUE_MAX {
             queue.pop_front();
         }
+        Ok(())
+    }
+
+    pub(crate) fn queue_len(&self) -> usize {
+        self.queue.lock().unwrap().len()
     }
 
     pub(crate) fn drain_queue(&self) -> Vec<Queued> {
@@ -373,9 +411,21 @@ impl Latest {
 
     /// As [`Self::mark_frame`], for a picture that came up at `at` (host seconds).
     pub(crate) fn mark_frame_at(&self, size: (u32, u32), at: f64) {
-        *self.content.lock().unwrap() = (size.0.min(self.width), size.1.min(self.height));
+        self.mark(size, at, true);
+    }
+
+    /// A picture that's up now, `queue`d for a consumer that wants every one
+    /// (or not: the same game picture with the cursor moved).
+    pub(crate) fn mark(&self, size: (u32, u32), at: f64, queue: bool) {
+        let size = (size.0.min(self.width), size.1.min(self.height));
+        *self.content.lock().unwrap() = size;
         self.waiting.store(false, Ordering::Release);
         self.has_frame.store(true, Ordering::Release);
+        if queue && self.wants_queue() {
+            if let Err(e) = self.queue_picture(size, at) {
+                eprintln!("frame blending: {e:#}");
+            }
+        }
         self.note_frame_at(at);
     }
 
@@ -466,6 +516,10 @@ impl Capture {
             let Some(pool) = pool.as_ref() else { return Ok(()) };
             let frame = pool.TryGetNextFrame()?;
             let content = frame.ContentSize()?;
+            // When Windows composed it (the same clock as `host_now`), more
+            // exact than when it reaches us; not if it's far off.
+            let now = super::system::host_now();
+            let shown = frame.SystemRelativeTime().map(|t| t.Duration as f64 / 1e7).ok().filter(|&t| t <= now && t > now - 0.1).unwrap_or(now);
             let copied = (|| -> windows::core::Result<Option<(u32, u32)>> {
                 let access: IDirect3DDxgiInterfaceAccess = frame.Surface()?.cast()?;
                 let tex: ID3D11Texture2D = unsafe { access.GetInterface()? };
@@ -507,10 +561,7 @@ impl Capture {
                     }
                 }
                 *last_frame2.lock().unwrap() = std::time::Instant::now();
-                *latest2.content.lock().unwrap() = size;
-                latest2.waiting.store(false, Ordering::Release);
-                latest2.has_frame.store(true, Ordering::Release);
-                latest2.note_frame();
+                latest2.mark_frame_at(size, shown);
             }
             // The display or window changed size: resize the pool to match.
             let mut size = pool_size.lock().unwrap();
