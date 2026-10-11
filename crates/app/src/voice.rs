@@ -19,17 +19,26 @@
 //! (~2 s) go to our classifier. The phrase is heard when it's sure
 //! ([`THRESHOLD`]) for [`NEED`] frames in a row. A few % of one core.
 
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Mutex};
 
 use capture::mixer::LiveAudio;
 
 use crate::service::QuickSave;
 
+/// What the app tells the detector.
+enum Cmd {
+    /// Listen to this microphone source (its id), or to none.
+    Listen(Option<String>),
+    /// A clip was just saved by hand.
+    ByHand,
+}
+
 pub struct Voice {
-    /// The microphone source to listen to (its id), or none.
-    listen: Sender<Option<String>>,
+    listen: Sender<Cmd>,
+    /// Keep snippets to review ([`crate::voice_samples`]).
+    collect: Arc<AtomicBool>,
     /// Clips saved by voice (the flag: whether it was).
     heard: Receiver<bool>,
     wanted: Option<String>,
@@ -43,18 +52,35 @@ impl Voice {
         let (heard_tx, heard) = channel();
         let problem: Arc<Mutex<Option<String>>> = Default::default();
         let p = problem.clone();
+        let collect: Arc<AtomicBool> = Default::default();
+        let c = collect.clone();
         std::thread::Builder::new()
             .name("voice".into())
-            .spawn(move || detector::run(rx, heard_tx, quick, live, ctx, p))
+            .spawn(move || detector::run(rx, heard_tx, quick, live, ctx, p, c))
             .expect("spawn voice thread");
-        Self { listen, heard, wanted: None, problem }
+        Self { listen, collect, heard, wanted: None, problem }
     }
 
     /// Listen to this microphone source, or not (cheap to call every frame).
     pub fn listen(&mut self, mic: Option<&str>) {
         if mic != self.wanted.as_deref() {
             self.wanted = mic.map(str::to_owned);
-            let _ = self.listen.send(self.wanted.clone());
+            let _ = self.listen.send(Cmd::Listen(self.wanted.clone()));
+        }
+    }
+
+    /// Whether to keep snippets of what it fires on and nearly fires on (cheap
+    /// to call every frame).
+    pub fn collect(&self, on: bool) {
+        self.collect.store(on, Ordering::Relaxed);
+    }
+
+    /// A clip was saved with the shortcut or button: the sound just before it
+    /// is kept to review, if collecting (the phrase may have been said and not
+    /// heard).
+    pub fn saved_by_hand(&self) {
+        if self.collect.load(Ordering::Relaxed) {
+            let _ = self.listen.send(Cmd::ByHand);
         }
     }
 
@@ -66,6 +92,7 @@ impl Voice {
 
 mod detector {
     use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -73,7 +100,9 @@ mod detector {
     use capture::mixer::{LiveAudio, RATE};
     use tract_onnx::prelude::*;
 
+    use super::Cmd;
     use crate::service::QuickSave;
+    use crate::voice_samples::{self, Kind};
 
     /// The models, built into the app (`assets/wake`, see its README).
     const MELSPECTROGRAM: &[u8] = include_bytes!("../assets/wake/melspectrogram.onnx");
@@ -90,6 +119,14 @@ mod detector {
     /// After a clip is saved, the phrase isn't heard again for this long: one
     /// take, one clip (the next take can come 1.6 s later).
     const QUIET_AFTER: f64 = 1.2;
+    /// A snippet is kept for review when the classifier gets this sure without
+    /// firing (a guess: low enough to catch the phrase said oddly, high enough
+    /// that ordinary talk doesn't fill the review queue), and a burst of it
+    /// ends when it drops below [`BURST_END`].
+    const ALMOST: f32 = 0.3;
+    const BURST_END: f32 = 0.1;
+    /// At least this long between snippets, so one noise isn't kept five times.
+    const SNIPPET_GAP: f64 = 4.0;
     /// The models' rate (48 kHz from the mixer is brought down to it).
     const MODEL_RATE: u32 = 16_000;
     /// Sound per feature frame (80 ms), and what the mel spectrogram is run
@@ -105,12 +142,13 @@ mod detector {
     type Model = Arc<TypedRunnableModel>;
 
     pub(super) fn run(
-        rx: Receiver<Option<String>>,
+        rx: Receiver<Cmd>,
         heard: Sender<bool>,
         quick: QuickSave,
         live: Arc<LiveAudio>,
         ctx: egui::Context,
         problem: Arc<Mutex<Option<String>>>,
+        collect: Arc<AtomicBool>,
     ) {
         let mut models: Option<Models> = None;
         let mut listening: Option<Listening> = None;
@@ -118,7 +156,11 @@ mod detector {
             let wanted = match (&mut listening, &models) {
                 // Listening: take sound until told otherwise.
                 (Some(l), Some(m)) => match rx.try_recv() {
-                    Ok(w) => Some(w),
+                    Ok(Cmd::Listen(w)) => Some(w),
+                    Ok(Cmd::ByHand) => {
+                        l.by_hand();
+                        None
+                    }
                     Err(TryRecvError::Empty) => {
                         if l.step(m) {
                             let _ = heard.send(quick.save());
@@ -129,7 +171,8 @@ mod detector {
                     Err(TryRecvError::Disconnected) => return,
                 },
                 _ => match rx.recv_timeout(Duration::from_secs(60)) {
-                    Ok(w) => Some(w),
+                    Ok(Cmd::Listen(w)) => Some(w),
+                    Ok(Cmd::ByHand) => None,
                     Err(RecvTimeoutError::Timeout) => None,
                     Err(RecvTimeoutError::Disconnected) => return,
                 },
@@ -154,7 +197,9 @@ mod detector {
             }
             let (tx, sound) = channel();
             live.channel(&mic).set_tap(Some(tx));
-            listening = Some(Listening::new(mic, sound));
+            let mut l = Listening::new(mic, sound);
+            l.collect = Some(collect.clone());
+            listening = Some(l);
         }
     }
 
@@ -219,6 +264,16 @@ mod detector {
         /// `HESTECLIPS_VOICE_DUMP=<file.wav>`: everything heard, kept to
         /// replay through the tests (written when listening stops).
         dump: Option<(std::path::PathBuf, Vec<f32>)>,
+        /// Whether to keep snippets to review; set by the app.
+        collect: Option<Arc<AtomicBool>>,
+        /// The last seconds heard (at the models' rate, as -1..1), while collecting.
+        recent: VecDeque<f32>,
+        /// The classifier's surest in the burst of confidence it's in, or none.
+        burst: Option<f32>,
+        /// A snippet to keep once enough has been heard after its moment:
+        /// (kind, score, when to keep it, seconds into the snippet it's at).
+        snippet: Option<(Kind, f32, f64, Option<f32>)>,
+        snippet_at: f64,
     }
 
     fn debug() -> bool {
@@ -275,6 +330,11 @@ mod detector {
                 best: 0.0,
                 logged_at: 0.0,
                 dump,
+                collect: None,
+                recent: VecDeque::new(),
+                burst: None,
+                snippet: None,
+                snippet_at: f64::NEG_INFINITY,
             }
         }
 
@@ -328,6 +388,16 @@ mod detector {
                 self.peak = samples.iter().fold(self.peak, |m, s| m.max(s.abs()));
             }
             let prepared = self.prepare(samples, rate);
+            if self.collecting() {
+                self.recent.extend(prepared.iter().map(|s| s / 32768.0));
+                let keep = ((voice_samples::BY_HAND + 1.0) * MODEL_RATE as f64) as usize;
+                if self.recent.len() > keep {
+                    self.recent.drain(..self.recent.len() - keep);
+                }
+            } else {
+                self.recent.clear();
+                self.snippet = None;
+            }
             self.pending.extend(prepared);
             let mut said = false;
             while self.pending.len() >= MEL_INPUT {
@@ -338,6 +408,7 @@ mod detector {
                 }
                 self.pending.drain(..HOP);
             }
+            self.keep_snippet();
             if debug() && self.clock - self.logged_at >= 2.0 {
                 eprintln!("voice: {:.0} s, loudest {:.1} dB, surest {:.2}", self.clock, 20.0 * self.peak.max(1e-9).log10(), self.best);
                 (self.peak, self.best, self.logged_at) = (0.0, 0.0, self.clock);
@@ -377,12 +448,70 @@ mod detector {
         fn judge(&mut self, p: f32) -> bool {
             self.best = self.best.max(p);
             self.sure = if p >= THRESHOLD { self.sure + 1 } else { 0 };
+            self.watch_burst(p);
             if self.sure < NEED || self.said_at.is_some_and(|t| self.clock - t < QUIET_AFTER) {
                 return false;
             }
             self.said_at = Some(self.clock);
             eprintln!("voice: heard \"hashtag HesteClip that\"");
+            self.note(Kind::Fired, self.burst.unwrap_or(p));
             true
+        }
+
+        fn collecting(&self) -> bool {
+            self.collect.as_ref().is_some_and(|c| c.load(Ordering::Relaxed))
+        }
+
+        /// A rise of the classifier's confidence that ended without firing is
+        /// kept to review: it may be the phrase said in a way it didn't take.
+        fn watch_burst(&mut self, p: f32) {
+            match self.burst {
+                None if p >= ALMOST => self.burst = Some(p),
+                Some(best) if p >= BURST_END => self.burst = Some(best.max(p)),
+                Some(best) => {
+                    self.burst = None;
+                    // Firing kept its own snippet already.
+                    if best < THRESHOLD || self.said_at.is_none_or(|t| self.clock - t > 3.0) {
+                        self.note(Kind::Almost, best);
+                    }
+                }
+                None => {}
+            }
+        }
+
+        /// Something worth a snippet happened now (when collecting).
+        fn note(&mut self, kind: Kind, score: f32) {
+            if !self.collecting() || self.snippet.is_some() || self.clock - self.snippet_at < SNIPPET_GAP {
+                return;
+            }
+            self.snippet = Some((kind, score, self.clock + voice_samples::AFTER, Some(voice_samples::BEFORE as f32)));
+        }
+
+        /// A clip was saved by hand: keep what led up to it.
+        pub(super) fn by_hand(&mut self) {
+            if !self.collecting() || self.snippet.is_some() || self.clock - self.snippet_at < SNIPPET_GAP {
+                return;
+            }
+            self.snippet = Some((Kind::ByHand, self.burst.unwrap_or(0.0), self.clock, None));
+        }
+
+        /// Keep the snippet that's due.
+        fn keep_snippet(&mut self) {
+            let Some((kind, score, due, moment)) = self.snippet else { return };
+            if self.clock < due {
+                return;
+            }
+            self.snippet = None;
+            self.snippet_at = self.clock;
+            let secs = match kind {
+                Kind::ByHand => voice_samples::BY_HAND,
+                _ => voice_samples::BEFORE + voice_samples::AFTER,
+            };
+            let n = ((secs * MODEL_RATE as f64) as usize).min(self.recent.len());
+            let audio: Vec<f32> = self.recent.iter().skip(self.recent.len() - n).copied().collect();
+            // Where the moment is, if the snippet came out shorter than planned.
+            let moment = moment.map(|m| m.min(audio.len() as f32 / MODEL_RATE as f32));
+            voice_samples::save_new(kind, score, moment, &audio);
         }
     }
 
@@ -479,6 +608,65 @@ mod detector {
             }
             let _ = std::fs::remove_dir_all(&dir);
             assert!(wrong.is_empty(), "wrong: {}", wrong.join(", "));
+        }
+
+        /// Feed `samples` to a detector that keeps snippets, as live sound
+        /// arrives; whether it fired. `by_hand_at`: a clip is saved by hand
+        /// that many seconds in.
+        fn collect_from(models: &Models, samples: &[f32], rate: u32, by_hand_at: Option<f64>) -> bool {
+            let (_tx, rx) = channel();
+            let mut l = Listening::new(String::new(), rx);
+            l.collect = Some(Arc::new(AtomicBool::new(true)));
+            let quiet = vec![0.0; rate as usize * 2];
+            let mut fired = false;
+            for chunk in quiet.iter().chain(samples).chain(&quiet).chain(&quiet).chain(&quiet).copied().collect::<Vec<_>>().chunks(rate as usize / 10) {
+                fired |= l.hear(models, chunk, rate);
+                if by_hand_at.is_some_and(|t| (l.clock - 2.0 - t).abs() < 0.05) {
+                    l.by_hand();
+                }
+            }
+            fired
+        }
+
+        /// What fired the detector, and a clip saved by hand, are kept as
+        /// snippets of the right length to review and export.
+        #[cfg(windows)]
+        #[test]
+        fn keeps_snippets_to_review() {
+            use crate::voice_samples::{self as vs, Label};
+            let dir = std::env::temp_dir().join(format!("hc-snippets-{}", std::process::id()));
+            *vs::TEST_DIR.lock().unwrap() = Some(dir.clone());
+            let models = Models::load().expect("load the model");
+            let file = dir.join("speech.wav");
+            std::fs::create_dir_all(&dir).unwrap();
+            speak("okay that was insane. hashtag heste clip that!", &file);
+            let (samples, rate) = read(&file);
+            assert!(collect_from(&models, &samples, rate, None), "fired");
+            let kept = vs::list();
+            assert_eq!(kept.len(), 1, "one snippet for one take: {kept:?}");
+            assert_eq!(kept[0].meta.kind, vs::Kind::Fired);
+            assert!((kept[0].secs - 6.5).abs() < 0.1, "{} s", kept[0].secs);
+            // A clip saved by hand during talk that isn't the phrase.
+            speak("I love this game, let's go again", &file);
+            let (samples, rate) = read(&file);
+            assert!(!collect_from(&models, &samples, rate, Some(6.0)));
+            let kept = vs::list();
+            let by_hand = kept.iter().find(|s| s.meta.kind == vs::Kind::ByHand).expect("a snippet of the hand-saved clip");
+            assert!((by_hand.secs - 8.0).abs() < 0.1, "{} s", by_hand.secs);
+            // Judged and exported: only the trimmed part, and not what's private.
+            let mut judged = kept.clone();
+            judged[0].meta.label = Label::Phrase;
+            judged[0].meta.trim = Some((1.0, 3.0));
+            judged[1].meta.label = Label::Other;
+            judged[1].meta.private = true;
+            let zip = dir.join("out.zip");
+            assert_eq!(vs::export(&zip, &judged).unwrap(), 1);
+            let mut archive = zip::ZipArchive::new(std::fs::File::open(&zip).unwrap()).unwrap();
+            let names: Vec<String> = (0..archive.len()).map(|i| archive.by_index(i).unwrap().name().unwrap().into_owned()).collect();
+            assert!(names.contains(&"samples.json".to_owned()) && names.len() == 3, "{names:?}");
+            let wav = names.iter().find(|n| n.ends_with(".wav")).unwrap();
+            assert_eq!(archive.by_name(wav).unwrap().size(), 44 + 2 * 2 * 16_000);
+            let _ = std::fs::remove_dir_all(&dir);
         }
 
         /// How often a long recording (many takes, some talk) triggers it, for

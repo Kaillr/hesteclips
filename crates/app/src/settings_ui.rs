@@ -244,6 +244,21 @@ impl App {
                     }
                 });
             });
+            divider(ui);
+            let hint = "Keeps about 6 seconds of your microphone each time the command saves a clip or nearly does, and around clips you save by hand. You listen to them and say what they were, so the detector can be made better. They stay on this computer until you choose to export them.";
+            row(ui, "Keep samples to improve it", Some(hint), |ui| {
+                ui.horizontal(|ui| {
+                    toggle(ui, &mut self.settings.voice_samples);
+                    let (to_hear, all) = self.voice_review.summary();
+                    if all > 0 || self.settings.voice_samples {
+                        ui.add_space(6.0);
+                        let label = if to_hear > 0 { format!("Review samples ({to_hear} new)") } else { "Review samples".to_owned() };
+                        if ui.add(crate::ui_kit::button(label, false)).clicked() {
+                            self.open_voice_review();
+                        }
+                    }
+                });
+            });
         });
 
         section(ui, "HesteFiles", |ui| self.hestefiles_settings(ui));

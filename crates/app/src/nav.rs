@@ -33,7 +33,7 @@ impl App {
             Page::View => Place::View(self.viewer.as_ref()?.clip().to_path_buf()),
             Page::Sources => Place::Sources,
             Page::Settings => Place::Settings,
-            Page::Edit => return None,
+            Page::Edit | Page::VoiceReview => return None,
         })
     }
 

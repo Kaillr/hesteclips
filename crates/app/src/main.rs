@@ -51,6 +51,8 @@ mod gpu_frames;
 #[cfg(hw_decode)]
 mod video;
 mod voice;
+mod voice_review;
+mod voice_samples;
 mod web_images;
 mod viewer;
 mod waveform;
@@ -220,6 +222,8 @@ pub(crate) enum Page {
     Clips,
     Sources,
     Settings,
+    /// Listening through the voice detector's samples (opened from Settings).
+    VoiceReview,
     Edit,
     View,
 }
@@ -439,6 +443,7 @@ struct App {
     quick_save: service::QuickSave,
     /// Listens for "hashtag HesteClip that".
     pub(crate) voice: voice::Voice,
+    pub(crate) voice_review: voice_review::Review,
     /// The game being clipped, for Discord: its app's id, the game, and when
     /// we last checked it's still open.
     clipped_game: Option<(String, discord::Game, Instant)>,
@@ -502,6 +507,7 @@ impl App {
             }),
             service,
             voice: voice::Voice::new(quick_save.clone(), live_audio.clone(), ctx.clone()),
+            voice_review: Default::default(),
             quick_save,
             hotkeys,
             recording_shortcut: None,
@@ -880,6 +886,7 @@ impl eframe::App for App {
                 Page::Clips => self.library(ui, frame),
                 Page::Sources => self.sources_page(ui),
                 Page::Settings => self.settings_page(ui),
+                Page::VoiceReview => self.voice_review_page(ui),
                 Page::Edit => self.editor_page(ui),
                 Page::View => self.viewer_page(ui, frame),
             });
@@ -888,6 +895,7 @@ impl eframe::App for App {
             Page::Clips => "library page",
             Page::Sources => "sources page",
             Page::Settings => "settings page",
+            Page::VoiceReview => "voice samples page",
             Page::Edit => "editor page",
             Page::View => "player page",
         });
@@ -995,7 +1003,9 @@ impl App {
         for _ in 0..self.voice.heard() {
             self.clip_saving();
         }
-        let listen = self.settings.voice_clip && self.rec_state == RecState::Buffering && self.recording_shortcut.is_none();
+        // Not while samples are played on the speakers: the detector would hear them.
+        let listen = self.settings.voice_clip && self.rec_state == RecState::Buffering && self.recording_shortcut.is_none() && self.page != Page::VoiceReview;
+        self.voice.collect(self.settings.voice_samples);
         let mic = listen.then(|| self.voice_mic()).flatten();
         self.voice.listen(mic.as_deref());
         self.pump_capture_events();
@@ -1161,7 +1171,8 @@ impl App {
         // The same control as the switches on the Sources page.
         let _ = compact;
         let labels: Vec<&str> = tabs.iter().map(|(_, l, _)| *l).collect();
-        let chosen = tabs.iter().position(|(p, _, _)| *p == self.page).unwrap_or(usize::MAX);
+        let on = if self.page == Page::VoiceReview { Page::Settings } else { self.page };
+        let chosen = tabs.iter().position(|(p, _, _)| *p == on).unwrap_or(usize::MAX);
         // As wide as the library's sidebar below, the two lined up.
         let responses = ui
             .allocate_ui(egui::vec2(library::SIDEBAR_W, ui_kit::CONTROL_H), |ui| {
@@ -1813,6 +1824,7 @@ impl App {
         let dir = self.clip_folder();
         self.service.save_clip(dir, self.games.clip_details());
         sound::play_saved(&self.settings.save_sound);
+        self.voice.saved_by_hand();
         self.clip_saving();
     }
 

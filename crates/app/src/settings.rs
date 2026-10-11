@@ -542,6 +542,9 @@ pub struct RecordSettings {
     pub discord_presence: bool,
     /// Saying "hashtag HesteClip that" saves a clip (while the replay buffer runs).
     pub voice_clip: bool,
+    /// Keep short snippets of the microphone around what the voice detector fires on or
+    /// nearly fires on, to listen through and label (never sent anywhere by itself).
+    pub voice_samples: bool,
 
     // --- Advanced (collapsible; sane defaults) ---
     pub encoder: Encoder,
@@ -618,6 +621,7 @@ impl Default for RecordSettings {
             auto_update: true,
             discord_presence: false,
             voice_clip: true,
+            voice_samples: false,
             encoder: Encoder::Auto,
             container: Container::Mp4,
             rate_control: RateControl::Cbr,
