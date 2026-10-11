@@ -1,10 +1,11 @@
 //! Decoded frames drawn straight from the GPU: nothing is copied back to the
 //! CPU or uploaded again.
 //!
-//! - **Windows**: the decoder renders each frame, at the video's own
-//!   resolution, into one of a pool of shareable D3D11 RGBA textures
-//!   (`capture::decode::Surfaces`); each is opened once in wgpu's D3D12
-//!   device (`dx12`).
+//! - **Windows**: the decoder copies each frame, at the video's own
+//!   resolution and still NV12, into one of a pool of shareable D3D11
+//!   textures (`capture::decode::Surfaces`; converted to RGBA instead where
+//!   the graphics card can't share NV12); each is opened once in wgpu's
+//!   D3D12 device (`dx12`), an NV12 one as a texture per plane.
 //! - **macOS**: the decoder's own NV12 frames, in IOSurfaces; each plane is
 //!   opened as a Metal texture over the same memory (`metal`), and the shader
 //!   converts to RGB as it filters.
@@ -77,7 +78,6 @@ enum Planes {
     #[cfg_attr(not(windows), allow(dead_code))]
     Rgba(wgpu::TextureView),
     /// Studio-range Y and CbCr, and the matrix (BT.601, else BT.709).
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Nv12 { y: wgpu::TextureView, cbcr: wgpu::TextureView, bt601: bool },
 }
 

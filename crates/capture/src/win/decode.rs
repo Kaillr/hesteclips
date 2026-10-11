@@ -14,7 +14,9 @@
 //!
 //! Frames either come back to the CPU as RGBA, or (`share_on`) stay on the
 //! GPU in a pool of shareable textures that the app's renderer opens once and
-//! draws directly: no copy back, no upload.
+//! draws directly: no copy back, no upload. Shared at the video's own size
+//! they stay NV12 (copied, not converted; the renderer converts as it draws)
+//! where the graphics card can share NV12.
 //!
 //! Feeding the decoder ourselves skips the reader's seek: a jump takes
 //! 1.7-3× less time (a keyframe 15 ms instead of 45, with the picture's
@@ -53,9 +55,11 @@ const UNITS: f64 = 10_000_000.0;
 /// frames (1 s at 60 fps) it's the cheaper way on average.
 const MAX_SKIP: u64 = 60;
 
-/// Shareable textures decoded frames are drawn into (see [`Surfaces`]): as
-/// many as fit in [`POOL_BYTES`], within these bounds. Frames are full
-/// resolution: 24 at 1440p is ~350 MB; 4K gets 16 (~530 MB).
+/// Shareable textures decoded frames go into (see [`Surfaces`]): as many as
+/// fit in [`POOL_BYTES`], within these bounds. Frames are full resolution;
+/// kept as the decoder gives them (NV12, 1.5 bytes a pixel) 24 at 4K are
+/// ~300 MB. Converted to RGBA (4 bytes, where NV12 can't be shared) 24 at
+/// 1440p are ~350 MB and 4K gets 16 (~530 MB).
 const POOL_MIN: usize = 16;
 const POOL_MAX: usize = 24;
 const POOL_BYTES: u64 = 512 << 20;
@@ -71,13 +75,15 @@ pub struct Picture {
     pub gpu: Option<Surface>,
 }
 
-/// A fixed set of shareable RGBA textures on the GPU. Each decoded frame takes
+/// A fixed set of shareable textures on the GPU. Each decoded frame takes
 /// a free one and gives it back when its [`Surface`] is dropped; the one freed
 /// longest ago is reused first, so a texture the screen may still be drawing
 /// isn't overwritten.
 pub struct Surfaces {
     /// Unique per pool, for caching what's been opened from it.
     pub id: usize,
+    /// What the textures hold.
+    pub format: SurfaceFormat,
     textures: Vec<ID3D11Texture2D>,
     handles: Vec<HANDLE>,
     free: Mutex<VecDeque<usize>>,
@@ -100,6 +106,16 @@ impl Drop for Surfaces {
     }
 }
 
+/// What a pool's textures hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SurfaceFormat {
+    /// Full-range RGBA, converted.
+    Rgba,
+    /// The decoder's own picture: studio-range NV12, BT.601 colours or (false)
+    /// BT.709. Drawing converts it.
+    Nv12 { bt601: bool },
+}
+
 /// One texture of a [`Surfaces`] pool, holding a frame.
 pub struct Surface {
     pool: Arc<Surfaces>,
@@ -118,6 +134,11 @@ impl Surface {
     /// Owned by the pool; valid while it lives.
     pub fn handle(&self) -> isize {
         self.pool.handles[self.slot].0 as isize
+    }
+
+    /// What the texture holds.
+    pub fn format(&self) -> SurfaceFormat {
+        self.pool.format
     }
 
     /// The pool's shared fence (NT handle, owned by the pool) and the value
@@ -150,7 +171,8 @@ pub struct Decoder {
     pub width: u32,
     pub height: u32,
     pub fps: f64,
-    convert: Convert,
+    /// The conversion to RGBA; none when frames stay NV12 (only copied).
+    convert: Option<Convert>,
     /// Frames stay on the GPU, in these.
     pool: Option<Arc<Surfaces>>,
     /// The video's own size.
@@ -439,8 +461,9 @@ impl Decoder {
             (texture.context("no texture")?, dxgi.GetSubresourceIndex()?)
         };
         let Some(pool) = self.pool.clone() else {
-            self.convert.run(&texture, slice, 0)?;
-            let rgba = self.convert.read(&self.gpu)?;
+            let convert = self.convert.as_mut().context("no conversion")?;
+            convert.run(&texture, slice, 0)?;
+            let rgba = convert.read(&self.gpu)?;
             return Ok(Picture { index, width: self.width, height: self.height, rgba, gpu: None });
         };
         // A free texture: there's always one unless the app holds on to frames.
@@ -454,7 +477,15 @@ impl Decoder {
             }
             std::thread::sleep(Duration::from_millis(2));
         };
-        self.convert.run(&texture, slice, slot)?;
+        match self.convert.as_mut() {
+            Some(c) => c.run(&texture, slice, slot)?,
+            // NV12 as it is: the decoder's picture (its texture can be larger,
+            // padded to whole macroblocks) copied into the pool's.
+            None => unsafe {
+                let region = D3D11_BOX { left: 0, top: 0, front: 0, right: self.width, bottom: self.height, back: 1 };
+                self.gpu.context.CopySubresourceRegion(&pool.textures[slot], 0, 0, 0, 0, &texture, slice, Some(&region));
+            },
+        }
         let ready = match &pool.fence {
             // The other device waits for this value before reading the frame.
             Some((fence, _)) => {
@@ -482,22 +513,50 @@ fn even_height(width: u32, source: (u32, u32)) -> u32 {
     (((width as f64) * source.1 as f64 / source.0.max(1) as f64 / 2.0).round() as u32 * 2).max(2)
 }
 
-/// What frames are drawn into at `size` (a shared pool, or one texture read
-/// back) and the conversion pass into them.
-fn outputs(gpu: &Gpu, shared: bool, source: (u32, u32), size: (u32, u32), fps: f64, bt601: bool) -> Result<(Option<Arc<Surfaces>>, Convert)> {
-    let pool = if shared { Some(Arc::new(surfaces(gpu, size.0, size.1)?)) } else { None };
+/// What frames go into at `size` (a shared pool, or one texture read back)
+/// and the conversion pass into them, if they're converted. Shared at the
+/// video's own size, they stay NV12 when the graphics card can share that:
+/// a copy instead of a conversion, and 1.5 bytes a pixel instead of 4.
+/// `HESTECLIPS_RGBA_FRAMES=1` always converts.
+fn outputs(gpu: &Gpu, shared: bool, source: (u32, u32), size: (u32, u32), fps: f64, bt601: bool) -> Result<(Option<Arc<Surfaces>>, Option<Convert>)> {
+    let nv12 = shared && size == source && size.0 % 2 == 0 && size.1 % 2 == 0 && shares_nv12(gpu) && std::env::var_os("HESTECLIPS_RGBA_FRAMES").is_none();
+    if nv12 {
+        match surfaces(gpu, size.0, size.1, SurfaceFormat::Nv12 { bt601 }) {
+            Ok(pool) => return Ok((Some(Arc::new(pool)), None)),
+            Err(e) => eprintln!("decoder: can't share NV12 frames, converting them: {e:#}"),
+        }
+    }
+    let pool = if shared { Some(Arc::new(surfaces(gpu, size.0, size.1, SurfaceFormat::Rgba)?)) } else { None };
     let targets: Vec<ID3D11Texture2D> = match &pool {
         Some(p) => p.textures.clone(),
         None => vec![gpu.texture(size.0, size.1, DXGI_FORMAT_R8G8B8A8_UNORM, D3D11_BIND_RENDER_TARGET.0 as u32, D3D11_USAGE_DEFAULT, 0)?],
     };
     let convert = Convert::new(gpu, source, size, fps, bt601, targets)?;
-    Ok((pool, convert))
+    Ok((pool, Some(convert)))
+}
+
+/// The graphics card can share NV12 textures with another device (Windows
+/// 10 1803 and later, with a driver that says so).
+fn shares_nv12(gpu: &Gpu) -> bool {
+    let mut options = D3D11_FEATURE_DATA_D3D11_OPTIONS4::default();
+    let asked = unsafe {
+        gpu.device.CheckFeatureSupport(
+            D3D11_FEATURE_D3D11_OPTIONS4,
+            &mut options as *mut _ as *mut _,
+            std::mem::size_of::<D3D11_FEATURE_DATA_D3D11_OPTIONS4>() as u32,
+        )
+    };
+    asked.is_ok() && options.ExtendedNV12SharedTextureSupported.as_bool()
 }
 
 /// The shared textures for a pool.
-fn surfaces(gpu: &Gpu, width: u32, height: u32) -> Result<Surfaces> {
+fn surfaces(gpu: &Gpu, width: u32, height: u32, format: SurfaceFormat) -> Result<Surfaces> {
     static NEXT: AtomicUsize = AtomicUsize::new(1);
-    let count = (POOL_BYTES / (width as u64 * height as u64 * 4).max(1)).clamp(POOL_MIN as u64, POOL_MAX as u64) as usize;
+    let (dxgi, bytes_per_pixel, bind) = match format {
+        SurfaceFormat::Rgba => (DXGI_FORMAT_R8G8B8A8_UNORM, 4.0, D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0),
+        SurfaceFormat::Nv12 { .. } => (windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_NV12, 1.5, D3D11_BIND_SHADER_RESOURCE.0),
+    };
+    let count = (POOL_BYTES as f64 / (width as f64 * height as f64 * bytes_per_pixel).max(1.0)).clamp(POOL_MIN as f64, POOL_MAX as f64) as usize;
     let mut textures = Vec::new();
     let mut handles = Vec::new();
     for _ in 0..count {
@@ -506,10 +565,10 @@ fn surfaces(gpu: &Gpu, width: u32, height: u32) -> Result<Surfaces> {
             Height: height,
             MipLevels: 1,
             ArraySize: 1,
-            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            Format: dxgi,
             SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
             Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+            BindFlags: bind as u32,
             CPUAccessFlags: 0,
             MiscFlags: (D3D11_RESOURCE_MISC_SHARED.0 | D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0) as u32,
         };
@@ -537,6 +596,7 @@ fn surfaces(gpu: &Gpu, width: u32, height: u32) -> Result<Surfaces> {
     };
     Ok(Surfaces {
         id: NEXT.fetch_add(1, Ordering::Relaxed),
+        format,
         textures,
         handles,
         free: Mutex::new((0..count).collect()),

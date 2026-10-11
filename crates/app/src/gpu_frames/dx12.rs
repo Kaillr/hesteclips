@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use capture::decode::Surface;
+use capture::decode::{Surface, SurfaceFormat};
 use eframe::egui_wgpu::RenderState;
 use eframe::wgpu;
 use windows::Win32::Foundation::HANDLE;
@@ -27,7 +27,9 @@ pub fn share_luid() -> Option<u64> {
 /// The pool textures opened so far. Freed when dropped.
 #[derive(Default)]
 pub struct Frames {
-    opened: HashMap<(usize, usize), (wgpu::Texture, wgpu::TextureView)>,
+    /// Each texture as wgpu sees it (an NV12 one as one texture per plane),
+    /// and how it's drawn.
+    opened: HashMap<(usize, usize), (Vec<wgpu::Texture>, Planes)>,
     /// Each pool's shared fence, opened on D3D12.
     fences: HashMap<usize, ID3D12Fence>,
     /// Pools seen, oldest first (a decoder makes a new one if reopened).
@@ -43,13 +45,27 @@ impl Frames {
         let rs = RENDER.get()?;
         self.forget_old_pools(rs, s.key().0);
         self.wait_for(rs, s);
-        if let Some((_, view)) = self.opened.get(&s.key()) {
-            return Some(Shown { key: s.key(), planes: Planes::Rgba(view.clone()) });
+        if let Some((_, planes)) = self.opened.get(&s.key()) {
+            return Some(Shown { key: s.key(), planes: planes.clone() });
         }
-        let texture = unsafe { open(rs, s.handle(), width, height) }.inspect_err(|e| eprintln!("sharing a frame failed: {e}")).ok()?;
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        self.opened.insert(s.key(), (texture, view.clone()));
-        Some(Shown { key: s.key(), planes: Planes::Rgba(view) })
+        let view = |t: &wgpu::Texture| t.create_view(&wgpu::TextureViewDescriptor::default());
+        let opened = match s.format() {
+            SurfaceFormat::Rgba => unsafe { open(rs, s.handle(), wgpu::TextureFormat::Rgba8Unorm, (width, height), None) }.map(|t| {
+                let planes = Planes::Rgba(view(&t));
+                (vec![t], planes)
+            }),
+            // Luma at full size, the colour (CbCr pairs) at half.
+            SurfaceFormat::Nv12 { bt601 } => unsafe {
+                open(rs, s.handle(), wgpu::TextureFormat::R8Unorm, (width, height), Some(0)).and_then(|y| {
+                    let cbcr = open(rs, s.handle(), wgpu::TextureFormat::Rg8Unorm, (width / 2, height / 2), Some(1))?;
+                    let planes = Planes::Nv12 { y: view(&y), cbcr: view(&cbcr), bt601 };
+                    Ok((vec![y, cbcr], planes))
+                })
+            },
+        };
+        let (textures, planes) = opened.inspect_err(|e| eprintln!("sharing a frame failed: {e}")).ok()?;
+        self.opened.insert(s.key(), (textures, planes.clone()));
+        Some(Shown { key: s.key(), planes })
     }
 
     /// Keep the current pool's textures and the one before it (its frames can
@@ -99,15 +115,21 @@ impl Drop for Frames {
     }
 }
 
-/// Open a shared D3D11 texture (NT handle) as a wgpu texture on D3D12.
-unsafe fn open(rs: &RenderState, handle: isize, width: u32, height: u32) -> Result<wgpu::Texture, String> {
+/// Open a shared D3D11 texture (NT handle) as a wgpu texture on D3D12: the
+/// whole of it, or one plane (`plane`: 0 luma, 1 chroma) of an NV12 one,
+/// with that plane's `format` and `width`×`height`.
+unsafe fn open(rs: &RenderState, handle: isize, format: wgpu::TextureFormat, (width, height): (u32, u32), plane: Option<u32>) -> Result<wgpu::Texture, String> {
     let size = wgpu::Extent3d { width, height, depth_or_array_layers: 1 };
     let hal_texture = unsafe {
         let device = rs.device.as_hal::<wgpu::hal::api::Dx12>().ok_or("the renderer isn't on D3D12")?;
         let mut resource: Option<ID3D12Resource> = None;
         device.raw_device().OpenSharedHandle(HANDLE(handle as *mut _), &mut resource).map_err(|e| e.message())?;
         let resource = resource.ok_or("no resource")?;
-        wgpu::hal::dx12::Device::texture_from_raw(resource, wgpu::TextureFormat::Rgba8Unorm, wgpu::TextureDimension::D2, size, 1, 1)
+        let texture = wgpu::hal::dx12::Device::texture_from_raw(resource, format, wgpu::TextureDimension::D2, size, 1, 1);
+        match plane {
+            Some(p) => texture.with_plane_slice(p),
+            None => texture,
+        }
     };
     let desc = wgpu::TextureDescriptor {
         label: Some("decoded frame"),
@@ -115,7 +137,7 @@ unsafe fn open(rs: &RenderState, handle: isize, width: u32, height: u32) -> Resu
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8Unorm,
+        format,
         usage: wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     };
