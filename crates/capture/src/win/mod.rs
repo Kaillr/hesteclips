@@ -944,6 +944,57 @@ impl FrameBlend {
     }
 }
 
+/// What the blending saw, printed every few seconds (to the log): how many
+/// pictures arrived, how evenly, and how many went into each frame, to tell a
+/// capture that delivers unevenly from a blend that's wrong.
+struct BlendStats {
+    since: Instant,
+    pictures: u32,
+    last: f64,
+    gap: (f64, f64),
+    in_frame: u32,
+    per_frame: (u32, u32),
+    frames: u32,
+    missed: u32,
+}
+
+impl BlendStats {
+    fn new() -> Self {
+        Self { since: Instant::now(), pictures: 0, last: 0.0, gap: (f64::MAX, 0.0), in_frame: 0, per_frame: (u32::MAX, 0), frames: 0, missed: 0 }
+    }
+
+    fn arrival(&mut self, at: f64) {
+        if self.last > 0.0 {
+            let g = (at - self.last) * 1000.0;
+            self.gap = (self.gap.0.min(g), self.gap.1.max(g));
+        }
+        self.last = at;
+        self.pictures += 1;
+        self.in_frame += 1;
+    }
+
+    fn frame_done(&mut self) {
+        self.per_frame = (self.per_frame.0.min(self.in_frame), self.per_frame.1.max(self.in_frame));
+        self.missed += (self.in_frame == 0) as u32;
+        self.in_frame = 0;
+        self.frames += 1;
+        if self.since.elapsed() >= Duration::from_secs(5) {
+            let secs = self.since.elapsed().as_secs_f64();
+            eprintln!(
+                "frame blending: {:.0} pictures/s, {:.2}-{:.2} ms apart; {}-{} per frame, {} frames without a new picture, over {} frames",
+                self.pictures as f64 / secs,
+                self.gap.0,
+                self.gap.1,
+                self.per_frame.0,
+                self.per_frame.1,
+                self.missed,
+                self.frames
+            );
+            *self = Self { last: self.last, ..Self::new() };
+        }
+    }
+}
+
 /// Like [`spawn_pacer`], for frame blending: instead of looking at the screen
 /// on a clock, every new picture is added to the frame it falls in, as it
 /// arrives, weighed by how long it stays up.
@@ -969,17 +1020,19 @@ fn spawn_blend_pacer(
         let mut up_since = t0;
         let mut have_picture = false;
         let (mut seen, _) = latest.arrivals();
+        let mut stats = BlendStats::new();
         if latest.has_frame() {
             blend.hold(&latest);
             have_picture = true;
         }
 
         // The frame ends: encode it, and begin the next.
-        let mut close = |blend: &mut FrameBlend, up_since: &mut f64, next: &mut i64, have_picture: bool| {
+        let mut close = |blend: &mut FrameBlend, up_since: &mut f64, next: &mut i64, have_picture: bool, stats: &mut BlendStats| {
             let end = t0 + (*next + 1) as f64 / fps_f;
             if have_picture {
                 blend.add(end - up_since.max(t0 + *next as f64 / fps_f));
                 blend.finish();
+                stats.frame_done();
                 if let Some(c) = camera.as_mut() {
                     c.pull();
                 }
@@ -1019,19 +1072,20 @@ fn spawn_blend_pacer(
                 // Frames that ended before the picture arrived took the old one.
                 let mut burst = 0;
                 while t0 + (next + 1) as f64 / fps_f <= arrived && burst < fps * 2 {
-                    close(&mut blend, &mut up_since, &mut next, have_picture);
+                    close(&mut blend, &mut up_since, &mut next, have_picture, &mut stats);
                     burst += 1;
                 }
                 if have_picture {
                     blend.add(arrived - up_since.max(t0 + next as f64 / fps_f));
                 }
                 blend.hold(&latest);
+                stats.arrival(arrived);
                 have_picture = true;
                 up_since = arrived;
             }
             let mut burst = 0;
             while t0 + (next + 1) as f64 / fps_f <= host_now() && burst < fps * 2 {
-                close(&mut blend, &mut up_since, &mut next, have_picture);
+                close(&mut blend, &mut up_since, &mut next, have_picture, &mut stats);
                 burst += 1;
             }
         }
