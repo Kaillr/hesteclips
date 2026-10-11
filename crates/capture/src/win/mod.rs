@@ -900,6 +900,12 @@ fn spawn_aac(track: usize, mut enc: AacEncoder, rx: mpsc::Receiver<Vec<f32>>, ou
 /// When the game runs faster, the looks pick evenly spaced ones of its
 /// pictures; slower, some picture is seen twice (as it was up that long).
 ///
+/// The pictures are averaged as light, not as pixel values (which are
+/// gamma-encoded): a screen showing them in turn gives off the average of
+/// their light. Averaging the values would give a bright thing moving over a
+/// dark background ghosts far too faint (a fifth of its value is about 3% of
+/// its light, not 20%), and a dark thing over a bright one ghosts too strong.
+///
 /// Looks are taken `BLEND_LATE` after their time, so that pictures noticed
 /// late still count.
 struct FrameBlend {
@@ -914,7 +920,11 @@ struct FrameBlend {
     /// Keeps a handed-over picture's texture from going away.
     held_keep: Option<windows::Win32::Graphics::Direct3D11::ID3D11Texture2D>,
     held_size: (u32, u32),
-    /// The average so far, drawn into; the converter reads it.
+    /// The average so far, as light (16-bit float, so faint ghosts and dark
+    /// colours keep their precision).
+    light_target: windows::Win32::Graphics::Direct3D11::ID3D11RenderTargetView,
+    light_view: windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView,
+    /// The finished frame, back in sRGB: the converter reads it.
     average: Arc<d3d::Latest>,
     target: windows::Win32::Graphics::Direct3D11::ID3D11RenderTargetView,
     /// Looks in the average so far.
@@ -926,7 +936,12 @@ impl FrameBlend {
         let average = d3d::Latest::new(gpu, latest.width, latest.height)?;
         let own = d3d::Latest::new(gpu, latest.width, latest.height)?;
         let own_view = quad::shader_view(gpu, &own.texture)?;
+        use windows::Win32::Graphics::Direct3D11::{D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_USAGE_DEFAULT};
+        let bind = (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32;
+        let light = gpu.texture(latest.width, latest.height, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT, bind, D3D11_USAGE_DEFAULT, 0)?;
         Ok(Self {
+            light_target: quad::target_view(gpu, &light)?,
+            light_view: quad::shader_view(gpu, &light)?,
             quad: quad::Quad::new(gpu)?,
             gpu: gpu.clone(),
             held_view: own_view.clone(),
@@ -962,7 +977,7 @@ impl FrameBlend {
         }
         self.count += steps;
         // Mixing in by its share of the total so far keeps it the average.
-        self.quad.average(&self.gpu, &self.target, (self.own.width, self.own.height), &self.held_view, steps as f32 / self.count as f32);
+        self.quad.average_light(&self.gpu, &self.light_target, (self.own.width, self.own.height), &self.held_view, steps as f32 / self.count as f32);
     }
 
     /// The frame is done: its average is ready for the converter, and the next
@@ -971,6 +986,7 @@ impl FrameBlend {
         if self.count == 0 {
             return None;
         }
+        self.quad.from_light(&self.gpu, &self.target, (self.own.width, self.own.height), &self.light_view);
         self.average.mark_frame(self.held_size);
         Some(std::mem::take(&mut self.count))
     }

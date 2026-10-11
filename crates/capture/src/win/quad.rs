@@ -45,7 +45,25 @@ float4 ps_diff(V i) : SV_Target {
     return float4(most, most, most, 1);
 }
 float4 ps_opaque(V i) : SV_Target { return float4(image.Sample(linear_clamp, i.uv).rgb, 1); }
+// sRGB colour to light (what a screen gives off, which adds up linearly), and back.
+float3 to_light(float3 c) { return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4); }
+float3 from_light(float3 c) { c = saturate(c); return c <= 0.0031308 ? c * 12.92 : 1.055 * pow(c, 1.0 / 2.4) - 0.055; }
+float4 ps_to_light(V i) : SV_Target { return float4(to_light(image.Sample(linear_clamp, i.uv).rgb), 1); }
+float4 ps_from_light(V i) : SV_Target { return float4(from_light(image.Sample(linear_clamp, i.uv).rgb), 1); }
 ";
+
+/// Which pixel shader a draw uses.
+#[derive(Clone, Copy, PartialEq)]
+enum Shader {
+    /// As it is, blended by its alpha.
+    Plain,
+    /// As it is, replacing what's there.
+    Opaque,
+    /// Turned into light (from sRGB), replacing or mixed by a weight.
+    ToLight,
+    /// Turned from light back into sRGB, replacing.
+    FromLight,
+}
 
 /// The shaders and states for drawing textured rectangles.
 pub(crate) struct Quad {
@@ -53,6 +71,8 @@ pub(crate) struct Quad {
     ps: ID3D11PixelShader,
     ps_opaque: ID3D11PixelShader,
     ps_diff: ID3D11PixelShader,
+    ps_to_light: ID3D11PixelShader,
+    ps_from_light: ID3D11PixelShader,
     block: ID3D11Buffer,
     blend: ID3D11BlendState,
     /// Mixes by a constant (the blend factor) instead of the picture's alpha.
@@ -95,6 +115,8 @@ impl Quad {
         let ps_code = compile(s!("ps"), s!("ps_4_0"))?;
         let ps_opaque_code = compile(s!("ps_opaque"), s!("ps_4_0"))?;
         let ps_diff_code = compile(s!("ps_diff"), s!("ps_4_0"))?;
+        let ps_to_light_code = compile(s!("ps_to_light"), s!("ps_4_0"))?;
+        let ps_from_light_code = compile(s!("ps_from_light"), s!("ps_4_0"))?;
         unsafe {
             let mut vs = None;
             dev.CreateVertexShader(bytes(&vs_code), None, Some(&mut vs))?;
@@ -104,6 +126,10 @@ impl Quad {
             dev.CreatePixelShader(bytes(&ps_opaque_code), None, Some(&mut ps_opaque))?;
             let mut ps_diff = None;
             dev.CreatePixelShader(bytes(&ps_diff_code), None, Some(&mut ps_diff))?;
+            let mut ps_to_light = None;
+            dev.CreatePixelShader(bytes(&ps_to_light_code), None, Some(&mut ps_to_light))?;
+            let mut ps_from_light = None;
+            dev.CreatePixelShader(bytes(&ps_from_light_code), None, Some(&mut ps_from_light))?;
             let block_desc = D3D11_BUFFER_DESC { ByteWidth: 16, Usage: D3D11_USAGE_DEFAULT, BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32, ..Default::default() };
             let mut block = None;
             dev.CreateBuffer(&block_desc, None, Some(&mut block))?;
@@ -143,6 +169,8 @@ impl Quad {
                 ps: ps.context("no pixel shader")?,
                 ps_opaque: ps_opaque.context("no pixel shader")?,
                 ps_diff: ps_diff.context("no pixel shader")?,
+                ps_to_light: ps_to_light.context("no pixel shader")?,
+                ps_from_light: ps_from_light.context("no pixel shader")?,
                 block: block.context("no constant buffer")?,
                 blend: blend.context("no blend state")?,
                 mix: mix.context("no blend state")?,
@@ -155,19 +183,20 @@ impl Quad {
     /// Draw `source` into `target` (`size` pixels) where `at` says: blended
     /// by its alpha, or (`opaque`) replacing what's there.
     pub(crate) fn draw(&self, gpu: &Gpu, target: &ID3D11RenderTargetView, size: (u32, u32), source: &ID3D11ShaderResourceView, at: &Placement, opaque: bool) {
-        self.run(gpu, target, size, source, at, opaque, None);
+        self.run(gpu, target, size, source, at, if opaque { Shader::Opaque } else { Shader::Plain }, None);
     }
 
-    /// Draw all of `source` over `target`, `weight` of it and the rest what's
-    /// there: with weights 1, 1/2, 1/3 … the target is the average of the
-    /// pictures drawn.
-    pub(crate) fn average(&self, gpu: &Gpu, target: &ID3D11RenderTargetView, size: (u32, u32), source: &ID3D11ShaderResourceView, weight: f32) {
-        let at = Placement {
-            dest: [0.0, 0.0, size.0 as f32, size.1 as f32],
-            uv: [0.0, 0.0, 1.0, 1.0],
-            clip: RECT { left: 0, top: 0, right: size.0 as i32, bottom: size.1 as i32 },
-        };
-        self.run(gpu, target, size, source, &at, true, Some(weight));
+    /// Draw all of `source` (sRGB) over `target` (a float texture, in light),
+    /// as light, `weight` of it and the rest what's there: with weights 1,
+    /// 1/2, 1/3 … the target is the average of the pictures' light, which is
+    /// what a screen showing them in turn gives off.
+    pub(crate) fn average_light(&self, gpu: &Gpu, target: &ID3D11RenderTargetView, size: (u32, u32), source: &ID3D11ShaderResourceView, weight: f32) {
+        self.run(gpu, target, size, source, &whole(size), Shader::ToLight, Some(weight));
+    }
+
+    /// Draw all of `source` (light) into `target`, back as sRGB.
+    pub(crate) fn from_light(&self, gpu: &Gpu, target: &ID3D11RenderTargetView, size: (u32, u32), source: &ID3D11ShaderResourceView) {
+        self.run(gpu, target, size, source, &whole(size), Shader::FromLight, None);
     }
 
     /// Whether `now` and `before` (both `size` valid, as big as their
@@ -200,7 +229,7 @@ impl Quad {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn run(&self, gpu: &Gpu, target: &ID3D11RenderTargetView, size: (u32, u32), source: &ID3D11ShaderResourceView, at: &Placement, opaque: bool, weight: Option<f32>) {
+    fn run(&self, gpu: &Gpu, target: &ID3D11RenderTargetView, size: (u32, u32), source: &ID3D11ShaderResourceView, at: &Placement, shader: Shader, weight: Option<f32>) {
         let (w, h) = (size.0 as f32, size.1 as f32);
         let [l, t, r, b] = at.dest;
         let place = [l / w * 2.0 - 1.0, 1.0 - t / h * 2.0, r / w * 2.0 - 1.0, 1.0 - b / h * 2.0, at.uv[0], at.uv[1], at.uv[2], at.uv[3]];
@@ -213,13 +242,19 @@ impl Quad {
             ctx.OMSetRenderTargets(Some(&[Some(target.clone())]), None);
             match weight {
                 Some(w) if w < 1.0 => ctx.OMSetBlendState(Some(&self.mix), Some(&[w; 4]), 0xffff_ffff),
-                _ => ctx.OMSetBlendState(if opaque { None } else { Some(&self.blend) }, None, 0xffff_ffff),
+                _ => ctx.OMSetBlendState(if shader == Shader::Plain { Some(&self.blend) } else { None }, None, 0xffff_ffff),
             }
             ctx.IASetInputLayout(None);
             ctx.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
             ctx.VSSetShader(&self.vs, None);
             ctx.VSSetConstantBuffers(0, Some(&[Some(self.place.clone())]));
-            ctx.PSSetShader(if opaque { &self.ps_opaque } else { &self.ps }, None);
+            let ps = match shader {
+                Shader::Plain => &self.ps,
+                Shader::Opaque => &self.ps_opaque,
+                Shader::ToLight => &self.ps_to_light,
+                Shader::FromLight => &self.ps_from_light,
+            };
+            ctx.PSSetShader(ps, None);
             ctx.PSSetShaderResources(0, Some(&[Some(source.clone())]));
             ctx.PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
             ctx.Draw(4, 0);
@@ -227,6 +262,15 @@ impl Quad {
             ctx.OMSetRenderTargets(None, None);
             ctx.PSSetShaderResources(0, Some(&[None]));
         }
+    }
+}
+
+/// All of a target `size` pixels big.
+fn whole(size: (u32, u32)) -> Placement {
+    Placement {
+        dest: [0.0, 0.0, size.0 as f32, size.1 as f32],
+        uv: [0.0, 0.0, 1.0, 1.0],
+        clip: RECT { left: 0, top: 0, right: size.0 as i32, bottom: size.1 as i32 },
     }
 }
 

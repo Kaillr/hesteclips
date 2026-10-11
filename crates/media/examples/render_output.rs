@@ -1,5 +1,5 @@
 //! Render a clip with export settings and report what came out:
-//! `cargo run --release -p media --example render_output -- <clip> <out> [height] [fps] [kbps] [max_mb] [mix_only]`
+//! `cargo run --release -p media --example render_output -- <clip> <out> [height] [fps] [kbps] [max_mb] [mix_only] [blend_fps]`
 //! (`-` skips a setting; `START=`/`END=` trim, in seconds.)
 fn main() -> anyhow::Result<()> {
     let a: Vec<String> = std::env::args().skip(1).collect();

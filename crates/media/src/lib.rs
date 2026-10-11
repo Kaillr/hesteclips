@@ -936,6 +936,15 @@ impl Weights {
     }
 }
 
+/// Whether this ffmpeg has the filter `name` (builds differ), asked once.
+fn has_filter(name: &str) -> bool {
+    static FILTERS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let list = FILTERS.get_or_init(|| {
+        ffmpeg().args(["-hide_banner", "-filters"]).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default()
+    });
+    list.lines().any(|l| l.split_whitespace().nth(1) == Some(name))
+}
+
 /// Video only, trimmed frame-exactly, into `out`. `progress` gets 0..=1.
 fn render_video(source: &Path, info: &ClipInfo, edit: &Edit, plan: &Plan, work: &Path, out: &Path, progress: &dyn Fn(f32)) -> Result<()> {
     let output = edit.output.effective(info);
@@ -951,12 +960,25 @@ fn render_video(source: &Path, info: &ClipInfo, edit: &Edit, plan: &Plan, work: 
         match output.blend_fps {
             // Frames at the blend rate, each output frame the average of the
             // ones ending at its time.
+            // Mixed as light (what a screen gives off), not as pixel values,
+            // which are gamma-encoded: a fifth of a bright ghost's value is
+            // about 3% of its light, not 20%. Recordings are BT.709, limited.
             Some(b) => {
+                let light = has_filter("zscale");
+                if light {
+                    filters.push("setparams=range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709".to_owned());
+                    filters.push("zscale=tin=iec61966-2-1:t=linear,format=gbrpf32le".to_owned());
+                }
                 if (b as f64) < info.fps - 0.5 {
                     filters.push(format!("fps={b}"));
                 }
                 filters.push(format!("tmix=frames={}", (b as f64 / rate).round() as u32));
                 filters.push(format!("fps={rate}"));
+                if light {
+                    filters.push("zscale=tin=linear:t=iec61966-2-1,format=gbrp".to_owned());
+                    filters.push("scale=out_color_matrix=bt709:out_range=tv,format=yuv420p".to_owned());
+                    filters.push("setparams=range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709".to_owned());
+                }
             }
             None => filters.push(format!("fps={rate}")),
         }

@@ -581,8 +581,13 @@ impl App {
     /// the frame rate: a whole multiple of it.
     fn blend_choice(&mut self, ui: &mut egui::Ui) {
         let choices = settings::blend_choices(self.settings.fps);
-        let samples = self.settings.blend_samples();
         let fps = self.settings.fps;
+        // After the frame rate changed: the nearest multiple of it (before
+        // the choice below, which must win).
+        let samples = self.settings.blend_samples();
+        if samples > 1 {
+            self.settings.blend_fps = fps * samples;
+        }
         let shown = if samples > 1 { format!("From {} fps", fps * samples) } else { "Off".to_owned() };
         ui.vertical(|ui| {
             egui::ComboBox::from_id_salt("blend_fps").selected_text(shown).show_ui(ui, |ui| {
@@ -591,13 +596,10 @@ impl App {
                     ui.selectable_value(&mut self.settings.blend_fps, r, format!("From {r} fps"));
                 }
             });
-            if samples > 1 {
-                ui.weak(format!("Captured at {} fps, blended down to a {fps} fps file", fps * samples));
+            if self.settings.blend_fps > 0 {
+                ui.weak(format!("Captured at {} fps, blended down to a {fps} fps file", self.settings.blend_fps));
             }
         });
-        if samples > 1 {
-            self.settings.blend_fps = fps * samples;
-        }
     }
 
     fn advanced(&mut self, ui: &mut egui::Ui) {
