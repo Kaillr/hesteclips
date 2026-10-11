@@ -313,6 +313,9 @@ struct App {
     rec_state: RecState,
     /// When the current recording/buffer started (for the live timer).
     rec_started: Option<Instant>,
+    /// Frames skipped so far, and when that last grew: the capture bar warns
+    /// while it's happening.
+    skipped_seen: (u64, Option<Instant>),
     /// A replay clip is being written; shows a placeholder card until it lands.
     /// Clips being written: replay clips still saving, and a stopped recording
     /// being finished. Each shows a placeholder card until it lands.
@@ -498,6 +501,7 @@ impl App {
             page: Page::Clips,
             rec_state: RecState::Idle,
             rec_started: None,
+            skipped_seen: (0, None),
             saving: 0,
             settings,
             saved_settings,
@@ -1154,11 +1158,19 @@ impl App {
             self.page = Page::Settings;
         }
         let compact = ui.available_width() < 820.0;
+        let skipped = capture::frames_skipped();
+        if skipped < self.skipped_seen.0 || self.rec_state == RecState::Idle {
+            self.skipped_seen = (0, None);
+        }
+        if skipped > self.skipped_seen.0 {
+            self.skipped_seen = (skipped, Some(Instant::now()));
+        }
         ui.horizontal(|ui| {
             ui.set_min_height(36.0);
             self.nav_tabs(ui, compact);
             ui.add_space(14.0);
             self.capture_status(ui, compact);
+            self.skipped_warning(ui);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 self.capture_actions(ui, compact);
                 self.update_button(ui, compact);
@@ -1255,6 +1267,22 @@ impl App {
             .response
             .on_hover_text(&tip);
         });
+    }
+
+    /// Shown while frames are being skipped (and a few seconds after): the
+    /// computer can't keep up with the recording settings.
+    fn skipped_warning(&self, ui: &mut egui::Ui) {
+        const SHOW_FOR: Duration = Duration::from_secs(5);
+        let Some(at) = self.skipped_seen.1.filter(|t| t.elapsed() < SHOW_FOR) else { return };
+        ui.add_space(10.0);
+        let amber = Color32::from_rgb(230, 170, 40);
+        let tip = format!(
+            "{} frames skipped so far: the video encoder couldn't keep up, so the clip stutters. Try a lower resolution, frame rate or bitrate{}.",
+            self.skipped_seen.0,
+            if self.settings.frame_blend { ", or turn off frame blending" } else { "" }
+        );
+        ui.label(RichText::new("Skipping frames").size(13.0).strong().color(amber)).on_hover_text(tip);
+        ui.ctx().request_repaint_after(SHOW_FOR.saturating_sub(at.elapsed()));
     }
 
     /// The one or two buttons that make sense right now; the primary one rightmost.

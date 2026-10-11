@@ -215,6 +215,7 @@ struct Session {
 
 impl Session {
     fn start(s: &EncodeSettings, target: Target, live: &Arc<LiveAudio>, mov: bool) -> Result<Self> {
+        crate::FRAMES_SKIPPED.store(0, Ordering::Relaxed);
         system::com_init();
         system::mf_startup()?;
         let gpu = d3d::Gpu::new()?;
@@ -967,6 +968,7 @@ fn spawn_pacer(
                             // shows the previous one a little longer).
                             None => {
                                 dropped += 1;
+                                crate::FRAMES_SKIPPED.fetch_add(1, Ordering::Relaxed);
                                 if dropped.is_power_of_two() {
                                     eprintln!("video encoder is behind: {dropped} frames skipped");
                                 }

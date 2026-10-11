@@ -443,6 +443,15 @@ pub struct Devices {
     pub apps: Vec<Device>,
 }
 
+static FRAMES_SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many frames the running capture has left out because the video
+/// encoder couldn't keep up (the file shows the previous one longer). Starts
+/// from 0 with each capture; only counted on Windows so far.
+pub fn frames_skipped() -> u64 {
+    FRAMES_SKIPPED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// AAC bitrate per audio track, bits per second.
 pub const AUDIO_BITRATE: u32 = 192_000;
 
