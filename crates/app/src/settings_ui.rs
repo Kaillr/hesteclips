@@ -76,8 +76,8 @@ impl App {
                     divider(ui);
                     row(
                         ui,
-                        "Capture at",
-                        Some("Frame blending: capture faster than the frame rate and average the pictures into each frame for smooth motion, like motion blur. Needs a game that runs at least that fast. The bitrate follows the frame rate."),
+                        "Frame blending",
+                        Some("Capture faster than the frame rate and average the pictures into each frame for smooth motion, like motion blur. Needs a game that runs at least that fast. The bitrate follows the frame rate."),
                         |ui| self.blend_choice(ui),
                     );
                 }
@@ -577,18 +577,18 @@ impl App {
         });
     }
 
-    /// The rate the screen is captured at before it's blended down to the
-    /// frame rate: the same (no blending), or a whole multiple of it.
+    /// Off, or the rate the screen is captured at before it's blended down to
+    /// the frame rate: a whole multiple of it.
     fn blend_choice(&mut self, ui: &mut egui::Ui) {
         let choices = settings::blend_choices(self.settings.fps);
         let samples = self.settings.blend_samples();
         let fps = self.settings.fps;
-        let shown = if samples > 1 { format!("{} fps", fps * samples) } else { "Same as frame rate".to_owned() };
+        let shown = if samples > 1 { format!("From {} fps", fps * samples) } else { "Off".to_owned() };
         ui.vertical(|ui| {
             egui::ComboBox::from_id_salt("blend_fps").selected_text(shown).show_ui(ui, |ui| {
-                ui.selectable_value(&mut self.settings.blend_fps, 0, "Same as frame rate");
+                ui.selectable_value(&mut self.settings.blend_fps, 0, "Off");
                 for r in choices {
-                    ui.selectable_value(&mut self.settings.blend_fps, r, format!("{r} fps"));
+                    ui.selectable_value(&mut self.settings.blend_fps, r, format!("From {r} fps"));
                 }
             });
             if samples > 1 {
