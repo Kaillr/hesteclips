@@ -1,6 +1,8 @@
 //! The page where the snippets the voice detector kept
 //! ([`crate::voice_samples`]) are listened to, trimmed to what matters and
-//! judged: was "hashtag HesteClip that" said in the highlighted part, or not?
+//! judged: should the highlighted part save a clip? It should when "hashtag
+//! HesteClip that" is said well enough that you'd want it to; a muddled try is a
+//! no.
 //! Nothing is assumed from what made the detector keep one: it may have fired
 //! on a laugh, and a near miss may be the phrase said in a way it didn't take.
 //!
@@ -197,10 +199,10 @@ impl App {
             r.play_or_stop();
         }
         if yes {
-            r.judge(Label::Phrase);
+            r.judge(Label::Trigger);
         }
         if no {
-            r.judge(Label::Other);
+            r.judge(Label::Ignore);
         }
         if delete {
             r.remove();
@@ -219,7 +221,7 @@ impl App {
             ui_kit::hint(
                 ui,
                 "Short sounds from your microphone, kept when \"hashtag HesteClip that\" saved a clip or nearly did, \
-                 and around clips you saved by hand. Listen, trim each to the part that matters, and say whether you said the phrase. \
+                 and around clips you saved by hand. Listen, trim each to the part that matters, and say whether it should save a clip. \
                  They stay on this computer, and the ones nobody has listened to are deleted after two weeks.",
             );
             if !collecting {
@@ -234,10 +236,10 @@ impl App {
             }
 
             let to_hear = r.list.iter().filter(|s| s.meta.label == Label::Unreviewed).count();
-            let said = r.list.iter().filter(|s| s.meta.label == Label::Phrase).count();
-            let other = r.list.iter().filter(|s| s.meta.label == Label::Other).count();
+            let said = r.list.iter().filter(|s| s.meta.label == Label::Trigger).count();
+            let other = r.list.iter().filter(|s| s.meta.label == Label::Ignore).count();
             ui.add_space(14.0);
-            ui.weak(format!("{to_hear} to listen to · {said} said the phrase · {other} not the phrase"));
+            ui.weak(format!("{to_hear} to listen to · {said} should save a clip · {other} shouldn't"));
             ui.add_space(8.0);
 
             // The one being judged.
@@ -289,29 +291,29 @@ impl App {
                     }
 
                     ui.add_space(12.0);
-                    ui.label("Do you say \u{201c}hashtag HesteClip that\u{201d} in the highlighted part?");
+                    ui.label("Should the highlighted part save a clip?");
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.add(ui_kit::button("Said the phrase", true)).on_hover_text("Y").clicked() {
-                                r.judge(Label::Phrase);
+                            if ui.add(ui_kit::button("Should save a clip", true)).on_hover_text("Y").clicked() {
+                                r.judge(Label::Trigger);
                             }
-                            if ui.add(ui_kit::button("Not the phrase", false)).on_hover_text("N").clicked() {
-                                r.judge(Label::Other);
+                            if ui.add(ui_kit::button("Shouldn't save a clip", false)).on_hover_text("N").clicked() {
+                                r.judge(Label::Ignore);
                             }
                             if ui.add(ui_kit::button("Delete", false)).on_hover_text("Deletes it for good (Delete)").clicked() {
                                 r.remove();
                             }
                             let verdict = match s.meta.label {
                                 Label::Unreviewed => "",
-                                Label::Phrase => "Marked: said the phrase",
-                                Label::Other => "Marked: not the phrase",
+                                Label::Trigger => "Marked: should save a clip",
+                                Label::Ignore => "Marked: shouldn't save a clip",
                             };
                             ui.weak(verdict);
                         });
                     });
                     ui.add_space(4.0);
-                    ui_kit::hint(ui, "Space plays · Y said the phrase · N not the phrase · Delete removes it · arrows move between samples");
+                    ui_kit::hint(ui, "Space plays · Y should save a clip · N shouldn't · Delete removes it · arrows move between samples");
                 });
             } else if to_hear == 0 {
                 ui_kit::card(ui, |ui| ui.label("Every sample has an answer. Pick one below to change it."));
@@ -362,8 +364,8 @@ impl App {
                 for s in &r.list {
                     let verdict = match s.meta.label {
                         Label::Unreviewed => "not listened to",
-                        Label::Phrase => "said the phrase",
-                        Label::Other => "not the phrase",
+                        Label::Trigger => "should save a clip",
+                        Label::Ignore => "shouldn't save a clip",
                     };
                     let text = format!("{}   {}   ·   {verdict}", when(s), s.meta.kind.describe());
                     if ui.selectable_label(r.selected.as_deref() == Some(&s.meta.id), text).clicked() {

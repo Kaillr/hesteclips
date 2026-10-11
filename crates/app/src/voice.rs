@@ -665,7 +665,7 @@ mod detector {
             assert!((by_hand.secs - 8.0).abs() < 0.1, "{} s", by_hand.secs);
             // Judged and exported: only the trimmed part, and only what's judged.
             let mut judged = kept.clone();
-            judged[0].meta.label = Label::Phrase;
+            judged[0].meta.label = Label::Trigger;
             judged[0].meta.trim = Some((1.0, 3.0));
             // The second is left unjudged.
             let zip = dir.join("out.zip");

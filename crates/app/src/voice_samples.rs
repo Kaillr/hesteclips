@@ -3,8 +3,8 @@
 //! fired on, and what was heard around a clip saved by hand.
 //!
 //! Nothing here is sent anywhere. The snippets sit in a folder on this
-//! computer until the user has listened to them, said which ones really were
-//! the phrase, and (if they want to help) exported the ones they're happy to
+//! computer until the user has listened to them, said which ones should have
+//! saved a clip, and (if they want to help) exported the ones they're happy to
 //! share as one zip file to send over themselves.
 //!
 //! A snippet is `<id>.wav` (16 kHz mono) with `<id>.json` beside it: what
@@ -56,10 +56,14 @@ impl Kind {
 pub enum Label {
     #[default]
     Unreviewed,
-    /// "Hashtag HesteClip that" was said, inside the trimmed part.
-    Phrase,
+    /// The trimmed part should save a clip: "hashtag HesteClip that", said
+    /// well enough that the user wants it to count. ("phrase" in files made
+    /// before it was asked as "should it save a clip".)
+    #[serde(alias = "phrase")]
+    Trigger,
     /// It wasn't (inside the trimmed part).
-    Other,
+    #[serde(alias = "other")]
+    Ignore,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -227,7 +231,7 @@ fn contributor() -> String {
 #[derive(Serialize)]
 struct ExportedSample<'a> {
     file: String,
-    /// "phrase" or "other".
+    /// "trigger" (should save a clip) or "ignore".
     label: Label,
     kind: Kind,
     score: f32,
@@ -248,7 +252,7 @@ pub fn export(to: &Path, samples: &[Sample]) -> Result<usize, String> {
     use zip::write::SimpleFileOptions;
     let shareable: Vec<&Sample> = samples.iter().filter(|s| s.shareable()).collect();
     if shareable.is_empty() {
-        return Err("There is nothing to share yet: mark some samples as the phrase or not.".into());
+        return Err("There is nothing to share yet: say for some samples whether they should save a clip.".into());
     }
     let file = std::fs::File::create(to).map_err(|e| e.to_string())?;
     let mut zip = zip::ZipWriter::new(file);
@@ -277,7 +281,7 @@ pub fn export(to: &Path, samples: &[Sample]) -> Result<usize, String> {
 const README: &str = "Voice samples from HesteClips, for improving the \"hashtag HesteClip that\" detector.\n\
 \n\
 samples/*.wav   16 kHz mono sound, only the part the person trimmed it to\n\
-samples.json    for each: label (phrase = the phrase was said, other = it wasn't),\n\
+samples.json    for each: label (trigger = it should save a clip, ignore = it shouldn't),\n\
                 what made it get kept (fired, almost, by_hand), the detector's score\n\
 \n\
 Nothing else is included: no name, no clips, no other audio.\n";
@@ -317,7 +321,7 @@ mod tests {
 
     #[test]
     fn trim_is_kept_inside_the_sample() {
-        let meta = Meta { id: "x".into(), kind: Kind::Almost, at: 0, score: 0.5, moment: None, label: Label::Phrase, trim: Some((-1.0, 99.0)), version: String::new() };
+        let meta = Meta { id: "x".into(), kind: Kind::Almost, at: 0, score: 0.5, moment: None, label: Label::Trigger, trim: Some((-1.0, 99.0)), version: String::new() };
         let s = Sample { meta, secs: 6.0 };
         assert_eq!(s.range(), (0.0, 6.0));
         assert!(s.shareable());

@@ -245,7 +245,7 @@ impl App {
                 });
             });
             divider(ui);
-            let hint = "Keeps about 6 seconds of your microphone each time the command saves a clip or nearly does, and around clips you save by hand. You listen to them and say what they were, so the detector can be made better. They stay on this computer until you choose to export them.";
+            let hint = "Keeps about 6 seconds of your microphone each time the command saves a clip or nearly does, and around clips you save by hand. You listen to them and say which should have saved a clip, so the detector can be made better. They stay on this computer until you choose to export them.";
             row(ui, "Keep samples to improve it", Some(hint), |ui| {
                 ui.horizontal(|ui| {
                     toggle(ui, &mut self.settings.voice_samples);
