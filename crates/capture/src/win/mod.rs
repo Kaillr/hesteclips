@@ -266,7 +266,11 @@ impl Session {
 
             let encoder = h264::Encoder::start(&gpu, width, height, s, session.writer_tx.clone())?;
             session.apps = picture_source.apps();
-            let picture = picture_source.open(&gpu, canvas_w, canvas_h, s.fps, s.away_screen.clone())?;
+            // The screen is captured fast enough for every look to find a new
+            // picture: the capture's rate limits are set from the looks per
+            // second, not the frame rate (at 60 fps they'd hold it to 240).
+            let looks_per_second = s.fps * s.blend_samples.max(1);
+            let picture = picture_source.open(&gpu, canvas_w, canvas_h, looks_per_second, s.away_screen.clone())?;
             let latest = picture.latest.clone();
             session.video = Some(picture.video);
             // A webcam that can't open doesn't stop the recording: its status
