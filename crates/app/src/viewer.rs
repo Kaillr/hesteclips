@@ -591,7 +591,7 @@ impl Ready {
         } else {
             // Coloured like the meters, so loud moments stand out; it grows
             // as the sound is decoded.
-            self.wave.paint(&ui.painter_at(audio), audio, (0.0, dur), |_| 1.0, |_, rms| zone(meter::to_db(rms)));
+            self.wave.paint(&ui.painter_at(audio), audio, (0.0, dur), 0, |_| 1.0, |_, rms| zone(meter::to_db(rms)));
         }
 
         // Already-played part of the levels, lightly marked, so where you are reads at a glance.

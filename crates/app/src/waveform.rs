@@ -140,14 +140,19 @@ impl Waveform {
 
     /// Draw `(from, span)` seconds into `lane`, mirrored around its middle, with
     /// `gain_at(t)` applied and each column coloured by `color(peak, rms)`.
-    pub fn paint(&self, p: &Painter, lane: Rect, (from, span): (f64, f64), gain_at: impl Fn(f64) -> f32, color: impl Fn(f32, f32) -> Color32) {
+    pub fn paint(&self, p: &Painter, lane: Rect, view: (f64, f64), gain_at: impl Fn(f64) -> f32, color: impl Fn(f32, f32) -> Color32) {
+        p.extend(self.shapes(p.pixels_per_point(), lane, view, gain_at, color));
+    }
+
+    /// What [`Self::paint`] draws.
+    fn shapes(&self, pixels_per_point: f32, lane: Rect, (from, span): (f64, f64), gain_at: impl Fn(f64) -> f32, color: impl Fn(f32, f32) -> Color32) -> Vec<Shape> {
         if self.is_empty() || span <= 0.0 {
-            return;
+            return Vec::new();
         }
         let mid = lane.center().y;
         let half = lane.height() / 2.0 - 2.0;
         // One column per physical pixel.
-        let step = 1.0 / p.pixels_per_point();
+        let step = 1.0 / pixels_per_point;
         let cols = (lane.width() / step).ceil() as usize;
         let per_col = span / cols as f64;
         let mut peaks = Mesh::default();
@@ -176,14 +181,30 @@ impl Waveform {
             push_column(&mut peaks, x, top, bottom, col.gamma_multiply(0.55), step);
             push_column(&mut body, x, mid - r, mid + r, col, step);
         }
-        p.add(Shape::mesh(peaks));
-        p.add(Shape::mesh(body));
+        let mut shapes = vec![Shape::mesh(peaks), Shape::mesh(body)];
         // Clipping: a red tick at the top and bottom where it happens.
+        let red = Stroke::new(step.max(1.0), crate::library::REC_RED);
         for x in clipped {
-            p.vline(x, lane.top()..=lane.top() + 3.0, Stroke::new(step.max(1.0), crate::library::REC_RED));
-            p.vline(x, lane.bottom() - 3.0..=lane.bottom(), Stroke::new(step.max(1.0), crate::library::REC_RED));
+            shapes.push(Shape::vline(x, lane.top()..=lane.top() + 3.0, red));
+            shapes.push(Shape::vline(x, lane.bottom() - 3.0..=lane.bottom(), red));
         }
+        shapes
     }
+
+    /// Changes whenever more of the sound is in.
+    fn version(&self) -> usize {
+        self.levels[0].len()
+    }
+}
+
+/// What a waveform was drawn for: the same again draws the same shapes.
+#[derive(PartialEq)]
+struct Drawn {
+    lane: [u32; 4],
+    view: (u64, u64),
+    pixels_per_point: u32,
+    version: usize,
+    style: u64,
 }
 
 /// Add a column (top and bottom vertex) and join it to the previous one.
@@ -212,14 +233,31 @@ fn push_column(mesh: &mut Mesh, x: f32, top: f32, bottom: f32, color: Color32, f
 pub struct Live {
     wave: std::sync::Mutex<Waveform>,
     done: std::sync::atomic::AtomicBool,
+    /// The shapes drawn last time, and what for: drawn again as they are
+    /// while nothing changes (building them is a column per pixel, every
+    /// redraw of a playing clip).
+    drawn: std::sync::Mutex<Option<(Drawn, Vec<Shape>)>>,
 }
 
 impl Live {
-    /// Paint what's there (see [`Waveform::paint`]).
-    pub fn paint(&self, p: &Painter, lane: Rect, view: (f64, f64), gain_at: impl Fn(f64) -> f32, color: impl Fn(f32, f32) -> Color32) {
-        if let Ok(w) = self.wave.lock() {
-            w.paint(p, lane, view, gain_at, color);
+    /// Paint what's there (see [`Waveform::paint`]). `style` must change
+    /// whenever `gain_at` or `color` would give something else (a volume
+    /// change, mute): the shapes are kept until then.
+    pub fn paint(&self, p: &Painter, lane: Rect, view: (f64, f64), style: u64, gain_at: impl Fn(f64) -> f32, color: impl Fn(f32, f32) -> Color32) {
+        let Ok(w) = self.wave.lock() else { return };
+        let key = Drawn {
+            lane: [lane.min.x, lane.min.y, lane.max.x, lane.max.y].map(f32::to_bits),
+            view: (view.0.to_bits(), view.1.to_bits()),
+            pixels_per_point: p.pixels_per_point().to_bits(),
+            version: w.version(),
+            style,
+        };
+        let mut drawn = self.drawn.lock().unwrap();
+        if drawn.as_ref().is_none_or(|(k, _)| *k != key) {
+            *drawn = Some((key, w.shapes(p.pixels_per_point(), lane, view, gain_at, color)));
         }
+        // Meshes are shared, not copied.
+        p.extend(drawn.as_ref().map(|(_, s)| s.clone()).unwrap_or_default());
     }
 
     /// Fully decoded, and there's no sound at all.
@@ -231,7 +269,7 @@ impl Live {
 /// Follow track `track` of `pcm` as it's decoded.
 pub fn follow(pcm: std::sync::Arc<media::pcm::Pcm>, track: usize, ctx: &egui::Context) -> std::sync::Arc<Live> {
     use std::sync::atomic::Ordering;
-    let live = std::sync::Arc::new(Live { wave: std::sync::Mutex::new(Waveform::empty(media::PREVIEW_RATE)), done: Default::default() });
+    let live = std::sync::Arc::new(Live { wave: std::sync::Mutex::new(Waveform::empty(media::PREVIEW_RATE)), done: Default::default(), drawn: Default::default() });
     let (out, ctx) = (live.clone(), ctx.clone());
     std::thread::Builder::new()
         .name("waveform".into())

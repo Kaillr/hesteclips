@@ -884,7 +884,14 @@ impl Ready {
             // Drawn with the volume curve applied: what you'll hear.
             if let Some(w) = self.waves.get(i) {
                 let base = if track.muted { Color32::from_gray(90) } else { WAVE_BLUE };
-                w.paint(&alp, lane, (v0, span), |t| track.gain_at(t), |_, _| base);
+                // The volume curve and mute decide what's drawn: drawn anew when they change.
+                let style = {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    serde_json::to_string(track).unwrap_or_default().hash(&mut h);
+                    h.finish()
+                };
+                w.paint(&alp, lane, (v0, span), style, |t| track.gain_at(t), |_, _| base);
             }
             draw_envelope(&alp, lane, track, dur, x_of);
             let meter = Rect::from_min_size(Pos2::new(outer.right() - meter_w, lane.top()), Vec2::new(meter_w - 4.0, audio_h));
