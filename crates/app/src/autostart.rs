@@ -26,6 +26,11 @@ pub fn is_on() -> bool {
 /// Start with the computer, or not.
 pub fn set(on: bool) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    // A build from the source folder isn't the installed app: starting it with the computer
+    // would launch the developer's build, so only turning it off is allowed there.
+    if on && exe.components().any(|c| c.as_os_str() == "target") {
+        return Err("only the installed app can start with the computer".into());
+    }
     imp::set(on, &exe)
 }
 
