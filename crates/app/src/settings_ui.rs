@@ -77,7 +77,7 @@ impl App {
                     row(
                         ui,
                         "Frame blending",
-                        Some("Looks at the screen this often and records the average of the looks in each frame: smooth motion, like motion blur. Best when the game runs at least that fast."),
+                        Some("Each frame is the average of the pictures the screen showed during it, up to this many a second: smooth motion, like motion blur. Needs a game that runs at least that fast."),
                         |ui| self.blend_choice(ui),
                     );
                 }

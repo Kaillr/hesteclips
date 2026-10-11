@@ -185,6 +185,12 @@ pub(crate) struct Latest {
     /// so turning the away screen off can bring it back: a minimized window
     /// sends no new frames. With its valid size.
     saved: Mutex<Option<(ID3D11Texture2D, (u32, u32))>>,
+    /// How many new pictures there have been, and when (host seconds, as f64
+    /// bits) the last one arrived: frame blending weighs each picture by how
+    /// long it was up, so it needs the real arrival times.
+    frames: Mutex<u64>,
+    arrived: std::sync::atomic::AtomicU64,
+    wake: std::sync::Condvar,
     gpu: Gpu,
 }
 unsafe impl Send for Latest {}
@@ -202,12 +208,37 @@ impl Latest {
             waiting: AtomicBool::new(false),
             app: Mutex::new(None),
             saved: Mutex::new(None),
+            frames: Mutex::new(0),
+            arrived: std::sync::atomic::AtomicU64::new(0),
+            wake: std::sync::Condvar::new(),
             gpu: gpu.clone(),
         }))
     }
 
     pub(crate) fn has_frame(&self) -> bool {
         self.has_frame.load(Ordering::Acquire)
+    }
+
+    /// The picture just changed: count it and time it, and wake anyone waiting.
+    pub(crate) fn note_frame(&self) {
+        let mut n = self.frames.lock().unwrap();
+        *n += 1;
+        self.arrived.store(super::system::host_now().to_bits(), Ordering::Release);
+        drop(n);
+        self.wake.notify_all();
+    }
+
+    /// Pictures so far, and when the last arrived.
+    pub(crate) fn arrivals(&self) -> (u64, f64) {
+        (*self.frames.lock().unwrap(), f64::from_bits(self.arrived.load(Ordering::Acquire)))
+    }
+
+    /// Wait until there's a picture newer than count `seen`, or `timeout`.
+    pub(crate) fn wait_for_frame(&self, seen: u64, timeout: std::time::Duration) {
+        let n = self.frames.lock().unwrap();
+        if *n == seen {
+            let _ = self.wake.wait_timeout(n, timeout);
+        }
     }
 
     pub(crate) fn app(&self) -> Option<String> {
@@ -251,6 +282,7 @@ impl Latest {
         *self.content.lock().unwrap() = (image.width, image.height);
         self.waiting.store(true, Ordering::Release);
         self.has_frame.store(true, Ordering::Release);
+        self.note_frame();
         Ok(())
     }
 
@@ -262,6 +294,7 @@ impl Latest {
         unsafe { self.gpu.context.CopyResource(&self.texture, copy) };
         *self.content.lock().unwrap() = *size;
         self.waiting.store(false, Ordering::Release);
+        self.note_frame();
         true
     }
 
@@ -294,6 +327,7 @@ impl Latest {
         *self.content.lock().unwrap() = (size.0.min(self.width), size.1.min(self.height));
         self.waiting.store(false, Ordering::Release);
         self.has_frame.store(true, Ordering::Release);
+        self.note_frame();
     }
 
     /// Show black, as a full-size frame.
@@ -307,6 +341,7 @@ impl Latest {
         *self.content.lock().unwrap() = (self.width, self.height);
         self.waiting.store(true, Ordering::Release);
         self.has_frame.store(true, Ordering::Release);
+        self.note_frame();
         Ok(())
     }
 }
@@ -426,6 +461,7 @@ impl Capture {
                 *latest2.content.lock().unwrap() = size;
                 latest2.waiting.store(false, Ordering::Release);
                 latest2.has_frame.store(true, Ordering::Release);
+                latest2.note_frame();
             }
             // The display or window changed size: resize the pool to match.
             let mut size = pool_size.lock().unwrap();
