@@ -44,16 +44,41 @@ pub fn busy() -> bool {
     DECODING.load(Ordering::Relaxed) > 0
 }
 
-/// One track: interleaved stereo at [`PREVIEW_RATE`].
+/// One track: stereo at [`PREVIEW_RATE`], each frame as two 16-bit samples
+/// in one atomic (left in the low half). Half the memory of 32-bit floats
+/// (a 10-minute clip's four tracks took 920 MB in the editor), and plenty
+/// for listening: [`SCALE`] keeps one bit of headroom, so sound over full
+/// scale (AAC can decode past it) isn't clipped, with its steps at -84 dBFS,
+/// under the AAC sound's own noise.
 pub struct PcmTrack {
-    samples: Box<[AtomicU32]>,
-    /// How many samples are decoded (always whole stereo frames).
+    frames: Box<[AtomicU32]>,
+    /// How many samples are decoded (2 per stereo frame).
     len: AtomicUsize,
 }
 
+/// Full scale (1.0) as a stored sample: values up to ±2.0 fit.
+const SCALE: f32 = 16_383.0;
+
+#[inline]
+fn pack(l: f32, r: f32) -> u32 {
+    let q = |v: f32| (v * SCALE).round().clamp(i16::MIN as f32, i16::MAX as f32) as i16 as u16 as u32;
+    q(l) | q(r) << 16
+}
+
+#[inline]
+fn unpack(v: u32) -> (f32, f32) {
+    ((v as u16 as i16) as f32 / SCALE, ((v >> 16) as u16 as i16) as f32 / SCALE)
+}
+
 impl PcmTrack {
-    fn with_capacity(n: usize) -> Self {
-        Self { samples: (0..n).map(|_| AtomicU32::new(0)).collect(), len: AtomicUsize::new(0) }
+    /// Room for `frames` stereo frames. The memory is zeroed by the system as
+    /// it's first written, not up front: a clip being opened uses only as much
+    /// as has been decoded.
+    fn with_frames(frames: usize) -> Self {
+        let zeroed = vec![0u32; frames].into_boxed_slice();
+        // SAFETY: AtomicU32 has the same size, alignment and bit validity as u32.
+        let frames = unsafe { Box::from_raw(Box::into_raw(zeroed) as *mut [AtomicU32]) };
+        Self { frames, len: AtomicUsize::new(0) }
     }
 
     /// Samples decoded so far (2 per stereo frame).
@@ -71,20 +96,34 @@ impl PcmTrack {
         if 2 * i + 1 >= self.len() {
             return None;
         }
-        let l = f32::from_bits(self.samples[2 * i].load(Ordering::Relaxed));
-        let r = f32::from_bits(self.samples[2 * i + 1].load(Ordering::Relaxed));
-        Some((l, r))
+        Some(unpack(self.frames[i].load(Ordering::Relaxed)))
     }
 
-    /// Samples `from..to` (clamped to what's decoded), as plain samples.
+    /// Samples `from..to` (clamped to what's decoded, whole frames), as plain
+    /// interleaved samples.
     pub fn copy(&self, from: usize, to: usize) -> Vec<f32> {
-        let to = to.min(self.len());
-        self.samples[from.min(to)..to].iter().map(|s| f32::from_bits(s.load(Ordering::Relaxed))).collect()
+        let to = to.min(self.len()) / 2;
+        let from = from.min(to * 2) / 2;
+        self.frames[from..to].iter().flat_map(|f| {
+            let (l, r) = unpack(f.load(Ordering::Relaxed));
+            [l, r]
+        }).collect()
     }
 
     /// What's decoded, as plain samples (for the waveform).
     pub fn to_vec(&self) -> Vec<f32> {
-        self.samples[..self.len()].iter().map(|s| f32::from_bits(s.load(Ordering::Relaxed))).collect()
+        self.copy(0, self.len())
+    }
+
+    /// Store interleaved stereo `samples` as frames from frame `at`; what's
+    /// past the end is dropped. Returns the frames stored.
+    fn store(&self, at: usize, samples: &[f32]) -> usize {
+        let room = self.frames.len().saturating_sub(at);
+        let n = (samples.len() / 2).min(room);
+        for (k, f) in samples.chunks_exact(2).take(n).enumerate() {
+            self.frames[at + k].store(pack(f[0], f[1]), Ordering::Relaxed);
+        }
+        n
     }
 }
 
@@ -100,8 +139,10 @@ impl Pcm {
         let tracks = tracks
             .into_iter()
             .map(|t| {
-                let n = t.len() / 2 * 2;
-                PcmTrack { samples: t[..n].iter().map(|s| AtomicU32::new(s.to_bits())).collect(), len: AtomicUsize::new(n) }
+                let track = PcmTrack::with_frames(t.len() / 2);
+                let n = track.store(0, &t);
+                track.len.store(n * 2, Ordering::Release);
+                track
             })
             .collect();
         Arc::new(Self { tracks, done: AtomicBool::new(true) })
@@ -137,7 +178,7 @@ pub fn decode_streaming(source: &Path, indices: &[usize], duration: f64, finishe
     // Room for the whole clip and a little more (the duration is the
     // container's, rounded); anything past it is dropped.
     let frames = ((duration.max(0.0) + 2.0) * PREVIEW_RATE as f64) as usize;
-    let pcm = Arc::new(Pcm { tracks: indices.iter().map(|_| PcmTrack::with_capacity(frames * 2)).collect(), done: AtomicBool::new(indices.is_empty()) });
+    let pcm = Arc::new(Pcm { tracks: indices.iter().map(|_| PcmTrack::with_frames(frames)).collect(), done: AtomicBool::new(indices.is_empty()) });
     if indices.is_empty() {
         finished(&pcm, Ok(()));
         return pcm;
@@ -189,8 +230,8 @@ fn decode_track(source: &Path, index: usize, out: &PcmTrack, cancel: &AtomicBool
     let mut stdout = child.stdout.take().context("no ffmpeg output")?;
     // ~20 ms of sound at a time; whole stereo frames are published.
     let mut buf = vec![0u8; 8 * 1024];
+    let mut samples: Vec<f32> = Vec::with_capacity(buf.len() / 4);
     let (mut have, mut written) = (0usize, 0usize);
-    let capacity = out.samples.len();
     loop {
         if cancel.load(Ordering::Relaxed) {
             let _ = child.kill();
@@ -203,13 +244,10 @@ fn decode_track(source: &Path, index: usize, out: &PcmTrack, cancel: &AtomicBool
         }
         have += read;
         let whole = have / 8 * 8;
-        for chunk in buf[..whole].chunks_exact(4) {
-            if written < capacity {
-                out.samples[written].store(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]), Ordering::Relaxed);
-                written += 1;
-            }
-        }
-        out.len.store(written, Ordering::Release);
+        samples.clear();
+        samples.extend(buf[..whole].chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])));
+        written += out.store(written, &samples);
+        out.len.store(written * 2, Ordering::Release);
         buf.copy_within(whole..have, 0);
         have -= whole;
     }
@@ -218,4 +256,25 @@ fn decode_track(source: &Path, index: usize, out: &PcmTrack, cancel: &AtomicBool
         anyhow::bail!("couldn't decode the sound");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Stored sound comes back within half a step, sound over full scale
+    /// included, and frames come back in order.
+    #[test]
+    fn samples_round_trip() {
+        let samples: Vec<f32> = (0..2000).map(|i| ((i as f32) * 0.37).sin() * 1.9).chain([1.0, -1.0, 0.0, 1.5]).collect();
+        let pcm = Pcm::from_tracks(vec![samples.clone()]);
+        let t = &pcm.tracks()[0];
+        assert_eq!(t.len(), samples.len());
+        let back = t.to_vec();
+        let worst = samples.iter().zip(&back).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(worst <= 0.5 / SCALE + 1e-7, "{worst}");
+        assert_eq!(t.frame(1000), Some((back[2000], back[2001])));
+        assert_eq!(t.frame(1002), None, "past what's decoded");
+        assert_eq!(t.copy(2, 6), back[2..6]);
+    }
 }
