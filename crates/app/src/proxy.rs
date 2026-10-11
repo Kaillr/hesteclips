@@ -1,4 +1,4 @@
-//! Scrub proxy: every frame of the clip as a small JPEG, kept in memory.
+//! Scrub proxy: every frame of the clip as a small JPEG, in a file.
 //!
 //! Seeking the real file costs 50-200 ms a frame, far too slow to follow a
 //! drag. One pass decodes every frame at a small size; after that any frame
@@ -18,9 +18,15 @@
 //! finished proxy is kept on disk (`cache`), so a clip opens fully scrubbable.
 //! A player opening a clip whose build is under way joins it at full speed:
 //! one build per clip, never two decoders on it (they slow each other down).
+//!
+//! The frames go straight into their file as they're made ([`Data`]); only
+//! where each one is stays in memory. Held in memory they took 0.2-1 GB per
+//! open clip (a 5-minute clip at 640 px: 914 MB). Reads come from Windows'
+//! file cache, which gives the memory back when something else needs it, and
+//! a kept proxy opens without being read in at all.
 
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -43,34 +49,112 @@ fn width_for(total: usize) -> u32 {
     }
 }
 
-/// One frame, shared by every index it stands for (a dropped frame's slot
-/// shows the one before it).
-type Jpeg = Arc<[u8]>;
+/// Where one JPEG is in the proxy's file; every slot it stands for points at
+/// it (a dropped frame's slot shows the one before it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Spot {
+    at: u64,
+    len: u32,
+}
 
 /// The proxy frames by frame number, filled in any order (see `hw`).
 #[derive(Default)]
 struct Store {
-    frames: Vec<Option<Jpeg>>,
+    frames: Vec<Option<Spot>>,
     /// How many slots are filled.
     ready: usize,
 }
 
 impl Store {
-    fn set(&mut self, i: usize, jpeg: &Jpeg) {
+    fn set(&mut self, i: usize, spot: Spot) {
         if i >= self.frames.len() {
             self.frames.resize(i + 1, None);
         }
         if self.frames[i].is_none() {
             self.ready += 1;
         }
-        self.frames[i] = Some(jpeg.clone());
+        self.frames[i] = Some(spot);
     }
 
     /// The next slot in order (the ffmpeg pass fills them front to back).
-    fn push(&mut self, jpeg: Jpeg) {
+    fn push(&mut self, spot: Spot) {
         let i = self.frames.len();
-        self.set(i, &jpeg);
+        self.set(i, spot);
     }
+}
+
+/// A proxy's file: JPEGs one after another, appended as they're made and
+/// readable at once; once complete, the slot index and a footer follow, and
+/// it's renamed to the clip's cache file (see `cache`). One being built is
+/// deleted when it's dropped unfinished.
+struct Data {
+    /// Writing: the file and its length. `None` once finished, or for a
+    /// proxy opened from the cache.
+    write: Mutex<Option<(std::fs::File, u64)>>,
+    read: std::fs::File,
+    path: Mutex<PathBuf>,
+    /// Delete the file when dropped (not finished and kept).
+    discard: AtomicBool,
+}
+
+impl Data {
+    /// A new, empty file at `path`.
+    fn create(path: PathBuf) -> std::io::Result<Self> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let write = std::fs::File::create(&path)?;
+        let read = std::fs::File::open(&path)?;
+        Ok(Self { write: Mutex::new(Some((write, 0))), read, path: Mutex::new(path), discard: AtomicBool::new(true) })
+    }
+
+    /// Add a JPEG; where it went.
+    fn append(&self, jpeg: &[u8]) -> std::io::Result<Spot> {
+        let mut w = self.write.lock().unwrap();
+        let (file, len) = w.as_mut().ok_or_else(|| std::io::Error::other("the proxy is finished"))?;
+        // Unbuffered: a slot is filled right after this, and readers read it.
+        file.write_all(jpeg)?;
+        let spot = Spot { at: *len, len: jpeg.len() as u32 };
+        *len += jpeg.len() as u64;
+        Ok(spot)
+    }
+
+    /// Bytes of JPEGs written so far.
+    fn bytes(&self) -> u64 {
+        self.write.lock().unwrap().as_ref().map_or(0, |w| w.1)
+    }
+
+    fn read(&self, spot: Spot) -> Option<Vec<u8>> {
+        let mut buf = vec![0u8; spot.len as usize];
+        read_at(&self.read, &mut buf, spot.at).ok()?;
+        Some(buf)
+    }
+}
+
+impl Drop for Data {
+    fn drop(&mut self) {
+        if self.discard.load(Ordering::Relaxed) {
+            // Closed first: Windows deletes a file only once nothing has it open.
+            drop(self.write.lock().unwrap().take());
+            let _ = std::fs::remove_file(&*self.path.lock().unwrap());
+        }
+    }
+}
+
+/// Fill `buf` from `file` at `offset`, without moving any shared position.
+fn read_at(file: &std::fs::File, mut buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+    while !buf.is_empty() {
+        #[cfg(windows)]
+        let n = std::os::windows::fs::FileExt::seek_read(file, buf, offset)?;
+        #[cfg(unix)]
+        let n = std::os::unix::fs::FileExt::read_at(file, buf, offset)?;
+        if n == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        buf = &mut buf[n..];
+        offset += n as u64;
+    }
+    Ok(())
 }
 
 /// One clip's proxy, being built or built: shared by every player showing
@@ -95,6 +179,8 @@ struct Build {
     child: Mutex<Option<Child>>,
     /// Where it's kept once complete; `None` if the file can't be keyed.
     cache: Option<PathBuf>,
+    /// The frames' file, once the build has started.
+    data: std::sync::OnceLock<Data>,
 }
 
 impl Build {
@@ -114,16 +200,21 @@ impl Build {
         }
     }
 
+    /// Keep a JPEG made for slot(s) to come; where it went (`None`: it
+    /// couldn't be written, so it's left out).
+    fn write(&self, jpeg: &[u8]) -> Option<Spot> {
+        self.data.get()?.append(jpeg).inspect_err(|e| eprintln!("scrub proxy: couldn't write a frame: {e}")).ok()
+    }
+
     /// The pass ended: keep the proxy if every frame is in.
     fn finish(&self) {
         let complete = self.complete.load(Ordering::Relaxed) && !self.stop.load(Ordering::Relaxed);
-        if let (true, Some(path)) = (complete, &self.cache) {
+        if let (true, Some(path), Some(data)) = (complete, &self.cache, self.data.get()) {
             let t = std::time::Instant::now();
-            // A copy of the list (the pictures are shared, not copied), so the
-            // lock isn't held while hundreds of MB go to disk: the player reads
-            // these every frame, and froze for seconds while it was.
+            // A copy of the list, so the lock isn't held while it's written:
+            // the player reads it every frame.
             let frames = self.frames.lock().unwrap().frames.clone();
-            match cache::save(path, &frames) {
+            match cache::finish(data, &frames, path) {
                 Err(e) => eprintln!("scrub proxy: couldn't keep it: {e}"),
                 Ok(()) if std::env::var_os("HESTECLIPS_DEBUG_VIDEO").is_some() => {
                     eprintln!("{:>8.3} scrub proxy: kept on disk in {:.0} ms", crate::player::uptime(), t.elapsed().as_secs_f64() * 1000.0);
@@ -185,6 +276,7 @@ fn shared_build(ctx: &egui::Context, source: &Path, fps: f64, total: usize, back
         done: AtomicBool::new(false),
         child: Mutex::new(None),
         cache: key.map(cache::path),
+        data: Default::default(),
     });
     if let Some(k) = key {
         map.insert(k, Arc::downgrade(&b));
@@ -199,13 +291,30 @@ fn shared_build(ctx: &egui::Context, source: &Path, fps: f64, total: usize, back
 fn start(ctx: &egui::Context, b: &Arc<Build>) {
     if let Some(path) = &b.cache {
         let t = std::time::Instant::now();
-        if let Some(store) = cache::load(path, b.total) {
+        if let Some((data, store)) = cache::load(path, b.total) {
             if std::env::var_os("HESTECLIPS_DEBUG_VIDEO").is_some() {
                 eprintln!("{:>8.3} scrub proxy: {} frames from the cache in {:.0} ms", crate::player::uptime(), store.ready, t.elapsed().as_secs_f64() * 1000.0);
             }
+            let _ = b.data.set(data);
             *b.frames.lock().unwrap() = store;
             b.done.store(true, Ordering::Relaxed);
             ctx.request_repaint();
+            return;
+        }
+    }
+    // Where the frames go while it's built: beside the kept ones (it becomes
+    // one when complete), else in the temporary folder.
+    let made = Data::create(cache::partial_path(b.cache.as_deref())).or_else(|e| {
+        eprintln!("scrub proxy: can't write beside the kept ones ({e}); using the temporary folder");
+        Data::create(cache::partial_path(None))
+    });
+    match made {
+        Ok(d) => {
+            let _ = b.data.set(d);
+        }
+        Err(e) => {
+            eprintln!("scrub proxy: nowhere to keep frames: {e}");
+            b.done.store(true, Ordering::Relaxed);
             return;
         }
     }
@@ -312,9 +421,11 @@ impl Proxy {
 
     /// Decode proxy frame `idx`, if it's been built yet.
     pub fn frame(&self, idx: u64) -> Option<egui::ColorImage> {
-        let jpeg = self.build.frames.lock().ok()?.frames.get(idx as usize)?.clone()?;
-        let img = image::load_from_memory_with_format(&jpeg, image::ImageFormat::Jpeg).ok()?.to_rgba8();
-        Some(egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw()))
+        let spot = (*self.build.frames.lock().ok()?.frames.get(idx as usize)?)?;
+        let jpeg = self.build.data.get()?.read(spot)?;
+        // JPEGs decode to RGB: taken as it is (no alpha to add, nothing to premultiply).
+        let img = image::load_from_memory_with_format(&jpeg, image::ImageFormat::Jpeg).ok()?.into_rgb8();
+        Some(egui::ColorImage::from_rgb([img.width() as usize, img.height() as usize], img.as_raw()))
     }
 }
 
@@ -341,7 +452,14 @@ fn start_ffmpeg(ctx: &egui::Context, b: &Arc<Build>) -> Option<Child> {
     let stdout = child.stdout.take()?;
     let (b, ctx) = (b.clone(), ctx.clone());
     std::thread::spawn(move || {
-        split_jpegs(stdout, &b.frames, &ctx);
+        split_jpegs(stdout, &ctx, |jpeg| match b.write(jpeg) {
+            Some(spot) => {
+                b.frames.lock().unwrap().push(spot);
+                true
+            }
+            // Slots are filled in order: one missing would shift every later one.
+            None => false,
+        });
         let ready = b.frames.lock().map_or(0, |f| f.ready);
         b.complete.store(ready >= b.total, Ordering::Relaxed);
         b.finish();
@@ -352,8 +470,9 @@ fn start_ffmpeg(ctx: &egui::Context, b: &Arc<Build>) -> Option<Child> {
 /// Split an MJPEG byte stream into individual JPEGs (each SOI 0xFFD8 … EOI 0xFFD9).
 ///
 /// ffmpeg's mjpeg encoder byte-stuffs 0xFF inside entropy-coded data, so the first
-/// EOI after a frame's start ends that frame.
-fn split_jpegs(mut r: impl Read, frames: &Mutex<Store>, ctx: &egui::Context) {
+/// EOI after a frame's start ends that frame. Each goes to `put`, which says
+/// whether to go on.
+fn split_jpegs(mut r: impl Read, ctx: &egui::Context, mut put: impl FnMut(&[u8]) -> bool) {
     let mut buf: Vec<u8> = Vec::with_capacity(1 << 20);
     let mut chunk = vec![0u8; 1 << 16];
     // Bytes before `scanned` have been searched for an EOI already.
@@ -372,8 +491,9 @@ fn split_jpegs(mut r: impl Read, frames: &Mutex<Store>, ctx: &egui::Context) {
             match buf[from..].windows(2).position(|w| w == [0xFF, 0xD9]) {
                 Some(off) => {
                     let end = from + off + 2;
-                    if let Ok(mut f) = frames.lock() {
-                        f.push(Arc::from(&buf[..end]));
+                    if !put(&buf[..end]) {
+                        ctx.request_repaint();
+                        return;
                     }
                     buf.drain(..end);
                     from = 2;
@@ -561,9 +681,11 @@ mod hw {
                     if c.start != start {
                         *c = Chunk::new(start, end);
                     }
-                    let mut store = frames.lock().unwrap();
                     match out {
                         Done::Frame { index, jpeg: Some(jpeg), .. } => {
+                            // Into the file first (not holding the slots: the
+                            // player reads them every frame).
+                            let Some(spot) = b.write(&jpeg) else { continue };
                             // A chunk's first frame: often all a scrub gets
                             // from it, so show it now.
                             if index == start {
@@ -573,10 +695,10 @@ mod hw {
                                 eprintln!("{:>8.3} scrub proxy: first frame in", crate::player::uptime());
                                 first = false;
                             }
-                            c.frame(&mut store, index, jpeg);
+                            c.frame(&mut frames.lock().unwrap(), index, spot);
                         }
                         Done::Frame { jpeg: None, .. } => {}
-                        Done::End { .. } => c.end(&mut store),
+                        Done::End { .. } => c.end(&mut frames.lock().unwrap()),
                     }
                 }
                 // Otherwise at most every 100 ms, but always within it (a
@@ -590,10 +712,8 @@ mod hw {
                 }
             }
             if debug {
-                let f = frames.lock().unwrap();
-                let mut seen = std::collections::HashSet::new();
-                let bytes: usize = f.frames.iter().flatten().filter(|j| seen.insert(j.as_ptr())).map(|j| j.len()).sum();
-                eprintln!("scrub proxy: {} frames in {:.1} s, {} MB", f.ready, started.elapsed().as_secs_f64(), bytes / 1_000_000);
+                let bytes = b.data.get().map_or(0, Data::bytes);
+                eprintln!("scrub proxy: {} frames in {:.1} s, {} MB", frames.lock().unwrap().ready, started.elapsed().as_secs_f64(), bytes / 1_000_000);
             }
             b.finish();
             ctx.request_repaint();
@@ -617,7 +737,7 @@ mod hw {
     }
 
     enum Done {
-        Frame { start: usize, end: usize, index: usize, jpeg: Option<Jpeg> },
+        Frame { start: usize, end: usize, index: usize, jpeg: Option<Vec<u8>> },
         End { start: usize, end: usize },
     }
 
@@ -635,7 +755,7 @@ mod hw {
         end: usize,
         /// The first slot not filled yet.
         next: usize,
-        last: Option<Jpeg>,
+        last: Option<Spot>,
     }
 
     impl Chunk {
@@ -643,20 +763,20 @@ mod hw {
             Self { start, end, next: start, last: None }
         }
 
-        pub(super) fn frame(&mut self, store: &mut Store, index: usize, jpeg: Jpeg) {
+        pub(super) fn frame(&mut self, store: &mut Store, index: usize, spot: Spot) {
             while self.next < index.min(self.end) {
-                store.set(self.next, self.last.as_ref().unwrap_or(&jpeg));
+                store.set(self.next, self.last.unwrap_or(spot));
                 self.next += 1;
             }
             if (self.start..self.end).contains(&index) {
-                store.set(index, &jpeg);
+                store.set(index, spot);
                 self.next = self.next.max(index + 1);
             }
-            self.last = Some(jpeg);
+            self.last = Some(spot);
         }
 
         pub(super) fn end(&mut self, store: &mut Store) {
-            if let Some(last) = &self.last {
+            if let Some(last) = self.last {
                 while self.next < self.end {
                     store.set(self.next, last);
                     self.next += 1;
@@ -665,8 +785,8 @@ mod hw {
         }
     }
 
-    fn encode(p: &Picture) -> Option<Jpeg> {
-        media::encode_jpeg(&p.rgba, p.width as u16, p.height as u16, QUALITY).map(Arc::from)
+    fn encode(p: &Picture) -> Option<Vec<u8>> {
+        media::encode_jpeg(&p.rgba, p.width as u16, p.height as u16, QUALITY)
     }
 }
 
@@ -674,16 +794,23 @@ mod hw {
 /// clip (keyed by path, size, modification time and frame count, so an edited
 /// or replaced file gets a fresh one), the least recently opened dropped once
 /// they pass [`CAP`].
+///
+/// A file is the frames' JPEGs one after another (as [`Data`] wrote them
+/// while building), then each slot's place (offset `u64`, length `u32`;
+/// offset `u64::MAX`: none), then the slot count, where those start (both
+/// `u64`) and [`MAGIC`]. Opening one reads only that index.
 mod cache {
     use super::*;
     use std::hash::{Hash, Hasher};
-    use std::io::Write;
 
     /// Disk the kept proxies may take, in all.
     const CAP: u64 = 5_000_000_000;
-    /// File format: magic, slot count, frame count, then each slot's frame
-    /// (`u32::MAX`: none), then each frame as length + JPEG.
-    const MAGIC: &[u8; 8] = b"HCPROXY1";
+    const MAGIC: &[u8; 8] = b"HCPROXY2";
+    /// The format before: the whole file was read into memory to open it.
+    const OLD_MAGIC: &[u8; 8] = b"HCPROXY1";
+    /// Bytes per slot in the index, and in the footer.
+    const SLOT: usize = 12;
+    const FOOTER: u64 = 24;
 
     fn dir() -> PathBuf {
         dirs::cache_dir().unwrap_or_else(std::env::temp_dir).join("hesteclips").join("proxy")
@@ -700,98 +827,103 @@ mod cache {
         dir().join(format!("{key:016x}.proxy"))
     }
 
-    pub fn save(path: &Path, frames: &[Option<Jpeg>]) -> std::io::Result<()> {
-        std::fs::create_dir_all(dir())?;
-        // Each frame once, however many slots show it.
-        let mut index = HashMap::<*const u8, u32>::new();
-        let mut unique: Vec<&Jpeg> = Vec::new();
-        let slots: Vec<u32> = frames
-            .iter()
-            .map(|f| match f {
-                None => u32::MAX,
-                Some(j) => *index.entry(j.as_ptr()).or_insert_with(|| {
-                    unique.push(j);
-                    unique.len() as u32 - 1
-                }),
-            })
-            .collect();
-        let tmp = path.with_extension("partial");
-        {
-            let mut w = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(&tmp)?);
-            w.write_all(MAGIC)?;
-            w.write_all(&(slots.len() as u64).to_le_bytes())?;
-            w.write_all(&(unique.len() as u64).to_le_bytes())?;
-            for s in &slots {
-                w.write_all(&s.to_le_bytes())?;
-            }
-            for j in &unique {
-                w.write_all(&(j.len() as u32).to_le_bytes())?;
-                w.write_all(j)?;
-            }
-            w.flush()?;
+    /// A new file for a build: beside `kept` (the file it becomes), else in
+    /// the temporary folder. Never one another build may be using.
+    pub fn partial_path(kept: Option<&Path>) -> PathBuf {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let name = format!("{}-{}", std::process::id(), n);
+        match kept {
+            Some(p) => p.with_extension(format!("{name}.partial")),
+            None => std::env::temp_dir().join(format!("hesteclips-proxy-{name}.partial")),
         }
-        std::fs::rename(&tmp, path)?;
+    }
+
+    /// The build in `data` is complete: write its index after the frames and
+    /// keep it at `path`.
+    pub fn finish(data: &Data, frames: &[Option<Spot>], path: &Path) -> std::io::Result<()> {
+        let mut w = data.write.lock().unwrap();
+        let (file, len) = w.as_mut().ok_or_else(|| std::io::Error::other("already finished"))?;
+        let mut tail = Vec::with_capacity(frames.len() * SLOT + FOOTER as usize);
+        for f in frames {
+            let s = f.unwrap_or(Spot { at: u64::MAX, len: 0 });
+            tail.extend_from_slice(&s.at.to_le_bytes());
+            tail.extend_from_slice(&s.len.to_le_bytes());
+        }
+        tail.extend_from_slice(&(frames.len() as u64).to_le_bytes());
+        tail.extend_from_slice(&len.to_le_bytes());
+        tail.extend_from_slice(MAGIC);
+        file.write_all(&tail)?;
+        file.flush()?;
+        *w = None;
+        drop(w);
+        // Readers keep their handle across the rename.
+        let from = data.path.lock().unwrap().clone();
+        std::fs::rename(&from, path)?;
+        *data.path.lock().unwrap() = path.to_path_buf();
+        data.discard.store(false, Ordering::Relaxed);
         evict();
         Ok(())
     }
 
-    /// The kept proxy at `path`, if there is a whole one for `total` frames.
-    pub fn load(path: &Path, total: usize) -> Option<Store> {
-        let bytes = std::fs::read(path).ok()?;
-        let store = parse(&bytes, total);
-        match &store {
-            // Just opened: the last to be dropped.
-            Some(_) => {
-                let _ = std::fs::File::options().write(true).open(path).and_then(|f| f.set_modified(std::time::SystemTime::now()));
-            }
-            None => {
-                let _ = std::fs::remove_file(path);
-            }
-        }
-        store
+    /// The kept proxy at `path`, if there is a whole one for `total` frames:
+    /// its file, open, and the slots. Anything else there is deleted.
+    pub fn load(path: &Path, total: usize) -> Option<(Data, Store)> {
+        let file = std::fs::File::open(path).ok()?;
+        let Some(store) = parse(&file, total) else {
+            drop(file);
+            let _ = std::fs::remove_file(path);
+            return None;
+        };
+        // Just opened: the last to be dropped.
+        let _ = std::fs::File::options().write(true).open(path).and_then(|f| f.set_modified(std::time::SystemTime::now()));
+        let data = Data { write: Mutex::new(None), read: file, path: Mutex::new(path.to_path_buf()), discard: AtomicBool::new(false) };
+        Some((data, store))
     }
 
-    fn parse(bytes: &[u8], total: usize) -> Option<Store> {
-        let mut at = 0usize;
-        let mut take = |n: usize| -> Option<&[u8]> {
-            let b = bytes.get(at..at.checked_add(n)?)?;
-            at += n;
-            Some(b)
-        };
-        if take(8)? != MAGIC {
-            return None;
-        }
+    fn parse(file: &std::fs::File, total: usize) -> Option<Store> {
+        let len = file.metadata().ok()?.len();
+        let mut footer = [0u8; FOOTER as usize];
+        read_at(file, &mut footer, len.checked_sub(FOOTER)?).ok()?;
         let u64_at = |b: &[u8]| u64::from_le_bytes(b.try_into().unwrap());
-        let slots = u64_at(take(8)?) as usize;
-        let count = u64_at(take(8)?) as usize;
-        if slots != total {
+        let (slots, index_at) = (u64_at(&footer[..8]) as usize, u64_at(&footer[8..16]));
+        if &footer[16..] != MAGIC || slots != total || index_at.checked_add(slots.checked_mul(SLOT)? as u64)? != len - FOOTER {
             return None;
         }
-        let index: Vec<u32> = take(slots.checked_mul(4)?)?.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
-        let mut unique: Vec<Jpeg> = Vec::with_capacity(count);
-        for _ in 0..count {
-            let len = u32::from_le_bytes(take(4)?.try_into().unwrap()) as usize;
-            unique.push(Arc::from(take(len)?));
-        }
+        let mut index = vec![0u8; slots * SLOT];
+        read_at(file, &mut index, index_at).ok()?;
         let mut store = Store::default();
-        for (i, &u) in index.iter().enumerate() {
-            if u != u32::MAX {
-                store.set(i, unique.get(u as usize)?);
+        for (i, s) in index.chunks_exact(SLOT).enumerate() {
+            let spot = Spot { at: u64_at(&s[..8]), len: u32::from_le_bytes(s[8..].try_into().unwrap()) };
+            if spot.at != u64::MAX {
+                if spot.at.checked_add(spot.len as u64)? > index_at {
+                    return None;
+                }
+                store.set(i, spot);
             }
         }
         Some(store)
     }
 
-    /// Drop the least recently opened until they fit in [`CAP`].
+    /// Drop the least recently opened until they fit in [`CAP`]; also any in
+    /// the old format, and builds a crash left behind.
     fn evict() {
         let Ok(entries) = std::fs::read_dir(dir()) else { return };
-        let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = entries
-            .flatten()
-            .filter_map(|e| {
-                let m = e.metadata().ok()?;
-                Some((m.modified().ok()?, m.len(), e.path()))
-            })
-            .collect();
+        let old = |p: &Path| {
+            let mut head = [0u8; 8];
+            std::fs::File::open(p).and_then(|mut f| f.read_exact(&mut head)).is_ok() && &head == OLD_MAGIC
+        };
+        let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = Vec::new();
+        for e in entries.flatten() {
+            let (Ok(m), path) = (e.metadata(), e.path()) else { continue };
+            let Ok(modified) = m.modified() else { continue };
+            let stale = path.extension().is_some_and(|x| x == "partial") && modified.elapsed().is_ok_and(|a| a > Duration::from_secs(24 * 3600));
+            if stale || old(&path) {
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+            files.push((modified, m.len(), path));
+        }
         files.sort();
         let mut total: u64 = files.iter().map(|f| f.1).sum();
         for (_, len, path) in files {
@@ -810,21 +942,39 @@ mod cache {
 
         #[test]
         fn kept_proxies_read_back() {
-            let j = |n: u8| -> Jpeg { Arc::from(vec![n, n, n]) };
+            let kept = std::env::temp_dir().join(format!("hesteclips-proxy-test-{}.proxy", std::process::id()));
+            let data = Data::create(partial_path(Some(&kept))).unwrap();
+            let a = data.append(&[1, 1, 1]).unwrap();
+            let b = data.append(&[2, 2]).unwrap();
+            // Readable while it's still being written.
+            assert_eq!(data.read(b).unwrap(), [2, 2]);
             let mut store = Store::default();
-            let a = j(1);
-            store.set(0, &a);
-            store.set(1, &a);
-            store.set(3, &j(2));
-            let path = std::env::temp_dir().join(format!("hesteclips-proxy-test-{}.proxy", std::process::id()));
-            save(&path, &store.frames).unwrap();
-            let back = load(&path, 4).expect("reads back");
-            assert_eq!(back.ready, 3);
-            assert_eq!(back.frames[1].as_deref(), Some(&[1u8, 1, 1][..]));
-            assert!(back.frames[2].is_none());
-            assert!(Arc::ptr_eq(back.frames[0].as_ref().unwrap(), back.frames[1].as_ref().unwrap()), "one copy per frame");
-            assert!(load(&path, 5).is_none(), "another frame count isn't this clip's");
-            let _ = std::fs::remove_file(&path);
+            store.set(0, a);
+            store.set(1, a);
+            store.set(3, b);
+            finish(&data, &store.frames, &kept).unwrap();
+            assert_eq!(data.read(a).unwrap(), [1, 1, 1], "still readable after it's kept");
+            drop(data);
+            assert!(kept.exists(), "kept, not deleted");
+            let (back, slots) = load(&kept, 4).expect("reads back");
+            assert_eq!(slots.ready, 3);
+            assert_eq!(back.read(slots.frames[1].unwrap()).unwrap(), [1, 1, 1]);
+            assert_eq!(back.read(slots.frames[3].unwrap()).unwrap(), [2, 2]);
+            assert!(slots.frames[2].is_none());
+            assert_eq!(slots.frames[0], slots.frames[1], "one copy per frame");
+            drop(back);
+            assert!(load(&kept, 5).is_none(), "another frame count isn't this clip's");
+            assert!(!kept.exists(), "a file that isn't this clip's is dropped");
+        }
+
+        #[test]
+        fn unfinished_builds_are_deleted() {
+            let path = partial_path(None);
+            let data = Data::create(path.clone()).unwrap();
+            data.append(&[7; 100]).unwrap();
+            assert!(path.exists());
+            drop(data);
+            assert!(!path.exists());
         }
     }
 }
@@ -838,14 +988,14 @@ mod tests {
     #[cfg(hw_decode)]
     #[test]
     fn chunks_fill_their_slots() {
-        let j = |n: u8| -> Jpeg { Arc::from(vec![n]) };
+        let j = |n: u8| Spot { at: n as u64, len: 1 };
         let mut store = Store::default();
         let mut c = hw::Chunk::new(0, 7);
         for (i, n) in [(0, 0), (1, 1), (3, 3), (3, 4), (6, 6)] {
             c.frame(&mut store, i, j(n));
         }
         c.end(&mut store);
-        let got: Vec<u8> = store.frames.iter().map(|x| x.as_ref().unwrap()[0]).collect();
+        let got: Vec<u64> = store.frames.iter().map(|x| x.unwrap().at).collect();
         assert_eq!(got, [0, 1, 1, 4, 4, 4, 6]);
         // A chunk 10..14 whose first frame (the one showing at 10) is 8.
         let mut c = hw::Chunk::new(10, 14);
@@ -853,7 +1003,7 @@ mod tests {
             c.frame(&mut store, i, j(n));
         }
         c.end(&mut store);
-        let got: Vec<u8> = (10..14).map(|i| store.frames[i].as_ref().unwrap()[0]).collect();
+        let got: Vec<u64> = (10..14).map(|i| store.frames[i].unwrap().at).collect();
         assert_eq!(got, [8, 8, 12, 12]);
         assert_eq!(store.ready, 11);
     }
@@ -886,9 +1036,11 @@ mod tests {
                     Ok(n)
                 }
             }
-            let frames = Mutex::new(Store::default());
-            split_jpegs(Chunked(stream.clone(), chunk), &frames, &egui::Context::default());
-            let got: Vec<Vec<u8>> = frames.into_inner().unwrap().frames.iter().map(|f| f.as_ref().unwrap().to_vec()).collect();
+            let mut got: Vec<Vec<u8>> = Vec::new();
+            split_jpegs(Chunked(stream.clone(), chunk), &egui::Context::default(), |j| {
+                got.push(j.to_vec());
+                true
+            });
             assert_eq!(got, (1..=5).map(frame).collect::<Vec<_>>(), "chunk size {chunk}");
         }
     }
