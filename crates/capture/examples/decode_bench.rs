@@ -130,6 +130,21 @@ fn main() -> anyhow::Result<()> {
         println!("{n} frames: {repeats} repeated numbers, {skips} skipped; first: {:?}", &got[..got.len().min(16)]);
         return Ok(());
     }
+    // PIPECHECK=n: n frames read in order (read ahead) against the same frames
+    // asked for one by one on another decoder, with a jump halfway: same
+    // numbers, same pixels.
+    if let Some(n) = std::env::var("PIPECHECK").ok().and_then(|n| n.parse::<u64>().ok()) {
+        let mut one_by_one = capture::win::decode::Decoder::open(&path, width, None)?;
+        let (mut same, mut differ) = (0u64, 0u64);
+        for k in 0..n {
+            let p = if k == n / 2 { d.frame(n * 3)? } else { d.next()? };
+            let Some(p) = p else { break };
+            let q = one_by_one.frame(p.index)?.expect("frame");
+            if q.index == p.index && q.rgba == p.rgba { same += 1 } else { differ += 1 }
+        }
+        println!("{same} frames the same, {differ} different");
+        return Ok(());
+    }
     // FULL=1: decode every frame (as the scrub proxy does) and report.
     if std::env::var_os("FULL").is_some() {
         let t = Instant::now();

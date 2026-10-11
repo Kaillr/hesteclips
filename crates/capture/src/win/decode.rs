@@ -183,7 +183,17 @@ pub struct Decoder {
     next_index: Option<u64>,
     /// A frame already read but not yet handed out.
     peeked: Option<(u64, IMFSample)>,
+    /// Frames read in order whose pixels are on their way back from the
+    /// GPU (see [`Self::next`]): their numbers and staging textures, oldest
+    /// first, and the staging texture the next one goes to.
+    coming: VecDeque<(u64, usize)>,
+    next_staging: usize,
 }
+
+/// Frames read back at once while reading in order: the GPU converts and
+/// copies the newest while the oldest is copied out (each waited for the GPU
+/// on its own before).
+const READ_AHEAD: usize = 3;
 
 // The reader is used from one thread at a time, which owns the decoder.
 unsafe impl Send for Decoder {}
@@ -309,6 +319,8 @@ impl Decoder {
                 offset: 0,
                 next_index: None,
                 peeked: None,
+                coming: VecDeque::new(),
+                next_staging: 0,
             };
             // The first frame's time is frame 0's; keep the frame for the first read.
             let (time, sample) = d.read_sample()?.context("the video has no frames")?;
@@ -342,6 +354,8 @@ impl Decoder {
     /// and playback do). Decoded forward from where the reader is when that's
     /// close, else from the keyframe before it. `None` past the end.
     pub fn frame(&mut self, index: u64) -> Result<Option<Picture>> {
+        // Frames read ahead are past: the decoder is where they ended.
+        self.coming.clear();
         let near = match (&self.src, self.next_index) {
             (Source::Direct(d), Some(n)) => d.decode_on(self.time_of(n), self.time_of(index)),
             (Source::Reader(_), Some(n)) => n <= index && index - n <= MAX_SKIP,
@@ -380,12 +394,31 @@ impl Decoder {
         }
     }
 
-    /// The frame after the last one read, with its pixels. `None` at the end.
+    /// The frame after the last one handed out, with its pixels. `None` at
+    /// the end. Frames that come back to the CPU are read [`READ_AHEAD`]
+    /// ahead: each waits for the GPU to finish only frames it started
+    /// earlier, not its own (every frame of a clip at 1280 px: 575 to 680 a
+    /// second; at 640 px no faster, the decoder is what's slow there).
     pub fn next(&mut self) -> Result<Option<Picture>> {
-        match self.read()? {
-            Some((i, sample)) => self.picture(i, &sample).map(Some),
-            None => Ok(None),
+        if self.pool.is_some() {
+            return match self.read()? {
+                Some((i, sample)) => self.picture(i, &sample).map(Some),
+                None => Ok(None),
+            };
         }
+        while self.coming.len() < READ_AHEAD {
+            let Some((i, sample)) = self.read()? else { break };
+            let (texture, slice) = decoded_texture(&sample)?;
+            let convert = self.convert.as_mut().context("no conversion")?;
+            convert.run(&texture, slice, 0)?;
+            let k = self.next_staging;
+            convert.stage(&self.gpu, k)?;
+            self.next_staging = (k + 1) % READ_AHEAD;
+            self.coming.push_back((i, k));
+        }
+        let Some((index, k)) = self.coming.pop_front() else { return Ok(None) };
+        let rgba = self.convert.as_ref().context("no conversion")?.read_staged(&self.gpu, k)?;
+        Ok(Some(Picture { index, width: self.width, height: self.height, rgba, gpu: None }))
     }
 
     /// The frame whose slot on the grid contains `time` (the decoder's clock).
@@ -453,13 +486,7 @@ impl Decoder {
 
     /// Convert a decoded frame and copy it off the GPU.
     fn picture(&mut self, index: u64, sample: &IMFSample) -> Result<Picture> {
-        let (texture, slice) = unsafe {
-            let buffer = sample.GetBufferByIndex(0)?;
-            let dxgi: IMFDXGIBuffer = buffer.cast().context("the decoder didn't give a GPU frame")?;
-            let mut texture: Option<ID3D11Texture2D> = None;
-            dxgi.GetResource(&ID3D11Texture2D::IID, &mut texture as *mut _ as *mut _)?;
-            (texture.context("no texture")?, dxgi.GetSubresourceIndex()?)
-        };
+        let (texture, slice) = decoded_texture(sample)?;
         let Some(pool) = self.pool.clone() else {
             let convert = self.convert.as_mut().context("no conversion")?;
             convert.run(&texture, slice, 0)?;
@@ -505,6 +532,17 @@ impl Decoder {
         };
         let surface = Surface { pool, slot, ready };
         Ok(Picture { index, width: self.width, height: self.height, rgba: Vec::new(), gpu: Some(surface) })
+    }
+}
+
+/// The decoder's texture holding `sample`'s picture, and its array slice.
+fn decoded_texture(sample: &IMFSample) -> Result<(ID3D11Texture2D, u32)> {
+    unsafe {
+        let buffer = sample.GetBufferByIndex(0)?;
+        let dxgi: IMFDXGIBuffer = buffer.cast().context("the decoder didn't give a GPU frame")?;
+        let mut texture: Option<ID3D11Texture2D> = None;
+        dxgi.GetResource(&ID3D11Texture2D::IID, &mut texture as *mut _ as *mut _)?;
+        Ok((texture.context("no texture")?, dxgi.GetSubresourceIndex()?))
     }
 }
 
@@ -606,7 +644,7 @@ fn surfaces(gpu: &Gpu, width: u32, height: u32, format: SurfaceFormat) -> Result
 }
 
 /// The GPU pass from a decoded NV12 frame to RGBA at the output size, and the
-/// staging texture it's read back through.
+/// staging textures it's read back through.
 struct Convert {
     video: ID3D11VideoContext,
     vdev: ID3D11VideoDevice,
@@ -615,7 +653,9 @@ struct Convert {
     /// What it draws into: one texture (read back) or the shared pool's.
     targets: Vec<ID3D11Texture2D>,
     outputs: Vec<ID3D11VideoProcessorOutputView>,
-    staging: ID3D11Texture2D,
+    /// CPU-readable copies of the target, made the first time they're
+    /// needed (frames shared on the GPU never are).
+    staging: Vec<ID3D11Texture2D>,
     /// Input views by decoder texture and array slice (the decoder cycles
     /// through a fixed set of surfaces).
     inputs: HashMap<(usize, u32), ID3D11VideoProcessorInputView>,
@@ -641,7 +681,6 @@ impl Convert {
         unsafe {
             let enumerator = vdev.CreateVideoProcessorEnumerator(&desc)?;
             let processor = vdev.CreateVideoProcessor(&enumerator, 0)?;
-            let staging = gpu.texture(size.0, size.1, DXGI_FORMAT_R8G8B8A8_UNORM, 0, D3D11_USAGE_STAGING, D3D11_CPU_ACCESS_READ.0 as u32)?;
             let out_desc = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
                 ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
                 Anonymous: D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 { Texture2D: D3D11_TEX2D_VPOV { MipSlice: 0 } },
@@ -667,7 +706,7 @@ impl Convert {
             video.VideoProcessorSetOutputTargetRect(&processor, true, Some(&dst));
             video.VideoProcessorSetStreamAutoProcessingMode(&processor, 0, false);
             video.VideoProcessorSetOutputAlphaFillMode(&processor, D3D11_VIDEO_PROCESSOR_ALPHA_FILL_MODE_OPAQUE, 0);
-            Ok(Self { video, vdev, enumerator, processor, targets, outputs, staging, inputs: HashMap::new(), source, size })
+            Ok(Self { video, vdev, enumerator, processor, targets, outputs, staging: Vec::new(), inputs: HashMap::new(), source, size })
         }
     }
 
@@ -711,15 +750,38 @@ impl Convert {
     }
 
     /// The (single) target's pixels: tight RGBA rows.
-    fn read(&self, gpu: &Gpu) -> Result<Vec<u8>> {
+    fn read(&mut self, gpu: &Gpu) -> Result<Vec<u8>> {
+        self.stage(gpu, 0)?;
+        self.read_staged(gpu, 0)
+    }
+
+    /// Start copying the (single) target into staging texture `k`; the GPU
+    /// does it after what's queued, without waiting here.
+    fn stage(&mut self, gpu: &Gpu, k: usize) -> Result<()> {
+        while self.staging.len() <= k {
+            let t = gpu.texture(self.size.0, self.size.1, DXGI_FORMAT_R8G8B8A8_UNORM, 0, D3D11_USAGE_STAGING, D3D11_CPU_ACCESS_READ.0 as u32)?;
+            self.staging.push(t);
+        }
+        unsafe {
+            gpu.context.CopyResource(&self.staging[k], &self.targets[0]);
+            gpu.context.Flush();
+        }
+        Ok(())
+    }
+
+    /// Staging texture `k`'s pixels, once the GPU has put them there: tight
+    /// RGBA rows.
+    fn read_staged(&self, gpu: &Gpu, k: usize) -> Result<Vec<u8>> {
+        let staging = self.staging.get(k).context("nothing staged")?;
         let (w, h) = self.size;
         let row = w as usize * 4;
-        let mut rgba = vec![0u8; row * h as usize];
+        let mut rgba = Vec::with_capacity(row * h as usize);
         unsafe {
-            gpu.context.CopyResource(&self.staging, &self.targets[0]);
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-            gpu.context.Map(&self.staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
+            gpu.context.Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
             let src = mapped.pData as *const u8;
+            // Written whole below, not zeroed first.
+            rgba.set_len(row * h as usize);
             if mapped.RowPitch as usize == row {
                 std::ptr::copy_nonoverlapping(src, rgba.as_mut_ptr(), rgba.len());
             } else {
@@ -727,7 +789,7 @@ impl Convert {
                     std::ptr::copy_nonoverlapping(src.add(y * mapped.RowPitch as usize), rgba[y * row..].as_mut_ptr(), row);
                 }
             }
-            gpu.context.Unmap(&self.staging, 0);
+            gpu.context.Unmap(staging, 0);
         }
         if rgba.is_empty() {
             bail!("empty frame");
