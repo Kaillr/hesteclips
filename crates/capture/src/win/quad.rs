@@ -147,6 +147,7 @@ impl Quad {
         let (w, h) = (size.0 as f32, size.1 as f32);
         let [l, t, r, b] = at.dest;
         let place = [l / w * 2.0 - 1.0, 1.0 - t / h * 2.0, r / w * 2.0 - 1.0, 1.0 - b / h * 2.0, at.uv[0], at.uv[1], at.uv[2], at.uv[3]];
+        let _lock = gpu.exclusive();
         let ctx = &gpu.context;
         unsafe {
             ctx.UpdateSubresource(&self.place, 0, None, place.as_ptr().cast(), 0, 0);

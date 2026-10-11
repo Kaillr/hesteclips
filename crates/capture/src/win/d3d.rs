@@ -31,11 +31,23 @@ pub(crate) struct Shared<T>(pub T);
 unsafe impl<T> Send for Shared<T> {}
 unsafe impl<T> Sync for Shared<T> {}
 
+/// See [`Gpu::exclusive`].
+pub(crate) struct ContextLock(Option<ID3D11Multithread>);
+
+impl Drop for ContextLock {
+    fn drop(&mut self) {
+        if let Some(mt) = &self.0 {
+            unsafe { mt.Leave() };
+        }
+    }
+}
+
 /// The D3D11 device everything video runs on.
 #[derive(Clone)]
 pub(crate) struct Gpu {
     pub device: ID3D11Device,
     pub context: ID3D11DeviceContext,
+    multithread: Option<ID3D11Multithread>,
 }
 unsafe impl Send for Gpu {}
 unsafe impl Sync for Gpu {}
@@ -80,12 +92,24 @@ impl Gpu {
         let (device, context) = (device.context("no D3D11 device")?, context.context("no D3D11 context")?);
         // Capture callbacks, the pacer and the encoder all use the one immediate
         // context; let D3D serialize them.
-        if let Ok(mt) = device.cast::<ID3D11Multithread>() {
+        let multithread = device.cast::<ID3D11Multithread>().ok();
+        if let Some(mt) = &multithread {
             unsafe {
                 let _ = mt.SetMultithreadProtected(true);
             }
         }
-        Ok(Self { device, context })
+        Ok(Self { device, context, multithread })
+    }
+
+    /// Hold the context for a run of calls: protection only makes each call
+    /// safe, so another thread's drawing (the game capture's, say) can still
+    /// land between a draw's calls and swap its target, shader or blend state
+    /// (black or stale frames). Released when the guard drops.
+    pub(crate) fn exclusive(&self) -> ContextLock {
+        if let Some(mt) = &self.multithread {
+            unsafe { mt.Enter() };
+        }
+        ContextLock(self.multithread.clone())
     }
 
     /// Wait until the GPU has finished everything submitted so far.
