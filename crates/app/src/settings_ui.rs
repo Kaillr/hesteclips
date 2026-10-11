@@ -76,8 +76,8 @@ impl App {
                     divider(ui);
                     row(
                         ui,
-                        "Frame blending",
-                        Some("Each frame is the average of the pictures the screen showed during it, up to this many a second: smooth motion, like motion blur. Needs a game that runs at least that fast."),
+                        "Capture at",
+                        Some("Frame blending: capture faster than the frame rate and average the pictures into each frame for smooth motion, like motion blur. Needs a game that runs at least that fast. The bitrate follows the frame rate."),
                         |ui| self.blend_choice(ui),
                     );
                 }
@@ -577,19 +577,26 @@ impl App {
         });
     }
 
-    /// Off, or the rate the screen is looked at: whole multiples of the frame rate.
+    /// The rate the screen is captured at before it's blended down to the
+    /// frame rate: the same (no blending), or a whole multiple of it.
     fn blend_choice(&mut self, ui: &mut egui::Ui) {
         let choices = settings::blend_choices(self.settings.fps);
         let samples = self.settings.blend_samples();
-        let shown = if samples > 1 { format!("{} fps", self.settings.fps * samples) } else { "Off".to_owned() };
-        egui::ComboBox::from_id_salt("blend_fps").selected_text(shown).show_ui(ui, |ui| {
-            ui.selectable_value(&mut self.settings.blend_fps, 0, "Off");
-            for r in choices {
-                ui.selectable_value(&mut self.settings.blend_fps, r, format!("{r} fps"));
+        let fps = self.settings.fps;
+        let shown = if samples > 1 { format!("{} fps", fps * samples) } else { "Same as frame rate".to_owned() };
+        ui.vertical(|ui| {
+            egui::ComboBox::from_id_salt("blend_fps").selected_text(shown).show_ui(ui, |ui| {
+                ui.selectable_value(&mut self.settings.blend_fps, 0, "Same as frame rate");
+                for r in choices {
+                    ui.selectable_value(&mut self.settings.blend_fps, r, format!("{r} fps"));
+                }
+            });
+            if samples > 1 {
+                ui.weak(format!("Captured at {} fps, blended down to a {fps} fps file", fps * samples));
             }
         });
         if samples > 1 {
-            self.settings.blend_fps = self.settings.fps * samples;
+            self.settings.blend_fps = fps * samples;
         }
     }
 
