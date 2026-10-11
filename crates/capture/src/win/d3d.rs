@@ -552,7 +552,8 @@ impl Capture {
             let _ = frame.Close();
             if let Ok(Some(size)) = copied {
                 // `HESTECLIPS_WGC_LOG=1`: how many frames arrive each second.
-                if std::env::var_os("HESTECLIPS_WGC_LOG").is_some() {
+                static LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                if *LOG.get_or_init(|| std::env::var_os("HESTECLIPS_WGC_LOG").is_some()) {
                     let mut c = counted2.lock().unwrap();
                     c.1 += 1;
                     if c.0.elapsed() >= std::time::Duration::from_secs(1) {
