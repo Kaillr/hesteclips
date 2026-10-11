@@ -81,13 +81,12 @@ impl App {
         }
         let dt = self.sources_view.last_frame.map_or(0.0, |t| (now - t).as_secs_f32()).min(0.2);
         self.sources_view.last_frame = Some(now);
-        // Meters and the preview move: keep repainting while this page is open —
-        // every display refresh when there's a preview to keep up with.
-        if capture::preview::AVAILABLE {
-            ui.ctx().request_repaint();
-        } else {
-            crate::ui_kit::repaint_after(ui.ctx(), Duration::from_millis(16));
-        }
+        // Meters and the preview move: keep repainting while this page is open,
+        // twice per frame of the preview (the recording's frame rate: once
+        // per frame missed some, the two not lining up), else about 60 times
+        // a second.
+        let every = if capture::preview::AVAILABLE { Duration::from_secs_f64(0.5 / self.settings.fps.max(1) as f64) } else { Duration::from_millis(16) };
+        crate::ui_kit::repaint_after(ui.ctx(), every);
 
         crate::ui_kit::page(ui, "sources_page", MAX_WIDTH, |ui| self.sources_column(ui, now, dt));
         self.live_audio.set_limiter(self.settings.limiter);

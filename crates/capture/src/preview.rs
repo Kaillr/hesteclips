@@ -28,8 +28,8 @@ pub const AVAILABLE: bool = cfg!(any(target_os = "windows", target_os = "macos",
 pub struct PreviewFrame {
     pub width: u32,
     pub height: u32,
-    /// The size being recorded: the picture's own, except on Linux, where
-    /// it's shrunk to the size it's shown at.
+    /// The size being recorded: the picture's own, except on Linux and
+    /// Windows, where it's shrunk to about the size it's shown at.
     pub recorded: (u32, u32),
     pub rgba: Vec<u8>,
     #[cfg(target_os = "macos")]
@@ -86,11 +86,11 @@ pub(crate) fn new_producer() -> u64 {
 /// Returns it either way, so the producer can reuse its buffer once nobody
 /// else holds it.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-pub(crate) fn publish(generation: u64, width: u32, height: u32, rgba: Vec<u8>, waiting: bool, app: Option<String>) -> Arc<PreviewFrame> {
+pub(crate) fn publish(generation: u64, (width, height): (u32, u32), recorded: (u32, u32), rgba: Vec<u8>, waiting: bool, app: Option<String>) -> Arc<PreviewFrame> {
     publish_frame(generation, PreviewFrame {
         width,
         height,
-        recorded: (width, height),
+        recorded,
         rgba,
         #[cfg(target_os = "macos")]
         surface: None,

@@ -843,17 +843,21 @@ impl Previewer {
     /// Frames on their way to the UI at once.
     const SLOTS: usize = 2;
 
-    /// `generation` from `crate::preview::new_producer`, taken when the capture
-    /// was asked for (so a slow start can't take over from a later one).
+    /// `width`×`height`: the recording's size (the picture is made smaller,
+    /// see [`preview_size`]). `generation` from `crate::preview::new_producer`,
+    /// taken when the capture was asked for (so a slow start can't take over
+    /// from a later one).
     pub(crate) fn new(
         gpu: &Gpu,
         latest: &Arc<Latest>,
         overlay: Option<(&Arc<Latest>, crate::webcam::SharedPlacement)>,
-        width: u32,
-        height: u32,
+        recorded_width: u32,
+        recorded_height: u32,
         fps: u32,
         generation: u64,
     ) -> Result<Self> {
+        let recorded = (recorded_width, recorded_height);
+        let (width, height) = preview_size(recorded_width, recorded_height);
         // RGBA straight from the GPU is what the UI takes; drivers that can't
         // write it get BGRA, swapped on the reader thread.
         let make = |format| -> Result<(ID3D11Texture2D, Vec<ID3D11Texture2D>, Converter)> {
@@ -917,7 +921,7 @@ impl Previewer {
                             px.swap(0, 2);
                         }
                     }
-                    recent.push_back(crate::preview::publish(generation, width, height, pixels, latest.waiting(), latest.app()));
+                    recent.push_back(crate::preview::publish(generation, (width, height), recorded, pixels, latest.waiting(), latest.app()));
                     while recent.len() > 3 {
                         recent.pop_front();
                     }
@@ -953,6 +957,19 @@ impl Drop for Previewer {
         }
     }
 }
+
+/// The preview's size for a recording of `width`×`height`: the same, at most
+/// [`PREVIEW_MAX_WIDTH`] wide. The Sources page shows it under 900 points
+/// wide; at a 1440p recording's size every frame was 15 MB to read back from
+/// the graphics card, copy and upload, 60 times a second.
+fn preview_size(width: u32, height: u32) -> (u32, u32) {
+    if width <= PREVIEW_MAX_WIDTH {
+        return (width, height);
+    }
+    (PREVIEW_MAX_WIDTH, ((height as u64 * PREVIEW_MAX_WIDTH as u64 / width as u64) as u32 / 2 * 2).max(2))
+}
+
+const PREVIEW_MAX_WIDTH: u32 = 1280;
 
 /// The largest rectangle with `w`×`h`'s shape that fits in `into_w`×`into_h`,
 /// centered: (x, y, width, height). Even values, as NV12 needs.
