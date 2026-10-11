@@ -934,6 +934,11 @@ struct FrameBlend {
     target: windows::Win32::Graphics::Direct3D11::ID3D11RenderTargetView,
     /// Looks in the average so far.
     count: u32,
+    /// Looks at the picture that's up not added yet: added in one draw when
+    /// another comes up or the frame is done (a game slower than the blend
+    /// rate is seen several times in a row; one draw each was a full-size
+    /// pass per look).
+    pending: u32,
 }
 
 impl FrameBlend {
@@ -957,11 +962,13 @@ impl FrameBlend {
             target: quad::target_view(gpu, &average.texture)?,
             average,
             count: 0,
+            pending: 0,
         })
     }
 
     /// The capture's newest picture is the one that's up now (copied).
     fn hold(&mut self, latest: &d3d::Latest) {
+        self.flush();
         unsafe { self.gpu.context.CopyResource(&self.own.texture, &latest.texture) };
         self.held_view = self.own_view.clone();
         self.held_keep = None;
@@ -970,13 +977,20 @@ impl FrameBlend {
 
     /// The same, for a picture the capture handed over whole.
     fn hold_queued(&mut self, q: d3d::Queued) {
+        self.flush();
         self.held_view = q.view;
         self.held_keep = Some(q.texture);
         self.held_size = q.size;
     }
 
-    /// Add the picture that's up, `steps` looks of it, to the frame's average.
-    fn add(&mut self, steps: u32) {
+    /// Add a look at the picture that's up to the frame's average.
+    fn add(&mut self) {
+        self.pending += 1;
+    }
+
+    /// Mix the looks at the picture that's up into the average, at once.
+    fn flush(&mut self) {
+        let steps = std::mem::take(&mut self.pending);
         if steps == 0 {
             return;
         }
@@ -988,6 +1002,7 @@ impl FrameBlend {
     /// The frame is done: its average is ready for the converter, and the next
     /// starts empty. How many looks it holds (None: nothing, no picture yet).
     fn finish(&mut self) -> Option<u32> {
+        self.flush();
         if self.count == 0 {
             return None;
         }
@@ -1055,7 +1070,7 @@ impl BlendPacer {
 
     fn look(&mut self) {
         if let Some(id) = self.held {
-            self.blend.add(1);
+            self.blend.add();
             if self.last_taken != Some(id) {
                 self.different += 1;
                 self.last_taken = Some(id);
