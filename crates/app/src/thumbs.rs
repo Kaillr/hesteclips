@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::clips::Clip;
 
@@ -33,11 +33,21 @@ struct Done {
 
 pub struct Thumbs {
     ctx: egui::Context,
-    ready: HashMap<u64, Thumb>,
+    /// With when each was last asked for.
+    ready: HashMap<u64, (Thumb, Instant)>,
     pending: HashSet<u64>,
     job_tx: Sender<(u64, PathBuf)>,
     done_rx: Receiver<Done>,
+    /// When unused pictures were last let go.
+    swept: Instant,
 }
+
+/// Pictures kept however long ago they were shown: a screenful or two and
+/// some scrolling around (each is ~0.5 MB on the graphics card). Past this,
+/// ones not shown for [`UNUSED`] are let go; they come back from the disk
+/// cache in a moment. Both guesses.
+const KEEP: usize = 150;
+const UNUSED: Duration = Duration::from_secs(60);
 
 impl Thumbs {
     pub fn new(ctx: egui::Context) -> Self {
@@ -62,7 +72,7 @@ impl Thumbs {
                 }
             });
         }
-        Self { ctx: app_ctx, ready: HashMap::new(), pending: HashSet::new(), job_tx, done_rx }
+        Self { ctx: app_ctx, ready: HashMap::new(), pending: HashSet::new(), job_tx, done_rx, swept: Instant::now() }
     }
 
     pub fn ctx(&self) -> egui::Context {
@@ -76,13 +86,20 @@ impl Thumbs {
             let texture = done.image.map(|img| {
                 ctx.load_texture(format!("thumb-{}", done.key), img, egui::TextureOptions::LINEAR)
             });
-            self.ready.insert(done.key, Thumb { texture, duration: done.duration });
+            self.ready.insert(done.key, (Thumb { texture, duration: done.duration }, Instant::now()));
+        }
+        let now = Instant::now();
+        if self.ready.len() > KEEP && now.duration_since(self.swept) > Duration::from_secs(5) {
+            self.swept = now;
+            self.ready.retain(|_, (_, used)| now.duration_since(*used) < UNUSED);
         }
         let key = key(clip);
         if !self.ready.contains_key(&key) && self.pending.insert(key) {
             let _ = self.job_tx.send((key, clip.path.clone()));
         }
-        self.ready.get(&key)
+        let (thumb, used) = self.ready.get_mut(&key)?;
+        *used = now;
+        Some(thumb)
     }
 }
 

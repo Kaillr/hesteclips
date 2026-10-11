@@ -1234,7 +1234,9 @@ impl App {
         let selected = self.selection.paths.contains(&clip.path);
 
         let ctx = ui.ctx().clone();
-        let thumb = self.thumbs.get(&ctx, clip);
+        // Only cards on screen (or about to be) load theirs: every clip's
+        // picture stayed on the graphics card otherwise, half a MB each.
+        let thumb = if ui.is_rect_visible(rect.expand(rect.height())) { self.thumbs.get(&ctx, clip) } else { None };
         let v = ui.visuals().clone();
         let p = ui.painter();
 
