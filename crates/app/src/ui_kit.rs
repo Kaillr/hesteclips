@@ -85,6 +85,16 @@ pub fn apply(ctx: &egui::Context) {
     });
 }
 
+/// Draw again in `delay`. Use this, not `request_repaint_after`, for short
+/// delays: egui takes a frame's time (`predicted_dt`, always 1/60 s here)
+/// off every delayed repaint, so anything under ~17 ms came at once, and a
+/// page asking for one every frame redrew on every display refresh (300 times
+/// a second on a fast screen).
+pub fn repaint_after(ctx: &egui::Context, delay: std::time::Duration) {
+    let frame = ctx.input(|i| i.predicted_dt).max(0.0);
+    ctx.request_repaint_after(delay + std::time::Duration::from_secs_f32(frame));
+}
+
 /// Hairlines (dividers).
 pub fn line(dark: bool) -> Color32 {
     if dark { Color32::from_white_alpha(18) } else { Color32::from_black_alpha(20) }

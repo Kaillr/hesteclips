@@ -300,9 +300,11 @@ impl Ready {
             m.feed(if playing { *l } else { (0.0, 0.0) }, dt);
         }
         self.master.feed(if playing { master_level } else { (0.0, 0.0) }, dt);
-        // Keep animating until the meters have fallen back to rest.
+        // Keep animating until the meters have fallen back to rest: about 60
+        // times a second is smooth (every refresh of a fast display redrew
+        // the whole editor for nothing).
         if self.meters.iter().chain([&self.master]).any(|m| m.peak > 1e-3 || m.hold > 1e-3) {
-            ctx.request_repaint();
+            crate::ui_kit::repaint_after(&ctx, std::time::Duration::from_millis(16));
         }
 
         let mut outcome = EditorOutcome::Stay;

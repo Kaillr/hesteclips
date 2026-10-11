@@ -135,6 +135,44 @@ struct Shared {
     /// Where playback stops (in stereo frames).
     end: AtomicU64,
     mix: Mutex<Mix>,
+    /// When the audio callback last moved `pos` ([`uptime`], µs), and how
+    /// much it moves it each time (µs of sound): the clock only moves in
+    /// those steps, so this says when the next frame can come up.
+    moved_at_us: AtomicU64,
+    step_us: AtomicU64,
+}
+
+impl Shared {
+    fn new(mix: Mix) -> Self {
+        Self {
+            pos: AtomicU64::new(0),
+            playing: AtomicBool::new(false),
+            scrubbing: AtomicBool::new(false),
+            end: AtomicU64::new(u64::MAX),
+            mix: Mutex::new(mix),
+            moved_at_us: AtomicU64::new(0),
+            step_us: AtomicU64::new(0),
+        }
+    }
+
+    /// How long until the clock (`pos`) shows `t` seconds or later: the first
+    /// audio callback after it gets there, plus a little. Playing only.
+    fn until(&self, t: f64) -> std::time::Duration {
+        let now = uptime();
+        let pos = self.pos.load(Ordering::Relaxed) as f64 / PREVIEW_RATE as f64;
+        let ahead = (t - pos).max(0.0);
+        let step = self.step_us.load(Ordering::Relaxed) as f64 / 1e6;
+        let wake = if step > 0.0 {
+            // The callback that moved it to `pos`, then whole steps on.
+            let moved = self.moved_at_us.load(Ordering::Relaxed) as f64 / 1e6;
+            moved + (ahead / step).ceil().max(1.0) * step
+        } else {
+            now + ahead
+        };
+        // A guess: callbacks come a little late now and then; waking 2 ms
+        // after one is due finds it done.
+        std::time::Duration::from_secs_f64((wake - now + 0.002).clamp(0.001, 0.1))
+    }
 }
 
 pub struct Player {
@@ -192,13 +230,7 @@ impl Player {
 
     fn with_pcm(ctx: &egui::Context, source: &Path, info: ClipInfo, pcm: Arc<Pcm>, gains: Vec<TrackEdit>) -> Self {
         let n = pcm.len();
-        let shared = Arc::new(Shared {
-            pos: AtomicU64::new(0),
-            playing: AtomicBool::new(false),
-            scrubbing: AtomicBool::new(false),
-            end: AtomicU64::new(u64::MAX),
-            mix: Mutex::new(Mix { tracks: gains, track_levels: vec![(0.0, 0.0); n], master_level: (0.0, 0.0) }),
-        });
+        let shared = Arc::new(Shared::new(Mix { tracks: gains, track_levels: vec![(0.0, 0.0); n], master_level: (0.0, 0.0) }));
         let (stream, audio_error) = match start_audio(shared.clone(), pcm.clone()) {
             Ok(s) => (Some(s), None),
             Err(e) => (None, Some(e)),
@@ -379,7 +411,11 @@ impl Player {
                     self.show(ctx, idx, frame);
                 }
             }
-            ctx.request_repaint();
+            if self.sound_playing() {
+                self.repaint_at_next_frame(ctx, want);
+            } else {
+                ctx.request_repaint();
+            }
         } else {
             while let Ok((idx, frame)) = self.still_rx.try_recv() {
                 if Some(idx) == self.still_wanted && idx == want {
@@ -408,6 +444,15 @@ impl Player {
             }
         }
         self.display.as_ref().map(Display::size)
+    }
+
+    /// Playing, showing frame `want`: draw again when the next one is due,
+    /// not on every display refresh (a 240 Hz screen redrew the whole page
+    /// four times per frame of a 60 fps clip). A frame that's late is
+    /// drawn when the decoder hands it over (it wakes the UI then).
+    fn repaint_at_next_frame(&self, ctx: &egui::Context, want: u64) {
+        let next = (want + 1) as f64 / self.info.fps.max(1.0);
+        crate::ui_kit::repaint_after(ctx, self.shared.until(next));
     }
 
     /// Draw the picture into `rect`: a decoded frame through the sharp
@@ -461,7 +506,7 @@ impl Player {
             if let Some(p) = v.take_upto(want) {
                 self.show_picture(ctx, p);
             }
-            ctx.request_repaint();
+            self.repaint_at_next_frame(ctx, want);
             return;
         }
         // Stopped by itself at the out point: so does the decoder.
@@ -965,6 +1010,8 @@ fn start_audio(shared: Arc<Shared>, pcm: Arc<Pcm>) -> Result<cpal::Stream, Strin
                     frac -= whole;
                 }
                 shared.pos.store(pos, Ordering::Relaxed);
+                shared.moved_at_us.store((uptime() * 1e6) as u64, Ordering::Relaxed);
+                shared.step_us.store((out.len() / channels.max(1)) as u64 * 1_000_000 / out_rate.max(1.0) as u64, Ordering::Relaxed);
 
                 if count > 0 {
                     if let Ok(mut m) = shared.mix.lock() {
@@ -996,13 +1043,7 @@ impl SoundPlayer {
     /// `pcm`'s one track is stereo at [`PREVIEW_RATE`], `duration` seconds long.
     pub fn new(pcm: Arc<Pcm>, duration: f64) -> Self {
         let tracks = vec![TrackEdit { index: 0, gain: 1.0, muted: false, points: Vec::new() }];
-        let shared = Arc::new(Shared {
-            pos: AtomicU64::new(0),
-            playing: AtomicBool::new(false),
-            scrubbing: AtomicBool::new(false),
-            end: AtomicU64::new(u64::MAX),
-            mix: Mutex::new(Mix { tracks, track_levels: vec![(0.0, 0.0)], master_level: (0.0, 0.0) }),
-        });
+        let shared = Arc::new(Shared::new(Mix { tracks, track_levels: vec![(0.0, 0.0)], master_level: (0.0, 0.0) }));
         let (stream, error) = match start_audio(shared.clone(), pcm) {
             Ok(s) => (Some(s), None),
             Err(e) => (None, Some(e)),

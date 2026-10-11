@@ -257,12 +257,15 @@ impl Video {
                     Ok(Some(p)) => {
                         next = p.index + 1;
                         let mut s = shared.lock().unwrap();
+                        let ran_out = s.ahead.is_empty();
                         // Decoded for a spot `play` has since moved away from.
                         if s.generation == generation {
                             s.ahead.push_back(p);
                         }
                         drop(s);
-                        if playing {
+                        // The UI draws when each frame is due; it only needs
+                        // waking when it ran out (this one may be late).
+                        if playing && ran_out {
                             ctx.request_repaint();
                         }
                     }

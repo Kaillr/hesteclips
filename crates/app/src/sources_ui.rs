@@ -86,7 +86,7 @@ impl App {
         if capture::preview::AVAILABLE {
             ui.ctx().request_repaint();
         } else {
-            ui.ctx().request_repaint_after(Duration::from_millis(16));
+            crate::ui_kit::repaint_after(ui.ctx(), Duration::from_millis(16));
         }
 
         crate::ui_kit::page(ui, "sources_page", MAX_WIDTH, |ui| self.sources_column(ui, now, dt));
