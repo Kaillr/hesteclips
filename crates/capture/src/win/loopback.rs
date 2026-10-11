@@ -57,6 +57,7 @@ impl Stream {
         let (stop2, alive2) = (stop.clone(), alive.clone());
         let thread = thread::spawn(move || {
             com_init();
+            super::system::multimedia_thread("Audio");
             match open(target) {
                 Ok((client, capture)) => {
                     let _ = ready_tx.send(Ok(()));

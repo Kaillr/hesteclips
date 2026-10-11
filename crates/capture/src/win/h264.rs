@@ -56,6 +56,7 @@ impl Encoder {
         let (gpu2, pool2, s2) = (gpu.clone(), pool.clone(), s.clone());
         let thread = thread::spawn(move || {
             super::system::com_init();
+            super::system::multimedia_thread("Capture");
             let mft = match open(&gpu2, width, height, &s2) {
                 Ok(m) => m,
                 Err(e) => {

@@ -1179,6 +1179,7 @@ fn spawn_blend_pacer(
     let stop = Arc::new(AtomicBool::new(false));
     let stop2 = stop.clone();
     let handle = thread::spawn(move || {
+        system::multimedia_thread("Capture");
         let t0 = host_now();
         clock.set(t0);
         let mut p = BlendPacer {
@@ -1253,6 +1254,9 @@ fn spawn_pacer(
     let stop = Arc::new(AtomicBool::new(false));
     let stop2 = stop.clone();
     let handle = thread::spawn(move || {
+        // On time even while a game keeps every core busy: a late look
+        // repeats a frame in the file.
+        system::multimedia_thread("Capture");
         let fps_f = fps as f64;
         let t0 = host_now();
         clock.set(t0);

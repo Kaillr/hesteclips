@@ -51,6 +51,21 @@ pub(crate) fn com_init() {
     let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
 }
 
+/// Have Windows' multimedia scheduler (MMCSS) run this thread as `task`
+/// ("Audio", "Capture": tasks Windows defines): it's woken on time even
+/// while a game keeps every core busy. For threads that mostly sleep: a
+/// thread that doesn't is held back by the scheduler. Lasts as long as the
+/// thread. `HESTECLIPS_NO_MMCSS=1` leaves threads as they are.
+pub(crate) fn multimedia_thread(task: &str) {
+    if std::env::var_os("HESTECLIPS_NO_MMCSS").is_some() {
+        return;
+    }
+    let mut index = 0u32;
+    if let Err(e) = unsafe { windows::Win32::System::Threading::AvSetMmThreadCharacteristicsW(&windows::core::HSTRING::from(task), &mut index) } {
+        eprintln!("thread priority ({task}): {e}");
+    }
+}
+
 /// Start Media Foundation, once per process.
 pub(crate) fn mf_startup() -> Result<()> {
     static STARTED: OnceLock<Result<(), String>> = OnceLock::new();
