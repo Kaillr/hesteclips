@@ -982,6 +982,63 @@ fn start_audio(shared: Arc<Shared>, pcm: Arc<Pcm>) -> Result<cpal::Stream, Strin
     Ok(stream)
 }
 
+/// Only the sound of a short clip, through the same engine as the editor's
+/// player (the live mix, and the pitch-keeping scrub sound), with no picture:
+/// for listening to the voice samples.
+pub struct SoundPlayer {
+    shared: Arc<Shared>,
+    _stream: Option<cpal::Stream>,
+    pub error: Option<String>,
+    duration: f64,
+}
+
+impl SoundPlayer {
+    /// `pcm`'s one track is stereo at [`PREVIEW_RATE`], `duration` seconds long.
+    pub fn new(pcm: Arc<Pcm>, duration: f64) -> Self {
+        let tracks = vec![TrackEdit { index: 0, gain: 1.0, muted: false, points: Vec::new() }];
+        let shared = Arc::new(Shared {
+            pos: AtomicU64::new(0),
+            playing: AtomicBool::new(false),
+            scrubbing: AtomicBool::new(false),
+            end: AtomicU64::new(u64::MAX),
+            mix: Mutex::new(Mix { tracks, track_levels: vec![(0.0, 0.0)], master_level: (0.0, 0.0) }),
+        });
+        let (stream, error) = match start_audio(shared.clone(), pcm) {
+            Ok(s) => (Some(s), None),
+            Err(e) => (None, Some(e)),
+        };
+        Self { shared, _stream: stream, error, duration }
+    }
+
+    pub fn time(&self) -> f64 {
+        self.shared.pos.load(Ordering::Relaxed) as f64 / PREVIEW_RATE as f64
+    }
+
+    pub fn is_playing(&self) -> bool {
+        self.shared.playing.load(Ordering::Relaxed)
+    }
+
+    pub fn seek(&self, t: f64) {
+        self.shared.pos.store(to_samples(t.clamp(0.0, self.duration)), Ordering::Relaxed);
+    }
+
+    /// Play from where it is until `until` seconds.
+    pub fn play(&self, until: f64) {
+        self.shared.end.store(to_samples(until), Ordering::Relaxed);
+        self.shared.scrubbing.store(false, Ordering::Relaxed);
+        self.shared.playing.store(true, Ordering::Relaxed);
+    }
+
+    pub fn pause(&self) {
+        self.shared.playing.store(false, Ordering::Relaxed);
+    }
+
+    /// The playhead is being dragged: the sound follows it.
+    pub fn scrub(&self, on: bool) {
+        self.shared.scrubbing.store(on && !self.is_playing(), Ordering::Relaxed);
+    }
+}
+
 /// Streams consecutive preview frames from a start time via one ffmpeg process.
 struct FrameStream {
     child: Child,

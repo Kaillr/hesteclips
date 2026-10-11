@@ -79,9 +79,6 @@ pub struct Meta {
     /// about; the whole snippet when not set.
     #[serde(default)]
     pub trim: Option<(f32, f32)>,
-    /// Never shared, however it's labelled.
-    #[serde(default)]
-    pub private: bool,
     #[serde(default)]
     pub version: String,
 }
@@ -99,9 +96,9 @@ impl Sample {
         (a.clamp(0.0, self.secs), b.clamp(0.0, self.secs).max(a))
     }
 
-    /// Shared if exported: judged, and not marked private.
+    /// Shared if exported: judged.
     pub fn shareable(&self) -> bool {
-        self.meta.label != Label::Unreviewed && !self.meta.private
+        self.meta.label != Label::Unreviewed
     }
 }
 
@@ -137,7 +134,6 @@ pub fn save_new(kind: Kind, score: f32, moment: Option<f32>, samples: &[f32]) {
             moment,
             label: Label::Unreviewed,
             trim: None,
-            private: false,
             version: env!("CARGO_PKG_VERSION").to_owned(),
         };
         let (wav, json) = paths(&id).ok_or("no data folder")?;
@@ -321,7 +317,7 @@ mod tests {
 
     #[test]
     fn trim_is_kept_inside_the_sample() {
-        let meta = Meta { id: "x".into(), kind: Kind::Almost, at: 0, score: 0.5, moment: None, label: Label::Phrase, trim: Some((-1.0, 99.0)), private: false, version: String::new() };
+        let meta = Meta { id: "x".into(), kind: Kind::Almost, at: 0, score: 0.5, moment: None, label: Label::Phrase, trim: Some((-1.0, 99.0)), version: String::new() };
         let s = Sample { meta, secs: 6.0 };
         assert_eq!(s.range(), (0.0, 6.0));
         assert!(s.shareable());

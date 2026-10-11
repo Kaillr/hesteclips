@@ -125,8 +125,9 @@ mod detector {
     /// ends when it drops below [`BURST_END`].
     const ALMOST: f32 = 0.3;
     const BURST_END: f32 = 0.1;
-    /// At least this long between snippets, so one noise isn't kept five times.
-    const SNIPPET_GAP: f64 = 4.0;
+    /// At least this long between snippets, so one noise isn't kept five times
+    /// (takes said one after another are 2-3 s apart).
+    const SNIPPET_GAP: f64 = 2.0;
     /// The models' rate (48 kHz from the mixer is brought down to it).
     const MODEL_RATE: u32 = 16_000;
     /// Sound per feature frame (80 ms), and what the mel spectrogram is run
@@ -274,6 +275,12 @@ mod detector {
         /// (kind, score, when to keep it, seconds into the snippet it's at).
         snippet: Option<(Kind, f32, f64, Option<f32>)>,
         snippet_at: f64,
+    }
+
+    /// `HESTECLIPS_VOICE_TRACE=1`: every frame's confidence, to see why a take wasn't heard.
+    fn trace() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("HESTECLIPS_VOICE_TRACE").is_some())
     }
 
     fn debug() -> bool {
@@ -448,6 +455,9 @@ mod detector {
         fn judge(&mut self, p: f32) -> bool {
             self.best = self.best.max(p);
             self.sure = if p >= THRESHOLD { self.sure + 1 } else { 0 };
+            if trace() {
+                eprintln!("voice: t={:.2} p={p:.2} sure={}", self.clock, self.sure);
+            }
             self.watch_burst(p);
             if self.sure < NEED || self.said_at.is_some_and(|t| self.clock - t < QUIET_AFTER) {
                 return false;
@@ -653,12 +663,11 @@ mod detector {
             let kept = vs::list();
             let by_hand = kept.iter().find(|s| s.meta.kind == vs::Kind::ByHand).expect("a snippet of the hand-saved clip");
             assert!((by_hand.secs - 8.0).abs() < 0.1, "{} s", by_hand.secs);
-            // Judged and exported: only the trimmed part, and not what's private.
+            // Judged and exported: only the trimmed part, and only what's judged.
             let mut judged = kept.clone();
             judged[0].meta.label = Label::Phrase;
             judged[0].meta.trim = Some((1.0, 3.0));
-            judged[1].meta.label = Label::Other;
-            judged[1].meta.private = true;
+            // The second is left unjudged.
             let zip = dir.join("out.zip");
             assert_eq!(vs::export(&zip, &judged).unwrap(), 1);
             let mut archive = zip::ZipArchive::new(std::fs::File::open(&zip).unwrap()).unwrap();
