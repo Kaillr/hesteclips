@@ -74,12 +74,15 @@ impl Encoder {
     }
 
     /// Queue slot `slot` as frame `n`. If the encoder is behind, the frame is
-    /// dropped (its slot freed) rather than stalling capture.
-    pub(crate) fn encode(&self, slot: usize, n: i64) {
-        let Some(tx) = &self.tx else { return };
+    /// dropped (its slot freed) rather than stalling capture: false then.
+    pub(crate) fn encode(&self, slot: usize, n: i64) -> bool {
+        let Some(tx) = &self.tx else { return false };
         match tx.try_send(Frame { slot, n }) {
-            Ok(()) => {}
-            Err(TrySendError::Full(f)) | Err(TrySendError::Disconnected(f)) => self.pool.give(f.slot),
+            Ok(()) => true,
+            Err(TrySendError::Full(f)) | Err(TrySendError::Disconnected(f)) => {
+                self.pool.give(f.slot);
+                false
+            }
         }
     }
 

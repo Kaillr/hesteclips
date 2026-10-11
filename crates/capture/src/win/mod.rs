@@ -1074,19 +1074,17 @@ impl BlendPacer {
         }
         match self.encoder.pool.take() {
             Some(slot) => match self.converter.convert(slot) {
-                Ok(()) => self.encoder.encode(slot, k),
+                Ok(()) => {
+                    if !self.encoder.encode(slot, k) {
+                        skipped(&mut self.dropped);
+                    }
+                }
                 Err(e) => {
                     self.encoder.pool.give(slot);
                     eprintln!("{e:#}");
                 }
             },
-            None => {
-                self.dropped += 1;
-                crate::FRAMES_SKIPPED.fetch_add(1, Ordering::Relaxed);
-                if self.dropped.is_power_of_two() {
-                    eprintln!("video encoder is behind: {} frames skipped", self.dropped);
-                }
-            }
+            None => skipped(&mut self.dropped),
         }
         if let Err(e) = self.preview.submit() {
             eprintln!("preview: {e:#}");
@@ -1224,6 +1222,17 @@ fn spawn_blend_pacer(
     (stop, handle)
 }
 
+/// The encoder can't keep up (no free frame for it, or its queue is full):
+/// this frame is skipped, and the file shows the one before a little longer.
+/// Counted for the UI, and logged now and then.
+fn skipped(dropped: &mut u64) {
+    *dropped += 1;
+    crate::FRAMES_SKIPPED.fetch_add(1, Ordering::Relaxed);
+    if dropped.is_power_of_two() {
+        eprintln!("video encoder is behind: {dropped} frames skipped");
+    }
+}
+
 /// Encode the newest screen image every 1/fps on the host clock. WGC only sends
 /// frames when the screen changes; repeating the last one keeps the output CFR.
 /// Frame N is stamped N/fps seconds after t0, the same clock the audio uses.
@@ -1257,21 +1266,17 @@ fn spawn_pacer(
                 if latest.has_frame() {
                     match encoder.pool.take() {
                         Some(slot) => match converter.convert(slot) {
-                            Ok(()) => encoder.encode(slot, next),
+                            Ok(()) => {
+                                if !encoder.encode(slot, next) {
+                                    skipped(&mut dropped);
+                                }
+                            }
                             Err(e) => {
                                 encoder.pool.give(slot);
                                 eprintln!("{e:#}");
                             }
                         },
-                        // The encoder can't keep up: skip this frame (the file
-                        // shows the previous one a little longer).
-                        None => {
-                            dropped += 1;
-                            crate::FRAMES_SKIPPED.fetch_add(1, Ordering::Relaxed);
-                            if dropped.is_power_of_two() {
-                                eprintln!("video encoder is behind: {dropped} frames skipped");
-                            }
-                        }
+                        None => skipped(&mut dropped),
                     }
                 }
                 next += 1;
