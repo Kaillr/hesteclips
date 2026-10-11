@@ -454,6 +454,9 @@ pub struct EncodeSettings {
     /// Container extension for finished files, e.g. "mp4" or "mkv".
     pub container_ext: String,
     pub fps: u32,
+    /// Windows: look at the picture this many times per frame and record the
+    /// average (smooth, like motion blur). 1 records the newest picture as is.
+    pub blend_samples: u32,
     pub video_bitrate_kbps: u32,
     /// Downscale target height, or `None` to keep native resolution.
     pub target_height: Option<u32>,

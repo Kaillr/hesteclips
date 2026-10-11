@@ -278,9 +278,13 @@ impl Session {
                 }
             });
             let overlay = camera.as_ref().zip(s.webcam.as_ref()).map(|(c, w)| (&c.latest, w.placement.clone()));
-            let converter = d3d::Converter::new(&gpu, &latest, overlay.clone(), &encoder.pool.textures, true, width, height, s.fps)?;
+            // With blending, frames come from an average of several looks at
+            // the picture, not the picture itself.
+            let blend = if s.blend_samples > 1 { Some(FrameBlend::new(&gpu, &latest, s.blend_samples)?) } else { None };
+            let converter_source = blend.as_ref().map_or(&latest, |b| &b.average);
+            let converter = d3d::Converter::new(&gpu, converter_source, overlay.clone(), &encoder.pool.textures, true, width, height, s.fps)?;
             let preview = d3d::Previewer::new(&gpu, &latest, overlay, width, height, s.fps, crate::preview::new_producer())?;
-            session.pacer = Some(spawn_pacer(s.fps, latest, converter, encoder, preview, camera, clock));
+            session.pacer = Some(spawn_pacer(s.fps, latest, blend, converter, encoder, preview, camera, clock));
             Ok(())
         })();
         if let Err(e) = started {
@@ -872,12 +876,47 @@ fn spawn_aac(track: usize, mut enc: AacEncoder, rx: mpsc::Receiver<Vec<f32>>, ou
 // Pacer: constant frame rate
 // ---------------------------------------------------------------------------
 
+/// The recorded picture as an average of `samples` looks at the screen per
+/// frame (live frame blending).
+struct FrameBlend {
+    samples: u32,
+    quad: quad::Quad,
+    gpu: d3d::Gpu,
+    source: windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView,
+    target: windows::Win32::Graphics::Direct3D11::ID3D11RenderTargetView,
+    /// What the average is drawn into; the converter reads it.
+    average: Arc<d3d::Latest>,
+}
+
+impl FrameBlend {
+    fn new(gpu: &d3d::Gpu, latest: &Arc<d3d::Latest>, samples: u32) -> Result<Self> {
+        let average = d3d::Latest::new(gpu, latest.width, latest.height)?;
+        Ok(Self {
+            samples,
+            quad: quad::Quad::new(gpu)?,
+            gpu: gpu.clone(),
+            source: quad::shader_view(gpu, &latest.texture)?,
+            target: quad::target_view(gpu, &average.texture)?,
+            average,
+        })
+    }
+
+    /// Mix the screen as it is now into the average: look `index` (from 0) of the frame.
+    fn look(&self, latest: &d3d::Latest, index: u32) {
+        self.quad.average(&self.gpu, &self.target, (latest.width, latest.height), &self.source, 1.0 / (index + 1) as f32);
+        if index + 1 == self.samples {
+            self.average.mark_frame(latest.content());
+        }
+    }
+}
+
 /// Encode the newest screen image every 1/fps on the host clock. WGC only sends
 /// frames when the screen changes; repeating the last one keeps the output CFR.
 /// Frame N is stamped N/fps seconds after t0, the same clock the audio uses.
 fn spawn_pacer(
     fps: u32,
     latest: Arc<d3d::Latest>,
+    blend: Option<FrameBlend>,
     converter: d3d::Converter,
     encoder: h264::Encoder,
     preview: d3d::Previewer,
@@ -887,7 +926,10 @@ fn spawn_pacer(
     let stop = Arc::new(AtomicBool::new(false));
     let stop2 = stop.clone();
     let handle = thread::spawn(move || {
-        let fps_f = fps as f64;
+        // One tick per look at the screen: `looks` of them make a frame (one
+        // without blending).
+        let looks = blend.as_ref().map_or(1, |b| b.samples) as i64;
+        let tick_rate = (fps as i64 * looks) as f64;
         let t0 = host_now();
         clock.set(t0);
         let mut next: i64 = 0;
@@ -895,28 +937,39 @@ fn spawn_pacer(
 
         while !stop2.load(Ordering::Relaxed) {
             let now = host_now();
-            let due = ((now - t0) * fps_f) as i64;
+            let due = ((now - t0) * tick_rate) as i64;
             // After a stall, catch up gradually rather than in one huge burst.
             let mut burst = 0;
-            while next <= due && burst < fps * 2 {
-                if let Some(c) = camera.as_mut() {
-                    c.pull();
+            let mut framed = false;
+            while next <= due && burst < fps as i64 * 2 * looks {
+                let look = (next % looks) as u32;
+                // A frame is the looks that end at its time.
+                let last_look = look as i64 == looks - 1;
+                if let Some(b) = blend.as_ref().filter(|_| latest.has_frame()) {
+                    b.look(&latest, look);
                 }
-                if latest.has_frame() {
-                    match encoder.pool.take() {
-                        Some(slot) => match converter.convert(slot) {
-                            Ok(()) => encoder.encode(slot, next),
-                            Err(e) => {
-                                encoder.pool.give(slot);
-                                eprintln!("{e:#}");
-                            }
-                        },
-                        // The encoder can't keep up: skip this frame (the file
-                        // shows the previous one a little longer).
-                        None => {
-                            dropped += 1;
-                            if dropped.is_power_of_two() {
-                                eprintln!("video encoder is behind: {dropped} frames skipped");
+                if last_look {
+                    framed = true;
+                    let frame = next / looks;
+                    if let Some(c) = camera.as_mut() {
+                        c.pull();
+                    }
+                    if latest.has_frame() {
+                        match encoder.pool.take() {
+                            Some(slot) => match converter.convert(slot) {
+                                Ok(()) => encoder.encode(slot, frame),
+                                Err(e) => {
+                                    encoder.pool.give(slot);
+                                    eprintln!("{e:#}");
+                                }
+                            },
+                            // The encoder can't keep up: skip this frame (the file
+                            // shows the previous one a little longer).
+                            None => {
+                                dropped += 1;
+                                if dropped.is_power_of_two() {
+                                    eprintln!("video encoder is behind: {dropped} frames skipped");
+                                }
                             }
                         }
                     }
@@ -925,10 +978,12 @@ fn spawn_pacer(
                 burst += 1;
             }
             // The Sources page is showing the preview: hand it this picture too.
-            if let Err(e) = preview.submit() {
-                eprintln!("preview: {e:#}");
+            if framed {
+                if let Err(e) = preview.submit() {
+                    eprintln!("preview: {e:#}");
+                }
             }
-            let wake = t0 + next as f64 / fps_f;
+            let wake = t0 + next as f64 / tick_rate;
             let wait = wake - host_now();
             if wait > 0.0 {
                 thread::sleep(Duration::from_secs_f64(wait));

@@ -3,7 +3,7 @@
 //! Args are sources: `mic:<device>`, `desktop`, `desktop-excl` (desktop minus app
 //! sources), `app:<bundle id or exe>`. Append `@mix`, `@track` to limit where it
 //! goes (default both). Env: REPLAY=1, SECS=n, EXT=mov, HEIGHT=n (0 = native),
-//! FPS=n, SOFTWARE=1, LIST=1 (list the inputs), SWITCH_MIC=<device> (the first source, a mic, switches to it halfway), SCREEN=<id>, WEBCAM=<id|1>, WEBCAM_FORMAT=WxH, APP=<exe>[,<exe>…] (record those apps' windows,
+//! FPS=n, BLEND=n (looks per frame), SOFTWARE=1, LIST=1 (list the inputs), SWITCH_MIC=<device> (the first source, a mic, switches to it halfway), SCREEN=<id>, WEBCAM=<id|1>, WEBCAM_FORMAT=WxH, APP=<exe>[,<exe>…] (record those apps' windows,
 //! following focus), HOOK=0 (never the game capture hook), ALLOW=<exe>[,…]
 //! (games with anti-cheat it may be used on), HESTECLIPS_FORCE_HOOK=<exe>[,…] (always, for testing).
 use capture::sources::{AudioSource, SourceKind};
@@ -44,6 +44,7 @@ default: {:?}", d.inputs.iter().map(|i| &i.name).collect::<Vec<_>>(), d.default_
         output_dir: std::env::temp_dir().join("hc"),
         container_ext: env("EXT").unwrap_or("mp4".into()),
         fps: env("FPS").and_then(|f| f.parse().ok()).unwrap_or(60),
+        blend_samples: env("BLEND").and_then(|f| f.parse().ok()).unwrap_or(1),
         video_bitrate_kbps: 12000,
         target_height: match env("HEIGHT").and_then(|h| h.parse().ok()) {
             Some(0) => None,

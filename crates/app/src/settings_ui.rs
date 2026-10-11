@@ -72,6 +72,17 @@ impl App {
                         });
                     },
                 );
+                if cfg!(windows) {
+                    divider(ui);
+                    row(
+                        ui,
+                        "Frame blending",
+                        Some("Mixes several looks at the screen into each frame for smoother motion, like motion blur. Most noticeable when the game runs faster than the frame rate."),
+                        |ui| {
+                            toggle(ui, &mut self.settings.frame_blend);
+                        },
+                    );
+                }
                 divider(ui);
                 row(ui, "Bitrate", Some("How much detail each second gets. Fast motion needs more; files grow with it."), |ui| self.bitrate_choice(ui));
                 divider(ui);

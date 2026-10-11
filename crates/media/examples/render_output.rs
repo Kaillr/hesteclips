@@ -13,7 +13,7 @@ fn main() -> anyhow::Result<()> {
     if let Some(e) = std::env::var("END").ok().and_then(|s| s.parse().ok()) {
         edit.end = e;
     }
-    edit.output = media::Output { height: opt(2), fps: opt(3), video_kbps: opt(4), max_mb: opt(5), mix_only: a.get(6).is_some_and(|s| s == "1") };
+    edit.output = media::Output { height: opt(2), fps: opt(3), video_kbps: opt(4), max_mb: opt(5), mix_only: a.get(6).is_some_and(|s| s == "1"), blend: a.get(7).is_some_and(|s| s == "1") };
     let est = edit.output.estimate_bytes(&info, &edit);
     let t = std::time::Instant::now();
     media::render_to(&src, &info, &edit, std::path::Path::new(&a[1]), None)?;

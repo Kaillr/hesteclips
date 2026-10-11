@@ -24,7 +24,7 @@ pub fn summary(info: &ClipInfo, edit: &Edit) -> String {
         parts.push(format!("{}p", o.height.unwrap()));
     }
     if o.fps.is_some_and(|f| (f as f64) < info.fps - 0.5) {
-        parts.push(format!("{} fps", o.fps.unwrap()));
+        parts.push(format!("{} fps{}", o.fps.unwrap(), if o.blend { " blended" } else { "" }));
     }
     if let Some(mb) = o.max_mb {
         parts.push(format!("under {mb} MB"));
@@ -87,6 +87,12 @@ pub fn ui(ui: &mut egui::Ui, info: &ClipInfo, edit: &mut Edit) -> bool {
             }
         });
         ui.end_row();
+
+        if o.fps.is_some_and(|f| (f as f64) < info.fps - 0.5) || (o.fps.is_none() && auto.is_some_and(|(_, f)| f < info.fps - 0.5)) {
+            ui.label("Frame blending");
+            crate::sources_ui::toggle(ui, &mut o.blend).on_hover_text("Mix the frames that fall into each new one for smoother motion, instead of dropping the extra ones. Takes a little longer");
+            ui.end_row();
+        }
 
         ui.label("Fit under");
         let shown = match o.max_mb {

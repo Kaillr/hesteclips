@@ -530,6 +530,9 @@ pub struct RecordSettings {
     /// Index into the runtime-detected display list.
     pub display_index: usize,
     pub fps: u32,
+    /// Record the average of several looks at the screen per frame (live
+    /// frame blending), for smoother, motion-blurred video.
+    pub frame_blend: bool,
     pub resolution: OutputResolution,
     pub video_bitrate_mbps: u32,
 
@@ -613,6 +616,7 @@ impl Default for RecordSettings {
             webcam: None,
             display_index: 0,
             fps: 60,
+            frame_blend: false,
             resolution: OutputResolution::Native,
             video_bitrate_mbps: 40,
 
@@ -728,6 +732,10 @@ impl Shortcuts {
 }
 
 /// Common frame-rate choices for the picker.
+/// Looks at the screen per frame with frame blending on. A guess: 4 is smooth
+/// at 60 fps without the GPU copying much more than the game draws.
+pub const BLEND_SAMPLES: u32 = 4;
+
 pub const FPS_CHOICES: [u32; 6] = [30, 60, 120, 144, 165, 240];
 
 /// `~/Movies/hesteclips` on macOS, the platform video dir elsewhere, falling back

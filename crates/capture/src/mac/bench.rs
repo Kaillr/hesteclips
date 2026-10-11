@@ -29,6 +29,7 @@ fn settings(fps: u32, kbps: u32) -> EncodeSettings {
         output_dir: std::env::temp_dir(),
         container_ext: "mp4".into(),
         fps,
+        blend_samples: 1,
         video_bitrate_kbps: kbps,
         target_height: None,
         keyframe_interval_secs: 2,

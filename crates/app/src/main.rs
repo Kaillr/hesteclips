@@ -700,6 +700,7 @@ impl App {
             output_dir: self.settings.output_dir.clone(),
             container_ext: self.settings.container.ext().to_owned(),
             fps: self.settings.fps,
+            blend_samples: if self.settings.frame_blend { settings::BLEND_SAMPLES } else { 1 },
             video_bitrate_kbps: self.settings.video_bitrate_mbps * 1000,
             target_height: self.settings.resolution.height(),
             keyframe_interval_secs: self.settings.keyframe_interval_secs,

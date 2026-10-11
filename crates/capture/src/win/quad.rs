@@ -35,6 +35,8 @@ pub(crate) struct Quad {
     ps: ID3D11PixelShader,
     ps_opaque: ID3D11PixelShader,
     blend: ID3D11BlendState,
+    /// Mixes by a constant (the blend factor) instead of the picture's alpha.
+    mix: ID3D11BlendState,
     sampler: ID3D11SamplerState,
     place: ID3D11Buffer,
 }
@@ -93,6 +95,10 @@ impl Quad {
             };
             let mut blend = None;
             dev.CreateBlendState(&blend_desc, Some(&mut blend))?;
+            blend_desc.RenderTarget[0].SrcBlend = D3D11_BLEND_BLEND_FACTOR;
+            blend_desc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_BLEND_FACTOR;
+            let mut mix = None;
+            dev.CreateBlendState(&blend_desc, Some(&mut mix))?;
             let sampler_desc = D3D11_SAMPLER_DESC {
                 Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
                 AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
@@ -111,6 +117,7 @@ impl Quad {
                 ps: ps.context("no pixel shader")?,
                 ps_opaque: ps_opaque.context("no pixel shader")?,
                 blend: blend.context("no blend state")?,
+                mix: mix.context("no blend state")?,
                 sampler: sampler.context("no sampler")?,
                 place: place.context("no constant buffer")?,
             })
@@ -120,6 +127,23 @@ impl Quad {
     /// Draw `source` into `target` (`size` pixels) where `at` says: blended
     /// by its alpha, or (`opaque`) replacing what's there.
     pub(crate) fn draw(&self, gpu: &Gpu, target: &ID3D11RenderTargetView, size: (u32, u32), source: &ID3D11ShaderResourceView, at: &Placement, opaque: bool) {
+        self.run(gpu, target, size, source, at, opaque, None);
+    }
+
+    /// Draw all of `source` over `target`, `weight` of it and the rest what's
+    /// there: with weights 1, 1/2, 1/3 … the target is the average of the
+    /// pictures drawn.
+    pub(crate) fn average(&self, gpu: &Gpu, target: &ID3D11RenderTargetView, size: (u32, u32), source: &ID3D11ShaderResourceView, weight: f32) {
+        let at = Placement {
+            dest: [0.0, 0.0, size.0 as f32, size.1 as f32],
+            uv: [0.0, 0.0, 1.0, 1.0],
+            clip: RECT { left: 0, top: 0, right: size.0 as i32, bottom: size.1 as i32 },
+        };
+        self.run(gpu, target, size, source, &at, true, Some(weight));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run(&self, gpu: &Gpu, target: &ID3D11RenderTargetView, size: (u32, u32), source: &ID3D11ShaderResourceView, at: &Placement, opaque: bool, weight: Option<f32>) {
         let (w, h) = (size.0 as f32, size.1 as f32);
         let [l, t, r, b] = at.dest;
         let place = [l / w * 2.0 - 1.0, 1.0 - t / h * 2.0, r / w * 2.0 - 1.0, 1.0 - b / h * 2.0, at.uv[0], at.uv[1], at.uv[2], at.uv[3]];
@@ -129,7 +153,10 @@ impl Quad {
             ctx.RSSetScissorRects(Some(&[at.clip]));
             ctx.RSSetViewports(Some(&[D3D11_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: w, Height: h, MinDepth: 0.0, MaxDepth: 1.0 }]));
             ctx.OMSetRenderTargets(Some(&[Some(target.clone())]), None);
-            ctx.OMSetBlendState(if opaque { None } else { Some(&self.blend) }, None, 0xffff_ffff);
+            match weight {
+                Some(w) if w < 1.0 => ctx.OMSetBlendState(Some(&self.mix), Some(&[w; 4]), 0xffff_ffff),
+                _ => ctx.OMSetBlendState(if opaque { None } else { Some(&self.blend) }, None, 0xffff_ffff),
+            }
             ctx.IASetInputLayout(None);
             ctx.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
             ctx.VSSetShader(&self.vs, None);

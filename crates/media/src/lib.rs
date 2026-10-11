@@ -445,6 +445,10 @@ pub struct Output {
     /// Only the mix (track 1), not each source on its own track too.
     #[serde(default)]
     pub mix_only: bool,
+    /// When the frame rate drops, blend the frames that fall in each new one
+    /// (smooth, like motion blur) instead of dropping the in-between ones.
+    #[serde(default)]
+    pub blend: bool,
 }
 
 /// AAC bitrate of each audio track a render writes.
@@ -460,6 +464,7 @@ impl Output {
             video_kbps: self.video_kbps.filter(|&k| info.video_kbps.is_none_or(|src| k < src)),
             max_mb: self.max_mb,
             mix_only: self.mix_only,
+            blend: self.blend,
         };
         e.fit_picture(info);
         e
@@ -932,7 +937,10 @@ fn render_video(source: &Path, info: &ClipInfo, edit: &Edit, plan: &Plan, work: 
     // Smaller and fewer frames: scaled (Lanczos, sharp) and dropped evenly.
     let mut filters = Vec::new();
     if output.fps.is_some() {
-        filters.push(format!("fps={}", edit.output.frame_rate(info)));
+        let rate = edit.output.frame_rate(info);
+        // `framerate` mixes the neighbouring source frames by how close they
+        // are; `fps` just picks one.
+        filters.push(if output.blend { format!("framerate=fps={rate}:scene=100") } else { format!("fps={rate}") });
     }
     if output.height.is_some() {
         let (w, h) = edit.output.size(info);
