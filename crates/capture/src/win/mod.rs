@@ -1070,7 +1070,7 @@ fn spawn_blend_pacer(
         }
 
         // The frame ends: encode it, and begin the next.
-        let mut close = |blend: &mut FrameBlend, up_since: &mut f64, next: &mut i64, have_picture: bool, stats: &mut BlendStats| {
+        let mut close = |blend: &mut FrameBlend, up_since: &mut f64, next: &mut i64, have_picture: bool| {
             let end = t0 + (*next + 1) as f64 / fps_f;
             if have_picture {
                 blend.add(end - up_since.max(t0 + *next as f64 / fps_f));
@@ -1120,7 +1120,7 @@ fn spawn_blend_pacer(
                 // Frames that ended before the picture arrived took the old one.
                 let mut burst = 0;
                 while t0 + (next + 1) as f64 / fps_f <= at && burst < fps * 2 {
-                    close(&mut blend, &mut up_since, &mut next, have_picture, &mut stats);
+                    close(&mut blend, &mut up_since, &mut next, have_picture);
                     burst += 1;
                 }
                 if have_picture {
@@ -1139,7 +1139,7 @@ fn spawn_blend_pacer(
             }
             let mut burst = 0;
             while t0 + (next + 1) as f64 / fps_f + BLEND_LATE <= host_now() && burst < fps * 2 {
-                close(&mut blend, &mut up_since, &mut next, have_picture, &mut stats);
+                close(&mut blend, &mut up_since, &mut next, have_picture);
                 burst += 1;
             }
         }
