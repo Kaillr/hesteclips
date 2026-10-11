@@ -147,8 +147,8 @@ impl Changes {
                         let row_bytes = BLOCKS.0 as usize * 4;
                         for row in 0..BLOCKS.1 as usize {
                             let line = std::slice::from_raw_parts((mapped.pData as *const u8).add(row * mapped.RowPitch as usize), row_bytes);
-                            // Blue, green, red of each block: any above 0 is a difference.
-                            differs |= line.iter().any(|&b| b != 0);
+                            // Blue, green, red of each block (the alpha is always full): any above 0 is a difference.
+                            differs |= line.chunks_exact(4).any(|px| px[..3].iter().any(|&b| b != 0));
                         }
                         gpu.context.Unmap(staging, 0);
                     },
