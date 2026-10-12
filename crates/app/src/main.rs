@@ -119,6 +119,11 @@ fn main() -> eframe::Result<()> {
             None => return Ok(()),
         }
     };
+    // Scrub frames kept from before scrubbing decoded live. (Not from a test
+    // instance: the real one beside it may be an older build using them.)
+    if !test_instance {
+        proxy::forget_kept();
+    }
     // Started with the computer: straight to the tray.
     let background = std::env::args().any(|a| a == autostart::BACKGROUND) && tray::available();
     // Before anything talks to the desktop portal (screen capture, shortcuts),

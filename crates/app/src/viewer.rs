@@ -4,8 +4,9 @@
 //! filmstrip over the clip's audio levels, so a shot, a shout or a quiet patch
 //! is visible before you get there. Hovering shows that moment's picture; click
 //! or drag to go there; scroll anywhere over the picture or the timeline to
-//! scrub. Scrubbing shows every frame straight from the in-memory proxy (see
-//! `proxy.rs`), the same as in the editor, and sharpens when you stop.
+//! scrub. Scrubbing decodes the frame under the playhead live (see
+//! `video.rs`), the same as in the editor: keyframes while it moves fast,
+//! every frame when it's slow, and the exact frame when you stop.
 //!
 //! It plays the clip as it's shared: the saved edit if there is one, and the
 //! mix (track 1).
@@ -30,7 +31,7 @@ use crate::filmstrip::Filmstrip;
 use crate::meter;
 use crate::player::Player;
 
-/// Scrolling keeps showing quick proxy frames until it's been still this long.
+/// Scrolling counts as scrubbing until it's been still this long.
 const SCROLL_SETTLE: Duration = Duration::from_millis(200);
 /// Arrow keys jump this far.
 const JUMP: f64 = 5.0;
@@ -392,6 +393,22 @@ impl Ready {
             } else {
                 ctx.request_repaint_after(SCROLL_SETTLE);
             }
+        }
+        match dev_drag() {
+            Some(Some(t)) => {
+                if self.dragging.is_none() {
+                    self.dragging = Some(self.player.is_playing());
+                    self.player.pause();
+                }
+                self.seek(t);
+                ctx.request_repaint();
+            }
+            Some(None) => {
+                if self.dragging.take() == Some(true) {
+                    self.play();
+                }
+            }
+            None => {}
         }
         let scrubbing = self.dragging.is_some() || self.scrolled.is_some();
 
@@ -773,6 +790,46 @@ fn dev_wheel() -> f32 {
     let due: f32 = plan.iter().filter(|(t, _)| *t <= now).map(|(_, d)| *d).sum();
     plan.retain(|(t, _)| *t > now);
     due
+}
+
+/// Dev aid: `HESTECLIPS_DEV_DRAG=4-6:10-20,8-9:30-25` drags the playhead
+/// from 10 s to 20 s of the clip between 4 and 6 s after start, then from
+/// 30 s back to 25 s, as the mouse would, to reproduce drag scrubbing
+/// without touching the mouse. `Some(Some(t))`: dragging to `t` now;
+/// `Some(None)`: a drag just ended.
+fn dev_drag() -> Option<Option<f64>> {
+    type Plan = (Vec<[f64; 4]>, bool);
+    static PLAN: std::sync::OnceLock<std::sync::Mutex<Plan>> = std::sync::OnceLock::new();
+    let plan = PLAN.get_or_init(|| {
+        let spec = std::env::var("HESTECLIPS_DEV_DRAG").unwrap_or_default();
+        let range = |s: &str| -> Option<(f64, f64)> {
+            let (a, b) = s.split_once('-')?;
+            Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+        };
+        let steps = spec
+            .split(',')
+            .filter_map(|s| s.split_once(':'))
+            .filter_map(|(when, to)| {
+                let ((t0, t1), (a, b)) = (range(when)?, range(to)?);
+                Some([t0, t1, a, b])
+            })
+            .collect();
+        std::sync::Mutex::new((steps, false))
+    });
+    let mut plan = plan.lock().unwrap();
+    if plan.0.is_empty() && !plan.1 {
+        return None;
+    }
+    let now = crate::player::uptime();
+    if let Some(&[t0, t1, a, b]) = plan.0.iter().find(|s| s[0] <= now && now < s[1]) {
+        plan.1 = true;
+        return Some(Some(a + (b - a) * (now - t0) / (t1 - t0).max(1e-3)));
+    }
+    plan.0.retain(|s| s[1] > now);
+    if std::mem::take(&mut plan.1) {
+        return Some(None);
+    }
+    None
 }
 
 /// The pointer is over `rect`, with no dialog or menu on top of it.

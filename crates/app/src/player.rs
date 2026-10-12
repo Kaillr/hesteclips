@@ -9,8 +9,9 @@
 //! starts at once; if that can't open a file (or elsewhere), an ffmpeg process streams
 //! scaled RGBA frames from the playhead onward, and single exact frames are
 //! decoded on demand when paused. Either way the UI shows whichever decoded
-//! frame matches the clock. While scrubbing, frames come from the in-memory
-//! proxy (`proxy.rs`).
+//! frame matches the clock. While scrubbing, frames come from the hardware
+//! decoder, live (`video.rs`); without one, from the scrub proxy, small
+//! frames built ahead in the background (`proxy.rs`).
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -32,6 +33,12 @@ use crate::video::Video;
 struct Picture {
     index: u64,
 }
+#[cfg(not(hw_decode))]
+struct Scrubbed {
+    asked: u64,
+    picture: Picture,
+    exact: bool,
+}
 
 /// Elsewhere there's no in-process decoder yet: a type with no values.
 #[cfg(not(hw_decode))]
@@ -40,6 +47,8 @@ enum Video {}
 impl Video {
     fn failed(&self) -> bool { match *self {} }
     fn show(&self, _: u64) { match *self {} }
+    fn scrub(&self, _: u64) { match *self {} }
+    fn take_scrub(&self) -> Option<Scrubbed> { match *self {} }
     fn play(&self, _: u64) { match *self {} }
     fn pause(&self) { match *self {} }
     fn take_exact(&self, _: u64) -> Option<Picture> { match *self {} }
@@ -199,8 +208,11 @@ pub struct Player {
     still_rx: Receiver<(u64, media::Frame)>,
     /// Frame index the last on-demand still was requested for.
     still_wanted: Option<u64>,
-    /// Every frame, small, for instant scrubbing.
-    proxy: Proxy,
+    /// Every frame, small, for instant scrubbing, built in the background:
+    /// only without the hardware decoder (which scrubs live).
+    proxy: Option<Proxy>,
+    /// The frame a scrub last asked the hardware decoder for.
+    scrub_asked: Option<u64>,
     /// Showing a proxy frame; swap in the sharp frame once the drag settles.
     showing_proxy: bool,
     /// While scrubbing where the proxy isn't built yet: the nearest frame
@@ -219,6 +231,50 @@ pub struct Player {
     asked_at: Option<std::time::Instant>,
     /// Frames shown while playing, per second (debug log).
     shown_count: Option<(std::time::Instant, u32)>,
+    /// The frame whose picture is on screen, whatever kind (debug log).
+    screen_index: Option<u64>,
+    /// How the picture keeps up while scrubbing (debug log).
+    scrub_stats: ScrubStats,
+}
+
+/// Debug log: while scrubbing, once a second, how many new pictures came
+/// up, how many redraws showed the frame wanted, and how far behind it the
+/// picture was (in frames, over the redraws).
+#[derive(Default)]
+struct ScrubStats {
+    since: Option<std::time::Instant>,
+    redraws: u32,
+    pictures: u32,
+    exact: u32,
+    behind: u64,
+    worst: u64,
+    last: Option<u64>,
+}
+
+impl ScrubStats {
+    fn note(&mut self, want: u64, on_screen: Option<u64>, exact: bool) {
+        let since = *self.since.get_or_insert_with(std::time::Instant::now);
+        self.redraws += 1;
+        if on_screen != self.last {
+            self.pictures += 1;
+            self.last = on_screen;
+        }
+        self.exact += exact as u32;
+        let off = on_screen.map_or(want, |i| i.abs_diff(want));
+        self.behind += off;
+        self.worst = self.worst.max(off);
+        if since.elapsed().as_secs_f64() >= 1.0 {
+            trace!(
+                "scrubbing: {} new pictures/s, {} of {} redraws exact, behind by {:.1} frames on average (at most {})",
+                self.pictures,
+                self.exact,
+                self.redraws,
+                self.behind as f64 / self.redraws as f64,
+                self.worst
+            );
+            *self = Self { last: self.last, ..Self::default() };
+        }
+    }
 }
 
 impl Player {
@@ -238,8 +294,8 @@ impl Player {
 
         let (still_tx, still_rx) = still_worker(ctx, source);
 
-        let info_fps = info.fps;
-        let total_frames = (info.duration * info_fps).floor() as usize;
+        let video = open_video(ctx, source, info.fps);
+        let proxy = video.is_none().then(|| Proxy::build(ctx, source, info.fps, total_frames(&info)));
         Self {
             source: source.to_path_buf(),
             info,
@@ -257,15 +313,18 @@ impl Player {
             still_tx,
             still_rx,
             still_wanted: None,
-            proxy: Proxy::build(ctx, source, info_fps, total_frames),
+            proxy,
+            scrub_asked: None,
             showing_proxy: false,
             stand_in: None,
-            video: open_video(ctx, source, info_fps),
+            video,
             pending_start: None,
             video_playing: false,
             played_at: None,
             shown_count: None,
             asked_at: None,
+            screen_index: None,
+            scrub_stats: ScrubStats::default(),
         }
     }
 
@@ -344,18 +403,22 @@ impl Player {
 
     /// For the `n` steps of `from..to` seconds: which have scrub frames.
     pub fn proxy_built(&self, from: f64, to: f64, n: usize) -> Vec<bool> {
-        self.proxy.built(self.info.frame_index(from), self.info.frame_index(to), n)
+        match &self.proxy {
+            Some(p) => p.built(self.info.frame_index(from), self.info.frame_index(to), n),
+            None => vec![true; n],
+        }
     }
 
-    /// Fraction of the scrub proxy that's built (0..=1).
+    /// Fraction of the scrub proxy that's built (0..=1); 1 without one.
     pub fn proxy_progress(&self) -> f32 {
-        let total = (self.info.duration * self.info.fps).floor().max(1.0);
-        (self.proxy.ready() as f64 / total).min(1.0) as f32
+        let Some(proxy) = &self.proxy else { return 1.0 };
+        (proxy.ready() as f64 / total_frames(&self.info).max(1) as f64).min(1.0) as f32
     }
 
-    /// The small scrub frame `idx`, if it's been built yet (for hover previews).
+    /// The small scrub frame `idx`, if there's a scrub proxy and it's been
+    /// built yet (for hover previews).
     pub fn proxy_frame(&self, idx: u64) -> Option<egui::ColorImage> {
-        self.proxy.frame(idx)
+        self.proxy.as_ref()?.frame(idx)
     }
 
     pub fn set_mix(&self, gains: Vec<TrackEdit>) {
@@ -377,14 +440,22 @@ impl Player {
     /// Returns the size of what's on screen (in pixels, to fit it); draw it
     /// with [`Self::paint`].
     pub fn update(&mut self, ctx: &egui::Context, scrubbing: bool) -> Option<egui::Vec2> {
-        self.proxy.set_focus(self.info.frame_index(self.time()));
+        // The hardware decoder broke (or can't read this file): scrub from a
+        // proxy after all.
+        if self.proxy.is_none() && self.hw().is_none() {
+            self.proxy = Some(Proxy::build(ctx, &self.source, self.info.fps, total_frames(&self.info)));
+        }
+        if let Some(proxy) = &self.proxy {
+            proxy.set_focus(self.info.frame_index(self.time()));
+        }
         self.shared.scrubbing.store(scrubbing && !self.sound_playing(), Ordering::Relaxed);
         #[cfg(hw_decode)]
-        if scrubbing && self.proxy_progress() < 1.0 {
+        if scrubbing {
             crate::video::scrubbing();
         }
         if self.hw().is_some() {
             self.update_hw(ctx, scrubbing);
+            self.note_scrub(scrubbing);
             return self.display.as_ref().map(Display::size);
         }
         let t = self.time();
@@ -425,9 +496,10 @@ impl Player {
             // While dragging, show the proxy frame right away (every mouse move).
             if self.shown_frame != Some(want) || (!scrubbing && self.showing_proxy) {
                 if self.shown_frame != Some(want) {
-                    if let Some(img) = self.proxy.frame(want) {
+                    if let Some(img) = self.proxy.as_ref().and_then(|p| p.frame(want)) {
                         self.set_texture(ctx, img);
                         self.shown_frame = Some(want);
+                        self.screen_index = Some(want);
                         self.showing_proxy = true;
                         self.stand_in = None;
                         // Coming back to a frame sharpened before asks again.
@@ -443,7 +515,22 @@ impl Player {
                 }
             }
         }
+        self.note_scrub(scrubbing);
         self.display.as_ref().map(Display::size)
+    }
+
+    /// Debug log: how the picture keeps up while scrubbing.
+    fn note_scrub(&mut self, scrubbing: bool) {
+        if !debug() {
+            return;
+        }
+        if !scrubbing || self.sound_playing() {
+            self.scrub_stats = ScrubStats::default();
+            return;
+        }
+        let want = self.info.frame_index(self.time());
+        let exact = self.shown_frame == Some(want);
+        self.scrub_stats.note(want, self.screen_index, exact);
     }
 
     /// Playing, showing frame `want`: draw again when the next one is due,
@@ -515,36 +602,47 @@ impl Player {
             self.video_playing = false;
             self.still_wanted = None;
         }
-        if let Some(p) = v.take_exact(want) {
+        // Scrubbing: what the decoder found for the newest frame asked (the
+        // keyframe on the way there, or the frame itself); then the exact
+        // frame asked once paused, which is newer.
+        let (found, exact) = (v.take_scrub(), v.take_exact(want));
+        if let Some(found) = found {
+            self.put_picture(ctx, found.picture);
+            // The picture for the frame asked even when its own number is
+            // lower (a dropped frame's slot).
+            if found.exact {
+                self.shown_frame = Some(found.asked);
+            }
+        }
+        if let Some(p) = exact {
             if let Some(at) = self.asked_at.take() {
                 trace!("sharp frame {want} (picture {}) {:.0} ms after asking", p.index, at.elapsed().as_secs_f64() * 1000.0);
             }
             self.show_picture(ctx, p);
             // It's the picture for `want` even when its own number is lower (a
-            // dropped frame's slot): don't put the proxy back over it.
+            // dropped frame's slot).
             self.shown_frame = Some(want);
         }
-        let sharp = self.shown_frame == Some(want) && !self.showing_proxy;
-        if !sharp {
-            // The small proxy frame right away (every mouse move while scrubbing)…
-            if self.shown_frame != Some(want) {
-                if let Some(img) = self.proxy.frame(want) {
-                    self.set_texture(ctx, img);
-                    self.shown_frame = Some(want);
-                    self.showing_proxy = true;
-                    self.stand_in = None;
-                } else if scrubbing {
-                    self.show_stand_in(ctx, want);
-                }
+        if self.shown_frame == Some(want) {
+            return;
+        }
+        let v = self.video.as_ref().expect("checked above");
+        if scrubbing {
+            // Every frame the playhead moves to (the decoder takes the newest).
+            if self.scrub_asked != Some(want) {
+                self.scrub_asked = Some(want);
+                // Stopping here again asks for the exact frame again.
+                self.still_wanted = None;
+                v.scrub(want);
             }
-            // …and the full-quality frame once the scrub has stopped (the mouse
-            // let go, the wheel settled). Asked once per frame wanted.
-            let v = self.video.as_ref().expect("checked above");
-            if !scrubbing && self.still_wanted != Some(want) {
-                self.still_wanted = Some(want);
-                self.asked_at = Some(std::time::Instant::now());
-                v.show(want);
-            }
+        } else if self.still_wanted != Some(want) {
+            // Paused somewhere new, or a scrub stopped (the mouse let go, the
+            // wheel settled) before its frame came: that frame, exactly.
+            // Asked once per frame wanted.
+            self.still_wanted = Some(want);
+            self.scrub_asked = None;
+            self.asked_at = Some(std::time::Instant::now());
+            v.show(want);
         }
     }
 
@@ -560,7 +658,7 @@ impl Player {
         }
         // Counts frames that change the picture, not frames handed over.
         if debug() && self.sound_playing() && self.shown_frame != Some(idx) {
-            let (now, ready) = (self.time(), self.proxy.ready());
+            let (now, ready) = (self.time(), self.proxy.as_ref().map_or(0, |p| p.ready()));
             let (since, n) = self.shown_count.get_or_insert((std::time::Instant::now(), 0));
             *n += 1;
             if since.elapsed().as_secs_f64() >= 1.0 {
@@ -568,6 +666,13 @@ impl Player {
                 self.shown_count = None;
             }
         }
+        self.put_picture(ctx, p);
+    }
+
+    /// Put a decoded picture on screen.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn put_picture(&mut self, ctx: &egui::Context, p: Picture) {
+        let idx = p.index;
         #[cfg(hw_decode)]
         {
             // On the GPU: draw its texture as it is.
@@ -584,6 +689,7 @@ impl Player {
         #[cfg(not(hw_decode))]
         let _ = (ctx, p);
         self.shown_frame = Some(idx);
+        self.screen_index = Some(idx);
         self.showing_proxy = false;
         self.stand_in = None;
     }
@@ -593,13 +699,14 @@ impl Player {
     /// replaces it as soon as it's built, and the sharp one once you stop).
     fn show_stand_in(&mut self, ctx: &egui::Context, want: u64) {
         let within = (self.info.fps * 10.0).round().max(1.0) as u64;
-        let Some(i) = self.proxy.nearest(want, within) else { return };
+        let Some(i) = self.proxy.as_ref().and_then(|p| p.nearest(want, within)) else { return };
         if self.stand_in == Some(i) {
             return;
         }
-        if let Some(img) = self.proxy.frame(i) {
+        if let Some(img) = self.proxy.as_ref().and_then(|p| p.frame(i)) {
             self.set_texture(ctx, img);
             self.shown_frame = None;
+            self.screen_index = Some(i);
             self.showing_proxy = true;
             self.stand_in = Some(i);
             trace!("scrubbing: frame {want} not built, showing {i}");
@@ -610,6 +717,7 @@ impl Player {
         let img = egui::ColorImage::from_rgba_unmultiplied([frame.width as usize, frame.height as usize], &frame.rgba);
         self.set_texture(ctx, img);
         self.shown_frame = Some(idx);
+        self.screen_index = Some(idx);
         self.showing_proxy = false;
         self.stand_in = None;
     }
@@ -671,6 +779,11 @@ fn open_video(ctx: &egui::Context, source: &Path, fps: f64) -> Option<Video> {
     }
     let _ = (ctx, source, fps);
     None
+}
+
+/// Frames in the clip, as the app counts them.
+fn total_frames(info: &ClipInfo) -> usize {
+    (info.duration * info.fps).floor() as usize
 }
 
 /// The sound while scrubbing a paused clip, at its own pitch whatever the

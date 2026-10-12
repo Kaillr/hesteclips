@@ -310,6 +310,11 @@ impl Stream {
         self.keys[k.saturating_sub(1)]
     }
 
+    /// The keyframes' times (100 ns), ascending.
+    pub(crate) fn key_times(&self) -> impl Iterator<Item = i64> + '_ {
+        self.keys.iter().map(|&k| self.time_of(k))
+    }
+
     /// Whether reaching time `t` from time `from` (the next frame's) is
     /// cheaper decoding on than starting again from `t`'s keyframe: unless
     /// `t` is past the next keyframe, decoding on wins.

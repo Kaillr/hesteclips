@@ -341,6 +341,16 @@ impl Decoder {
         self.source
     }
 
+    /// The keyframes' numbers, ascending: a jump to one is a single frame to
+    /// decode. Empty through the file reader, which doesn't say.
+    pub fn keyframes(&self) -> Vec<u64> {
+        let Source::Direct(d) = &self.src else { return Vec::new() };
+        let mut k: Vec<u64> = d.key_times().map(|t| self.index_of(t)).collect();
+        k.sort_unstable();
+        k.dedup();
+        k
+    }
+
     /// Number frames on this rate's grid instead of the file's own (to match
     /// how the app counts them, from ffprobe's average rate).
     pub fn set_fps(&mut self, fps: f64) {

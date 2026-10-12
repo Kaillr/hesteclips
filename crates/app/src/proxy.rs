@@ -1,7 +1,12 @@
 //! Scrub proxy: every frame of the clip as a small JPEG, in a file.
 //!
-//! Seeking the real file costs 50-200 ms a frame, far too slow to follow a
-//! drag. One pass decodes every frame at a small size; after that any frame
+//! Only where there's no hardware decoder to scrub with (`hw_decode`: Linux,
+//! or a file it can't read): with one, scrubbing decodes live (`video.rs`),
+//! keyframes while the playhead moves fast and every frame when it's slow,
+//! with nothing built beforehand.
+//!
+//! Seeking the real file through ffmpeg costs 50-200 ms a frame, far too
+//! slow to follow a drag. One pass decodes every frame at a small size; after that any frame
 //! is a JPEG decode away, so scrubbing updates the picture on every mouse
 //! move. Frames arrive in order while it builds, so the start of the clip is
 //! scrubbable almost immediately.
@@ -343,8 +348,12 @@ fn start(ctx: &egui::Context, b: &Arc<Build>) {
 }
 
 /// Build `source`'s proxy in the background and keep it, unless it's kept
-/// already: one clip at a time, in the order asked.
+/// already: one clip at a time, in the order asked. Nothing where the
+/// hardware decoder scrubs.
 pub fn prebuild(ctx: &egui::Context, source: &Path) {
+    if cfg!(hw_decode) {
+        return;
+    }
     static QUEUE: std::sync::OnceLock<Mutex<std::sync::mpsc::Sender<PathBuf>>> = std::sync::OnceLock::new();
     let queue = QUEUE.get_or_init(|| {
         let (tx, rx) = std::sync::mpsc::channel::<PathBuf>();
@@ -368,6 +377,16 @@ pub fn prebuild(ctx: &egui::Context, source: &Path) {
         Mutex::new(tx)
     });
     let _ = queue.lock().unwrap().send(source.to_path_buf());
+}
+
+/// Where the hardware decoder scrubs, proxies kept from before it did (up to
+/// 5 GB) are of no more use: delete them, in the background.
+pub fn forget_kept() {
+    if cfg!(hw_decode) {
+        std::thread::spawn(|| {
+            let _ = std::fs::remove_dir_all(cache::dir());
+        });
+    }
 }
 
 pub struct Proxy {
@@ -812,7 +831,7 @@ mod cache {
     const SLOT: usize = 12;
     const FOOTER: u64 = 24;
 
-    fn dir() -> PathBuf {
+    pub fn dir() -> PathBuf {
         dirs::cache_dir().unwrap_or_else(std::env::temp_dir).join("hesteclips").join("proxy")
     }
 
