@@ -734,9 +734,11 @@ impl Shortcuts {
 
 /// Common frame-rate choices for the picker.
 /// The blend rates offered for a frame rate: whole multiples of it, up to a
-/// rate the screen and the GPU copying can plausibly keep up with (a guess).
-pub fn blend_choices(fps: u32) -> Vec<u32> {
-    (2..=8).map(|k| fps * k).filter(|&r| r <= 960).collect()
+/// rate the screen and the GPU copying can plausibly keep up with (a guess),
+/// or `max` where the system can't look faster (macOS: the display's
+/// refresh rate).
+pub fn blend_choices(fps: u32, max: Option<u32>) -> Vec<u32> {
+    (2..=8).map(|k| fps * k).filter(|&r| r <= max.unwrap_or(960).min(960)).collect()
 }
 
 impl RecordSettings {

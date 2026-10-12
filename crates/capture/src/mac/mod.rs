@@ -1,6 +1,7 @@
 //! macOS pieces beyond the recorder's core (`crate::sck`).
 
 pub mod bench;
+pub(crate) mod blend;
 pub(crate) mod camera;
 pub mod decode;
 pub(crate) mod gpu;
@@ -23,10 +24,10 @@ pub fn probe_encoder(width: usize, height: usize) -> String {
     crate::sck::probe_encoder(width, height)
 }
 
-/// A display's size in pixels, by id (`None`: the main display), else the
+/// A display's current mode, by id (`None`: the main display), else the
 /// main display's.
-pub(crate) fn display_pixels(id: Option<&str>) -> Option<(u32, u32)> {
-    use objc2_core_graphics::{CGDisplayCopyDisplayMode, CGDisplayMode, CGGetActiveDisplayList, CGMainDisplayID};
+fn display_mode(id: Option<&str>) -> Option<objc2_core_foundation::CFRetained<objc2_core_graphics::CGDisplayMode>> {
+    use objc2_core_graphics::{CGDisplayCopyDisplayMode, CGGetActiveDisplayList, CGMainDisplayID};
     let mut ids = [0u32; 16];
     let mut n = 0u32;
     if unsafe { CGGetActiveDisplayList(16, ids.as_mut_ptr(), &mut n) } != objc2_core_graphics::CGError::Success {
@@ -34,7 +35,22 @@ pub(crate) fn display_pixels(id: Option<&str>) -> Option<(u32, u32)> {
     }
     let ids = &ids[..n as usize];
     let display = id.and_then(|s| s.parse::<u32>().ok()).filter(|d| ids.contains(d)).unwrap_or_else(|| CGMainDisplayID());
-    let mode = CGDisplayCopyDisplayMode(display);
+    CGDisplayCopyDisplayMode(display)
+}
+
+/// A display's size in pixels, by id (`None`: the main display), else the
+/// main display's.
+pub(crate) fn display_pixels(id: Option<&str>) -> Option<(u32, u32)> {
+    use objc2_core_graphics::CGDisplayMode;
+    let mode = display_mode(id);
     let (w, h) = (CGDisplayMode::pixel_width(mode.as_deref()), CGDisplayMode::pixel_height(mode.as_deref()));
     (w > 0 && h > 0).then_some((w as u32, h as u32))
+}
+
+/// How many times a second a display shows a new picture, by id (`None`:
+/// the main display). Nothing on it changes faster, so ScreenCaptureKit
+/// never delivers more different pictures than this, whatever a game draws.
+pub(crate) fn display_refresh(id: Option<&str>) -> Option<u32> {
+    let hz = objc2_core_graphics::CGDisplayMode::refresh_rate(display_mode(id).as_deref());
+    (hz >= 1.0).then(|| hz.round() as u32)
 }

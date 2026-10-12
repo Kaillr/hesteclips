@@ -72,12 +72,16 @@ impl App {
                         });
                     },
                 );
-                if cfg!(windows) {
+                if cfg!(any(windows, target_os = "macos")) {
                     divider(ui);
                     row(
                         ui,
                         "Frame blending",
-                        Some("Capture faster than the frame rate and average the pictures into each frame for smooth motion, like motion blur. Needs a game that runs at least that fast. The bitrate follows the frame rate."),
+                        Some(if cfg!(windows) {
+                            "Capture faster than the frame rate and average the pictures into each frame for smooth motion, like motion blur. Needs a game that runs at least that fast. The bitrate follows the frame rate."
+                        } else {
+                            "Capture faster than the frame rate and average the pictures into each frame for smooth motion, like motion blur. Up to your display's refresh rate: macOS shows no more pictures than that, however fast a game runs."
+                        }),
                         |ui| self.blend_choice(ui),
                     );
                 }
@@ -580,7 +584,9 @@ impl App {
     /// Off, or the rate the screen is captured at before it's blended down to
     /// the frame rate: a whole multiple of it.
     fn blend_choice(&mut self, ui: &mut egui::Ui) {
-        let choices = settings::blend_choices(self.settings.fps);
+        // macOS: no faster than the display being recorded shows pictures.
+        let max = capture::max_blend_rate(&self.video_source());
+        let choices = settings::blend_choices(self.settings.fps, max);
         let fps = self.settings.fps;
         // After the frame rate changed: the nearest multiple of it (before
         // the choice below, which must win).
@@ -588,16 +594,27 @@ impl App {
         if samples > 1 {
             self.settings.blend_fps = fps * samples;
         }
-        let shown = if samples > 1 { format!("From {} fps", fps * samples) } else { "Off".to_owned() };
+        // Set for a faster display than this one: the capture blends as much
+        // as this one allows (the setting stays, for the other display).
+        let used = choices.iter().copied().filter(|&r| r <= fps * samples).max().filter(|_| samples > 1);
+        let shown = used.map_or_else(|| "Off".to_owned(), |r| format!("From {r} fps"));
         ui.vertical(|ui| {
-            egui::ComboBox::from_id_salt("blend_fps").selected_text(shown).show_ui(ui, |ui| {
-                ui.selectable_value(&mut self.settings.blend_fps, 0, "Off");
-                for r in choices {
-                    ui.selectable_value(&mut self.settings.blend_fps, r, format!("From {r} fps"));
-                }
+            ui.add_enabled_ui(!choices.is_empty(), |ui| {
+                egui::ComboBox::from_id_salt("blend_fps").selected_text(shown).show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.settings.blend_fps, 0, "Off");
+                    for &r in &choices {
+                        ui.selectable_value(&mut self.settings.blend_fps, r, format!("From {r} fps"));
+                    }
+                });
             });
-            if self.settings.blend_fps > 0 {
-                ui.weak(format!("Captured at {} fps, blended down to a {fps} fps file", self.settings.blend_fps));
+            match (used, max) {
+                (Some(r), _) => {
+                    ui.weak(format!("Captured at {r} fps, blended down to a {fps} fps file"));
+                }
+                (None, Some(hz)) if choices.is_empty() => {
+                    ui.weak(format!("Your display shows {hz} pictures a second: blending needs a frame rate of {} fps or less", hz / 2));
+                }
+                _ => {}
             }
         });
     }

@@ -68,6 +68,7 @@ use crate::output::{in_progress, timestamp};
 use crate::sources::{AudioCapture, AudioSource, SourceKind, mix_inputs, track_layout};
 use crate::avwriter::{SendFormat, SendSample};
 use crate::writer::{self, Layout, Media, Writer};
+use crate::mac::blend::{Blender, spawn_blend_pacer};
 use crate::mac::video::{self, Frames, Picture, pick_display, shareable_content};
 use crate::{EncodeSettings, Mode, Recorder};
 
@@ -277,12 +278,21 @@ impl Session {
             session.mixer = Some((stop, mixer));
 
             let encoder = Encoder::new(width, height, s, session.writer_tx.clone())?;
-            let picture = Picture::start(&s.video, &content, &display, (width, height), s.fps, away)?;
+            // With blending, the screen is looked at faster than the frame
+            // rate, never faster than the display shows new pictures.
+            let looks = blend_looks(s);
+            let picture = Picture::start(&s.video, &content, &display, (width, height), s.fps * looks, away)?;
             // A webcam that can't open doesn't stop the recording: its status
             // says why, and the picture goes on without it.
             let frames = Frames::new(picture.latest.clone(), s.webcam.as_ref(), width, height, crate::preview::new_producer())?;
+            let latest = picture.latest.clone();
             session.video = Some(picture);
-            session.pacer = Some(spawn_pacer(s.fps, frames, encoder, clock));
+            session.pacer = Some(if looks > 1 {
+                let blender = Blender::new(width, height)?;
+                spawn_blend_pacer(s.fps, looks, latest, blender, frames, encoder, clock)
+            } else {
+                spawn_pacer(s.fps, frames, encoder, clock)
+            });
             Ok(())
         })();
         if let Err(e) = started {
@@ -317,6 +327,14 @@ impl Session {
         drop(self.writer_tx);
         self.writer.take().map_or(Ok(()), Writer::join)
     }
+}
+
+/// Looks at the screen per frame for frame blending: as asked, but no more
+/// than the display can show new pictures in a frame's time (1: no blending).
+fn blend_looks(s: &EncodeSettings) -> u32 {
+    let asked = s.blend_samples.max(1);
+    let most = crate::max_blend_rate(&s.video).map_or(asked, |hz| (hz / s.fps.max(1)).max(1));
+    asked.min(most)
 }
 
 /// AAC-encode one track's PCM and pass the packets to the writer.

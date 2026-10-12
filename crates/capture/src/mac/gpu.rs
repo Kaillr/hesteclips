@@ -65,27 +65,12 @@ impl Gpu {
     pub(crate) fn new() -> Result<Self> {
         let device = MTLCreateSystemDefaultDevice().context("no Metal device")?;
         let queue = device.newCommandQueue().context("no Metal command queue")?;
-        let library = device
-            .newLibraryWithSource_options_error(&NSString::from_str(KERNELS), None)
-            .map_err(|e| anyhow::anyhow!("couldn't build the compositor: {}", e.localizedDescription()))?;
-        let pipeline = |name: &str| -> Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>> {
-            let f = library.newFunctionWithName(&NSString::from_str(name)).context("missing kernel")?;
-            device.newComputePipelineStateWithFunction_error(&f).map_err(|e| anyhow::anyhow!("couldn't build the compositor: {}", e.localizedDescription()))
-        };
-        Ok(Self { luma: pipeline("luma")?, chroma: pipeline("chroma")?, device, queue })
+        let mut k = kernels(&device, KERNELS, &["luma", "chroma"])?.into_iter();
+        Ok(Self { luma: k.next().unwrap(), chroma: k.next().unwrap(), device, queue })
     }
 
-    /// Plane `plane` of an NV12 buffer as a texture over the same memory.
     fn plane(&self, buf: &CVPixelBuffer, plane: usize, write: bool) -> Result<Retained<ProtocolObject<dyn MTLTexture>>> {
-        let surface = CVPixelBufferGetIOSurface(Some(buf)).context("the frame isn't in an IOSurface")?;
-        let (w, h) = (CVPixelBufferGetWidth(buf), CVPixelBufferGetHeight(buf));
-        let (format, w, h) = if plane == 0 { (MTLPixelFormat::R8Unorm, w, h) } else { (MTLPixelFormat::RG8Unorm, w.div_ceil(2), h.div_ceil(2)) };
-        unsafe {
-            let desc = MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(format, w, h, false);
-            desc.setUsage(if write { MTLTextureUsage::ShaderWrite | MTLTextureUsage::ShaderRead } else { MTLTextureUsage::ShaderRead });
-            desc.setStorageMode(MTLStorageMode::Shared);
-            self.device.newTextureWithDescriptor_iosurface_plane(&desc, &surface, plane).context("Metal couldn't open a frame")
-        }
+        plane_texture(&self.device, buf, plane, write)
     }
 
     /// Draw `camera` (cropped, placed and mirrored as `placement` says) over
@@ -127,6 +112,42 @@ impl Gpu {
         cmd.waitUntilCompleted();
         Ok(())
     }
+}
+
+/// Plane `plane` of an NV12 buffer as a texture over the same memory.
+pub(crate) fn plane_texture(
+    device: &ProtocolObject<dyn MTLDevice>,
+    buf: &CVPixelBuffer,
+    plane: usize,
+    write: bool,
+) -> Result<Retained<ProtocolObject<dyn MTLTexture>>> {
+    let surface = CVPixelBufferGetIOSurface(Some(buf)).context("the frame isn't in an IOSurface")?;
+    let (w, h) = (CVPixelBufferGetWidth(buf), CVPixelBufferGetHeight(buf));
+    let (format, w, h) = if plane == 0 { (MTLPixelFormat::R8Unorm, w, h) } else { (MTLPixelFormat::RG8Unorm, w.div_ceil(2), h.div_ceil(2)) };
+    unsafe {
+        let desc = MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(format, w, h, false);
+        desc.setUsage(if write { MTLTextureUsage::ShaderWrite | MTLTextureUsage::ShaderRead } else { MTLTextureUsage::ShaderRead });
+        desc.setStorageMode(MTLStorageMode::Shared);
+        device.newTextureWithDescriptor_iosurface_plane(&desc, &surface, plane).context("Metal couldn't open a frame")
+    }
+}
+
+/// Build Metal kernels from source: one pipeline per name, in order.
+pub(crate) fn kernels(
+    device: &ProtocolObject<dyn MTLDevice>,
+    source: &str,
+    names: &[&str],
+) -> Result<Vec<Retained<ProtocolObject<dyn MTLComputePipelineState>>>> {
+    let library = device
+        .newLibraryWithSource_options_error(&NSString::from_str(source), None)
+        .map_err(|e| anyhow::anyhow!("couldn't build GPU kernels: {}", e.localizedDescription()))?;
+    names
+        .iter()
+        .map(|name| {
+            let f = library.newFunctionWithName(&NSString::from_str(name)).context("missing kernel")?;
+            device.newComputePipelineStateWithFunction_error(&f).map_err(|e| anyhow::anyhow!("couldn't build GPU kernels: {}", e.localizedDescription()))
+        })
+        .collect()
 }
 
 /// A pool of IOSurface-backed NV12 buffers for composed frames, the size of

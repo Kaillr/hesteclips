@@ -11,7 +11,8 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::collections::VecDeque;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -54,15 +55,81 @@ pub(crate) struct Latest {
     app: Mutex<Option<String>>,
     /// Nothing's being recorded: the away screen (or black) shows.
     waiting: AtomicBool,
+    /// For frame blending, which needs every picture and when it came up,
+    /// not just the newest.
+    arrivals: Mutex<Arrivals>,
+    arrived: Condvar,
 }
 
+/// Pictures as they come up, numbered: `seq` counts every change of the
+/// picture (the away screen too, which isn't queued), so a change without
+/// an arrival shows as a number the queue never had.
+#[derive(Default)]
+struct Arrivals {
+    seq: u64,
+    /// `None` until blending asks for them.
+    queue: Option<VecDeque<Arrival>>,
+}
+
+/// A picture from the stream and the host time it was shown on the screen.
+pub(crate) struct Arrival {
+    pub at: f64,
+    pub seq: u64,
+    pub buffer: Arc<Buffer>,
+}
+
+/// Pictures kept for blending before the oldest go (each holds one of the
+/// stream's buffers; it has 8). The blending takes them within a millisecond
+/// or so; this is for a stall.
+const MAX_QUEUED: usize = 4;
+
 impl Latest {
-    fn set(&self, b: CFRetained<CVPixelBuffer>) {
-        *self.frame.lock().unwrap() = Some(Arc::new(Buffer(b)));
+    fn set(&self, b: CFRetained<CVPixelBuffer>, at: f64) {
+        let b = Arc::new(Buffer(b));
+        *self.frame.lock().unwrap() = Some(b.clone());
+        let mut a = self.arrivals.lock().unwrap();
+        a.seq += 1;
+        let seq = a.seq;
+        if let Some(q) = a.queue.as_mut() {
+            if q.len() >= MAX_QUEUED {
+                q.pop_front();
+            }
+            q.push_back(Arrival { at, seq, buffer: b });
+        }
+        drop(a);
+        self.arrived.notify_all();
+    }
+
+    /// The picture was put up some other way (the away screen).
+    fn put(&self, b: Arc<Buffer>) {
+        *self.frame.lock().unwrap() = Some(b);
+        self.arrivals.lock().unwrap().seq += 1;
+        self.arrived.notify_all();
     }
 
     pub(crate) fn get(&self) -> Option<Arc<Buffer>> {
         self.frame.lock().unwrap().clone()
+    }
+
+    /// Keep every picture from now on, for [`Self::drain`].
+    pub(crate) fn queue_arrivals(&self) {
+        self.arrivals.lock().unwrap().queue.get_or_insert_with(VecDeque::new);
+    }
+
+    /// The number of the newest change of the picture.
+    pub(crate) fn seq(&self) -> u64 {
+        self.arrivals.lock().unwrap().seq
+    }
+
+    /// Wait up to `timeout` for a change after `seen`.
+    pub(crate) fn wait(&self, seen: u64, timeout: Duration) {
+        let a = self.arrivals.lock().unwrap();
+        let _ = self.arrived.wait_timeout_while(a, timeout, |a| a.seq <= seen);
+    }
+
+    /// The pictures that came up since the last call, oldest first.
+    pub(crate) fn drain(&self) -> Vec<Arrival> {
+        self.arrivals.lock().unwrap().queue.as_mut().map_or_else(Vec::new, |q| q.drain(..).collect())
     }
 }
 
@@ -81,7 +148,9 @@ define_class!(
             // Idle/blank status frames carry no image: keep the previous one.
             if kind == SCStreamOutputType::Screen && !out.paused.load(Ordering::Relaxed) {
                 if let Some(image) = unsafe { sample.image_buffer() } {
-                    out.latest.set(image);
+                    // On the host clock, when the screen showed it.
+                    let at = unsafe { sample.presentation_time_stamp().seconds() };
+                    out.latest.set(image, at);
                     out.frames.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -305,7 +374,7 @@ fn show_away(latest: &Latest, away: Option<&Arc<Buffer>>, width: usize, height: 
             Err(_) => return,
         },
     };
-    *latest.frame.lock().unwrap() = Some(frame);
+    latest.put(frame);
     *latest.app.lock().unwrap() = None;
     latest.waiting.store(true, Ordering::Relaxed);
 }
@@ -535,6 +604,12 @@ impl Frames {
     /// The frame to encode now, if there's a picture yet.
     pub(crate) fn next(&mut self) -> Option<Arc<Buffer>> {
         let screen = self.latest.get()?;
+        Some(self.make(screen))
+    }
+
+    /// The frame to encode from `screen` (the newest picture, or a blend of
+    /// several): with the webcam over it, if one shows.
+    pub(crate) fn make(&mut self, screen: Arc<Buffer>) -> Arc<Buffer> {
         let frame = match &mut self.camera {
             None => screen,
             Some((layer, placement, gpu, pool)) => {
@@ -544,7 +619,7 @@ impl Frames {
                 if cam.is_none() {
                     self.last = None;
                     self.preview.offer(&screen, self.latest.waiting.load(Ordering::Relaxed), self.latest.app.lock().unwrap().clone());
-                    return Some(screen);
+                    return screen;
                 }
                 let key = (Arc::as_ptr(&screen) as usize, cam.as_ref().map_or(0, |c| c.seq), p);
                 match &self.last {
@@ -565,7 +640,7 @@ impl Frames {
             }
         };
         self.preview.offer(&frame, self.latest.waiting.load(Ordering::Relaxed), self.latest.app.lock().unwrap().clone());
-        Some(frame)
+        frame
     }
 }
 

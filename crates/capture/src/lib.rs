@@ -138,6 +138,26 @@ pub fn frame_size(source: &VideoSource, target_height: Option<u32>) -> Option<(u
     native.map(|(w, h)| output_size(w, h, target_height))
 }
 
+/// The fastest a recording of `source` can look at the screen for frame
+/// blending, if there's a limit: on macOS the display's refresh rate (games
+/// and apps: the main display's), as ScreenCaptureKit only sees what the
+/// display shows. Windows takes the game's own pictures: no limit.
+pub fn max_blend_rate(source: &VideoSource) -> Option<u32> {
+    #[cfg(target_os = "macos")]
+    {
+        let id = match source {
+            VideoSource::Screen { id, .. } => Some(id.as_str()),
+            VideoSource::Apps { .. } => None,
+        };
+        mac::display_refresh(id)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = source;
+        None
+    }
+}
+
 /// What a recording's video shows. This is the bottom layer of the picture;
 /// overlays (a webcam) will go on top of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -463,7 +483,7 @@ pub struct EncodeSettings {
     /// Container extension for finished files, e.g. "mp4" or "mkv".
     pub container_ext: String,
     pub fps: u32,
-    /// Windows: look at the picture this many times per frame and record the
+    /// Windows and macOS: look at the picture this many times per frame and record the
     /// average (smooth, like motion blur). 1 records the newest picture as is.
     pub blend_samples: u32,
     pub video_bitrate_kbps: u32,
