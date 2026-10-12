@@ -213,6 +213,23 @@ fn wgpu_options() -> eframe::egui_wgpu::WgpuConfiguration {
             Err(_) if cfg!(windows) => new.instance_descriptor.backends = eframe::wgpu::Backends::DX12,
             Err(_) => {}
         }
+        // A development build has the GPU driver check every call (wgpu's
+        // default), but what it finds is only printed with HESTECLIPS_DEBUG_GPU:
+        // without that, the checks just cost 170-190 MB of memory.
+        // (`WGPU_VALIDATION=1` still turns them on.)
+        if std::env::var_os("HESTECLIPS_DEBUG_GPU").is_none() {
+            let checks = eframe::wgpu::InstanceFlags::VALIDATION | eframe::wgpu::InstanceFlags::GPU_BASED_VALIDATION;
+            new.instance_descriptor.flags = eframe::wgpu::InstanceFlags::from_build_config().difference(checks).with_env();
+        }
+        // wgpu's default ("Performance") reserves memory in big blocks: for data
+        // on its way to the GPU (pictures, thumbnails), 64 MB and then 128 MB of
+        // RAM, kept while anything in them is in use. Small blocks are enough
+        // for what this app sends: ~150 MB less, drawing just as fast.
+        let device = new.device_descriptor.clone();
+        new.device_descriptor = std::sync::Arc::new(move |adapter| eframe::wgpu::DeviceDescriptor {
+            memory_hints: eframe::wgpu::MemoryHints::MemoryUsage,
+            ..device(adapter)
+        });
     }
     options
 }
