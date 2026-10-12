@@ -392,7 +392,7 @@ impl Decoder {
     }
 
     /// Frames for scrubbing back and forth, kept a while: `width` wide (at
-    /// most the video's), as many as fit in `bytes` (16 to 256), in textures
+    /// most the video's), as many as fit in `bytes` (16 to 2048), in textures
     /// of their own so keeping them doesn't hold up playback's. NV12 where
     /// the graphics card shares it (the conversion scales it), else RGBA.
     /// How many there are; an error unless frames are shared.
@@ -406,7 +406,7 @@ impl Decoder {
         let w = width.min(self.source.0).max(2) / 2 * 2;
         let size = (w, even_height(w, self.source));
         let make = |format: SurfaceFormat, bytes_per_pixel: f64, out: DXGI_COLOR_SPACE_TYPE| -> Result<(Arc<Surfaces>, Convert)> {
-            let count = (bytes as f64 / (size.0 as f64 * size.1 as f64 * bytes_per_pixel)).clamp(16.0, 256.0) as usize;
+            let count = (bytes as f64 / (size.0 as f64 * size.1 as f64 * bytes_per_pixel)).clamp(16.0, 2048.0) as usize;
             let pool = surfaces(&self.gpu, size.0, size.1, format, count, true)?;
             let convert = Convert::new(&self.gpu, self.source, size, self.fps, self.bt601, out, pool.textures.clone())?;
             Ok((Arc::new(pool), convert))
