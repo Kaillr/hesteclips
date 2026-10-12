@@ -203,6 +203,7 @@ fn output(pcm: &Pcm, gain: f32) -> Result<(), String> {
     let config = cpal::StreamConfig { channels: supported.channels(), sample_rate: supported.sample_rate(), buffer_size: cpal::BufferSize::Default };
     let step = RATE as f64 / out_rate;
     let frames = pcm.len() / 2;
+    let gain = if crate::player::dev_muted() { 0.0 } else { gain };
     let data = pcm.clone();
     let mut pos = 0.0f64;
     let recorded = capture::sources::own_sound::Playing::start();

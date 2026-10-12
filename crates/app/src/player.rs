@@ -920,105 +920,112 @@ fn start_audio(shared: Arc<Shared>, pcm: Arc<Pcm>) -> Result<cpal::Stream, Strin
     let mut scrub = Scrub::new(out_rate);
     trace!("audio output: {} Hz, {} channels, buffer {:?}", out_rate, channels, supported.buffer_size());
 
+    let mut mix = move |out: &mut [f32], info: &cpal::OutputCallbackInfo| {
+        out.fill(0.0);
+        let playing = shared.playing.load(Ordering::Relaxed);
+        if playing != was_playing {
+            was_playing = playing;
+            if playing {
+                let ts = info.timestamp();
+                let latency = ts.playback.duration_since(ts.callback);
+                trace!("audio callback plays ({} frames per callback, heard {:?} later)", out.len() / channels.max(1), latency);
+            }
+        }
+        if !playing && scrub.sounding(shared.scrubbing.load(Ordering::Relaxed)) {
+            let tracks: Vec<TrackEdit> = match shared.mix.lock() {
+                Ok(m) => m.tracks.clone(),
+                Err(_) => return,
+            };
+            let target = shared.pos.load(Ordering::Relaxed) as f64;
+            let active = shared.scrubbing.load(Ordering::Relaxed);
+            let (peak, rms, track_levels) = scrub.render(out, channels, &pcm, &tracks, target, active);
+            if let Ok(mut m) = shared.mix.lock() {
+                m.track_levels = track_levels;
+                m.master_level = (peak, rms);
+            }
+            return;
+        }
+        scrub.reset();
+        if !playing {
+            // Silence: report zero so meters fall and the UI can stop redrawing.
+            if let Ok(mut m) = shared.mix.try_lock() {
+                m.track_levels.iter_mut().for_each(|l| *l = (0.0, 0.0));
+                m.master_level = (0.0, 0.0);
+            }
+            return;
+        }
+        let tracks: Vec<TrackEdit> = match shared.mix.lock() {
+            Ok(m) => m.tracks.clone(),
+            Err(_) => return,
+        };
+        // Volume can ramp (keyframes): evaluate it every 256 samples (~5 ms)
+        // and interpolate in between, which is smooth and cheap.
+        let mut gains: Vec<f32> = Vec::new();
+        let mut next_eval = 0u64;
+        let end = shared.end.load(Ordering::Relaxed);
+        let mut pos = shared.pos.load(Ordering::Relaxed);
+        let mut track_peak = vec![0.0f32; n_tracks];
+        let mut track_sq = vec![0.0f64; n_tracks];
+        let (mut m_peak, mut m_sq, mut count) = (0.0f32, 0.0f64, 0usize);
+
+        for frame in out.chunks_mut(channels) {
+            if pos >= end {
+                shared.playing.store(false, Ordering::Relaxed);
+                break;
+            }
+            if pos >= next_eval {
+                let t = pos as f64 / PREVIEW_RATE as f64;
+                gains = tracks.iter().map(|tr| tr.gain_at(t)).collect();
+                next_eval = pos + 256;
+            }
+            let (mut l, mut r) = (0.0f32, 0.0f32);
+            for (t, track) in pcm.tracks().iter().enumerate() {
+                // Not decoded yet (just opened, jumped far ahead): silence.
+                if let Some((a, b)) = track.frame(pos as usize) {
+                    let g = gains.get(t).copied().unwrap_or(1.0);
+                    let (tl, tr) = (a * g, b * g);
+                    l += tl;
+                    r += tr;
+                    let a = tl.abs().max(tr.abs());
+                    track_peak[t] = track_peak[t].max(a);
+                    track_sq[t] += (a as f64).powi(2);
+                }
+            }
+            m_peak = m_peak.max(l.abs().max(r.abs()));
+            m_sq += (l.abs().max(r.abs()) as f64).powi(2);
+            count += 1;
+            match channels {
+                1 => frame[0] = (l + r) * 0.5,
+                _ => {
+                    frame[0] = l;
+                    frame[1] = r;
+                }
+            }
+            frac += step;
+            let whole = frac.floor();
+            pos += whole as u64;
+            frac -= whole;
+        }
+        shared.pos.store(pos, Ordering::Relaxed);
+        shared.moved_at_us.store((uptime() * 1e6) as u64, Ordering::Relaxed);
+        shared.step_us.store((out.len() / channels.max(1)) as u64 * 1_000_000 / out_rate.max(1.0) as u64, Ordering::Relaxed);
+
+        if count > 0 {
+            if let Ok(mut m) = shared.mix.lock() {
+                let rms = |sq: f64| (sq / count as f64).sqrt() as f32;
+                m.track_levels = (0..n_tracks).map(|t| (track_peak[t], rms(track_sq[t]))).collect();
+                m.master_level = (m_peak, rms(m_sq));
+            }
+        }
+    };
+    let muted = dev_muted();
     let stream = device
         .build_output_stream::<f32, _, _>(
             config,
             move |out: &mut [f32], info: &cpal::OutputCallbackInfo| {
-                out.fill(0.0);
-                let playing = shared.playing.load(Ordering::Relaxed);
-                if playing != was_playing {
-                    was_playing = playing;
-                    if playing {
-                        let ts = info.timestamp();
-                        let latency = ts.playback.duration_since(ts.callback);
-                        trace!("audio callback plays ({} frames per callback, heard {:?} later)", out.len() / channels.max(1), latency);
-                    }
-                }
-                if !playing && scrub.sounding(shared.scrubbing.load(Ordering::Relaxed)) {
-                    let tracks: Vec<TrackEdit> = match shared.mix.lock() {
-                        Ok(m) => m.tracks.clone(),
-                        Err(_) => return,
-                    };
-                    let target = shared.pos.load(Ordering::Relaxed) as f64;
-                    let active = shared.scrubbing.load(Ordering::Relaxed);
-                    let (peak, rms, track_levels) = scrub.render(out, channels, &pcm, &tracks, target, active);
-                    if let Ok(mut m) = shared.mix.lock() {
-                        m.track_levels = track_levels;
-                        m.master_level = (peak, rms);
-                    }
-                    return;
-                }
-                scrub.reset();
-                if !playing {
-                    // Silence: report zero so meters fall and the UI can stop redrawing.
-                    if let Ok(mut m) = shared.mix.try_lock() {
-                        m.track_levels.iter_mut().for_each(|l| *l = (0.0, 0.0));
-                        m.master_level = (0.0, 0.0);
-                    }
-                    return;
-                }
-                let tracks: Vec<TrackEdit> = match shared.mix.lock() {
-                    Ok(m) => m.tracks.clone(),
-                    Err(_) => return,
-                };
-                // Volume can ramp (keyframes): evaluate it every 256 samples (~5 ms)
-                // and interpolate in between, which is smooth and cheap.
-                let mut gains: Vec<f32> = Vec::new();
-                let mut next_eval = 0u64;
-                let end = shared.end.load(Ordering::Relaxed);
-                let mut pos = shared.pos.load(Ordering::Relaxed);
-                let mut track_peak = vec![0.0f32; n_tracks];
-                let mut track_sq = vec![0.0f64; n_tracks];
-                let (mut m_peak, mut m_sq, mut count) = (0.0f32, 0.0f64, 0usize);
-
-                for frame in out.chunks_mut(channels) {
-                    if pos >= end {
-                        shared.playing.store(false, Ordering::Relaxed);
-                        break;
-                    }
-                    if pos >= next_eval {
-                        let t = pos as f64 / PREVIEW_RATE as f64;
-                        gains = tracks.iter().map(|tr| tr.gain_at(t)).collect();
-                        next_eval = pos + 256;
-                    }
-                    let (mut l, mut r) = (0.0f32, 0.0f32);
-                    for (t, track) in pcm.tracks().iter().enumerate() {
-                        // Not decoded yet (just opened, jumped far ahead): silence.
-                        if let Some((a, b)) = track.frame(pos as usize) {
-                            let g = gains.get(t).copied().unwrap_or(1.0);
-                            let (tl, tr) = (a * g, b * g);
-                            l += tl;
-                            r += tr;
-                            let a = tl.abs().max(tr.abs());
-                            track_peak[t] = track_peak[t].max(a);
-                            track_sq[t] += (a as f64).powi(2);
-                        }
-                    }
-                    m_peak = m_peak.max(l.abs().max(r.abs()));
-                    m_sq += (l.abs().max(r.abs()) as f64).powi(2);
-                    count += 1;
-                    match channels {
-                        1 => frame[0] = (l + r) * 0.5,
-                        _ => {
-                            frame[0] = l;
-                            frame[1] = r;
-                        }
-                    }
-                    frac += step;
-                    let whole = frac.floor();
-                    pos += whole as u64;
-                    frac -= whole;
-                }
-                shared.pos.store(pos, Ordering::Relaxed);
-                shared.moved_at_us.store((uptime() * 1e6) as u64, Ordering::Relaxed);
-                shared.step_us.store((out.len() / channels.max(1)) as u64 * 1_000_000 / out_rate.max(1.0) as u64, Ordering::Relaxed);
-
-                if count > 0 {
-                    if let Ok(mut m) = shared.mix.lock() {
-                        let rms = |sq: f64| (sq / count as f64).sqrt() as f32;
-                        m.track_levels = (0..n_tracks).map(|t| (track_peak[t], rms(track_sq[t]))).collect();
-                        m.master_level = (m_peak, rms(m_sq));
-                    }
+                mix(out, info);
+                if muted {
+                    out.fill(0.0);
                 }
             },
             |e| eprintln!("audio output error: {e}"),
@@ -1027,6 +1034,13 @@ fn start_audio(shared: Arc<Shared>, pcm: Arc<Pcm>) -> Result<cpal::Stream, Strin
         .map_err(|e| e.to_string())?;
     stream.play().map_err(|e| e.to_string())?;
     Ok(stream)
+}
+
+/// Dev aid: `HESTECLIPS_MUTE=1` plays everything silently, with the same
+/// timing (test instances that play and scrub clips).
+pub(crate) fn dev_muted() -> bool {
+    static MUTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *MUTED.get_or_init(|| std::env::var_os("HESTECLIPS_MUTE").is_some())
 }
 
 /// Only the sound of a short clip, through the same engine as the editor's
