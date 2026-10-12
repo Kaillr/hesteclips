@@ -119,7 +119,8 @@ impl AacEncoder {
         self.pending.extend_from_slice(samples);
         let mut out = Vec::new();
         while self.pending.len() >= AAC_FRAMES * 2 {
-            if let Some(p) = self.encode_one() {
+            let feed = Feed { samples: self.pending.as_ptr(), frames: AAC_FRAMES as u32, given: false };
+            if let Some(p) = self.encode_one(feed) {
                 out.push(p);
             }
             self.pending.drain(..AAC_FRAMES * 2);
@@ -127,8 +128,25 @@ impl AacEncoder {
         out
     }
 
-    fn encode_one(&mut self) -> Option<AacPacket> {
-        let mut feed = Feed { samples: self.pending.as_ptr(), frames: AAC_FRAMES as u32, given: false };
+    /// The end of the sound: the last partial packet (padded with silence) and
+    /// the packets the encoder still holds back for its delay.
+    pub fn finish(&mut self) -> Vec<AacPacket> {
+        let mut out = Vec::new();
+        if !self.pending.is_empty() {
+            let pad = AAC_FRAMES * 2 - self.pending.len();
+            out.extend(self.push(&vec![0.0; pad]));
+        }
+        // An empty feed ends the stream; each call then returns one held-back
+        // packet, and none once it's empty. Bounded in case it never says so.
+        for _ in 0..16 {
+            let feed = Feed { samples: ptr::null(), frames: 0, given: false };
+            let Some(p) = self.encode_one(feed) else { break };
+            out.push(p);
+        }
+        out
+    }
+
+    fn encode_one(&mut self, mut feed: Feed) -> Option<AacPacket> {
         let mut buf = vec![0u8; 2048];
         let mut list = AudioBufferList {
             mNumberBuffers: 1,
@@ -175,6 +193,12 @@ unsafe extern "C-unwind" fn input_proc(
 ) -> i32 {
     let feed = unsafe { &mut *(user as *mut Feed) };
     let list = unsafe { &mut *io_data.as_ptr() };
+    if feed.frames == 0 {
+        // No packets and no error: the end of the stream.
+        unsafe { *io_packets.as_ptr() = 0 };
+        list.mBuffers[0].mDataByteSize = 0;
+        return 0;
+    }
     if feed.given {
         unsafe { *io_packets.as_ptr() = 0 };
         // Non-zero tells the converter "no data right now" without ending the stream.

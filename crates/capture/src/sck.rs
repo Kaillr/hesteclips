@@ -329,6 +329,11 @@ fn spawn_aac(track: usize, mut enc: AacEncoder, rx: mpsc::Receiver<Vec<f32>>, ou
                 }
             }
         }
+        // The mixer is done: what the encoder still holds is the last ~50 ms
+        // of the recording.
+        for packet in enc.finish() {
+            let _ = out.send(writer::Command::Media(Media::Audio { track, packet }));
+        }
     })
 }
 
