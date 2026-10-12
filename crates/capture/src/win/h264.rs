@@ -208,7 +208,7 @@ fn configure_hardware(activate: &IMFActivate, gpu: &Gpu, width: u32, height: u32
 /// Rate control, GOP and latency, then the media types, then start streaming.
 fn configure(mft: &IMFTransform, width: u32, height: u32, s: &EncodeSettings) -> Result<()> {
     let bitrate = s.video_bitrate_kbps.saturating_mul(1000);
-    let gop = s.fps * s.keyframe_interval_secs.max(1);
+    let gop = crate::keyframe_every(s.fps);
     unsafe {
         if let Ok(api) = mft.cast::<ICodecAPI>() {
             // Each is best effort: encoders support different subsets.

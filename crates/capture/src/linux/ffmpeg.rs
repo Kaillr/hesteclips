@@ -207,7 +207,7 @@ impl H264 {
     pub(crate) fn start(width: u32, height: u32, s: &EncodeSettings, out: Sender<WriterCommand>) -> Result<Self> {
         let codec = encoder(s.use_hardware)?;
         eprintln!("video encoder: {} ({}x{} at {} fps)", codec.label(), width, height, s.fps);
-        let gop = s.fps * s.keyframe_interval_secs.max(1);
+        let gop = crate::keyframe_every(s.fps);
         let mut child = ffmpeg()
             .args(codec.args(width, height, s.fps, s.video_bitrate_kbps.max(100), gop))
             .stdin(Stdio::piped())

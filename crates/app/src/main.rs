@@ -733,7 +733,6 @@ impl App {
             blend_samples: self.settings.blend_samples(),
             video_bitrate_kbps: self.settings.video_bitrate_mbps * 1000,
             target_height: self.settings.resolution.height(),
-            keyframe_interval_secs: self.settings.keyframe_interval_secs,
             use_hardware: self.settings.encoder != Encoder::Software,
             replay_seconds: self.settings.replay_seconds,
             video: self.video_source(),

@@ -627,11 +627,6 @@ impl App {
                 }
             });
         });
-
-        divider(ui);
-        row(ui, "Keyframe interval", Some("Shorter: edits save faster, files get a little bigger."), |ui| {
-            ui.add(egui::Slider::new(&mut self.settings.keyframe_interval_secs, 1..=10).suffix(" s"));
-        });
     }
 
     /// One shortcut: a button showing the keys (click to record new ones), and

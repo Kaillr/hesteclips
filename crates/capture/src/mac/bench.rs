@@ -32,7 +32,6 @@ fn settings(fps: u32, kbps: u32) -> EncodeSettings {
         blend_samples: 1,
         video_bitrate_kbps: kbps,
         target_height: None,
-        keyframe_interval_secs: 2,
         use_hardware: true,
         replay_seconds: 60,
         video: VideoSource::Screen { id: String::new(), hook: Default::default() },

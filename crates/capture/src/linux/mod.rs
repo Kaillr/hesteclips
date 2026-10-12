@@ -201,7 +201,7 @@ impl Recorder for LinuxRecorder {
         self.container_ext = if settings.container_ext == "mov" { "mov".into() } else { "mp4".into() };
         std::fs::create_dir_all(&settings.output_dir)?;
 
-        let mut s = settings.clone();
+        let s = settings.clone();
         let target = match mode {
             Mode::Record => {
                 let file = self.output_dir.join(format!("recording_{}.{}", timestamp(), self.container_ext));
@@ -209,8 +209,6 @@ impl Recorder for LinuxRecorder {
                 Target::Record(in_progress(&file))
             }
             Mode::ReplayBuffer => {
-                // 1 s keyframes: a saved clip starts at most 1 s before the window.
-                s.keyframe_interval_secs = 1;
                 self.current_file = None;
                 Target::Replay(settings.replay_seconds as f64)
             }

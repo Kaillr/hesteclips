@@ -110,7 +110,7 @@ impl Recorder for SckRecorder {
         self.container_ext = if settings.container_ext == "mov" { "mov".into() } else { "mp4".into() };
         std::fs::create_dir_all(&settings.output_dir)?;
 
-        let mut s = settings.clone();
+        let s = settings.clone();
         let target = match mode {
             Mode::Record => {
                 let file = self.output_dir.join(format!("recording_{}.{}", timestamp(), self.container_ext));
@@ -118,8 +118,6 @@ impl Recorder for SckRecorder {
                 Target::Record(in_progress(&file))
             }
             Mode::ReplayBuffer => {
-                // 1 s keyframes: a saved clip starts at most 1 s before the window.
-                s.keyframe_interval_secs = 1;
                 self.current_file = None;
                 Target::Replay(settings.replay_seconds as f64)
             }
@@ -776,7 +774,7 @@ impl Encoder {
             };
             let session = CFRetained::from_raw(session);
 
-            let kf = s.keyframe_interval_secs.max(1);
+            let gop = crate::keyframe_every(s.fps);
             let set = |key: &CFString, value: &CFType| VTSessionSetProperty(&session, key, Some(value));
             set(kVTCompressionPropertyKey_RealTime, CFBoolean::new(true));
             set(kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_H264_High_AutoLevel);
@@ -784,8 +782,8 @@ impl Encoder {
             set(kVTCompressionPropertyKey_AllowFrameReordering, CFBoolean::new(false));
             set(kVTCompressionPropertyKey_AverageBitRate, &CFNumber::new_i64(s.video_bitrate_kbps as i64 * 1000));
             set(kVTCompressionPropertyKey_ExpectedFrameRate, &CFNumber::new_i32(s.fps as i32));
-            set(kVTCompressionPropertyKey_MaxKeyFrameInterval, &CFNumber::new_i32((s.fps * kf) as i32));
-            set(kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, &CFNumber::new_f64(kf as f64));
+            set(kVTCompressionPropertyKey_MaxKeyFrameInterval, &CFNumber::new_i32(gop as i32));
+            set(kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, &CFNumber::new_f64(gop as f64 / s.fps.max(1) as f64));
             set(kVTCompressionPropertyKey_ColorPrimaries, kCVImageBufferColorPrimaries_ITU_R_709_2);
             set(kVTCompressionPropertyKey_TransferFunction, kCVImageBufferTransferFunction_ITU_R_709_2);
             set(kVTCompressionPropertyKey_YCbCrMatrix, kCVImageBufferYCbCrMatrix_ITU_R_709_2);
@@ -905,7 +903,7 @@ fn is_keyframe(sample: &CMSampleBuffer) -> bool {
 pub(crate) fn probe_encoder(width: usize, height: usize) -> String {
     let s = EncodeSettings {
         output_dir: std::env::temp_dir(), container_ext: "mp4".into(), fps: 60, blend_samples: 1, video_bitrate_kbps: 20000, target_height: None,
-        keyframe_interval_secs: 2, use_hardware: true, replay_seconds: 5, video: crate::VideoSource::Screen { id: String::new(), hook: Default::default() },
+        use_hardware: true, replay_seconds: 5, video: crate::VideoSource::Screen { id: String::new(), hook: Default::default() },
         away_screen: None, webcam: None, sources: Vec::new(),
     };
     match probe_video_format(width, height, &s) {

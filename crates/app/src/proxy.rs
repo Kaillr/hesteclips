@@ -746,7 +746,8 @@ mod hw {
 
     /// Frames per chunk: built one at a time, nearest the player first; one
     /// left half-built when the player moves to another not built yet.
-    /// 2 s at 60 fps (a keyframe at the start of each, as clips are recorded).
+    /// 2 s at 60 fps (starting on a keyframe, as clips are recorded: one a
+    /// second, at most 120 frames apart).
     const CHUNK: usize = 120;
 
     enum Job {

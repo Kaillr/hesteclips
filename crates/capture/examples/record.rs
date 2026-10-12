@@ -51,7 +51,6 @@ default: {:?}", d.inputs.iter().map(|i| &i.name).collect::<Vec<_>>(), d.default_
             Some(h) => Some(h),
             None => Some(720),
         },
-        keyframe_interval_secs: 2,
         use_hardware: env("SOFTWARE").is_none(),
         replay_seconds: 5,
         video: {

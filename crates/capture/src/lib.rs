@@ -475,6 +475,19 @@ pub fn frames_skipped() -> u64 {
 /// AAC bitrate per audio track, bits per second.
 pub const AUDIO_BITRATE: u32 = 192_000;
 
+/// Frames from one keyframe to the next when recording at `fps`: one a
+/// second, but never more than 120 frames apart. A clip saved from the replay
+/// buffer starts on a keyframe (so at most a second early), and scrubbing and
+/// saving an edit decode from the keyframe before a frame: the gap in frames is
+/// what they cost (at 240 fps, a keyframe every 2 s made scrubbing back
+/// stall). Measured with the NVIDIA hardware encoder at 15 Mbps, 5 s of osu!
+/// and of CS2: at 240 fps, 120 frames instead of 480 made files 0.4-4%
+/// bigger and VMAF at most 0.5 lower; at 60 fps, a second instead of two,
+/// about 1% bigger and at most 0.13 lower.
+pub fn keyframe_every(fps: u32) -> u32 {
+    fps.clamp(1, 120)
+}
+
 /// Everything the backend needs to start a capture. The app builds this from its
 /// own richer `RecordSettings`.
 #[derive(Debug, Clone)]
@@ -489,7 +502,6 @@ pub struct EncodeSettings {
     pub video_bitrate_kbps: u32,
     /// Downscale target height, or `None` to keep native resolution.
     pub target_height: Option<u32>,
-    pub keyframe_interval_secs: u32,
     /// Use a hardware encoder (VideoToolbox, or the GPU's Media Foundation
     /// encoder on Windows) vs. software.
     pub use_hardware: bool,

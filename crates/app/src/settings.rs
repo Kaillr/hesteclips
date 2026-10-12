@@ -554,9 +554,6 @@ pub struct RecordSettings {
     pub encoder: Encoder,
     pub container: Container,
     pub rate_control: RateControl,
-    /// Seconds between keyframes. Lower = more seekable & cleaner replay cuts,
-    /// larger files. 2s is a sane default.
-    pub keyframe_interval_secs: u32,
     pub output_dir: PathBuf,
     /// Save each clip in a folder named after the game it's of (`osu!/`,
     /// `Desktop/` when there's no game), shown as categories in the library.
@@ -630,7 +627,6 @@ impl Default for RecordSettings {
             encoder: Encoder::Auto,
             container: Container::Mp4,
             rate_control: RateControl::Cbr,
-            keyframe_interval_secs: 2,
             output_dir: default_output_dir(),
             folder_per_game: true,
             game_folders: Default::default(),
