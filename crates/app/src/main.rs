@@ -84,7 +84,7 @@ impl log::Log for GpuLog {
 }
 
 /// The capture bar's skipped-frames warning stays this long after the last
-/// skip, and its share is of this last stretch's frames.
+/// skip, and counts the frames skipped in this last stretch.
 const SKIP_WINDOW: Duration = Duration::from_secs(5);
 
 fn main() -> eframe::Result<()> {
@@ -347,7 +347,7 @@ struct App {
     /// while it's happening.
     skipped_seen: (u64, Option<Instant>),
     /// The capture's frame counts (skipped, encoded) as they were over the
-    /// last few seconds, oldest first: the warning says what share is skipped.
+    /// last few seconds, oldest first: the warning counts what was skipped.
     skip_counts: std::collections::VecDeque<(Instant, u64, u64)>,
     /// A replay clip is being written; shows a placeholder card until it lands.
     /// Clips being written: replay clips still saving, and a stopped recording
@@ -1311,19 +1311,22 @@ impl App {
     }
 
     /// Shown while frames are being skipped (and a few seconds after): the
-    /// computer can't keep up with the recording settings. Says how much (of
-    /// the last few seconds' frames: a few now and then over a long recording
-    /// are normal, not worth a total), what that does to the clip, and what
-    /// the settings are; a click opens Settings.
+    /// computer can't keep up with the recording settings. Says how many
+    /// frames (of the last few seconds': a few now and then over a long
+    /// recording are normal, not worth a total), what that does to the clip,
+    /// and what the settings are; a click opens Settings.
     fn skipped_warning(&mut self, ui: &mut egui::Ui) {
         let Some(at) = self.skipped_seen.1.filter(|t| t.elapsed() < SKIP_WINDOW) else { return };
-        ui.add_space(10.0);
-        let amber = Color32::from_rgb(230, 170, 40);
-        let share = |skipped: u64, encoded: u64| skipped as f64 * 100.0 / (skipped + encoded).max(1) as f64;
-        let percent = |p: f64| if p < 1.0 { format!("{p:.1}%") } else { format!("{p:.0}%") };
+        // Of the last few seconds' frames: how many were skipped, of how many.
         let (skipped, encoded) = self.skip_counts.back().map_or((self.skipped_seen.0, 0), |&(_, s, e)| (s, e));
         let (s0, e0) = self.skip_counts.front().map_or((0, 0), |&(_, s, e)| (s, e));
-        let recent = share(skipped - s0.min(skipped), encoded - e0.min(encoded));
+        let lost = skipped - s0.min(skipped);
+        let all = lost + encoded - e0.min(encoded);
+        if lost == 0 {
+            return;
+        }
+        ui.add_space(10.0);
+        let amber = Color32::from_rgb(230, 170, 40);
         let r = &self.settings;
         let size = match r.resolution {
             settings::OutputResolution::Native => "native resolution".to_owned(),
@@ -1331,16 +1334,16 @@ impl App {
         };
         let blending = r.blend_samples() > 1;
         let tip = format!(
-            "{} of the frames in the last {} seconds were skipped. \
+            "{lost} of the {all} frames in the last {} seconds were skipped. \
              The video encoder couldn't keep up: where a frame is skipped, the one before stays on screen longer, so the clip stutters there.\n\n\
              Recording at {size}, {} fps{}. A lower frame rate or resolution gives it less to do{}. Click to open Settings.",
-            percent(recent),
             SKIP_WINDOW.as_secs(),
             r.fps,
             if blending { format!(", blended from {} fps", r.fps * r.blend_samples()) } else { String::new() },
             if blending { ", and so does turning off frame blending" } else { "" },
         );
-        let label = egui::Label::new(RichText::new(format!("Skipping {} of frames", percent(recent))).size(13.0).strong().color(amber)).sense(egui::Sense::click());
+        let text = if lost == 1 { "Skipped 1 frame".to_owned() } else { format!("Skipped {lost} frames") };
+        let label = egui::Label::new(RichText::new(text).size(13.0).strong().color(amber)).sense(egui::Sense::click());
         let response = ui.add(label).on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand);
         if response.clicked() {
             self.page = Page::Settings;
