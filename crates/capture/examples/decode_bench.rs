@@ -7,6 +7,50 @@ fn main() -> anyhow::Result<()> {
     let path = std::path::PathBuf::from(std::env::args().nth(1).expect("clip path"));
     let width: u32 = std::env::args().nth(2).and_then(|w| w.parse().ok()).unwrap_or(1280);
 
+    // THROUGHPUT=1: frames decoded a second, as scrubbing does it: from each
+    // keyframe to the frame before the next (a jump's work), with nothing
+    // out but the last (silent), with every frame out as the app's
+    // full-size shared frames, and as its small ones (SMALL=width, 1280).
+    if std::env::var_os("THROUGHPUT").is_some() {
+        use capture::win::decode::Decoder;
+        let luid = Decoder::default_luid();
+        let mut d = Decoder::open_direct(&path, u32::MAX, luid)?;
+        let keys = d.keyframes();
+        let gaps: Vec<(u64, u64)> = keys.windows(2).map(|w| (w[0], w[1] - 1)).take(8).collect();
+        anyhow::ensure!(!gaps.is_empty(), "fewer than two keyframes");
+        let small_w = std::env::var("SMALL").ok().and_then(|w| w.parse().ok()).unwrap_or(1280);
+        let small = d.small_frames(small_w, 256 << 20)?;
+        let total: u64 = gaps.iter().map(|(a, b)| b - a).sum();
+        let rate = |secs: f64| total as f64 / secs;
+        // Silent: the keyframe, then on to the gap's last frame in one go.
+        let mut secs = 0.0;
+        for &(k, last) in &gaps {
+            d.frame(k)?;
+            let s = Instant::now();
+            d.frame(last)?;
+            secs += s.elapsed().as_secs_f64();
+        }
+        println!("{} gaps of ~{} frames: silent {:.0} fps", gaps.len(), total / gaps.len() as u64, rate(secs));
+        // Every frame out, full size (shared, dropped at once) and small.
+        for (label, small_out) in [("full-size frames out", false), ("small frames out", true)] {
+            let mut secs = 0.0;
+            for &(k, last) in &gaps {
+                if small_out { d.frame_small(k)? } else { d.frame(k)? };
+                let s = Instant::now();
+                let mut at = k;
+                while at < last {
+                    match if small_out { d.next_small()? } else { d.next()? } {
+                        Some(p) => at = p.index,
+                        None => break,
+                    }
+                }
+                d.flush();
+                secs += s.elapsed().as_secs_f64();
+            }
+            println!("{label}: {:.0} fps ({small} small frames of {small_w} px)", rate(secs));
+        }
+        return Ok(());
+    }
     // DIRECT=1: jumps through the decoder fed directly against the file
     // reader's, alternating so other load hits both alike. Keyframes (every
     // KEY_EVERY frames, default 120) and halfway between.

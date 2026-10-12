@@ -218,6 +218,13 @@ impl Decoder {
         Self::open_with(path, width, share_on, std::env::var_os("HESTECLIPS_NO_DIRECT_DECODE").is_none())
     }
 
+    /// The default graphics card's LUID (to share frames on it, as the app
+    /// does with its renderer's; for benchmarks).
+    pub fn default_luid() -> Option<u64> {
+        com_init();
+        Gpu::new().ok()?.adapter_luid()
+    }
+
     /// Frames at `width` wide, back on the CPU as RGBA (thumbnails, scrub frames).
     pub fn open_rgba(path: &Path, width: u32) -> Result<Self> {
         Self::open(path, width, None)
