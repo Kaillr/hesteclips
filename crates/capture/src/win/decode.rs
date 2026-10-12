@@ -378,12 +378,20 @@ impl Decoder {
         self.frame_as(index, false)
     }
 
-    /// [`Self::frame`], as a small frame (see [`Self::small_frames`]).
+    /// [`Self::frame`], as a small frame (see [`Self::small_frames`]); call
+    /// [`Self::flush`] before drawing it.
     pub fn frame_small(&mut self, index: u64) -> Result<Option<Picture>> {
         self.frame_as(index, true)
     }
 
-    /// [`Self::next`], as a small frame (see [`Self::small_frames`]).
+    /// Send the small frames made since the last flush to the GPU: before any
+    /// of them is drawn (the renderer would wait for them forever).
+    pub fn flush(&self) {
+        unsafe { self.gpu.context.Flush() };
+    }
+
+    /// [`Self::next`], as a small frame (see [`Self::small_frames`]); call
+    /// [`Self::flush`] before drawing it.
     pub fn next_small(&mut self) -> Result<Option<Picture>> {
         match self.read()? {
             Some((i, sample)) => self.picture_as(i, &sample, true).map(Some),
@@ -568,7 +576,8 @@ impl Decoder {
             let slot = free_slot(&pool)?;
             convert.run(&texture, slice, slot)?;
             let (width, height) = convert.size;
-            let surface = hand_over(&self.gpu, pool, slot)?;
+            // Sent to the GPU with the next flush (see `Self::flush`).
+            let surface = hand_over(&self.gpu, pool, slot, false)?;
             return Ok(Picture { index, width, height, rgba: Vec::new(), gpu: Some(surface) });
         }
         let Some(pool) = self.pool.clone() else {
@@ -587,7 +596,7 @@ impl Decoder {
                 self.gpu.context.CopySubresourceRegion(&pool.textures[slot], 0, 0, 0, 0, &texture, slice, Some(&region));
             },
         }
-        let surface = hand_over(&self.gpu, pool, slot)?;
+        let surface = hand_over(&self.gpu, pool, slot, true)?;
         Ok(Picture { index, width: self.width, height: self.height, rgba: Vec::new(), gpu: Some(surface) })
     }
 }
@@ -608,8 +617,9 @@ fn free_slot(pool: &Surfaces) -> Result<usize> {
 }
 
 /// `slot` of `pool`, just written (queued on the GPU), as a frame for the
-/// renderer: it waits for the pool's fence before reading it.
-fn hand_over(gpu: &Gpu, pool: Arc<Surfaces>, slot: usize) -> Result<Surface> {
+/// renderer: it waits for the pool's fence before reading it. `flush`: send
+/// the work to the GPU now (else the caller flushes before it's drawn).
+fn hand_over(gpu: &Gpu, pool: Arc<Surfaces>, slot: usize, flush: bool) -> Result<Surface> {
     let ready = match &pool.fence {
         // The other device waits for this value before reading the frame.
         Some((fence, _)) => {
@@ -617,7 +627,9 @@ fn hand_over(gpu: &Gpu, pool: Arc<Surfaces>, slot: usize) -> Result<Surface> {
             unsafe {
                 let ctx4: ID3D11DeviceContext4 = gpu.context.cast()?;
                 ctx4.Signal(fence, v)?;
-                gpu.context.Flush();
+                if flush {
+                    gpu.context.Flush();
+                }
             }
             v
         }

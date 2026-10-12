@@ -287,6 +287,9 @@ impl Decoder {
         self.next()
     }
 
+    /// Nothing to send: frames are finished when handed out.
+    pub fn flush(&self) {}
+
     /// "direct": frames always come from our own index.
     pub fn way(&self) -> &'static str {
         "direct"

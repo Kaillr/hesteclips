@@ -7,26 +7,24 @@
 //! - Playing, it stays a dozen frames ahead of the clock.
 //! - Scrubbing, it decodes the frame under the playhead, live, with nothing
 //!   built beforehand. A frame is decoded from the keyframe before it (once
-//!   a second in recordings; a keyframe alone takes 1-15 ms), so:
-//!   - forward, far from the picture shown, it shows frames on the way
-//!     there, a few frames apart, until it's there or the playhead moves on
-//!     (near, the next frames are decoded already, or quick to decode on);
-//!   - back, every frame decoded from a keyframe on the way to the one asked
-//!     for is kept (small, see [`SMALL_WIDTH`]: a keyframe gap and a half
-//!     of them), and while idle the gap before them is decoded too, 8 frames
-//!     at a time, on from where it stopped: a step back is a frame at hand,
-//!     either way, no frame is decoded twice, and a newer request never
-//!     waits long. The full-size frame comes when the scrub stops;
-//!   - back fast to a frame not kept, the first frame on the way (its
-//!     keyframe) at once.
+//!   a second in recordings; a keyframe alone takes 1-15 ms), so every frame
+//!   decoded on the way to the one asked for is kept (small, see
+//!   [`SMALL_WIDTH`]: a keyframe gap and a half of them), and while idle the
+//!   ones on the way are decoded too (going back, the gap before those kept;
+//!   forward, on after them), 8 frames at a time, on from where it stopped:
+//!   a frame kept shows at once either way, no frame is decoded twice, and a
+//!   newer request never waits long. Fast, or forward far from the picture
+//!   shown, the frames on the way show as they come (the keyframe first).
+//!   The full-size frame comes when the scrub stops (on a 240 fps recording
+//!   with 480 frames between keyframes, 30-480 ms: decoded from the keyframe).
 //!
-//!   Measured with `HESTECLIPS_DEV_DRAG` (debug build, steady, frames behind
-//!   the playhead): 1080p60 recording, 1-10× back 0.2-2.8; a 1440p clip with
-//!   B-frames, 1-3× 0.2-0.8, 6× 2, 10× 12; a 240 fps recording with 480
-//!   frames between keyframes, 1-2× 1-4 once its first gap is decoded (a
-//!   fast sweep 100-200 behind: the decoder does ~1300 frames a second).
-//!   Forward, a new picture with nearly every redraw at 1-5×, 65-85 a second
-//!   at 30×.
+//!   Measured with `HESTECLIPS_DEV_DRAG` (debug build; a release build is
+//!   the same: the decoder sets the pace), frames behind the playhead once
+//!   steady: 1080p60 recording, 1-10× back 0.2-7, 1× back and forth 0.2,
+//!   30× forward 40; a 1440p clip with B-frames, 1-3× back 0.2-0.8, 30×
+//!   forward 67; a 240 fps recording with 480 frames between keyframes, 1×
+//!   either way 1, 5× sweeps 26-32, 10× sweeps ~70 (the first sweep over a
+//!   stretch ~100-270, decoding it).
 //!
 //! Commands are coalesced: only the newest request matters, so a burst of
 //! seeks costs one decode.
@@ -241,16 +239,16 @@ impl Video {
             // A command that came in while handling one.
             let mut pending: Option<Cmd> = None;
             // Scrubbing: frames kept to show again at once, either way (see
-            // `Kept`), small once going back; the decoder's small frames, once
-            // asked for (how many); a stretch from a keyframe being decoded
-            // into them (the decoder's next frame follows `.0`, on up to `.1`);
-            // and where the kept frames start when filling in before them gave
-            // nothing more (the start).
+            // `Kept`), small; the decoder's small frames, once asked for (how
+            // many); the stretch decoded into them last (the decoder's next
+            // frame follows `.0`, on up to `.1`: done once `.0` gets there);
+            // and where filling in gave nothing more (the way, and the start
+            // or end of the frames kept).
             let mut kept = Kept::default();
             let mut small: Option<usize> = None;
             let mut asked_small = false;
             let mut filling: Option<(u64, u64)> = None;
-            let mut stuck: Option<u64> = None;
+            let mut stuck: Option<(i8, u64)> = None;
             // The longest gap between keyframes, in frames.
             let gop = keys.windows(2).map(|w| w[1] - w[0]).max().unwrap_or((fps * 2.0) as u64).max(1);
             let full_cap = match dec.pool_size() {
@@ -266,17 +264,23 @@ impl Video {
             let mut last_scrub: Option<(u64, std::time::Instant)> = None;
             let mut speed = 0.0f64;
             'work: loop {
-                let backward = !playing && speed < 0.0 && last_scrub.is_some();
+                // Scrubbing with frames kept, which way: back (-1), forward (1,
+                // with small frames: without, playback's read-ahead serves).
+                let dir: i8 = match (playing, last_scrub) {
+                    (false, Some(_)) if speed < 0.0 => -1,
+                    (false, Some(_)) if speed > 0.0 && small.is_some() => 1,
+                    _ => 0,
+                };
                 let room = {
                     let s = shared.lock().unwrap();
-                    // Going back, frames after the playhead aren't needed.
-                    !at_end && !backward && s.ahead.len() < if playing { ahead_playing } else { AHEAD_PAUSED }
+                    // Scrubbing, the frames kept are the read-ahead.
+                    !at_end && dir == 0 && s.ahead.len() < if playing { ahead_playing } else { AHEAD_PAUSED }
                 };
-                // Going back: on with the stretch being decoded while it's
-                // before the playhead, else the one before the frames kept.
-                let prefetch = backward
+                // Filling in the frames on the way: on with the stretch under
+                // way if it's still wanted, else the next one.
+                let prefetch = dir != 0
                     && last_scrub.is_some_and(|(at, _)| {
-                        filling.is_some_and(|(last, _)| last < at) || fill_target(&kept, &keys, at, kept_cap(small), stuck).is_some()
+                        filling.is_some_and(|f| wanted(f, at, dir)) || fill_target(&kept, &keys, at, kept_cap(small), stuck, dir).is_some()
                     });
                 // Busy: just check for news. Full and playing: wait for the clock
                 // to take frames. Full and paused: sleep until told something.
@@ -376,25 +380,29 @@ impl Video {
                                 None => {
                                     let key = keys.partition_point(|&k| k <= i).checked_sub(1).map(|n| keys[n]);
                                     let fast = speed.abs() > FAST * fps;
-                                    if speed < 0.0 {
-                                        if !asked_small {
-                                            asked_small = true;
-                                            let (w, bytes) = small_size(dec.source_size(), gop);
-                                            small = dec
-                                                .small_frames(w, bytes)
-                                                .inspect_err(|e| eprintln!("scrubbing keeps full-size frames: {e:#}"))
-                                                .ok();
-                                            if crate::player::debug() {
-                                                eprintln!(
-                                                    "{:>8.3} video: {small:?} small frames at {w} px kept scrubbing back ({gop} frames between keyframes), made in {:.0} ms",
-                                                    crate::player::uptime(),
-                                                    started.elapsed().as_secs_f64() * 1000.0
-                                                );
-                                            }
+                                    if !asked_small {
+                                        asked_small = true;
+                                        let (w, bytes) = small_size(dec.source_size(), gop);
+                                        small = dec
+                                            .small_frames(w, bytes)
+                                            .inspect_err(|e| eprintln!("scrubbing keeps full-size frames: {e:#}"))
+                                            .ok();
+                                        if crate::player::debug() {
+                                            eprintln!(
+                                                "{:>8.3} video: {small:?} small frames at {w} px kept scrubbing ({gop} frames between keyframes), made in {:.0} ms",
+                                                crate::player::uptime(),
+                                                started.elapsed().as_secs_f64() * 1000.0
+                                            );
                                         }
+                                    }
+                                    if speed < 0.0 || small.is_some() {
                                         let cap = kept_cap(small);
                                         let use_small = small.is_some();
+                                        let back = speed < 0.0;
                                         let k = key.unwrap_or(0);
+                                        // Forward far from the picture shown: the
+                                        // frames on the way show as they come.
+                                        let far = !back && shown.is_some_and(|s| s.abs_diff(i) as f64 > FAR * fps);
                                         // Decoding toward it already (on from its
                                         // keyframe): on to it. Else from its keyframe,
                                         // or where the frames kept from it end.
@@ -405,15 +413,15 @@ impl Video {
                                             }
                                         } else {
                                             let from = resume_from(&kept, k, i);
-                                            kept.trim(i, cap.saturating_sub(STEP as usize + 2), true);
+                                            kept.trim(i, cap.saturating_sub(STEP as usize + 2), back);
                                             match start_fill(&mut dec, use_small, &mut kept, from, i) {
                                                 Ok(f) => filling = f,
                                                 Err(e) => return fail(&format!("{e:#}")),
                                             }
                                             positioned = false;
-                                            // Going back fast: the first frame on the
+                                            // Fast, or far: the first frame on the
                                             // way (its keyframe) shows at once.
-                                            if fast && kept.get(i).is_none() {
+                                            if (fast || far) && kept.get(i).is_none() {
                                                 if let Some(p) = kept.get(from).filter(|p| shown != Some(p.index)) {
                                                     if crate::player::debug() {
                                                         eprintln!("{:>8.3} video: scrub back to {i}: frame {from} first, {:.1} ms", crate::player::uptime(), started.elapsed().as_secs_f64() * 1000.0);
@@ -432,10 +440,23 @@ impl Video {
                                                 break Some(p);
                                             }
                                             let Some(mut f) = filling.take() else { break None };
-                                            kept.trim(i, cap.saturating_sub(STEP as usize + 2), true);
-                                            match step_fill(&mut dec, use_small, &mut kept, &mut f) {
-                                                Ok(done) => filling = (!done).then_some(f),
+                                            kept.trim(i, cap.saturating_sub(STEP as usize + 2), back);
+                                            let before = f.0;
+                                            let done = match step_fill(&mut dec, use_small, &mut kept, &mut f) {
+                                                Ok(done) => done,
                                                 Err(e) => return fail(&format!("{e:#}")),
+                                            };
+                                            filling = Some(f);
+                                            if done && f.0 == before {
+                                                // Nothing more to decode (the end).
+                                                break None;
+                                            }
+                                            if far {
+                                                if let Some(p) = kept.get(f.0).filter(|p| shown != Some(p.index)) {
+                                                    shown = Some(p.index);
+                                                    shared.lock().unwrap().scrub = Some(Scrubbed { asked: i, picture: p, exact: false });
+                                                    ctx.request_repaint();
+                                                }
                                             }
                                             if let Ok(newer) = rx.try_recv() {
                                                 pending = Some(newer);
@@ -535,46 +556,60 @@ impl Video {
                     continue;
                 }
                 if prefetch {
-                    // Scrubbing back: the frames before the playhead, a few at a
-                    // time (a newer request is looked at between), before it gets
-                    // there.
+                    // Scrubbing: the frames on the way (before the playhead going
+                    // back, after it going forward), a few at a time (a newer
+                    // request is looked at between), before it gets there.
                     let at = last_scrub.map_or(0, |(i, _)| i);
                     let cap = kept_cap(small);
                     let use_small = small.is_some();
+                    let back = dir < 0;
                     let _urgent = Urgent::begin();
                     let started = std::time::Instant::now();
                     positioned = false;
                     // Room first: each frame decoded takes a texture.
-                    kept.trim(at, cap.saturating_sub(STEP as usize + 2), true);
-                    let target = match filling.take().filter(|(last, _)| *last < at) {
-                        // On with the stretch under way, no further than the playhead.
-                        Some((last, to)) => Some((last, to.min(at))),
+                    kept.trim(at, cap.saturating_sub(STEP as usize + 2), back);
+                    let mut f = match filling.filter(|&f| wanted(f, at, dir)) {
+                        // On with the stretch under way (going back, no further
+                        // than the playhead).
+                        Some((last, to)) => (last, if back { to.min(at) } else { to }),
                         None => {
-                            let Some((from, to)) = fill_target(&kept, &keys, at, cap, stuck) else { continue };
-                            match start_fill(&mut dec, use_small, &mut kept, from, to) {
-                                Ok(f) => f,
-                                Err(e) => return fail(&format!("{e:#}")),
+                            let Some((from, to)) = fill_target(&kept, &keys, at, cap, stuck, dir) else { continue };
+                            let start = resume_from(&kept, key_before(&keys, from), from);
+                            match filling {
+                                // The decoder is just before it: on from there.
+                                Some((last, _)) if last + 1 == from => (last, to),
+                                _ => match start_fill(&mut dec, use_small, &mut kept, start, to) {
+                                    Ok(Some(f)) => f,
+                                    Ok(None) => {
+                                        stuck = Some((dir, from));
+                                        continue;
+                                    }
+                                    Err(e) => return fail(&format!("{e:#}")),
+                                },
                             }
                         }
                     };
-                    let done = match target {
-                        Some(mut f) => match step_fill(&mut dec, use_small, &mut kept, &mut f) {
-                            Ok(done) => {
-                                filling = (!done).then_some(f);
-                                done
-                            }
-                            Err(e) => return fail(&format!("{e:#}")),
-                        },
-                        None => true,
+                    let done = match step_fill(&mut dec, use_small, &mut kept, &mut f) {
+                        Ok(done) => done,
+                        Err(e) => return fail(&format!("{e:#}")),
                     };
+                    filling = Some(f);
                     if done {
-                        // Nothing joined up (a gap the file can't fill): stop.
-                        let start = kept.start_of(at);
-                        if fill_target(&kept, &keys, at, cap, stuck).is_some_and(|(_, to)| start.is_none_or(|s| s > to + 1)) {
-                            stuck = start;
+                        // Nothing joined up (a gap the file can't fill, or its
+                        // end): stop that way.
+                        if let Some((from, _)) = fill_target(&kept, &keys, at, cap, stuck, dir) {
+                            if filling.is_none_or(|(last, _)| last + 1 != from) {
+                                stuck = Some((dir, from));
+                            }
                         }
                         if crate::player::debug() {
-                            eprintln!("{:>8.3} video: kept frames back to {start:?} while idle (playhead at {at}), {} kept", crate::player::uptime(), kept.frames.len());
+                            eprintln!(
+                                "{:>8.3} video: kept frames {:?}..={:?} while idle (playhead at {at}), {} kept",
+                                crate::player::uptime(),
+                                kept.start_of(at),
+                                kept.end_of(at),
+                                kept.frames.len()
+                            );
                         }
                     }
                     if crate::player::debug() && started.elapsed().as_millis() > 20 {
@@ -791,12 +826,30 @@ impl Kept {
         }
     }
 
-    /// At most `cap` frames: drop those farthest from `at` (going `back`,
-    /// those after it first: passed).
+    /// The last frame slot of the unbroken stretch kept from `i` on.
+    fn end_of(&self, i: u64) -> Option<u64> {
+        let mut end = self.covered_to(i)?;
+        for (&g, (_, to)) in self.frames.range(i.saturating_add(1)..) {
+            if g > end.saturating_add(1) {
+                break;
+            }
+            end = end.max(*to);
+        }
+        Some(end)
+    }
+
+    /// At most `cap` frames: drop those farthest from `at`, those passed
+    /// first (after it going `back`, before it going forward).
     fn trim(&mut self, at: u64, cap: usize, back: bool) {
         while self.frames.len() > cap {
             let (Some((&lo, _)), Some((&hi, _))) = (self.frames.first_key_value(), self.frames.last_key_value()) else { return };
-            let drop = if (back && hi > at) || at.abs_diff(hi) >= at.abs_diff(lo) { hi } else { lo };
+            let drop = if back {
+                if hi > at || at.abs_diff(hi) >= at.abs_diff(lo) { hi } else { lo }
+            } else if lo < at || at.abs_diff(lo) >= at.abs_diff(hi) {
+                lo
+            } else {
+                hi
+            };
             self.frames.remove(&drop);
         }
     }
@@ -809,18 +862,26 @@ impl Kept {
 /// Start decoding frames `from..` into `kept` (small ones if `small`): the
 /// one showing at `from` now (decoded from its keyframe; `from` is one, or
 /// where the frames kept from it end). Then [`step_fill`] goes on to `to`:
-/// the stretch under way, if there's more to it.
+/// the stretch, done once its first frame gets there. `None`: no frame.
 fn start_fill(dec: &mut Decoder, small: bool, kept: &mut Kept, from: u64, to: u64) -> anyhow::Result<Option<(u64, u64)>> {
     let first = if small { dec.frame_small(from)? } else { dec.frame(from)? };
+    dec.flush();
     let Some(p) = first else { return Ok(None) };
     let last = p.index;
     kept.push(None, p, from);
-    Ok((last.max(from) < to).then_some((last, to)))
+    Ok(Some((last.max(from), to)))
 }
 
 /// The next few frames of the stretch `f` (the decoder's next frame follows
 /// `f.0`, up to `f.1`) into `kept`. Whether it's done.
 fn step_fill(dec: &mut Decoder, small: bool, kept: &mut Kept, f: &mut (u64, u64)) -> anyhow::Result<bool> {
+    let done = step_fill_unflushed(dec, small, kept, f);
+    // Made a few at a time, sent to the GPU together (before any is shown).
+    dec.flush();
+    done
+}
+
+fn step_fill_unflushed(dec: &mut Decoder, small: bool, kept: &mut Kept, f: &mut (u64, u64)) -> anyhow::Result<bool> {
     for _ in 0..STEP {
         if f.0 >= f.1 {
             return Ok(true);
@@ -845,13 +906,8 @@ fn key_before(keys: &[u64], i: u64) -> u64 {
     keys.partition_point(|&k| k <= i).checked_sub(1).map_or(0, |n| keys[n])
 }
 
-/// Where to decode from to get frame `i` from keyframe `key`: the first frame
-/// after those kept from `key` on (they're decoded already), if that's a few
-/// frames on. Further on, from the keyframe again, every frame shown and
-/// kept: getting there is decoding all those frames anyway, and this way a
-/// newer request is looked at every few (getting to a frame 2 s into a
-/// keyframe gap at 240 fps took 245 ms without a look).
-fn resume_from(kept: &Kept, key: u64, i: u64) -> u64 {
+/// The first frame from keyframe `key` on not kept (up to `i`).
+fn first_missing(kept: &Kept, key: u64, i: u64) -> u64 {
     let mut at = key;
     while at <= i {
         match kept.covered_to(at) {
@@ -859,21 +915,49 @@ fn resume_from(kept: &Kept, key: u64, i: u64) -> u64 {
             None => break,
         }
     }
-    let at = at.min(i);
+    at.min(i)
+}
+
+/// Where to decode from to get frame `i` from keyframe `key`: the first frame
+/// after those kept from `key` on (they're decoded already), if that's a few
+/// frames on. Further on, from the keyframe again, every frame shown and
+/// kept: getting there is decoding all those frames anyway, and this way a
+/// newer request is looked at every few (getting to a frame 2 s into a
+/// keyframe gap at 240 fps took 245 ms without a look).
+fn resume_from(kept: &Kept, key: u64, i: u64) -> u64 {
+    let at = first_missing(kept, key, i);
     if at - key > STEP { key } else { at }
 }
 
-/// Scrubbing back with the playhead at `at`: the frames to decode next
-/// (`from..=to`: the keyframe gap just before the stretch kept up to it, from
-/// where the frames kept from its keyframe end), unless a third of `cap`
-/// are kept before it already.
-fn fill_target(kept: &Kept, keys: &[u64], at: u64, cap: usize, stuck: Option<u64>) -> Option<(u64, u64)> {
-    let start = kept.start_of(at)?;
-    if start == 0 || at - start >= cap as u64 / 3 || stuck == Some(start) {
-        return None;
-    }
-    let to = start - 1;
-    Some((resume_from(kept, key_before(keys, to), to), to))
+/// Scrubbing with the playhead at `at`, going `dir` (-1 back, 1 forward):
+/// the frames to decode next (`from..=to`, `from` the first missing), unless
+/// a third of `cap` are kept that way already. Back: the keyframe gap just
+/// before the stretch kept up to the playhead. Forward: on after the
+/// stretch kept from it.
+fn fill_target(kept: &Kept, keys: &[u64], at: u64, cap: usize, stuck: Option<(i8, u64)>, dir: i8) -> Option<(u64, u64)> {
+    let third = cap as u64 / 3;
+    let (from, to) = if dir < 0 {
+        let start = kept.start_of(at)?;
+        if start == 0 || at - start >= third {
+            return None;
+        }
+        let to = start - 1;
+        (first_missing(kept, key_before(keys, to), to), to)
+    } else {
+        let end = kept.end_of(at)?;
+        if end == u64::MAX || end - at >= third {
+            return None;
+        }
+        (end + 1, at + third)
+    };
+    (stuck != Some((dir, from))).then_some((from, to))
+}
+
+/// Whether the stretch `f` being decoded is still wanted with the playhead
+/// at `at` going `dir`: not done, and still before the playhead going back,
+/// at or after it going forward.
+fn wanted(f: (u64, u64), at: u64, dir: i8) -> bool {
+    f.0 < f.1 && if dir < 0 { f.0 < at } else { f.0 + 1 >= at }
 }
 
 /// The small frames for scrubbing back (see [`SMALL_WIDTH`]): their width and
