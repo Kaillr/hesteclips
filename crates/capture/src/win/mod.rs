@@ -215,6 +215,7 @@ struct Session {
 impl Session {
     fn start(s: &EncodeSettings, target: Target, live: &Arc<LiveAudio>, mov: bool) -> Result<Self> {
         crate::FRAMES_SKIPPED.store(0, Ordering::Relaxed);
+        crate::FRAMES_ENCODED.store(0, Ordering::Relaxed);
         system::com_init();
         system::mf_startup()?;
         let gpu = d3d::Gpu::new()?;
@@ -1093,7 +1094,9 @@ impl BlendPacer {
         match self.encoder.pool.take() {
             Some(slot) => match self.converter.convert(slot) {
                 Ok(()) => {
-                    if !self.encoder.encode(slot, k) {
+                    if self.encoder.encode(slot, k) {
+                        encoded();
+                    } else {
                         skipped(&mut self.dropped);
                     }
                 }
@@ -1241,6 +1244,11 @@ fn spawn_blend_pacer(
     (stop, handle)
 }
 
+/// A frame went to the encoder: counted for the UI (the share skipped).
+fn encoded() {
+    crate::FRAMES_ENCODED.fetch_add(1, Ordering::Relaxed);
+}
+
 /// The encoder can't keep up (no free frame for it, or its queue is full):
 /// this frame is skipped, and the file shows the one before a little longer.
 /// Counted for the UI, and logged now and then.
@@ -1289,7 +1297,9 @@ fn spawn_pacer(
                     match encoder.pool.take() {
                         Some(slot) => match converter.convert(slot) {
                             Ok(()) => {
-                                if !encoder.encode(slot, next) {
+                                if encoder.encode(slot, next) {
+                                    encoded();
+                                } else {
                                     skipped(&mut dropped);
                                 }
                             }

@@ -464,6 +464,14 @@ pub struct Devices {
 }
 
 static FRAMES_SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FRAMES_ENCODED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many frames the running capture has handed to the video encoder (to
+/// tell what share [`frames_skipped`] is). Starts from 0 with each capture;
+/// only counted on Windows so far.
+pub fn frames_encoded() -> u64 {
+    FRAMES_ENCODED.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// How many frames the running capture has left out because the video
 /// encoder couldn't keep up (the file shows the previous one longer). Starts

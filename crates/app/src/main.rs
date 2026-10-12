@@ -83,6 +83,10 @@ impl log::Log for GpuLog {
     fn flush(&self) {}
 }
 
+/// The capture bar's skipped-frames warning stays this long after the last
+/// skip, and its share is of this last stretch's frames.
+const SKIP_WINDOW: Duration = Duration::from_secs(5);
+
 fn main() -> eframe::Result<()> {
     if std::env::var_os("HESTECLIPS_DEBUG_GPU").is_some() {
         static LOGGER: GpuLog = GpuLog;
@@ -342,6 +346,9 @@ struct App {
     /// Frames skipped so far, and when that last grew: the capture bar warns
     /// while it's happening.
     skipped_seen: (u64, Option<Instant>),
+    /// The capture's frame counts (skipped, encoded) as they were over the
+    /// last few seconds, oldest first: the warning says what share is skipped.
+    skip_counts: std::collections::VecDeque<(Instant, u64, u64)>,
     /// A replay clip is being written; shows a placeholder card until it lands.
     /// Clips being written: replay clips still saving, and a stopped recording
     /// being finished. Each shows a placeholder card until it lands.
@@ -528,6 +535,7 @@ impl App {
             rec_state: RecState::Idle,
             rec_started: None,
             skipped_seen: (0, None),
+            skip_counts: Default::default(),
             saving: 0,
             settings,
             saved_settings,
@@ -1183,12 +1191,20 @@ impl App {
             self.page = Page::Settings;
         }
         let compact = ui.available_width() < 820.0;
-        let skipped = capture::frames_skipped();
+        let (skipped, encoded) = (capture::frames_skipped(), capture::frames_encoded());
         if skipped < self.skipped_seen.0 || self.rec_state == RecState::Idle {
             self.skipped_seen = (0, None);
+            self.skip_counts.clear();
         }
         if skipped > self.skipped_seen.0 {
             self.skipped_seen = (skipped, Some(Instant::now()));
+        }
+        if self.rec_state != RecState::Idle {
+            let now = Instant::now();
+            self.skip_counts.push_back((now, skipped, encoded));
+            while self.skip_counts.len() > 1 && self.skip_counts.front().is_some_and(|(t, ..)| now - *t > SKIP_WINDOW) {
+                self.skip_counts.pop_front();
+            }
         }
         ui.horizontal(|ui| {
             ui.set_min_height(36.0);
@@ -1295,19 +1311,42 @@ impl App {
     }
 
     /// Shown while frames are being skipped (and a few seconds after): the
-    /// computer can't keep up with the recording settings.
-    fn skipped_warning(&self, ui: &mut egui::Ui) {
-        const SHOW_FOR: Duration = Duration::from_secs(5);
-        let Some(at) = self.skipped_seen.1.filter(|t| t.elapsed() < SHOW_FOR) else { return };
+    /// computer can't keep up with the recording settings. Says how much (of
+    /// the last few seconds' frames, and of the whole recording), what that
+    /// does to the clip, and what the settings are; a click opens Settings.
+    fn skipped_warning(&mut self, ui: &mut egui::Ui) {
+        let Some(at) = self.skipped_seen.1.filter(|t| t.elapsed() < SKIP_WINDOW) else { return };
         ui.add_space(10.0);
         let amber = Color32::from_rgb(230, 170, 40);
+        let share = |skipped: u64, encoded: u64| skipped as f64 * 100.0 / (skipped + encoded).max(1) as f64;
+        let percent = |p: f64| if p < 1.0 { format!("{p:.1}%") } else { format!("{p:.0}%") };
+        let (skipped, encoded) = self.skip_counts.back().map_or((self.skipped_seen.0, 0), |&(_, s, e)| (s, e));
+        let (s0, e0) = self.skip_counts.front().map_or((0, 0), |&(_, s, e)| (s, e));
+        let recent = share(skipped - s0.min(skipped), encoded - e0.min(encoded));
+        let r = &self.settings;
+        let size = match r.resolution {
+            settings::OutputResolution::Native => "native resolution".to_owned(),
+            res => res.label(),
+        };
+        let blending = r.blend_samples() > 1;
         let tip = format!(
-            "{} frames skipped so far: the video encoder couldn't keep up, so the clip stutters. Try a lower resolution, frame rate or bitrate{}.",
-            self.skipped_seen.0,
-            if self.settings.blend_samples() > 1 { ", or turn off frame blending" } else { "" }
+            "{} of the frames in the last {} seconds were skipped ({} since the recording started, {} of its frames). \
+             The video encoder couldn't keep up: where a frame is skipped, the one before stays on screen longer, so the clip stutters there.\n\n\
+             Recording at {size}, {} fps{}. A lower frame rate or resolution gives it less to do{}. Click to open Settings.",
+            percent(recent),
+            SKIP_WINDOW.as_secs(),
+            skipped,
+            percent(share(skipped, encoded)),
+            r.fps,
+            if blending { format!(", blended from {} fps", r.fps * r.blend_samples()) } else { String::new() },
+            if blending { ", and so does turning off frame blending" } else { "" },
         );
-        ui.label(RichText::new("Skipping frames").size(13.0).strong().color(amber)).on_hover_text(tip);
-        ui.ctx().request_repaint_after(SHOW_FOR.saturating_sub(at.elapsed()));
+        let label = egui::Label::new(RichText::new(format!("Skipping {} of frames", percent(recent))).size(13.0).strong().color(amber)).sense(egui::Sense::click());
+        let response = ui.add(label).on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand);
+        if response.clicked() {
+            self.page = Page::Settings;
+        }
+        ui.ctx().request_repaint_after(SKIP_WINDOW.saturating_sub(at.elapsed()));
     }
 
     /// The one or two buttons that make sense right now; the primary one rightmost.
