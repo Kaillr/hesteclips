@@ -88,10 +88,18 @@ fn main() -> eframe::Result<()> {
         static LOGGER: GpuLog = GpuLog;
         let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(log::LevelFilter::Warn));
     }
+    // A development test instance (opened on a page or clip by a dev hook)
+    // runs beside the real one, and leaves its single-instance lock, its log
+    // and its kept files alone.
+    let test_instance = std::env::vars_os().any(|(k, _)| {
+        let k = k.to_string_lossy();
+        ["HESTECLIPS_OPEN_", "HESTECLIPS_DEMO_", "HESTECLIPS_LIBRARY", "HESTECLIPS_SETTINGS"].iter().any(|p| k.starts_with(p))
+    });
     // An installed app has no console: what it prints goes to its log file
-    // (`HESTECLIPS_LOG=1` does the same in a development build, to check it).
+    // (`HESTECLIPS_LOG=1` does the same in a development build, or a test
+    // instance, to check it).
     #[cfg(any(windows, target_os = "linux"))]
-    if cfg!(not(debug_assertions)) || std::env::var_os("HESTECLIPS_LOG").is_some() {
+    if (cfg!(not(debug_assertions)) && !test_instance) || std::env::var_os("HESTECLIPS_LOG").is_some() {
         logfile::start();
     }
     #[cfg(windows)]
@@ -107,10 +115,6 @@ fn main() -> eframe::Result<()> {
     }
     // One HesteClips at a time: another launch shows the running one and
     // exits. (Not for development test instances, which run beside it.)
-    let test_instance = std::env::vars_os().any(|(k, _)| {
-        let k = k.to_string_lossy();
-        ["HESTECLIPS_OPEN_", "HESTECLIPS_DEMO_", "HESTECLIPS_LIBRARY", "HESTECLIPS_SETTINGS"].iter().any(|p| k.starts_with(p))
-    });
     let instance = if test_instance {
         None
     } else {
