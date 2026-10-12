@@ -513,20 +513,24 @@ impl App {
     /// each with a way to hear it.
     fn sound_settings(&mut self, ui: &mut egui::Ui) {
         let cfg = &mut self.settings.save_sound;
-        row(ui, "Play a sound when a clip is saved", Some("Never recorded into your clips."), |ui| {
+        row(ui, "Play a sound when a clip is saved", None, |ui| {
             toggle(ui, &mut cfg.enabled);
         });
         divider(ui);
         ui.add_enabled_ui(cfg.enabled, |ui| {
+            row(ui, "Record the sound", Some("In clips and recordings made after it (a clip ends the moment it's saved)."), |ui| {
+                toggle(ui, &mut cfg.recorded);
+            });
+            divider(ui);
             row(ui, "Sound", None, |ui| {
                 ui.vertical(|ui| {
                     let mut remove = None;
-                    let volume = cfg.volume;
+                    let (volume, recorded) = (cfg.volume, cfg.recorded);
                     let mut choice = |ui: &mut egui::Ui, id: String, name: &str| -> bool {
                         let mut gone = false;
                         ui.horizontal(|ui| {
                             if ui.add(egui::Button::new("▶").min_size(egui::vec2(26.0, 0.0))).on_hover_text("Hear it").clicked() {
-                                crate::sound::play(&id, volume);
+                                crate::sound::play(&id, volume, recorded);
                             }
                             if ui.radio(cfg.sound == id, name).clicked() {
                                 cfg.sound = id.clone();
@@ -559,7 +563,7 @@ impl App {
                             match crate::sound::add_custom(&path, &cfg.custom) {
                                 Ok(c) => {
                                     cfg.sound = crate::sound::id_of(&c);
-                                    crate::sound::play(&cfg.sound, cfg.volume);
+                                    crate::sound::play(&cfg.sound, cfg.volume, cfg.recorded);
                                     cfg.custom.push(c);
                                 }
                                 Err(e) => self.sound_error = Some(e),
@@ -575,7 +579,7 @@ impl App {
             row(ui, "Volume", Some("Let go of the slider to hear it."), |ui| {
                 let slider = ui.add(egui::Slider::new(&mut cfg.volume, 0.0..=1.0).custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
                 if slider.drag_stopped() || (slider.changed() && !slider.dragged()) {
-                    crate::sound::play(&cfg.sound, cfg.volume);
+                    crate::sound::play(&cfg.sound, cfg.volume, cfg.recorded);
                 }
             });
         });

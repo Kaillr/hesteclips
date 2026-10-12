@@ -4,8 +4,9 @@
 //! Sounds are decoded once (ffmpeg, so any audio file works) and kept in
 //! memory; playing one opens the default output for as long as it lasts.
 //! Desktop capture leaves out what HesteClips plays, so as it plays the cue is
-//! also handed to the desktop sound source (`capture::sources::own_sound`):
-//! like any other app's sound, it's in the clips saved after it.
+//! also handed to the sources recording HesteClips' sound
+//! (`capture::sources::own_sound`), unless that's turned off: like any other
+//! app's sound, it's in the clips saved after it.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -38,17 +39,17 @@ fn cache() -> &'static Mutex<HashMap<String, Pcm>> {
 /// The clip-saved sound, if it's on.
 pub fn play_saved(cfg: &SaveSound) {
     if cfg.enabled {
-        play(&cfg.sound, cfg.volume);
+        play(&cfg.sound, cfg.volume, cfg.recorded);
     }
 }
 
 /// Play `sound` (a built-in id or `file:<path>`) at `volume` (0..=1), in the
-/// background.
-pub fn play(sound: &str, volume: f32) {
+/// background; `recorded`, also into recordings.
+pub fn play(sound: &str, volume: f32, recorded: bool) {
     let sound = sound.to_owned();
     std::thread::spawn(move || {
         if let Ok(pcm) = pcm(&sound) {
-            if let Err(e) = output(&pcm, gain(volume)) {
+            if let Err(e) = output(&pcm, gain(volume), recorded) {
                 eprintln!("clip sound: {e}");
             }
         }
@@ -195,7 +196,7 @@ fn chime() -> Vec<f32> {
 }
 
 /// Play `pcm` once on the default output and wait for it to finish.
-fn output(pcm: &Pcm, gain: f32) -> Result<(), String> {
+fn output(pcm: &Pcm, gain: f32, recorded: bool) -> Result<(), String> {
     let device = cpal::default_host().default_output_device().ok_or("no audio output device")?;
     let supported = device.default_output_config().map_err(|e| e.to_string())?;
     let channels = supported.channels() as usize;
@@ -206,7 +207,7 @@ fn output(pcm: &Pcm, gain: f32) -> Result<(), String> {
     let gain = if crate::player::dev_muted() { 0.0 } else { gain };
     let data = pcm.clone();
     let mut pos = 0.0f64;
-    let recorded = capture::sources::own_sound::Playing::start();
+    let mut recorded = recorded.then(capture::sources::own_sound::Playing::start);
     let stream = device
         .build_output_stream::<f32, _, _>(
             config,
@@ -226,7 +227,7 @@ fn output(pcm: &Pcm, gain: f32) -> Result<(), String> {
                     pos += step;
                 }
                 let to = (pos as usize).min(frames);
-                if to > from {
+                if let Some(recorded) = recorded.as_mut().filter(|_| to > from) {
                     let played: Vec<f32> = data[from * 2..to * 2].iter().map(|x| x * gain).collect();
                     recorded.push(&played);
                 }

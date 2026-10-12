@@ -1149,6 +1149,9 @@ fn start_audio(shared: Arc<Shared>, pcm: Arc<Pcm>) -> Result<cpal::Stream, Strin
         }
     };
     let muted = dev_muted();
+    // Recorded like any other app's sound (desktop capture leaves HesteClips
+    // out, see `capture::sources::own_sound`).
+    let mut recorded = capture::sources::own_sound::Playing::at(out_rate as u32);
     let stream = device
         .build_output_stream::<f32, _, _>(
             config,
@@ -1156,6 +1159,12 @@ fn start_audio(shared: Arc<Shared>, pcm: Arc<Pcm>) -> Result<cpal::Stream, Strin
                 mix(out, info);
                 if muted {
                     out.fill(0.0);
+                }
+                // Silence needn't be handed over: a gap is silent.
+                if out.iter().any(|&x| x != 0.0) {
+                    let ts = info.timestamp();
+                    let delay = ts.playback.duration_since(ts.callback).as_secs_f64().min(0.5);
+                    recorded.push_frames(out, channels, delay);
                 }
             },
             |e| eprintln!("audio output error: {e}"),

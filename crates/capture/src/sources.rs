@@ -173,8 +173,16 @@ impl AudioCapture {
         }
         #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
         let system = if system_sources.is_empty() { None } else { Some(SystemAudio::start(system_sources)?) };
+        // HesteClips' own sound: into its app source if it has one, else into
+        // the desktop (unless the desktop leaves out apps with their own source).
+        let own = own_app_id();
+        let own_source = sources.iter().any(|s| is_own_app(&s.kind, own.as_deref()));
         for (source, feed) in sources.iter().zip(&feeds) {
-            if matches!(source.kind, SourceKind::Desktop { .. }) {
+            let takes = match source.kind {
+                SourceKind::Desktop { exclude_app_sources } => !(own_source && exclude_app_sources),
+                ref kind => is_own_app(kind, own.as_deref()),
+            };
+            if takes {
                 own_sound::listen(feed);
             }
         }
@@ -292,68 +300,124 @@ pub(crate) fn quiet_xruns(name: String) -> impl FnMut(cpal::Error) + Send + 'sta
 
 /// HesteClips' own sounds (the clip-saved cue) in desktop audio.
 ///
-/// Desktop capture leaves out everything HesteClips plays, so clip previews and
-/// a mic you "Listen" to never end up in a clip. Its sounds are added to every
-/// desktop source here instead, as they play, so they're in the recording
-/// like any other app's.
+/// Desktop capture leaves out everything HesteClips plays, so a mic you
+/// "Listen" to never ends up in a clip twice. What it plays for you (clips,
+/// scrubbing, the clip sound) is added here instead, as it plays, so it's in
+/// the recording like any other app's: in the desktop source, or in a
+/// HesteClips app source when there's one (and the desktop leaves apps with
+/// their own source out).
 pub mod own_sound {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex, Weak};
 
     use crate::mixer::{RATE, SourceFeed};
 
-    fn desktops() -> &'static Mutex<Vec<Weak<SourceFeed>>> {
-        static DESKTOPS: Mutex<Vec<Weak<SourceFeed>>> = Mutex::new(Vec::new());
-        &DESKTOPS
+    /// The sources HesteClips' sound goes into; bumped generation on change.
+    fn listeners() -> &'static Mutex<Vec<Weak<SourceFeed>>> {
+        static LISTENERS: Mutex<Vec<Weak<SourceFeed>>> = Mutex::new(Vec::new());
+        &LISTENERS
     }
+    static GENERATION: AtomicU64 = AtomicU64::new(0);
 
     pub(crate) fn listen(feed: &Arc<SourceFeed>) {
-        let mut d = desktops().lock().unwrap();
+        let mut d = listeners().lock().unwrap();
         d.retain(|w| w.strong_count() > 0);
         d.push(Arc::downgrade(feed));
+        GENERATION.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn forget(feed: &Arc<SourceFeed>) {
-        desktops().lock().unwrap().retain(|w| w.strong_count() > 0 && !std::ptr::eq(w.as_ptr(), Arc::as_ptr(feed)));
+        listeners().lock().unwrap().retain(|w| w.strong_count() > 0 && !std::ptr::eq(w.as_ptr(), Arc::as_ptr(feed)));
+        GENERATION.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// One sound being played: what it pushes goes into every desktop source
-    /// capturing right now.
+    /// One sound being played: what it pushes goes into every source taking
+    /// HesteClips' sound, including ones that start while it plays (the
+    /// player stays open across recordings).
     pub struct Playing {
+        rate: u32,
+        generation: u64,
         children: Vec<(Weak<SourceFeed>, Arc<SourceFeed>)>,
     }
 
     impl Playing {
+        /// Stereo at 48 kHz.
         pub fn start() -> Self {
-            let children = desktops()
-                .lock()
-                .unwrap()
-                .iter()
-                .filter_map(|w| Some((w.clone(), w.upgrade()?.add_child(RATE))))
-                .collect();
-            Self { children }
+            Self::at(RATE)
         }
 
-        /// Stereo 48 kHz samples, played now.
-        pub fn push(&self, samples: &[f32]) {
+        /// At `rate` (an output device's).
+        pub fn at(rate: u32) -> Self {
+            let mut playing = Self { rate, generation: u64::MAX, children: Vec::new() };
+            playing.follow();
+            playing
+        }
+
+        /// Into the sources taking HesteClips' sound right now.
+        fn follow(&mut self) {
+            let generation = GENERATION.load(Ordering::Relaxed);
+            if generation == self.generation {
+                return;
+            }
+            self.generation = generation;
+            self.leave();
+            self.children = listeners().lock().unwrap().iter().filter_map(|w| Some((w.clone(), w.upgrade()?.add_child(self.rate)))).collect();
+        }
+
+        fn leave(&mut self) {
+            for (parent, child) in self.children.drain(..) {
+                if let Some(p) = parent.upgrade() {
+                    p.remove_child(&child);
+                }
+            }
+        }
+
+        /// Stereo samples, played now.
+        pub fn push(&mut self, samples: &[f32]) {
+            self.push_frames(samples, 2, 0.0);
+        }
+
+        /// Interleaved samples, `channels` per frame (as the output device
+        /// takes them), heard `delay` seconds from now.
+        pub fn push_frames(&mut self, samples: &[f32], channels: usize, delay: f64) {
+            self.follow();
             if self.children.is_empty() || samples.is_empty() {
                 return;
             }
-            let now = super::host_now();
+            let at = super::host_now() + delay;
             for (_, child) in &self.children {
-                child.push(now, samples, 2);
+                child.push(at, samples, channels);
             }
         }
     }
 
     impl Drop for Playing {
         fn drop(&mut self) {
-            for (parent, child) in &self.children {
-                if let Some(p) = parent.upgrade() {
-                    p.remove_child(child);
-                }
-            }
+            self.leave();
         }
     }
+}
+
+/// HesteClips' own id as an app source ([`SourceKind::App`]): its executable
+/// on Windows, its bundle id on macOS. None on Linux, where it isn't listed.
+pub fn own_app_id() -> Option<String> {
+    #[cfg(target_os = "windows")]
+    {
+        std::env::current_exe().ok()?.file_name().map(|n| n.to_string_lossy().into_owned())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        objc2_app_kit::NSRunningApplication::currentApplication().bundleIdentifier().map(|id| id.to_string())
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        None
+    }
+}
+
+/// `kind` is HesteClips itself, added as an app.
+pub(crate) fn is_own_app(kind: &SourceKind, own: Option<&str>) -> bool {
+    matches!((kind, own), (SourceKind::App { bundle_id }, Some(own)) if bundle_id.eq_ignore_ascii_case(own))
 }
 
 /// Captures sources only to drive the meters (nothing is written anywhere).
@@ -481,7 +545,7 @@ mod tests {
         let channel = live.channel("Desktop");
         let before = channel.input.take().max_peak();
         // Half a second of a loud tone, pushed as it would play.
-        let playing = own_sound::Playing::start();
+        let mut playing = own_sound::Playing::start();
         let block: Vec<f32> = (0..480).flat_map(|i| [0.8 * (i as f32 * 0.1).sin(); 2]).collect();
         for _ in 0..50 {
             playing.push(&block);
@@ -491,5 +555,30 @@ mod tests {
         let during = channel.input.take().max_peak();
         eprintln!("desktop peak before {before:.3}, with our sound {during:.3}");
         assert!(during > 0.7, "{during}");
+    }
+
+    #[test]
+    #[ignore = "captures real system audio; run with --ignored"]
+    fn own_sound_goes_to_its_app_source_from_a_player_opened_before() {
+        // A player open before the capture starts (at 44.1 kHz, 4 channels).
+        let mut playing = own_sound::Playing::at(44_100);
+        let live = LiveAudio::new();
+        let own = own_app_id().expect("HesteClips' own app id");
+        let desktop = AudioSource { kind: SourceKind::Desktop { exclude_app_sources: true }, ..src("Desktop", true, true) };
+        let app = AudioSource { kind: SourceKind::App { bundle_id: own }, ..src("HesteClips", true, true) };
+        let _monitor = LevelMonitor::start(&[desktop, app], live.clone()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let (desktop, app) = (live.channel("Desktop"), live.channel("HesteClips"));
+        let _ = (desktop.input.take(), app.input.take());
+        let block: Vec<f32> = (0..441).flat_map(|i| [0.8 * (i as f32 * 0.1).sin(); 4]).collect();
+        for _ in 0..50 {
+            playing.push_frames(&block, 4, 0.02);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let (in_desktop, in_app) = (desktop.input.take().max_peak(), app.input.take().max_peak());
+        eprintln!("our sound: desktop peak {in_desktop:.3}, app source peak {in_app:.3}, app source {:?}", app.status());
+        assert!(in_app > 0.7, "{in_app}");
+        assert!(in_desktop < 0.1, "heard twice: {in_desktop}");
     }
 }

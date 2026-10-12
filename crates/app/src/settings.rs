@@ -661,11 +661,13 @@ pub struct SaveSound {
     pub volume: f32,
     /// Sounds you've added, copied into HesteClips' own folder.
     pub custom: Vec<CustomSound>,
+    /// Recorded like any other app's sound (in what's recorded after it).
+    pub recorded: bool,
 }
 
 impl Default for SaveSound {
     fn default() -> Self {
-        Self { enabled: true, sound: "horse".into(), volume: 0.6, custom: Vec::new() }
+        Self { enabled: true, sound: "horse".into(), volume: 0.6, custom: Vec::new(), recorded: true }
     }
 }
 

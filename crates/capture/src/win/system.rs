@@ -330,12 +330,12 @@ pub fn list_apps() -> Vec<Device> {
     com_init();
     let mut pids: Vec<u32> = app_windows().into_iter().map(|(_, pid)| pid).collect();
     pids.extend(audio_session_pids());
-    apps_of(pids)
+    apps_of(pids, true)
 }
 
 /// Apps whose window can be recorded ([`crate::VideoSource::Apps`]).
 pub fn list_windowed_apps() -> Vec<Device> {
-    apps_of(app_windows().into_iter().map(|(_, pid)| pid).collect())
+    apps_of(app_windows().into_iter().map(|(_, pid)| pid).collect(), false)
 }
 
 /// The executable of the app in focus (`osu!.exe`).
@@ -344,13 +344,17 @@ pub fn foreground_exe() -> Option<String> {
 }
 
 /// Processes as apps: by executable, named by their file description, without
-/// shell processes or HesteClips itself, sorted by name.
-fn apps_of(pids: Vec<u32>) -> Vec<Device> {
+/// shell processes (or HesteClips itself, unless `with_own`), sorted by name.
+fn apps_of(mut pids: Vec<u32>, with_own: bool) -> Vec<Device> {
     let own = std::process::id();
+    if with_own {
+        // Listed whether or not it's playing anything right now.
+        pids.push(own);
+    }
     let mut seen = std::collections::HashSet::new();
     let mut apps: Vec<Device> = pids
         .into_iter()
-        .filter(|&pid| pid != own && pid != 0 && seen.insert(pid))
+        .filter(|&pid| (with_own || pid != own) && pid != 0 && seen.insert(pid))
         .filter_map(|pid| {
             let path = image_path(pid)?;
             let exe = std::path::Path::new(&path).file_name()?.to_string_lossy().into_owned();
@@ -361,8 +365,10 @@ fn apps_of(pids: Vec<u32>) -> Vec<Device> {
             Some(Device { id: exe, name })
         })
         .collect();
-    let own_exe = std::env::current_exe().ok().and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()));
-    apps.retain(|a| own_exe.as_deref().is_none_or(|own| !a.id.eq_ignore_ascii_case(own)));
+    if !with_own {
+        let own_exe = std::env::current_exe().ok().and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()));
+        apps.retain(|a| own_exe.as_deref().is_none_or(|own| !a.id.eq_ignore_ascii_case(own)));
+    }
     apps.sort_by_key(|d| (d.name.to_lowercase(), d.id.to_lowercase()));
     apps.dedup_by(|a, b| a.id.eq_ignore_ascii_case(&b.id));
     apps

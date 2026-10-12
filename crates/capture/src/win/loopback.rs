@@ -4,8 +4,9 @@
 //!
 //! - **App source**: one include stream per top process of the app, so its
 //!   helpers (browser tabs, Discord's voice process) come along.
-//! - **Desktop**: everything except HesteClips itself (its clip previews);
-//!   its cue sounds are added back in by `sources::own_sound`.
+//! - **Desktop**: everything except HesteClips itself (a mic you "Listen" to
+//!   would be heard twice); what it plays for you is added back in by
+//!   `sources::own_sound`, as is a HesteClips app source's sound.
 //! - **Desktop minus app sources**: WASAPI can exclude only one tree, so while
 //!   any of those apps runs, the desktop is rebuilt from an include stream per
 //!   process that has an audio session — minus the apps, minus us.
@@ -290,6 +291,7 @@ impl SystemAudio {
 fn sync_taps(taps: &mut [Tap]) {
     let tree = ProcessTree::snapshot();
     let own = std::process::id();
+    let own_app = crate::sources::own_app_id();
     let app_exes: Vec<String> = taps
         .iter()
         .filter_map(|t| match &t.source.kind {
@@ -303,8 +305,12 @@ fn sync_taps(taps: &mut [Tap]) {
     for tap in taps.iter_mut() {
         let wanted: Vec<Target> = match &tap.source.kind {
             SourceKind::App { bundle_id } => {
-                let roots = tree.roots_of(bundle_id);
-                if roots.is_empty() {
+                // Never this process (its sound comes from `own_sound`), but
+                // another HesteClips running, yes.
+                let mut roots = tree.roots_of(bundle_id);
+                roots.retain(|&pid| pid != own);
+                let own_source = crate::sources::is_own_app(&tap.source.kind, own_app.as_deref());
+                if roots.is_empty() && !own_source {
                     // Nothing to listen to until the app opens.
                     for (_, (_, child)) in tap.streams.drain() {
                         tap.feed.remove_child(&child);
@@ -361,7 +367,8 @@ fn sync_taps(taps: &mut [Tap]) {
                 }
             }
         }
-        let live = !tap.streams.is_empty() || matches!(tap.source.kind, SourceKind::Desktop { .. }) && tap.failed.is_empty();
+        let live = !tap.streams.is_empty()
+            || (matches!(tap.source.kind, SourceKind::Desktop { .. }) || crate::sources::is_own_app(&tap.source.kind, own_app.as_deref())) && tap.failed.is_empty();
         tap.channel.set_status(if live { SourceStatus::Live } else { SourceStatus::Unavailable });
         let mut capturing: Vec<String> = tap.streams.keys().map(|t| format!("{t:?}")).collect();
         capturing.sort_unstable();
