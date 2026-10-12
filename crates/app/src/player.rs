@@ -607,7 +607,10 @@ impl Player {
         // frame asked once paused, which is newer.
         let (found, exact) = (v.take_scrub(), v.take_exact(want));
         if let Some(found) = found {
+            // Kept small while scrubbing back: sharp again once it stops.
+            let small = found.picture.width < self.info.width;
             self.put_picture(ctx, found.picture);
+            self.showing_proxy = small;
             // The picture for the frame asked even when its own number is
             // lower (a dropped frame's slot).
             if found.exact {
@@ -623,7 +626,8 @@ impl Player {
             // dropped frame's slot).
             self.shown_frame = Some(want);
         }
-        if self.shown_frame == Some(want) {
+        // The frame on screen; small is enough while scrubbing.
+        if self.shown_frame == Some(want) && (scrubbing || !self.showing_proxy) {
             return;
         }
         let v = self.video.as_ref().expect("checked above");

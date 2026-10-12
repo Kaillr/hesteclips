@@ -74,6 +74,7 @@ pub enum Output {
 
 /// A decoded picture: NV12 on the GPU in `gpu` ([`Output::Screen`]), or
 /// opaque RGBA in `rgba`, rows top to bottom, no padding ([`Output::Rgba`]).
+#[derive(Clone)]
 pub struct Picture {
     /// Frame number from the start of the clip.
     pub index: u64,
@@ -86,6 +87,7 @@ pub struct Picture {
 /// A decoded frame's buffer: studio-range NV12 in an IOSurface (plane 0 Y,
 /// plane 1 interleaved CbCr at half size), which the renderer opens as
 /// textures without copying. The decoder reuses it once dropped.
+#[derive(Clone)]
 pub struct Surface {
     buf: CFRetained<CVPixelBuffer>,
     /// BT.601 colours (else BT.709).
@@ -267,6 +269,22 @@ impl Decoder {
     /// buffers come from a pool that grows as needed).
     pub fn pool_size(&self) -> Option<usize> {
         None
+    }
+
+    /// Smaller frames for scrubbing: none here (the buffers come from a pool
+    /// that grows as needed: scrubbing keeps a few full-size ones instead).
+    pub fn small_frames(&mut self, _width: u32, _bytes: u64) -> Result<usize> {
+        bail!("no small frames on macOS")
+    }
+
+    /// [`Self::frame`] (no small frames here).
+    pub fn frame_small(&mut self, index: u64) -> Result<Option<Picture>> {
+        self.frame(index)
+    }
+
+    /// [`Self::next`] (no small frames here).
+    pub fn next_small(&mut self) -> Result<Option<Picture>> {
+        self.next()
     }
 
     /// "direct": frames always come from our own index.

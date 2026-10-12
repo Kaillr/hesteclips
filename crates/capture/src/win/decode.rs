@@ -66,6 +66,7 @@ const POOL_BYTES: u64 = 512 << 20;
 
 /// A decoded picture, opaque RGBA: in `rgba` (rows top to bottom, no
 /// padding), or on the GPU in `gpu` (and `rgba` is empty).
+#[derive(Clone)]
 pub struct Picture {
     /// Frame number from the start of the clip.
     pub index: u64,
@@ -116,8 +117,12 @@ pub enum SurfaceFormat {
     Nv12 { bt601: bool },
 }
 
-/// One texture of a [`Surfaces`] pool, holding a frame.
-pub struct Surface {
+/// One texture of a [`Surfaces`] pool, holding a frame. Copies share it; it
+/// goes back to the pool when the last one is dropped.
+#[derive(Clone)]
+pub struct Surface(Arc<Slot>);
+
+struct Slot {
     pool: Arc<Surfaces>,
     slot: usize,
     /// The fence value signalled once this frame was written.
@@ -127,18 +132,18 @@ pub struct Surface {
 impl Surface {
     /// The pool and slot: the same texture every time, so open it once.
     pub fn key(&self) -> (usize, usize) {
-        (self.pool.id, self.slot)
+        (self.0.pool.id, self.0.slot)
     }
 
     /// An NT handle to the texture, to open it on another device (D3D12).
     /// Owned by the pool; valid while it lives.
     pub fn handle(&self) -> isize {
-        self.pool.handles[self.slot].0 as isize
+        self.0.pool.handles[self.0.slot].0 as isize
     }
 
     /// What the texture holds.
     pub fn format(&self) -> SurfaceFormat {
-        self.pool.format
+        self.0.pool.format
     }
 
     /// The pool's shared fence (NT handle, owned by the pool) and the value
@@ -146,11 +151,11 @@ impl Surface {
     /// `None` if the graphics card couldn't share a fence (then the frame was
     /// finished before it was handed over).
     pub fn fence(&self) -> Option<(isize, u64)> {
-        self.pool.fence.as_ref().map(|(_, h)| (h.0 as isize, self.ready))
+        self.0.pool.fence.as_ref().map(|(_, h)| (h.0 as isize, self.0.ready))
     }
 }
 
-impl Drop for Surface {
+impl Drop for Slot {
     fn drop(&mut self) {
         self.pool.free.lock().unwrap().push_back(self.slot);
     }
@@ -177,6 +182,8 @@ pub struct Decoder {
     pool: Option<Arc<Surfaces>>,
     /// The video's own size.
     source: (u32, u32),
+    /// Its colours are BT.601 (else BT.709).
+    bt601: bool,
     /// Media Foundation's time of frame 0.
     offset: i64,
     /// The frame the next read returns, when known (none after a seek).
@@ -188,6 +195,8 @@ pub struct Decoder {
     /// first, and the staging texture the next one goes to.
     coming: VecDeque<(u64, usize)>,
     next_staging: usize,
+    /// Small frames for scrubbing (see [`Self::small_frames`]), once asked for.
+    small: Option<(Arc<Surfaces>, Convert)>,
 }
 
 /// Frames read back at once while reading in order: the GPU converts and
@@ -316,11 +325,13 @@ impl Decoder {
                 convert,
                 pool,
                 source: (sw, sh),
+                bt601,
                 offset: 0,
                 next_index: None,
                 peeked: None,
                 coming: VecDeque::new(),
                 next_staging: 0,
+                small: None,
             };
             // The first frame's time is frame 0's; keep the frame for the first read.
             let (time, sample) = d.read_sample()?.context("the video has no frames")?;
@@ -364,6 +375,55 @@ impl Decoder {
     /// and playback do). Decoded forward from where the reader is when that's
     /// close, else from the keyframe before it. `None` past the end.
     pub fn frame(&mut self, index: u64) -> Result<Option<Picture>> {
+        self.frame_as(index, false)
+    }
+
+    /// [`Self::frame`], as a small frame (see [`Self::small_frames`]).
+    pub fn frame_small(&mut self, index: u64) -> Result<Option<Picture>> {
+        self.frame_as(index, true)
+    }
+
+    /// [`Self::next`], as a small frame (see [`Self::small_frames`]).
+    pub fn next_small(&mut self) -> Result<Option<Picture>> {
+        match self.read()? {
+            Some((i, sample)) => self.picture_as(i, &sample, true).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Frames for scrubbing back and forth, kept a while: `width` wide (at
+    /// most the video's), as many as fit in `bytes` (16 to 256), in textures
+    /// of their own so keeping them doesn't hold up playback's. NV12 where
+    /// the graphics card shares it (the conversion scales it), else RGBA.
+    /// How many there are; an error unless frames are shared.
+    pub fn small_frames(&mut self, width: u32, bytes: u64) -> Result<usize> {
+        if let Some((pool, _)) = &self.small {
+            return Ok(pool.textures.len());
+        }
+        if self.pool.is_none() {
+            bail!("frames aren't shared on the GPU");
+        }
+        let w = width.min(self.source.0).max(2) / 2 * 2;
+        let size = (w, even_height(w, self.source));
+        let make = |format: SurfaceFormat, bytes_per_pixel: f64, out: DXGI_COLOR_SPACE_TYPE| -> Result<(Arc<Surfaces>, Convert)> {
+            let count = (bytes as f64 / (size.0 as f64 * size.1 as f64 * bytes_per_pixel)).clamp(16.0, 256.0) as usize;
+            let pool = surfaces(&self.gpu, size.0, size.1, format, count, true)?;
+            let convert = Convert::new(&self.gpu, self.source, size, self.fps, self.bt601, out, pool.textures.clone())?;
+            Ok((Arc::new(pool), convert))
+        };
+        let nv12 = (shares_nv12(&self.gpu) && std::env::var_os("HESTECLIPS_RGBA_FRAMES").is_none())
+            .then(|| make(SurfaceFormat::Nv12 { bt601: false }, 1.5, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709))
+            .and_then(|r| r.inspect_err(|e| eprintln!("decoder: no small NV12 frames, RGBA instead: {e:#}")).ok());
+        let small = match nv12 {
+            Some(s) => s,
+            None => make(SurfaceFormat::Rgba, 4.0, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709)?,
+        };
+        let n = small.0.textures.len();
+        self.small = Some(small);
+        Ok(n)
+    }
+
+    fn frame_as(&mut self, index: u64, small: bool) -> Result<Option<Picture>> {
         // Frames read ahead are past: the decoder is where they ended.
         self.coming.clear();
         let near = match (&self.src, self.next_index) {
@@ -385,7 +445,7 @@ impl Decoder {
                             let next = (t != i64::MAX).then(|| self.index_of(t));
                             if next.is_none_or(|n| n > index) {
                                 self.next_index = next;
-                                return self.picture(i, &sample).map(Some);
+                                return self.picture_as(i, &sample, small).map(Some);
                             }
                         }
                     }
@@ -394,12 +454,12 @@ impl Decoder {
                 Some((i, sample)) => {
                     // Past it: that's the answer's end. Keep this one for the
                     // next read (it's the next frame, needed anyway).
-                    let Some((li, ls)) = last else { return self.picture(i, &sample).map(Some) };
+                    let Some((li, ls)) = last else { return self.picture_as(i, &sample, small).map(Some) };
                     self.peeked = Some((i, sample));
                     self.next_index = Some(i);
-                    return self.picture(li, &ls).map(Some);
+                    return self.picture_as(li, &ls, small).map(Some);
                 }
-                None => return last.map(|(i, s)| self.picture(i, &s)).transpose(),
+                None => return last.map(|(i, s)| self.picture_as(i, &s, small)).transpose(),
             }
         }
     }
@@ -496,24 +556,28 @@ impl Decoder {
 
     /// Convert a decoded frame and copy it off the GPU.
     fn picture(&mut self, index: u64, sample: &IMFSample) -> Result<Picture> {
+        self.picture_as(index, sample, false)
+    }
+
+    /// [`Self::picture`]; `small`: into the small frames' textures.
+    fn picture_as(&mut self, index: u64, sample: &IMFSample, small: bool) -> Result<Picture> {
         let (texture, slice) = decoded_texture(sample)?;
+        if small {
+            let (pool, convert) = self.small.as_mut().context("no small frames")?;
+            let pool = pool.clone();
+            let slot = free_slot(&pool)?;
+            convert.run(&texture, slice, slot)?;
+            let (width, height) = convert.size;
+            let surface = hand_over(&self.gpu, pool, slot)?;
+            return Ok(Picture { index, width, height, rgba: Vec::new(), gpu: Some(surface) });
+        }
         let Some(pool) = self.pool.clone() else {
             let convert = self.convert.as_mut().context("no conversion")?;
             convert.run(&texture, slice, 0)?;
             let rgba = convert.read(&self.gpu)?;
             return Ok(Picture { index, width: self.width, height: self.height, rgba, gpu: None });
         };
-        // A free texture: there's always one unless the app holds on to frames.
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let slot = loop {
-            if let Some(s) = pool.free.lock().unwrap().pop_front() {
-                break s;
-            }
-            if Instant::now() > deadline {
-                bail!("no free frame texture");
-            }
-            std::thread::sleep(Duration::from_millis(2));
-        };
+        let slot = free_slot(&pool)?;
         match self.convert.as_mut() {
             Some(c) => c.run(&texture, slice, slot)?,
             // NV12 as it is: the decoder's picture (its texture can be larger,
@@ -523,26 +587,47 @@ impl Decoder {
                 self.gpu.context.CopySubresourceRegion(&pool.textures[slot], 0, 0, 0, 0, &texture, slice, Some(&region));
             },
         }
-        let ready = match &pool.fence {
-            // The other device waits for this value before reading the frame.
-            Some((fence, _)) => {
-                let v = pool.fence_value.fetch_add(1, Ordering::Relaxed) + 1;
-                unsafe {
-                    let ctx4: ID3D11DeviceContext4 = self.gpu.context.cast()?;
-                    ctx4.Signal(fence, v)?;
-                    self.gpu.context.Flush();
-                }
-                v
-            }
-            // No shared fence: finish writing here before handing it over.
-            None => {
-                self.gpu.wait_idle()?;
-                0
-            }
-        };
-        let surface = Surface { pool, slot, ready };
+        let surface = hand_over(&self.gpu, pool, slot)?;
         Ok(Picture { index, width: self.width, height: self.height, rgba: Vec::new(), gpu: Some(surface) })
     }
+}
+
+/// A free texture of `pool`: there's always one unless the app holds on to
+/// frames (then waits a moment for one).
+fn free_slot(pool: &Surfaces) -> Result<usize> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Some(s) = pool.free.lock().unwrap().pop_front() {
+            return Ok(s);
+        }
+        if Instant::now() > deadline {
+            bail!("no free frame texture");
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// `slot` of `pool`, just written (queued on the GPU), as a frame for the
+/// renderer: it waits for the pool's fence before reading it.
+fn hand_over(gpu: &Gpu, pool: Arc<Surfaces>, slot: usize) -> Result<Surface> {
+    let ready = match &pool.fence {
+        // The other device waits for this value before reading the frame.
+        Some((fence, _)) => {
+            let v = pool.fence_value.fetch_add(1, Ordering::Relaxed) + 1;
+            unsafe {
+                let ctx4: ID3D11DeviceContext4 = gpu.context.cast()?;
+                ctx4.Signal(fence, v)?;
+                gpu.context.Flush();
+            }
+            v
+        }
+        // No shared fence: finish writing here before handing it over.
+        None => {
+            gpu.wait_idle()?;
+            0
+        }
+    };
+    Ok(Surface(Arc::new(Slot { pool, slot, ready })))
 }
 
 /// The decoder's texture holding `sample`'s picture, and its array slice.
@@ -569,18 +654,23 @@ fn even_height(width: u32, source: (u32, u32)) -> u32 {
 fn outputs(gpu: &Gpu, shared: bool, source: (u32, u32), size: (u32, u32), fps: f64, bt601: bool) -> Result<(Option<Arc<Surfaces>>, Option<Convert>)> {
     let nv12 = shared && size == source && size.0 % 2 == 0 && size.1 % 2 == 0 && shares_nv12(gpu) && std::env::var_os("HESTECLIPS_RGBA_FRAMES").is_none();
     if nv12 {
-        match surfaces(gpu, size.0, size.1, SurfaceFormat::Nv12 { bt601 }) {
+        match surfaces(gpu, size.0, size.1, SurfaceFormat::Nv12 { bt601 }, pool_count(size, 1.5), false) {
             Ok(pool) => return Ok((Some(Arc::new(pool)), None)),
             Err(e) => eprintln!("decoder: can't share NV12 frames, converting them: {e:#}"),
         }
     }
-    let pool = if shared { Some(Arc::new(surfaces(gpu, size.0, size.1, SurfaceFormat::Rgba)?)) } else { None };
+    let pool = if shared { Some(Arc::new(surfaces(gpu, size.0, size.1, SurfaceFormat::Rgba, pool_count(size, 4.0), true)?)) } else { None };
     let targets: Vec<ID3D11Texture2D> = match &pool {
         Some(p) => p.textures.clone(),
         None => vec![gpu.texture(size.0, size.1, DXGI_FORMAT_R8G8B8A8_UNORM, D3D11_BIND_RENDER_TARGET.0 as u32, D3D11_USAGE_DEFAULT, 0)?],
     };
-    let convert = Convert::new(gpu, source, size, fps, bt601, targets)?;
+    let convert = Convert::new(gpu, source, size, fps, bt601, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, targets)?;
     Ok((pool, Some(convert)))
+}
+
+/// Playback's textures: as many as fit in [`POOL_BYTES`], within bounds.
+fn pool_count(size: (u32, u32), bytes_per_pixel: f64) -> usize {
+    (POOL_BYTES as f64 / (size.0 as f64 * size.1 as f64 * bytes_per_pixel).max(1.0)).clamp(POOL_MIN as f64, POOL_MAX as f64) as usize
 }
 
 /// The graphics card can share NV12 textures with another device (Windows
@@ -597,14 +687,15 @@ fn shares_nv12(gpu: &Gpu) -> bool {
     asked.is_ok() && options.ExtendedNV12SharedTextureSupported.as_bool()
 }
 
-/// The shared textures for a pool.
-fn surfaces(gpu: &Gpu, width: u32, height: u32, format: SurfaceFormat) -> Result<Surfaces> {
+/// A pool of `count` shared textures; `render_target`: the video processor
+/// draws into them (else frames are copied in).
+fn surfaces(gpu: &Gpu, width: u32, height: u32, format: SurfaceFormat, count: usize, render_target: bool) -> Result<Surfaces> {
     static NEXT: AtomicUsize = AtomicUsize::new(1);
-    let (dxgi, bytes_per_pixel, bind) = match format {
-        SurfaceFormat::Rgba => (DXGI_FORMAT_R8G8B8A8_UNORM, 4.0, D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0),
-        SurfaceFormat::Nv12 { .. } => (windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_NV12, 1.5, D3D11_BIND_SHADER_RESOURCE.0),
+    let dxgi = match format {
+        SurfaceFormat::Rgba => DXGI_FORMAT_R8G8B8A8_UNORM,
+        SurfaceFormat::Nv12 { .. } => windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_NV12,
     };
-    let count = (POOL_BYTES as f64 / (width as f64 * height as f64 * bytes_per_pixel).max(1.0)).clamp(POOL_MIN as f64, POOL_MAX as f64) as usize;
+    let bind = D3D11_BIND_SHADER_RESOURCE.0 | if render_target { D3D11_BIND_RENDER_TARGET.0 } else { 0 };
     let mut textures = Vec::new();
     let mut handles = Vec::new();
     for _ in 0..count {
@@ -674,7 +765,8 @@ struct Convert {
 }
 
 impl Convert {
-    fn new(gpu: &Gpu, source: (u32, u32), size: (u32, u32), fps: f64, bt601: bool, targets: Vec<ID3D11Texture2D>) -> Result<Self> {
+    /// From the decoder's NV12 to `targets` (`out`: RGB, or YCbCr into NV12 ones).
+    fn new(gpu: &Gpu, source: (u32, u32), size: (u32, u32), fps: f64, bt601: bool, out: DXGI_COLOR_SPACE_TYPE, targets: Vec<ID3D11Texture2D>) -> Result<Self> {
         let vdev: ID3D11VideoDevice = gpu.device.cast().context("the graphics card has no video processor")?;
         let video: ID3D11VideoContext = gpu.context.cast()?;
         let rate = DXGI_RATIONAL { Numerator: fps.round().max(1.0) as u32, Denominator: 1 };
@@ -702,12 +794,12 @@ impl Convert {
                 outputs.push(view.context("no output view")?);
             }
 
-            // Studio-range YCbCr in, full-range RGB out: what the file says it
-            // is, and what the screen wants.
+            // Studio-range YCbCr in, as the file says; out full-range RGB (what
+            // the screen wants), or studio-range YCbCr scaled.
             let in_space: DXGI_COLOR_SPACE_TYPE = if bt601 { DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P601 } else { DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709 };
             let video1: ID3D11VideoContext1 = video.cast().context("the graphics card's video processor is too old")?;
             video1.VideoProcessorSetStreamColorSpace1(&processor, 0, in_space);
-            video1.VideoProcessorSetOutputColorSpace1(&processor, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
+            video1.VideoProcessorSetOutputColorSpace1(&processor, out);
             let src = RECT { left: 0, top: 0, right: source.0 as i32, bottom: source.1 as i32 };
             let dst = RECT { left: 0, top: 0, right: size.0 as i32, bottom: size.1 as i32 };
             video.VideoProcessorSetStreamFrameFormat(&processor, 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
