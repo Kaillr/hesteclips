@@ -100,6 +100,9 @@ struct Ready {
     dragging: Option<bool>,
     /// Last scroll-scrub, and whether it was playing before scrolling began.
     scrolled: Option<(Instant, bool)>,
+    /// `,` held down (repeating): stepping back goes as a scrub does, with
+    /// the frames on the way kept, sharp once it's let go.
+    stepping_back: bool,
     /// When the mouse last moved, scrolled or clicked (fullscreen controls).
     last_activity: Instant,
     /// Wheel movement, eased out over the next frames.
@@ -360,6 +363,7 @@ impl Ready {
             wave,
             dragging: None,
             scrolled: None,
+            stepping_back: false,
             glide: Default::default(),
             last_activity: Instant::now(),
             scroll_to: None,
@@ -422,6 +426,7 @@ impl Ready {
         // Click to play or pause; drag out of the window to share the clip.
         let (preview, preview_resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), preview_h), Sense::click_and_drag());
         ui.painter().rect_filled(preview, if full { 0 } else { 8 }, Color32::BLACK);
+        self.player.set_stepping(self.stepping_back);
         if let Some(size) = self.player.update(&ctx, scrubbing) {
             let scale = (preview.width() / size.x).min(preview.height() / size.y);
             // On whole screen pixels: a half-pixel offset alone blurs text.
@@ -693,7 +698,10 @@ impl Ready {
             return;
         }
         let none = egui::Modifiers::NONE;
-        let (space, k, left, right, j, l, comma, period, home, end, m) = ctx.input_mut(|i| {
+        let (space, k, left, right, j, l, mut comma, mut period, home, end, m, mut held) = ctx.input_mut(|i| {
+            // A held key's repeats: looked at before the presses are taken.
+            let repeat = i.events.iter().any(|e| matches!(e, egui::Event::Key { key: Key::Comma, pressed: true, repeat: true, .. }));
+            let held = i.key_down(Key::Comma) && (self.stepping_back || repeat);
             (
                 i.consume_key(none, Key::Space),
                 i.consume_key(none, Key::K),
@@ -706,8 +714,18 @@ impl Ready {
                 i.consume_key(none, Key::Home),
                 i.consume_key(none, Key::End),
                 i.consume_key(none, Key::M),
+                held,
             )
         });
+        let mut steps = u32::from(comma || period);
+        if let Some((n, key, repeating)) = dev_hold() {
+            steps += n;
+            comma |= n > 0 && key == Key::Comma;
+            period |= n > 0 && key == Key::Period;
+            held |= repeating && key == Key::Comma;
+            ctx.request_repaint();
+        }
+        self.stepping_back = held;
         if space || k {
             self.toggle_play();
         }
@@ -727,7 +745,7 @@ impl Ready {
         if comma || period {
             self.player.pause();
             let fd = self.info.frame_duration();
-            self.seek(self.info.snap(now) + if period { fd } else { -fd });
+            self.seek(self.info.snap(now) + steps as f64 * if period { fd } else { -fd });
         }
         if home {
             self.seek(0.0);
@@ -830,6 +848,38 @@ fn dev_drag() -> Option<Option<f64>> {
         return Some(None);
     }
     None
+}
+
+/// Dev aid: `HESTECLIPS_DEV_HOLD=4-8:,` holds `,` (or `.`) down from 4 to 8 s
+/// after start, as a held key does on Windows (a press, then repeats 30
+/// times a second after half a second), to reproduce frame stepping without
+/// touching the keyboard. Presses due now, the key, and whether they repeat.
+fn dev_hold() -> Option<(u32, Key, bool)> {
+    static PLAN: std::sync::OnceLock<std::sync::Mutex<(Vec<(f64, f64, Key)>, u32)>> = std::sync::OnceLock::new();
+    let plan = PLAN.get_or_init(|| {
+        let spec = std::env::var("HESTECLIPS_DEV_HOLD").unwrap_or_default();
+        let holds = spec
+            .split(';')
+            .filter_map(|s| s.split_once(':'))
+            .filter_map(|(when, key)| {
+                let (a, b) = when.split_once('-')?;
+                let key = if key.trim() == "." { Key::Period } else { Key::Comma };
+                Some((a.trim().parse().ok()?, b.trim().parse().ok()?, key))
+            })
+            .collect();
+        std::sync::Mutex::new((holds, 0))
+    });
+    let mut plan = plan.lock().unwrap();
+    let now = crate::player::uptime();
+    let Some(&(t0, _, key)) = plan.0.iter().find(|h| h.0 <= now && now < h.1) else {
+        plan.1 = 0;
+        return None;
+    };
+    let since = now - t0;
+    let due = 1 + if since < 0.5 { 0 } else { ((since - 0.5) * 30.0) as u32 + 1 };
+    let new = due - plan.1.min(due);
+    plan.1 = due;
+    Some((new, key, since >= 0.5))
 }
 
 /// The pointer is over `rect`, with no dialog or menu on top of it.

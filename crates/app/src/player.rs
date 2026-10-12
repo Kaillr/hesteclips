@@ -235,6 +235,9 @@ pub struct Player {
     screen_index: Option<u64>,
     /// How the picture keeps up while scrubbing (debug log).
     scrub_stats: ScrubStats,
+    /// Stepping back frame by frame with the key held: the picture comes as
+    /// it does scrubbing (no sound).
+    stepping: bool,
 }
 
 /// Debug log: while scrubbing, once a second, how many new pictures came
@@ -325,6 +328,7 @@ impl Player {
             asked_at: None,
             screen_index: None,
             scrub_stats: ScrubStats::default(),
+            stepping: false,
         }
     }
 
@@ -450,10 +454,14 @@ impl Player {
         }
         self.shared.scrubbing.store(scrubbing && !self.sound_playing(), Ordering::Relaxed);
         #[cfg(hw_decode)]
-        if scrubbing {
+        if scrubbing || self.stepping {
             crate::video::scrubbing();
         }
         if self.hw().is_some() {
+            // Each step back on its own decodes from the keyframe before it
+            // (up to a second of frames): held, it fell behind and froze
+            // until the steps came near a keyframe again.
+            let scrubbing = scrubbing || self.stepping;
             self.update_hw(ctx, scrubbing);
             self.note_scrub(scrubbing);
             return self.display.as_ref().map(Display::size);
@@ -517,6 +525,11 @@ impl Player {
         }
         self.note_scrub(scrubbing);
         self.display.as_ref().map(Display::size)
+    }
+
+    /// A key held to step back frame by frame (see `stepping`).
+    pub fn set_stepping(&mut self, on: bool) {
+        self.stepping = on;
     }
 
     /// Debug log: how the picture keeps up while scrubbing.
