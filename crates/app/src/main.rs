@@ -1312,8 +1312,9 @@ impl App {
 
     /// Shown while frames are being skipped (and a few seconds after): the
     /// computer can't keep up with the recording settings. Says how much (of
-    /// the last few seconds' frames, and of the whole recording), what that
-    /// does to the clip, and what the settings are; a click opens Settings.
+    /// the last few seconds' frames: a few now and then over a long recording
+    /// are normal, not worth a total), what that does to the clip, and what
+    /// the settings are; a click opens Settings.
     fn skipped_warning(&mut self, ui: &mut egui::Ui) {
         let Some(at) = self.skipped_seen.1.filter(|t| t.elapsed() < SKIP_WINDOW) else { return };
         ui.add_space(10.0);
@@ -1330,13 +1331,11 @@ impl App {
         };
         let blending = r.blend_samples() > 1;
         let tip = format!(
-            "{} of the frames in the last {} seconds were skipped ({} since the recording started, {} of its frames). \
+            "{} of the frames in the last {} seconds were skipped. \
              The video encoder couldn't keep up: where a frame is skipped, the one before stays on screen longer, so the clip stutters there.\n\n\
              Recording at {size}, {} fps{}. A lower frame rate or resolution gives it less to do{}. Click to open Settings.",
             percent(recent),
             SKIP_WINDOW.as_secs(),
-            skipped,
-            percent(share(skipped, encoded)),
             r.fps,
             if blending { format!(", blended from {} fps", r.fps * r.blend_samples()) } else { String::new() },
             if blending { ", and so does turning off frame blending" } else { "" },
