@@ -22,20 +22,12 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use egui::{Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
+use egui::{Color32, Pos2, Sense};
 
 use crate::collections::Collections;
-use crate::{App, RecState, clips, share, store, thumbs};
-
-const MIN_CARD_WIDTH: f32 = 220.0;
-const GAP: f32 = 14.0;
-const CAPTION_HEIGHT: f32 = 42.0;
-const RADIUS: u8 = 8;
-/// The sidebar's width, and the narrowest page that still gets one.
-pub(crate) const SIDEBAR_W: f32 = 230.0;
-const SIDEBAR_FROM: f32 = 720.0;
-/// How long a freshly saved clip stays highlighted.
-const NEW_HIGHLIGHT: Duration = Duration::from_secs(8);
+use crate::theme;
+use crate::ui_kit;
+use crate::{App, clips, share, store};
 
 pub(crate) const REC_RED: Color32 = crate::ui_kit::DANGER;
 pub(crate) const ACCENT: Color32 = crate::ui_kit::ACCENT;
@@ -94,16 +86,17 @@ impl Filter {
 }
 
 /// Something to show in the library, as the sidebar lists it.
-struct View {
-    filter: Filter,
-    label: String,
-    count: usize,
+#[derive(Clone)]
+pub(crate) struct View {
+    pub filter: Filter,
+    pub label: String,
+    pub count: usize,
 }
 
 /// What the sidebar lists: the games (the library's folders, by name, with
 /// Desktop and then Other — clips in no folder — last, as they aren't games)
 /// and the collections (by name). No games when the library has no folders.
-fn views(clips: &[clips::Clip], cols: &Collections) -> (Vec<View>, Vec<View>) {
+pub(crate) fn views(clips: &[clips::Clip], cols: &Collections) -> (Vec<View>, Vec<View>) {
     let mut games: Vec<View> = Vec::new();
     let mut loose = 0;
     // Newest first, so a folder's place is its newest clip's.
@@ -136,16 +129,16 @@ fn views(clips: &[clips::Clip], cols: &Collections) -> (Vec<View>, Vec<View>) {
 
 /// Clips being dragged inside the window.
 pub(crate) struct CardDrag {
-    files: Vec<PathBuf>,
+    pub files: Vec<PathBuf>,
     /// The clip the drag started on, for the picture under the pointer.
-    clip: PathBuf,
-    /// What dropping now would do, as the sidebar found it this frame.
-    target: Option<(DropOn, String)>,
+    pub clip: PathBuf,
+    /// What dropping now would do, as the panel found it this frame.
+    pub target: Option<(DropOn, String)>,
 }
 
 /// Where dragged clips can go.
 #[derive(Clone)]
-enum DropOn {
+pub(crate) enum DropOn {
     View(Filter),
     NewCollection,
 }
@@ -168,7 +161,7 @@ enum CollectionDialogKind {
 /// Clips picked for a bulk action.
 #[derive(Default)]
 pub(crate) struct Selection {
-    paths: HashSet<PathBuf>,
+    pub paths: HashSet<PathBuf>,
     /// Last card clicked, where a Shift-click range starts.
     anchor: Option<PathBuf>,
 }
@@ -191,7 +184,7 @@ impl Selection {
         }
     }
 
-    fn toggle(&mut self, path: &PathBuf) {
+    pub fn toggle(&mut self, path: &PathBuf) {
         if !self.paths.remove(path) {
             self.paths.insert(path.clone());
         }
@@ -199,7 +192,7 @@ impl Selection {
     }
 
     /// Add every clip from the anchor to `path`, in library order.
-    fn extend_to(&mut self, path: &PathBuf, clips: &[clips::Clip]) {
+    pub fn extend_to(&mut self, path: &PathBuf, clips: &[clips::Clip]) {
         let at = |p: &PathBuf| clips.iter().position(|c| &c.path == p);
         match (self.anchor.as_ref().and_then(at), at(path)) {
             (Some(a), Some(b)) => {
@@ -215,7 +208,7 @@ impl Selection {
     }
 }
 
-enum Action {
+pub(crate) enum Action {
     /// Drag the file out of the window (to another app / the desktop).
     DragOut(Vec<PathBuf>, Option<PathBuf>),
     /// Start dragging clips inside the window (from this clip's card).
@@ -251,7 +244,7 @@ enum Action {
     CancelUpload(PathBuf),
 }
 
-enum Card<'a> {
+pub(crate) enum Card<'a> {
     /// Recording or saving a replay clip.
     Placeholder,
     /// A "Save as new clip" render that has no file yet.
@@ -260,288 +253,6 @@ enum Card<'a> {
 }
 
 impl App {
-    pub(crate) fn library(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
-        self.permission_banner(ui);
-
-        // One card for a recording in progress, and one per clip still being written.
-        let placeholders = usize::from(self.rec_state == RecState::Recording) + self.saving;
-        let placeholder = placeholders > 0;
-        let new_renders: Vec<usize> = (0..self.renders.len()).filter(|&i| self.renders[i].as_new).collect();
-        if self.clips.is_empty() && !placeholder && new_renders.is_empty() {
-            self.empty_state(ui);
-            return;
-        }
-
-        // The clips of what's picked in the sidebar. Cards borrow a snapshot so
-        // drawing them can still use `&mut self` (thumbnail cache).
-        let (games, collections) = views(&self.clips, &self.collections);
-        let mut folders: Vec<String> = games.iter().filter_map(|c| if let Filter::Folder(f) = &c.filter { Some(f.clone()) } else { None }).collect();
-        folders.sort_by_key(|f| f.to_lowercase());
-        let clips: Vec<clips::Clip> = self.clips.iter().filter(|c| self.library_filter.matches(c, &self.collections)).cloned().collect();
-
-        let mut action = self.selection_keys(ui);
-        if let Some(a) = self.follow_drag(ui.ctx()) {
-            action = Some(a);
-        }
-        let wide = ui.available_width() >= SIDEBAR_FROM;
-        if wide {
-            // A card of its own, a shade off the page, instead of a line.
-            let fill = if ui.visuals().dark_mode { Color32::from_white_alpha(7) } else { Color32::from_black_alpha(9) };
-            egui::Panel::left("library_sidebar")
-                .resizable(false)
-                .show_separator_line(false)
-                .exact_size(SIDEBAR_W)
-                .frame(
-                    egui::Frame::new()
-                        .fill(fill)
-                        .corner_radius(10)
-                        // Rows inset like the page tabs above, so the chosen
-                        // row lines up with the chosen tab.
-                        .inner_margin(egui::Margin::symmetric(crate::ui_kit::SEGMENT_PAD as i8, 8))
-                        .outer_margin(egui::Margin { left: 0, right: 0, top: 8, bottom: 8 }),
-                )
-                .show(ui, |ui| {
-                    egui::ScrollArea::vertical().id_salt("library_sidebar_scroll").auto_shrink([false, false]).show(ui, |ui| {
-                        if let Some(a) = self.sidebar(ui, &games, &collections) {
-                            action = Some(a);
-                        }
-                    });
-                });
-        }
-        // Clear of the sidebar's line.
-        let mut padded = ui.new_child(egui::UiBuilder::new().max_rect({
-            let r = ui.available_rect_before_wrap();
-            if wide { r.with_min_x(r.min.x + 16.0) } else { r }
-        }));
-        let ui = &mut padded;
-        // Group into days. The placeholder always belongs to today.
-        let mut groups: Vec<(chrono::NaiveDate, Vec<Card>)> = Vec::new();
-        let mut live: Vec<Card> = new_renders.into_iter().map(Card::NewRender).collect();
-        for _ in 0..placeholders {
-            live.insert(0, Card::Placeholder);
-        }
-        if !live.is_empty() {
-            // Something new is on its way: Today opens to show it coming.
-            let today = chrono::Local::now().date_naive();
-            if self.folded.contains(&today) {
-                self.folded.set(today, false);
-            }
-            groups.push((today, live));
-        }
-        for clip in &clips {
-            let day = clip.day();
-            match groups.last_mut() {
-                Some((d, cards)) if *d == day => cards.push(Card::Clip(clip)),
-                _ => groups.push((day, vec![Card::Clip(clip)])),
-            }
-        }
-
-        // A clip being brought back into view unfolds its day.
-        if let Some(day) = self.reveal_clip.as_ref().and_then(|p| clips.iter().find(|c| &c.path == p)).map(|c| c.day()) {
-            self.folded.set(day, false);
-        }
-        let days: Vec<chrono::NaiveDate> = groups.iter().map(|(d, _)| *d).collect();
-        if let Some(a) = self.view_header(ui, wide, &games, &collections, clips.len(), &days) {
-            action = Some(a);
-        }
-        if !self.selection.is_empty() {
-            if let Some(a) = self.selection_bar(ui, clips.len(), &folders) {
-                action = Some(a);
-            }
-        }
-        if clips.is_empty() && placeholders == 0 {
-            if let Filter::Collection(id) = &self.library_filter {
-                let name = self.collections.get(id).map(|c| c.name.clone()).unwrap_or_default();
-                empty_collection(ui, &name);
-            }
-        }
-
-        crate::ui_kit::scroll(ui, "library_clips", |ui| {
-            let avail = ui.available_width();
-            let cols = (((avail + GAP) / (MIN_CARD_WIDTH + GAP)).floor() as usize).max(1);
-            let card_w = (avail - GAP * (cols - 1) as f32) / cols as f32;
-
-            for (day, cards) in &groups {
-                ui.add_space(10.0);
-                let n = cards.iter().filter(|c| matches!(c, Card::Clip(_))).count();
-                let collapsed = self.folded.contains(day);
-                if day_header(ui, &clips::day_label(*day), n, collapsed).clicked() {
-                    self.folded.set(*day, !collapsed);
-                }
-                if collapsed {
-                    continue;
-                }
-                ui.add_space(6.0);
-                for row in cards.chunks(cols) {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = GAP;
-                        for card in row {
-                            match card {
-                                Card::Placeholder => self.placeholder_card(ui, card_w),
-                                Card::NewRender(i) => self.new_render_card(ui, *i, card_w),
-                                Card::Clip(clip) => {
-                                    if let Some(a) = self.clip_card(ui, clip, card_w, &folders) {
-                                        action = Some(a);
-                                    }
-                                }
-                            }
-                        }
-                    });
-                    ui.add_space(GAP);
-                }
-            }
-            // Room under the last day, as on the other pages: the list ends
-            // visibly instead of running into the window's edge.
-            ui.add_space(24.0);
-        });
-
-        if let Some(a) = self.finish_drag(ui.ctx()) {
-            action = Some(a);
-        }
-
-        match action {
-            Some(Action::Open(p)) => self.open_viewer(p),
-            Some(Action::OpenExternal(p)) => {
-                if let Err(e) = clips::open_in_default_app(&p) {
-                    self.toast_error(format!("Couldn't open the clip: {e}"));
-                }
-            }
-            Some(Action::Share(p, choice)) => self.share(frame, p, choice),
-            Some(Action::DragOut(files, preview)) => self.drag_out(ui.ctx(), frame, files, preview),
-            Some(Action::StartDrag(files, clip)) => self.card_drag = Some(CardDrag { files, clip, target: None }),
-            Some(Action::Drop(files, on)) => match on {
-                DropOn::View(Filter::Folder(f)) => self.move_clips(ui.ctx(), &files, Some(f)),
-                DropOn::View(Filter::Loose) => self.move_clips(ui.ctx(), &files, None),
-                DropOn::View(Filter::Collection(id)) => self.put_in_collection(&files, &id, true),
-                DropOn::View(Filter::All) => {}
-                DropOn::NewCollection => self.new_collection_with(files),
-            },
-            Some(Action::Edit(p)) => self.open_editor(p),
-            Some(Action::Rename(p)) => self.rename_clip(p),
-            Some(Action::Trash(p)) => self.delete_clips(&[p], false),
-            Some(Action::MoveTo(paths, folder)) => self.move_clips(ui.ctx(), &paths, folder),
-            Some(Action::MoveSelectedTo(folder)) => {
-                let paths: Vec<PathBuf> = clips.iter().filter(|c| self.selection.paths.contains(&c.path)).map(|c| c.path.clone()).collect();
-                self.move_clips(ui.ctx(), &paths, folder);
-            }
-            Some(Action::Filter(f)) => {
-                self.library_filter = f;
-                self.selection.clear();
-            }
-            Some(Action::RenameFolder(name)) => self.rename_folder(&name),
-            Some(Action::NewCollection(paths)) => self.new_collection_with(paths),
-            Some(Action::InCollection(paths, id, add)) => self.put_in_collection(&paths, &id, add),
-            Some(Action::RenameCollection(id)) => {
-                let name = self.collections.get(&id).map(|c| c.name.clone()).unwrap_or_default();
-                self.collection_dialog = Some(CollectionDialog { kind: CollectionDialogKind::Rename(id), name, error: None, focused: false });
-            }
-            Some(Action::DeleteCollection(id)) => {
-                self.collection_dialog = Some(CollectionDialog { kind: CollectionDialogKind::Delete(id), name: String::new(), error: None, focused: false });
-            }
-            Some(Action::RevealFolder(name)) => {
-                if let Err(e) = clips::open_in_default_app(&self.settings.output_dir.join(name)) {
-                    self.toast_error(format!("Couldn't open the folder: {e}"));
-                }
-            }
-            Some(Action::Select { path, range }) => {
-                if range {
-                    self.selection.extend_to(&path, &clips);
-                } else {
-                    self.selection.toggle(&path);
-                }
-            }
-            Some(Action::SelectAll) => {
-                self.selection.paths = clips.iter().map(|c| c.path.clone()).collect();
-            }
-            Some(Action::Deselect) => self.selection.clear(),
-            Some(Action::CancelUpload(p)) => {
-                if let Some(up) = self.cloud.upload_for(&p) {
-                    up.cancel();
-                }
-            }
-            Some(Action::TrashSelected(ask)) => {
-                // In library order, so the toast and any failure read naturally.
-                let paths: Vec<PathBuf> = self.clips.iter().filter(|c| self.selection.paths.contains(&c.path)).map(|c| c.path.clone()).collect();
-                self.delete_clips(&paths, ask);
-            }
-            None => {}
-        }
-    }
-
-    /// ⌘A selects every clip, ⌫ / Delete trashes the selection, Esc clears it.
-    fn selection_keys(&mut self, ui: &egui::Ui) -> Option<Action> {
-        if crate::ui_kit::overlay_open(ui.ctx()) || ui.ctx().egui_wants_keyboard_input() {
-            return None;
-        }
-        let cmd = egui::Modifiers::COMMAND;
-        ui.ctx().input_mut(|i| {
-            if i.consume_key(cmd, egui::Key::A) {
-                Some(Action::SelectAll)
-            } else if self.selection.is_empty() {
-                None
-            } else if i.consume_key(cmd, egui::Key::Backspace)
-                || i.consume_key(egui::Modifiers::NONE, egui::Key::Backspace)
-                || i.consume_key(egui::Modifiers::NONE, egui::Key::Delete) {
-                Some(Action::TrashSelected(true))
-            } else if i.consume_key(egui::Modifiers::NONE, egui::Key::Escape) {
-                Some(Action::Deselect)
-            } else {
-                None
-            }
-        })
-    }
-
-    /// The bar on top while clips are selected: how many, and what to do with
-    /// them. `shown`: how many clips the library shows.
-    fn selection_bar(&self, ui: &mut egui::Ui, shown: usize, folders: &[String]) -> Option<Action> {
-        let mut action = None;
-        let n = self.selection.paths.len();
-        ui.add_space(8.0);
-        egui::Frame::new()
-            .fill(ACCENT.gamma_multiply(0.16))
-            .corner_radius(CornerRadius::same(RADIUS))
-            .inner_margin(egui::Margin::symmetric(12, 8))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(if n == 1 { "1 clip selected".to_owned() } else { format!("{n} clips selected") }).strong().size(15.0));
-                    ui.add_space(8.0);
-                    if n < shown && ui.button("Select all").on_hover_text(crate::hotkey_label_cmd("A")).clicked() {
-                        action = Some(Action::SelectAll);
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let trash = crate::ui_kit::danger_button(self.delete_label(None));
-                        let key = if cfg!(target_os = "macos") { "⌫".to_owned() } else { "Delete".to_owned() };
-                        if ui.add(trash).on_hover_text(key).clicked() {
-                            action = Some(Action::TrashSelected(false));
-                        }
-                        if !folders.is_empty() {
-                            ui.menu_button("Move to", |ui| {
-                                if let Some(f) = move_menu(ui, folders, None, true) {
-                                    action = Some(Action::MoveSelectedTo(f));
-                                }
-                            });
-                        }
-                        let selected: Vec<PathBuf> = self.clips.iter().filter(|c| self.selection.paths.contains(&c.path)).map(|c| c.path.clone()).collect();
-                        if let Filter::Collection(id) = &self.library_filter
-                            && ui.button("Remove from collection").clicked()
-                        {
-                            action = Some(Action::InCollection(selected.clone(), id.clone(), false));
-                        }
-                        ui.menu_button("+  Add to collection", |ui| {
-                            if let Some(a) = collection_menu(ui, &self.collections, &selected) {
-                                action = Some(a);
-                            }
-                        });
-                        if ui.button("Cancel").on_hover_text("Esc").clicked() {
-                            action = Some(Action::Deselect);
-                        }
-                    });
-                });
-            });
-        action
-    }
-
     /// Move clips (and their edits) to the Bin. Clips with a save in progress are
     /// left alone: their file is about to be replaced.
     /// Delete clips the way the setting says: to the Recycle Bin, or for good.
@@ -560,35 +271,48 @@ impl App {
     }
 
     /// "Move … to the Recycle Bin?" or "Delete … for good?", while clips wait
-    /// for it. Enter confirms.
+    /// for it, with the clip's picture and name when it's one. Enter confirms.
     pub(crate) fn delete_dialog(&mut self, ctx: &egui::Context) {
         let Some(paths) = self.confirm_delete.clone() else { return };
         let permanently = self.settings.delete_permanently;
         let bin = store::bin_name();
-        // A short heading; the clip's name under it, on one line.
-        let (what, name) = match paths.as_slice() {
-            [one] => ("it", Some(crate::clips::title_for_stem(&one.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()))),
-            _ => ("them", None),
+        let one = match paths.as_slice() {
+            [one] => self.clips.iter().find(|c| &c.path == one).cloned(),
+            _ => None,
         };
-        let count = if paths.len() == 1 { String::new() } else { format!(" {} clips", paths.len()) };
+        let what = if paths.len() == 1 { "it" } else { "them" };
+        let title = match (permanently, paths.len()) {
+            (true, 1) => "Delete for good?".to_owned(),
+            (true, n) => format!("Delete {n} clips for good?"),
+            (false, 1) => format!("Move to the {bin}?"),
+            (false, n) => format!("Move {n} clips to the {bin}?"),
+        };
+        let tex = one.as_ref().and_then(|c| self.thumbs.get(ctx, c).and_then(|t| t.texture.clone()));
         let (mut yes, mut no) = (false, false);
-        let modal = egui::Modal::new(egui::Id::new("confirm_delete")).show(ctx, |ui| {
-            ui.set_width(380.0);
-            ui.heading(if permanently { format!("Delete{count} for good?") } else { format!("Move{count} to the {bin}?") });
-            ui.add_space(6.0);
-            if let Some(name) = &name {
-                ui.add(egui::Label::new(egui::RichText::new(name).strong()).truncate());
+        let modal = ui_kit::dialog(ctx, "confirm_delete", 380.0, |ui| {
+            ui_kit::dialog_title(ui, &title);
+            if let Some(c) = &one {
+                ui.horizontal(|ui| {
+                    let (r, _) = ui.allocate_exact_size(egui::vec2(80.0, 45.0), Sense::hover());
+                    match &tex {
+                        Some(t) => {
+                            let uv = crate::filmstrip::crop_uv(t.size_vec2(), r.size());
+                            egui::Image::from_texture((t.id(), r.size())).uv(uv).corner_radius(4).paint_at(ui, r);
+                        }
+                        None => {
+                            ui.painter().rect_filled(r, 4, theme::pal(ui).raise2);
+                        }
+                    }
+                    ui.add_space(4.0);
+                    ui.add(egui::Label::new(theme::text(c.title(), 13.5, theme::W::Medium).color(theme::pal(ui).text)).truncate());
+                });
+                ui.add_space(8.0);
             }
-            if permanently {
-                ui.label(format!("You can't get {what} back."));
-            } else {
-                ui.label(format!("You can get {what} back from the {bin}."));
-            }
-            ui.add_space(12.0);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui_kit::dialog_text(ui, &if permanently { format!("You can't get {what} back.") } else { format!("You can get {what} back from the {bin}.") });
+            ui_kit::dialog_buttons(ui, |ui| {
                 let label = if permanently { "Delete".to_owned() } else { format!("Move to {bin}") };
-                yes = ui.add(crate::ui_kit::danger_button(label)).clicked();
-                no = ui.add(crate::ui_kit::button("Cancel", false)).clicked();
+                yes = ui.add(ui_kit::danger_button(label)).clicked();
+                no = ui.add(ui_kit::button("Cancel", false).ghost()).clicked();
             });
             // Enter deletes, as the default action of a confirmation.
             yes |= ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -654,9 +378,9 @@ impl App {
         } else if busy > 0 {
             self.toast_error("Clips that are still saving an edit were kept.");
         } else if !moved.is_empty() && permanently {
-            self.toast(format!("Deleted {what}"));
+            self.toast_icon(egui_phosphor::regular::TRASH, format!("Deleted {what}"));
         } else if !moved.is_empty() {
-            self.toast(format!("Moved {what} to the {bin}"));
+            self.toast_icon(egui_phosphor::regular::TRASH, format!("Moved {what} to the {bin}"));
         }
         self.selection.clear();
         self.refresh_clips();
@@ -681,283 +405,6 @@ impl App {
         }
     }
 
-    /// The sidebar: all clips, the games, your collections.
-    fn sidebar(&mut self, ui: &mut egui::Ui, games: &[View], collections: &[View]) -> Option<Action> {
-        let mut action = None;
-        let all = View { filter: Filter::All, label: "All clips".into(), count: self.clips.len() };
-        if let Some(a) = self.side_row(ui, &all) {
-            action = Some(a);
-        }
-        if !games.is_empty() {
-            section_label(ui, "Games");
-            for v in games {
-                if let Some(a) = self.side_row(ui, v) {
-                    action = Some(a);
-                }
-            }
-        }
-        section_label(ui, "Collections");
-        for v in collections {
-            if let Some(a) = self.side_row(ui, v) {
-                action = Some(a);
-            }
-        }
-        if collections.is_empty() {
-            ui.horizontal(|ui| {
-                ui.add_space(8.0);
-                ui.add(egui::Label::new(egui::RichText::new("Keep your best clips together, like \"Ace clutches\".").size(12.0).weak()).wrap());
-            });
-            ui.add_space(4.0);
-        }
-        let row = new_collection_row(ui);
-        if let Some(drag) = &mut self.card_drag
-            && row.contains_pointer()
-        {
-            drag.target = Some((DropOn::NewCollection, "New collection with it".into()));
-            ui.painter().rect_stroke(row.rect, ROW_RADIUS, Stroke::new(1.5, ACCENT), StrokeKind::Inside);
-        }
-        if row.clicked() {
-            action = Some(Action::NewCollection(Vec::new()));
-        }
-        action
-    }
-
-    /// One entry of the sidebar: its picture, name and number of clips.
-    fn side_row(&mut self, ui: &mut egui::Ui, view: &View) -> Option<Action> {
-        let mut action = None;
-        let selected = self.library_filter == view.filter;
-        let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_H), Sense::click());
-        let v = ui.visuals().clone();
-        let drop_here = self.drop_target(ui, rect, &view.filter);
-        // Selected: a soft tint and a stronger name, not a solid block.
-        if selected {
-            ui.painter().rect_filled(rect, ROW_RADIUS, ACCENT.gamma_multiply(0.22));
-        } else if resp.hovered() || drop_here {
-            ui.painter().rect_filled(rect, ROW_RADIUS, row_hover(&v));
-        }
-        if drop_here {
-            ui.painter().rect_stroke(rect, ROW_RADIUS, Stroke::new(1.5, ACCENT), StrokeKind::Inside);
-        }
-        let text = if selected { v.strong_text_color() } else { v.text_color() };
-        let icon_color = if selected { ACCENT } else { v.weak_text_color() };
-        let icon = Rect::from_center_size(Pos2::new(rect.left() + 8.0 + ICON / 2.0, rect.center().y), Vec2::splat(ICON));
-        self.view_icon(ui, &view.filter, icon, icon_color);
-        let count = ui.painter().layout_no_wrap(view.count.to_string(), FontId::proportional(12.0), v.weak_text_color());
-        let count_x = rect.right() - 8.0 - count.size().x;
-        ui.painter().galley(Pos2::new(count_x, rect.center().y - count.size().y / 2.0), count, v.weak_text_color());
-        let label_x = rect.left() + 8.0 + ICON + 10.0;
-        let label = ui.painter().layout_job(single_line(&view.label, FontId::proportional(14.0), text, (count_x - label_x - 8.0).max(10.0)));
-        ui.painter().galley(Pos2::new(label_x, rect.center().y - label.size().y / 2.0), label, text);
-        let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
-        if resp.clicked() && !selected {
-            action = Some(Action::Filter(view.filter.clone()));
-        }
-        resp.context_menu(|ui| {
-            if let Some(a) = view_menu(ui, &view.filter) {
-                action = Some(a);
-            }
-        });
-        action
-    }
-
-    /// While clips are dragged over this sidebar entry: whether they can go
-    /// there (it's then what a drop does).
-    fn drop_target(&mut self, ui: &egui::Ui, rect: Rect, filter: &Filter) -> bool {
-        let Some(drag) = &mut self.card_drag else { return false };
-        if !ui.rect_contains_pointer(rect) {
-            return false;
-        }
-        let name = |f: &Filter| match f {
-            Filter::Folder(name) => name.clone(),
-            Filter::Loose => "Other".into(),
-            Filter::Collection(id) => self.collections.get(id).map(|c| c.name.clone()).unwrap_or_default(),
-            Filter::All => String::new(),
-        };
-        let label = match filter {
-            Filter::All => return false,
-            Filter::Collection(id) if drag.files.iter().all(|p| self.collections.contains(id, p)) => return false,
-            Filter::Collection(_) => format!("Add to {}", name(filter)),
-            Filter::Folder(_) | Filter::Loose => {
-                let dir = match filter {
-                    Filter::Folder(f) => self.settings.output_dir.join(f),
-                    _ => self.settings.output_dir.clone(),
-                };
-                if drag.files.iter().all(|p| p.parent() == Some(dir.as_path())) {
-                    return false;
-                }
-                format!("Move to {}", name(filter))
-            }
-        };
-        drag.target = Some((DropOn::View(filter.clone()), label));
-        true
-    }
-
-    /// Keep up with clips being dragged: out of the window, they go to the OS
-    /// (to drop into another app); Esc cancels.
-    fn follow_drag(&mut self, ctx: &egui::Context) -> Option<Action> {
-        let drag = self.card_drag.as_mut()?;
-        drag.target = None;
-        // `hover_pos` is gone once the pointer has left the window.
-        let (down, pos, esc) = ctx.input(|i| (i.pointer.primary_down(), i.pointer.hover_pos(), i.key_pressed(egui::Key::Escape)));
-        if esc {
-            self.card_drag = None;
-            ctx.stop_dragging();
-            return None;
-        }
-        let outside = pos.is_none_or(|p| !ctx.content_rect().shrink(2.0).contains(p));
-        if down && outside && share::CAN_DRAG_OUT {
-            let drag = self.card_drag.take()?;
-            let preview = self.clips.iter().find(|c| c.path == drag.clip).and_then(thumbs::cached_jpeg);
-            return Some(Action::DragOut(drag.files, preview));
-        }
-        None
-    }
-
-    /// After the sidebar has looked at the pointer: drop on what it's over when
-    /// the button comes up, else draw the clips under the pointer.
-    fn finish_drag(&mut self, ctx: &egui::Context) -> Option<Action> {
-        let drag = self.card_drag.as_ref()?;
-        if !ctx.input(|i| i.pointer.primary_down()) {
-            let drag = self.card_drag.take()?;
-            return drag.target.map(|(on, _)| Action::Drop(drag.files, on));
-        }
-        let pos = ctx.input(|i| i.pointer.latest_pos())?;
-        ctx.set_cursor_icon(if drag.target.is_some() { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab });
-        let clip = self.clips.iter().find(|c| c.path == drag.clip).cloned();
-        let tex = clip.and_then(|c| self.thumbs.get(ctx, &c).and_then(|t| t.texture.clone()));
-        let (n, label) = (drag.files.len(), drag.target.as_ref().map(|(_, l)| l.clone()));
-        egui::Area::new(egui::Id::new("card_drag_ghost"))
-            .order(egui::Order::Tooltip)
-            .fixed_pos(pos + Vec2::new(12.0, 12.0))
-            .interactable(false)
-            .show(ctx, |ui| {
-                let size = Vec2::new(128.0, 72.0);
-                let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
-                let p = ui.painter();
-                // More than one: cards stacked behind.
-                if n > 1 {
-                    p.rect_filled(rect.translate(Vec2::new(5.0, -5.0)), 6, Color32::from_gray(70));
-                }
-                match &tex {
-                    Some(tex) => {
-                        let uv = crate::filmstrip::crop_uv(tex.size_vec2(), size);
-                        egui::Image::from_texture((tex.id(), size)).uv(uv).corner_radius(6).tint(Color32::from_white_alpha(230)).paint_at(ui, rect);
-                    }
-                    None => {
-                        p.rect_filled(rect, 6, Color32::from_gray(40));
-                    }
-                }
-                p.rect_stroke(rect, 6, Stroke::new(1.5, ACCENT), StrokeKind::Inside);
-                if n > 1 {
-                    let c = rect.right_top() + Vec2::new(-2.0, 2.0);
-                    p.circle_filled(c, 11.0, ACCENT);
-                    p.text(c, Align2::CENTER_CENTER, n.to_string(), FontId::proportional(12.0), Color32::WHITE);
-                }
-                if let Some(label) = &label {
-                    let g = p.layout_no_wrap(label.clone(), FontId::proportional(13.0), Color32::WHITE);
-                    let r = Rect::from_min_size(rect.left_bottom() + Vec2::new(0.0, 6.0), g.size() + Vec2::new(14.0, 8.0));
-                    p.rect_filled(r, 6, ACCENT);
-                    p.galley(r.min + Vec2::new(7.0, 4.0), g, Color32::WHITE);
-                }
-            });
-        ctx.request_repaint();
-        None
-    }
-
-    /// The picture of a view: a game's icon, a collection's newest clip.
-    fn view_icon(&mut self, ui: &mut egui::Ui, filter: &Filter, rect: Rect, color: Color32) {
-        // Every icon is the same square: a picture (a game's logo, a
-        // collection's newest clip) fills it; otherwise a line drawing.
-        let p = ui.painter().clone();
-        match filter {
-            Filter::All => glyph_grid(&p, rect, color),
-            Filter::Loose => glyph_folder(&p, rect, color),
-            Filter::Folder(name) => match self.folder_icon(ui.ctx(), name) {
-                Some(tex) => {
-                    egui::Image::from_texture((tex.id(), rect.size())).corner_radius(5).paint_at(ui, rect);
-                }
-                None if name == clips::DESKTOP => glyph_monitor(&p, rect, color),
-                None => glyph_folder(&p, rect, color),
-            },
-            Filter::Collection(id) => {
-                let newest = self.clips.iter().find(|c| self.collections.contains(id, &c.path)).cloned();
-                let ctx = ui.ctx().clone();
-                match newest.and_then(|c| self.thumbs.get(&ctx, &c).and_then(|t| t.texture.clone())) {
-                    Some(tex) => {
-                        let uv = crate::filmstrip::crop_uv(tex.size_vec2(), rect.size());
-                        egui::Image::from_texture((tex.id(), rect.size())).uv(uv).corner_radius(5).paint_at(ui, rect);
-                    }
-                    None => collection_glyph(&p, rect, color),
-                }
-            }
-        }
-    }
-
-    /// The name of what's shown, on top of the clips; a menu of everything to
-    /// show when there's no room for the sidebar.
-    fn view_header(&mut self, ui: &mut egui::Ui, wide: bool, games: &[View], collections: &[View], shown: usize, days: &[chrono::NaiveDate]) -> Option<Action> {
-        let mut action = None;
-        let (title, filter) = match &self.library_filter {
-            Filter::All => ("All clips".to_owned(), Filter::All),
-            Filter::Loose => ("Other".to_owned(), Filter::Loose),
-            Filter::Folder(f) => (f.clone(), self.library_filter.clone()),
-            Filter::Collection(id) => (self.collections.get(id).map(|c| c.name.clone()).unwrap_or_default(), self.library_filter.clone()),
-        };
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            let heading = egui::RichText::new(&title).size(20.0).strong();
-            if wide {
-                ui.label(heading);
-            } else {
-                // Everything the sidebar would list.
-                ui.menu_button(egui::RichText::new(format!("{title}  ⏷")).size(20.0).strong(), |ui| {
-                    ui.set_min_width(220.0);
-                    let all = View { filter: Filter::All, label: "All clips".into(), count: self.clips.len() };
-                    let mut pick = |ui: &mut egui::Ui, v: &View| {
-                        if ui.selectable_label(self.library_filter == v.filter, format!("{}   {}", v.label, v.count)).clicked() {
-                            action = Some(Action::Filter(v.filter.clone()));
-                        }
-                    };
-                    pick(ui, &all);
-                    if !games.is_empty() {
-                        ui.separator();
-                        ui.weak("Games");
-                        games.iter().for_each(|v| pick(ui, v));
-                    }
-                    ui.separator();
-                    ui.weak("Collections");
-                    collections.iter().for_each(|v| pick(ui, v));
-                    if ui.button("+  New collection…").clicked() {
-                        action = Some(Action::NewCollection(Vec::new()));
-                    }
-                    // No sidebar to right-click: what it would offer for this view.
-                    if !matches!(filter, Filter::All | Filter::Loose) {
-                        ui.separator();
-                        if let Some(a) = view_menu(ui, &filter) {
-                            action = Some(a);
-                        }
-                    }
-                });
-            }
-            ui.weak(if shown == 1 { "1 clip".to_owned() } else { format!("{shown} clips") });
-            // Fold every day away, or open them all again: quiet text by the
-            // count, a view option, not an action beside the capture buttons.
-            if days.len() > 1 {
-                ui.weak("·");
-                let all_folded = days.iter().all(|d| self.folded.contains(d));
-                let label = if all_folded { "Expand all" } else { "Collapse all" };
-                let galley = ui.painter().layout_no_wrap(label.to_owned(), egui::TextStyle::Body.resolve(ui.style()), Color32::PLACEHOLDER);
-                let (rect, r) = ui.allocate_exact_size(galley.size(), Sense::click());
-                let color = if r.hovered() { ui.visuals().strong_text_color() } else { ui.visuals().weak_text_color() };
-                ui.painter().galley_with_override_text_color(rect.min, galley, color);
-                if r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                    self.folded.set_all(days, !all_folded);
-                }
-            }
-        });
-        ui.add_space(2.0);
-        action
-    }
 
     /// Ask for a name for a new collection with these clips in it.
     pub(crate) fn new_collection_with(&mut self, paths: Vec<PathBuf>) {
@@ -970,33 +417,40 @@ impl App {
         if add {
             let n = self.collections.add(id, paths);
             match (paths.len(), n) {
-                (_, 0) => self.toast(format!("Already in {name}")),
-                (1, _) => self.toast(format!("Added to {name}")),
-                _ => self.toast(format!("Added {n} clips to {name}")),
+                (_, 0) => self.toast_icon(egui_phosphor::regular::FOLDER_PLUS, format!("Already in {name}")),
+                (1, _) => self.toast_icon(egui_phosphor::regular::FOLDER_PLUS, format!("Added to {name}")),
+                _ => self.toast_icon(egui_phosphor::regular::FOLDER_PLUS, format!("Added {n} clips to {name}")),
             }
         } else {
             self.collections.remove(id, paths);
-            self.toast(if paths.len() == 1 { format!("Removed from {name}") } else { format!("Removed {} clips from {name}", paths.len()) });
+            self.toast_icon(egui_phosphor::regular::MINUS_CIRCLE, if paths.len() == 1 { format!("Removed from {name}") } else { format!("Removed {} clips from {name}", paths.len()) });
         }
         self.selection.clear();
+    }
+
+    pub(crate) fn rename_collection(&mut self, id: String) {
+        let name = self.collections.get(&id).map(|c| c.name.clone()).unwrap_or_default();
+        self.collection_dialog = Some(CollectionDialog { kind: CollectionDialogKind::Rename(id), name, error: None, focused: false });
+    }
+
+    pub(crate) fn delete_collection(&mut self, id: String) {
+        self.collection_dialog = Some(CollectionDialog { kind: CollectionDialogKind::Delete(id), name: String::new(), error: None, focused: false });
     }
 
     /// The "New collection", "Rename collection" and "Delete collection" dialogs.
     pub(crate) fn collection_dialog(&mut self, ctx: &egui::Context) {
         let Some(d) = &mut self.collection_dialog else { return };
         let (mut close, mut submit) = (false, false);
-        let modal = egui::Modal::new(egui::Id::new("collection_dialog")).show(ctx, |ui| {
-            ui.set_width(380.0);
+        let modal = ui_kit::dialog(ctx, "collection_dialog", 380.0, |ui| {
             if let CollectionDialogKind::Delete(id) = &d.kind {
                 let c = self.collections.get(id);
-                ui.heading(format!("Delete “{}”?", c.map_or("", |c| c.name.as_str())));
-                ui.add_space(6.0);
-                ui.label("The collection goes away. Its clips stay in your library.");
-                ui.add_space(12.0);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    submit = ui.add(crate::ui_kit::danger_button("Delete collection")).clicked();
-                    close = ui.add(crate::ui_kit::button("Cancel", false)).clicked();
+                ui_kit::dialog_title(ui, &format!("Delete “{}”?", c.map_or("", |c| c.name.as_str())));
+                ui_kit::dialog_text(ui, "The collection goes away. Its clips stay in your library.");
+                ui_kit::dialog_buttons(ui, |ui| {
+                    submit = ui.add(ui_kit::danger_button("Delete collection")).clicked();
+                    close = ui.add(ui_kit::button("Cancel", false).ghost()).clicked();
                 });
+                submit |= ui.input(|i| i.key_pressed(egui::Key::Enter));
                 return;
             }
             let (heading, button) = match &d.kind {
@@ -1005,9 +459,8 @@ impl App {
                 CollectionDialogKind::New(_) => ("New collection".to_owned(), "Create".to_owned()),
                 _ => ("Rename collection".to_owned(), "Rename".to_owned()),
             };
-            ui.heading(heading);
-            ui.add_space(6.0);
-            let out = egui::TextEdit::singleline(&mut d.name).hint_text("Like \"Best of the week\"").desired_width(f32::INFINITY).show(ui);
+            ui_kit::dialog_title(ui, &heading);
+            let out = ui_kit::text_field(ui, &mut d.name, "Like “Best of the week”");
             if !d.focused {
                 out.response.request_focus();
                 let mut state = out.state.clone();
@@ -1017,14 +470,14 @@ impl App {
             }
             submit = out.response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             if let Some(e) = &d.error {
-                ui.colored_label(ui.visuals().error_fg_color, e);
+                ui.add_space(4.0);
+                ui.label(theme::text(e, 12.5, theme::W::Regular).color(theme::pal(ui).danger));
             }
-            ui.add_space(12.0);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.add(crate::ui_kit::button(button, true)).clicked() {
+            ui_kit::dialog_buttons(ui, |ui| {
+                if ui.add(ui_kit::button(button, true)).clicked() {
                     submit = true;
                 }
-                if ui.add(crate::ui_kit::button("Cancel", false)).clicked() {
+                if ui.add(ui_kit::button("Cancel", false).ghost()).clicked() {
                     close = true;
                 }
             });
@@ -1070,7 +523,7 @@ impl App {
 
     /// The game's picture for one of the library's folders, when Discord knows
     /// the game (also after the folder's been renamed).
-    fn folder_icon(&mut self, ctx: &egui::Context, folder: &str) -> Option<egui::TextureHandle> {
+    pub(crate) fn folder_icon(&mut self, ctx: &egui::Context, folder: &str) -> Option<egui::TextureHandle> {
         let game = self.settings.game_folders.iter().find(|(_, f)| *f == folder).map_or(folder, |(game, _)| game.as_str());
         let url = crate::discord::game_for_folder(game)?.icon?;
         self.web_images.icon(ctx, &url)
@@ -1079,7 +532,7 @@ impl App {
     /// Move clips to another folder of the library (`None`: the library
     /// itself). Their edits follow by id. Clips busy saving an edit or
     /// uploading stay where they are.
-    fn move_clips(&mut self, ctx: &egui::Context, paths: &[PathBuf], folder: Option<String>) {
+    pub(crate) fn move_clips(&mut self, ctx: &egui::Context, paths: &[PathBuf], folder: Option<String>) {
         let lib = self.settings.output_dir.clone();
         let dir = folder.as_ref().map_or(lib.clone(), |f| lib.join(f));
         if let Err(e) = std::fs::create_dir_all(&dir) {
@@ -1111,9 +564,9 @@ impl App {
         } else if busy > 0 {
             self.toast_error("Clips that are still saving an edit or uploading were kept where they are.");
         } else if moved == 1 {
-            self.toast(format!("Moved to {place}"));
+            self.toast_icon(egui_phosphor::regular::FOLDERS, format!("Moved to {place}"));
         } else if moved > 1 {
-            self.toast(format!("Moved {moved} clips to {place}"));
+            self.toast_icon(egui_phosphor::regular::FOLDERS, format!("Moved {moved} clips to {place}"));
         }
         self.selection.clear();
         self.refresh_clips();
@@ -1121,7 +574,7 @@ impl App {
 
     /// A clip's file moved (renamed, or to another folder): the player, the
     /// editor and the "new" highlight follow it.
-    fn follow_rename(&mut self, ctx: &egui::Context, from: &Path, to: &Path) {
+    pub(crate) fn follow_rename(&mut self, ctx: &egui::Context, from: &Path, to: &Path) {
         self.collections.follow(from, to);
         if let Some((p, _)) = &mut self.last_saved
             && p == from
@@ -1135,349 +588,6 @@ impl App {
             e.renamed(ctx, from, to);
         }
     }
-
-    fn empty_state(&mut self, ui: &mut egui::Ui) {
-        ui.vertical_centered(|ui| {
-            ui.add_space(ui.available_height() * 0.28);
-            ui.label(egui::RichText::new("🎬").size(44.0));
-            ui.add_space(8.0);
-            ui.label(egui::RichText::new("No clips yet").size(20.0).strong());
-            ui.add_space(4.0);
-            let hint = match self.rec_state {
-                RecState::Buffering => format!(
-                    "The replay buffer is running. Press {} or Save clip to keep the last {}.",
-                    self.shortcut_label(crate::settings::ShortcutAction::SaveClip),
-                    crate::settings_ui::length_words(self.settings.replay_seconds)
-                ),
-                RecState::Recording => "Recording… stop it to see your clip here.".to_owned(),
-                RecState::Idle => format!(
-                    "Start the replay buffer and press {} whenever something worth keeping happens.",
-                    self.shortcut_label(crate::settings::ShortcutAction::SaveClip)
-                ),
-            };
-            ui.weak(hint);
-        });
-    }
-
-    /// Placeholder for a clip that doesn't exist yet: a pulsing dot, a label and,
-    /// when known, a progress bar. Shared by recording, saving and rendering.
-    fn progress_card(ui: &mut egui::Ui, w: f32, title: &str, caption: &str, color: Color32, progress: Option<f32>) {
-        let (rect, _) = ui.allocate_exact_size(Vec2::new(w, w * 9.0 / 16.0 + CAPTION_HEIGHT), Sense::hover());
-        let thumb = Rect::from_min_size(rect.min, Vec2::new(w, w * 9.0 / 16.0));
-        let p = ui.painter();
-        let v = ui.visuals();
-        p.rect_filled(thumb, RADIUS, v.extreme_bg_color);
-        p.rect_stroke(thumb, RADIUS, Stroke::new(1.5, color), StrokeKind::Inside);
-        pulse(p, thumb.center() - Vec2::new(0.0, 14.0), color, ui.input(|i| i.time));
-        p.text(thumb.center() + Vec2::new(0.0, 14.0), Align2::CENTER_CENTER, title, FontId::proportional(15.0), v.text_color());
-        if let Some(f) = progress {
-            progress_bar(p, thumb, f, color);
-        }
-        p.text(Pos2::new(rect.left() + 2.0, thumb.bottom() + 8.0), Align2::LEFT_TOP, caption, FontId::proportional(14.0), v.weak_text_color());
-        ui.ctx().request_repaint();
-    }
-
-    fn new_render_card(&mut self, ui: &mut egui::Ui, i: usize, w: f32) {
-        let job = &self.renders[i];
-        let f = job.progress();
-        // Show the source clip's preview under the progress, so it's clear what's being made.
-        let source = self.clips.iter().find(|c| c.path == job.source).cloned();
-        if let Some(src) = source {
-            let name = job.dest.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-            let (rect, _) = ui.allocate_exact_size(Vec2::new(w, w * 9.0 / 16.0 + CAPTION_HEIGHT), Sense::hover());
-            let thumb_rect = Rect::from_min_size(rect.min, Vec2::new(w, w * 9.0 / 16.0));
-            let ctx = ui.ctx().clone();
-            if let Some(tex) = self.thumbs.get(&ctx, &src).and_then(|t| t.texture.clone()) {
-                let uv = crate::filmstrip::crop_uv(tex.size_vec2(), thumb_rect.size());
-                egui::Image::from_texture((tex.id(), thumb_rect.size())).uv(uv).corner_radius(RADIUS).paint_at(ui, thumb_rect);
-            }
-            let p = ui.painter();
-            p.rect_filled(thumb_rect, RADIUS, Color32::from_black_alpha(160));
-            p.rect_stroke(thumb_rect, RADIUS, Stroke::new(1.5, ACCENT), StrokeKind::Inside);
-            pulse(p, thumb_rect.center() - Vec2::new(0.0, 12.0), ACCENT, ui.input(|i| i.time));
-            p.text(thumb_rect.center() + Vec2::new(0.0, 14.0), Align2::CENTER_CENTER, format!("Saving new clip  {:.0}%", f * 100.0), FontId::proportional(14.0), Color32::WHITE);
-            progress_bar(p, thumb_rect, f, ACCENT);
-            let v = ui.visuals();
-            p.text(Pos2::new(rect.left() + 2.0, thumb_rect.bottom() + 6.0), Align2::LEFT_TOP, &name, FontId::proportional(14.0), v.strong_text_color());
-            ui.ctx().request_repaint();
-            return;
-        }
-        let name = job.dest.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-        Self::progress_card(ui, w, &format!("Saving  {:.0}%", f * 100.0), &name, ACCENT, Some(f));
-    }
-
-    fn placeholder_card(&mut self, ui: &mut egui::Ui, w: f32) {
-        if self.rec_state == RecState::Recording {
-            let secs = self.rec_started.map_or(0, |t| t.elapsed().as_secs());
-            let title = format!("Recording  {}", thumbs::format_duration(Duration::from_secs(secs)));
-            Self::progress_card(ui, w, &title, "In progress", REC_RED, None);
-        } else {
-            Self::progress_card(ui, w, "Saving clip…", "In progress", ACCENT, None);
-        }
-    }
-
-    fn clip_card(&mut self, ui: &mut egui::Ui, clip: &clips::Clip, w: f32, folders: &[String]) -> Option<Action> {
-        let thumb_h = w * 9.0 / 16.0;
-        // click_and_drag: a click plays, a drag pulls the file out of the window.
-        let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, thumb_h + CAPTION_HEIGHT), Sense::click_and_drag());
-        let thumb_rect = Rect::from_min_size(rect.min, Vec2::new(w, thumb_h));
-        if self.reveal_clip.as_ref() == Some(&clip.path) {
-            ui.scroll_to_rect(rect, Some(egui::Align::Center));
-            self.reveal_clip = None;
-        }
-        let hovered = ui.rect_contains_pointer(rect);
-        let is_new = self
-            .last_saved
-            .as_ref()
-            .is_some_and(|(p, at)| *p == clip.path && at.elapsed() < NEW_HIGHLIGHT);
-        let selecting = !self.selection.is_empty();
-        let selected = self.selection.paths.contains(&clip.path);
-
-        let ctx = ui.ctx().clone();
-        // Only cards on screen (or about to be) load theirs: every clip's
-        // picture stayed on the graphics card otherwise, half a MB each.
-        let thumb = if ui.is_rect_visible(rect.expand(rect.height())) { self.thumbs.get(&ctx, clip) } else { None };
-        let v = ui.visuals().clone();
-        let p = ui.painter();
-
-        // --- Thumbnail (cropped to 16:9 so every card lines up) ---
-        match thumb.and_then(|t| t.texture.as_ref()) {
-            Some(tex) => {
-                let uv = crate::filmstrip::crop_uv(tex.size_vec2(), thumb_rect.size());
-                egui::Image::from_texture((tex.id(), thumb_rect.size()))
-                    .uv(uv)
-                    .corner_radius(RADIUS)
-                    .paint_at(ui, thumb_rect);
-            }
-            None => {
-                p.rect_filled(thumb_rect, RADIUS, v.extreme_bg_color);
-                // Still being made: an ellipsis; none to be had: just the dark frame.
-                if thumb.is_none() {
-                    p.text(thumb_rect.center(), Align2::CENTER_CENTER, "…", FontId::proportional(26.0), v.weak_text_color());
-                }
-            }
-        }
-
-        if let Some(d) = thumb.and_then(|t| t.duration) {
-            badge(p, thumb_rect.right_bottom() - Vec2::new(6.0, 6.0), Align2::RIGHT_BOTTOM, &thumbs::format_duration(d), Color32::from_black_alpha(190));
-        }
-        // An edit of this clip is rendering: dim it, pulse, and show progress.
-        let render = self.renders.iter().find(|j| !j.as_new && j.source == clip.path).map(|j| j.progress());
-        if let Some(f) = render {
-            p.rect_filled(thumb_rect, RADIUS, Color32::from_black_alpha(150));
-            pulse(p, thumb_rect.center() - Vec2::new(0.0, 12.0), ACCENT, ui.input(|i| i.time));
-            p.text(thumb_rect.center() + Vec2::new(0.0, 14.0), Align2::CENTER_CENTER, format!("Saving edit  {:.0}%", f * 100.0), FontId::proportional(14.0), Color32::WHITE);
-            progress_bar(p, thumb_rect, f, ACCENT);
-            ui.ctx().request_repaint();
-        } else if let Some(up) = self.cloud.upload_for(&clip.path) {
-            // Uploading: a slim bar along the bottom and a label, without hiding the clip.
-            let f = up.progress();
-            let label = if up.merging() { "Finishing upload…".to_owned() } else { format!("Uploading  {:.0}%", f * 100.0) };
-            badge(p, thumb_rect.left_top() + Vec2::new(6.0, 6.0), Align2::LEFT_TOP, &label, Color32::from_black_alpha(190));
-            progress_bar(p, thumb_rect, f, ACCENT);
-            ui.ctx().request_repaint();
-        } else if is_new && !selecting && !hovered {
-            badge(p, thumb_rect.left_top() + Vec2::new(6.0, 6.0), Align2::LEFT_TOP, "NEW", ACCENT);
-        }
-        if selected {
-            p.rect_filled(thumb_rect, RADIUS, ACCENT.gamma_multiply(0.22));
-        }
-
-        if hovered && render.is_none() && !selecting {
-            p.rect_filled(thumb_rect, RADIUS, Color32::from_black_alpha(70));
-            let c = thumb_rect.center();
-            p.circle_filled(c, 22.0, Color32::from_black_alpha(150));
-            p.add(egui::Shape::convex_polygon(
-                vec![c + Vec2::new(-6.0, -10.0), c + Vec2::new(11.0, 0.0), c + Vec2::new(-6.0, 10.0)],
-                Color32::WHITE,
-                Stroke::NONE,
-            ));
-        }
-        let border = if selected {
-            Stroke::new(3.0, ACCENT)
-        } else if is_new {
-            Stroke::new(2.0, ACCENT)
-        } else if hovered {
-            Stroke::new(1.0, v.widgets.hovered.bg_stroke.color)
-        } else {
-            Stroke::new(1.0, v.widgets.noninteractive.bg_stroke.color)
-        };
-        p.rect_stroke(thumb_rect, RADIUS, border, StrokeKind::Inside);
-
-        // --- Caption ---
-        // Edited clips say so in words, in the accent colour, right where you read
-        // the clip's details — not a dark chip lost on top of a busy thumbnail.
-        let edited = clip.original.is_some() && render.is_none();
-        let mut text_x = rect.left() + 2.0;
-        let title_y = thumb_rect.bottom() + 6.0;
-        if edited {
-            text_x += edited_pill(p, Pos2::new(text_x, title_y + 1.0)) + 6.0;
-        }
-        let text_w = rect.right() - text_x - 2.0;
-        let title = p.layout_job(single_line(&clip.title(), FontId::proportional(14.0), v.strong_text_color(), text_w));
-        p.galley(Pos2::new(text_x, title_y), title, v.text_color());
-        let ext = clip.path.extension().map(|e| e.to_string_lossy().to_uppercase()).unwrap_or_default();
-        // The format only when it isn't the usual MP4: on every card it said nothing.
-        let mut detail = clip.human_size();
-        if ext != "MP4" {
-            detail = format!("{detail}  ·  {ext}");
-        }
-        // Every game's clips together: say whose this is.
-        if let (Filter::All | Filter::Collection(_), Some(folder)) = (&self.library_filter, &clip.folder) {
-            detail = format!("{folder}  ·  {detail}");
-        }
-        let meta = p.layout_job(single_line(&detail, FontId::proportional(12.0), v.weak_text_color(), w - 4.0));
-        p.galley(Pos2::new(rect.left() + 2.0, thumb_rect.bottom() + 24.0), meta, v.weak_text_color());
-
-        let mut action = None;
-        let modifiers = ui.input(|i| i.modifiers);
-
-        // Check circle: always there while selecting, on hover otherwise.
-        if (hovered || selecting) && render.is_none() {
-            let check = Rect::from_min_size(thumb_rect.left_top() + Vec2::new(8.0, 8.0), Vec2::splat(24.0));
-            let r = ui.interact(check.expand(4.0), ui.id().with(("select", &clip.path)), Sense::click());
-            check_circle(ui.painter(), check.center(), selected, r.hovered());
-            let tip = if selected { "Deselect" } else { "Select" };
-            if r.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tip).clicked() {
-                action = Some(Action::Select { path: clip.path.clone(), range: modifiers.shift });
-            }
-        }
-
-        // Hover shortcuts for the most common follow-ups.
-        let share_rect = Rect::from_min_size(thumb_rect.right_top() + Vec2::new(-84.0, 6.0), Vec2::new(78.0, 26.0));
-        let edit_rect = Rect::from_min_size(share_rect.left_top() - Vec2::new(70.0, 0.0), Vec2::new(64.0, 26.0));
-        let share_id = ui.id().with(("share_menu", &clip.path));
-        let menu_open = egui::Popup::is_id_open(ui.ctx(), share_id);
-        if (hovered || menu_open) && render.is_none() && !selecting {
-            let overlay_button = |ui: &mut egui::Ui, rect: Rect, text: &str, fill: Color32| {
-                // A detached child Ui: `ui.put` would count as another item in the row
-                // and push the next card one gap to the right while hovered.
-                ui.new_child(egui::UiBuilder::new().max_rect(rect)).add_sized(
-                    rect.size(),
-                    egui::Button::new(egui::RichText::new(text).color(Color32::WHITE))
-                        .fill(fill)
-                        .corner_radius(CornerRadius::same(6)),
-                )
-            };
-            if overlay_button(ui, edit_rect, "Edit", Color32::from_black_alpha(170)).clicked() {
-                action = Some(Action::Edit(clip.path.clone()));
-            }
-            let share_btn = overlay_button(ui, share_rect, "Share", ACCENT);
-            egui::Popup::menu(&share_btn).id(share_id).show(|ui| {
-                if let Some(c) = share_menu(ui, share_btn.rect.left_bottom()) {
-                    action = Some(Action::Share(clip.path.clone(), c));
-                }
-            });
-        }
-
-        let hint = match (selecting, share::CAN_DRAG_OUT) {
-            (true, true) => "Click to select · drag the selected clips into any app",
-            (true, false) => "Click to select",
-            (false, true) => "Click to play · drag into any app to share",
-            (false, false) => "Click to play",
-        };
-        let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(format!("{}\n{hint}", clip.name));
-        // Once the pointer has moved a little with the button held, it's a drag:
-        // hand it to the OS so the clip can be dropped into Discord, Finder, a
-        // browser… (egui alone can't drag outside its own window).
-        // Dragging one of the selected clips takes them all, in library order;
-        // any other clip goes alone, as in a file manager.
-        if resp.drag_started() && action.is_none() && self.card_drag.is_none() {
-            let files = if selected {
-                self.clips.iter().filter(|c| self.selection.paths.contains(&c.path)).map(|c| c.path.clone()).collect()
-            } else {
-                vec![clip.path.clone()]
-            };
-            action = Some(Action::StartDrag(files, clip.path.clone()));
-        }
-        if resp.clicked() && action.is_none() && render.is_none() {
-            action = Some(if modifiers.shift && (selecting || modifiers.command) {
-                Action::Select { path: clip.path.clone(), range: true }
-            } else if selecting || modifiers.command {
-                Action::Select { path: clip.path.clone(), range: false }
-            } else {
-                Action::Open(clip.path.clone())
-            });
-        }
-        let n = self.selection.paths.len();
-        let uploading = self.cloud.upload_for(&clip.path).is_some();
-        resp.context_menu(|ui| {
-            ui.set_min_width(190.0);
-            // Right-clicking one of several selected clips acts on all of them.
-            if selected && n > 1 {
-                let paths: Vec<PathBuf> = self.clips.iter().filter(|c| self.selection.paths.contains(&c.path)).map(|c| c.path.clone()).collect();
-                ui.menu_button(format!("+  Add {n} clips to collection"), |ui| {
-                    if let Some(a) = collection_menu(ui, &self.collections, &paths) {
-                        action = Some(a);
-                    }
-                });
-                if let Filter::Collection(id) = &self.library_filter
-                    && ui.button(format!("Remove {n} clips from collection")).clicked()
-                {
-                    action = Some(Action::InCollection(paths.clone(), id.clone(), false));
-                }
-                if !folders.is_empty() {
-                    ui.menu_button(format!("Move {n} clips to"), |ui| {
-                        if let Some(f) = move_menu(ui, folders, None, true) {
-                            action = Some(Action::MoveSelectedTo(f));
-                        }
-                    });
-                }
-                if ui.button(egui::RichText::new(self.delete_label(Some(n))).color(v.error_fg_color)).clicked() {
-                    action = Some(Action::TrashSelected(false));
-                }
-                if ui.button("Deselect all").clicked() {
-                    action = Some(Action::Deselect);
-                }
-                return;
-            }
-            if ui.button("Play").clicked() {
-                action = Some(Action::Open(clip.path.clone()));
-            }
-            if ui.button("Open in default player").clicked() {
-                action = Some(Action::OpenExternal(clip.path.clone()));
-            }
-            if ui.button("Edit…").clicked() {
-                action = Some(Action::Edit(clip.path.clone()));
-            }
-            if ui.button("Rename…").clicked() {
-                action = Some(Action::Rename(clip.path.clone()));
-            }
-            ui.menu_button("+  Add to collection", |ui| {
-                if let Some(a) = collection_menu(ui, &self.collections, std::slice::from_ref(&clip.path)) {
-                    action = Some(a);
-                }
-            });
-            if let Filter::Collection(id) = &self.library_filter
-                && ui.button("Remove from collection").clicked()
-            {
-                action = Some(Action::InCollection(vec![clip.path.clone()], id.clone(), false));
-            }
-            if !folders.is_empty() {
-                ui.menu_button("Move to", |ui| {
-                    if let Some(f) = move_menu(ui, folders, clip.folder.as_deref(), clip.folder.is_some()) {
-                        action = Some(Action::MoveTo(vec![clip.path.clone()], f));
-                    }
-                });
-            }
-            if !selected && ui.button("Select").clicked() {
-                action = Some(Action::Select { path: clip.path.clone(), range: false });
-            }
-            ui.separator();
-            if uploading {
-                if ui.button("Cancel upload").clicked() {
-                    action = Some(Action::CancelUpload(clip.path.clone()));
-                }
-            } else if let Some(c) = share_menu(ui, ui.ctx().pointer_latest_pos().unwrap_or_default()) {
-                action = Some(Action::Share(clip.path.clone(), c));
-            }
-            ui.separator();
-            if ui.button(egui::RichText::new(self.delete_label(None)).color(v.error_fg_color)).clicked() {
-                action = Some(Action::Trash(clip.path.clone()));
-            }
-        });
-        action
-    }
 }
 
 impl App {
@@ -1486,7 +596,7 @@ impl App {
         self.rename = Some(Rename { path, name, error: None, focused: false, folder: false });
     }
 
-    fn rename_folder(&mut self, name: &str) {
+    pub(crate) fn rename_folder(&mut self, name: &str) {
         let path = self.settings.output_dir.join(name);
         self.rename = Some(Rename { path, name: name.to_owned(), error: None, focused: false, folder: true });
     }
@@ -1531,32 +641,27 @@ impl App {
         let Some(r) = &mut self.rename else { return };
         let mut close = false;
         let mut submit = false;
-        let modal = egui::Modal::new(egui::Id::new("rename_clip")).show(ctx, |ui| {
-            ui.set_width(380.0);
-            ui.heading(if r.folder { "Rename folder" } else { "Rename clip" });
-            ui.add_space(6.0);
-            let out = egui::TextEdit::singleline(&mut r.name).desired_width(f32::INFINITY).show(ui);
+        let modal = ui_kit::dialog(ctx, "rename_clip", 380.0, |ui| {
+            ui_kit::dialog_title(ui, if r.folder { "Rename folder" } else { "Rename clip" });
+            let out = ui_kit::text_field(ui, &mut r.name, "");
             if !r.focused {
                 // Open with the whole name selected, ready to type over.
                 out.response.request_focus();
                 let mut state = out.state.clone();
-                state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
-                    egui::text::CCursor::new(0),
-                    egui::text::CCursor::new(r.name.chars().count()),
-                )));
+                state.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(r.name.chars().count()))));
                 state.store(ui.ctx(), out.response.id);
                 r.focused = true;
             }
             submit = out.response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             if let Some(e) = &r.error {
-                ui.colored_label(ui.visuals().error_fg_color, e);
+                ui.add_space(4.0);
+                ui.label(theme::text(e, 12.5, theme::W::Regular).color(theme::pal(ui).danger));
             }
-            ui.add_space(12.0);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.add(crate::ui_kit::button("Rename", true)).clicked() {
+            ui_kit::dialog_buttons(ui, |ui| {
+                if ui.add(ui_kit::button("Rename", true)).clicked() {
                     submit = true;
                 }
-                if ui.add(crate::ui_kit::button("Cancel", false)).clicked() {
+                if ui.add(ui_kit::button("Cancel", false).ghost()).clicked() {
                     close = true;
                 }
             });
@@ -1606,35 +711,9 @@ pub(crate) enum ShareChoice {
 }
 
 /// The ways to get a clip out, shared by the library's Share button and
-/// right-click menu and the player's Share button. Ordered by how often
-/// people reach for them.
+/// right-click menu and the player's Share button.
 pub(crate) fn share_menu(ui: &mut egui::Ui, anchor: Pos2) -> Option<ShareChoice> {
-    let mut choice = None;
-    ui.set_min_width(230.0);
-    let paste = crate::hotkey_label_cmd("V");
-    if ui.button("Copy clip").on_hover_text(format!("Then paste it into Discord, a chat or a folder ({paste})")).clicked() {
-        choice = Some(ShareChoice::Copy);
-    }
-    if share::HAS_SHARE_SHEET && ui.button(share::SHARE_SHEET_LABEL).clicked() {
-        choice = Some(ShareChoice::Sheet(anchor));
-    }
-    if ui.button("Upload to HesteFiles…").clicked() {
-        choice = Some(ShareChoice::Upload);
-    }
-    if ui.button(format!("{}", crate::reveal_label())).clicked() {
-        choice = Some(ShareChoice::Reveal);
-    }
-    if ui.button("Save audio as MP3…").on_hover_text("Just the clip's sound, saved where you pick").clicked() {
-        choice = Some(ShareChoice::Mp3);
-    }
-    if share::CAN_DRAG_OUT {
-        ui.separator();
-        ui.weak("Tip: drag the clip into any app");
-    }
-    if choice.is_some() {
-        ui.close();
-    }
-    choice
+    crate::library_view::share_items(ui, anchor, false)
 }
 
 impl App {
@@ -1703,153 +782,6 @@ impl App {
     }
 }
 
-/// The "Edited" marker in a card's caption: a small accent pill. Returns its width.
-fn edited_pill(p: &egui::Painter, at: Pos2) -> f32 {
-    let galley = p.layout_no_wrap("Edited".to_owned(), FontId::proportional(11.5), Color32::WHITE);
-    let rect = Rect::from_min_size(at, galley.size() + Vec2::new(12.0, 3.0));
-    p.rect_filled(rect, 8, ACCENT);
-    p.galley(rect.min + Vec2::new(6.0, 1.5), galley, Color32::WHITE);
-    rect.width()
-}
-
-/// A card's selection circle: hollow when not selected, a filled check when it is.
-fn check_circle(p: &egui::Painter, c: Pos2, selected: bool, hovered: bool) {
-    if selected {
-        p.circle_filled(c, 12.0, ACCENT);
-        p.circle_stroke(c, 12.0, Stroke::new(1.5, Color32::WHITE));
-        let tick = vec![c + Vec2::new(-5.5, 0.5), c + Vec2::new(-1.5, 4.5), c + Vec2::new(6.0, -4.0)];
-        p.add(egui::Shape::line(tick, Stroke::new(2.2, Color32::WHITE)));
-    } else {
-        p.circle_filled(c, 12.0, Color32::from_black_alpha(if hovered { 140 } else { 90 }));
-        p.circle_stroke(c, 11.0, Stroke::new(1.8, Color32::WHITE));
-    }
-}
-
-/// Soft pulsing dot (the same "live" cue as the recording indicator).
-fn pulse(p: &egui::Painter, c: Pos2, color: Color32, time: f64) {
-    let phase = (time * 2.5).sin() as f32 * 0.5 + 0.5;
-    p.circle_filled(c, 9.0 + 5.0 * phase, color.gamma_multiply(0.18 + 0.12 * (1.0 - phase)));
-    p.circle_filled(c, 7.0, color);
-}
-
-/// Thin progress bar along the bottom of a thumbnail.
-fn progress_bar(p: &egui::Painter, thumb: Rect, f: f32, color: Color32) {
-    let track = Rect::from_min_max(Pos2::new(thumb.left() + 14.0, thumb.bottom() - 16.0), Pos2::new(thumb.right() - 14.0, thumb.bottom() - 11.0));
-    p.rect_filled(track, 3, Color32::from_white_alpha(30));
-    let fill = Rect::from_min_max(track.min, Pos2::new(track.left() + track.width() * f.clamp(0.0, 1.0), track.bottom()));
-    p.rect_filled(fill, 3, color);
-}
-
-fn badge(p: &egui::Painter, pos: Pos2, anchor: Align2, text: &str, fill: Color32) {
-    let galley = p.layout_no_wrap(text.to_owned(), FontId::proportional(11.5), Color32::WHITE);
-    let rect = anchor.anchor_size(pos, galley.size() + Vec2::new(10.0, 4.0));
-    p.rect_filled(rect, 4, fill);
-    p.galley(rect.min + Vec2::new(5.0, 2.0), galley, Color32::WHITE);
-}
-
-/// The folders to move clips to: each of the library's but `current`, and
-/// Other (out of any folder) when `offer_other`. The one picked, if any.
-fn move_menu(ui: &mut egui::Ui, folders: &[String], current: Option<&str>, offer_other: bool) -> Option<Option<String>> {
-    let mut picked = None;
-    for f in folders.iter().filter(|f| Some(f.as_str()) != current) {
-        if ui.button(f).clicked() {
-            picked = Some(Some(f.clone()));
-        }
-    }
-    if offer_other {
-        ui.separator();
-        if ui.button("Other").on_hover_text("Out of any game's folder").clicked() {
-            picked = Some(None);
-        }
-    }
-    picked
-}
-
-/// "+ New collection" at the end of the sidebar: a row like the others,
-/// lit up on hover.
-fn new_collection_row(ui: &mut egui::Ui) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_H), Sense::click());
-    let v = ui.visuals();
-    if resp.hovered() {
-        ui.painter().rect_filled(rect, ROW_RADIUS, row_hover(v));
-    }
-    // Quiet until pointed at: it's an action, not a place.
-    let color = if resp.hovered() { v.strong_text_color() } else { v.weak_text_color() };
-    let icon = Rect::from_center_size(Pos2::new(rect.left() + 8.0 + ICON / 2.0, rect.center().y), Vec2::splat(ICON));
-    let (c, h) = (icon.center(), ICON * 0.3);
-    let line = Stroke::new(1.5, color);
-    ui.painter().line_segment([c - Vec2::new(h, 0.0), c + Vec2::new(h, 0.0)], line);
-    ui.painter().line_segment([c - Vec2::new(0.0, h), c + Vec2::new(0.0, h)], line);
-    ui.painter().text(Pos2::new(rect.left() + 8.0 + ICON + 10.0, rect.center().y), Align2::LEFT_CENTER, "New collection", FontId::proportional(14.0), color);
-    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
-}
-
-/// Sidebar rows: their height, corners, and the size of their icon.
-const ROW_H: f32 = 30.0;
-const ROW_RADIUS: u8 = 6;
-const ICON: f32 = 20.0;
-
-fn row_hover(v: &egui::Visuals) -> Color32 {
-    if v.dark_mode { Color32::from_white_alpha(10) } else { Color32::from_black_alpha(12) }
-}
-
-/// "All clips": a grid of four.
-fn glyph_grid(p: &egui::Painter, rect: Rect, color: Color32) {
-    let r = rect.shrink(3.0);
-    let gap = 2.5;
-    let cell = (r.width() - gap) / 2.0;
-    for (x, y) in [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)] {
-        let min = r.min + Vec2::new(x * (cell + gap), y * (cell + gap));
-        p.rect_stroke(Rect::from_min_size(min, Vec2::splat(cell)), 2, Stroke::new(1.4, color), StrokeKind::Inside);
-    }
-}
-
-/// Desktop: a monitor on its stand.
-fn glyph_monitor(p: &egui::Painter, rect: Rect, color: Color32) {
-    let line = Stroke::new(1.4, color);
-    let screen = Rect::from_min_max(rect.min + Vec2::new(2.0, 3.0), Pos2::new(rect.right() - 2.0, rect.bottom() - 6.0));
-    p.rect_stroke(screen, 2, line, StrokeKind::Inside);
-    let foot = rect.bottom() - 2.5;
-    p.line_segment([Pos2::new(rect.center().x, screen.bottom()), Pos2::new(rect.center().x, foot)], line);
-    p.line_segment([Pos2::new(rect.center().x - 4.0, foot), Pos2::new(rect.center().x + 4.0, foot)], line);
-}
-
-/// Other (clips in no folder): a folder.
-fn glyph_folder(p: &egui::Painter, rect: Rect, color: Color32) {
-    let r = rect.shrink2(Vec2::new(2.0, 4.0));
-    let tab = r.left() + r.width() * 0.4;
-    let points = vec![
-        Pos2::new(r.left(), r.bottom()),
-        Pos2::new(r.left(), r.top()),
-        Pos2::new(tab - 2.0, r.top()),
-        Pos2::new(tab + 1.0, r.top() + 2.5),
-        Pos2::new(r.right(), r.top() + 2.5),
-        Pos2::new(r.right(), r.bottom()),
-    ];
-    p.add(egui::Shape::closed_line(points, Stroke::new(1.4, color)));
-}
-
-/// A collection's picture when it has no clips: the square its newest
-/// clip's picture fills, empty (dashed).
-fn collection_glyph(p: &egui::Painter, rect: Rect, color: Color32) {
-    let r = rect.shrink(1.5);
-    // Rounded corners drawn as short arcs, dashes along the straight sides.
-    let k = 4.0;
-    let corner = |c: Pos2, from: f32| -> Vec<Pos2> {
-        (0..=4).map(|i| {
-            let a = from + i as f32 * std::f32::consts::FRAC_PI_8;
-            c + Vec2::new(a.cos(), a.sin()) * k
-        }).collect()
-    };
-    let mut path = Vec::new();
-    path.extend(corner(Pos2::new(r.right() - k, r.top() + k), -std::f32::consts::FRAC_PI_2));
-    path.extend(corner(Pos2::new(r.right() - k, r.bottom() - k), 0.0));
-    path.extend(corner(Pos2::new(r.left() + k, r.bottom() - k), std::f32::consts::FRAC_PI_2));
-    path.extend(corner(Pos2::new(r.left() + k, r.top() + k), std::f32::consts::PI));
-    path.push(path[0]);
-    p.extend(egui::Shape::dashed_line(&path, Stroke::new(1.3, color), 3.0, 2.5));
-}
-
 /// Delete a clip, waiting a moment if it's still open (decoders closing
 /// after being told to stop: a few ms, rarely more).
 fn delete_when_free(clip: &clips::Clip, library: &[clips::Clip], permanently: bool) -> Result<(), String> {
@@ -1865,83 +797,8 @@ fn delete_when_free(clip: &clips::Clip, library: &[clips::Clip], permanently: bo
     }
 }
 
-/// A section's name in the sidebar.
-fn section_label(ui: &mut egui::Ui, text: &str) {
-    ui.add_space(16.0);
-    ui.horizontal(|ui| {
-        ui.add_space(8.0);
-        ui.label(egui::RichText::new(text.to_uppercase()).size(11.0).extra_letter_spacing(0.8).color(ui.visuals().weak_text_color()));
-    });
-    ui.add_space(4.0);
-}
-
-/// What can be done with a game's folder or a collection (right-click, ⋯).
-fn view_menu(ui: &mut egui::Ui, filter: &Filter) -> Option<Action> {
-    let mut action = None;
-    match filter {
-        Filter::Folder(name) => {
-            if ui.button(format!("{}", crate::reveal_label())).clicked() {
-                action = Some(Action::RevealFolder(name.clone()));
-            }
-            if ui.button("Rename folder…").clicked() {
-                action = Some(Action::RenameFolder(name.clone()));
-            }
-        }
-        Filter::Collection(id) => {
-            if ui.button("Rename collection…").clicked() {
-                action = Some(Action::RenameCollection(id.clone()));
-            }
-            if ui.button(egui::RichText::new("Delete collection…").color(ui.visuals().error_fg_color)).clicked() {
-                action = Some(Action::DeleteCollection(id.clone()));
-            }
-        }
-        Filter::All | Filter::Loose => {}
-    }
-    action
-}
-
-/// Pick a collection to put clips in: each one, ticked when they're all in it
-/// already (picking it then takes them out), and a new one.
-fn collection_menu(ui: &mut egui::Ui, cols: &Collections, paths: &[PathBuf]) -> Option<Action> {
-    let mut action = None;
-    ui.set_min_width(200.0);
-    let mut list: Vec<_> = cols.list().iter().collect();
-    list.sort_by_key(|c| c.name.to_lowercase());
-    for c in list {
-        let all_in = !paths.is_empty() && paths.iter().all(|p| cols.contains(&c.id, p));
-        let label = if all_in { format!("✔  {}", c.name) } else { format!("     {}", c.name) };
-        let tip = if all_in { "Take out of this collection" } else { "Add to this collection" };
-        if ui.button(label).on_hover_text(tip).clicked() {
-            action = Some(Action::InCollection(paths.to_vec(), c.id.clone(), !all_in));
-        }
-    }
-    if !cols.list().is_empty() {
-        ui.separator();
-    }
-    if ui.button("+  New collection…").clicked() {
-        action = Some(Action::NewCollection(paths.to_vec()));
-    }
-    action
-}
-
-/// A collection with no clips yet: how to fill it.
-fn empty_collection(ui: &mut egui::Ui, name: &str) {
-    ui.vertical_centered(|ui| {
-        ui.add_space(ui.available_height() * 0.28);
-        ui.label(egui::RichText::new(format!("Nothing in {name} yet")).size(18.0).strong());
-        ui.add_space(6.0);
-        ui.weak("Drag clips onto it in the sidebar, or right-click a clip and choose Add to collection.");
-    });
-}
-
 fn file_name_of(path: &Path) -> String {
     path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
-}
-
-fn single_line(text: &str, font: FontId, color: Color32, max_width: f32) -> egui::text::LayoutJob {
-    let mut job = egui::text::LayoutJob::simple_singleline(text.to_owned(), font, color);
-    job.wrap = egui::text::TextWrapping::truncate_at_width(max_width);
-    job
 }
 
 #[cfg(test)]
@@ -1980,31 +837,6 @@ mod tests {
         s.clear();
         assert!(s.is_empty());
     }
-}
-
-/// A day's heading in the library: click it to fold its clips away or open
-/// them again. An arrow shows which (down: open).
-fn day_header(ui: &mut egui::Ui, label: &str, clips: usize, collapsed: bool) -> egui::Response {
-    let r = ui
-        .horizontal(|ui| {
-            let (arrow, _) = ui.allocate_exact_size(Vec2::new(14.0, 18.0), Sense::hover());
-            ui.label(egui::RichText::new(label).strong().size(15.0));
-            if clips > 0 {
-                ui.weak(if clips == 1 { "1 clip".to_owned() } else { format!("{clips} clips") });
-            }
-            arrow
-        });
-    let resp = ui.interact(r.response.rect, ui.id().with(("day", label)), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
-    let v = ui.visuals();
-    let color = if resp.hovered() { v.strong_text_color() } else { v.weak_text_color() };
-    let c = r.inner.center();
-    let points = if collapsed {
-        vec![Pos2::new(c.x - 3.0, c.y - 5.0), Pos2::new(c.x + 3.0, c.y), Pos2::new(c.x - 3.0, c.y + 5.0)]
-    } else {
-        vec![Pos2::new(c.x - 5.0, c.y - 3.0), Pos2::new(c.x + 5.0, c.y - 3.0), Pos2::new(c.x, c.y + 3.0)]
-    };
-    ui.painter().add(egui::Shape::convex_polygon(points, color, Stroke::NONE));
-    resp
 }
 
 /// The days folded away in the library, kept in its `.hesteclips` folder so

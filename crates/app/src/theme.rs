@@ -306,6 +306,18 @@ pub fn since(ctx: &egui::Context, start: f64, secs: f32) -> f32 {
     ease_out(t)
 }
 
+/// When `id` was first asked about (egui time): for things that appear.
+/// Forget it with [`unborn`] once the thing is gone, so it appears again next
+/// time. (Reads the time before touching the store: egui's locks don't nest.)
+pub fn born(ctx: &egui::Context, id: Id) -> f64 {
+    let now = ctx.input(|i| i.time);
+    ctx.data_mut(|d| *d.get_temp_mut_or_insert_with(id.with("born"), || now))
+}
+
+pub fn unborn(ctx: &egui::Context, id: Id) {
+    ctx.data_mut(|d| d.remove::<f64>(id.with("born")));
+}
+
 /// Between two colours.
 pub fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
     if t <= 0.0 {

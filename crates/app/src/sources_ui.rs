@@ -88,6 +88,7 @@ impl App {
         let every = if capture::preview::AVAILABLE { Duration::from_secs_f64(0.5 / self.settings.fps.max(1) as f64) } else { Duration::from_millis(16) };
         crate::ui_kit::repaint_after(ui.ctx(), every);
 
+        self.page_head(ui, "Sources", |_, _| {}, false);
         crate::ui_kit::page(ui, "sources_page", MAX_WIDTH, |ui| self.sources_column(ui, now, dt));
         self.live_audio.set_limiter(self.settings.limiter);
     }

@@ -23,7 +23,13 @@ const WIDTH: u32 = 480;
 pub struct Thumb {
     pub texture: Option<egui::TextureHandle>,
     pub duration: Option<Duration>,
+    /// The picture at a tiny size (RGBA, [`SMALL_W`] wide), for the library
+    /// panel's glass, which blurs it on the CPU.
+    pub small: Option<std::sync::Arc<(usize, usize, Vec<u8>)>>,
 }
+
+/// Width of [`Thumb::small`].
+pub const SMALL_W: usize = 40;
 
 struct Done {
     key: u64,
@@ -83,10 +89,11 @@ impl Thumbs {
     pub fn get(&mut self, ctx: &egui::Context, clip: &Clip) -> Option<&Thumb> {
         while let Ok(done) = self.done_rx.try_recv() {
             self.pending.remove(&done.key);
+            let small = done.image.as_ref().map(|img| std::sync::Arc::new(shrink(img, SMALL_W)));
             let texture = done.image.map(|img| {
                 ctx.load_texture(format!("thumb-{}", done.key), img, egui::TextureOptions::LINEAR)
             });
-            self.ready.insert(done.key, (Thumb { texture, duration: done.duration }, Instant::now()));
+            self.ready.insert(done.key, (Thumb { texture, duration: done.duration, small }, Instant::now()));
         }
         let now = Instant::now();
         if self.ready.len() > KEEP && now.duration_since(self.swept) > Duration::from_secs(5) {
@@ -103,8 +110,21 @@ impl Thumbs {
     }
 }
 
-/// Duration in seconds of a clip whose thumbnail has been made (probed then).
 impl Thumbs {
+    /// The tiny picture of a clip whose picture is loaded.
+    pub fn small(&self, clip: &Clip) -> Option<std::sync::Arc<(usize, usize, Vec<u8>)>> {
+        self.ready.get(&key(clip)).and_then(|(t, _)| t.small.clone())
+    }
+
+    /// The clip's length, if its picture has been made (it's found then),
+    /// without asking for one.
+    pub fn duration(&self, clip: &Clip) -> Option<Duration> {
+        if let Some((t, _)) = self.ready.get(&key(clip)) {
+            return t.duration;
+        }
+        let secs = std::fs::read_to_string(cache_dir().join(format!("{:016x}.dur", key(clip)))).ok()?.trim().parse::<f64>().ok()?;
+        Some(Duration::from_secs_f64(secs))
+    }
 }
 
 /// The cached thumbnail JPEG for `clip`, if it's been generated.
@@ -157,6 +177,35 @@ fn generate(key: u64, video: &Path) -> (Option<egui::ColorImage>, Option<Duratio
             .status();
     }
     (load(&jpg), duration)
+}
+
+/// A picture `w` wide (box-averaged), as (width, height, RGBA).
+fn shrink(img: &egui::ColorImage, w: usize) -> (usize, usize, Vec<u8>) {
+    let [sw, sh] = img.size;
+    let h = ((sh * w) / sw.max(1)).max(1);
+    let mut out = vec![0u8; w * h * 4];
+    for y in 0..h {
+        let (y0, y1) = (y * sh / h, ((y + 1) * sh / h).max(y * sh / h + 1));
+        for x in 0..w {
+            let (x0, x1) = (x * sw / w, ((x + 1) * sw / w).max(x * sw / w + 1));
+            let mut acc = [0u32; 4];
+            for yy in y0..y1.min(sh) {
+                for xx in x0..x1.min(sw) {
+                    let c = img.pixels[yy * sw + xx];
+                    acc[0] += c.r() as u32;
+                    acc[1] += c.g() as u32;
+                    acc[2] += c.b() as u32;
+                    acc[3] += c.a() as u32;
+                }
+            }
+            let n = ((y1.min(sh) - y0) * (x1.min(sw) - x0)).max(1) as u32;
+            let o = (y * w + x) * 4;
+            for k in 0..4 {
+                out[o + k] = (acc[k] / n) as u8;
+            }
+        }
+    }
+    (w, h, out)
 }
 
 fn load(jpg: &Path) -> Option<egui::ColorImage> {

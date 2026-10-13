@@ -1,0 +1,188 @@
+//! The library panel's glass: behind its card is the clip grid itself, at its
+//! real place, blurred very wide, under a light tint. The card catches the
+//! light spilling over from the clips beside it, like a macOS sidebar.
+//!
+//! Made on the CPU, once, whenever the clips on screen or the layout change:
+//! the clips' tiny pictures are painted at 1/8 scale on transparent, blurred
+//! (three box passes per axis, close to a Gaussian), and only the light is
+//! saturated and laid over the card's own colour (saturating the card's
+//! slightly blue grey turned it visibly blue). The result is rounded to 8 bits
+//! once, with an ordered threshold, so the gradient has no bands. Scrolling
+//! only moves it: it's drawn offset inside the card, never made again per
+//! frame.
+
+use std::path::PathBuf;
+
+use egui::{Color32, Pos2, Rect, vec2};
+
+use crate::App;
+use crate::theme;
+
+/// The picture is made at this fraction of the grid's size.
+const SCALE: f32 = 1.0 / 8.0;
+/// Blur radius in points (the user asked for 150 after 100).
+const RADIUS: f32 = 150.0;
+/// The light is this much more saturated.
+const SATURATE: f32 = 2.6;
+
+#[derive(Default)]
+pub struct Glass {
+    texture: Option<egui::TextureHandle>,
+    /// What it was made from: the clips and their places, the card, the look.
+    signature: u64,
+    /// Where its top-left is in grid coordinates (content, before scroll),
+    /// and its size in points.
+    origin: Pos2,
+    size: egui::Vec2,
+}
+
+/// A clip on the grid, for the glass: its picture's place in the grid's
+/// content (scrolling not applied, where it's going if it's moving) and its
+/// tiny picture.
+pub struct Tile {
+    pub rect: Rect,
+    pub path: PathBuf,
+    pub small: Option<std::sync::Arc<(usize, usize, Vec<u8>)>>,
+}
+
+/// Paint the card with its glass. `origin`: where the grid's content
+/// top-left is on screen now. Call where the card is drawn, after the grid.
+pub fn paint(ui: &mut egui::Ui, card: Rect, app: &mut App) {
+    let p = theme::pal(ui);
+    let painter = ui.painter_at(card);
+    painter.rect_filled(card, 8, p.raise);
+    let origin = app.glass_origin;
+    let tiles = std::mem::take(&mut app.glass_tiles);
+    // Only clips within a blur radius of the card light it: the grid's first
+    // column or two.
+    let reach = RADIUS * 1.5;
+    let near: Vec<&Tile> = tiles.iter().filter(|t| t.rect.left() < reach).collect();
+    use std::hash::{Hash, Hasher};
+    let mut sig = std::collections::hash_map::DefaultHasher::new();
+    p.dark.hash(&mut sig);
+    ((card.width() as i32), (card.height() as i32), ((card.left() - origin.x) as i32)).hash(&mut sig);
+    for t in &near {
+        t.path.hash(&mut sig);
+        (t.rect.min.x as i32, t.rect.min.y as i32, t.rect.width() as i32).hash(&mut sig);
+        t.small.is_some().hash(&mut sig);
+    }
+    let sig = sig.finish();
+    if sig != app.glass.signature {
+        app.glass.signature = sig;
+        if near.is_empty() {
+            app.glass.texture = None;
+        } else {
+            make(ui.ctx(), &mut app.glass, &near, card.left() - origin.x, p);
+        }
+    }
+    app.glass_tiles = tiles;
+    if let Some(tex) = &app.glass.texture {
+        let r = Rect::from_min_size(origin + app.glass.origin.to_vec2(), app.glass.size);
+        let mut mesh = egui::Mesh::with_texture(tex.id());
+        mesh.add_rect_with_uv(r, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+        painter.add(egui::Shape::mesh(mesh));
+    }
+    let tint = if p.dark { Color32::from_rgba_unmultiplied(24, 25, 29, 56) } else { Color32::from_rgba_unmultiplied(250, 250, 251, 92) };
+    painter.rect_filled(card, 8, tint);
+    painter.rect_stroke(card, 8, egui::Stroke::new(1.0, if p.dark { Color32::from_white_alpha(13) } else { Color32::from_black_alpha(15) }), egui::StrokeKind::Inside);
+}
+
+/// Make the glass picture: the grid's clips near the card, blurred, one
+/// picture the height of the grid (scrolling only moves it). `left`: the
+/// card's left edge in grid content coordinates.
+fn make(ctx: &egui::Context, glass: &mut Glass, tiles: &[&Tile], left: f32, p: &theme::Pal) {
+    let top = tiles.iter().map(|t| t.rect.top()).fold(f32::INFINITY, f32::min).min(0.0) - RADIUS;
+    let bottom = tiles.iter().map(|t| t.rect.bottom()).fold(0.0, f32::max) + RADIUS;
+    // Very long libraries: no taller than a GPU texture allows.
+    let bottom = bottom.min(top + 8000.0 / SCALE);
+    let right = RADIUS * 1.5;
+    let area = Rect::from_min_max(Pos2::new(left, top), Pos2::new(right.max(left + 1.0), bottom));
+    let w = ((area.width() * SCALE).ceil() as usize).max(2);
+    let h = ((area.height() * SCALE).ceil() as usize).max(2);
+    // Premultiplied light, linear, f32.
+    let mut buf = vec![[0f32; 4]; w * h];
+    let lin = |v: u8| (v as f32 / 255.0).powf(2.2);
+    for t in tiles {
+        let Some(small) = &t.small else { continue };
+        let (sw, sh, px) = (small.0, small.1, &small.2);
+        let x0 = ((t.rect.left() - area.left()) * SCALE).floor() as i32;
+        let y0 = ((t.rect.top() - area.top()) * SCALE).floor() as i32;
+        let tw = ((t.rect.width() * SCALE).round() as i32).max(1);
+        let th = ((t.rect.height() * SCALE).round() as i32).max(1);
+        for y in 0..th {
+            let yy = y0 + y;
+            if yy < 0 || yy >= h as i32 {
+                continue;
+            }
+            let sy = (y as usize * sh / th as usize).min(sh - 1);
+            for x in 0..tw {
+                let xx = x0 + x;
+                if xx < 0 || xx >= w as i32 {
+                    continue;
+                }
+                let sx = (x as usize * sw / tw as usize).min(sw - 1);
+                let o = (sy * sw + sx) * 4;
+                buf[yy as usize * w + xx as usize] = [lin(px[o]), lin(px[o + 1]), lin(px[o + 2]), 1.0];
+            }
+        }
+    }
+    // Blur: three box passes per axis (σ = radius / 2).
+    let r = ((RADIUS * SCALE) / 2.0).round().max(1.0) as usize;
+    for _ in 0..3 {
+        box_blur(&mut buf, w, h, r, true);
+        box_blur(&mut buf, w, h, r, false);
+    }
+    // Composite: only the light saturated, over the card's own colour.
+    let base = p.raise;
+    let card_lin = [lin(base.r()), lin(base.g()), lin(base.b())];
+    let strength = if p.dark { 0.9 } else { 0.55 };
+    let mut img = egui::ColorImage::new([w, h], vec![Color32::TRANSPARENT; w * h]);
+    for y in 0..h {
+        for x in 0..w {
+            let [r, g, b, a] = buf[y * w + x];
+            let (cr, cg, cb) = if a > 1e-4 { (r / a, g / a, b / a) } else { (0.0, 0.0, 0.0) };
+            let l = 0.2126 * cr + 0.7152 * cg + 0.0722 * cb;
+            let sat = |c: f32| (l + (c - l) * SATURATE).max(0.0);
+            let k = a * strength;
+            let out = [card_lin[0] * (1.0 - k) + sat(cr) * k, card_lin[1] * (1.0 - k) + sat(cg) * k, card_lin[2] * (1.0 - k) + sat(cb) * k];
+            // Rounded to 8 bits once, with an ordered threshold: no bands.
+            let n = (52.982_918 * ((0.067_110_56 * x as f32 + 0.005_837_15 * y as f32).fract())).fract() - 0.5;
+            let enc = |v: f32| ((v.clamp(0.0, 1.0).powf(1.0 / 2.2) * 255.0) + n).round().clamp(0.0, 255.0) as u8;
+            img.pixels[y * w + x] = Color32::from_rgb(enc(out[0]), enc(out[1]), enc(out[2]));
+        }
+    }
+    glass.texture = Some(ctx.load_texture("library_glass", img, egui::TextureOptions::LINEAR));
+    glass.origin = area.min;
+    glass.size = vec2(w as f32 / SCALE, h as f32 / SCALE);
+}
+/// One box blur pass of radius `r`, along rows (`horizontal`) or columns,
+/// edges clamped.
+fn box_blur(buf: &mut [[f32; 4]], w: usize, h: usize, r: usize, horizontal: bool) {
+    let (n, lines) = if horizontal { (w, h) } else { (h, w) };
+    let idx = |line: usize, i: usize| if horizontal { line * w + i } else { i * w + line };
+    let mut tmp = vec![[0f32; 4]; n];
+    let win = (2 * r + 1) as f32;
+    for line in 0..lines {
+        let mut acc = [0f32; 4];
+        let at = |i: isize| -> usize { i.clamp(0, n as isize - 1) as usize };
+        for i in -(r as isize)..=(r as isize) {
+            let c = buf[idx(line, at(i))];
+            for k in 0..4 {
+                acc[k] += c[k];
+            }
+        }
+        for i in 0..n {
+            for k in 0..4 {
+                tmp[i][k] = acc[k] / win;
+            }
+            let add = buf[idx(line, at(i as isize + r as isize + 1))];
+            let sub = buf[idx(line, at(i as isize - r as isize))];
+            for k in 0..4 {
+                acc[k] += add[k] - sub[k];
+            }
+        }
+        for i in 0..n {
+            buf[idx(line, i)] = tmp[i];
+        }
+    }
+}

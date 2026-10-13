@@ -24,6 +24,8 @@ mod games;
 mod header;
 mod osu_plays;
 mod library;
+mod library_view;
+mod glass;
 #[cfg(target_os = "linux")]
 mod linux_desktop;
 mod meter;
@@ -36,6 +38,7 @@ mod service;
 mod settings;
 mod settings_ui;
 mod share;
+mod shell;
 mod shortcuts;
 mod sound;
 mod sources_ui;
@@ -63,8 +66,7 @@ use crate::ui_kit::Dismissed as _;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
-use egui::{Color32, RichText};
-use library::{ACCENT, REC_RED};
+use egui::Color32;
 use service::{CaptureService, Evt};
 use settings::{Encoder, RecordSettings, SourceKind};
 
@@ -161,6 +163,9 @@ fn main() -> eframe::Result<()> {
         .with_min_inner_size([560.0, 420.0])
         .with_title("HesteClips")
         .with_icon(app_icon());
+    // macOS: no title bar; the rail runs to the top, under the traffic lights.
+    #[cfg(target_os = "macos")]
+    let viewport = viewport.with_fullsize_content_view(true).with_titlebar_shown(false).with_title_shown(false);
     // Wayland names the window's app by this (its icon and name come from
     // the `.desktop` file of the same name).
     #[cfg(target_os = "linux")]
@@ -319,6 +324,17 @@ fn hotkey_label_cmd(key: &str) -> String {
     shortcuts::command(key).join(" + ")
 }
 
+/// The OS's file manager's name: "Finder", "Explorer", "the file manager".
+pub(crate) fn file_manager() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Finder"
+    } else if cfg!(target_os = "windows") {
+        "Explorer"
+    } else {
+        "the file manager"
+    }
+}
+
 /// What the OS calls its file manager.
 fn reveal_label() -> &'static str {
     if cfg!(target_os = "macos") {
@@ -330,14 +346,7 @@ fn reveal_label() -> &'static str {
     }
 }
 
-/// A short-lived message shown at the bottom of the window.
-struct Toast {
-    text: String,
-    error: bool,
-    at: Instant,
-}
-
-const TOAST_FOR: Duration = Duration::from_secs(4);
+const TOAST_FOR: Duration = Duration::from_millis(3200);
 
 struct App {
     pub(crate) page: Page,
@@ -431,7 +440,11 @@ struct App {
     /// Public links of finished uploads, each shown in its own dialog once
     /// nothing else is open: (clip, link).
     public_links: std::collections::VecDeque<(PathBuf, String)>,
-    toast: Option<Toast>,
+    toast: Option<shell::Toast>,
+    /// Where toasts sit: how far above the window's bottom, and how far
+    /// right of its centre (the middle of the page, beside the rail).
+    toast_bottom: f32,
+    toast_x_offset: f32,
     editor: Option<editor::Editor>,
     viewer: Option<viewer::Viewer>,
     /// Edits being rendered in the background, with live progress.
@@ -446,6 +459,18 @@ struct App {
     pub(crate) rename: Option<library::Rename>,
     /// Clips selected in the library for a bulk action.
     pub(crate) selection: library::Selection,
+    /// What's typed in the library's search.
+    pub(crate) library_query: String,
+    /// New clips whose dot has been seen (pointed at).
+    pub(crate) seen_new: std::collections::HashSet<PathBuf>,
+    /// A clip brought back into view, and when: it flashes.
+    pub(crate) flash_clip: Option<(PathBuf, f64)>,
+    pub(crate) app_icon_tex: Option<egui::TextureHandle>,
+    /// The grid's clips (in the grid's content coordinates) and where that
+    /// content is on screen now, for the panel's glass.
+    pub(crate) glass_tiles: Vec<glass::Tile>,
+    pub(crate) glass_origin: egui::Pos2,
+    pub(crate) glass: glass::Glass,
     /// Clips being dragged inside the window, to a game or collection.
     pub(crate) card_drag: Option<library::CardDrag>,
     /// Clips waiting for "Delete permanently?" to be answered.
@@ -496,6 +521,12 @@ impl App {
         let settings = RecordSettings::load();
         // egui keeps the window's frame in step (on Wayland, drawn by winit).
         ctx.set_theme(settings.theme.preference());
+        // Dev aid: `HESTECLIPS_THEME=light|dark` for this launch only.
+        match std::env::var("HESTECLIPS_THEME").as_deref() {
+            Ok("light") => ctx.set_theme(egui::ThemePreference::Light),
+            Ok("dark") => ctx.set_theme(egui::ThemePreference::Dark),
+            _ => {}
+        }
         sound::preload(&settings.save_sound.sound);
         store::set_library(&settings.output_dir);
         let recovered = capture::output::recover_unfinished(&settings.output_dir);
@@ -591,6 +622,8 @@ impl App {
             dialog: None,
             public_links: Default::default(),
             toast: None,
+            toast_bottom: 22.0,
+            toast_x_offset: 0.0,
             editor: None,
             viewer: None,
             renders: Vec::new(),
@@ -601,6 +634,13 @@ impl App {
             next_render_id: 0,
             rename: None,
             selection: library::Selection::default(),
+            library_query: String::new(),
+            seen_new: Default::default(),
+            flash_clip: None,
+            app_icon_tex: None,
+            glass_tiles: Vec::new(),
+            glass_origin: egui::Pos2::ZERO,
+            glass: Default::default(),
             last_poll: None,
             library_stamp: Vec::new(),
             library_filter: library::Filter::All,
@@ -726,11 +766,21 @@ impl App {
     }
 
     fn toast(&mut self, text: impl Into<String>) {
-        self.toast = Some(Toast { text: text.into(), error: false, at: Instant::now() });
+        self.toast_icon(egui_phosphor::regular::CHECK_CIRCLE, text);
+    }
+
+    /// A toast with an icon that says what kind of thing happened.
+    pub(crate) fn toast_icon(&mut self, icon: &'static str, text: impl Into<String>) {
+        self.toast = Some(shell::Toast { text: text.into(), icon, error: false, at: Instant::now(), action: None, for_: TOAST_FOR });
+    }
+
+    /// A toast with a button (Show), up a little longer.
+    pub(crate) fn toast_action(&mut self, icon: &'static str, text: impl Into<String>, label: &str, action: shell::ToastAction) {
+        self.toast = Some(shell::Toast { text: text.into(), icon, error: false, at: Instant::now(), action: Some((label.to_owned(), action)), for_: Duration::from_secs(6) });
     }
 
     fn toast_error(&mut self, text: impl Into<String>) {
-        self.toast = Some(Toast { text: text.into(), error: true, at: Instant::now() });
+        self.toast = Some(shell::Toast { text: text.into(), icon: egui_phosphor::regular::WARNING_CIRCLE, error: true, at: Instant::now(), action: None, for_: Duration::from_secs(5) });
     }
 
     /// Translate the UI's `RecordSettings` into the backend's `EncodeSettings`.
@@ -856,54 +906,41 @@ impl eframe::App for App {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
         }
 
-        // The editor and viewer get the whole window; capture keeps running
-        // underneath and the hotkeys still work.
-        if !matches!(self.page, Page::Edit | Page::View) {
-            // Flush with the window; a hairline under it, nothing around it.
-            let bar = egui::Panel::top("capture_bar")
+        // The rail on every page but the player and editor, which get the
+        // whole window (capture keeps running underneath and the shortcuts
+        // still work).
+        let full = matches!(self.page, Page::Edit | Page::View);
+        if !full {
+            egui::Panel::left("rail")
+                .resizable(false)
                 .show_separator_line(false)
-                .frame(egui::Frame::new().fill(ui.visuals().panel_fill).inner_margin(egui::Margin::symmetric(ui_kit::PAGE_MARGIN, 10)))
-                .show(ui, |ui| self.capture_bar(ui));
-            let r = bar.response.rect;
-            ui.painter().hline(r.x_range(), r.bottom(), egui::Stroke::new(1.0, ui_kit::line(ui.visuals().dark_mode)));
+                .exact_size(shell::RAIL_W)
+                .frame(egui::Frame::NONE)
+                .show(ui, |ui| self.rail(ui));
         }
-
-        // A message floats over the bottom of the page for a few seconds,
-        // without pushing anything around.
-        if let Some(toast) = &self.toast {
-            if toast.at.elapsed() < TOAST_FOR {
-                let (text, error) = (toast.text.clone(), toast.error);
-                egui::Area::new(egui::Id::new("toast"))
-                    .order(egui::Order::Foreground)
-                    .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -20.0))
-                    .interactable(false)
-                    .show(&ctx, |ui| {
-                        let v = ui.visuals().clone();
-                        egui::Frame::new()
-                            .fill(v.window_fill)
-                            .stroke(egui::Stroke::new(1.0, ui_kit::line(v.dark_mode)))
-                            .corner_radius(ui_kit::CARD_RADIUS)
-                            .shadow(v.popup_shadow)
-                            .inner_margin(egui::Margin::symmetric(16, 10))
-                            .show(ui, |ui| {
-                                let color = if error { ui_kit::DANGER } else { v.strong_text_color() };
-                                ui.add(egui::Label::new(RichText::new(text).color(color)).wrap_mode(egui::TextWrapMode::Extend));
-                            });
-                    });
-            } else {
-                self.toast = None;
-            }
+        // ⌘, opens Settings, as in every Mac app.
+        if !full && !ctx.egui_wants_keyboard_input() && !ui_kit::overlay_open(&ctx) && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Comma)) {
+            self.page = Page::Settings;
         }
+        self.track_skips();
+        // Toasts sit over the middle of the page, clear of the rail, and above
+        // the player's controls.
+        self.toast_x_offset = if full { 0.0 } else { shell::RAIL_W / 2.0 };
+        self.toast_bottom = match self.page {
+            Page::View => 210.0,
+            Page::Edit => 300.0,
+            _ => 22.0,
+        };
+        self.toasts(&ctx, frame);
 
         // The viewer in fullscreen: the picture from edge to edge.
         let edge_to_edge = self.page == Page::View && ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
-        let central = if edge_to_edge {
-            egui::Frame::NONE.fill(egui::Color32::BLACK)
+        let p = theme::pal(ui);
+        let central = if edge_to_edge || full {
+            egui::Frame::NONE.fill(if edge_to_edge { Color32::BLACK } else { p.base })
         } else {
-            // Pages that scroll run to the window's bottom edge; the player
-            // and editor keep a margin under their controls.
-            let bottom = if matches!(self.page, Page::Edit | Page::View) { 12 } else { 0 };
-            egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin { left: ui_kit::PAGE_MARGIN, right: ui_kit::PAGE_MARGIN, top: 0, bottom })
+            // Pages that scroll run to the window's bottom edge.
+            egui::Frame::new().fill(p.base).inner_margin(egui::Margin { left: ui_kit::PAGE_MARGIN, right: ui_kit::PAGE_MARGIN, top: if shell::under_titlebar() { 0 } else { 4 }, bottom: 0 })
         };
         laps.lap("bars");
         // A dialog or menu open (now, or drawn last frame): it gets the keys.
@@ -1184,14 +1221,10 @@ impl App {
     }
 }
 
-// --- Header: where you are on the left, capture status and actions on the right ---
+// --- Capture status beside the recorder ---
 impl App {
-    fn capture_bar(&mut self, ui: &mut egui::Ui) {
-        // ⌘, opens Settings, as in every Mac app.
-        if !ui.ctx().egui_wants_keyboard_input() && !ui_kit::overlay_open(ui.ctx()) && ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Comma)) {
-            self.page = Page::Settings;
-        }
-        let compact = ui.available_width() < 820.0;
+    /// Count skipped frames over the last few seconds, for the warning.
+    fn track_skips(&mut self) {
         let (skipped, encoded) = (capture::frames_skipped(), capture::frames_encoded());
         if skipped < self.skipped_seen.0 || self.rec_state == RecState::Idle {
             self.skipped_seen = (0, None);
@@ -1207,116 +1240,15 @@ impl App {
                 self.skip_counts.pop_front();
             }
         }
-        ui.horizontal(|ui| {
-            ui.set_min_height(36.0);
-            self.nav_tabs(ui, compact);
-            ui.add_space(14.0);
-            self.capture_status(ui, compact);
-            self.skipped_warning(ui);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                self.capture_actions(ui, compact);
-                self.update_button(ui, compact);
-            });
-        });
-    }
-
-    /// Clips · Sources · Settings, as one segmented control: words, which
-    /// fit even narrow (icons were guesswork).
-    fn nav_tabs(&mut self, ui: &mut egui::Ui, compact: bool) {
-        let tabs = [
-            (Page::Clips, "Clips", None),
-            (Page::Sources, "Sources", Some("What goes into your clips: the picture, your mic, the game's sound".to_owned())),
-            (Page::Settings, "Settings", Some(hotkey_label_cmd(","))),
-        ];
-        // The same control as the switches on the Sources page.
-        let _ = compact;
-        let labels: Vec<&str> = tabs.iter().map(|(_, l, _)| *l).collect();
-        let on = if self.page == Page::VoiceReview { Page::Settings } else { self.page };
-        let chosen = tabs.iter().position(|(p, _, _)| *p == on).unwrap_or(usize::MAX);
-        // As wide as the library's sidebar below, the two lined up.
-        let responses = ui
-            .allocate_ui(egui::vec2(library::SIDEBAR_W, ui_kit::CONTROL_H), |ui| {
-                ui.set_width(library::SIDEBAR_W);
-                ui_kit::segmented(ui, &labels, chosen)
-            })
-            .inner;
-        for ((page, _, tip), mut r) in tabs.into_iter().zip(responses) {
-            if let Some(tip) = tip {
-                r = r.on_hover_text(tip);
-            }
-            if r.clicked() {
-                self.page = page;
-            }
-        }
-    }
-
-    /// What capture is doing: a dot and a short line, with the hotkey hint below
-    /// when there's room. Shown on every page so it's never a surprise.
-    fn capture_status(&self, ui: &mut egui::Ui, compact: bool) {
-        let elapsed = self.rec_started.map_or(Duration::ZERO, |t| t.elapsed());
-        let replay = thumbs::format_duration(Duration::from_secs(self.settings.replay_seconds.into()));
-        use settings::ShortcutAction as A;
-        // The hint: the shortcut (drawn as keycaps) and what it does.
-        let (live, color, title, hint_keys, hint) = match self.rec_state {
-            RecState::Idle => (false, ui.visuals().weak_text_color(), "Not recording".to_owned(), None, String::new()),
-            RecState::Buffering if self.saving > 0 => (
-                true,
-                ACCENT,
-                if self.saving > 1 { format!("Saving {} clips…", self.saving) } else { "Saving clip…".to_owned() },
-                self.shortcut_keys(A::SaveClip),
-                format!("saves another of the last {replay}"),
-            ),
-            RecState::Buffering => (true, ACCENT, "Replay buffer on".to_owned(), self.shortcut_keys(A::SaveClip), format!("saves the last {replay}")),
-            RecState::Recording => (true, REC_RED, format!("Recording  {}", thumbs::format_duration(elapsed)), self.shortcut_keys(A::ToggleRecord), "stops".to_owned()),
-        };
-        // The line under the status is a shortcut and what it does: without a
-        // shortcut set it would be a stray word ("stops").
-        let hint = if hint_keys.is_some() { hint } else { String::new() };
-        let tip = match &hint_keys {
-            Some(k) => format!("{} {hint}", k.join(" + ")),
-            None => hint.clone(),
-        };
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 8.0;
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
-            if live {
-                // A soft pulse so it reads as "on" at a glance.
-                let t = ui.input(|i| i.time);
-                let halo = 0.25 + 0.2 * (t * 2.5).sin() as f32;
-                ui.painter().circle_filled(rect.center(), 8.0, color.gamma_multiply(halo));
-                ui.painter().circle_filled(rect.center(), 5.0, color);
-            } else {
-                ui.painter().circle_stroke(rect.center(), 5.0, egui::Stroke::new(1.5, color));
-            }
-            let title = RichText::new(&title).size(14.0).strong().color(if live { color } else { ui.visuals().text_color() });
-            if compact || hint.is_empty() {
-                ui.label(title).on_hover_text(&tip);
-                return;
-            }
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = 2.0;
-                ui.label(title);
-                {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 5.0;
-                        if let Some(k) = &hint_keys {
-                            shortcuts::keycaps(ui, k, 10.5);
-                        }
-                        ui.label(RichText::new(&hint).size(11.5).weak());
-                    });
-                }
-            })
-            .response
-            .on_hover_text(&tip);
-        });
     }
 
     /// Shown while frames are being skipped (and a few seconds after): the
     /// computer can't keep up with the recording settings. Says how many
     /// frames (of the last few seconds': a few now and then over a long
     /// recording are normal, not worth a total), what that does to the clip,
-    /// and what the settings are; a click opens Settings.
-    fn skipped_warning(&mut self, ui: &mut egui::Ui) {
+    /// and what the settings are; a click opens Settings. Laid out right to
+    /// left, before the recorder.
+    pub(crate) fn skipped_warning(&mut self, ui: &mut egui::Ui) {
         let Some(at) = self.skipped_seen.1.filter(|t| t.elapsed() < SKIP_WINDOW) else { return };
         // Of the last few seconds' frames: how many were skipped, of how many.
         let (skipped, encoded) = self.skip_counts.back().map_or((self.skipped_seen.0, 0), |&(_, s, e)| (s, e));
@@ -1326,8 +1258,7 @@ impl App {
         if lost == 0 {
             return;
         }
-        ui.add_space(10.0);
-        let amber = Color32::from_rgb(230, 170, 40);
+        let warn = theme::pal(ui).warn;
         let r = &self.settings;
         let size = match r.resolution {
             settings::OutputResolution::Native => "native resolution".to_owned(),
@@ -1344,54 +1275,13 @@ impl App {
             if blending { ", and so does turning off frame blending" } else { "" },
         );
         let text = if lost == 1 { "Skipped 1 frame".to_owned() } else { format!("Skipped {lost} frames") };
-        let label = egui::Label::new(RichText::new(text).size(13.0).strong().color(amber)).sense(egui::Sense::click());
+        let label = egui::Label::new(theme::text(format!("{}  {text}", egui_phosphor::regular::WARNING), 13.0, theme::W::Semibold).color(warn)).sense(egui::Sense::click());
+        ui.add_space(6.0);
         let response = ui.add(label).on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand);
         if response.clicked() {
             self.page = Page::Settings;
         }
         ui.ctx().request_repaint_after(SKIP_WINDOW.saturating_sub(at.elapsed()));
-    }
-
-    /// The one or two buttons that make sense right now; the primary one rightmost.
-    fn capture_actions(&mut self, ui: &mut egui::Ui, compact: bool) {
-        let button = |text: &str, fill: Option<Color32>| match fill {
-            Some(c) if c == REC_RED => ui_kit::danger_button(text),
-            Some(_) => ui_kit::button(text, true),
-            None => ui_kit::button(text, false),
-        };
-        match self.rec_state {
-            RecState::Idle => {
-                let start = if compact { "Replay buffer" } else { "Start replay buffer" };
-                if ui
-                    .add(button(start, Some(ACCENT)))
-                    .on_hover_text(format!("Keep the last {} ready to save ({})", thumbs::format_duration(Duration::from_secs(self.settings.replay_seconds.into())), self.shortcut_label(settings::ShortcutAction::ToggleBuffer)))
-                    .clicked()
-                {
-                    self.start_replay_buffer();
-                }
-                if ui.add(button("Record", None)).on_hover_text(format!("Record until you stop ({})", self.shortcut_label(settings::ShortcutAction::ToggleRecord))).clicked() {
-                    self.start_recording();
-                }
-            }
-            RecState::Buffering => {
-                if ui
-                    .add(button("Save clip", Some(ACCENT)))
-                    .on_hover_text(self.shortcut_label(settings::ShortcutAction::SaveClip))
-                    .clicked()
-                {
-                    self.save_clip();
-                }
-                if ui.add(button("Stop", None)).on_hover_text(format!("Stop the replay buffer ({})", self.shortcut_label(settings::ShortcutAction::ToggleBuffer))).clicked() {
-                    self.stop();
-                }
-            }
-            RecState::Recording => {
-                let stop = if compact { "Stop" } else { "Stop recording" };
-                if ui.add(button(stop, Some(REC_RED))).on_hover_text(self.shortcut_label(settings::ShortcutAction::ToggleRecord)).clicked() {
-                    self.stop();
-                }
-            }
-        }
     }
 
     /// Follow the game being clipped, for Discord: the last one in focus, for
@@ -1452,30 +1342,23 @@ impl App {
 
     /// "Update ready", once a new version is downloaded: restarts into it. It
     /// installs on quit anyway, so this is only for the impatient — and never
-    /// cuts a recording short.
-    fn update_button(&mut self, ui: &mut egui::Ui, compact: bool) {
+    /// cuts a recording short. Laid out right to left, before the recorder.
+    pub(crate) fn update_button(&mut self, ui: &mut egui::Ui) {
         let update::Status::Ready(version) = self.updater.status() else {
             return;
         };
-        ui.add_space(6.0);
-        let text = if compact { "⬆" } else { "Update ready" };
-        let button = egui::Button::new(RichText::new(text).size(13.0).color(ACCENT))
-            .fill(ACCENT.gamma_multiply(0.15))
-            .stroke(egui::Stroke::NONE)
-            .min_size(egui::vec2(0.0, 28.0))
-            .corner_radius(14);
+        ui.add_space(4.0);
         let recording = self.rec_state == RecState::Recording;
-        let tip = if self.rec_state == RecState::Buffering {
+        let tip = if recording {
+            format!("HesteClips {version} is ready. It installs when you quit, or restart once your recording is done.")
+        } else if self.rec_state == RecState::Buffering {
             let after = if self.settings.auto_start_buffer { "starts again, empty" } else { "stops" };
-            format!("HesteClips {version} is ready. Click to restart into it now (the replay buffer {after}), or it installs when you quit.")
+            format!("HesteClips {version} is ready. Click to restart into it now (clipping {after}), or it installs when you quit.")
         } else {
             format!("HesteClips {version} is ready. Click to restart into it now, or it installs when you quit.")
         };
-        let r = ui
-            .add_enabled(!recording, button)
-            .on_hover_text(tip)
-            .on_disabled_hover_text(format!("HesteClips {version} is ready. It installs when you quit, or restart once your recording is done."));
-        if r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() && self.updater.install_on_exit(true) {
+        let b = ui_kit::Btn::ghost("Update ready").with_icon(egui_phosphor::regular::ARROW_CIRCLE_UP).enabled(!recording).tip(tip);
+        if b.show(ui).clicked() && self.updater.install_on_exit(true) {
             // Really quit (not to the tray): the update goes in, then it starts again.
             self.quit(ui.ctx());
         }
@@ -2025,11 +1908,12 @@ impl App {
                     self.saving = self.saving.saturating_sub(1);
                     // A new clip is never hidden in a folded Today.
                     self.folded.set(chrono::Local::now().date_naive(), false);
-                    self.toast(format!("Saved {}", file_name(&path)));
                     // Scrub frames ready before it's opened.
                     proxy::prebuild(&self.ctx(), &path);
                     self.last_saved = Some((path.clone(), Instant::now()));
                     self.refresh_clips();
+                    let title = self.clips.iter().find(|c| c.path == path).map(|c| c.title()).unwrap_or_else(|| file_stem(&path));
+                    self.toast_action(egui_phosphor::regular::CHECK_CIRCLE, format!("Saved {title}"), "Play", shell::ToastAction::Show(path.clone()));
                     // Showing another game's clips: show this one too.
                     self.library_filter.reveal(&self.clips, &self.collections, &path);
                 }

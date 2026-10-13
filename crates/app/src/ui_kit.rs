@@ -241,6 +241,9 @@ pub enum Kind {
     DangerText,
     /// On, like a toggled tool (snapping on).
     On,
+    /// A step above the control it sits in (the recorder's action when it
+    /// isn't the screen's main one).
+    Raised,
 }
 
 /// A button: an optional icon, a label, an optional trailing icon or keycap.
@@ -334,6 +337,36 @@ impl<'a> Btn<'a> {
         self
     }
 
+    /// How wide it's drawn this frame (its width eases to fit its words).
+    /// Needs an [`Btn::id`] to match what [`Btn::show`] draws.
+    pub fn width(&self, ui: &egui::Ui) -> f32 {
+        let h = if self.small { SMALL_H } else { CONTROL_H };
+        let target = self.target_width(ui, h);
+        match self.id {
+            Some(id) => theme::value(ui.ctx(), id.with("w"), target, theme::NORMAL),
+            None => target,
+        }
+    }
+
+    fn target_width(&self, ui: &egui::Ui, h: f32) -> f32 {
+        let size = if self.small { 12.5 } else { 13.0 };
+        let icon_size = if self.small { 14.0 } else { 15.5 };
+        let text_w = |t: &str, f: FontId| ui.painter().layout_no_wrap(t.to_owned(), f, Color32::PLACEHOLDER).size().x;
+        let label_w = (!self.label.is_empty()).then(|| text_w(&self.label, theme::font(size, W::Medium)));
+        let icon_w = self.icon.map(|i| text_w(i, FontId::proportional(icon_size)));
+        let trail_w = self.trail.map(|i| text_w(i, FontId::proportional(icon_size - 1.5)));
+        let keys_w = self.keys.as_ref().map(|k| key_hint_width(ui, k, 11.0));
+        let only_icon = label_w.is_none() && trail_w.is_none() && keys_w.is_none();
+        if only_icon {
+            return h;
+        }
+        let pad_l = if self.icon.is_some() { 10.0 } else if self.small { 9.0 } else { 12.0 };
+        let pad_r = if self.keys.is_some() || self.trail.is_some() { 8.0 } else if self.small { 9.0 } else { 12.0 };
+        let parts: Vec<f32> = [icon_w, label_w, trail_w, keys_w].into_iter().flatten().collect();
+        let content = parts.iter().sum::<f32>() + 7.0 * (parts.len().max(1) - 1) as f32;
+        (pad_l + content + pad_r).max(self.min_w)
+    }
+
     pub fn show(self, ui: &mut egui::Ui) -> Response {
         let p = theme::pal(ui);
         let h = if self.small { SMALL_H } else { CONTROL_H };
@@ -371,15 +404,21 @@ impl<'a> Btn<'a> {
                 Kind::Stop => (theme::mix(p.rec, Color32::WHITE, hv * 0.12), Color32::WHITE),
                 Kind::DangerText => (theme::fade(p.sel, hv).blend(theme::fade(p.control, if p.dark { 0.0 } else { hv })), p.danger),
                 Kind::On => (p.seg_on, p.text),
+                Kind::Raised => (theme::mix(if p.dark { p.raise } else { Color32::WHITE }, if p.dark { p.raise2 } else { p.raise2 }, hv), p.text),
             };
             let fg = if self.enabled { fg } else { theme::fade(fg, 0.38) };
             let fill = if self.enabled || self.kind == Kind::Primary || self.kind == Kind::Stop { fill } else { Color32::TRANSPARENT };
             let rect_d = if pressed { rect.shrink(0.5) } else { rect };
+            if self.kind == Kind::Raised && !p.dark {
+                ui.painter().rect_filled(rect_d.translate(vec2(0.0, 1.0)), self.corners, Color32::from_black_alpha(22));
+            }
             ui.painter().rect_filled(rect_d, self.corners, if self.enabled { fill } else { theme::fade(fill, 0.4) });
             // Content: centred when it fits, clipped when the width is still
             // catching up.
             let painter = ui.painter_at(rect);
-            let mut x = if only_icon { rect.center().x - icon_g.as_ref().map_or(0.0, |g| g.size().x) / 2.0 } else { rect.left() + pad_l + ((w - target_w).max(0.0)) / 2.0 };
+            // Centred: in the button's width as it is (a minimum width, or
+            // one still catching up with new words).
+            let mut x = if only_icon { rect.center().x - icon_g.as_ref().map_or(0.0, |g| g.size().x) / 2.0 } else { rect.center().x - (pad_l + content + pad_r) / 2.0 + pad_l };
             let cy = rect.center().y;
             if let Some(g) = icon_g {
                 painter.galley(Pos2::new(x, cy - g.size().y / 2.0), g.clone(), fg);

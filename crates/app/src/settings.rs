@@ -318,6 +318,34 @@ pub enum SourceKind {
     App { bundle_id: String, app_name: String },
 }
 
+/// The order the library shows clips in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum LibrarySort {
+    #[default]
+    Newest,
+    Oldest,
+    Longest,
+    Largest,
+}
+
+impl LibrarySort {
+    pub const ALL: [LibrarySort; 4] = [LibrarySort::Newest, LibrarySort::Oldest, LibrarySort::Longest, LibrarySort::Largest];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            LibrarySort::Newest => "Newest first",
+            LibrarySort::Oldest => "Oldest first",
+            LibrarySort::Longest => "Longest first",
+            LibrarySort::Largest => "Largest first",
+        }
+    }
+
+    /// Grouped by day (newest or oldest first), or one list.
+    pub fn by_day(self) -> bool {
+        matches!(self, LibrarySort::Newest | LibrarySort::Oldest)
+    }
+}
+
 /// One audio source on the Sources page.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioSourceCfg {
@@ -601,6 +629,8 @@ pub struct RecordSettings {
     /// so a clip never opens at full blast after you'd turned it down.
     pub player_volume: f32,
     pub player_muted: bool,
+    /// The library's order.
+    pub library_sort: LibrarySort,
     /// Pre-sources audio list; migrated into `audio_sources` on load.
     #[serde(skip_serializing)]
     audio_tracks: Option<Vec<LegacyAudioTrack>>,
@@ -632,6 +662,7 @@ impl Default for RecordSettings {
             game_folders: Default::default(),
             game_details: true,
             delete_permanently: false,
+            library_sort: LibrarySort::Newest,
             theme: Theme::System,
             close_to_tray: true,
             close_asked: false,
@@ -706,8 +737,8 @@ impl ShortcutAction {
     pub fn label(self) -> &'static str {
         match self {
             ShortcutAction::SaveClip => "Save clip",
-            ShortcutAction::ToggleBuffer => "Start / stop replay buffer",
-            ShortcutAction::ToggleRecord => "Start / stop recording",
+            ShortcutAction::ToggleBuffer => "Start or stop clipping",
+            ShortcutAction::ToggleRecord => "Start or stop recording",
         }
     }
 }

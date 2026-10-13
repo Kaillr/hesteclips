@@ -12,7 +12,7 @@ use crate::settings::{self, Container, Encoder, FPS_CHOICES, OutputResolution, S
 use crate::{App, RecState, reveal_label, shortcuts};
 
 /// Replay lengths offered as one-click choices (seconds).
-const REPLAY_CHOICES: [u32; 8] = [15, 30, 60, 120, 300, 600, 1200, 1800];
+pub(crate) const REPLAY_CHOICES: [u32; 8] = [15, 30, 60, 120, 300, 600, 1200, 1800];
 /// The page's content column never gets wider than this.
 const MAX_WIDTH: f32 = 760.0;
 /// Below this content width, controls go under their labels.
@@ -22,6 +22,7 @@ const LABEL_W: f32 = 210.0;
 
 impl App {
     pub(crate) fn settings_page(&mut self, ui: &mut egui::Ui) {
+        self.page_head(ui, "Settings", |_, _| {}, false);
         crate::ui_kit::page(ui, "settings_page", MAX_WIDTH, |ui| self.settings_column(ui));
     }
 
