@@ -214,6 +214,12 @@ impl Cloud {
             cloud.connect(&token);
             return cloud;
         }
+        // `HESTECLIPS_NO_KEYCHAIN=1`: a test instance that stays disconnected
+        // (no password prompt for each one launched to check a screen).
+        if std::env::var_os("HESTECLIPS_NO_KEYCHAIN").is_some() {
+            cloud.connection = Connection::Disconnected;
+            return cloud;
+        }
         // Reading the keychain can block on a system permission prompt, so never do
         // it on the UI thread.
         cloud.spawn(|| Evt::StoredToken(keychain().and_then(|k| k.get_password().ok())));

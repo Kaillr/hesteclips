@@ -38,6 +38,7 @@ uuid = { version = "1", features = ["v4"] }
 discord-rich-presence = "1.1.0"
 ureq = { version = "3.4.2", features = ["json"] }
 zip = { version = "9.0.1", default-features = false }
+egui-phosphor = { version = "0.14", default-features = false, features = ["fill", "regular"] }
 
 # Dragging a clip out of the window as a file. Its Linux side needs a GTK
 # window, which eframe doesn't have.

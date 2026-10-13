@@ -528,7 +528,7 @@ impl Ready {
                     crate::ui_kit::hint(ui, "Your changes are saved first.");
                 }
                 ui.add_space(8.0);
-                let option = |ui: &mut egui::Ui, title: &str, text: &str, button: egui::Button<'static>| {
+                let option = |ui: &mut egui::Ui, title: &str, text: &str, button: crate::ui_kit::ButtonWidget| {
                     crate::ui_kit::card(ui, |ui| {
                         ui.horizontal(|ui| {
                             let w = ui.available_width() - 150.0;

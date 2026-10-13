@@ -42,6 +42,7 @@ mod sources_ui;
 mod store;
 mod thumbs;
 mod tray;
+mod theme;
 mod ui_kit;
 mod update;
 #[cfg(target_os = "linux")]
