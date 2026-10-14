@@ -277,9 +277,7 @@ impl App {
 
             // Sharing.
             let ready = r.list.iter().filter(|s| s.shareable()).count();
-            ui.add_space(26.0);
-            ui.label(crate::theme::text("Help improve the detector", 13.0, crate::theme::W::Semibold).color(crate::theme::pal(ui).text2));
-            ui.add_space(6.0);
+            ui_kit::section_head(ui, "Help improve the detector", false, |_| {});
             ui_kit::card(ui, "voice_export", |ui| {
                 ui_kit::hint(
                     ui,

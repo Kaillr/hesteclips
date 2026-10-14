@@ -65,12 +65,9 @@ impl App {
         let mut any = false;
         let scroll = ui_kit::scroll(ui, "settings_page", |ui| {
             let origin = ui.cursor().top();
-            // Centred on the page, clear of the section list on the right.
-            let room = ui.available_width();
-            let list = if room >= width + 180.0 { 160.0 } else { 0.0 };
-            let left = ((room - width) / 2.0).min(room - width - list).max(0.0);
+            // On the page's margin, as every page's content is (the section
+            // list sits on the right).
             ui.horizontal_top(|ui| {
-            ui.add_space(left);
             ui.vertical(|ui| {
                 ui.set_width(width);
                 for name in SECTIONS {
@@ -166,11 +163,7 @@ impl App {
     /// button to stop.
     fn group_head(&mut self, ui: &mut egui::Ui, name: &str) -> egui::Response {
         let p = theme::pal(ui);
-        ui.add_space(if name == SECTIONS[0] { 4.0 } else { 26.0 });
-        let r = ui
-            .horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 10.0;
-                ui.label(theme::text(name, 13.0, W::Semibold).color(p.text2));
+        ui_kit::section_head(ui, name, name == SECTIONS[0], |ui| {
                 if name == "Video" && self.rec_state != RecState::Idle {
                     let what = if self.rec_state == RecState::Recording { "recording" } else { "clipping" };
                     ui.label(theme::text(format!("{}  Locked while {what}", icon::LOCK_SIMPLE), 12.5, W::Regular).color(p.text3));
@@ -179,10 +172,7 @@ impl App {
                         self.stop();
                     }
                 }
-            })
-            .response;
-        ui.add_space(6.0);
-        r
+        })
     }
 
     /// Why a setting fixed at capture start is locked now, if it is.

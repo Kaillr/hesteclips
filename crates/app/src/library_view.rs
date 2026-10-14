@@ -374,7 +374,9 @@ impl App {
         let mut action = None;
         // The card's rows line up with the page title (the page margin from
         // the rail), their own padding inside it.
-        let inner = Rect::from_min_max(rect.min + vec2(ui_kit::PAGE_MARGIN as f32 - 10.0, 0.0), rect.max - vec2(0.0, 16.0));
+        // The same gap below the card as beside it.
+        let side = ui_kit::PAGE_MARGIN as f32 - 10.0;
+        let inner = Rect::from_min_max(rect.min + vec2(side, 0.0), rect.max - vec2(0.0, side));
         // Title and search on the heading's row.
         let head = Rect::from_min_size(inner.min, vec2(inner.width(), crate::shell::HEAD_H));
         crate::shell::drag_window_area(ui, Rect::from_min_size(head.min, vec2(70.0, head.height())), "panel_head");

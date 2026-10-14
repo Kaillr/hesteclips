@@ -1184,8 +1184,10 @@ impl Ready {
         } else if over < -0.5 {
             self.lanes_short = (self.lanes_short + over).max(0.0);
         }
-        // The mix's meter stands at the right, as tall as the timeline.
-        let meter_col = Rect::from_min_max(Pos2::new(outer.right() - MIX_W, outer.top()), Pos2::new(outer.right(), body_bottom));
+        // The mix's meter stands at the right, as tall as the timeline, as
+        // far in from the edge as the transport's buttons are.
+        let right = outer.right() - crate::transport::BAR_PAD;
+        let meter_col = Rect::from_min_max(Pos2::new(right - MIX_W, outer.top()), Pos2::new(right, body_bottom));
         // Room between for the end handle and the lanes' scrollbar.
         let lanes_x = outer.left() + HEADER_W..=meter_col.left() - 24.0;
         let lanes = Rect::from_x_y_ranges(lanes_x.clone(), outer.top()..=body_bottom);

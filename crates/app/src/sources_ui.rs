@@ -96,6 +96,9 @@ impl App {
 
         self.page_head(ui, "Sources", |_, _| {});
         crate::ui_kit::arrive(ui, |ui| crate::ui_kit::scroll(ui, "sources_page", |ui| {
+            // The headings' tops level with the other pages' first heading
+            // (these are bigger, in a taller row).
+            ui.add_space(4.0);
             let w = ui.available_width();
             // Picture on the left, sound on the right, when there's room;
             // one above the other when there isn't.
@@ -132,7 +135,7 @@ impl App {
     fn picture_column(&mut self, ui: &mut egui::Ui) {
         self.video_card(ui);
         if capture::webcam::AVAILABLE {
-            ui.add_space(22.0);
+            crate::ui_kit::gap(ui, crate::ui_kit::SECTION_GAP);
             self.webcam_card(ui);
         }
     }
@@ -149,7 +152,7 @@ impl App {
         });
         // The mix first: it's what people hear, and where it gets too loud.
         self.master_strip(ui, now, dt);
-        ui.add_space(14.0);
+        crate::ui_kit::gap(ui, crate::ui_kit::STACK_GAP);
 
         let mut remove = None;
         let mut move_up = None;
@@ -176,7 +179,7 @@ impl App {
             let s = &self.settings.audio_sources[i];
             channel.set_volume(from_db(s.volume_db), s.muted);
             channel.set_denoise(s.noise_removal);
-            ui.add_space(10.0);
+            crate::ui_kit::gap(ui, crate::ui_kit::STACK_GAP);
         }
         if let Some(i) = remove {
             let name = self.settings.audio_sources.remove(i).name;
@@ -374,11 +377,11 @@ impl App {
                     self.windowed_apps = capture::list_windowed_apps();
                 }
             }
-            ui.add_space(12.0);
+            crate::ui_kit::gap(ui, crate::ui_kit::STACK_GAP);
         }
 
         self.preview_picture(ui, frame.as_deref());
-        ui.add_space(12.0);
+        crate::ui_kit::gap(ui, crate::ui_kit::STACK_GAP);
 
         match self.settings.capture.clone() {
             CaptureTarget::Apps { apps, away_screen } if capture::APP_CAPTURE => self.app_list(ui, apps, away_screen, frame.as_deref()),
@@ -1200,7 +1203,8 @@ pub(crate) fn column_head(ui: &mut egui::Ui, title: &str, right: impl FnOnce(&mu
         ui.label(crate::theme::text(title, 15.0, crate::theme::W::Semibold).color(pal.text));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), right);
     });
-    ui.add_space(10.0);
+    // As far below as Settings' headings are from their groups.
+    ui.add_space(4.0);
 }
 
 pub(crate) fn from_db(db: f32) -> f32 {

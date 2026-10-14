@@ -289,8 +289,11 @@ pub fn ruler(ui: &mut egui::Ui, rect: Rect, view: (f64, f64), fps: f64, frames: 
             let label = if frames { format!("{}", (t * fps).round() as u64) } else { short_clock(t, step) };
             let g = painter.layout_no_wrap(label, theme::font(11.0, W::Regular), p.text3);
             // A pin over its time hides it: the pin is what matters there.
+            // One that doesn't fit before the edge isn't drawn (cut, the end's
+            // "0:05.00" showed as a lone "0").
             let span_x = x + 4.0 - 12.0..=x + 4.0 + g.size().x + 12.0;
-            if !moments.iter().any(|m| span_x.contains(&x_of(m.t))) {
+            let fits = x + 4.0 + g.size().x <= rect.right() + 10.0;
+            if fits && !moments.iter().any(|m| span_x.contains(&x_of(m.t))) {
                 painter.galley(Pos2::new(x + 4.0, rect.bottom() - 13.0 - g.size().y), g, p.text3);
             }
         }
@@ -356,12 +359,16 @@ pub fn vrule(ui: &mut egui::Ui) {
     ui.painter().vline(r.center().x, r.y_range(), Stroke::new(1.0, p.line2));
 }
 
+/// Space between the bar's ends and its buttons; the editor's timeline
+/// keeps the same at its right.
+pub const BAR_PAD: f32 = 14.0;
+
 /// The transport bar's frame: a hairline on top, three columns (left, the
 /// centre on the bar's true centre, right).
 pub fn bar(ui: &mut egui::Ui, rect: Rect, centre_w: f32, mut part: impl FnMut(&mut egui::Ui, Part)) {
     let p = theme::pal(ui);
     ui.painter().hline(rect.x_range(), rect.top(), Stroke::new(1.0, p.line));
-    let inner = rect.shrink2(vec2(14.0, 0.0));
+    let inner = rect.shrink2(vec2(BAR_PAD, 0.0));
     let c = Rect::from_center_size(inner.center(), vec2(centre_w, rect.height()));
     let l = Rect::from_min_max(inner.min, Pos2::new(c.left() - 8.0, inner.bottom()));
     let r = Rect::from_min_max(Pos2::new(c.right() + 8.0, inner.top()), inner.max);

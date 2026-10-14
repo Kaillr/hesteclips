@@ -29,6 +29,33 @@ pub const CARD_RADIUS: u8 = 8;
 pub const PAGE_MARGIN: i8 = 24;
 /// The search field's width, the same on every page that has one.
 pub const SEARCH_W: f32 = 160.0;
+/// Between cards stacked in a column, on every page.
+pub const STACK_GAP: f32 = 16.0;
+/// Above a heading that starts another part of a page.
+pub const SECTION_GAP: f32 = 32.0;
+
+/// Leave exactly `px` between what's above and what comes next (egui adds
+/// its item spacing between the two on top of any space added).
+pub fn gap(ui: &mut egui::Ui, px: f32) {
+    ui.add_space((px - ui.spacing().item_spacing.y).max(0.0));
+}
+
+/// A heading over a part of a page (Settings' groups, Voice samples'
+/// sharing): small and quiet, [`SECTION_GAP`] below what's above it (less
+/// at the top of a page), with anything `extra` adds beside it.
+pub fn section_head(ui: &mut egui::Ui, text: &str, first: bool, extra: impl FnOnce(&mut egui::Ui)) -> Response {
+    let p = theme::pal(ui);
+    gap(ui, if first { 10.0 } else { SECTION_GAP });
+    let r = ui
+        .horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 10.0;
+            ui.label(theme::text(text, 13.0, W::Semibold).color(p.text2));
+            extra(ui);
+        })
+        .response;
+    ui.add_space(6.0);
+    r
+}
 
 /// Set the look for both themes. Called once at start-up.
 pub fn apply(ctx: &egui::Context) {
