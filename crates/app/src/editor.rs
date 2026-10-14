@@ -381,6 +381,9 @@ impl Ready {
             if part != crate::transport::Part::Right {
                 return;
             }
+            // Narrower windows: the export button shows just its icon, and
+            // Cancel goes (back and Esc cancel too).
+            let narrow = ui.ctx().content_rect().width() < 820.0;
             // Save, with Save as new in its menu.
             let corners_l = egui::CornerRadius { nw: 6, sw: 6, ne: 0, se: 0 };
             let corners_r = egui::CornerRadius { nw: 0, sw: 0, ne: 6, se: 6 };
@@ -401,7 +404,7 @@ impl Ready {
             }
             ui.spacing_mut().item_spacing.x = 6.0;
             ui.add_space(4.0);
-            if Btn::ghost("Cancel").show(ui).clicked() {
+            if !narrow && Btn::ghost("Cancel").show(ui).clicked() {
                 cancel = true;
             }
             crate::transport::vrule(ui);
@@ -420,7 +423,12 @@ impl Ready {
                 }
             });
             // How the saved file is made: applies to Save and Save as new.
-            let export = Btn::ghost(crate::export_ui::summary(&self.info, &self.edit)).with_icon(icon::SLIDERS_HORIZONTAL).trail(icon::CARET_DOWN).id("export_btn").tip("Export settings: resolution, frame rate, quality, a size to fit under, sound tracks").show(ui);
+            let summary = crate::export_ui::summary(&self.info, &self.edit);
+            let export = if narrow {
+                Btn::icon(Kind::Ghost, icon::SLIDERS_HORIZONTAL).id("export_btn").tip(format!("Export settings: {summary}")).show(ui)
+            } else {
+                Btn::ghost(summary).with_icon(icon::SLIDERS_HORIZONTAL).trail(icon::CARET_DOWN).id("export_btn").tip("Export settings: resolution, frame rate, quality, a size to fit under, sound tracks").show(ui)
+            };
             if export.clicked() {
                 self.export_open = !self.export_open;
             }
@@ -696,16 +704,33 @@ impl Ready {
         let full = self.info.duration.max(1e-6);
         let zoom_frac = (1.0 - ((self.view.1 / full).ln() / (self.min_span() / full).ln()).clamp(0.0, 1.0)) as f32;
         let zoom_frac = 1.0 - zoom_frac;
-        crate::transport::bar(ui, bar, 250.0, |ui, part| match part {
+        // Narrower windows: Start and End become their brackets, the zoom
+        // slider goes (its buttons stay), then the time moves out of the
+        // middle to make room.
+        let medium = bar.width() < 860.0;
+        let narrow = bar.width() < 660.0;
+        let centre_w = if narrow { 44.0 } else { 250.0 };
+        crate::transport::bar(ui, bar, centre_w, |ui, part| match part {
             crate::transport::Part::Left => {
                 undo = Btn::icon(Kind::Ghost, icon::ARROW_U_UP_LEFT).enabled(can_undo).tip("Undo  (Cmd Z)").show(ui).clicked();
                 redo = Btn::icon(Kind::Ghost, icon::ARROW_U_UP_RIGHT).enabled(can_redo).tip("Redo  (Shift Cmd Z)").show(ui).clicked();
                 crate::transport::vrule(ui);
-                set_in = Btn::ghost("Start").with_icon("[").small().tip("Start the clip here  (I)").show(ui).clicked();
-                set_out = Btn::ghost("End").trail("]").small().tip("End the clip here  (O)").show(ui).clicked();
+                if medium {
+                    set_in = Btn::ghost("[").small().tip("Start the clip here  (I)").show(ui).clicked();
+                    set_out = Btn::ghost("]").small().tip("End the clip here  (O)").show(ui).clicked();
+                    // No room in the middle: the time here, without the length.
+                    if narrow {
+                        crate::transport::vrule(ui);
+                        crate::transport::timecode(ui, t, 0.0, self.info.fps, &mut frames);
+                    }
+                } else {
+                    set_in = Btn::ghost("Start").with_icon("[").small().tip("Start the clip here  (I)").show(ui).clicked();
+                    set_out = Btn::ghost("End").trail("]").small().tip("End the clip here  (O)").show(ui).clicked();
+                }
             }
             crate::transport::Part::Centre => {
-                let c = crate::transport::centre(ui, self.player.is_playing(), prev.as_ref(), next.as_ref());
+                // Narrow: play alone (the pins and [ ] still go to moments).
+                let c = if narrow { crate::transport::play_button(ui, self.player.is_playing()) } else { crate::transport::centre(ui, self.player.is_playing(), prev.as_ref(), next.as_ref()) };
                 play = c.play;
                 if c.prev {
                     jump = prev.as_ref().map(|m| m.t);
@@ -713,7 +738,9 @@ impl Ready {
                 if c.next {
                     jump = next.as_ref().map(|m| m.t);
                 }
-                crate::transport::timecode(ui, t, self.info.duration, self.info.fps, &mut frames);
+                if !narrow {
+                    crate::transport::timecode(ui, t, self.info.duration, self.info.fps, &mut frames);
+                }
             }
             crate::transport::Part::Right => {
                 // Zoom: out, the slider, in.
@@ -721,7 +748,7 @@ impl Ready {
                     zoom_by = Some(2.0);
                 }
                 let mut z = zoom_frac;
-                if crate::transport::slider(ui, &mut z, 96.0).on_hover_text("Zoom the timeline").changed() {
+                if !medium && crate::transport::slider(ui, &mut z, 96.0).on_hover_text("Zoom the timeline").changed() {
                     zoom_to = Some(z);
                 }
                 if Btn::icon(Kind::Ghost, icon::MAGNIFYING_GLASS_MINUS).small().tip("Zoom out  (−)").show(ui).clicked() {

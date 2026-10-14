@@ -192,7 +192,9 @@ impl App {
     /// The recorder: the status (its ∨ opens the other options) and the one
     /// action that makes sense now, with its shortcut. `main`: its action is
     /// the screen's main one (on Clips); elsewhere it's a normal button.
-    pub(crate) fn recorder(&mut self, ui: &mut egui::Ui) {
+    /// `compact`: a narrow window, so just the status dot and ∨, and the
+    /// action without its shortcut.
+    pub(crate) fn recorder(&mut self, ui: &mut egui::Ui, compact: bool) {
         let p = theme::pal(ui);
         let state = self.rec_state;
         let elapsed = self.rec_started.map_or(Duration::ZERO, |t| t.elapsed());
@@ -205,7 +207,7 @@ impl App {
         let font = theme::font(13.0, W::Semibold);
         let tg = ui.painter().layout_no_wrap(title.clone(), font, p.text);
         let sg = sub.as_ref().map(|s| ui.painter().layout_no_wrap(s.clone(), theme::font(13.0, W::Medium), p.text3));
-        let stat_target = 27.0 + tg.size().x + sg.as_ref().map_or(0.0, |g| g.size().x + 6.0) + 8.0 + 20.0;
+        let stat_target = if compact { 27.0 + 22.0 } else { 27.0 + tg.size().x + sg.as_ref().map_or(0.0, |g| g.size().x + 6.0) + 8.0 + 20.0 };
         let stat_w = theme::value(ui.ctx(), egui::Id::new("rec_stat_w"), stat_target, theme::NORMAL);
         // The one action.
         let saving = self.saving > 0;
@@ -221,6 +223,7 @@ impl App {
             RecState::Recording => Btn::new(Kind::Stop, "Stop recording").with_icon(egui_phosphor::fill::STOP).keys(self.shortcut_keys(A::ToggleRecord)).tip("Stop and save the recording"),
         }
         .id("recorder_action");
+        let btn = if compact { btn.keys(None) } else { btn };
         let total = 2.0 + stat_w + 2.0 + btn.width(ui) + 2.0;
         // Status first, then the action: laid out left to right in a box
         // allocated from the right.
@@ -243,15 +246,17 @@ impl App {
                     painter.circle_stroke(c, 3.5, Stroke::new(1.5, p.text3));
                 }
             }
+            // Clipped to the box while its width eases between compact and not.
+            let words = ui.painter_at(r.with_max_x(r.right() - 24.0));
             let mut x = r.left() + 27.0;
-            painter.galley(Pos2::new(x, r.center().y - tg.size().y / 2.0), tg.clone(), p.text);
+            words.galley(Pos2::new(x, r.center().y - tg.size().y / 2.0), tg.clone(), p.text);
             x += tg.size().x + 6.0;
             if let Some(g) = sg {
-                painter.galley(Pos2::new(x, r.center().y - g.size().y / 2.0), g.clone(), p.text3);
+                words.galley(Pos2::new(x, r.center().y - g.size().y / 2.0), g.clone(), p.text3);
             }
             let turn = theme::toggle(ui.ctx(), resp.id.with("turn"), open, theme::NORMAL);
             ui_kit::chevron(&painter, Pos2::new(r.right() - 14.0, r.center().y), 3.5, turn, p.text3);
-            let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("More options");
+            let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(if compact { format!("{title}{}", sub.as_ref().map(|s| format!("  {s}")).unwrap_or_default()) } else { "More options".to_owned() });
             egui::Popup::menu(&resp)
                 .id(menu_id)
                 .gap(6.0)
@@ -353,12 +358,25 @@ impl App {
                 ui.label(theme::text(title, 20.0, W::Semibold).color(p.text));
                 ui.add_space(6.0);
             }
-            left(self, ui);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                self.recorder(ui);
-                self.update_button(ui);
-                self.skipped_warning(ui);
+            // Narrow: the recorder shrinks to its dot and action, and the
+            // left side (title, search) gets what's left, never under it.
+            let compact = rect.width() < 720.0;
+            // The right side's width last frame (it's laid out after).
+            let key = egui::Id::new(("page_head_right", compact));
+            let right_w = ui.data(|d| d.get_temp::<f32>(key)).unwrap_or(if compact { 230.0 } else { 340.0 });
+            let left_rect = Rect::from_min_max(ui.cursor().min, Pos2::new((rect.right() - right_w - 16.0).max(ui.cursor().min.x + 40.0), rect.bottom()));
+            let mut lui = ui.new_child(egui::UiBuilder::new().max_rect(left_rect).layout(egui::Layout::left_to_right(egui::Align::Center)));
+            left(self, &mut lui);
+            let right = ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let start = ui.cursor().max.x;
+                self.recorder(ui, compact);
+                if !compact {
+                    self.update_button(ui);
+                    self.skipped_warning(ui);
+                }
+                start - ui.cursor().max.x
             });
+            ui.data_mut(|d| d.insert_temp(key, right.inner));
         });
     }
 

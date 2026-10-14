@@ -321,7 +321,8 @@ impl Viewer {
             ui,
             &title,
             false,
-            if nav.position.is_some() { 120.0 } else { 0.0 },
+            // Narrow: no "n of m" between the arrows.
+            if nav.position.is_some() { if ui.ctx().content_rect().width() < 560.0 { 60.0 } else { 120.0 } } else { 0.0 },
             |ui, part| match part {
             crate::transport::Part::Centre => {
                 let p = crate::theme::pal(ui);
@@ -329,7 +330,7 @@ impl Viewer {
                 if Btn::icon(Kind::Ghost, icon::CARET_LEFT).small().enabled(nav.previous.is_some()).tip("Previous clip  (Q)").show(ui).clicked() {
                     out = nav.previous.clone().map_or(ViewerOutcome::Stay, ViewerOutcome::Open);
                 }
-                if let Some((i, n)) = nav.position {
+                if let Some((i, n)) = nav.position.filter(|_| ui.ctx().content_rect().width() >= 560.0) {
                     let text = format!("{i} of {n}");
                     let g = ui.painter().layout_no_wrap(text, crate::theme::font(13.0, crate::theme::W::Regular), p.text3);
                     let (r, _) = ui.allocate_exact_size(egui::vec2(120.0 - 2.0 * 26.0 - 4.0, 26.0), Sense::hover());
@@ -377,11 +378,15 @@ impl Viewer {
                     }
                 });
                 let share_tip = if crate::share::CAN_DRAG_OUT { "Copy it, send it or upload it, or drag the picture into any app" } else { "Copy it, send it or upload it" };
-                let share = Btn::primary("Share").with_icon(icon::EXPORT).enabled(ready).tip(if ready { share_tip } else { wait }).show(ui);
+                // Narrow: Share and Edit as their icons.
+                let narrow = ui.ctx().content_rect().width() < 700.0;
+                let share = if narrow { Btn::icon(Kind::Primary, icon::EXPORT).tip("Share") } else { Btn::primary("Share").with_icon(icon::EXPORT) };
+                let share = share.enabled(ready).tip(if ready { share_tip } else { wait }).show(ui);
                 if let Some(c) = crate::ui_kit::menu_popup(&share, false, 250.0, |ui| crate::library::share_menu(ui, share.rect.left_bottom())).flatten() {
                     out = ViewerOutcome::Share(c);
                 }
-                if Btn::normal("Edit").with_icon(icon::SCISSORS).enabled(ready).tip(if ready { "Trim it, adjust its sound, or save it smaller" } else { wait }).show(ui).clicked() {
+                let edit = if narrow { Btn::icon(Kind::Normal, icon::SCISSORS) } else { Btn::normal("Edit").with_icon(icon::SCISSORS) };
+                if edit.enabled(ready).tip(if ready { "Trim it, adjust its sound, or save it smaller" } else { wait }).show(ui).clicked() {
                     out = ViewerOutcome::Edit;
                 }
             }

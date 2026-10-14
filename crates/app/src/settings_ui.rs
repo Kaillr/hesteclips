@@ -42,9 +42,12 @@ impl App {
         if !ui_kit::overlay_open(ui.ctx()) && ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
             ui.memory_mut(|m| m.request_focus(egui::Id::new("settings_search")));
         }
-        let width = (ui.available_width() - 180.0).clamp(320.0, COLUMN);
+        // The column, and room for the section list beside it when it fits;
+        // without the list the column takes the whole page.
+        let page_w = ui.available_width();
+        let width = if page_w >= COLUMN + 180.0 { COLUMN } else { page_w };
         self.page_head(ui, "Settings", |app, ui| {
-            ui.allocate_ui(egui::vec2(ui_kit::SEARCH_W, ui_kit::CONTROL_H), |ui| {
+            ui.allocate_ui(egui::vec2(ui_kit::SEARCH_W.min(ui.available_width()), ui_kit::CONTROL_H), |ui| {
                 crate::library_view::search_field(ui, "settings_search", &mut app.settings_query, "Search");
             });
         });

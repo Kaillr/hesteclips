@@ -341,7 +341,7 @@ impl App {
         let mut hui = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_max(Pos2::new(title_x, head.top()), head.max)).layout(egui::Layout::left_to_right(egui::Align::Center)));
         hui.label(theme::text("Clips", 20.0, W::Semibold).color(p.text));
         hui.add_space(6.0);
-        hui.allocate_ui(vec2(ui_kit::SEARCH_W, ui_kit::CONTROL_H), |ui| search_field(ui, "library_search", &mut self.library_query, "Search"));
+        hui.allocate_ui(vec2(ui_kit::SEARCH_W.min(hui.available_width()), ui_kit::CONTROL_H), |ui| search_field(ui, "library_search", &mut self.library_query, "Search"));
         // The card.
         let card = Rect::from_min_max(Pos2::new(inner.left(), head.bottom()), inner.max);
         crate::glass::paint(ui, card, self);

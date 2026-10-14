@@ -1123,58 +1123,98 @@ impl<'a> Row<'a> {
         let p = theme::pal(ui);
         let (pad_x, min_h) = if self.kid { (12.0, 44.0) } else { (16.0, 52.0) };
         let locked = self.locked.is_some();
-        let mut clicked_locked = false;
         let width = ui.available_width();
-        let r = ui
-            .allocate_ui_with_layout(vec2(width, min_h), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+        // How wide the control was last frame: beside the label when both
+        // fit, else under it (narrow windows), never over it.
+        let key = ui.id().with(("row_control_w", self.label));
+        let control_w = ui.data(|d| d.get_temp::<f32>(key)).unwrap_or(0.0);
+        let inner_w = width - pad_x * 2.0;
+        let stacked = control_w > 0.0 && control_w + 16.0 + 140.0 > inner_w;
+        let label_w = if stacked { inner_w } else { (inner_w - control_w - 16.0).max(120.0) };
+        let label = |ui: &mut egui::Ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 5.0;
+                let size = if self.kid { 13.5 } else { 14.0 };
+                ui.label(theme::text(self.label, size, W::Regular).color(if locked { p.text2 } else { p.text }));
+                if let Some((t, b)) = self.tip {
+                    info(ui, t, b);
+                }
+                if let Some(why) = &self.locked {
+                    ui.label(theme::ic(icon::LOCK_SIMPLE, 12.5).color(p.text3)).on_hover_text(why);
+                }
+            });
+            if let Some(n) = &self.note {
+                ui.add(egui::Label::new(theme::text(n, 12.5, W::Regular).color(if self.warn { p.warn } else { p.text3 })).wrap());
+            }
+        };
+        let mut clicked_locked = false;
+        let mut control_rect = Rect::NOTHING;
+        let place_control = |ui: &mut egui::Ui| -> R {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            if locked {
+                let inner = ui.add_enabled_ui(false, |ui| {
+                    ui.multiply_opacity(0.7);
+                    control(ui)
+                });
+                control_rect = inner.response.rect;
+                // Named after its row: every locked row's control column has the same id.
+                let resp = ui.interact(inner.response.rect, ui.id().with(("locked", self.label)), Sense::click()).on_hover_cursor(egui::CursorIcon::NotAllowed);
+                if let Some(why) = &self.locked {
+                    let resp = resp.on_hover_text(why);
+                    clicked_locked = resp.clicked();
+                }
+                inner.inner
+            } else {
+                let inner = ui.scope(control);
+                control_rect = inner.response.rect;
+                inner.inner
+            }
+        };
+        let r = if stacked {
+            // The label, then the control on its own line, right-aligned.
+            ui.allocate_ui_with_layout(vec2(width, min_h), egui::Layout::top_down(egui::Align::Min), |ui| {
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(pad_x);
+                    ui.allocate_ui_with_layout(vec2(label_w, 0.0), egui::Layout::top_down(egui::Align::Min), label);
+                });
+                ui.add_space(6.0);
+                let r = ui.allocate_ui_with_layout(vec2(width, CONTROL_H), egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(pad_x);
+                    place_control(ui)
+                });
+                ui.add_space(10.0);
+                r.inner
+            })
+            .inner
+        } else {
+            ui.allocate_ui_with_layout(vec2(width, min_h), egui::Layout::left_to_right(egui::Align::Center), |ui| {
                 ui.set_min_height(min_h);
                 ui.add_space(pad_x);
-                let label_w = (width * 0.58).min(width - pad_x * 2.0 - 120.0).max(120.0);
                 ui.allocate_ui_with_layout(vec2(label_w, min_h), egui::Layout::top_down(egui::Align::Min), |ui| {
-                    ui.add_space(if self.note.is_some() { 9.0 } else { 0.0 });
-                    ui.spacing_mut().item_spacing.y = 2.0;
-                    if self.note.is_none() {
+                    if self.note.is_some() {
+                        ui.add_space(9.0);
+                    } else {
                         ui.add_space(((min_h - 20.0) / 2.0).max(0.0));
                     }
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 5.0;
-                        let size = if self.kid { 13.5 } else { 14.0 };
-                        ui.label(theme::text(self.label, size, W::Regular).color(if locked { p.text2 } else { p.text }));
-                        if let Some((t, b)) = self.tip {
-                            info(ui, t, b);
-                        }
-                        if let Some(why) = &self.locked {
-                            ui.label(theme::ic(icon::LOCK_SIMPLE, 12.5).color(p.text3)).on_hover_text(why);
-                        }
-                    });
-                    if let Some(n) = &self.note {
-                        ui.add(egui::Label::new(theme::text(n, 12.5, W::Regular).color(if self.warn { p.warn } else { p.text3 })).wrap());
+                    label(ui);
+                    if self.note.is_some() {
                         ui.add_space(8.0);
                     }
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(pad_x);
-                    ui.spacing_mut().item_spacing.x = 8.0;
-                    if locked {
-                        let inner = ui.add_enabled_ui(false, |ui| {
-                            ui.multiply_opacity(0.7);
-                            control(ui)
-                        });
-                        // Named after its row: every locked row's control
-                        // column has the same id.
-                        let resp = ui.interact(inner.response.rect, ui.id().with(("locked", self.label)), Sense::click()).on_hover_cursor(egui::CursorIcon::NotAllowed);
-                        if let Some(why) = &self.locked {
-                            let resp = resp.on_hover_text(why);
-                            clicked_locked = resp.clicked();
-                        }
-                        inner.inner
-                    } else {
-                        control(ui)
-                    }
+                    place_control(ui)
                 })
                 .inner
             })
-            .inner;
+            .inner
+        };
+        if control_rect.is_positive() && (control_rect.width() - control_w).abs() > 0.5 {
+            ui.data_mut(|d| d.insert_temp(key, control_rect.width()));
+            ui.ctx().request_discard("a settings row's control changed width");
+        }
         (r, clicked_locked)
     }
 }

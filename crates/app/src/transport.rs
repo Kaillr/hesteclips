@@ -180,14 +180,21 @@ pub struct Centre {
 /// Play between "previous moment" and "next moment" (greyed when there's
 /// none; their tips name the moment).
 pub fn centre(ui: &mut egui::Ui, playing: bool, prev: Option<&Moment>, next: Option<&Moment>) -> Centre {
-    let p = theme::pal(ui);
     let mut c = Centre::default();
     let tip = |m: Option<&Moment>, dir: &str, key: &str| match m {
         Some(m) => format!("{dir} to {}  ({key})", m.label.to_lowercase()),
         None => format!("No {} moment", if dir == "Back" { "earlier" } else { "later" }),
     };
     c.prev = Btn::icon(Kind::Ghost, egui_phosphor::fill::SKIP_BACK).enabled(prev.is_some()).tip(tip(prev, "Back", "[")).show(ui).clicked();
-    // Play: a round button in the main action's colour; the glyph cross-fades.
+    c.play = play_button(ui, playing).play;
+    c.next = Btn::icon(Kind::Ghost, egui_phosphor::fill::SKIP_FORWARD).enabled(next.is_some()).tip(tip(next, "Ahead", "]")).show(ui).clicked();
+    c
+}
+
+/// Play: a round button in the main action's colour; the glyph cross-fades.
+pub fn play_button(ui: &mut egui::Ui, playing: bool) -> Centre {
+    let p = theme::pal(ui);
+    let mut c = Centre::default();
     let (r, resp) = ui.allocate_exact_size(vec2(36.0, 36.0), Sense::click());
     let hv = theme::toggle(ui.ctx(), resp.id.with("hv"), resp.hovered(), theme::FAST);
     let down = resp.is_pointer_button_down_on();
@@ -203,23 +210,22 @@ pub fn centre(ui: &mut egui::Ui, playing: bool, prev: Option<&Moment>, next: Opt
         ui.painter().text(rr.center(), Align2::CENTER_CENTER, egui_phosphor::fill::PAUSE, FontId::new(16.0 * (0.7 + 0.3 * t), theme::fill_family()), theme::fade(fg, t));
     }
     c.play = resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Play or pause  (Space)").clicked();
-    c.next = Btn::icon(Kind::Ghost, egui_phosphor::fill::SKIP_FORWARD).enabled(next.is_some()).tip(tip(next, "Ahead", "]")).show(ui).clicked();
     c
 }
 
 /// The time: "0:22.13 / 0:59.80", or frames. Click to switch. Fixed-width
-/// digits, so it doesn't jitter.
+/// digits, so it doesn't jitter. `total` 0: just the time (narrow windows).
 pub fn timecode(ui: &mut egui::Ui, t: f64, total: f64, fps: f64, frames: &mut bool) {
     let p = theme::pal(ui);
     let (now, all) = if *frames {
         let f = |s: f64| (s * fps).round() as u64;
-        (f(t).to_string(), format!("/ {} frames", f(total)))
+        (f(t).to_string(), if total > 0.0 { format!("/ {} frames", f(total)) } else { String::new() })
     } else {
-        (clock(t), format!("/ {}", clock(total)))
+        (clock(t), if total > 0.0 { format!("/ {}", clock(total)) } else { String::new() })
     };
     let a = ui.painter().layout_no_wrap(now, theme::font(14.0, W::Medium), p.text);
     let b = ui.painter().layout_no_wrap(all, theme::font(14.0, W::Regular), p.text3);
-    let w = a.size().x + 6.0 + b.size().x + 16.0;
+    let w = a.size().x + if b.size().x > 0.0 { 6.0 + b.size().x } else { 0.0 } + 16.0;
     let id = ui.next_auto_id();
     let w = theme::value(ui.ctx(), id.with("w"), w, theme::NORMAL);
     let (r, resp) = ui.allocate_exact_size(vec2(w, 30.0), Sense::click());
