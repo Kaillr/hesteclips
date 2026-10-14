@@ -854,9 +854,9 @@ impl Ready {
     }
 
     /// The kept length under the timeline: shown, and on a click typed over
-    /// ("12", "0:12.5", or frames when times show as frames). Enter moves the
-    /// end to make it that long (the start stays; as long as the clip
-    /// allows), Esc or clicking away leaves it.
+    /// ("12", "0:12.5", or frames when times show as frames). Enter makes the
+    /// kept part that long around its middle (as long as the clip allows),
+    /// Esc or clicking away leaves it.
     fn length_field(&mut self, ui: &mut egui::Ui, rect: Rect, shown: &str) {
         let pal = crate::theme::pal(ui);
         let id = ui.id().with("length_field");
@@ -891,7 +891,7 @@ impl Ready {
                         match secs.filter(|s| *s > 0.0) {
                             Some(secs) => {
                                 let was = self.edit.clone();
-                                (self.edit.start, self.edit.end) = trim_to_length(&self.info, self.edit.start, secs);
+                                (self.edit.start, self.edit.end) = trim_to_length(&self.info, self.edit.start, self.edit.end, secs);
                                 if !same_edit(&self.edit, &was) {
                                     self.push_undo(was);
                                 }
@@ -1431,9 +1431,8 @@ impl Ready {
         if let Some(label) = len_label {
             self.length_field(ui, label, &len_text);
         }
-        // A press on the length is the length's, not the timeline's.
-        let on_label = len_label.is_some_and(|l| ui.input(|i| i.pointer.press_origin()).is_some_and(|p| l.contains(p)));
-        let resp = if on_label { ui.interact(Rect::NOTHING, ui.id().with("timeline_off"), Sense::hover()) } else { resp };
+        // (A click on the length is its own; a drag that starts on it is
+        // the timeline's, sliding the kept part: egui gives each its widget.)
 
         // What's under the pointer, in priority order.
         let hit = |pos: Pos2, this: &Self| -> Option<Drag> {
@@ -1733,16 +1732,22 @@ fn same_edit(a: &Edit, b: &Edit) -> bool {
         })
 }
 
-/// The kept part made `secs` long from `start`: the end moves; past the
-/// clip's end, the end stays there and the start comes back instead (as far
-/// as the clip allows). On frames, at least one long.
-fn trim_to_length(info: &media::ClipInfo, start: f64, secs: f64) -> (f64, f64) {
+/// The kept part (`start`..`end`) made `secs` long around its middle; where
+/// that runs past an end of the clip, it shifts back in (as long as the clip
+/// allows). On frames, at least one long.
+fn trim_to_length(info: &media::ClipInfo, start: f64, end: f64, secs: f64) -> (f64, f64) {
     let fd = info.frame_duration();
-    if start + secs > info.duration {
-        let start = info.snap((info.duration - secs).max(0.0));
-        return (start, info.duration);
+    let secs = secs.clamp(fd, info.duration);
+    let mid = (start + end) / 2.0;
+    let mut a = mid - secs / 2.0;
+    if a < 0.0 {
+        a = 0.0;
     }
-    (start, info.snap(start + secs).max(start + fd))
+    if a + secs > info.duration {
+        a = info.duration - secs;
+    }
+    let a = info.snap(a.max(0.0));
+    (a, (info.snap(a + secs)).min(info.duration).max(a + fd))
 }
 
 /// The volume line, striped (so it reads as a control over the waveform, not
@@ -1792,11 +1797,16 @@ mod length_tests {
     }
 
     #[test]
-    fn typed_length_moves_the_end() {
-        assert_eq!(trim_to_length(&info(), 10.0, 12.5), (10.0, 22.5));
-        // Longer than what's left: the end stays at the clip's, the start comes back.
-        assert_eq!(trim_to_length(&info(), 50.0, 20.0), (40.0, 60.0));
+    fn typed_length_grows_from_the_middle() {
+        // 20..30 (middle 25) made 20 long: 15..35.
+        assert_eq!(trim_to_length(&info(), 20.0, 30.0, 20.0), (15.0, 35.0));
+        // Made shorter: 23..27.
+        assert_eq!(trim_to_length(&info(), 20.0, 30.0, 4.0), (23.0, 27.0));
+        // Past the clip's end: shifted back in.
+        assert_eq!(trim_to_length(&info(), 50.0, 58.0, 20.0), (40.0, 60.0));
+        // Past its start: shifted forward.
+        assert_eq!(trim_to_length(&info(), 0.0, 4.0, 10.0), (0.0, 10.0));
         // Longer than the whole clip: all of it.
-        assert_eq!(trim_to_length(&info(), 5.0, 90.0), (0.0, 60.0));
+        assert_eq!(trim_to_length(&info(), 5.0, 10.0, 90.0), (0.0, 60.0));
     }
 }
