@@ -81,6 +81,10 @@ struct Ready {
     /// Smoothed meter values (peak, rms) per track, then master; and peak holds.
     meters: Vec<Meter>,
     master: Meter,
+    /// How far short the sound lanes came last frame, for the split between
+    /// picture and timeline (whatever the guess of the other parts' height
+    /// missed).
+    lanes_short: f32,
     /// The kept length being typed (click the length under the timeline).
     typing_length: Option<String>,
     /// The mix's meter on the right of the timeline (as on Sources).
@@ -303,6 +307,7 @@ impl Ready {
             master: Meter::default(),
             mix_meter: Default::default(),
             typing_length: None,
+            lanes_short: 0.0,
             dragging: None,
             resume: false,
             grab_offset: 0.0,
@@ -508,8 +513,12 @@ impl Ready {
         let total = ui.available_height();
         let below_min = DIVIDER_H + crate::transport::BAR_H + RULER_H + VIDEO_H + 4.0 + AUDIO_H + LENGTH_H + 10.0;
         // Never more timeline than its lanes need: the picture gets the rest.
-        let below_max = DIVIDER_H + crate::transport::BAR_H + RULER_H + VIDEO_H + 8.0 + self.edit.tracks.len() as f32 * (AUDIO_H + 4.0) + LENGTH_H + 10.0;
-        let preview_h = (total * *preview_share).max(total - below_max).min(total - below_min).max(MIN_PREVIEW_H);
+        // (The same sum the timeline makes: its ruler, video lane, the gap
+        // above the sound lanes, each lane and the gap after it, the length.)
+        let below_max = DIVIDER_H + crate::transport::BAR_H + RULER_H + VIDEO_H + 4.0 + 4.0 + self.edit.tracks.len() as f32 * (AUDIO_H + 4.0) + LENGTH_H + 10.0 + self.lanes_short;
+        // The divider's share, except that every sound lane shows (no
+        // scrolling) whenever the picture can still have a third of the room.
+        let preview_h = (total * *preview_share).min((total - below_max).max(total / 3.0)).max(total - below_max).min(total - below_min).max(MIN_PREVIEW_H);
         let (preview_rect, preview_resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), preview_h), Sense::click());
         let size = self.player.update(&ctx, self.dragging.is_some());
         let player = &self.player;
@@ -1130,14 +1139,26 @@ impl Ready {
         // As tall as it needs, up to what's left; the sound lanes scroll in
         // whatever height that leaves them.
         let room = (ui.available_height() - LENGTH_H - 8.0).max(RULER_H + VIDEO_H + lane_step);
-        let total_h = (RULER_H + VIDEO_H + lanes_h + 4.0).min(room);
+        // Ruler, video lane, the gap above the lanes, the lanes.
+        let total_h = (RULER_H + VIDEO_H + 4.0 + lanes_h).min(room);
         let (outer, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), total_h + LENGTH_H), Sense::hover());
         let body_bottom = outer.top() + total_h;
         let audio_view = Rect::from_x_y_ranges(outer.x_range(), outer.top() + RULER_H + VIDEO_H..=body_bottom);
-        let max_scroll = (lanes_h - audio_view.height()).max(0.0);
+        // The lanes and the gap above them; a few points over is no reason
+        // to scroll.
+        let over = 4.0 + lanes_h - audio_view.height();
+        let max_scroll = if over > 2.0 { over } else { 0.0 };
+        // Short with the picture already as small as the divider lets it be
+        // (it gives the lanes their room first): next frame asks for this much more.
+        if over > 0.5 {
+            self.lanes_short = (self.lanes_short + over).min(200.0);
+        } else if over < -0.5 {
+            self.lanes_short = (self.lanes_short + over).max(0.0);
+        }
         // The mix's meter stands at the right, as tall as the timeline.
         let meter_col = Rect::from_min_max(Pos2::new(outer.right() - MIX_W, outer.top()), Pos2::new(outer.right(), body_bottom));
-        let lanes_x = outer.left() + HEADER_W..=meter_col.left() - 12.0;
+        // Room between for the end handle and the lanes' scrollbar.
+        let lanes_x = outer.left() + HEADER_W..=meter_col.left() - 24.0;
         let lanes = Rect::from_x_y_ranges(lanes_x.clone(), outer.top()..=body_bottom);
         let p = ui.painter_at(outer);
 
@@ -1242,11 +1263,11 @@ impl Ready {
                 };
                 w.paint(&alp, lane.shrink2(Vec2::new(0.0, 2.0)), (v0, span), style, |t| track.gain_at(t), |_, _| base);
             }
-            draw_envelope(&alp, pal, lane, track, dur, x_of);
         }
         // Scrollbar, at the lanes' right edge, when they don't all fit.
         if max_scroll > 0.0 {
-            let track = Rect::from_x_y_ranges(lanes.right() + 4.0..=lanes.right() + 8.0, audio_view.y_range());
+            // Clear of the end handle, which stands out past the lanes.
+            let track = Rect::from_x_y_ranges(lanes.right() + 14.0..=lanes.right() + 18.0, audio_view.y_range());
             let view_h = audio_view.height();
             let thumb_h = (view_h / lanes_h * view_h).max(24.0);
             let thumb_y = track.top() + self.lane_scroll / max_scroll * (view_h - thumb_h);
@@ -1284,6 +1305,13 @@ impl Ready {
             let corners = if left { egui::CornerRadius { nw: 4, sw: 4, ne: 0, se: 0 } } else { egui::CornerRadius { nw: 0, sw: 0, ne: 4, se: 4 } };
             p.rect_filled(h, corners, crate::theme::mix(edge, pal.text, grow));
             p.vline(h.center().x, h.center().y - 8.0..=h.center().y + 8.0, Stroke::new(2.0, crate::theme::fade(pal.base, 0.7)));
+        }
+        // The volume lines over the handles: their points stay where you can
+        // see and grab them.
+        for (i, lane) in lane_rects.iter().enumerate() {
+            if lane.intersects(audio_view) {
+                draw_envelope(&alp, pal, *lane, &self.edit.tracks[i], dur, x_of);
+            }
         }
         // The kept part's length, as a dimension line under the lanes; drag it
         // to slide the kept part along the clip, its length kept.
@@ -1436,6 +1464,15 @@ impl Ready {
 
         // What's under the pointer, in priority order.
         let hit = |pos: Pos2, this: &Self| -> Option<Drag> {
+            // A volume point over a handle is the point's.
+            for (i, lane) in lane_rects.iter().enumerate() {
+                if lane.contains(pos) && audio_view.contains(pos) {
+                    let track = &this.edit.tracks[i];
+                    if let Some(k) = track.points.iter().position(|pt| Pos2::new(x_of(pt.t), y_of_db(*lane, pt.db)).distance(pos) < 7.0) {
+                        return Some(Drag::Point(i, k));
+                    }
+                }
+            }
             if in_handle.expand(5.0).contains(pos) {
                 return Some(Drag::In);
             }
@@ -1471,7 +1508,6 @@ impl Ready {
             }
             // Hover: a line through the lanes, and the volume on a lane.
             if self.dragging.is_none() && lanes.contains(pos) && pos.y > ruler.bottom() {
-                lp.vline(pos.x, video.top()..=body.bottom(), Stroke::new(1.0, crate::theme::fade(pal.text3, 0.6)));
                 if let Some(i) = lane_rects.iter().position(|l| l.contains(pos) && audio_view.contains(pos)) {
                     let t = self.info.snap(t_of(pos.x));
                     let text = db_label(self.edit.tracks[i].db_at(t));

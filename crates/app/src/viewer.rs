@@ -771,7 +771,6 @@ impl Ready {
         // Hover: a line, and that moment's picture and time.
         if let Some(pos) = resp.hover_pos().filter(|_| self.dragging.is_none() && pos_in(video.union(audio), resp.hover_pos())) {
             let t = self.info.snap(t_of(pos.x));
-            painter.vline(pos.x, video.top()..=audio.bottom(), Stroke::new(1.0, crate::theme::fade(p.text3, 0.8)));
             self.hover_preview(ui, t, pos.x, video, preview);
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         } else {
