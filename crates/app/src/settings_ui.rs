@@ -43,18 +43,11 @@ impl App {
             ui.memory_mut(|m| m.request_focus(egui::Id::new("settings_search")));
         }
         let width = (ui.available_width() - 180.0).clamp(320.0, COLUMN);
-        // Its right edge where the Clips panel's card ends, as on Clips.
-        let panel_end = ui.max_rect().left() - ui_kit::PAGE_MARGIN as f32 + crate::library_view::PANEL_W;
-        self.page_head(
-            ui,
-            "Settings",
-            |app, ui| {
-                let w = (panel_end - ui.cursor().left()).max(120.0);
-                ui.allocate_ui(egui::vec2(w, ui_kit::CONTROL_H), |ui| {
-                    crate::library_view::search_field(ui, "settings_search", &mut app.settings_query, "Search");
-                });
-            },
-        );
+        self.page_head(ui, "Settings", |app, ui| {
+            ui.allocate_ui(egui::vec2(ui_kit::SEARCH_W, ui_kit::CONTROL_H), |ui| {
+                crate::library_view::search_field(ui, "settings_search", &mut app.settings_query, "Search");
+            });
+        });
         ui_kit::arrive(ui, |ui| self.settings_content(ui, width));
         self.reset_dialog(ui.ctx());
     }
@@ -69,6 +62,12 @@ impl App {
         let mut any = false;
         let scroll = ui_kit::scroll(ui, "settings_page", |ui| {
             let origin = ui.cursor().top();
+            // Centred on the page, clear of the section list on the right.
+            let room = ui.available_width();
+            let list = if room >= width + 180.0 { 160.0 } else { 0.0 };
+            let left = ((room - width) / 2.0).min(room - width - list).max(0.0);
+            ui.horizontal_top(|ui| {
+            ui.add_space(left);
             ui.vertical(|ui| {
                 ui.set_width(width);
                 for name in SECTIONS {
@@ -89,6 +88,7 @@ impl App {
                     });
                 }
                 ui.add_space(28.0);
+            });
             });
             ui.cursor().top() - origin
         });

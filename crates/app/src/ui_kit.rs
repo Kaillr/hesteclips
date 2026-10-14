@@ -26,7 +26,9 @@ pub const RADIUS: u8 = 6;
 /// Groups, menus, popovers.
 pub const CARD_RADIUS: u8 = 8;
 /// Space between a page's edge and its content.
-pub const PAGE_MARGIN: i8 = 28;
+pub const PAGE_MARGIN: i8 = 24;
+/// The search field's width, the same on every page that has one.
+pub const SEARCH_W: f32 = 160.0;
 
 /// Set the look for both themes. Called once at start-up.
 pub fn apply(ctx: &egui::Context) {

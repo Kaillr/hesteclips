@@ -325,14 +325,18 @@ impl App {
         let rect = ui.max_rect();
         ui.painter().rect_filled(rect, 0, p.base);
         let mut action = None;
-        let inner = Rect::from_min_max(rect.min + vec2(16.0, 0.0), rect.max - vec2(0.0, 16.0));
+        // The card's rows line up with the page title (the page margin from
+        // the rail), their own padding inside it.
+        let inner = Rect::from_min_max(rect.min + vec2(ui_kit::PAGE_MARGIN as f32 - 10.0, 0.0), rect.max - vec2(0.0, 16.0));
         // Title and search on the heading's row.
         let head = Rect::from_min_size(inner.min, vec2(inner.width(), crate::shell::HEAD_H));
         crate::shell::drag_window_area(ui, Rect::from_min_size(head.min, vec2(70.0, head.height())), "panel_head");
-        let mut hui = ui.new_child(egui::UiBuilder::new().max_rect(head.shrink2(vec2(8.0, 0.0)).with_max_x(head.right())).layout(egui::Layout::left_to_right(egui::Align::Center)));
+        // The title where every page's is: the page margin from the rail.
+        let title_x = rect.left() + ui_kit::PAGE_MARGIN as f32;
+        let mut hui = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_max(Pos2::new(title_x, head.top()), head.max)).layout(egui::Layout::left_to_right(egui::Align::Center)));
         hui.label(theme::text("Clips", 20.0, W::Semibold).color(p.text));
         hui.add_space(6.0);
-        search_field(&mut hui, "library_search", &mut self.library_query, "Search");
+        hui.allocate_ui(vec2(ui_kit::SEARCH_W, ui_kit::CONTROL_H), |ui| search_field(ui, "library_search", &mut self.library_query, "Search"));
         // The card.
         let card = Rect::from_min_max(Pos2::new(inner.left(), head.bottom()), inner.max);
         crate::glass::paint(ui, card, self);
