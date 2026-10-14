@@ -512,7 +512,9 @@ pub fn drag_window_area(ui: &egui::Ui, rect: Rect, id: &str) {
     // Only its own empty space: on a button or field in it, the button gets
     // the click and the drag (egui hands a drag to whatever senses drags, so
     // this asks which widget the pointer is on).
-    let mine = ui.ctx().interaction_snapshot(|s| s.contains_pointer.iter().all(|w| *w == resp.id || !is_interactive(ui.ctx(), *w)));
+    // (The ids first, then each looked up: egui's locks don't nest.)
+    let under: Vec<egui::Id> = ui.ctx().interaction_snapshot(|s| s.contains_pointer.iter().copied().collect());
+    let mine = under.into_iter().all(|w| w == resp.id || !is_interactive(ui.ctx(), w));
     if !mine {
         return;
     }
@@ -536,5 +538,30 @@ pub fn clock(secs: u32) -> String {
         format!("{}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60)
     } else {
         format!("{}:{:02}", secs / 60, secs % 60)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The window's drag area with a button on it, the pointer over both:
+    /// no lock taken inside another (it froze the app).
+    #[test]
+    fn drag_area_over_a_button() {
+        if !under_titlebar() {
+            return;
+        }
+        let ctx = egui::Context::default();
+        let at = egui::pos2(40.0, 20.0);
+        for events in [vec![egui::Event::PointerMoved(at)], vec![], vec![]] {
+            let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(400.0, 300.0))), events, ..Default::default() };
+            let mut out = ctx.run_ui(raw, |ui| {
+                let rect = Rect::from_min_size(Pos2::ZERO, vec2(400.0, 52.0));
+                drag_window_area(ui, rect, "test");
+                ui.put(Rect::from_min_size(egui::pos2(20.0, 10.0), vec2(60.0, 30.0)), egui::Button::new("Button"));
+            });
+            out.textures_delta.clear();
+        }
     }
 }
