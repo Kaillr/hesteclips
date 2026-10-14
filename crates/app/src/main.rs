@@ -420,10 +420,13 @@ struct App {
     live_audio: std::sync::Arc<capture::mixer::LiveAudio>,
     /// Meters-only capture while the Sources page is open and nothing records,
     /// with the sources it was started for.
-    level_monitor: Option<(Vec<capture::sources::AudioSource>, capture::sources::LevelMonitor)>,
+    level_monitor: Option<(Vec<capture::sources::AudioSource>, sources_ui::Background)>,
+    /// When the pointer was last on Sources' place in the rail: its captures
+    /// start then (see `wants_sources_capture`).
+    pub(crate) sources_warm: Option<Instant>,
     /// Preview-only capture while the Sources page is open and nothing records,
     /// with the source, height and frame rate it was started for.
-    pub(crate) video_preview: Option<((capture::VideoSource, Option<u32>, u32, Option<capture::webcam::Webcam>), capture::preview::VideoPreview)>,
+    pub(crate) video_preview: Option<(sources_ui::PreviewSetup, capture::preview::VideoPreview)>,
     sources_view: sources_ui::SourcesView,
     /// A microphone heard live ("Listen" on the Sources page).
     pub(crate) listening: Option<sources_ui::Listening>,
@@ -619,6 +622,7 @@ impl App {
             audio: capture::audio::list_audio_devices(),
             live_audio,
             level_monitor: None,
+            sources_warm: None,
             video_preview: None,
             sources_view: Default::default(),
             listening: None,
@@ -1024,7 +1028,7 @@ impl eframe::App for App {
         let now = Instant::now();
         if self.last_poll.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(1)) {
             self.last_poll = Some(now);
-            self.permission = capture::screen_permission();
+            self.permission = permission_now();
             laps.lap("permission");
             let stamp = clips::stamp(&self.settings.output_dir);
             if stamp != self.library_stamp {
@@ -1069,6 +1073,16 @@ impl eframe::App for App {
         {
             eprintln!("dev: quitting");
             self.quit(ctx);
+        }
+        // `HESTECLIPS_DEV_PAGES=<secs>`: go round Clips, Sources and Settings,
+        // one every so many seconds (with `HESTECLIPS_DEV_LAPS` to time it).
+        if let Some(every) = std::env::var("HESTECLIPS_DEV_PAGES").ok().and_then(|s| s.parse::<f64>().ok()) {
+            static STEP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let step = (launched.elapsed().as_secs_f64() / every) as u64;
+            if STEP.swap(step, std::sync::atomic::Ordering::Relaxed) != step && step > 0 {
+                self.page = [Page::Sources, Page::Settings, Page::Clips][(step as usize - 1) % 3];
+                eprintln!("dev: to {:?}", self.page);
+            }
         }
         // `HESTECLIPS_DEV_SWITCH=<secs>` (with the above): switch between the
         // whole screen and games and apps every so many seconds while
@@ -2022,12 +2036,33 @@ impl Laps {
 
     fn report(self) {
         let total = self.start.elapsed();
-        if total < Self::SLOW {
+        // `HESTECLIPS_DEV_LAPS=<ms>`: log every update at least that slow.
+        let slow = std::env::var("HESTECLIPS_DEV_LAPS").ok().and_then(|s| s.parse::<u64>().ok()).map_or(Self::SLOW, Duration::from_millis);
+        if total < slow {
             return;
         }
         let parts: Vec<String> = self.laps.iter().filter(|(_, d)| *d >= Duration::from_millis(5)).map(|(w, d)| format!("{w} {} ms", d.as_millis())).collect();
         eprintln!("{} slow UI update: {} ms ({})", chrono::Local::now().format("%H:%M:%S"), total.as_millis(), parts.join(", "));
     }
+}
+
+/// Whether the app may record the screen, as last checked. Asking macOS
+/// takes about 15 ms, so it's asked on a thread of its own, once a second,
+/// not in the middle of drawing a frame.
+fn permission_now() -> capture::Permission {
+    static NOW: std::sync::Mutex<Option<capture::Permission>> = std::sync::Mutex::new(None);
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        std::thread::Builder::new()
+            .name("screen permission".into())
+            .spawn(|| loop {
+                let p = capture::screen_permission();
+                *NOW.lock().unwrap() = Some(p);
+                std::thread::sleep(Duration::from_secs(1));
+            })
+            .expect("spawn permission thread");
+    });
+    NOW.lock().unwrap().unwrap_or_else(capture::screen_permission)
 }
 
 /// Just the file name of a path, for status messages.

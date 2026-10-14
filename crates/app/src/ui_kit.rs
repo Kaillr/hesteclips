@@ -208,10 +208,12 @@ pub fn arrive<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
 
 /// [`arrive`] on a page whose background is `bg`.
 pub fn arrive_on<R>(ui: &mut egui::Ui, bg: Color32, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    const RISE: f32 = 10.0;
+    // Quick and small: a page that's drawn at once shouldn't look like it's
+    // still coming (a slower one read as a slow page).
+    const RISE: f32 = 6.0;
     let ctx = ui.ctx().clone();
     let Some(at) = ctx.data(|d| d.get_temp::<f64>(page_arrived_id())) else { return add(ui) };
-    let t = theme::since(&ctx, at, theme::SLOW);
+    let t = theme::since(&ctx, at, theme::FAST + 0.03);
     if t >= 1.0 {
         return add(ui);
     }

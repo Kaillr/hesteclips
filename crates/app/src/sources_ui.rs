@@ -58,7 +58,14 @@ pub(crate) struct SourcesView {
     /// When the open apps were last checked, for the games-and-apps statuses.
     apps_checked: Option<Instant>,
     renaming: Option<String>,
+    /// The last preview frame and what it was of (picture, size, rate,
+    /// webcam): shown again at once when the page opens on the same, while
+    /// the preview's capture starts (that takes a moment).
+    last_preview: Option<(PreviewSetup, std::sync::Arc<capture::preview::PreviewFrame>)>,
 }
+
+/// What a preview shows: the picture, its height, the frame rate and the webcam.
+pub(crate) type PreviewSetup = (capture::VideoSource, Option<u32>, u32, Option<capture::webcam::Webcam>);
 
 
 impl App {
@@ -315,7 +322,18 @@ impl App {
     /// following focus), with a live preview of exactly what gets recorded.
     fn video_card(&mut self, ui: &mut egui::Ui) {
         capture::preview::request();
-        let frame = capture::preview::latest();
+        // The capture's newest frame; while it's starting, the last one of the
+        // same picture (the page looks as it did straight away).
+        let setup = self.video_preview.as_ref().map(|(w, _)| w.clone());
+        let frame = match capture::preview::latest() {
+            Some(f) => {
+                if let Some(setup) = setup {
+                    self.sources_view.last_preview = Some((setup, f.clone()));
+                }
+                Some(f)
+            }
+            None => self.sources_view.last_preview.as_ref().filter(|(was, _)| Some(was) == setup.as_ref()).map(|(_, f)| f.clone()),
+        };
         self.update_preview_texture(ui.ctx(), frame.as_deref());
         // Which listed apps are open, for their status; cheap, so every 2 s.
         let apps_mode = matches!(self.settings.capture, CaptureTarget::Apps { .. });
@@ -673,7 +691,7 @@ impl App {
     /// open and nothing records (a running capture feeds the preview itself).
     /// Restarts when what to record changes.
     pub(crate) fn ensure_video_preview(&mut self) {
-        let want = capture::preview::AVAILABLE && self.page == crate::Page::Sources && self.rec_state == crate::RecState::Idle;
+        let want = capture::preview::AVAILABLE && self.wants_sources_capture() && self.rec_state == crate::RecState::Idle;
         if !want {
             self.video_preview = None;
             return;
@@ -697,7 +715,7 @@ impl App {
     }
 
     pub(crate) fn ensure_level_monitor(&mut self) {
-        let want = self.page == crate::Page::Sources && self.rec_state == crate::RecState::Idle;
+        let want = self.wants_sources_capture() && self.rec_state == crate::RecState::Idle;
         if !want {
             self.level_monitor = None;
             return;
@@ -706,10 +724,64 @@ impl App {
         let current = self.level_monitor.as_ref().map(|(s, _)| s);
         if current != Some(&sources) {
             self.level_monitor = None; // stop the old one before opening devices again
-            match capture::sources::LevelMonitor::start(&sources, self.live_audio.clone()) {
-                Ok(m) => self.level_monitor = Some((sources, m)),
-                Err(e) => self.toast_error(format!("Couldn't open audio: {e}")),
+            self.level_monitor = Some((sources.clone(), Background::start(sources, self.live_audio.clone())));
+        }
+        if let Some(e) = self.level_monitor.as_ref().and_then(|(_, m)| m.take_error()) {
+            self.toast_error(format!("Couldn't open audio: {e}"));
+        }
+    }
+
+    /// The Sources page is open, or about to be (the pointer is on its place
+    /// in the rail): its preview and meters start then, so they're running
+    /// by the time it shows.
+    pub(crate) fn wants_sources_capture(&self) -> bool {
+        self.page == crate::Page::Sources || self.sources_warm.is_some_and(|t| t.elapsed() < Duration::from_secs(2))
+    }
+}
+
+/// The meters' capture, opened and closed on a thread of its own: opening
+/// every audio device took a third of a second, and the page froze for it
+/// each time it opened.
+pub(crate) struct Background {
+    /// The monitor once open; `None` in it after it's let go of, so one that
+    /// opens only then is closed again.
+    monitor: std::sync::Arc<std::sync::Mutex<Option<Option<capture::sources::LevelMonitor>>>>,
+    error: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+}
+
+impl Background {
+    fn start(sources: Vec<capture::sources::AudioSource>, live: std::sync::Arc<capture::mixer::LiveAudio>) -> Self {
+        let monitor = std::sync::Arc::new(std::sync::Mutex::new(Some(None)));
+        let error = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let (m, e) = (monitor.clone(), error.clone());
+        std::thread::spawn(move || match capture::sources::LevelMonitor::start(&sources, live) {
+            Ok(started) => {
+                let mut slot = m.lock().unwrap();
+                match slot.as_mut() {
+                    Some(open) => *open = Some(started),
+                    // Let go of meanwhile: closed here, on this thread.
+                    None => {
+                        drop(slot);
+                        drop(started);
+                    }
+                }
             }
+            Err(err) => *e.lock().unwrap() = Some(format!("{err:#}")),
+        });
+        Self { monitor, error }
+    }
+
+    fn take_error(&self) -> Option<String> {
+        self.error.lock().unwrap().take()
+    }
+}
+
+impl Drop for Background {
+    /// Closed on a thread too (stopping waits for the devices).
+    fn drop(&mut self) {
+        let open = self.monitor.lock().unwrap().take().flatten();
+        if let Some(open) = open {
+            std::thread::spawn(move || drop(open));
         }
     }
 }

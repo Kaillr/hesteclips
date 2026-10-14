@@ -146,6 +146,11 @@ impl App {
         for (page, glyph, label, tip) in places {
             let r = Rect::from_min_size(Pos2::new(rect.center().x - 32.0, y), vec2(64.0, 58.0));
             let resp = ui.interact(r, egui::Id::new(("rail", label)), Sense::click());
+            // About to open Sources: its preview and meters start now, so
+            // they're running by the time it shows.
+            if page == Page::Sources && resp.hovered() {
+                self.sources_warm = Some(Instant::now());
+            }
             let chosen = on == page;
             let hv = theme::toggle(ui.ctx(), resp.id.with("hv"), resp.hovered(), theme::FAST);
             let sel = theme::toggle(ui.ctx(), resp.id.with("on"), chosen, theme::NORMAL);
