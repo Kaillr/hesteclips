@@ -413,7 +413,8 @@ impl App {
         });
     }
 
-    /// A toast: what just happened, at the bottom of the window, rising in.
+    /// A toast: what just happened, at the bottom of the window, rising in
+    /// and coming into focus.
     pub(crate) fn toasts(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
         let Some(t) = self.toast.clone() else { return };
         let age = t.at.elapsed();
@@ -430,8 +431,13 @@ impl App {
         }
         let p = theme::ctx_pal(ctx);
         let rise = theme::ease_out((age.as_secs_f32() / theme::SLOW).min(1.0));
+        // Its opacity comes with the focus; it leaves with a plain fade.
+        let focus = (age.as_secs_f32() / ui_kit::FOCUS_SECS).min(1.0);
         let fade_out = 1.0 - ((age.as_secs_f32() - t.for_.as_secs_f32()) / 0.25).clamp(0.0, 1.0);
-        let opacity = rise * fade_out;
+        // Every frame while it moves (the page otherwise repaints only now and then).
+        if rise < 1.0 || fade_out < 1.0 {
+            ctx.request_repaint();
+        }
         let bottom = self.toast_bottom;
         let mut act = None;
         let mut close = false;
@@ -440,8 +446,8 @@ impl App {
             .anchor(Align2::CENTER_BOTTOM, vec2(self.toast_x_offset, -bottom + 14.0 * (1.0 - rise)))
             .fade_in(false)
             .interactable(t.action.is_some())
-            .show(ctx, |ui| {
-                ui.multiply_opacity(opacity);
+            .show(ctx, |ui| ui_kit::focus_in(ui, focus, 1.0, |ui| {
+                ui.multiply_opacity(fade_out);
                 egui::Frame::new()
                     .fill(p.pop)
                     .stroke(Stroke::new(1.0, if p.dark { Color32::from_white_alpha(18) } else { Color32::from_black_alpha(20) }))
@@ -465,7 +471,7 @@ impl App {
                             }
                         });
                     });
-            });
+            }));
         ctx.data_mut(|d| d.insert_temp(egui::Id::new("toast_hovered"), area.response.contains_pointer()));
         if close {
             self.toast = None;
