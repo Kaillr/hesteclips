@@ -162,7 +162,7 @@ impl App {
             meters.input.update(channel.input.take(), now, dt);
             meters.output.update(channel.meter.take(), now, dt);
             let listening = self.listening.as_ref().filter(|l| l.source == id_for_listen).map(|l| l.monitor.latency_ms());
-            let action = source_card(ui, &mut self.settings.audio_sources[i], &channel, meters, &self.audio, has_app_sources, &mut self.sources_view.renaming, listening, locked, i == 0);
+            let action = source_card(ui, &mut self.settings.audio_sources[i], &channel, meters, &self.audio, has_app_sources, &mut self.sources_view.renaming, listening, locked, i == 0, &mut self.app_icons);
             match action {
                 CardAction::Remove => remove = Some(i),
                 CardAction::MoveUp if i > 0 => move_up = Some(i),
@@ -280,7 +280,8 @@ impl App {
                     egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
                         for app in self.sources_view.apps.clone() {
                             let added = taken.contains(&app.id);
-                            let item = Item::new(app.name.clone()).enabled(!added);
+                            let tex = self.app_icons.get(ui.ctx(), &app.id).map(|t| t.id());
+                            let item = Item::new(app.name.clone()).image(tex).enabled(!added);
                             let item = if added { item.tip("Already added") } else { item };
                             if item.show(ui).clicked() {
                                 self.settings.audio_sources.push(AudioSourceCfg::new(&app.name, SourceKind::App { bundle_id: app.id.clone(), app_name: app.name.clone() }));
@@ -551,6 +552,8 @@ impl App {
                         Some(t) => {
                             egui::Image::from_texture((t.id(), lead.size())).corner_radius(4).paint_at(ui, lead);
                         }
+                        // Else the app's own icon, else a symbol.
+                        None if crate::app_icons::paint(ui, &mut self.app_icons, &app.id, lead.expand(1.0)) => {}
                         None => {
                             ui.painter().text(lead.center(), egui::Align2::CENTER_CENTER, icon::APP_WINDOW, egui::FontId::proportional(16.0), pal.text3);
                         }
@@ -861,6 +864,7 @@ fn source_card(
     // While capturing: why what's recorded can't change (it's set at the start).
     locked: Option<&str>,
     first: bool,
+    app_icons: &mut crate::app_icons::AppIcons,
 ) -> CardAction {
     use crate::theme::{self, W};
     use crate::ui_kit::{Btn, Item, Kind};
@@ -876,14 +880,21 @@ fn source_card(
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
             let (r, _) = ui.allocate_exact_size(egui::vec2(30.0, 30.0), Sense::hover());
-            ui.painter().rect_filled(r, 6, pal.control);
-            let glyph = match &source.kind {
-                SourceKind::Microphone { .. } => icon::MICROPHONE,
-                SourceKind::Desktop { .. } => icon::SPEAKER_HIFI,
-                SourceKind::App { app_name, .. } if app_name.to_lowercase().contains("discord") => icon::DISCORD_LOGO,
-                SourceKind::App { .. } => icon::APP_WINDOW,
+            // An app's own icon, where there is one, in place of a symbol.
+            let own = match &source.kind {
+                SourceKind::App { bundle_id, .. } => crate::app_icons::paint(ui, app_icons, bundle_id, r.shrink(1.0)),
+                _ => false,
             };
-            ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, glyph, egui::FontId::proportional(16.0), pal.text2);
+            if !own {
+                ui.painter().rect_filled(r, 6, pal.control);
+                let glyph = match &source.kind {
+                    SourceKind::Microphone { .. } => icon::MICROPHONE,
+                    SourceKind::Desktop { .. } => icon::SPEAKER_HIFI,
+                    SourceKind::App { app_name, .. } if app_name.to_lowercase().contains("discord") => icon::DISCORD_LOGO,
+                    SourceKind::App { .. } => icon::APP_WINDOW,
+                };
+                ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, glyph, egui::FontId::proportional(16.0), pal.text2);
+            }
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 1.0;
                 if renaming.as_deref() == Some(source.id.as_str()) {

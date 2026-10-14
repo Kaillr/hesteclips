@@ -144,3 +144,37 @@ pub(crate) fn bundle_file_name(id: &str) -> Option<String> {
     let app = apps.iter().find(|a| id_of(a).is_some_and(|i| i.eq_ignore_ascii_case(id)))?;
     app.bundleURL().or_else(|| app.executableURL()).and_then(|u| u.lastPathComponent()).map(|n| n.to_string())
 }
+
+/// The icon of the app with bundle id `id` (installed, running or not), as
+/// `size`×`size` RGBA (straight alpha, rows top to bottom). `None` for an id
+/// without an app bundle (a program run from a folder).
+pub fn app_icon(id: &str, size: u32) -> Option<Vec<u8>> {
+    use objc2_core_foundation::{CGPoint, CGSize};
+    use objc2_core_graphics::{CGBitmapContextCreate, CGColorSpace, CGContext, CGImageAlphaInfo};
+    use objc2_foundation::{NSRect, NSString};
+    let ws = NSWorkspace::sharedWorkspace();
+    let url = ws.URLForApplicationWithBundleIdentifier(&NSString::from_str(id))?;
+    let path = url.path()?;
+    let image = ws.iconForFile(&path);
+    let mut rect = NSRect::new(objc2_foundation::NSPoint::new(0.0, 0.0), objc2_foundation::NSSize::new(size as f64, size as f64));
+    // SAFETY: a proposed rect we own; no context or hints.
+    let cg = unsafe { image.CGImageForProposedRect_context_hints(&mut rect, None, None) }?;
+    let (w, h) = (size as usize, size as usize);
+    let mut px = vec![0u8; w * h * 4];
+    let space = CGColorSpace::new_device_rgb()?;
+    // SAFETY: `px` holds w*h*4 bytes and outlives the context, which is
+    // dropped at the end of this function.
+    let ctx = unsafe { CGBitmapContextCreate(px.as_mut_ptr().cast(), w, h, 8, w * 4, Some(&space), CGImageAlphaInfo::PremultipliedLast.0) }?;
+    CGContext::draw_image(Some(&ctx), objc2_core_foundation::CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(w as f64, h as f64)), Some(&cg));
+    drop(ctx);
+    // Premultiplied to straight alpha.
+    for p in px.chunks_exact_mut(4) {
+        let a = p[3] as u32;
+        if a > 0 && a < 255 {
+            for c in &mut p[..3] {
+                *c = ((*c as u32 * 255 + a / 2) / a).min(255) as u8;
+            }
+        }
+    }
+    Some(px)
+}

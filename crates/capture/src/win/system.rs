@@ -649,3 +649,77 @@ pub(crate) fn from_wide(buf: &[u16]) -> String {
     let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
     String::from_utf16_lossy(&buf[..len])
 }
+
+/// The icon of the running app whose executable is `exe` (`Discord.exe`), as
+/// `size`×`size` RGBA (straight alpha, rows top to bottom). `None` when it
+/// isn't running (only a running one says where its executable is) or has
+/// no icon.
+pub fn app_icon(exe: &str, size: u32) -> Option<Vec<u8>> {
+    use windows::Win32::Graphics::Gdi::{
+        BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, HGDIOBJ, SelectObject,
+    };
+    use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
+    use windows::Win32::UI::Shell::{SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHGetFileInfoW};
+    use windows::Win32::UI::WindowsAndMessaging::{DI_NORMAL, DestroyIcon, DrawIconEx};
+    let path = processes().into_iter().find(|p| p.exe.eq_ignore_ascii_case(exe)).and_then(|p| image_path(p.pid))?;
+    let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut info = SHFILEINFOW::default();
+    // SAFETY: a NUL-terminated path, and `info` sized for SHFILEINFOW.
+    let got = unsafe {
+        SHGetFileInfoW(windows::core::PCWSTR(wide.as_ptr()), FILE_FLAGS_AND_ATTRIBUTES(0), Some(&mut info), std::mem::size_of::<SHFILEINFOW>() as u32, SHGFI_ICON | SHGFI_LARGEICON)
+    };
+    if got == 0 || info.hIcon.is_invalid() {
+        return None;
+    }
+    let (w, h) = (size as i32, size as i32);
+    // Drawn into a 32-bit top-down bitmap we can read.
+    let header = BITMAPINFOHEADER {
+        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+        biWidth: w,
+        biHeight: -h,
+        biPlanes: 1,
+        biBitCount: 32,
+        biCompression: BI_RGB.0,
+        ..Default::default()
+    };
+    let bmi = BITMAPINFO { bmiHeader: header, ..Default::default() };
+    let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+    // SAFETY: GDI objects made here, and released before returning.
+    unsafe {
+        let dc = CreateCompatibleDC(None);
+        let dib = match CreateDIBSection(Some(dc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0) {
+            Ok(b) => b,
+            Err(_) => {
+                let _ = DeleteDC(dc);
+                let _ = DestroyIcon(info.hIcon);
+                return None;
+            }
+        };
+        let old = SelectObject(dc, HGDIOBJ(dib.0));
+        let drawn = DrawIconEx(dc, 0, 0, info.hIcon, w, h, 0, None, DI_NORMAL).is_ok();
+        let n = (w * h * 4) as usize;
+        let mut px = if drawn && !bits.is_null() { std::slice::from_raw_parts(bits as *const u8, n).to_vec() } else { Vec::new() };
+        SelectObject(dc, old);
+        let _ = DeleteObject(HGDIOBJ(dib.0));
+        let _ = DeleteDC(dc);
+        let _ = DestroyIcon(info.hIcon);
+        if px.is_empty() {
+            return None;
+        }
+        // BGRA, premultiplied, to RGBA with straight alpha. An icon without
+        // an alpha channel (old style) draws with alpha 0: opaque then.
+        let any_alpha = px.chunks_exact(4).any(|p| p[3] != 0);
+        for p in px.chunks_exact_mut(4) {
+            p.swap(0, 2);
+            if !any_alpha {
+                p[3] = 255;
+            } else if p[3] > 0 && p[3] < 255 {
+                let a = p[3] as u32;
+                for c in &mut p[..3] {
+                    *c = ((*c as u32 * 255 + a / 2) / a).min(255) as u8;
+                }
+            }
+        }
+        Some(px)
+    }
+}

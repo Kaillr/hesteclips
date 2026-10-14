@@ -816,6 +816,8 @@ pub fn menu_style(style: &mut egui::Style) {
 /// a key, a value or a ›. Returns its response; a click closes the menu.
 pub struct Item<'a> {
     icon: Option<&'a str>,
+    /// A picture in the icon's place (an app's own icon).
+    image: Option<egui::TextureId>,
     check: Option<bool>,
     label: String,
     right: Option<String>,
@@ -827,10 +829,14 @@ pub struct Item<'a> {
 
 impl<'a> Item<'a> {
     pub fn new(label: impl Into<String>) -> Self {
-        Self { icon: None, check: None, label: label.into(), right: None, keys: None, danger: false, enabled: true, tip: None }
+        Self { icon: None, image: None, check: None, label: label.into(), right: None, keys: None, danger: false, enabled: true, tip: None }
     }
     pub fn icon(mut self, icon: &'a str) -> Self {
         self.icon = Some(icon);
+        self
+    }
+    pub fn image(mut self, tex: Option<egui::TextureId>) -> Self {
+        self.image = tex;
         self
     }
     pub fn check(mut self, on: bool) -> Self {
@@ -860,7 +866,7 @@ impl<'a> Item<'a> {
 
     fn natural_width(&self, ui: &egui::Ui) -> f32 {
         let g = ui.painter().layout_no_wrap(self.label.clone(), theme::font(13.5, W::Regular), Color32::PLACEHOLDER);
-        let lead = if self.icon.is_some() || self.check.is_some() { 24.0 } else { 0.0 };
+        let lead = if self.icon.is_some() || self.image.is_some() || self.check.is_some() { 24.0 } else { 0.0 };
         let right = self.right.as_ref().map_or(0.0, |r| ui.painter().layout_no_wrap(r.clone(), theme::font(12.5, W::Regular), Color32::PLACEHOLDER).size().x + 18.0)
             + self.keys.as_ref().map_or(0.0, |k| key_hint_width(ui, k, 11.0) + 18.0);
         9.0 + lead + g.size().x + right + 10.0
@@ -890,6 +896,10 @@ impl<'a> Item<'a> {
             if on {
                 painter.text(Pos2::new(x + 7.0, rect.center().y), Align2::CENTER_CENTER, icon::CHECK, FontId::proportional(13.0), p.text);
             }
+            x += 24.0;
+        } else if let Some(tex) = self.image {
+            let r = Rect::from_center_size(Pos2::new(x + 7.5, rect.center().y), vec2(17.0, 17.0));
+            egui::Image::from_texture((tex, r.size())).tint(if self.enabled { Color32::WHITE } else { Color32::from_white_alpha(100) }).paint_at(ui, r);
             x += 24.0;
         } else if let Some(i) = self.icon {
             painter.text(Pos2::new(x + 7.5, rect.center().y), Align2::CENTER_CENTER, i, FontId::proportional(15.0), icon_color);

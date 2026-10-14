@@ -7,6 +7,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // no console window on release Windows
 
+mod app_icons;
 mod autostart;
 mod away;
 mod clips;
@@ -425,6 +426,8 @@ struct App {
     /// When the pointer was last on Sources' place in the rail: its captures
     /// start then (see `wants_sources_capture`).
     pub(crate) sources_warm: Option<Instant>,
+    /// Apps' own icons, for app sources and the games and apps followed.
+    pub(crate) app_icons: app_icons::AppIcons,
     /// Preview-only capture while the Sources page is open and nothing records,
     /// with the source, height and frame rate it was started for.
     pub(crate) video_preview: Option<(sources_ui::PreviewSetup, capture::preview::VideoPreview)>,
@@ -628,6 +631,7 @@ impl App {
             live_audio,
             level_monitor: None,
             sources_warm: None,
+            app_icons: Default::default(),
             video_preview: None,
             sources_view: Default::default(),
             listening: None,

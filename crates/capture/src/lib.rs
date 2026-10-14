@@ -285,6 +285,27 @@ pub fn list_windowed_apps() -> Vec<Device> {
     }
 }
 
+/// The icon of an app source's app ([`sources::SourceKind::App`]'s id: a
+/// bundle id on macOS, an executable on Windows), as `size`×`size` RGBA with
+/// straight alpha. `None` where there isn't one to show: Linux, a program
+/// without an app bundle, or on Windows an app that isn't running. Slow-ish
+/// (it reads files): call it off the UI thread.
+pub fn app_icon(id: &str, size: u32) -> Option<Vec<u8>> {
+    #[cfg(target_os = "windows")]
+    {
+        win::system::app_icon(id, size)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        mac::windows::app_icon(id, size)
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        let _ = (id, size);
+        None
+    }
+}
+
 /// The app in focus, where the platform can tell: its executable on Windows
 /// (`osu!.exe`), its bundle id on macOS (else its executable).
 pub fn foreground_exe() -> Option<String> {
@@ -602,5 +623,19 @@ mod size_tests {
         // Portrait.
         assert_eq!(output_size(2160, 7680, None), (1152, 4096));
         assert_eq!(output_size(4096, 2304, None), (4096, 2304));
+    }
+}
+
+#[cfg(test)]
+mod app_icon_tests {
+    /// An app that's installed on every Mac has an icon; a made-up one doesn't.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn finder_has_an_icon() {
+        let px = super::app_icon("com.apple.finder", 32).expect("Finder's icon");
+        assert_eq!(px.len(), 32 * 32 * 4);
+        assert!(px.chunks_exact(4).any(|p| p[3] == 255), "some of it is opaque");
+        assert!(px.chunks_exact(4).filter(|p| p[3] > 0).count() > 200, "it covers most of the square");
+        assert!(super::app_icon("no.such.app.hesteclips", 32).is_none());
     }
 }
