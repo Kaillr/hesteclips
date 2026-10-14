@@ -497,6 +497,10 @@ fn audio_filter(display: &SCDisplay, apps: &[Retained<SCRunningApplication>], in
     }
 }
 
+/// One ScreenCaptureKit stream starts at a time (two at once could each
+/// wait for the other's start).
+pub(crate) static STARTING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Run an SCStream start/stop call and wait for its completion handler.
 fn await_completion(call: impl FnOnce(&block2::DynBlock<dyn Fn(*mut NSError)>)) -> Result<(), String> {
     let (tx, rx) = mpsc::channel::<Option<String>>();
@@ -512,6 +516,7 @@ fn await_completion(call: impl FnOnce(&block2::DynBlock<dyn Fn(*mut NSError)>)) 
 }
 
 fn start_capture(stream: &SCStream) -> Result<()> {
+    let _one = STARTING.lock();
     await_completion(|h| unsafe { stream.startCaptureWithCompletionHandler(Some(h)) })
         .map_err(|e| anyhow::anyhow!("couldn't start screen capture: {e}"))
 }

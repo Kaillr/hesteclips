@@ -297,7 +297,10 @@ impl Picture {
         let queue = DispatchQueue::new("hesteclips.sck.video", None);
         unsafe { stream.addStreamOutput_type_sampleHandlerQueue_error(ProtocolObject::from_ref(&*output), SCStreamOutputType::Screen, Some(&queue)) }
             .map_err(|e| anyhow::anyhow!("can't capture the screen: {}", e.localizedDescription()))?;
-        await_completion(|h| unsafe { stream.startCaptureWithCompletionHandler(Some(h)) }).map_err(|e| anyhow::anyhow!("couldn't start screen capture: {e}"))?;
+        {
+            let _one = crate::sck::STARTING.lock();
+            await_completion(|h| unsafe { stream.startCaptureWithCompletionHandler(Some(h)) }).map_err(|e| anyhow::anyhow!("couldn't start screen capture: {e}"))?;
+        }
         let display_id = match source {
             VideoSource::Screen { id, .. } => id.clone(),
             VideoSource::Apps { .. } => String::new(),

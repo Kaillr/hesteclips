@@ -696,6 +696,12 @@ impl App {
             self.video_preview = None;
             return;
         }
+        // The meters' capture first: started together, the first time in a
+        // session, the two waited on each other five seconds (the meters
+        // stood still all that time).
+        if self.video_preview.is_none() && self.level_monitor.as_ref().is_some_and(|(_, m)| !m.ready()) {
+            return;
+        }
         // What a recording would be: same picture, size and frame rate.
         let webcam = self.webcam_source();
         let wanted = (self.video_source(), self.settings.resolution.height(), self.settings.fps, webcam.clone());
@@ -747,6 +753,7 @@ pub(crate) struct Background {
     /// opens only then is closed again.
     monitor: std::sync::Arc<std::sync::Mutex<Option<Option<capture::sources::LevelMonitor>>>>,
     error: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    started: Instant,
 }
 
 impl Background {
@@ -768,7 +775,12 @@ impl Background {
             }
             Err(err) => *e.lock().unwrap() = Some(format!("{err:#}")),
         });
-        Self { monitor, error }
+        Self { monitor, error, started: Instant::now() }
+    }
+
+    /// Open (or failed, or taking very long): what waits for it may start.
+    fn ready(&self) -> bool {
+        self.started.elapsed() > Duration::from_secs(8) || self.error.lock().unwrap().is_some() || self.monitor.lock().unwrap().as_ref().is_some_and(|m| m.is_some())
     }
 
     fn take_error(&self) -> Option<String> {
