@@ -482,15 +482,15 @@ impl App {
             .anchor(Align2::CENTER_BOTTOM, vec2(self.toast_x_offset, -bottom + 14.0 * (1.0 - rise)))
             .fade_in(false)
             .interactable(t.action.is_some())
-            .show(ctx, |ui| ui_kit::focus_in(ui, focus, 1.0, |ui| {
+            .show(ctx, |ui| {
                 ui.multiply_opacity(fade_out);
-                egui::Frame::new()
+                let frame = egui::Frame::new()
                     .fill(p.pop)
                     .stroke(Stroke::new(1.0, if p.dark { Color32::from_white_alpha(18) } else { Color32::from_black_alpha(20) }))
                     .corner_radius(ui_kit::CARD_RADIUS)
                     .shadow(ui.visuals().popup_shadow)
-                    .inner_margin(egui::Margin { left: 12, right: if t.action.is_some() { 6 } else { 14 }, top: 6, bottom: 6 })
-                    .show(ui, |ui| {
+                    .inner_margin(egui::Margin { left: 12, right: if t.action.is_some() { 6 } else { 14 }, top: 6, bottom: 6 });
+                ui_kit::focus_in(ui, focus, frame, |ui| {
                         ui.horizontal(|ui| {
                             ui.set_min_height(28.0);
                             ui.spacing_mut().item_spacing.x = 10.0;
@@ -506,8 +506,8 @@ impl App {
                                 }
                             }
                         });
-                    });
-            }));
+                });
+            });
         ctx.data_mut(|d| d.insert_temp(egui::Id::new("toast_hovered"), area.response.contains_pointer()));
         if close {
             self.toast = None;

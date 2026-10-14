@@ -13,7 +13,6 @@
 //! - **Motion**: hover fades in, a chosen option slides to its place, a
 //!   button that changes its words changes its width smoothly.
 
-use egui::emath::TSTransform;
 use egui::{Align2, Color32, CornerRadius, FontId, Margin, Pos2, Rect, Response, Sense, Stroke, StrokeKind, TextStyle, Vec2, vec2};
 
 
@@ -1342,8 +1341,8 @@ pub fn well(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::Debug, open:
 pub const FOCUS_SECS: f32 = 0.18;
 /// How blurred it starts, in points.
 const FOCUS_BLUR: f32 = 5.0;
-/// The copies that make the blur: an inner and an outer ring, at these
-/// fractions of the blur.
+/// The copies that blur what's in the box: an inner and an outer ring, at
+/// these fractions of the blur.
 const FOCUS_RINGS: [(f32, usize); 2] = [(0.45, 6), (1.0, 8)];
 
 /// How far something that appeared at `born` (egui time) is into coming
@@ -1356,73 +1355,112 @@ pub fn focus_since(ctx: &egui::Context, born: f64) -> f32 {
     x
 }
 
-/// What `add` draws comes into focus as `x` goes from 0 to 1 (see
-/// [`focus_since`]): blurred and faint at first, then sharp, growing from
-/// `from` of its size. Dialogs and toasts arrive like this; menus and
-/// tooltips open at once (they're opened all the time).
+/// A box (`frame`, no outer margin) with `add` in it, coming into focus as
+/// `x` goes from 0 to 1 (see [`focus_since`]): blurred and faint at first,
+/// then sharp. Dialogs and toasts arrive like this; menus and tooltips open
+/// at once (they're opened all the time).
 ///
-/// egui can't blur, so it's drawn a few times: once in place and in two
-/// small rings of copies around it, all see-through, so together they're a
-/// soft version of it. The rings close in and fade as it sharpens, and at the
-/// end only the one in place is left, as it's normally drawn. (Large, the
-/// copies would read as a double image; this small, they read as blur.)
-pub fn focus_in<R>(ui: &mut egui::Ui, x: f32, from: f32, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    if x >= 1.0 {
-        return add(ui);
-    }
+/// egui can't blur, so the box is drawn once, its edge softened (egui's
+/// feathering) and fading in, so its colour is always its own. What's in it is
+/// drawn in two small rings of faint copies with itself on top, together
+/// as visible as a plain fade; the rings close in and fade out. Nothing
+/// changes size (scaled text is soft until it lands, then visibly snaps), and
+/// it's drawn the same way when it's sharp, so nothing changes at the end.
+pub fn focus_in<R>(ui: &mut egui::Ui, x: f32, frame: egui::Frame, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     let ctx = ui.ctx().clone();
-    let layer = ui.layer_id();
-    let start = ctx.graphics(|g| g.get(layer).map_or(0, |l| l.next_idx().0));
-    let r = add(ui);
+    let x = x.clamp(0.0, 1.0);
     // Seen as fast as a plain fade; the blur goes more gently, so it's seen.
     let shown = theme::ease_out(x);
     let blur = FOCUS_BLUR * (1.0 - x) * (1.0 - x);
-    // How much of what's seen is the blurred copies: all of it at first,
-    // none at the end. Each copy's opacity and the one in place's are such
-    // that the whole stack shows `shown`, as a plain fade would.
+    // The box goes under what's in it: its place first, filled in after.
+    let under = ui.painter().add(egui::Shape::Noop);
+    let layer = ui.layer_id();
+    let start = ctx.graphics(|g| g.get(layer).map_or(0, |l| l.next_idx().0));
+    // Laid out as the frame would be (its stroke is inside its margin).
+    let (m, sw) = (frame.inner_margin, frame.stroke.width.round() as i8);
+    let margin = Margin { left: m.left + sw, right: m.right + sw, top: m.top + sw, bottom: m.bottom + sw };
+    let mut content = ui.new_child(egui::UiBuilder::new().max_rect(ui.available_rect_before_wrap() - egui::epaint::MarginF32::from(margin)));
+    let r = add(&mut content);
+    let rect = content.min_rect() + egui::epaint::MarginF32::from(margin);
+    ui.allocate_rect(rect, Sense::hover());
+    let mut boxed = egui::epaint::RectShape::new(rect, frame.corner_radius, theme::fade(frame.fill, shown), Stroke::new(frame.stroke.width, theme::fade(frame.stroke.color, shown)), StrokeKind::Inside);
+    boxed.blur_width = blur;
+    let mut shapes = vec![egui::Shape::Rect(boxed)];
+    if frame.shadow != egui::Shadow::NONE {
+        let mut shadow = frame.shadow.as_shape(rect, frame.corner_radius);
+        shadow.fill = theme::fade(shadow.fill, shown);
+        shadow.blur_width += blur;
+        shapes.insert(0, egui::Shape::Rect(shadow));
+    }
+    ui.painter().set(under, egui::Shape::Vec(shapes));
+    if x >= 1.0 {
+        return r;
+    }
+    // How much of what's seen is the copies: all of it at first, none at the
+    // end. Each copy's opacity and the one on top's are such that together
+    // they show `shown`.
     let copies: usize = FOCUS_RINGS.iter().map(|(_, n)| n).sum();
     let soft = shown * (1.0 - x);
     let each = 1.0 - (1.0 - soft).powf(1.0 / copies as f32);
-    let centre = 1.0 - (1.0 - shown) / (1.0 - soft).max(1e-3);
-    let scale = from + (1.0 - from) * shown;
+    let top = 1.0 - (1.0 - shown) / (1.0 - soft).max(1e-3);
     ctx.graphics_mut(|g| {
         let list = g.entry(layer);
         let end = list.next_idx().0;
         if end <= start {
             return;
         }
-        let shapes: Vec<egui::epaint::ClippedShape> = list.all_entries().skip(start).cloned().collect();
-        let bounds = shapes.iter().fold(Rect::NOTHING, |b, cs| b.union(cs.shape.visual_bounding_rect()));
-        let pivot = if bounds.is_positive() { bounds.center().to_vec2() } else { Vec2::ZERO };
-        let grow = TSTransform::from_translation(pivot) * TSTransform::from_scaling(scale) * TSTransform::from_translation(-pivot);
-        let place = |cs: &mut egui::epaint::ClippedShape, offset: Vec2, opacity: f32| {
-            let tr = TSTransform::from_translation(offset) * grow;
-            cs.shape.transform(tr);
-            cs.clip_rect = tr.mul_rect(cs.clip_rect);
-            egui::epaint::shape_transform::adjust_colors(&mut cs.shape, move |c| {
-                if *c != Color32::PLACEHOLDER {
-                    *c = c.gamma_multiply(opacity);
-                }
-            });
-        };
+        // Taken out, then put back over the copies, so none of them covers it.
+        let content: Vec<egui::epaint::ClippedShape> = list.all_entries().skip(start).cloned().collect();
         for i in start..end {
-            list.mutate_shape(egui::layers::ShapeIdx(i), |cs| place(cs, Vec2::ZERO, centre));
+            list.mutate_shape(egui::layers::ShapeIdx(i), |cs| cs.shape = egui::Shape::Noop);
         }
         for (frac, n) in FOCUS_RINGS {
             for k in 0..n {
                 // The rings turned against each other, so no copies line up.
                 let a = std::f32::consts::TAU * (k as f32 + frac) / n as f32;
                 let offset = vec2(a.cos(), a.sin()) * blur * frac;
-                // (A picture the GPU draws is drawn once, in place.)
-                for cs in shapes.iter().filter(|cs| !matches!(cs.shape, egui::Shape::Callback(_))) {
-                    let mut cs = cs.clone();
-                    place(&mut cs, offset, each);
-                    list.add(cs.clip_rect, cs.shape);
+                // (A picture the GPU draws is drawn once.)
+                for cs in content.iter().filter(|cs| !matches!(cs.shape, egui::Shape::Callback(_))) {
+                    let mut shape = cs.shape.clone();
+                    shift(&mut shape, offset, each);
+                    list.add(cs.clip_rect.translate(offset), shape);
                 }
             }
         }
+        for cs in content {
+            let mut shape = cs.shape;
+            shift(&mut shape, Vec2::ZERO, top);
+            list.add(cs.clip_rect, shape);
+        }
     });
     r
+}
+
+/// A shape moved by `offset` at `opacity` of its own. Text is moved by its
+/// place and faded by its opacity (transforming it copies its whole layout,
+/// every frame, for every copy).
+fn shift(shape: &mut egui::Shape, offset: Vec2, opacity: f32) {
+    match shape {
+        egui::Shape::Text(t) => {
+            t.pos += offset;
+            t.opacity_factor *= opacity;
+        }
+        egui::Shape::Vec(shapes) => {
+            for s in shapes {
+                shift(s, offset, opacity);
+            }
+        }
+        s => {
+            if offset != Vec2::ZERO {
+                s.translate(offset);
+            }
+            egui::epaint::shape_transform::adjust_colors(s, move |c| {
+                if *c != Color32::PLACEHOLDER {
+                    *c = c.gamma_multiply(opacity);
+                }
+            });
+        }
+    }
 }
 
 /// A dialog: a scrim over the window, the box coming into focus.
@@ -1452,10 +1490,12 @@ pub fn dialog<R>(ctx: &egui::Context, id: &str, width: f32, add: impl FnOnce(&mu
     // The scrim comes in by itself; the box (drawn on it, in the same layer)
     // comes into focus.
     let modal = egui::Modal::new(id).backdrop_color(theme::fade(p.scrim, theme::ease_out(x))).frame(egui::Frame::NONE).area(egui::Modal::default_area(id).fade_in(false));
-    modal.show(ctx, |ui| focus_in(ui, x, 0.97, |ui| frame.show(ui, |ui| {
-        ui.set_width(width);
-        add(ui)
-    }).inner))
+    modal.show(ctx, |ui| {
+        focus_in(ui, x, frame, |ui| {
+            ui.set_width(width);
+            add(ui)
+        })
+    })
 }
 
 /// A dialog's title.
@@ -1799,33 +1839,43 @@ mod tests {
         assert_eq!(shown, 3);
     }
 
-    /// Coming into focus: half way, it's drawn in place and in rings of
-    /// copies around it, together as visible as a plain fade; at the end
-    /// only the one in place is left, as it's normally drawn.
+    /// Coming into focus: the box is drawn once, at the fade's opacity;
+    /// what's in it half way is copies with itself on top (so none covers
+    /// it), together as visible as the fade; sharp, it's drawn once, whole.
     #[test]
     fn a_dialog_comes_into_focus() {
         let ctx = egui::Context::default();
+        let frame = egui::Frame::new().fill(Color32::BLACK).inner_margin(10);
         let draw = |x: f32| {
             let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 300.0))), ..Default::default() };
             let mut shapes = Vec::new();
             let mut out = ctx.run_ui(raw, |ui| {
                 let layer = ui.layer_id();
                 let start = ui.ctx().graphics(|g| g.get(layer).map_or(0, |l| l.next_idx().0));
-                focus_in(ui, x, 0.97, |ui| ui.painter().rect_filled(egui::Rect::from_min_size(egui::pos2(100.0, 100.0), egui::vec2(100.0, 50.0)), 0, Color32::WHITE));
-                shapes = ui.ctx().graphics(|g| g.get(layer).map(|l| l.all_entries().skip(start).map(|cs| cs.shape.clone()).collect::<Vec<_>>()).unwrap_or_default());
+                focus_in(ui, x, frame, |ui| ui.painter().rect_filled(egui::Rect::from_min_size(egui::pos2(100.0, 100.0), egui::vec2(100.0, 50.0)), 0, Color32::WHITE));
+                shapes = ui.ctx().graphics(|g| g.get(layer).map(|l| l.all_entries().skip(start).map(|cs| cs.shape.clone()).filter(|s| !matches!(s, egui::Shape::Noop)).collect::<Vec<_>>()).unwrap_or_default());
             });
             out.textures_delta.clear();
             shapes
         };
-        let alpha = |s: &egui::Shape| if let egui::Shape::Rect(r) = s { r.fill.a() as f32 / 255.0 } else { panic!("a rect") };
+        let rect = |s: &egui::Shape| match s {
+            egui::Shape::Rect(r) => r.clone(),
+            egui::Shape::Vec(v) if v.len() == 1 => if let egui::Shape::Rect(r) = &v[0] { r.clone() } else { panic!("a rect") },
+            _ => panic!("a rect: {s:?}"),
+        };
         let half = draw(0.5);
         let copies: usize = FOCUS_RINGS.iter().map(|(_, n)| n).sum();
-        assert_eq!(half.len(), 1 + copies);
-        let left = half.iter().fold(1.0, |left, s| left * (1.0 - alpha(s)));
+        assert_eq!(half.len(), 1 + copies + 1, "the box, the copies, itself");
+        let boxed = rect(&half[0]);
+        assert!((boxed.fill.a() as f32 / 255.0 - theme::ease_out(0.5)).abs() < 0.02, "the box fades, once");
+        let content: Vec<_> = half[1..].iter().map(rect).collect();
+        assert_eq!(content.last().unwrap().rect.min, egui::pos2(100.0, 100.0), "itself on top, in place");
+        let left = content.iter().fold(1.0, |left, r| left * (1.0 - r.fill.a() as f32 / 255.0));
         assert!(((1.0 - left) - theme::ease_out(0.5)).abs() < 0.02, "as visible as a fade: {}", 1.0 - left);
         let done = draw(1.0);
-        assert_eq!(done.len(), 1);
-        assert_eq!(alpha(&done[0]), 1.0);
+        assert_eq!(done.len(), 2);
+        assert_eq!((rect(&done[0]).fill, rect(&done[0]).blur_width), (Color32::BLACK, 0.0));
+        assert_eq!(rect(&done[1]).fill, Color32::WHITE);
     }
 
     #[test]
