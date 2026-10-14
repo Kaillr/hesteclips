@@ -19,6 +19,7 @@ use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, vec2};
 use crate::settings::ShortcutAction as A;
 use crate::theme::{self, W, icon};
 use crate::ui_kit::{self, Btn, Item, Kind};
+use crate::ui_kit::Dismissed as _;
 use crate::{App, Page, RecState, thumbs};
 
 /// The rail's width.
@@ -30,6 +31,13 @@ pub const HEAD_H: f32 = 64.0;
 /// and headers keep clear of the traffic lights.
 pub fn under_titlebar() -> bool {
     cfg!(target_os = "macos")
+}
+
+/// Which screen's keyboard shortcuts to show.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Keys {
+    Player,
+    Editor,
 }
 
 /// What a toast's button does.
@@ -348,6 +356,64 @@ impl App {
                     self.open_viewer(clip);
                 }
             }
+        }
+    }
+}
+
+impl App {
+    /// The keyboard shortcuts of the player or the editor.
+    pub(crate) fn keys_dialog(&mut self, ctx: &egui::Context) {
+        let Some(which) = self.show_keys else { return };
+        let rows: &[(&str, &str)] = match which {
+            Keys::Player => &[
+                ("Space  K", "Play or pause"),
+                ("← →", "Back or ahead 5 seconds"),
+                ("J  L", "Back or ahead 10 seconds"),
+                (",  .", "One frame back or ahead"),
+                ("Home  End", "Start or end"),
+                ("Scroll", "Scrub"),
+                ("M", "Mute"),
+                ("F", "Fullscreen"),
+                ("Q  E", "Previous or next clip"),
+                ("F2", "Rename"),
+                ("Delete", "Delete the clip"),
+                ("Esc", "Back to your clips"),
+            ],
+            Keys::Editor => &[
+                ("Space", "Play or pause"),
+                ("← →", "One frame back or ahead"),
+                ("Shift ← →", "One second back or ahead"),
+                ("I  O", "Start or end here"),
+                ("Home  End", "Go to the start or end"),
+                ("Cmd Z", "Undo  (Shift for redo)"),
+                ("N", "Snapping on or off"),
+                ("+  −  \\", "Zoom in, out, or to fit"),
+                ("Ctrl scroll", "Zoom the timeline"),
+                ("Shift scroll", "Move along the timeline"),
+                ("Drag the volume line", "Change a track's volume"),
+                ("Double-click it", "Add a volume point"),
+                ("Right-click a point", "Remove it"),
+                ("Cmd S", "Save"),
+                ("F2", "Rename"),
+            ],
+        };
+        let mut close = false;
+        let modal = ui_kit::dialog(ctx, "keys_dialog", 440.0, |ui| {
+            ui_kit::dialog_title(ui, "Keyboard shortcuts");
+            let p = theme::pal(ui);
+            egui::Grid::new("keys_grid").num_columns(2).spacing(vec2(18.0, 8.0)).show(ui, |ui| {
+                for (k, what) in rows {
+                    ui.label(theme::text(*k, 13.5, W::Semibold).color(p.text));
+                    ui.label(theme::text(*what, 13.5, W::Regular).color(p.text2));
+                    ui.end_row();
+                }
+            });
+            ui_kit::dialog_buttons(ui, |ui| {
+                close = ui.add(ui_kit::button("Done", false)).clicked();
+            });
+        });
+        if close || modal.dismissed() {
+            self.show_keys = None;
         }
     }
 }

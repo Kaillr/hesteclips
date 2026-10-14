@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
-use egui::{Align2, Color32, FontId, Key, Pos2, Rect, RichText, Sense, Stroke, Vec2};
+use egui::{Align2, Color32, FontId, Key, Pos2, Rect, Sense, Stroke, Vec2};
 use media::pcm::Pcm;
 use media::{ClipInfo, TrackEdit};
 
@@ -31,6 +31,8 @@ use crate::filmstrip::Filmstrip;
 use crate::meter;
 use crate::player::Player;
 
+/// The timeline: ruler, filmstrip and sound, and the space under it.
+const TIMELINE_H: f32 = 26.0 + 56.0 + 4.0 + 48.0 + 14.0;
 /// Scrolling counts as scrubbing until it's been still this long.
 const SCROLL_SETTLE: Duration = Duration::from_millis(200);
 /// Arrow keys jump this far.
@@ -52,6 +54,10 @@ pub enum ViewerOutcome {
     Delete,
     /// The picture was dragged: hand the clip to the OS to drop into an app.
     DragOut,
+    /// Play it in the OS default video player instead.
+    OpenExternal,
+    /// Show the keyboard shortcuts.
+    Keys,
 }
 
 /// Where this clip sits in the library, for stepping through clips.
@@ -116,6 +122,10 @@ struct Ready {
     muted: bool,
     /// The picture was dragged this frame: share the clip by drag and drop.
     drag_out: bool,
+    /// Times shown as frames instead of minutes and seconds.
+    show_frames: bool,
+    /// The big play / pause sign after a click on the picture: which, and when.
+    flash_play: Option<(bool, Instant)>,
 }
 
 impl Viewer {
@@ -201,40 +211,52 @@ impl Viewer {
         match &mut self.state {
             State::Saving => {
                 let rect = ui.available_rect_before_wrap();
+                ui.painter().rect_filled(rect, 0, crate::theme::pal(ui).stage);
                 let f = nav.saving.unwrap_or(0.0);
                 ui.scope_builder(egui::UiBuilder::new().max_rect(Rect::from_center_size(rect.center(), Vec2::new(280.0, 60.0))), |ui| {
                     ui.vertical_centered(|ui| {
-                        ui.label(RichText::new(format!("Saving your edit…  {:.0}%", f * 100.0)).size(15.0));
-                        ui.add_space(8.0);
-                        ui.add(egui::ProgressBar::new(f).desired_height(4.0).fill(crate::ui_kit::ACCENT));
+                        ui.label(crate::theme::text(format!("Saving your edit  {:.0}%", f * 100.0), 14.0, crate::theme::W::Medium).color(Color32::WHITE));
+                        ui.add_space(10.0);
+                        let (bar, _) = ui.allocate_exact_size(Vec2::new(220.0, 3.0), Sense::hover());
+                        ui.painter().rect_filled(bar, 2, Color32::from_white_alpha(40));
+                        let w = crate::theme::value(ui.ctx(), egui::Id::new("viewer_saving"), f, crate::theme::NORMAL);
+                        ui.painter().rect_filled(Rect::from_min_max(bar.min, Pos2::new(bar.left() + bar.width() * w, bar.bottom())), 2, Color32::WHITE);
                     });
                 });
                 ctx.request_repaint_after(Duration::from_millis(100));
             }
             State::Loading(_) => {
                 let rect = ui.available_rect_before_wrap();
-                ui.put(Rect::from_center_size(rect.center(), Vec2::splat(24.0)), egui::Spinner::new().size(24.0));
+                ui.painter().rect_filled(rect, 0, crate::theme::pal(ui).stage);
+                ui.put(Rect::from_center_size(rect.center(), Vec2::splat(24.0)), egui::Spinner::new().size(22.0).color(Color32::from_white_alpha(170)));
             }
             State::Failed(e) => {
+                let p = crate::theme::pal(ui);
                 ui.vertical_centered(|ui| {
                     ui.add_space(80.0);
-                    ui.colored_label(ui.visuals().error_fg_color, format!("Couldn't play this clip: {e}"));
+                    ui.label(crate::theme::text("Couldn't play this clip", 15.0, crate::theme::W::Semibold).color(p.text));
+                    ui.add_space(4.0);
+                    ui.label(crate::theme::text(e.as_str(), 13.0, crate::theme::W::Regular).color(p.text3));
                 });
             }
             State::Ready(r) => r.ui(ui),
         }
         if !ctx.egui_wants_keyboard_input() && !crate::ui_kit::overlay_open(&ctx) {
             let none = egui::Modifiers::NONE;
-            let (esc, prev, next, f, f2, delete) = ctx.input_mut(|i| {
+            let (esc, prev, next, f, f2, delete, keys) = ctx.input_mut(|i| {
                 (
                     i.consume_key(none, Key::Escape),
                     i.consume_key(none, Key::Q),
                     i.consume_key(none, Key::E),
                     i.consume_key(none, Key::F),
                     i.consume_key(none, Key::F2),
-                    i.consume_key(none, Key::Delete),
+                    i.consume_key(none, Key::Delete) || i.consume_key(egui::Modifiers::COMMAND, Key::Backspace),
+                    i.consume_key(egui::Modifiers::SHIFT, Key::Slash) || i.consume_key(none, Key::Questionmark),
                 )
             });
+            if keys {
+                out = ViewerOutcome::Keys;
+            }
             if f2 {
                 out = ViewerOutcome::Rename;
             }
@@ -273,73 +295,91 @@ impl Viewer {
         out
     }
 
+    /// Back and the clip's name on the left, previous and next clip in the
+    /// middle, Edit, Share and ⋯ on the right.
     fn header(&mut self, ui: &mut egui::Ui, nav: &Nav) -> ViewerOutcome {
-        use crate::header;
+        use crate::ui_kit::{Btn, Item, Kind};
+        use egui_phosphor::regular as icon;
         let mut out = ViewerOutcome::Stay;
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.set_min_height(header::HEIGHT);
-            if header::back(ui).clicked() {
-                out = ViewerOutcome::Close;
+        let stem = self.clip.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let title = crate::clips::title_for_stem(&stem);
+        // While its edit saves, the clip's file is about to change.
+        let ready = !matches!(self.state, State::Saving);
+        let wait = "Wait for the edit to finish saving";
+        let (back, rename) = crate::transport::header(
+            ui,
+            &title,
+            false,
+            if nav.position.is_some() { 120.0 } else { 0.0 },
+            |ui, part| match part {
+            crate::transport::Part::Centre => {
+                let p = crate::theme::pal(ui);
+                ui.spacing_mut().item_spacing.x = 2.0;
+                if Btn::icon(Kind::Ghost, icon::CARET_LEFT).small().enabled(nav.previous.is_some()).tip("Previous clip  (Q)").show(ui).clicked() {
+                    out = nav.previous.clone().map_or(ViewerOutcome::Stay, ViewerOutcome::Open);
+                }
+                if let Some((i, n)) = nav.position {
+                    let text = format!("{i} of {n}");
+                    let g = ui.painter().layout_no_wrap(text, crate::theme::font(13.0, crate::theme::W::Regular), p.text3);
+                    let (r, _) = ui.allocate_exact_size(egui::vec2(120.0 - 2.0 * 26.0 - 4.0, 26.0), Sense::hover());
+                    ui.painter().galley(r.center() - g.size() / 2.0, g, p.text3);
+                }
+                if Btn::icon(Kind::Ghost, icon::CARET_RIGHT).small().enabled(nav.next.is_some()).tip("Next clip  (E)").show(ui).clicked() {
+                    out = nav.next.clone().map_or(ViewerOutcome::Stay, ViewerOutcome::Open);
+                }
             }
-            ui.add_space(6.0);
-            // Step through the clips you're browsing. Before the name, so they
-            // stay put whatever its length.
-            if ui.add_enabled(nav.previous.is_some(), header::icon("‹")).on_hover_text("Previous clip  (Q)").clicked() {
-                out = nav.previous.clone().map_or(ViewerOutcome::Stay, ViewerOutcome::Open);
-            }
-            if ui.add_enabled(nav.next.is_some(), header::icon("›")).on_hover_text("Next clip  (E)").clicked() {
-                out = nav.next.clone().map_or(ViewerOutcome::Stay, ViewerOutcome::Open);
-            }
-            if let Some((i, n)) = nav.position {
-                ui.weak(format!("{i} of {n}"));
-            }
-            ui.add_space(10.0);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // While its edit saves, the clip's file is about to change.
-                let ready = !matches!(self.state, State::Saving);
-                let wait = "Wait for the edit to finish saving";
-                let share = ui.add_enabled(ready, header::button("Share", true)).on_disabled_hover_text(wait).on_hover_text(if crate::share::CAN_DRAG_OUT {
-                    "Copy it, send it or upload it — or drag the picture into any app"
-                } else {
-                    "Copy it, send it or upload it"
-                });
-                egui::Popup::menu(&share).show(|ui| {
-                    if let Some(c) = crate::library::share_menu(ui, share.rect.left_bottom()) {
-                        out = ViewerOutcome::Share(c);
+            crate::transport::Part::Right => {
+                // ⋯: collections, rename, delete.
+                let more = Btn::icon(Kind::Ghost, icon::DOTS_THREE).tip("More").show(ui);
+                crate::ui_kit::menu_popup(&more, false, 250.0, |ui| {
+                    crate::ui_kit::submenu(ui, Item::new("Add to collection").icon(icon::FOLDER_PLUS), |ui| {
+                        for (id, name, inside) in &nav.collections {
+                            let tip = if *inside { "Take out of this collection" } else { "Add to this collection" };
+                            if Item::new(name.clone()).check(*inside).tip(tip).show(ui).clicked() {
+                                out = ViewerOutcome::InCollection(id.clone(), !inside);
+                            }
+                        }
+                        if !nav.collections.is_empty() {
+                            crate::ui_kit::menu_sep(ui);
+                        }
+                        if Item::new("New collection…").icon(icon::PLUS).show(ui).clicked() {
+                            out = ViewerOutcome::NewCollection;
+                        }
+                    });
+                    if Item::new("Rename…").icon(icon::PENCIL_SIMPLE).keys(Some(vec!["F2".into()])).show(ui).clicked() {
+                        out = ViewerOutcome::Rename;
+                    }
+                    if Item::new("Open in another player").icon(icon::ARROW_SQUARE_OUT).show(ui).clicked() {
+                        out = ViewerOutcome::OpenExternal;
+                    }
+                    crate::ui_kit::menu_sep(ui);
+                    if Item::new("Keyboard shortcuts").icon(icon::KEYBOARD).keys(Some(vec!["?".into()])).show(ui).clicked() {
+                        out = ViewerOutcome::Keys;
+                    }
+                    crate::ui_kit::menu_sep(ui);
+                    let del_key = Some(vec![if cfg!(target_os = "macos") { icon::BACKSPACE.to_owned() } else { "Del".to_owned() }]);
+                    if Item::new(nav.delete_label.clone()).icon(icon::TRASH).danger().enabled(ready).keys(del_key).show(ui).clicked() {
+                        out = ViewerOutcome::Delete;
                     }
                 });
-                if ui.add_enabled(ready, header::button("Edit", false)).on_disabled_hover_text(wait).on_hover_text("Trim it, adjust its audio, or save it smaller").clicked() {
+                let share_tip = if crate::share::CAN_DRAG_OUT { "Copy it, send it or upload it, or drag the picture into any app" } else { "Copy it, send it or upload it" };
+                let share = Btn::primary("Share").with_icon(icon::EXPORT).enabled(ready).tip(if ready { share_tip } else { wait }).show(ui);
+                if let Some(c) = crate::ui_kit::menu_popup(&share, false, 250.0, |ui| crate::library::share_menu(ui, share.rect.left_bottom())).flatten() {
+                    out = ViewerOutcome::Share(c);
+                }
+                if Btn::normal("Edit").with_icon(icon::SCISSORS).enabled(ready).tip(if ready { "Trim it, adjust its sound, or save it smaller" } else { wait }).show(ui).clicked() {
                     out = ViewerOutcome::Edit;
                 }
-                let delete = header::button("Delete", false);
-                if ui.add_enabled(ready, delete).on_disabled_hover_text(wait).on_hover_text(format!("{}  (Delete)", nav.delete_label)).clicked() {
-                    out = ViewerOutcome::Delete;
-                }
-                let collect = ui.add(header::button("+ Collection", false)).on_hover_text("Add it to a collection of your own, like \"Ace clutches\"");
-                egui::Popup::menu(&collect).show(|ui| {
-                    ui.set_min_width(200.0);
-                    for (id, name, inside) in &nav.collections {
-                        let label = if *inside { format!("✔  {name}") } else { format!("     {name}") };
-                        if ui.button(label).on_hover_text(if *inside { "Take out of this collection" } else { "Add to this collection" }).clicked() {
-                            out = ViewerOutcome::InCollection(id.clone(), !inside);
-                        }
-                    }
-                    if !nav.collections.is_empty() {
-                        ui.separator();
-                    }
-                    if ui.button("+  New collection…").clicked() {
-                        out = ViewerOutcome::NewCollection;
-                    }
-                });
-                ui.add_space(12.0);
-                let stem = self.clip.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-                if header::title(ui, &crate::clips::title_for_stem(&stem)) {
-                    out = ViewerOutcome::Rename;
-                }
-            });
-        });
-        ui.add_space(6.0);
+            }
+            crate::transport::Part::Left => {}
+            },
+        );
+        if back {
+            out = ViewerOutcome::Close;
+        }
+        if rename {
+            out = ViewerOutcome::Rename;
+        }
         out
     }
 }
@@ -371,6 +411,8 @@ impl Ready {
             volume: volume.0,
             muted: volume.1,
             drag_out: false,
+            show_frames: false,
+            flash_play: None,
         };
         r.apply_volume(ctx);
         r
@@ -418,22 +460,26 @@ impl Ready {
 
         let full = is_fullscreen(&ctx);
 
-        // --- Picture: everything above the timeline and controls; in
-        // fullscreen the whole screen, with the controls over it ---
-        let timeline_h = 52.0 + 2.0 + 40.0;
-        let controls_h = 8.0 + timeline_h + 8.0 + 34.0 + 6.0;
+        // --- Picture: everything above the transport and timeline; in
+        // fullscreen the whole screen, with them floating over it ---
+        let controls_h = crate::transport::BAR_H + TIMELINE_H + 14.0;
         let preview_h = if full { ui.available_height() } else { (ui.available_height() - controls_h).max(160.0) };
         // Click to play or pause; drag out of the window to share the clip.
         let (preview, preview_resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), preview_h), Sense::click_and_drag());
-        ui.painter().rect_filled(preview, if full { 0 } else { 8 }, Color32::BLACK);
         self.player.set_stepping(self.stepping_back);
-        if let Some(size) = self.player.update(&ctx, scrubbing) {
-            let scale = (preview.width() / size.x).min(preview.height() / size.y);
-            // On whole screen pixels: a half-pixel offset alone blurs text.
-            let ppp = ctx.pixels_per_point();
-            let r = Rect::from_center_size(preview.center(), size * scale);
-            let r = Rect::from_min_size(((r.min.to_vec2() * ppp).round() / ppp).to_pos2(), r.size());
-            self.player.paint(ui, r);
+        let size = self.player.update(&ctx, scrubbing);
+        let glow = self.strip.near(self.player.time()).cloned();
+        let player = &self.player;
+        crate::transport::stage(ui, preview, size, glow.as_ref(), false, |r| player.paint(ui, r));
+        if let Some(f) = self.flash_play.filter(|(_, at)| at.elapsed() < Duration::from_millis(450)) {
+            // A big play / pause sign that grows and fades where you clicked.
+            let t = f.1.elapsed().as_secs_f32() / 0.45;
+            let r = 32.0 * (0.8 + 0.5 * t);
+            let c = preview.center();
+            ui.painter().circle_filled(c, r, Color32::from_black_alpha((128.0 * (1.0 - t)) as u8));
+            let glyph = if f.0 { egui_phosphor::fill::PLAY } else { egui_phosphor::fill::PAUSE };
+            ui.painter().text(c + Vec2::new(if f.0 { 2.0 } else { 0.0 }, 0.0), Align2::CENTER_CENTER, glyph, FontId::new(28.0 * (0.8 + 0.5 * t), crate::theme::fill_family()), Color32::from_white_alpha((255.0 * (1.0 - t)) as u8));
+            ctx.request_repaint();
         }
 
         let mut timeline_w = preview.width();
@@ -441,22 +487,22 @@ impl Ready {
             // Over the bottom of the picture while the mouse moves (and a few
             // seconds after) or rests on them; hidden otherwise, cursor too,
             // paused or not (a paused frame is often for a screenshot).
-            let bar = Rect::from_min_max(egui::pos2(preview.left(), preview.bottom() - controls_h - 24.0), preview.max);
+            let bar = Rect::from_min_max(egui::pos2(preview.left(), preview.bottom() - controls_h - 110.0), preview.max);
             let shown = self.controls_shown(&ctx, bar);
             if shown > 0.0 {
-                // Clear at the top, near-black within 40 points: readable over
+                // Clear at the top, near-black at the bottom: readable over
                 // any picture.
                 let shade = |a: f32| Color32::from_black_alpha((a * shown) as u8);
-                let mid = bar.top() + 40.0;
+                let mid = bar.top() + bar.height() * 0.4;
                 let fade = egui::Mesh {
                     indices: vec![0, 1, 2, 2, 1, 3, 2, 3, 4, 4, 3, 5],
                     vertices: [
                         (bar.left_top(), 0.0),
                         (bar.right_top(), 0.0),
-                        (egui::pos2(bar.left(), mid), 190.0),
-                        (egui::pos2(bar.right(), mid), 190.0),
-                        (bar.left_bottom(), 225.0),
-                        (bar.right_bottom(), 225.0),
+                        (egui::pos2(bar.left(), mid), 140.0),
+                        (egui::pos2(bar.right(), mid), 140.0),
+                        (bar.left_bottom(), 210.0),
+                        (bar.right_bottom(), 210.0),
                     ]
                     .into_iter()
                     .map(|(pos, a)| egui::epaint::Vertex { pos, uv: egui::epaint::WHITE_UV, color: shade(a) })
@@ -464,15 +510,17 @@ impl Ready {
                     texture_id: Default::default(),
                 };
                 ui.painter().add(fade);
-                let area = Rect::from_min_max(egui::pos2(bar.left() + 20.0, bar.top() + 24.0), egui::pos2(bar.right() - 20.0, bar.bottom()));
+                let area = Rect::from_min_max(egui::pos2(bar.left() + 10.0, preview.bottom() - controls_h - 4.0 + 8.0 * (1.0 - shown)), egui::pos2(bar.right() - 10.0, bar.bottom()));
                 let mut child = ui.new_child(egui::UiBuilder::new().max_rect(area));
                 child.multiply_opacity(shown);
-                timeline_w = self.controls(&mut child, preview, timeline_h);
+                // White on the shade, whatever the look.
+                child.visuals_mut().dark_mode = true;
+                timeline_w = self.controls(&mut child, preview, true);
             } else if pointer_over(&ctx, preview) {
                 ctx.set_cursor_icon(egui::CursorIcon::None);
             }
         } else {
-            timeline_w = self.controls(ui, preview, timeline_h);
+            timeline_w = self.controls(ui, preview, false);
         }
 
         let preview_resp = preview_resp.on_hover_cursor(if full { egui::CursorIcon::Default } else { egui::CursorIcon::PointingHand });
@@ -482,9 +530,11 @@ impl Ready {
         if preview_resp.double_clicked() {
             // The first click of the two already toggled playing: undo that.
             self.toggle_play();
+            self.flash_play = None;
             set_fullscreen(&ctx, !is_fullscreen(&ctx));
         } else if preview_resp.clicked() {
             self.toggle_play();
+            self.flash_play = Some((self.player.is_playing(), Instant::now()));
         }
 
         // Scroll over the picture (or the timeline, over or under it) to
@@ -531,115 +581,118 @@ impl Ready {
         ctx.animate_bool_with_time(egui::Id::new("viewer_controls"), visible, 0.2)
     }
 
-    /// The timeline and the play / time / volume row, from the top of `ui`.
+    /// The transport bar and the timeline under it, from the top of `ui`.
     /// Returns the timeline's width (wheel scrubbing scales by it).
-    fn controls(&mut self, ui: &mut egui::Ui, preview: Rect, timeline_h: f32) -> f32 {
-        ui.add_space(8.0);
-        let (outer, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), timeline_h), Sense::click_and_drag());
-        self.timeline(ui, outer, &resp, preview);
-
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            ui.set_min_height(34.0);
-            let label = if self.player.is_playing() { "\u{23f8}" } else { "\u{25b6}" };
-            let play = egui::Button::new(RichText::new(label).size(18.0)).min_size(Vec2::new(44.0, 32.0)).corner_radius(8);
-            if ui.add(play).on_hover_text("Play / pause  (Space)").clicked() {
-                self.toggle_play();
+    fn controls(&mut self, ui: &mut egui::Ui, preview: Rect, over_picture: bool) -> f32 {
+        use crate::ui_kit::{Btn, Kind};
+        let ctx = ui.ctx().clone();
+        let bar = Rect::from_min_size(ui.cursor().min, Vec2::new(ui.available_width(), crate::transport::BAR_H));
+        ui.allocate_rect(bar, Sense::hover());
+        let moments: Vec<crate::transport::Moment> = Vec::new();
+        let t = self.player.time();
+        let prev = moments.iter().rev().find(|m| m.t < t - 0.05).cloned();
+        let next = moments.iter().find(|m| m.t > t + 0.05).cloned();
+        let mut toggle = false;
+        let mut jump = None;
+        let mut frames = self.show_frames;
+        crate::transport::bar(
+            ui,
+            if over_picture { bar.with_min_y(bar.top() + 1.0) } else { bar },
+            150.0,
+            |ui, part| match part {
+            crate::transport::Part::Left => crate::transport::timecode(ui, t, self.info.duration, self.info.fps, &mut frames),
+            crate::transport::Part::Centre => {
+                let c = crate::transport::centre(ui, self.player.is_playing(), prev.as_ref(), next.as_ref());
+                toggle = c.play;
+                if c.prev {
+                    jump = prev.as_ref().map(|m| m.t);
+                }
+                if c.next {
+                    jump = next.as_ref().map(|m| m.t);
+                }
             }
-            ui.add_space(8.0);
-            ui.label(RichText::new(clock(self.player.time())).monospace().size(15.0));
-            ui.weak(format!("/ {}", clock(self.info.duration)));
-
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            crate::transport::Part::Right => {
                 let full = is_fullscreen(ui.ctx());
-                let fs = egui::Button::new(RichText::new("\u{26f6}").size(16.0)).min_size(Vec2::new(32.0, 28.0)).corner_radius(6).selected(full);
-                if ui.add(fs).on_hover_text(if full { "Exit fullscreen  (F or Esc)" } else { "Fullscreen  (F, or double-click the picture)" }).clicked() {
+                let fs_icon = if full { egui_phosphor::regular::CORNERS_IN } else { egui_phosphor::regular::CORNERS_OUT };
+                if Btn::icon(Kind::Ghost, fs_icon).tip(if full { "Exit fullscreen  (F or Esc)" } else { "Fullscreen  (F, or double-click the picture)" }).show(ui).clicked() {
                     set_fullscreen(ui.ctx(), !full);
                 }
-                ui.add_space(8.0);
-                let mut changed = false;
-                let slider = egui::Slider::new(&mut self.volume, 0.0..=1.0).show_value(false);
-                changed |= ui.add_sized(Vec2::new(100.0, 20.0), slider).on_hover_text("Volume").changed();
-                let icon = if self.muted || self.volume == 0.0 { "\u{1f507}" } else { "\u{1f50a}" };
-                if ui.add(egui::Button::new(icon).frame(false)).on_hover_text(if self.muted { "Unmute  (M)" } else { "Mute  (M)" }).clicked() {
-                    self.muted = !self.muted;
-                    changed = true;
-                }
+                let mut v = if self.muted { 0.0 } else { self.volume };
+                let changed = crate::transport::slider(ui, &mut v, 100.0).on_hover_text("Volume").changed();
                 if changed {
-                    if self.volume > 0.0 && ui.input(|i| i.pointer.any_down()) {
-                        self.muted = false;
-                    }
+                    self.volume = v;
+                    self.muted = false;
                     self.apply_volume(ui.ctx());
                 }
-                ui.add_space(8.0);
-                crate::ui_kit::shortcuts_button(
-                    ui,
-                    &[
-                        ("Space or K", "Play or pause"),
-                        ("← →", "Back or ahead 5 seconds"),
-                        ("J L", "Back or ahead 10 seconds"),
-                        (", .", "One frame back or ahead"),
-                        ("Home End", "Start or end"),
-                        ("Scroll", "Scrub"),
-                        ("M", "Mute"),
-                        ("F", "Fullscreen"),
-                        ("Q E", "Previous or next clip"),
-                        ("F2", "Rename"),
-                        ("Delete", "Delete the clip"),
-                        ("Esc", "Back to your clips"),
-                    ],
-                );
-            });
-        });
-        outer.width()
+                let speaker = if self.muted || self.volume == 0.0 { egui_phosphor::regular::SPEAKER_X } else { egui_phosphor::regular::SPEAKER_HIGH };
+                if Btn::icon(Kind::Ghost, speaker).small().tip(if self.muted { "Unmute  (M)" } else { "Mute  (M)" }).show(ui).clicked() {
+                    self.muted = !self.muted;
+                    self.apply_volume(ui.ctx());
+                }
+            }
+            },
+        );
+        self.show_frames = frames;
+        if toggle {
+            self.toggle_play();
+        }
+        if let Some(t) = jump {
+            self.seek(t);
+        }
+        let _ = ctx;
+        let (outer, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), TIMELINE_H), Sense::click_and_drag());
+        let lanes = outer.shrink2(Vec2::new(14.0, 0.0)).with_max_y(outer.bottom() - 14.0);
+        self.timeline(ui, lanes, &resp, preview, &moments);
+        lanes.width()
     }
 
-    /// Filmstrip over the audio levels, with the playhead through both. Hover to
-    /// see a moment; click or drag to go there.
-    fn timeline(&mut self, ui: &mut egui::Ui, outer: Rect, resp: &egui::Response, preview: Rect) {
-        let v = ui.visuals().clone();
-        let p = ui.painter_at(outer.expand(8.0));
+    /// The ruler with the clip's moments, the filmstrip, then the sound,
+    /// with the playhead through them all. The played part is bright, the
+    /// rest dimmed. Hover to see a moment; click or drag to go there.
+    fn timeline(&mut self, ui: &mut egui::Ui, outer: Rect, resp: &egui::Response, preview: Rect, moments: &[crate::transport::Moment]) {
+        let p = crate::theme::pal(ui);
+        let painter = ui.painter_at(outer.expand(8.0));
         let dur = self.info.duration.max(1e-6);
-        let video = Rect::from_min_size(outer.min, Vec2::new(outer.width(), 52.0));
-        let audio = Rect::from_min_max(Pos2::new(outer.left(), video.bottom() + 2.0), outer.max);
+        let ruler = Rect::from_min_size(outer.min, Vec2::new(outer.width(), crate::transport::RULER_H));
+        let video = Rect::from_min_size(Pos2::new(outer.left(), ruler.bottom()), Vec2::new(outer.width(), 56.0));
+        let audio = Rect::from_min_max(Pos2::new(outer.left(), video.bottom() + 4.0), outer.max);
         let x_of = |t: f64| outer.left() + (t / dur) as f32 * outer.width();
         let t_of = |x: f32| ((x - outer.left()) / outer.width()).clamp(0.0, 1.0) as f64 * dur;
 
-        p.rect_filled(video, 4, v.extreme_bg_color);
-        self.strip.paint(ui, video, 0.0, dur, dur);
-        p.rect_filled(audio, 4, v.extreme_bg_color);
-        if self.wave.is_silent_file() {
-            p.text(audio.center(), Align2::CENTER_CENTER, "No sound", FontId::proportional(12.0), Color32::from_gray(110));
-        } else {
-            // Coloured like the meters, so loud moments stand out; it grows
-            // as the sound is decoded.
-            self.wave.paint(&ui.painter_at(audio), audio, (0.0, dur), 0, |_| 1.0, |_, rms| zone(meter::to_db(rms)));
+        if let Some(t) = crate::transport::ruler(ui, ruler, (0.0, dur), self.info.fps, self.show_frames, moments) {
+            self.seek(t);
         }
-
-        // Already-played part of the levels, lightly marked, so where you are reads at a glance.
+        painter.rect_filled(video, 5, p.raise2);
+        self.strip.paint(ui, video, 0.0, dur, dur);
+        painter.rect_filled(audio, 5, p.raise);
+        if self.wave.is_silent_file() {
+            painter.text(audio.center(), Align2::CENTER_CENTER, "No sound", crate::theme::font(12.0, crate::theme::W::Regular), p.text3);
+        } else {
+            // The sound as the app hears it: the loudest peaks as a lighter
+            // outline, how loud it sounds as the solid shape inside.
+            let wave_hi = p.wave_hi;
+            self.wave.paint(&ui.painter_at(audio.shrink2(Vec2::new(0.0, 2.0))), audio.shrink2(Vec2::new(0.0, 2.0)), (0.0, dur), u64::from(p.dark), |_| 1.0, |_, _| wave_hi);
+        }
+        // What's left to play, dimmed: where you are reads at a glance.
         let xp = x_of(self.info.snap(self.player.time()));
-        p.rect_filled(Rect::from_min_max(audio.min, Pos2::new(xp, audio.bottom())), 4, Color32::from_white_alpha(10));
+        let dim = Color32::from_rgba_unmultiplied(10, 11, 14, if p.dark { 115 } else { 0 });
+        let dim = if p.dark { dim } else { Color32::from_rgba_unmultiplied(248, 248, 249, 128) };
+        let rest = Rect::from_min_max(Pos2::new(xp, video.top()), Pos2::new(outer.right(), audio.bottom()));
+        painter.rect_filled(rest.intersect(video), egui::CornerRadius { nw: 0, sw: 0, ne: 5, se: 5 }, dim);
+        painter.rect_filled(rest.intersect(audio), egui::CornerRadius { nw: 0, sw: 0, ne: 5, se: 5 }, dim);
 
-        // Scrub proxy still building: a thin bar until every frame is scrubbable.
-        crate::player::paint_proxy_bar(ui, &self.player, video, 0.0, dur);
-
-        // Hover: a line, and that moment's picture and time above the timeline.
-        if let Some(pos) = resp.hover_pos().filter(|_| self.dragging.is_none()) {
+        // Hover: a line, and that moment's picture and time.
+        if let Some(pos) = resp.hover_pos().filter(|_| self.dragging.is_none() && pos_in(video.union(audio), resp.hover_pos())) {
             let t = self.info.snap(t_of(pos.x));
-            p.vline(pos.x, outer.y_range(), Stroke::new(1.0, Color32::from_white_alpha(120)));
-            self.hover_preview(ui, t, pos.x, outer, preview);
+            painter.vline(pos.x, video.top()..=audio.bottom(), Stroke::new(1.0, crate::theme::fade(p.text3, 0.8)));
+            self.hover_preview(ui, t, pos.x, video, preview);
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         } else {
             self.hover = None;
         }
 
         // Playhead.
-        p.vline(xp, outer.top() - 4.0..=outer.bottom(), Stroke::new(2.0, Color32::WHITE));
-        p.add(egui::Shape::convex_polygon(
-            vec![Pos2::new(xp - 6.0, outer.top() - 6.0), Pos2::new(xp + 6.0, outer.top() - 6.0), Pos2::new(xp, outer.top() + 2.0)],
-            Color32::WHITE,
-            Stroke::NONE,
-        ));
+        crate::transport::playhead(&painter, xp, ruler.bottom() - 4.0, audio.bottom(), p.text);
 
         // Click or drag to go there. Playing pauses while you drag and carries on after.
         if resp.drag_started() {
@@ -647,7 +700,7 @@ impl Ready {
             self.player.pause();
         }
         if let Some(pos) = resp.interact_pointer_pos() {
-            if resp.dragged() || resp.drag_started() || resp.clicked() {
+            if (resp.dragged() || resp.drag_started() || resp.clicked()) && pos.y > ruler.bottom() - 6.0 {
                 self.seek(t_of(pos.x));
             }
         }
@@ -679,18 +732,22 @@ impl Ready {
             _ => self.strip.near(t).cloned(),
         };
         let aspect = self.info.width.max(1) as f32 / self.info.height.max(1) as f32;
-        let w = 240.0f32.min(preview.width() * 0.4);
+        let w = 200.0f32.min(preview.width() * 0.35);
         let size = Vec2::new(w, w / aspect);
         let left = (x - size.x / 2.0).clamp(timeline.left(), timeline.right() - size.x);
-        let frame = Rect::from_min_size(Pos2::new(left, timeline.top() - 14.0 - size.y - 20.0), size);
+        let frame = Rect::from_min_size(Pos2::new(left, timeline.top() - 40.0 - size.y), size);
         let p = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("viewer_hover")));
-        p.rect_filled(frame.expand(2.0), 6, Color32::from_black_alpha(230));
+        let shadow = egui::Shadow { offset: [0, 6], blur: 18, spread: 0, color: Color32::from_black_alpha(130) };
+        p.add(shadow.as_shape(frame, 5));
+        p.rect_filled(frame, 5, Color32::BLACK);
         if let Some(tex) = tex {
-            p.image(tex.id(), frame, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+            p.add(egui::Shape::Rect(egui::epaint::RectShape::filled(frame, 5, Color32::WHITE).with_texture(tex.id(), Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)))));
         }
-        let label = Rect::from_min_size(Pos2::new(frame.left() - 2.0, frame.bottom() + 2.0), Vec2::new(frame.width() + 4.0, 20.0));
-        p.rect_filled(label, 6, Color32::from_black_alpha(230));
-        p.text(label.center(), Align2::CENTER_CENTER, clock(t), FontId::monospace(12.0), Color32::WHITE);
+        p.rect_stroke(frame, 5, Stroke::new(1.5, Color32::WHITE), egui::StrokeKind::Inside);
+        let g = p.layout_no_wrap(if self.show_frames { format!("{}", self.info.frame_index(t)) } else { crate::transport::clock(t) }, crate::theme::font(11.5, crate::theme::W::Semibold), Color32::WHITE);
+        let label = Rect::from_center_size(Pos2::new(frame.center().x, frame.bottom() + 14.0), g.size() + Vec2::new(12.0, 4.0));
+        p.rect_filled(label, 4, Color32::from_black_alpha(184));
+        p.galley(label.min + Vec2::new(6.0, 2.0), g, Color32::WHITE);
     }
 
     fn keyboard(&mut self, ctx: &egui::Context) {
@@ -781,6 +838,10 @@ impl Ready {
         }
         self.play();
     }
+}
+
+fn pos_in(rect: Rect, pos: Option<Pos2>) -> bool {
+    pos.is_some_and(|p| rect.contains(p))
 }
 
 fn is_fullscreen(ctx: &egui::Context) -> bool {

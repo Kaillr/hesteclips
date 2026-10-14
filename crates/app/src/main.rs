@@ -21,7 +21,6 @@ mod filmstrip;
 mod logfile;
 mod game_events;
 mod games;
-mod header;
 mod osu_plays;
 mod library;
 mod library_view;
@@ -38,6 +37,7 @@ mod service;
 mod settings;
 mod settings_ui;
 mod share;
+mod transport;
 mod shell;
 mod shortcuts;
 mod sound;
@@ -289,11 +289,6 @@ pub(crate) fn app_icon() -> egui::IconData {
 }
 
 impl App {
-    /// The shortcut for `action` as text ("Option + F10"), or "no shortcut".
-    pub(crate) fn shortcut_label(&self, action: settings::ShortcutAction) -> String {
-        shortcuts::keys(self.settings.shortcuts.get(action)).map_or_else(|| "no shortcut".into(), |k| k.join(" + "))
-    }
-
     /// The shortcut for `action` as key names, for keycaps.
     pub(crate) fn shortcut_keys(&self, action: settings::ShortcutAction) -> Option<Vec<String>> {
         shortcuts::keys(self.settings.shortcuts.get(action))
@@ -471,6 +466,8 @@ struct App {
     pub(crate) glass_tiles: Vec<glass::Tile>,
     pub(crate) glass_origin: egui::Pos2,
     pub(crate) glass: glass::Glass,
+    /// The keyboard shortcuts dialog, for this screen.
+    pub(crate) show_keys: Option<shell::Keys>,
     /// Clips being dragged inside the window, to a game or collection.
     pub(crate) card_drag: Option<library::CardDrag>,
     /// Clips waiting for "Delete permanently?" to be answered.
@@ -641,6 +638,7 @@ impl App {
             glass_tiles: Vec::new(),
             glass_origin: egui::Pos2::ZERO,
             glass: Default::default(),
+            show_keys: None,
             last_poll: None,
             library_stamp: Vec::new(),
             library_filter: library::Filter::All,
@@ -950,6 +948,7 @@ impl eframe::App for App {
             || self.confirm_delete.is_some()
             || self.confirm_reset
             || self.close_dialog
+            || self.show_keys.is_some()
             || ctx.memory(|m| m.top_modal_layer().is_some())
             || ctx.any_popup_open();
         ui_kit::set_overlay_open(&ctx, overlay);
@@ -985,6 +984,7 @@ impl eframe::App for App {
         self.collection_dialog(&ctx);
         self.delete_dialog(&ctx);
         self.close_dialog(&ctx);
+        self.keys_dialog(&ctx);
         ui_kit::pointer_cursor(&ctx);
         ui_kit::lenient_clicks(&ctx);
         laps.lap("dialogs");
@@ -1494,6 +1494,13 @@ impl App {
                 let clip = v.clip().to_path_buf();
                 self.rename_clip(clip);
             }
+            viewer::ViewerOutcome::OpenExternal => {
+                let clip = v.clip().to_path_buf();
+                if let Err(e) = clips::open_in_default_app(&clip) {
+                    self.toast_error(format!("Couldn't open the clip: {e}"));
+                }
+            }
+            viewer::ViewerOutcome::Keys => self.show_keys = Some(shell::Keys::Player),
             viewer::ViewerOutcome::DragOut => {
                 let clip = v.clip().to_path_buf();
                 let preview = self.clips.iter().find(|c| c.path == clip).and_then(thumbs::cached_jpeg);
@@ -1515,6 +1522,7 @@ impl App {
         self.settings.editor_preview_share = ed.preview_share();
         match outcome {
             editor::EditorOutcome::Stay => {}
+            editor::EditorOutcome::Keys => self.show_keys = Some(shell::Keys::Editor),
             editor::EditorOutcome::Close => self.close_editor(),
             editor::EditorOutcome::Reverted(target) => {
                 match store::revert(&target) {
