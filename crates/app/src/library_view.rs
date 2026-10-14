@@ -138,10 +138,10 @@ impl App {
         let wide_page = wide;
         let (games_c, cols_c) = (games.clone(), collections.clone());
         let mut head_action = None;
-        self.page_head(
+        self.page_head_folding(
             &mut page_ui,
             "",
-            |app, ui| {
+            |app, ui, tight| {
                 if !wide_page {
                     if let Some(a) = app.narrow_filter_menu(ui, &title, &games_c, &cols_c) {
                         head_action = Some(a);
@@ -160,17 +160,36 @@ impl App {
                 ui.label(theme::text(&count, 13.5, W::Regular).color(theme::pal(ui).text3));
                 ui.add_space(2.0);
                 let sort = app.settings.library_sort;
-                let r = Btn::ghost(sort.label()).with_icon(icon::ARROWS_DOWN_UP).small().id("lib_sort").show(ui);
-                ui_kit::menu_popup(&r, true, 200.0, |ui| {
-                    for s in LibrarySort::ALL {
-                        if Item::new(s.label()).check(sort == s).show(ui).clicked() {
-                            app.settings.library_sort = s;
+                let all_folded = days.iter().all(|d| app.folded.contains(d));
+                let fold_label = if all_folded { "Expand all" } else { "Collapse all" };
+                if tight {
+                    // Not enough room: the order and fold-all in a menu (the
+                    // recorder keeps its words longer).
+                    let r = Btn::icon(Kind::Ghost, icon::DOTS_THREE).small().id("lib_more").tip(format!("Order: {}", sort.label())).show(ui);
+                    ui_kit::menu_popup(&r, true, 200.0, |ui| {
+                        ui_kit::menu_head(ui, "Order");
+                        for s in LibrarySort::ALL {
+                            if Item::new(s.label()).check(sort == s).show(ui).clicked() {
+                                app.settings.library_sort = s;
+                            }
                         }
-                    }
-                });
-                if days.len() > 1 {
-                    let all_folded = days.iter().all(|d| app.folded.contains(d));
-                    if Btn::ghost(if all_folded { "Expand all" } else { "Collapse all" }).small().id("lib_fold").show(ui).clicked() {
+                        if days.len() > 1 {
+                            ui_kit::menu_sep(ui);
+                            if Item::new(fold_label).icon(if all_folded { icon::ARROWS_OUT_SIMPLE } else { icon::ARROWS_IN_SIMPLE }).show(ui).clicked() {
+                                app.folded.set_all(&days, !all_folded);
+                            }
+                        }
+                    });
+                } else {
+                    let r = Btn::ghost(sort.label()).with_icon(icon::ARROWS_DOWN_UP).small().id("lib_sort").show(ui);
+                    ui_kit::menu_popup(&r, true, 200.0, |ui| {
+                        for s in LibrarySort::ALL {
+                            if Item::new(s.label()).check(sort == s).show(ui).clicked() {
+                                app.settings.library_sort = s;
+                            }
+                        }
+                    });
+                    if days.len() > 1 && Btn::ghost(fold_label).small().id("lib_fold").show(ui).clicked() {
                         app.folded.set_all(&days, !all_folded);
                     }
                 }

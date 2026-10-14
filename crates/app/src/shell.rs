@@ -348,6 +348,13 @@ impl App {
     /// then the recorder on the right. Dragging its empty space moves the
     /// window.
     pub(crate) fn page_head(&mut self, ui: &mut egui::Ui, title: &str, left: impl FnOnce(&mut Self, &mut egui::Ui)) {
+        self.page_head_folding(ui, title, |app, ui, _| left(app, ui));
+    }
+
+    /// [`Self::page_head`] for a heading with things it can fold away when
+    /// it's narrow (`left` gets `tight`: put them in a menu). Room runs out
+    /// in this order: first those fold, then the recorder drops its words.
+    pub(crate) fn page_head_folding(&mut self, ui: &mut egui::Ui, title: &str, left: impl FnOnce(&mut Self, &mut egui::Ui, bool)) {
         let p = theme::pal(ui);
         let rect = Rect::from_min_size(ui.cursor().min, vec2(ui.available_width(), HEAD_H));
         drag_window_area(ui, rect, "page_head");
@@ -363,22 +370,27 @@ impl App {
             // Compact only when the full one doesn't fit beside what the
             // left side needs (both as wide as last frame; the left side's
             // search can shrink, so it counts at its smallest).
+            // The left side's width, laid out in full and folded (each as
+            // last drawn; folded unknown until it's been drawn so: guessed).
             let full_key = egui::Id::new(("page_head_right", false));
-            let left_key = egui::Id::new(("page_head_left", title, ui.id()));
+            let left_key = |tight: bool| egui::Id::new(("page_head_left", title, tight));
             let full_w = ui.data(|d| d.get_temp::<f32>(full_key)).unwrap_or(340.0);
-            let left_need = ui.data(|d| d.get_temp::<f32>(left_key)).unwrap_or(0.0);
+            let left_full = ui.data(|d| d.get_temp::<f32>(left_key(false))).unwrap_or(0.0);
+            let left_tight = ui.data(|d| d.get_temp::<f32>(left_key(true))).unwrap_or(left_full * 0.6);
             let room = rect.right() - ui.cursor().min.x;
-            let compact = left_need + 16.0 + full_w > room;
+            let fits = |left: f32| left + 16.0 + full_w <= room;
+            let tight = !fits(left_full);
+            let compact = tight && !fits(left_tight);
             let key = egui::Id::new(("page_head_right", compact));
             let right_w = ui.data(|d| d.get_temp::<f32>(key)).unwrap_or(if compact { 230.0 } else { 340.0 });
             let left_rect = Rect::from_min_max(ui.cursor().min, Pos2::new((rect.right() - right_w - 16.0).max(ui.cursor().min.x + 40.0), rect.bottom()));
             let mut lui = ui.new_child(egui::UiBuilder::new().max_rect(left_rect).layout(egui::Layout::left_to_right(egui::Align::Center)));
-            left(self, &mut lui);
+            left(self, &mut lui, tight);
             // What the left side took, less the search's give (it shrinks to 80).
             let used = lui.min_rect().width();
             let give = (ui_kit::SEARCH_W - 80.0).max(0.0);
             let need = if title.is_empty() { used } else { (used - give).max(0.0) };
-            ui.data_mut(|d| d.insert_temp(left_key, need));
+            ui.data_mut(|d| d.insert_temp(left_key(tight), need));
             let right = ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let start = ui.cursor().max.x;
                 self.recorder(ui, compact);
