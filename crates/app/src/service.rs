@@ -42,6 +42,8 @@ pub enum Evt {
     State(Option<Mode>),
     Saved(PathBuf),
     Error(String),
+    /// Something to tell that isn't a failed start or save.
+    Notice(String),
 }
 
 /// For the signal handler: a way to stop the running capture and wait for its
@@ -146,7 +148,9 @@ impl CaptureService {
                         }
                     },
                     Cmd::UpdateVideo(video) => {
-                        recorder.update_video(&video);
+                        if !recorder.update_video(&video) {
+                            send(&evt_tx, Evt::Notice("Couldn't switch what's recorded while capturing. Stop and start again to record it.".into()));
+                        }
                     }
                     Cmd::ReplaySeconds(seconds) => recorder.set_replay_seconds(seconds),
                     Cmd::SetMic(id, device) => {

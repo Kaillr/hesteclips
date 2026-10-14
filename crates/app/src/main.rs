@@ -1066,6 +1066,27 @@ impl eframe::App for App {
             eprintln!("dev: quitting");
             self.quit(ctx);
         }
+        // `HESTECLIPS_DEV_SWITCH=<secs>` (with the above): switch between the
+        // whole screen and games and apps every so many seconds while
+        // clipping, and save a clip a second before quitting (to check
+        // switching mid-clip).
+        if let Some(every) = std::env::var("HESTECLIPS_DEV_SWITCH").ok().and_then(|s| s.parse::<f64>().ok())
+            && self.rec_state == RecState::Buffering
+        {
+            static STEP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let step = (launched.elapsed().as_secs_f64() / every) as u64;
+            if STEP.swap(step, std::sync::atomic::Ordering::Relaxed) != step && step > 0 {
+                let apps = matches!(self.settings.capture, settings::CaptureTarget::Apps { .. });
+                eprintln!("dev: switching to {}", if apps { "the whole screen" } else { "games and apps" });
+                self.settings.capture = if apps { settings::CaptureTarget::Screen } else { settings::CaptureTarget::Apps { apps: vec![settings::CaptureApp { id: "com.apple.Terminal".into(), name: "Terminal".into() }], away_screen: true } };
+            }
+            let quit_at = std::env::var("HESTECLIPS_DEV_BUFFER_QUIT").ok().and_then(|s| s.parse::<f64>().ok()).unwrap_or(f64::MAX);
+            static SAVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if launched.elapsed().as_secs_f64() > quit_at - 1.5 && !SAVED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("dev: saving a clip");
+                self.save_clip();
+            }
+        }
         self.background(ctx);
         self.pump_tray(ctx);
         self.handle_close(ctx);
@@ -1863,16 +1884,15 @@ impl App {
         self.rec_started = None;
     }
 
-    /// A changed list of games and apps reaches a running capture right away;
-    /// it starts following the new list without restarting.
+    /// What to record (games and apps, the whole screen, which display)
+    /// reaches a running capture right away; it switches without restarting.
     fn sync_capture_video(&mut self) {
         if self.rec_state == RecState::Idle {
             self.capturing_video = None;
             return;
         }
         let now = self.video_source();
-        let both_apps = matches!((&now, &self.capturing_video), (capture::VideoSource::Apps { .. }, Some(capture::VideoSource::Apps { .. })));
-        if both_apps && self.capturing_video.as_ref() != Some(&now) {
+        if self.capturing_video.as_ref() != Some(&now) {
             self.service.update_video(now.clone());
             self.capturing_video = Some(now);
         }
@@ -1956,6 +1976,7 @@ impl App {
                     self.saving = self.saving.saturating_sub(1);
                     self.toast_error(e);
                 }
+                Evt::Notice(e) => self.toast_error(e),
             }
         }
     }

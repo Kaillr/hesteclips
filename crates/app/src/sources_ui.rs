@@ -333,19 +333,19 @@ impl App {
             }
         });
 
-        // What to record. Switching kinds (or displays) needs a fresh start,
-        // so it waits while capturing; the app list below changes live.
+        // What to record: changes right away, while capturing too (the clip
+        // switches mid-way; nothing restarts). The display too, except on
+        // Linux, where the desktop picks it when capture starts.
         let stop_first = self.stop_first();
+        let display_locked = !idle && cfg!(target_os = "linux");
         if capture::APP_CAPTURE {
             let opts = [
-                crate::ui_kit::Seg { icon: Some(egui_phosphor::regular::MONITOR), label: "Whole screen", tip: Some(if idle { "Everything on one display" } else { stop_first }) },
-                crate::ui_kit::Seg { icon: Some(egui_phosphor::regular::APP_WINDOW), label: "Games and apps", tip: Some(if idle { "Only the games and apps you pick, following whichever you're using" } else { stop_first }) },
+                crate::ui_kit::Seg { icon: Some(egui_phosphor::regular::MONITOR), label: "Whole screen", tip: Some("Everything on one display") },
+                crate::ui_kit::Seg { icon: Some(egui_phosphor::regular::APP_WINDOW), label: "Games and apps", tip: Some("Only the games and apps you pick, following whichever you're using") },
             ];
             let w = ui.available_width();
             if let Some(i) = crate::ui_kit::segmented_opts(ui, "capture_kind", &opts, usize::from(apps_mode), Some(w), true) {
-                if !idle {
-                    self.toast_icon(egui_phosphor::regular::LOCK_SIMPLE, stop_first.trim_end_matches('.'));
-                } else if i == 0 && apps_mode {
+                if i == 0 && apps_mode {
                     let apps = std::mem::replace(&mut self.settings.capture, CaptureTarget::Screen);
                     if matches!(apps, CaptureTarget::Apps { .. }) {
                         self.settings.idle_apps = Some(apps);
@@ -386,11 +386,11 @@ impl App {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let names: Vec<String> = self.screens.iter().map(|d| d.name.clone()).collect();
                             let current = names.get(self.settings.display_index).cloned().unwrap_or_else(|| "Main display".to_owned());
-                            let r = crate::ui_kit::select(ui, &current, 180.0).on_hover_text(if idle { "" } else { stop_first });
-                            if !idle && r.clicked() {
+                            let r = crate::ui_kit::select(ui, &current, 180.0).on_hover_text(if display_locked { stop_first } else { "" });
+                            if display_locked && r.clicked() {
                                 egui::Popup::close_id(ui.ctx(), r.id.with("menu"));
                                 self.toast_icon(egui_phosphor::regular::LOCK_SIMPLE, stop_first.trim_end_matches('.'));
-                            } else if idle {
+                            } else if !display_locked {
                                 crate::ui_kit::menu_popup(&r, false, 240.0, |ui| {
                                     for (i, name) in names.iter().enumerate() {
                                         if crate::ui_kit::Item::new(name.clone()).check(self.settings.display_index == i).show(ui).clicked() {

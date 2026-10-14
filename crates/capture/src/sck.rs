@@ -171,7 +171,7 @@ impl Recorder for SckRecorder {
     }
 
     fn update_video(&mut self, video: &crate::VideoSource) -> bool {
-        self.session.as_ref().and_then(|s| s.video.as_ref()).is_some_and(|p| p.update(video))
+        self.session.as_mut().and_then(|s| s.video.as_mut()).is_some_and(|p| p.update(video))
     }
 
     fn set_mic(&mut self, id: &str, device: &str) -> bool {
@@ -222,10 +222,11 @@ struct Session {
 impl Session {
     fn start(s: &EncodeSettings, target: Target, live: &Arc<LiveAudio>) -> Result<Self> {
         let (content, display, (width, height)) = video::plan(&s.video, s.target_height)?;
-        // The away screen, converted once.
+        // The away screen, converted once (recording the whole screen too:
+        // it can switch to games and apps while it runs).
         let away = match &s.away_screen {
-            Some(img) if matches!(s.video, crate::VideoSource::Apps { .. }) => Some(Arc::new(video::still_buffer(Some(img), width, height)?)),
-            _ => None,
+            Some(img) => Some(Arc::new(video::still_buffer(Some(img), width, height)?)),
+            None => None,
         };
         let clock = Arc::new(Clock::default());
 

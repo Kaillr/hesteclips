@@ -82,14 +82,14 @@ impl PreviewCapture {
             let opened = (|| -> Result<(Picture, Frames)> {
                 let (content, display, size) = video::plan(&source, target_height)?;
                 let away = match &away {
-                    Some(img) if matches!(source, VideoSource::Apps { .. }) => Some(Arc::new(video::still_buffer(Some(img), size.0, size.1)?)),
-                    _ => None,
+                    Some(img) => Some(Arc::new(video::still_buffer(Some(img), size.0, size.1)?)),
+                    None => None,
                 };
                 let picture = Picture::start(&source, &content, &display, size, fps, away)?;
                 let frames = Frames::new(picture.latest.clone(), webcam.as_ref(), size.0, size.1, generation)?;
                 Ok((picture, frames))
             })();
-            let (picture, mut frames) = match opened {
+            let (mut picture, mut frames) = match opened {
                 Ok(p) => p,
                 Err(e) => {
                     *error2.lock().unwrap() = Some(format!("{e:#}"));

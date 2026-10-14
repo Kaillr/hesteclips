@@ -157,13 +157,7 @@ impl Recorder for WinRecorder {
     }
 
     fn update_video(&mut self, video: &VideoSource) -> bool {
-        match (AppsConfig::of(video), self.session.as_ref().and_then(|s| s.apps.as_ref())) {
-            (Some(config), Some(list)) => {
-                *list.lock().unwrap() = config;
-                true
-            }
-            _ => false,
-        }
+        self.session.as_mut().is_some_and(|s| s.update_video(video))
     }
 
     fn set_mic(&mut self, id: &str, device: &str) -> bool {
@@ -203,6 +197,9 @@ struct Session {
     video: Option<Video>,
     /// The games and apps being followed, when recording apps.
     apps: Option<AppList>,
+    /// What starting another kind of picture takes (whole screen, or games
+    /// and apps), to switch while it runs.
+    switch: Option<Switch>,
     pacer: Option<(Arc<AtomicBool>, JoinHandle<()>)>,
     audio: Option<AudioCapture>,
     mixer: Option<(Arc<AtomicBool>, JoinHandle<()>)>,
@@ -235,7 +232,7 @@ impl Session {
         let writer_tx = writer.tx.clone();
 
         let mut session =
-            Self { video: None, apps: None, pacer: None, audio: None, mixer: None, encoders: Vec::new(), writer_tx, writer: Some(writer) };
+            Self { video: None, apps: None, switch: None, pacer: None, audio: None, mixer: None, encoders: Vec::new(), writer_tx, writer: Some(writer) };
         let started = (|| -> Result<()> {
             // One PCM channel + AAC thread per track, in layout order: the mix,
             // each own track, the rest.
@@ -273,6 +270,7 @@ impl Session {
             let picture = picture_source.open(&gpu, canvas_w, canvas_h, looks_per_second, s.away_screen.clone())?;
             let latest = picture.latest.clone();
             session.video = Some(picture.video);
+            session.switch = Some(Switch { gpu: gpu.clone(), latest: latest.clone(), fps: looks_per_second, away: s.away_screen.clone(), source: s.video.clone() });
             // A webcam that can't open doesn't stop the recording: its status
             // says why, and the picture goes on without it.
             let camera = s.webcam.as_ref().and_then(|w| match camera::CameraLayer::new(&gpu, w) {
@@ -301,6 +299,52 @@ impl Session {
             return Err(e);
         }
         Ok(session)
+    }
+
+    /// Record something else without restarting: another list of games and
+    /// apps, or the whole screen instead of them (or the other way round, or
+    /// another display), into the same picture. False if it couldn't.
+    fn update_video(&mut self, video: &VideoSource) -> bool {
+        if let (Some(config), Some(list)) = (AppsConfig::of(video), self.apps.as_ref()) {
+            *list.lock().unwrap() = config;
+            if let Some(sw) = &mut self.switch {
+                sw.source = video.clone();
+            }
+            return true;
+        }
+        let Some(sw) = &mut self.switch else { return false };
+        if sw.source == *video {
+            return true;
+        }
+        let source = match PictureSource::plan(video) {
+            Ok((source, _)) => source,
+            Err(e) => {
+                eprintln!("can't switch what's recorded: {e:#}");
+                return false;
+            }
+        };
+        // The old one stops first: they'd both fill the picture.
+        if let Some(old) = self.video.take() {
+            old.stop();
+        }
+        let apps = source.apps();
+        match source.start(&sw.gpu, &sw.latest, sw.fps, sw.away.clone()) {
+            Ok(v) => {
+                self.video = Some(v);
+                self.apps = apps;
+                sw.source = video.clone();
+                true
+            }
+            Err(e) => {
+                eprintln!("can't switch what's recorded: {e:#}");
+                // Back to what it was recording.
+                if let Ok((old, _)) = PictureSource::plan(&sw.source) {
+                    self.apps = old.apps();
+                    self.video = old.start(&sw.gpu, &sw.latest, sw.fps, sw.away.clone()).ok();
+                }
+                false
+            }
+        }
     }
 
     /// Stop capturing and finish the file (record) or drop the ring (replay).
@@ -372,6 +416,16 @@ impl AppsConfig {
 /// Shared with the thread following the apps, so it can change while it runs.
 type AppList = Arc<std::sync::Mutex<AppsConfig>>;
 
+/// What starting another kind of picture into a running capture takes.
+struct Switch {
+    gpu: d3d::Gpu,
+    latest: Arc<d3d::Latest>,
+    fps: u32,
+    away: Option<Arc<crate::StillImage>>,
+    /// What it's recording now.
+    source: VideoSource,
+}
+
 /// A running capture and the texture it fills.
 struct Picture {
     video: Video,
@@ -402,15 +456,20 @@ impl PictureSource {
         // copy must hold all of it. A display is its own size; an app's window
         // can be on any display — on a portrait one, taller than the frame — so
         // it gets room for a window on the biggest of them.
-        let (copy_w, copy_h) = match &self {
-            PictureSource::Screen(..) => (width, height),
-            PictureSource::Apps(_) => {
-                let (w, h) = system::largest_display_box();
-                (w.max(width), h.max(height))
-            }
+        // Room for a window whatever it records now: it can switch to games
+        // and apps while it runs.
+        let (copy_w, copy_h) = {
+            let (w, h) = system::largest_display_box();
+            (w.max(width), h.max(height))
         };
         let latest = d3d::Latest::new(gpu, copy_w, copy_h)?;
-        let video = match self {
+        let video = self.start(gpu, &latest, fps, away)?;
+        Ok(Picture { video, latest })
+    }
+
+    /// Start recording into `latest`.
+    fn start(self, gpu: &d3d::Gpu, latest: &Arc<d3d::Latest>, fps: u32, away: Option<Arc<crate::StillImage>>) -> Result<Video> {
+        Ok(match self {
             PictureSource::Apps(list) => {
                 // The away screen (black with it off) until one of the
                 // apps' windows shows up.
@@ -434,8 +493,7 @@ impl PictureSource {
                 }
                 Video::follow_screen(gpu.clone(), latest.clone(), item, monitor, capture, fps, hook)
             }
-        };
-        Ok(Picture { video, latest })
+        })
     }
 
     /// The app list, when following apps.

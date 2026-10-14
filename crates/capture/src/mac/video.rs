@@ -237,12 +237,18 @@ pub(crate) fn plan(source: &VideoSource, target_height: Option<u32>) -> Result<(
 }
 
 /// One running capture: its stream, and for games and apps the thread that
-/// follows them.
+/// follows them. Whole screen or games and apps can be switched while it
+/// runs: the same stream, its filter swapped (the frame size stays).
 pub(crate) struct Picture {
     pub latest: Arc<Latest>,
     stream: Retained<SCStream>,
     _output: Retained<ScreenOutput>,
+    out: Arc<Output>,
     follow: Option<(Arc<AtomicBool>, JoinHandle<()>, Arc<Mutex<AppsConfig>>)>,
+    /// The display shown while recording the whole screen (by id).
+    display: String,
+    size: (usize, usize),
+    away: Option<Arc<Buffer>>,
 }
 
 /// The games and apps a capture follows, and what to show while you're in
@@ -292,7 +298,12 @@ impl Picture {
         unsafe { stream.addStreamOutput_type_sampleHandlerQueue_error(ProtocolObject::from_ref(&*output), SCStreamOutputType::Screen, Some(&queue)) }
             .map_err(|e| anyhow::anyhow!("can't capture the screen: {}", e.localizedDescription()))?;
         await_completion(|h| unsafe { stream.startCaptureWithCompletionHandler(Some(h)) }).map_err(|e| anyhow::anyhow!("couldn't start screen capture: {e}"))?;
-        let mut picture = Self { latest, stream, _output: output, follow: None };
+        let display_id = match source {
+            VideoSource::Screen { id, .. } => id.clone(),
+            VideoSource::Apps { .. } => String::new(),
+        };
+        let _ = content;
+        let mut picture = Self { latest, stream, _output: output, out, follow: None, display: display_id, size: (width, height), away };
         match apps {
             None => {
                 let deadline = Instant::now() + Duration::from_secs(3);
@@ -304,38 +315,79 @@ impl Picture {
                     thread::sleep(Duration::from_millis(10));
                 }
             }
-            Some(config) => {
-                let list = Arc::new(Mutex::new(config));
-                let stop = Arc::new(AtomicBool::new(false));
-                let stream = SendStream(picture.stream.clone());
-                let (latest, display, list2, stop2) = (picture.latest.clone(), unsafe { display.displayID() }, list.clone(), stop.clone());
-                let _ = content;
-                let handle = thread::spawn(move || follow_apps(stream, out, latest, display, list2, stop2, away, (width, height)));
-                picture.follow = Some((stop, handle, list));
-            }
+            Some(config) => picture.start_following(config),
         }
         Ok(picture)
     }
 
-    /// Follow a different list of games and apps without restarting. False
-    /// if this capture doesn't follow apps.
-    pub(crate) fn update(&self, source: &VideoSource) -> bool {
+    /// Start following games and apps (from the away screen).
+    fn start_following(&mut self, config: AppsConfig) {
+        let list = Arc::new(Mutex::new(config));
+        let stop = Arc::new(AtomicBool::new(false));
+        let stream = SendStream(self.stream.clone());
+        let (out, latest, list2, stop2, away, size) = (self.out.clone(), self.latest.clone(), list.clone(), stop.clone(), self.away.clone(), self.size);
+        let handle = thread::spawn(move || follow_apps(stream, out, latest, list2, stop2, away, size));
+        self.follow = Some((stop, handle, list));
+    }
+
+    fn stop_following(&mut self) {
+        if let Some((stop, handle, _)) = self.follow.take() {
+            stop.store(true, Ordering::Relaxed);
+            let _ = handle.join();
+        }
+    }
+
+    /// Record something else without restarting: another list of games and
+    /// apps, another display, or the whole screen instead of games and apps
+    /// (or the other way round). False if it couldn't.
+    pub(crate) fn update(&mut self, source: &VideoSource) -> bool {
         match (AppsConfig::of(source), &self.follow) {
             (Some(config), Some((_, _, list))) => {
                 *list.lock().unwrap() = config;
                 true
             }
-            _ => false,
+            (Some(config), None) => {
+                // From the whole screen: the away screen until one of them shows.
+                self.out.paused.store(true, Ordering::Relaxed);
+                show_away(&self.latest, self.away.as_ref().filter(|_| config.away_when_unfocused), self.size.0, self.size.1);
+                self.start_following(config);
+                true
+            }
+            (None, following) => {
+                let VideoSource::Screen { id, .. } = source else { return false };
+                if following.is_none() && *id == self.display {
+                    return true;
+                }
+                self.stop_following();
+                match show_display(&self.stream, id) {
+                    Ok(()) => {
+                        self.display = id.clone();
+                        *self.latest.app.lock().unwrap() = None;
+                        self.latest.waiting.store(false, Ordering::Relaxed);
+                        self.out.paused.store(false, Ordering::Relaxed);
+                        true
+                    }
+                    Err(e) => {
+                        eprintln!("can't switch to recording the screen: {e:#}");
+                        false
+                    }
+                }
+            }
         }
     }
 
     pub(crate) fn stop(mut self) {
-        if let Some((stop, handle, _)) = self.follow.take() {
-            stop.store(true, Ordering::Relaxed);
-            let _ = handle.join();
-        }
+        self.stop_following();
         let _ = await_completion(|h| unsafe { self.stream.stopCaptureWithCompletionHandler(Some(h)) });
     }
+}
+
+/// Point the stream at a whole display (by id; the main one if it's gone).
+fn show_display(stream: &SCStream, id: &str) -> Result<()> {
+    let content = shareable_content()?;
+    let display = pick_display(&content, id).context("no display to capture")?;
+    let filter = unsafe { SCContentFilter::initWithDisplay_excludingWindows(SCContentFilter::alloc(), &display, &NSArray::new()) };
+    await_completion(|h| unsafe { stream.updateContentFilter_completionHandler(&filter, Some(h)) }).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 struct SendStream(Retained<SCStream>);
@@ -389,7 +441,6 @@ fn follow_apps(
     stream: SendStream,
     out: Arc<Output>,
     latest: Arc<Latest>,
-    display_id: u32,
     list: Arc<Mutex<AppsConfig>>,
     stop: Arc<AtomicBool>,
     away: Option<Arc<Buffer>>,
@@ -510,7 +561,6 @@ fn follow_apps(
             thread::sleep(Duration::from_millis(20));
         }
     }
-    let _ = display_id;
 }
 
 /// Point the stream at window `id` (ScreenCaptureKit's list is fetched for it).
