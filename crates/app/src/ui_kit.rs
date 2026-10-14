@@ -870,7 +870,9 @@ impl<'a> Item<'a> {
     }
 
     pub fn show(self, ui: &mut egui::Ui) -> Response {
-        let w = ui.available_width().max(self.natural_width(ui)).max(menu_min_width(ui));
+        let natural = self.natural_width(ui);
+        menu_saw(ui, natural);
+        let w = natural.max(menu_min_width(ui));
         self.paint(ui, w, false)
     }
 
@@ -923,23 +925,64 @@ impl<'a> Item<'a> {
     }
 }
 
-fn menu_min_width_id() -> egui::Id {
-    egui::Id::new("ui_kit_menu_min_w")
+/// A menu's width and its widest row, kept by the menu's own `Ui`: as wide
+/// as asked, or as its widest row last frame when that's wider (a row can't
+/// see the ones after it). Never as wide as the room around it: a popup
+/// keeps the size its first frame had, and rows that filled the room made
+/// every menu as wide as the window.
+#[derive(Clone, Copy, Default)]
+struct MenuWidth {
+    asked: f32,
+    widest: f32,
+    /// The widest row so far this frame.
+    seen: f32,
 }
 
+/// The menu `ui` is in: its key, and its width. Rows sit in the menu's own
+/// `Ui` or a few levels inside it (a horizontal group, a scroll area).
+fn menu_of(ui: &egui::Ui) -> Option<(egui::Id, MenuWidth)> {
+    ui.stack().iter().take(6).find_map(|frame| {
+        let key = frame.id.with("ui_kit_menu_w");
+        ui.data(|d| d.get_temp::<MenuWidth>(key)).map(|m| (key, m))
+    })
+}
+
+/// The width rows of the menu `ui` is in are laid out at.
 fn menu_min_width(ui: &egui::Ui) -> f32 {
-    ui.data(|d| d.get_temp::<f32>(menu_min_width_id())).unwrap_or(0.0)
+    menu_of(ui).map_or(0.0, |(_, m)| m.asked.max(m.widest))
 }
 
-/// Lay out a menu's content at least `w` wide.
+/// A row that needs `w` was laid out in the menu `ui` is in.
+fn menu_saw(ui: &egui::Ui, w: f32) {
+    if let Some((key, _)) = menu_of(ui) {
+        ui.data_mut(|d| {
+            let m = d.get_temp_mut_or_default::<MenuWidth>(key);
+            m.seen = m.seen.max(w);
+        });
+    }
+}
+
+/// Lay out a menu's content `w` wide (wider when a row needs it).
 pub fn menu_width(ui: &mut egui::Ui, w: f32) {
-    ui.set_min_width(w);
-    ui.data_mut(|d| d.insert_temp(menu_min_width_id(), w));
+    let key = ui.id().with("ui_kit_menu_w");
+    let m = ui.data_mut(|d| {
+        let m = d.get_temp_mut_or_default::<MenuWidth>(key);
+        // Last frame's rows: the widest is the width now.
+        if m.seen > 0.0 {
+            m.widest = m.seen;
+        }
+        m.seen = 0.0;
+        m.asked = w;
+        *m
+    });
+    ui.set_width(m.asked.max(m.widest));
 }
 
 /// A row that opens a submenu to its right on hover.
 pub fn submenu<R>(ui: &mut egui::Ui, item: Item, content: impl FnOnce(&mut egui::Ui) -> R) -> Option<R> {
-    let w = ui.available_width().max(item.natural_width(ui) + 18.0).max(menu_min_width(ui));
+    let natural = item.natural_width(ui) + 18.0;
+    menu_saw(ui, natural);
+    let w = natural.max(menu_min_width(ui));
     let resp = item.paint(ui, w, true);
     let style = std::sync::Arc::new({
         let mut s = (*ui.ctx().global_style()).clone();
@@ -949,7 +992,7 @@ pub fn submenu<R>(ui: &mut egui::Ui, item: Item, content: impl FnOnce(&mut egui:
     egui::containers::menu::SubMenu::new()
         .config(egui::containers::menu::MenuConfig::new().style(egui::style::StyleModifier::new(move |s: &mut egui::Style| *s = (*style).clone())))
         .show(ui, &resp, |ui| {
-            menu_width(ui, 220.0);
+            menu_width(ui, menu_floor(220.0));
             content(ui)
         })
         .map(|r| r.inner)
@@ -959,7 +1002,7 @@ pub fn submenu<R>(ui: &mut egui::Ui, item: Item, content: impl FnOnce(&mut egui:
 pub fn menu_sep(ui: &mut egui::Ui) {
     let p = theme::pal(ui);
     ui.add_space(4.0);
-    let w = ui.available_width();
+    let w = menu_min_width(ui).max(1.0);
     let (r, _) = ui.allocate_exact_size(vec2(w, 1.0), Sense::hover());
     ui.painter().hline(r.x_range().shrink(4.0), r.center().y, Stroke::new(1.0, p.line));
     ui.add_space(4.0);
@@ -980,6 +1023,20 @@ pub fn menu_head(ui: &mut egui::Ui, text: &str) {
 /// right edge).
 pub fn menu_popup<R>(resp: &Response, left: bool, width: f32, content: impl FnOnce(&mut egui::Ui) -> R) -> Option<R> {
     let id = resp.id.with("menu");
+    // Dev aid: `HESTECLIPS_OPEN_MENU=<n>` opens the n-th menu button drawn
+    // (from 0) once, to see it without clicking.
+    #[cfg(debug_assertions)]
+    if let Some(n) = std::env::var("HESTECLIPS_OPEN_MENU").ok().and_then(|s| s.parse::<u64>().ok()) {
+        let key = egui::Id::new("ui_kit_dev_menu");
+        let (pass, count, done) = resp.ctx.data(|d| d.get_temp::<(u64, u64, bool)>(key)).unwrap_or_default();
+        let now = resp.ctx.cumulative_pass_nr();
+        let count = if pass == now { count } else { 0 };
+        let open = !done && count == n && resp.ctx.input(|i| i.time) > 2.5;
+        resp.ctx.data_mut(|d| d.insert_temp(key, (now, count + 1, done || open)));
+        if open {
+            egui::Popup::open_id(&resp.ctx, id);
+        }
+    }
     let ui_frame = menu_frame_ctx(&resp.ctx);
     egui::Popup::menu(resp)
         .id(id)
@@ -988,7 +1045,8 @@ pub fn menu_popup<R>(resp: &Response, left: bool, width: f32, content: impl FnOn
         .frame(ui_frame)
         .style(menu_style)
         .show(|ui| {
-            menu_width(ui, width);
+            // Never narrower than what opened it (a dropdown hangs from its field).
+            menu_width(ui, menu_floor(width).max(resp.rect.width() - 12.0));
             content(ui)
         })
         .map(|r| r.inner)
@@ -1001,10 +1059,17 @@ pub fn context_menu<R>(resp: &Response, width: f32, content: impl FnOnce(&mut eg
         .frame(frame)
         .style(menu_style)
         .show(|ui| {
-            menu_width(ui, width);
+            menu_width(ui, menu_floor(width));
             content(ui)
         })
         .map(|r| r.inner)
+}
+
+/// How narrow a menu may be: it's as wide as its widest row, so `asked`
+/// only keeps a short one from looking cramped (up to a point: a list of
+/// short values stays small).
+fn menu_floor(asked: f32) -> f32 {
+    asked.min(180.0)
 }
 
 fn menu_frame_ctx(ctx: &egui::Context) -> egui::Frame {
@@ -1417,7 +1482,8 @@ impl ValueField<'_> {
         chevron(ui.painter(), dd.center(), 3.5, turn, theme::mix(p.text3, p.text, dhv));
         let ddr = ddr.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Common values");
         let mut focus = false;
-        menu_popup(&ddr, false, 240.0, |ui| {
+        // As wide as the field (wider when a value's note needs it).
+        menu_popup(&ddr, false, self.width, |ui| {
             for (i, (label, _, note)) in self.presets.iter().enumerate() {
                 let mut item = Item::new(label.clone()).check(self.current == Some(i));
                 if !note.is_empty() {

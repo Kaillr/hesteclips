@@ -187,7 +187,7 @@ impl App {
                 .frame(ui_kit::menu_frame(ui))
                 .style(ui_kit::menu_style)
                 .show(|ui| {
-                    ui_kit::menu_width(ui, 250.0);
+                    ui_kit::menu_width(ui, 220.0);
                     self.recorder_menu(ui);
                 });
             if btn.show(ui).clicked() {

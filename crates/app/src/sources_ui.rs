@@ -484,13 +484,7 @@ impl App {
                 _ => false,
             };
             match (drawn, frame) {
-                (true, Some(f)) => {
-                    if f.waiting && matches!(&self.settings.capture, CaptureTarget::Apps { apps, .. } if apps.is_empty()) {
-                        let band = egui::Rect::from_center_size(rect.center_bottom() - egui::vec2(0.0, 22.0), egui::vec2(rect.width(), 28.0));
-                        p.rect_filled(band, 0.0, Color32::from_black_alpha(180));
-                        p.text(band.center(), egui::Align2::CENTER_CENTER, "Add a game or app below to start.", egui::FontId::proportional(13.0), Color32::from_gray(220));
-                    }
-                }
+                (true, Some(_)) => {}
                 _ => match self.video_preview.as_ref().and_then(|(_, p)| p.error()) {
                     Some(e) => message(&format!("No preview: {e}")),
                     None => message("Starting preview…"),
