@@ -77,7 +77,10 @@ impl App {
         match self.settings.library_sort {
             LibrarySort::Newest => {}
             LibrarySort::Oldest => shown.reverse(),
-            LibrarySort::Longest => shown.sort_by(|a, b| self.thumbs.duration(b).cmp(&self.thumbs.duration(a))),
+            LibrarySort::Longest => {
+                let lengths: std::collections::HashMap<PathBuf, Option<Duration>> = shown.iter().map(|c| (c.path.clone(), self.thumbs.duration(c))).collect();
+                shown.sort_by(|a, b| lengths[&b.path].cmp(&lengths[&a.path]));
+            }
             LibrarySort::Largest => shown.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes)),
         }
 
@@ -184,7 +187,10 @@ impl App {
         let mut grid_ui = page_ui.new_child(egui::UiBuilder::new().max_rect(grid_rect));
         let mut tiles: Vec<crate::glass::Tile> = Vec::new();
         let mut origin = Pos2::ZERO;
-        ui_kit::scroll(&mut grid_ui, "library_clips", |ui| {
+        // Another game or collection: its cards are simply in place (and
+        // arrive with the page), not sliding over from where they were.
+        let arriving = ui_kit::just_arrived(page_ui.ctx());
+        ui_kit::arrive(&mut grid_ui, |ui| ui_kit::scroll(ui, "library_clips", |ui| {
             origin = ui.cursor().min;
             let avail = ui.available_width();
             let cols = (((avail + GAP_X) / (MIN_CARD_W + GAP_X)).floor() as usize).clamp(1, 6);
@@ -213,11 +219,16 @@ impl App {
                 let h = full_h * open;
                 let top = ui.cursor().min;
                 let area = Rect::from_min_size(top, vec2(avail, h));
-                // Every clip's place for the glass, drawn or not.
+                // The places of the clips that light the panel (its first
+                // columns), drawn or not.
                 if open >= 1.0 {
                     for (i, card) in cards.iter().enumerate() {
+                        let col_x = (i % cols) as f32 * (card_w + GAP_X);
+                        if col_x > crate::glass::REACH {
+                            continue;
+                        }
                         if let Card::Clip(c) = card {
-                            let target = Pos2::new(top.x + (i % cols) as f32 * (card_w + GAP_X), top.y + (i / cols) as f32 * (card_h + GAP_Y));
+                            let target = Pos2::new(top.x + col_x, top.y + (i / cols) as f32 * (card_h + GAP_Y));
                             let rect = Rect::from_min_size(target - origin.to_vec2(), vec2(card_w, card_w * 9.0 / 16.0));
                             tiles.push(crate::glass::Tile { rect, path: c.path.clone(), small: self.thumbs.small(c) });
                         }
@@ -228,12 +239,16 @@ impl App {
                     for (i, card) in cards.iter().enumerate() {
                         let (r, c) = (i / cols, i % cols);
                         let target = Pos2::new(top.x + c as f32 * (card_w + GAP_X), top.y + r as f32 * (card_h + GAP_Y));
+                        // Only cards on screen (or nearly) are drawn and
+                        // animate; the others are kept where they belong, so
+                        // one coming into view slides in from there.
                         let key = card_key(card, &self.renders);
-                        let pos = self.card_pos(ui.ctx(), &key, target, top);
-                        let rect = Rect::from_min_size(pos, vec2(card_w, card_h));
-                        if !ui.is_rect_visible(rect.expand(card_h)) {
+                        let near = ui.is_rect_visible(Rect::from_min_size(target, vec2(card_w, card_h)).expand(card_h * 2.0));
+                        let pos = self.card_pos(ui.ctx(), &key, target, top, near && !arriving);
+                        if !near {
                             continue;
                         }
+                        let rect = Rect::from_min_size(pos, vec2(card_w, card_h));
                         let mut cui = ui.new_child(egui::UiBuilder::new().max_rect(rect));
                         cui.set_clip_rect(clip);
                         if open < 1.0 {
@@ -253,7 +268,7 @@ impl App {
                 ui.allocate_space(vec2(avail, h));
             }
             ui.add_space(if selecting { 90.0 } else { 28.0 });
-        });
+        }));
         // Clicking the grid's empty space deselects; right-click offers its menu.
         let bg = page_ui.interact(grid_rect, egui::Id::new("lib_bg"), Sense::click());
         if bg.clicked() && selecting {
@@ -285,11 +300,12 @@ impl App {
 
     /// Where a card is drawn: sliding to `target` when its place changes.
     /// Places are relative to the group's top, so scrolling doesn't animate.
-    fn card_pos(&mut self, ctx: &egui::Context, key: &str, target: Pos2, origin: Pos2) -> Pos2 {
+    fn card_pos(&mut self, ctx: &egui::Context, key: &str, target: Pos2, origin: Pos2, animate: bool) -> Pos2 {
         let id = egui::Id::new(("card_pos", key));
         let rel = target - origin;
-        let x = theme::value(ctx, id.with("x"), rel.x, theme::NORMAL * 1.4);
-        let y = theme::value(ctx, id.with("y"), rel.y, theme::NORMAL * 1.4);
+        let secs = if animate { theme::NORMAL * 1.4 } else { 0.0 };
+        let x = theme::value(ctx, id.with("x"), rel.x, secs);
+        let y = theme::value(ctx, id.with("y"), rel.y, secs);
         origin + vec2(x, y)
     }
 

@@ -266,7 +266,14 @@ struct Tween {
 pub fn value(ctx: &egui::Context, id: Id, target: f32, secs: f32) -> f32 {
     let now = ctx.input(|i| i.time);
     let id = id.with("tween");
+    // No time: there at once (a drag follows the pointer exactly).
     let tween = ctx.data(|d| d.get_temp::<Tween>(id));
+    if secs <= 0.0 {
+        if !tween.is_some_and(|tw| tw.from == target && tw.to == target) {
+            ctx.data_mut(|d| d.insert_temp(id, Tween { from: target, to: target, start: now, secs: 1.0 }));
+        }
+        return target;
+    }
     let current = |tw: &Tween| {
         let t = ((now - tw.start) as f32 / tw.secs.max(1e-3)).clamp(0.0, 1.0);
         tw.from + (tw.to - tw.from) * ease_out(t)

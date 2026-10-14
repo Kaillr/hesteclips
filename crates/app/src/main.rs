@@ -488,8 +488,9 @@ struct App {
     quitting: bool,
     /// The first close: ask whether to keep running in the tray.
     close_dialog: bool,
-    /// What was shown last frame, to scroll a new view back to the top.
-    last_view: Option<(Page, library::Filter)>,
+    /// What was shown last frame (page, library filter, Clip names open), to
+    /// scroll a new view back to the top and bring its content in.
+    last_view: Option<(Page, library::Filter, bool)>,
     /// Library auto-refresh: last folder poll + when the library's folders
     /// last changed, as last seen.
     last_poll: Option<Instant>,
@@ -971,11 +972,16 @@ impl eframe::App for App {
         ui_kit::set_overlay_open(&ctx, overlay);
         // Another page, game or collection starts at the top. Back from the
         // player or editor, the library stays where it was (and shows the clip).
-        let view = (self.page, self.library_filter.clone());
-        let reset = self.last_view.as_ref().is_some_and(|(page, filter)| {
+        let view = (self.page, self.library_filter.clone(), self.naming_open && self.page == Page::Settings);
+        let reset = self.last_view.as_ref().is_some_and(|(page, filter, _)| {
             (*page != view.0 && !matches!(page, Page::Edit | Page::View)) || (*filter != view.1 && view.0 == Page::Clips)
         });
         ui_kit::set_scroll_reset(&ctx, reset);
+        // Another page's content fades in and rises.
+        let arrived = self.last_view.as_ref().is_some_and(|(page, filter, naming)| *page != view.0 || (*filter != view.1 && view.0 == Page::Clips) || *naming != view.2);
+        if arrived {
+            ui_kit::page_changed(&ctx);
+        }
         self.last_view = Some(view);
         egui::CentralPanel::default()
             .frame(central)
@@ -984,8 +990,10 @@ impl eframe::App for App {
                 Page::Sources => self.sources_page(ui),
                 Page::Settings => self.settings_page(ui),
                 Page::VoiceReview => self.voice_review_page(ui),
-                Page::Edit => self.editor_page(ui),
-                Page::View => self.viewer_page(ui, frame),
+                // The player and editor have no rail or shared heading: all of
+                // them arrives.
+                Page::Edit => ui_kit::arrive(ui, |ui| self.editor_page(ui)),
+                Page::View => ui_kit::arrive_on(ui, if edge_to_edge { Color32::BLACK } else { p.base }, |ui| self.viewer_page(ui, frame)),
             });
 
         laps.lap(match self.page {

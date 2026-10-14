@@ -24,6 +24,8 @@ const SCALE: f32 = 1.0 / 8.0;
 const RADIUS: f32 = 150.0;
 /// The light is this much more saturated.
 const SATURATE: f32 = 2.6;
+/// Clips this far into the grid (from its left edge) light the card.
+pub const REACH: f32 = RADIUS * 1.5;
 
 #[derive(Default)]
 pub struct Glass {
@@ -55,8 +57,7 @@ pub fn paint(ui: &mut egui::Ui, card: Rect, app: &mut App) {
     let tiles = std::mem::take(&mut app.glass_tiles);
     // Only clips within a blur radius of the card light it: the grid's first
     // column or two.
-    let reach = RADIUS * 1.5;
-    let near: Vec<&Tile> = tiles.iter().filter(|t| t.rect.left() < reach).collect();
+    let near: Vec<&Tile> = tiles.iter().filter(|t| t.rect.left() < REACH).collect();
     use std::hash::{Hash, Hasher};
     let mut sig = std::collections::hash_map::DefaultHasher::new();
     p.dark.hash(&mut sig);
@@ -95,7 +96,7 @@ fn make(ctx: &egui::Context, glass: &mut Glass, tiles: &[&Tile], left: f32, p: &
     let bottom = tiles.iter().map(|t| t.rect.bottom()).fold(0.0, f32::max) + RADIUS;
     // Very long libraries: no taller than a GPU texture allows.
     let bottom = bottom.min(top + 8000.0 / SCALE);
-    let right = RADIUS * 1.5;
+    let right = REACH;
     let area = Rect::from_min_max(Pos2::new(left, top), Pos2::new(right.max(left + 1.0), bottom));
     let w = ((area.width() * SCALE).ceil() as usize).max(2);
     let h = ((area.height() * SCALE).ceil() as usize).max(2);

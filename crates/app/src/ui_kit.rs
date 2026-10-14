@@ -180,16 +180,75 @@ pub fn set_scroll_reset(ctx: &egui::Context, reset: bool) {
     ctx.data_mut(|d| d.insert_temp(scroll_reset_id(), reset));
 }
 
+fn page_arrived_id() -> egui::Id {
+    egui::Id::new("ui_kit_page_arrived")
+}
+
+/// Another page (or game, or collection) is shown from this frame: its
+/// content arrives with [`arrive`]. Set by the app.
+pub fn page_changed(ctx: &egui::Context) {
+    let now = ctx.input(|i| i.time);
+    ctx.data_mut(|d| d.insert_temp(page_arrived_id(), now));
+}
+
+/// Whether the page changed this very frame (see [`page_changed`]).
+pub fn just_arrived(ctx: &egui::Context) -> bool {
+    let now = ctx.input(|i| i.time);
+    ctx.data(|d| d.get_temp::<f64>(page_arrived_id())) == Some(now)
+}
+
+/// A page's content, under its heading: just after the page changes it
+/// fades in and rises a few points. The fade is a veil in the page's colour
+/// over what's drawn, so pictures the GPU draws (the player, the preview)
+/// fade too; content with one of those only fades (they can't move with it).
+pub fn arrive<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let bg = theme::pal(ui).base;
+    arrive_on(ui, bg, add)
+}
+
+/// [`arrive`] on a page whose background is `bg`.
+pub fn arrive_on<R>(ui: &mut egui::Ui, bg: Color32, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    const RISE: f32 = 10.0;
+    let ctx = ui.ctx().clone();
+    let Some(at) = ctx.data(|d| d.get_temp::<f64>(page_arrived_id())) else { return add(ui) };
+    let t = theme::since(&ctx, at, theme::SLOW);
+    if t >= 1.0 {
+        return add(ui);
+    }
+    let layer = ui.layer_id();
+    let start = ctx.graphics(|g| g.get(layer).map_or(0, |l| l.next_idx().0));
+    // Its scroll bar too, in the page's margin.
+    let mut area = ui.available_rect_before_wrap();
+    area.max.x += PAGE_MARGIN as f32;
+    let r = add(ui);
+    let dy = RISE * (1.0 - t);
+    let veil = theme::fade(bg, 1.0 - t);
+    ctx.graphics_mut(|g| {
+        let list = g.entry(layer);
+        let end = list.next_idx().0;
+        let gpu = list.all_entries().skip(start).any(|cs| matches!(cs.shape, egui::Shape::Callback(_)));
+        if !gpu {
+            for i in start..end {
+                list.mutate_shape(egui::layers::ShapeIdx(i), |cs| cs.shape.translate(vec2(0.0, dy)));
+            }
+        }
+        list.add(area.intersect(ui.clip_rect()), egui::Shape::rect_filled(area, 0, veil));
+    });
+    r
+}
+
 /// A page of settings-like content: scrolls, left-aligned on the page's
 /// margin, at most `max_width` wide.
 pub fn page(ui: &mut egui::Ui, id: &str, max_width: f32, add: impl FnOnce(&mut egui::Ui)) {
-    scroll(ui, id, |ui| {
-        let w = ui.available_width().min(max_width);
-        ui.vertical(|ui| {
-            ui.set_width(w);
-            add(ui);
-            ui.add_space(28.0);
-        });
+    arrive(ui, |ui| {
+        scroll(ui, id, |ui| {
+            let w = ui.available_width().min(max_width);
+            ui.vertical(|ui| {
+                ui.set_width(w);
+                add(ui);
+                ui.add_space(28.0);
+            });
+        })
     });
 }
 

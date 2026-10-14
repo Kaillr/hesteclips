@@ -88,7 +88,7 @@ impl App {
         crate::ui_kit::repaint_after(ui.ctx(), every);
 
         self.page_head(ui, "Sources", |_, _| {}, false);
-        crate::ui_kit::scroll(ui, "sources_page", |ui| {
+        crate::ui_kit::arrive(ui, |ui| crate::ui_kit::scroll(ui, "sources_page", |ui| {
             let w = ui.available_width();
             // Picture on the left, sound on the right, when there's room;
             // one above the other when there isn't.
@@ -117,7 +117,7 @@ impl App {
                 });
             }
             ui.add_space(28.0);
-        });
+        }));
         self.live_audio.set_limiter(self.settings.limiter);
     }
 

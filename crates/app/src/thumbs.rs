@@ -46,6 +46,9 @@ pub struct Thumbs {
     done_rx: Receiver<Done>,
     /// When unused pictures were last let go.
     swept: Instant,
+    /// Clip lengths read from the disk cache, so sorting by length doesn't
+    /// read a file per clip every frame.
+    durations: HashMap<u64, Option<Duration>>,
 }
 
 /// Pictures kept however long ago they were shown: a screenful or two and
@@ -78,7 +81,7 @@ impl Thumbs {
                 }
             });
         }
-        Self { ctx: app_ctx, ready: HashMap::new(), pending: HashSet::new(), job_tx, done_rx, swept: Instant::now() }
+        Self { ctx: app_ctx, ready: HashMap::new(), pending: HashSet::new(), job_tx, done_rx, swept: Instant::now(), durations: HashMap::new() }
     }
 
     pub fn ctx(&self) -> egui::Context {
@@ -118,12 +121,20 @@ impl Thumbs {
 
     /// The clip's length, if its picture has been made (it's found then),
     /// without asking for one.
-    pub fn duration(&self, clip: &Clip) -> Option<Duration> {
-        if let Some((t, _)) = self.ready.get(&key(clip)) {
+    pub fn duration(&mut self, clip: &Clip) -> Option<Duration> {
+        let k = key(clip);
+        if let Some((t, _)) = self.ready.get(&k) {
             return t.duration;
         }
-        let secs = std::fs::read_to_string(cache_dir().join(format!("{:016x}.dur", key(clip)))).ok()?.trim().parse::<f64>().ok()?;
-        Some(Duration::from_secs_f64(secs))
+        if let Some(d) = self.durations.get(&k) {
+            return *d;
+        }
+        let d = std::fs::read_to_string(cache_dir().join(format!("{k:016x}.dur"))).ok().and_then(|s| s.trim().parse::<f64>().ok()).map(Duration::from_secs_f64);
+        // Not made yet: asked for again once its picture is in (then `ready` has it).
+        if d.is_some() {
+            self.durations.insert(k, d);
+        }
+        d
     }
 }
 

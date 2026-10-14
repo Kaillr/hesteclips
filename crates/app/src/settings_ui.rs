@@ -56,6 +56,12 @@ impl App {
             },
             false,
         );
+        ui_kit::arrive(ui, |ui| self.settings_content(ui, width));
+        self.reset_dialog(ui.ctx());
+    }
+
+    /// Settings under the heading: the groups, and the section list.
+    fn settings_content(&mut self, ui: &mut egui::Ui, width: f32) {
         let filter = Filter { q: self.settings_query.trim().to_lowercase() };
         let wide = ui.available_width() >= width + 180.0;
         let page = ui.available_rect_before_wrap();
@@ -117,7 +123,6 @@ impl App {
                 ui.painter().vline(x - 0.75, my..=my + 28.0, egui::Stroke::new(1.5, p.text));
             }
         }
-        self.reset_dialog(ui.ctx());
     }
 
     /// One group of settings, filtered by the search. Returns whether it shows.
@@ -1028,7 +1033,7 @@ impl App {
             return;
         }
         let width = ui.available_width().min(COLUMN);
-        ui_kit::scroll(ui, "naming_page", |ui| {
+        ui_kit::arrive(ui, |ui| ui_kit::scroll(ui, "naming_page", |ui| {
             ui.vertical(|ui| {
                 ui.set_width(width);
                 let p = theme::pal(ui);
@@ -1084,7 +1089,7 @@ impl App {
                 }
                 ui.add_space(28.0);
             });
-        });
+        }));
     }
 }
 
