@@ -184,6 +184,9 @@ impl App {
         // The grid.
         let grid_rect = page_ui.available_rect_before_wrap();
         let selecting = !self.selection.is_empty();
+        // The grid's empty space, under the cards (made first, so a card
+        // gets its own clicks): a click deselects, right-click has its menu.
+        let bg = page_ui.interact(grid_rect, egui::Id::new("lib_bg"), Sense::click());
         let mut grid_ui = page_ui.new_child(egui::UiBuilder::new().max_rect(grid_rect));
         let mut tiles: Vec<crate::glass::Tile> = Vec::new();
         let mut origin = Pos2::ZERO;
@@ -269,8 +272,6 @@ impl App {
             }
             ui.add_space(if selecting { 90.0 } else { 28.0 });
         }));
-        // Clicking the grid's empty space deselects; right-click offers its menu.
-        let bg = page_ui.interact(grid_rect, egui::Id::new("lib_bg"), Sense::click());
         if bg.clicked() && selecting {
             action = Some(Action::Deselect);
         }
