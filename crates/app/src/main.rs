@@ -25,6 +25,7 @@ mod osu_plays;
 mod library;
 mod library_view;
 mod glass;
+mod hover_play;
 #[cfg(target_os = "linux")]
 mod linux_desktop;
 mod meter;
@@ -473,6 +474,10 @@ struct App {
     pub(crate) seen_new: std::collections::HashSet<PathBuf>,
     /// A clip brought back into view, and when: it flashes.
     pub(crate) flash_clip: Option<(PathBuf, f64)>,
+    /// The clip playing in its card under the pointer (see `hover_play`).
+    pub(crate) hover_play: Option<hover_play::HoverPlay>,
+    /// A card was under the pointer this frame (else `hover_play` stops).
+    pub(crate) hover_seen: bool,
     pub(crate) app_icon_tex: Option<egui::TextureHandle>,
     /// The grid's clips (in the grid's content coordinates) and where that
     /// content is on screen now, for the panel's glass.
@@ -653,6 +658,8 @@ impl App {
             connect_focused: false,
             seen_new: Default::default(),
             flash_clip: None,
+            hover_play: None,
+            hover_seen: false,
             app_icon_tex: None,
             glass_tiles: Vec::new(),
             glass_origin: egui::Pos2::ZERO,
@@ -920,6 +927,10 @@ impl eframe::App for App {
 
         self.navigate(&ctx);
 
+        // A clip plays in its card on Clips only.
+        if self.page != Page::Clips {
+            self.hover_play = None;
+        }
         // Hearing a microphone is for the Sources page only: never left on.
         if self.page != Page::Sources {
             self.listening = None;

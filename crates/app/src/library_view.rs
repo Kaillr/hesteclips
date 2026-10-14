@@ -39,6 +39,7 @@ const NEW_FOR: Duration = Duration::from_secs(60 * 30);
 
 impl App {
     pub(crate) fn library(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
+        self.hover_seen = false;
         // One card for a recording in progress, and one per clip still being written.
         let placeholders = usize::from(self.rec_state == RecState::Recording) + self.saving;
         let new_renders: Vec<usize> = (0..self.renders.len()).filter(|&i| self.renders[i].as_new).collect();
@@ -294,6 +295,10 @@ impl App {
         }
         if let Some(a) = self.finish_drag(ui.ctx()) {
             action = Some(a);
+        }
+        // Off every card: the clip playing in one stops.
+        if !self.hover_seen {
+            self.hover_play = None;
         }
         self.do_action(ui.ctx(), frame, action, &shown);
     }
@@ -760,7 +765,6 @@ impl App {
         let thumb = self.thumbs.get(&ctx, clip);
         let tex = thumb.and_then(|t| t.texture.clone());
         let duration = thumb.and_then(|t| t.duration);
-        let hv = theme::toggle(&ctx, resp.id.with("hv"), hovered, theme::FAST);
         let sel = theme::toggle(&ctx, resp.id.with("sel"), selected, theme::FAST);
         let render = self.renders.iter().find(|j| !j.as_new && j.source == clip.path).map(|j| j.progress());
 
@@ -768,21 +772,21 @@ impl App {
         let painter = ui.painter().clone();
         match &tex {
             Some(tex) => {
-                // A slow zoom on hover, inside the card's corners.
                 let uv = crate::filmstrip::crop_uv(tex.size_vec2(), thumb_rect.size());
-                let z = 0.025 * hv;
-                let uv = Rect::from_center_size(uv.center(), uv.size() * (1.0 - z));
-                let mut img = egui::Image::from_texture((tex.id(), thumb_rect.size())).uv(uv).corner_radius(ui_kit::RADIUS);
-                if hv > 0.0 {
-                    img = img.tint(theme::mix(Color32::WHITE, Color32::from_gray(255), hv));
-                }
-                img.paint_at(ui, thumb_rect);
-                if hv > 0.0 {
-                    painter.rect_filled(thumb_rect, ui_kit::RADIUS, Color32::from_white_alpha((hv * 10.0) as u8));
-                }
+                egui::Image::from_texture((tex.id(), thumb_rect.size())).uv(uv).corner_radius(ui_kit::RADIUS).paint_at(ui, thumb_rect);
             }
             None => {
                 painter.rect_filled(thumb_rect, ui_kit::RADIUS, p.raise2);
+            }
+        }
+        // Rested on: it plays, after a moment (while nothing's dragged or saved).
+        if hovered && render.is_none() && self.card_drag.is_none() {
+            crate::hover_play::HoverPlay::hovering(&mut self.hover_play, &clip.path);
+            self.hover_seen = true;
+        }
+        if let Some(h) = self.hover_play.as_mut().filter(|h| h.clip() == clip.path) {
+            if let Some(size) = h.update(&ctx) {
+                h.paint(ui, thumb_rect, size);
             }
         }
         // Selected: an outline a little outside the picture.
