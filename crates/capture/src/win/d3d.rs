@@ -42,6 +42,37 @@ impl Drop for ContextLock {
     }
 }
 
+/// Our GPU work goes ahead of the game's. A game that keeps the GPU busy
+/// (CS2 at 100%) otherwise gets it first: measured, a frame's capture,
+/// blending and conversion then finished 300-860 ms after it was submitted
+/// instead of within a frame, the encoder's frames all waited on it, and up to
+/// 190 frames in 5 s were skipped. What we ask for is a few percent of the
+/// GPU; the game gives that up either way, now without our frames waiting.
+/// OBS does the same. `HESTECLIPS_NO_GPU_PRIORITY=1` leaves it as it was.
+fn raise_gpu_priority(device: &ID3D11Device) {
+    if std::env::var_os("HESTECLIPS_NO_GPU_PRIORITY").is_some_and(|v| v != "0") {
+        return;
+    }
+    #[link(name = "gdi32")]
+    unsafe extern "system" {
+        fn D3DKMTSetProcessSchedulingPriorityClass(process: windows::Win32::Foundation::HANDLE, class: i32) -> i32;
+    }
+    /// D3DKMT_SCHEDULINGPRIORITYCLASS_HIGH (REALTIME needs administrator).
+    const HIGH: i32 = 4;
+    static PROCESS: std::sync::Once = std::sync::Once::new();
+    PROCESS.call_once(|| {
+        let status = unsafe { D3DKMTSetProcessSchedulingPriorityClass(windows::Win32::System::Threading::GetCurrentProcess(), HIGH) };
+        if status != 0 {
+            eprintln!("couldn't raise the GPU priority (status {status:#x})");
+        }
+    });
+    if let Ok(dxgi) = device.cast::<IDXGIDevice>() {
+        if let Err(e) = unsafe { dxgi.SetGPUThreadPriority(7) } {
+            eprintln!("couldn't raise the GPU thread priority: {e}");
+        }
+    }
+}
+
 /// The D3D11 device everything video runs on.
 #[derive(Clone)]
 pub(crate) struct Gpu {
@@ -98,6 +129,7 @@ impl Gpu {
                 let _ = mt.SetMultithreadProtected(true);
             }
         }
+        raise_gpu_priority(&device);
         Ok(Self { device, context, multithread })
     }
 
@@ -629,6 +661,10 @@ impl TexturePool {
 
     pub(crate) fn take(&self) -> Option<usize> {
         self.free.lock().unwrap().pop()
+    }
+
+    pub(crate) fn free_count(&self) -> usize {
+        self.free.lock().unwrap().len()
     }
 
     pub(crate) fn give(&self, slot: usize) {

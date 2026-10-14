@@ -50,7 +50,11 @@ pub(crate) struct Encoder {
 
 impl Encoder {
     pub(crate) fn start(gpu: &Gpu, width: u32, height: u32, s: &EncodeSettings, out: Sender<Command>) -> Result<Self> {
-        let pool = TexturePool::new(gpu, width, height, 8)?;
+        // Enough to ride out the GPU being taken by a game for a while: even
+        // with our raised GPU priority (`d3d::raise_gpu_priority`), CS2 kept
+        // a frame's work waiting up to ~230 ms now and then; 8 frames (133 ms
+        // at 60 fps) ran out and frames were skipped. ~3 MB each at 1080p.
+        let pool = TexturePool::new(gpu, width, height, 16)?;
         let (tx, rx) = mpsc::sync_channel::<Frame>(QUEUE);
         let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
         let (gpu2, pool2, s2) = (gpu.clone(), pool.clone(), s.clone());
@@ -412,7 +416,7 @@ impl Run {
                 }
                 sample.AddBuffer(&buffer)?;
                 self.stamp(&sample, frame.n)?;
-                let release: IMFAsyncCallback = Release { pool: self.pool.clone(), slot: frame.slot }.into();
+                let release: IMFAsyncCallback = Release { pool: self.pool.clone(), slot: frame.slot, given: Instant::now() }.into();
                 tracked.SetAllocator(&release, None)?;
                 mft.ProcessInput(0, &sample, 0)?;
             }
@@ -541,7 +545,14 @@ fn sequence_header(mft: &IMFTransform) -> Option<AvcConfig> {
 struct Release {
     pool: Arc<TexturePool>,
     slot: usize,
+    given: Instant,
 }
+
+/// How long the encoder held its frames (µs): the longest, and the total and
+/// count for the average. Read and reset by the encode diagnostics.
+pub(crate) static HELD_MAX_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static HELD_SUM_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static HELD_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl IMFAsyncCallback_Impl for Release_Impl {
     fn GetParameters(&self, _flags: *mut u32, _queue: *mut u32) -> windows::core::Result<()> {
@@ -549,6 +560,11 @@ impl IMFAsyncCallback_Impl for Release_Impl {
     }
 
     fn Invoke(&self, _result: windows::core::Ref<IMFAsyncResult>) -> windows::core::Result<()> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let us = self.given.elapsed().as_micros() as u64;
+        HELD_MAX_US.fetch_max(us, Relaxed);
+        HELD_SUM_US.fetch_add(us, Relaxed);
+        HELD_N.fetch_add(1, Relaxed);
         self.pool.give(self.slot);
         Ok(())
     }

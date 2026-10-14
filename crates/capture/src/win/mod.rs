@@ -1103,6 +1103,99 @@ struct BlendPacer {
     camera: Option<camera::CameraLayer>,
     dropped: u64,
     stats: BlendStats,
+    diag: Option<EncodeDiag>,
+}
+
+/// `HESTECLIPS_ENCODE_LOG=1`: where frames wait, logged every 5 s. How late
+/// the pacer closed frames and how long closing took (CPU), how long the GPU
+/// took to finish a frame's work after it was submitted, how long the encoder
+/// held frames, the fewest free encoder frames, and why frames were skipped.
+struct EncodeDiag {
+    since: Instant,
+    frames: u32,
+    late_max: f64,
+    close_max: Duration,
+    /// Queries ending each frame's GPU work, oldest first, with when.
+    pending: std::collections::VecDeque<(windows::Win32::Graphics::Direct3D11::ID3D11Query, Instant)>,
+    spare: Vec<windows::Win32::Graphics::Direct3D11::ID3D11Query>,
+    gpu_ms: Vec<f64>,
+    free_min: usize,
+    pool_empty: u32,
+    queue_full: u32,
+}
+
+impl EncodeDiag {
+    fn new() -> Option<Self> {
+        std::env::var_os("HESTECLIPS_ENCODE_LOG").map(|_| Self {
+            since: Instant::now(),
+            frames: 0,
+            late_max: 0.0,
+            close_max: Duration::ZERO,
+            pending: Default::default(),
+            spare: Vec::new(),
+            gpu_ms: Vec::new(),
+            free_min: usize::MAX,
+            pool_empty: 0,
+            queue_full: 0,
+        })
+    }
+
+    fn frame(&mut self, gpu: &d3d::Gpu, late: f64, close: Duration) {
+        use windows::Win32::Graphics::Direct3D11::{D3D11_ASYNC_GETDATA_DONOTFLUSH, D3D11_QUERY_DESC, D3D11_QUERY_EVENT};
+        self.frames += 1;
+        self.late_max = self.late_max.max(late);
+        self.close_max = self.close_max.max(close);
+        unsafe {
+            while let Some((q, at)) = self.pending.front() {
+                let mut done = 0i32;
+                let r = gpu.context.GetData(q, Some(&mut done as *mut i32 as *mut _), 4, D3D11_ASYNC_GETDATA_DONOTFLUSH.0 as u32);
+                if r.is_err() || done == 0 {
+                    break;
+                }
+                self.gpu_ms.push(at.elapsed().as_secs_f64() * 1000.0);
+                let (q, _) = self.pending.pop_front().unwrap();
+                self.spare.push(q);
+            }
+            let q = self.spare.pop().or_else(|| {
+                let mut q = None;
+                gpu.device.CreateQuery(&D3D11_QUERY_DESC { Query: D3D11_QUERY_EVENT, MiscFlags: 0 }, Some(&mut q)).ok()?;
+                q
+            });
+            if let Some(q) = q {
+                gpu.context.End(&q);
+                self.pending.push_back((q, Instant::now()));
+            }
+        }
+        if self.since.elapsed() < Duration::from_secs(5) {
+            return;
+        }
+        use std::sync::atomic::Ordering::Relaxed;
+        let held_max = h264::HELD_MAX_US.swap(0, Relaxed) as f64 / 1000.0;
+        let held_n = h264::HELD_N.swap(0, Relaxed).max(1);
+        let held_avg = h264::HELD_SUM_US.swap(0, Relaxed) as f64 / 1000.0 / held_n as f64;
+        self.gpu_ms.sort_by(f64::total_cmp);
+        let pct = |p: f64| self.gpu_ms.get(((self.gpu_ms.len() as f64 - 1.0) * p).round() as usize).copied().unwrap_or(f64::NAN);
+        eprintln!(
+            "encode: {} frames; closed up to {:.1} ms late, closing took up to {:.1} ms; GPU done after {:.1}/{:.1}/{:.1} ms (median/99%/max), {} unfinished; encoder held frames {:.1} ms avg, {:.1} max; fewest free frames {}; skipped {} (no free frame) + {} (queue full)",
+            self.frames,
+            self.late_max * 1000.0,
+            self.close_max.as_secs_f64() * 1000.0,
+            pct(0.5),
+            pct(0.99),
+            pct(1.0),
+            self.pending.len(),
+            held_avg,
+            held_max,
+            self.free_min,
+            self.pool_empty,
+            self.queue_full,
+        );
+        let pending = std::mem::take(&mut self.pending);
+        let spare = std::mem::take(&mut self.spare);
+        *self = Self::new().unwrap();
+        self.pending = pending;
+        self.spare = spare;
+    }
 }
 
 impl BlendPacer {
@@ -1141,6 +1234,8 @@ impl BlendPacer {
 
     /// Frame `k` is done: encode it.
     fn close(&mut self, k: i64) {
+        let started = Instant::now();
+        let late = host_now() - self.look_time((k + 1) * self.looks - 1);
         let different = std::mem::take(&mut self.different);
         if self.blend.finish().is_none() {
             return;
@@ -1149,6 +1244,9 @@ impl BlendPacer {
         if let Some(c) = self.camera.as_mut() {
             c.pull();
         }
+        if let Some(d) = self.diag.as_mut() {
+            d.free_min = d.free_min.min(self.encoder.pool.free_count());
+        }
         match self.encoder.pool.take() {
             Some(slot) => match self.converter.convert(slot) {
                 Ok(()) => {
@@ -1156,6 +1254,9 @@ impl BlendPacer {
                         encoded();
                     } else {
                         skipped(&mut self.dropped);
+                        if let Some(d) = self.diag.as_mut() {
+                            d.queue_full += 1;
+                        }
                     }
                 }
                 Err(e) => {
@@ -1163,10 +1264,18 @@ impl BlendPacer {
                     eprintln!("{e:#}");
                 }
             },
-            None => skipped(&mut self.dropped),
+            None => {
+                skipped(&mut self.dropped);
+                if let Some(d) = self.diag.as_mut() {
+                    d.pool_empty += 1;
+                }
+            }
         }
         if let Err(e) = self.preview.submit() {
             eprintln!("preview: {e:#}");
+        }
+        if let Some(d) = self.diag.as_mut() {
+            d.frame(&self.blend.gpu, late, started.elapsed());
         }
     }
 
@@ -1273,6 +1382,7 @@ fn spawn_blend_pacer(
             camera,
             dropped: 0,
             stats: BlendStats::new(),
+            diag: EncodeDiag::new(),
         };
         if latest.has_frame() {
             p.blend.hold(&latest);
