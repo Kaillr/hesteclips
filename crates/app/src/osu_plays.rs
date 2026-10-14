@@ -169,11 +169,14 @@ impl Tracker {
     }
 
     /// The name for a clip from `since` to `now`: the play on screen longest
-    /// in it.
+    /// in it. `None` when no play was on screen for at least a third of it:
+    /// a clip of something else that just caught the end of a map isn't the
+    /// map's.
     pub fn title(&self, since: Instant, now: Instant, fields: &GameTitles) -> Option<String> {
         let overlap = |p: &Play| p.end.min(now).saturating_duration_since(p.start.max(since));
         let play = self.plays.iter().filter(|p| !overlap(p).is_zero()).max_by_key(|p| overlap(p))?;
-        Some(name(play, fields))
+        let clip = now.saturating_duration_since(since);
+        (overlap(play) * 3 >= clip).then(|| name(play, fields))
     }
 }
 
@@ -502,6 +505,10 @@ mod tests {
         assert_eq!(title.as_deref(), Some("412pp · 98.52% FC · +HDDT · FREEDOM DiVE [FOUR DIMENSIONS]"));
         // Long after, nothing of it is in the clip.
         assert_eq!(t.title(at(100), at(130), &fields()), None);
+        // A minute's clip that only caught its last seconds: not the map's.
+        assert_eq!(t.title(at(40), at(100), &fields()), None);
+        // Half of it: the map's.
+        assert!(t.title(at(20), at(60), &fields()).is_some());
     }
 
     #[test]

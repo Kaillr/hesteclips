@@ -14,6 +14,12 @@
 //! Each kill becomes an event with the moment it happened; a clip's name sums
 //! up the events inside it (osu!: the play on screen longest in it). A clip
 //! with none keeps its usual name.
+//!
+//! **A clip is named after its best streak**, not everything in it: kills in
+//! a row without dying (CS2: and in one round; Dota 2 and League: in one
+//! fight, with no long gap between kills). A clip of a deathmatch or a long
+//! recording would otherwise add up kills from several lives ("9 kills"),
+//! which isn't what was clipped.
 
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -38,6 +44,10 @@ const KEEP: Duration = Duration::from_secs(4 * 3600);
 const MAX_EVENTS: usize = 5000;
 /// An ace or multikill this close to a kill is that kill's (see `moments`).
 const MERGE: Duration = Duration::from_millis(1500);
+/// Dota 2 and League: kills further apart than this are separate fights (a
+/// streak's kills are in one fight). Dota's own multikills allow 18 seconds
+/// between kills; League's 10.
+const FIGHT_GAP: Duration = Duration::from_secs(18);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Game {
@@ -48,12 +58,21 @@ enum Game {
 
 #[derive(Debug, Clone, PartialEq)]
 enum Kind {
-    /// `round`: CS2's round number (0 elsewhere).
-    Kill { headshot: bool, round: u64 },
+    /// `streak`: which run of kills it's part of; it changes when the player
+    /// dies, a new round starts (CS2) or a fight ends (Dota 2, League).
+    Kill { headshot: bool, streak: u64 },
     /// CS2: all five of the other team in one round.
-    Ace,
+    Ace { streak: u64 },
     /// League: two to five champions in a row.
-    Multikill(u32),
+    Multikill { n: u32, streak: u64 },
+}
+
+impl Kind {
+    fn streak(&self) -> u64 {
+        match *self {
+            Kind::Kill { streak, .. } | Kind::Ace { streak } | Kind::Multikill { streak, .. } => streak,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -174,15 +193,15 @@ impl Events {
             let label = match e.kind {
                 Kind::Kill { headshot: true, .. } => "Headshot".to_owned(),
                 Kind::Kill { .. } => "Kill".to_owned(),
-                Kind::Ace => "Ace".to_owned(),
-                Kind::Multikill(n) => match n {
+                Kind::Ace { .. } => "Ace".to_owned(),
+                Kind::Multikill { n, .. } => match n {
                     2..=5 => ["Double kill", "Triple kill", "Quadra kill", "Pentakill"][(n - 2) as usize].to_owned(),
                     _ => format!("{n} kills"),
                 },
             };
             // An ace or multikill comes with the kill that made it: that
             // kill is called by it, not pinned twice.
-            if matches!(e.kind, Kind::Ace | Kind::Multikill(_))
+            if matches!(e.kind, Kind::Ace { .. } | Kind::Multikill { .. })
                 && let Some(last) = out.last_mut().filter(|(a, _)| a.abs_diff(ago) <= MERGE)
             {
                 last.1 = label;
@@ -215,34 +234,40 @@ fn summarize(events: &[&Event]) -> Option<String> {
         .max_by_key(|(_, n)| *n)?
         .0;
     let mut events: Vec<&&Event> = events.iter().filter(|e| e.game == game).collect();
-    // CS2: a clip can span rounds, and "6 kills" can't happen in one. Name
-    // it after its best round (the latest of equals).
-    if game == Game::Cs2 {
-        let mut per_round = std::collections::BTreeMap::<u64, usize>::new();
-        for e in &events {
-            if let Kind::Kill { round, .. } = e.kind {
-                *per_round.entry(round).or_default() += 1;
+    // Named after the best streak in it: the most kills (then an ace or the
+    // biggest multikill, then the most headshots), the latest of equals.
+    // A clip spanning lives or rounds would otherwise add up kills that
+    // never happened together ("9 kills" in a deathmatch).
+    let mut streaks = std::collections::BTreeMap::<u64, (usize, bool, u32, usize)>::new();
+    for e in &events {
+        let s = streaks.entry(e.kind.streak()).or_default();
+        match e.kind {
+            Kind::Kill { headshot, .. } => {
+                s.0 += 1;
+                s.3 += usize::from(headshot);
             }
-        }
-        if let Some(best) = per_round.iter().max_by_key(|(r, n)| (**n, **r)).map(|(r, _)| *r) {
-            events.retain(|e| !matches!(e.kind, Kind::Kill { round, .. } if round != best));
+            Kind::Ace { .. } => s.1 = true,
+            Kind::Multikill { n, .. } => s.2 = s.2.max(n),
         }
     }
+    let best = streaks.iter().max_by_key(|(id, (kills, ace, multi, hs))| (*kills, *ace, *multi, *hs, **id)).map(|(id, _)| *id)?;
+    events.retain(|e| e.kind.streak() == best);
     let kills = events.iter().filter(|e| matches!(e.kind, Kind::Kill { .. })).count();
     let headshots = events.iter().filter(|e| matches!(e.kind, Kind::Kill { headshot: true, .. })).count();
+    let ace = events.iter().any(|e| matches!(e.kind, Kind::Ace { .. }));
     let context = events.iter().rev().find_map(|e| e.context.clone());
     let kills_text = |n: usize| if n == 1 { "1 kill".to_owned() } else { format!("{n} kills") };
     let what = match game {
-        Game::Cs2 if events.iter().any(|e| e.kind == Kind::Ace) => "Ace".to_owned(),
+        Game::Cs2 if ace => "Ace".to_owned(),
         Game::Cs2 if kills == 1 && headshots == 1 => "Headshot".to_owned(),
         Game::Cs2 if headshots > 0 => format!("{} ({headshots} {})", kills_text(kills), if headshots == 1 { "headshot" } else { "headshots" }),
-        Game::League => match events.iter().filter_map(|e| if let Kind::Multikill(n) = e.kind { Some(n) } else { None }).max() {
+        Game::League => match events.iter().filter_map(|e| if let Kind::Multikill { n, .. } = e.kind { Some(n) } else { None }).max() {
             Some(n) if n >= 2 => ["Double kill", "Triple kill", "Quadra kill", "Pentakill"][(n.min(5) - 2) as usize].to_owned(),
             _ => kills_text(kills),
         },
         _ => kills_text(kills),
     };
-    if kills == 0 && !events.iter().any(|e| e.kind == Kind::Ace) {
+    if kills == 0 && !ace {
         return None;
     }
     let joiner = if game == Game::Cs2 { "on" } else { "as" };
@@ -433,8 +458,18 @@ fn record_post(events: &Events, request: &str, body: &[u8]) {
 struct Cs2Tracker {
     map: Option<String>,
     kills: Option<u64>,
+    deaths: Option<u64>,
+    round: Option<u64>,
     round_kills: u64,
     round_hs: u64,
+    /// The current streak: it changes when the player dies or a round
+    /// starts (in a deathmatch, the round never ends: dying ends a streak).
+    streak: u64,
+    /// The player was dead at the last post about them.
+    dead: bool,
+    /// A death already counted from no health, whose rise in the death count
+    /// is still to come (it isn't another death).
+    death_seen: bool,
 }
 
 impl Cs2Tracker {
@@ -448,7 +483,8 @@ impl Cs2Tracker {
         }
         let map = state["map"]["name"].as_str().map(map_name);
         if map != self.map {
-            *self = Self { map: map.clone(), ..Self::default() };
+            let streak = self.streak + 1;
+            *self = Self { map: map.clone(), streak, ..Self::default() };
         }
         let (Some(kills), Some(round_kills), Some(round_hs)) = (
             player["match_stats"]["kills"].as_u64(),
@@ -458,19 +494,55 @@ impl Cs2Tracker {
             return Vec::new();
         };
         let round = state["map"]["round"].as_u64().unwrap_or(0);
-        let mut found = Vec::new();
-        let new_kills = self.kills.map_or(0, |k| kills.saturating_sub(k));
-        // Headshots this round, beyond those already counted (it resets each round).
-        let new_hs = if round_kills >= self.round_kills { round_hs.saturating_sub(self.round_hs) } else { round_hs };
-        for k in 0..new_kills {
-            found.push((Kind::Kill { headshot: k < new_hs, round }, self.map.clone()));
+        let deaths = player["match_stats"]["deaths"].as_u64();
+        let dead = player["state"]["health"].as_u64() == Some(0);
+        // A streak ends with a death or a new round. A death shows as no
+        // health, or only as the death count going up next time the post is
+        // about the player (while dead, posts are mostly about whoever is
+        // watched); seen as both, it's one death.
+        let counted = matches!((self.deaths, deaths), (Some(a), Some(b)) if b > a);
+        let fell = dead && !self.dead;
+        let died = fell || (counted && !self.death_seen);
+        if fell {
+            self.death_seen = !counted;
+        } else if counted {
+            self.death_seen = false;
         }
-        if self.kills.is_some() && round_kills >= 5 && self.round_kills < 5 {
-            found.push((Kind::Ace, self.map.clone()));
+        let new_round = self.round.is_some_and(|r| r != round);
+        // The round's counts start over each round (and with each life in a
+        // deathmatch): what's beyond them counts from zero.
+        let fresh = new_round || round_kills < self.round_kills;
+        let new_kills = self.kills.map_or(0, |k| kills.saturating_sub(k));
+        let new_hs = if fresh { round_hs } else { round_hs.saturating_sub(self.round_hs) };
+        let mut found = Vec::new();
+        let warmup = state["map"]["phase"].as_str() == Some("warmup");
+        // A new round: its kills are a new streak.
+        if new_round {
+            self.streak += 1;
+        }
+        if !warmup {
+            for k in 0..new_kills {
+                found.push((Kind::Kill { headshot: k < new_hs, streak: self.streak }, self.map.clone()));
+            }
+            // An ace: the other team's five, in one round. Not in a deathmatch
+            // (no team, and five a life is common) nor Wingman (two of them).
+            let mode = state["map"]["mode"].as_str().unwrap_or("");
+            let team_of_five = !matches!(mode, "deathmatch" | "scrimcomp2v2" | "wingman" | "gungameprogressive" | "gungametrbomb" | "armsrace");
+            if team_of_five && self.kills.is_some() && round_kills >= 5 && (self.round_kills < 5 || fresh) {
+                found.push((Kind::Ace { streak: self.streak }, self.map.clone()));
+            }
+        }
+        // Died: what follows is a new streak (kills seen in the same post were
+        // made before it).
+        if died {
+            self.streak += 1;
         }
         self.kills = Some(kills);
+        self.deaths = deaths.or(self.deaths);
+        self.round = Some(round);
         self.round_kills = round_kills;
         self.round_hs = round_hs;
+        self.dead = dead;
         found
     }
 }
@@ -493,20 +565,44 @@ fn map_name(id: &str) -> String {
 struct DotaTracker {
     match_id: Option<String>,
     kills: Option<u64>,
+    deaths: Option<u64>,
+    /// The current streak (one fight): it changes when the player dies or
+    /// kills nothing for [`FIGHT_GAP`].
+    streak: u64,
+    last_kill: Option<Instant>,
 }
 
 impl DotaTracker {
     fn update(&mut self, state: &Value) -> Vec<(Kind, Option<String>)> {
+        self.update_at(state, Instant::now())
+    }
+
+    fn update_at(&mut self, state: &Value, now: Instant) -> Vec<(Kind, Option<String>)> {
         let match_id = state["map"]["matchid"].as_str().map(str::to_owned);
         if match_id != self.match_id {
-            *self = Self { match_id, kills: None };
+            let streak = self.streak + 1;
+            *self = Self { match_id, streak, ..Self::default() };
         }
         // Spectating: `player` holds teams rather than one player.
         let Some(kills) = state["player"]["kills"].as_u64() else { return Vec::new() };
+        let deaths = state["player"]["deaths"].as_u64();
         let hero = state["hero"]["name"].as_str().map(hero_name);
         let new = self.kills.map_or(0, |k| kills.saturating_sub(k));
+        if new > 0 && self.last_kill.is_some_and(|t| now.saturating_duration_since(t) > FIGHT_GAP) {
+            self.streak += 1;
+        }
+        let found = (0..new).map(|_| (Kind::Kill { headshot: false, streak: self.streak }, hero.clone())).collect();
+        if new > 0 {
+            self.last_kill = Some(now);
+        }
+        // Died: the next kills are another fight (kills in the same post came first).
+        if matches!((self.deaths, deaths), (Some(a), Some(b)) if b > a) {
+            self.streak += 1;
+            self.last_kill = None;
+        }
         self.kills = Some(kills);
-        (0..new).map(|_| (Kind::Kill { headshot: false, round: 0 }, hero.clone())).collect()
+        self.deaths = deaths.or(self.deaths);
+        found
     }
 }
 
@@ -599,6 +695,10 @@ fn poll_league(events: &Events) {
 struct LeagueTracker {
     /// The last event already looked at (`None`: none yet this match).
     last_id: Option<i64>,
+    /// The current streak (one fight): it changes when the player dies or
+    /// kills nothing for [`FIGHT_GAP`] (game time).
+    streak: u64,
+    last_kill: Option<f64>,
 }
 
 impl LeagueTracker {
@@ -623,10 +723,23 @@ impl LeagueTracker {
                 continue;
             }
             self.last_id = Some(id);
-            let ago = Duration::from_secs_f64((game_time - e["EventTime"].as_f64().unwrap_or(game_time)).max(0.0));
+            let at = e["EventTime"].as_f64().unwrap_or(game_time);
+            let ago = Duration::from_secs_f64((game_time - at).max(0.0));
             let kind = match e["EventName"].as_str() {
-                Some("ChampionKill") if is_me(&e["KillerName"]) => Kind::Kill { headshot: false, round: 0 },
-                Some("Multikill") if is_me(&e["KillerName"]) => Kind::Multikill(e["KillStreak"].as_u64().unwrap_or(0) as u32),
+                Some("ChampionKill") if is_me(&e["VictimName"]) => {
+                    // Died: the next kills are another fight.
+                    self.streak += 1;
+                    self.last_kill = None;
+                    continue;
+                }
+                Some("ChampionKill") if is_me(&e["KillerName"]) => {
+                    if self.last_kill.is_some_and(|t| at - t > FIGHT_GAP.as_secs_f64()) {
+                        self.streak += 1;
+                    }
+                    self.last_kill = Some(at);
+                    Kind::Kill { headshot: false, streak: self.streak }
+                }
+                Some("Multikill") if is_me(&e["KillerName"]) => Kind::Multikill { n: e["KillStreak"].as_u64().unwrap_or(0) as u32, streak: self.streak },
                 _ => continue,
             };
             found.push((ago, kind, champion.clone()));
@@ -645,10 +758,18 @@ mod tests {
     }
 
     fn cs_state_in(round: u64, kills: u64, round_kills: u64, hs: u64) -> Value {
+        cs_full("competitive", "live", round, kills, 0, round_kills, hs, 100)
+    }
+
+    /// A CS2 post about the player: the mode and phase, the round, their
+    /// kills and deaths in the match, kills and headshots this round (or
+    /// this life, in a deathmatch) and health.
+    #[allow(clippy::too_many_arguments)]
+    fn cs_full(mode: &str, phase: &str, round: u64, kills: u64, deaths: u64, round_kills: u64, hs: u64, health: u64) -> Value {
         json!({
             "provider": {"steamid": "1"},
-            "map": {"name": "de_mirage", "round": round},
-            "player": {"steamid": "1", "state": {"round_kills": round_kills, "round_killhs": hs}, "match_stats": {"kills": kills}},
+            "map": {"name": "de_mirage", "mode": mode, "phase": phase, "round": round},
+            "player": {"steamid": "1", "state": {"health": health, "round_kills": round_kills, "round_killhs": hs}, "match_stats": {"kills": kills, "deaths": deaths}},
             "auth": {"token": GSI_TOKEN}
         })
     }
@@ -693,6 +814,122 @@ mod tests {
         assert_eq!(summary_of(found, Game::Cs2).as_deref(), Some("Ace on Mirage"));
     }
 
+    /// A deathmatch is one long round: a clip spanning several lives is
+    /// named after its best life, not all of its kills together, and five
+    /// kills in a life isn't an ace.
+    #[test]
+    fn cs2_deathmatch_names_the_best_life() {
+        let mut t = Cs2Tracker::default();
+        let dm = |kills, deaths, rk, hs, health| cs_full("deathmatch", "live", 0, kills, deaths, rk, hs, health);
+        let mut found = t.update(&dm(10, 3, 0, 0, 100));
+        // A life: 3 kills (1 headshot), then dead (the post says so: no health).
+        found.extend(t.update(&dm(11, 3, 1, 1, 100)));
+        found.extend(t.update(&dm(13, 3, 3, 1, 100)));
+        found.extend(t.update(&dm(13, 3, 3, 1, 0)));
+        // While dead, posts are about whoever's watched: ignored.
+        let mut other = dm(40, 9, 2, 0, 100);
+        other["player"]["steamid"] = json!("2");
+        found.extend(t.update(&other));
+        // Respawned (the death counted now): 5 kills, 2 headshots, then a
+        // death seen only in the count.
+        for (k, hs) in [(1, 0), (2, 1), (3, 1), (4, 2), (5, 2)] {
+            found.extend(t.update(&dm(13 + k, 4, k, hs, 100)));
+        }
+        found.extend(t.update(&dm(18, 5, 0, 0, 100)));
+        // Another life: 2 kills.
+        found.extend(t.update(&dm(19, 5, 1, 0, 100)));
+        found.extend(t.update(&dm(20, 5, 2, 0, 100)));
+        assert_eq!(found.iter().filter(|(k, _)| matches!(k, Kind::Kill { .. })).count(), 10);
+        assert!(!found.iter().any(|(k, _)| matches!(k, Kind::Ace { .. })), "no ace in a deathmatch");
+        assert_eq!(summary_of(found, Game::Cs2).as_deref(), Some("5 kills (2 headshots) on Mirage"));
+    }
+
+    /// Kills seen in the same post as the death were made before it: they
+    /// stay with that life.
+    #[test]
+    fn cs2_kills_before_a_death_stay_in_that_life() {
+        let mut t = Cs2Tracker::default();
+        let dm = |kills, deaths, rk, health| cs_full("deathmatch", "live", 0, kills, deaths, rk, 0, health);
+        let mut found = t.update(&dm(0, 0, 0, 100));
+        found.extend(t.update(&dm(1, 0, 1, 100)));
+        // Traded: the second kill and the death in one post.
+        found.extend(t.update(&dm(2, 1, 2, 0)));
+        found.extend(t.update(&dm(3, 1, 1, 100)));
+        assert_eq!(summary_of(found, Game::Cs2).as_deref(), Some("2 kills on Mirage"));
+    }
+
+    /// Competitive: a round ends a streak even without dying, and an ace is
+    /// still an ace; warmup kills don't count.
+    #[test]
+    fn cs2_rounds_aces_and_warmup() {
+        let mut t = Cs2Tracker::default();
+        let mut found = t.update(&cs_full("competitive", "warmup", 0, 0, 0, 0, 0, 100));
+        found.extend(t.update(&cs_full("competitive", "warmup", 0, 6, 0, 6, 0, 100)));
+        assert!(found.is_empty(), "warmup: {found:?}");
+        // The match starts: counts start over.
+        found.extend(t.update(&cs_full("competitive", "live", 1, 0, 0, 0, 0, 100)));
+        for k in 1..=5 {
+            found.extend(t.update(&cs_full("competitive", "live", 1, k, 0, k, 0, 100)));
+        }
+        // The next round, alive: 2 kills, a separate streak.
+        found.extend(t.update(&cs_full("competitive", "live", 2, 6, 0, 1, 0, 100)));
+        found.extend(t.update(&cs_full("competitive", "live", 2, 7, 0, 2, 0, 100)));
+        assert_eq!(found.iter().filter(|(k, _)| matches!(k, Kind::Ace { .. })).count(), 1);
+        assert_eq!(summary_of(found, Game::Cs2).as_deref(), Some("Ace on Mirage"));
+    }
+
+    /// Equal streaks: the latest is named (it's likely what was clipped:
+    /// it's what just happened when the clip was saved).
+    #[test]
+    fn the_latest_of_equal_streaks() {
+        let mut t = Cs2Tracker::default();
+        let dm = |kills, deaths, rk, hs| cs_full("deathmatch", "live", 0, kills, deaths, rk, hs, 100);
+        let mut found = t.update(&dm(0, 0, 0, 0));
+        found.extend(t.update(&dm(2, 0, 2, 0)));
+        found.extend(t.update(&dm(2, 1, 0, 0)));
+        found.extend(t.update(&dm(4, 1, 2, 2)));
+        assert_eq!(summary_of(found, Game::Cs2).as_deref(), Some("2 kills (2 headshots) on Mirage"));
+    }
+
+    /// Dota 2: a fight is kills without a long gap and without dying.
+    #[test]
+    fn dota_names_the_best_fight() {
+        let mut t = DotaTracker::default();
+        let state = |k: u64, d: u64| json!({"map": {"matchid": "9"}, "player": {"kills": k, "deaths": d}, "hero": {"name": "npc_dota_hero_nevermore"}});
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let mut found = t.update_at(&state(0, 0), at(0));
+        // A fight: 2 kills 5 s apart. A minute later, another: 3 kills.
+        found.extend(t.update_at(&state(1, 0), at(10)));
+        found.extend(t.update_at(&state(2, 0), at(15)));
+        found.extend(t.update_at(&state(3, 0), at(80)));
+        found.extend(t.update_at(&state(4, 0), at(84)));
+        found.extend(t.update_at(&state(5, 0), at(90)));
+        // Died, then one more right after respawning.
+        found.extend(t.update_at(&state(5, 1), at(95)));
+        found.extend(t.update_at(&state(6, 1), at(99)));
+        assert_eq!(summary_of(found, Game::Dota2).as_deref(), Some("3 kills as Shadow Fiend"));
+    }
+
+    /// League: dying ends a fight's streak.
+    #[test]
+    fn league_death_ends_a_streak() {
+        let mut t = LeagueTracker::default();
+        let data = json!({
+            "activePlayer": {"riotIdGameName": "Me"},
+            "allPlayers": [{"riotIdGameName": "Me", "championName": "Jinx"}],
+            "gameData": {"gameTime": 100.0},
+            "events": {"Events": [
+                {"EventID": 1, "EventName": "ChampionKill", "EventTime": 60.0, "KillerName": "Me", "VictimName": "A"},
+                {"EventID": 2, "EventName": "ChampionKill", "EventTime": 64.0, "KillerName": "Me", "VictimName": "B"},
+                {"EventID": 3, "EventName": "ChampionKill", "EventTime": 66.0, "KillerName": "C", "VictimName": "Me"},
+                {"EventID": 4, "EventName": "ChampionKill", "EventTime": 70.0, "KillerName": "Me", "VictimName": "C"}
+            ]}
+        });
+        let found = t.update(&data).into_iter().map(|(_, k, c)| (k, c)).collect();
+        assert_eq!(summary_of(found, Game::League).as_deref(), Some("2 kills as Jinx"));
+    }
+
     #[test]
     fn dota_kills() {
         let mut t = DotaTracker::default();
@@ -732,13 +969,13 @@ mod tests {
         let now = Instant::now();
         {
             let mut s = events.state.lock().unwrap();
-            let kill = Kind::Kill { headshot: false, round: 0 };
+            let kill = Kind::Kill { headshot: false, streak: 0 };
             s.push(now - Duration::from_secs(20), Game::League, kill.clone(), None);
             s.push(now - Duration::from_secs(8), Game::League, kill, None);
             // The multikill comes with the second kill: it names it.
-            s.push(now - Duration::from_secs(8), Game::League, Kind::Multikill(2), None);
+            s.push(now - Duration::from_secs(8), Game::League, Kind::Multikill { n: 2, streak: 0 }, None);
             // Before the clip.
-            s.push(now - Duration::from_secs(90), Game::League, Kind::Kill { headshot: false, round: 0 }, None);
+            s.push(now - Duration::from_secs(90), Game::League, Kind::Kill { headshot: false, streak: 0 }, None);
         }
         let m = events.moments(now - Duration::from_secs(60), now);
         assert_eq!(m, vec![(Duration::from_secs(20), "Kill".to_owned()), (Duration::from_secs(8), "Double kill".to_owned())]);
