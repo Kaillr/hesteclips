@@ -183,6 +183,8 @@ fn main() -> eframe::Result<()> {
         Box::new(|cc| {
             #[cfg(hw_decode)]
             gpu_frames::init(cc.wgpu_render_state.as_ref(), &cc.egui_ctx);
+            #[cfg(target_os = "macos")]
+            shell::centre_window_buttons(cc);
             ui_kit::apply(&cc.egui_ctx);
             Ok(Box::new(App::new(cc.egui_ctx.clone(), instance)))
         }),

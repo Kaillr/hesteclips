@@ -25,12 +25,35 @@ use crate::{App, Page, RecState, thumbs};
 /// The rail's width.
 pub const RAIL_W: f32 = 78.0;
 /// The height of a page's heading row (the recorder's row).
-pub const HEAD_H: f32 = 64.0;
+pub const HEAD_H: f32 = 52.0;
 
 /// Whether the window draws under a see-through title bar (macOS): the rail
 /// and headers keep clear of the traffic lights.
 pub fn under_titlebar() -> bool {
     cfg!(target_os = "macos")
+}
+
+/// macOS: the window's buttons (close, minimise, fullscreen) centred in a
+/// title bar as tall as the headings ([`HEAD_H`]), as Finder's are: an empty
+/// toolbar in the unified style does it, and macOS keeps them there through
+/// resizing, fullscreen and focus (moving the buttons by hand has to be
+/// redone after each, and flickers).
+#[cfg(target_os = "macos")]
+pub fn centre_window_buttons(window: &impl raw_window_handle::HasWindowHandle) {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSToolbar, NSView, NSWindowToolbarStyle};
+    use objc2_foundation::NSString;
+    use raw_window_handle::RawWindowHandle;
+    let Ok(handle) = window.window_handle() else { return };
+    let RawWindowHandle::AppKit(h) = handle.as_raw() else { return };
+    let Some(mtm) = MainThreadMarker::new() else { return };
+    // SAFETY: eframe's AppKit handle points at the live content NSView, and
+    // this runs on the main thread (checked above).
+    let view: &NSView = unsafe { h.ns_view.cast::<NSView>().as_ref() };
+    let Some(window) = view.window() else { return };
+    let toolbar = NSToolbar::initWithIdentifier(mtm.alloc(), &NSString::from_str("hesteclips"));
+    window.setToolbar(Some(&toolbar));
+    window.setToolbarStyle(NSWindowToolbarStyle::Unified);
 }
 
 /// Which screen's keyboard shortcuts to show.
