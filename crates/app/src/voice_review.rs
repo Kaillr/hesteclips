@@ -14,7 +14,7 @@
 
 use std::time::{Duration, Instant};
 
-use egui::{Color32, Key, Rect, RichText, Sense, Stroke, pos2, vec2};
+use egui::{Color32, Key, Rect, Sense, Stroke, pos2, vec2};
 use media::PREVIEW_RATE;
 
 use crate::player::SoundPlayer;
@@ -218,43 +218,46 @@ impl App {
             r.remove();
         }
 
+        let total = r.list.len();
+        let answered = r.list.iter().filter(|s| s.meta.label != Label::Unreviewed).count();
+        self.page_head(
+            ui,
+            "",
+            |_, ui| {
+                back |= ui_kit::Btn::icon(ui_kit::Kind::Ghost, egui_phosphor::regular::CARET_LEFT).tip("Back to Settings  (Esc)").show(ui).clicked();
+                let p = crate::theme::pal(ui);
+                ui.label(crate::theme::text("Voice samples", 20.0, crate::theme::W::Semibold).color(p.text));
+                if total > 0 {
+                    ui.add_space(4.0);
+                    ui.label(crate::theme::text(format!("{answered} of {total} answered"), 13.5, crate::theme::W::Regular).color(p.text3));
+                }
+            },
+            false,
+        );
         ui_kit::page(ui, "voice_review", 720.0, |ui| {
             let top = ui.allocate_space(vec2(1.0, 1.0)).1;
-            ui.add_space(8.0);
-            let total = r.list.len();
-            let answered = r.list.iter().filter(|s| s.meta.label != Label::Unreviewed).count();
-
-            // Where you are, and how far along.
-            ui.horizontal(|ui| {
-                if ui.add(egui::Button::new(RichText::new("\u{2039}  Settings").color(ui.visuals().weak_text_color())).frame(false)).clicked() {
-                    back = true;
-                }
-            });
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Voice samples").size(22.0).strong());
-                if total > 0 {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.weak(format!("{answered} of {total} answered"));
-                    });
-                }
-            });
             if total > 0 {
-                ui.add_space(8.0);
-                ui.add(egui::ProgressBar::new(answered as f32 / total as f32).desired_height(4.0).fill(ui_kit::ACCENT).corner_radius(2));
+                // How far along: the bar eases as answers come in.
+                let p = crate::theme::pal(ui);
+                let (bar, _) = ui.allocate_exact_size(vec2(ui.available_width(), 3.0), Sense::hover());
+                ui.painter().rect_filled(bar, 2, p.control);
+                let f = crate::theme::value(ui.ctx(), egui::Id::new("voice_progress"), answered as f32 / total as f32, crate::theme::NORMAL);
+                ui.painter().rect_filled(Rect::from_min_max(bar.min, pos2(bar.left() + bar.width() * f, bar.bottom())), 2, p.text2);
             }
             ui.add_space(16.0);
 
             if total == 0 {
                 ui_kit::card(ui, |ui| {
+                    let p = crate::theme::pal(ui);
                     ui.add_space(8.0);
-                    ui.label(RichText::new("No samples yet").size(16.0).strong());
+                    ui.label(crate::theme::text("No samples yet", 15.0, crate::theme::W::Semibold).color(p.text));
                     ui.add_space(4.0);
-                    if collecting {
-                        ui.weak("They appear while the replay buffer runs, when the voice command saves a clip or nearly does.");
+                    let text = if collecting {
+                        "They appear while clipping, when the voice command saves a clip or nearly does."
                     } else {
-                        ui.weak("Turn on \"Keep samples to improve it\" under Voice in Settings, and they appear while the replay buffer runs.");
-                    }
+                        "Turn on “Keep voice samples” under Voice in Settings, and they appear while clipping."
+                    };
+                    ui_kit::hint(ui, text);
                     ui.add_space(8.0);
                 });
                 return;
@@ -264,19 +267,20 @@ impl App {
                 ui_kit::card(ui, |ui| self.review_card(ui, &mut r, &s, &mut say));
             } else {
                 ui_kit::card(ui, |ui| {
+                    let p = crate::theme::pal(ui);
                     ui.add_space(8.0);
-                    ui.label(RichText::new("All caught up").size(18.0).strong());
+                    ui.label(crate::theme::text("All caught up", 15.0, crate::theme::W::Semibold).color(p.text));
                     ui.add_space(4.0);
-                    ui.weak("Every sample has an answer. Pick one below to change it, or share them to help improve the detector.");
+                    ui_kit::hint(ui, "Every sample has an answer. Pick one below to change it, or export them to help improve the detector.");
                     ui.add_space(8.0);
                 });
             }
 
             // Sharing.
             let ready = r.list.iter().filter(|s| s.shareable()).count();
-            ui.add_space(24.0);
-            ui.label(RichText::new("Help improve the detector").size(15.0).strong());
-            ui.add_space(8.0);
+            ui.add_space(26.0);
+            ui.label(crate::theme::text("Help improve the detector", 13.0, crate::theme::W::Semibold).color(crate::theme::pal(ui).text2));
+            ui.add_space(6.0);
             ui_kit::card(ui, |ui| {
                 ui_kit::hint(
                     ui,
@@ -294,12 +298,12 @@ impl App {
                         if ui.add(ui_kit::button("Cancel", false)).clicked() {
                             r.confirm_delete_all = false;
                         }
-                    } else if ui.add(egui::Button::new(RichText::new("Delete all").color(ui_kit::DANGER)).frame(false)).clicked() {
+                    } else if ui_kit::Btn::new(ui_kit::Kind::DangerText, "Delete all").small().show(ui).clicked() {
                         r.confirm_delete_all = true;
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let label = if ready == 0 { "Export".to_owned() } else { format!("Export {ready}") };
-                        if ui.add_enabled(ready > 0, ui_kit::button(label, true)).clicked() {
+                        if ui_kit::Btn::normal(label).enabled(ready > 0).show(ui).clicked() {
                             let picked = rfd::FileDialog::new().set_file_name("hesteclips-voice-samples.zip").add_filter("Zip file", &["zip"]).save_file();
                             if let Some(path) = picked {
                                 say = Some(match voice_samples::export(&path, &r.list) {
@@ -313,33 +317,60 @@ impl App {
             });
 
             // All of them, out of the way until wanted.
-            ui.add_space(24.0);
+            ui.add_space(26.0);
             let mut pick = None;
-            egui::CollapsingHeader::new(RichText::new(format!("All samples ({total})")).size(15.0).strong()).default_open(false).show(ui, |ui| {
-                ui.add_space(4.0);
-                for s in &r.list {
-                    let selected = r.selected.as_deref() == Some(&s.meta.id);
-                    let row = ui.horizontal(|ui| {
-                        let (dot, _) = ui.allocate_exact_size(vec2(14.0, 18.0), Sense::hover());
-                        let center = dot.center();
-                        let weak = ui.visuals().weak_text_color();
-                        match s.meta.label {
-                            Label::Trigger => ui.painter().circle_filled(center, 4.5, ui_kit::ACCENT),
-                            Label::Ignore => ui.painter().circle_filled(center, 4.5, weak),
-                            Label::Unreviewed => ui.painter().circle_stroke(center, 4.0, Stroke::new(1.5, weak)),
-                        };
-                        let answer = match s.meta.label {
-                            Label::Unreviewed => "Not answered",
-                            Label::Trigger => "Should save a clip",
-                            Label::Ignore => "Shouldn't save a clip",
-                        };
-                        ui.selectable_label(selected, format!("{}   {}   ·   {answer}", when(s), s.meta.kind.describe())).clicked()
-                    });
-                    if row.inner {
-                        pick = Some(s.meta.id.clone());
-                    }
-                }
+            let p = crate::theme::pal(ui);
+            let open_id = egui::Id::new("voice_all_open");
+            let open = ui.data(|d| d.get_temp::<bool>(open_id)).unwrap_or(false);
+            let head = ui.horizontal(|ui| {
+                let turn = crate::theme::toggle(ui.ctx(), open_id.with("turn"), !open, crate::theme::NORMAL);
+                let (r, _) = ui.allocate_exact_size(vec2(14.0, 18.0), Sense::hover());
+                let a = -std::f32::consts::FRAC_PI_2 * turn;
+                let rot = |v: egui::Vec2| vec2(v.x * a.cos() - v.y * a.sin(), v.x * a.sin() + v.y * a.cos());
+                let c = r.center();
+                ui.painter().add(egui::Shape::line(vec![c + rot(vec2(-4.0, -2.0)), c + rot(vec2(0.0, 2.0)), c + rot(vec2(4.0, -2.0))], Stroke::new(1.6, p.text3)));
+                ui.label(crate::theme::text(format!("All samples ({total})"), 13.0, crate::theme::W::Semibold).color(p.text2));
             });
+            if ui.interact(head.response.rect, open_id.with("click"), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                ui.data_mut(|d| d.insert_temp(open_id, !open));
+            }
+            let shown = crate::theme::toggle(ui.ctx(), open_id.with("shown"), open, crate::theme::NORMAL);
+            if shown > 0.0 {
+                ui.add_space(6.0);
+                ui.scope(|ui| {
+                    ui.multiply_opacity(shown);
+                    egui::Frame::new().fill(p.raise).corner_radius(8).inner_margin(egui::Margin::same(5)).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.spacing_mut().item_spacing.y = 1.0;
+                        for s in &r.list {
+                            let selected = r.selected.as_deref() == Some(&s.meta.id);
+                            let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 32.0), Sense::click());
+                            let hv = crate::theme::toggle(ui.ctx(), resp.id.with("hv"), resp.hovered(), crate::theme::FAST);
+                            if selected {
+                                ui.painter().rect_filled(rect, 5, p.seg_on);
+                            } else if hv > 0.0 {
+                                ui.painter().rect_filled(rect, 5, crate::theme::fade(p.sel, hv));
+                            }
+                            let center = pos2(rect.left() + 14.0, rect.center().y);
+                            match s.meta.label {
+                                Label::Trigger => ui.painter().circle_filled(center, 4.0, p.text),
+                                Label::Ignore => ui.painter().circle_filled(center, 4.0, p.text3),
+                                Label::Unreviewed => ui.painter().circle_stroke(center, 3.5, Stroke::new(1.5, p.text3)),
+                            };
+                            let answer = match s.meta.label {
+                                Label::Unreviewed => "Not answered",
+                                Label::Trigger => "Should save a clip",
+                                Label::Ignore => "Shouldn't save a clip",
+                            };
+                            ui.painter().text(pos2(rect.left() + 28.0, rect.center().y), egui::Align2::LEFT_CENTER, format!("{}  ·  {}", when(s), s.meta.kind.describe()), crate::theme::font(13.0, crate::theme::W::Regular), p.text);
+                            ui.painter().text(pos2(rect.right() - 10.0, rect.center().y), egui::Align2::RIGHT_CENTER, answer, crate::theme::font(12.5, crate::theme::W::Regular), p.text3);
+                            if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                pick = Some(s.meta.id.clone());
+                            }
+                        }
+                    });
+                });
+            }
             if let Some(id) = pick {
                 r.select(&id);
                 ui.scroll_to_rect(top, Some(egui::Align::TOP));
@@ -362,14 +393,15 @@ impl App {
     /// The task: hear it, decide.
     fn review_card(&mut self, ui: &mut egui::Ui, r: &mut Review, s: &Sample, say: &mut Option<(String, bool)>) {
         let ctx = ui.ctx().clone();
+        let p = crate::theme::pal(ui);
         ui.horizontal(|ui| {
-            ui.label(RichText::new(s.meta.kind.describe()).size(16.0).strong());
+            ui.label(crate::theme::text(s.meta.kind.describe(), 15.0, crate::theme::W::Semibold).color(p.text));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.weak(when(s));
+                ui.label(crate::theme::text(when(s), 12.5, crate::theme::W::Regular).color(p.text3));
             });
         });
         if s.meta.kind != Kind::ByHand {
-            ui.weak(format!("The detector was {:.0}% sure", s.meta.score * 100.0));
+            ui_kit::hint(ui, &format!("The detector was {:.0}% sure", s.meta.score * 100.0));
         }
         ui.add_space(12.0);
 
@@ -395,9 +427,9 @@ impl App {
             }
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                ui.weak(format!("Highlighted {:.1} s of {:.1} s. Drag its ends to choose what to judge, or drag over the sound to scrub.", r.trim.1 - r.trim.0, s.secs));
+                ui.add(egui::Label::new(crate::theme::text(format!("Highlighted {:.1} s of {:.1} s. Drag its ends to choose what to judge, or drag over the sound to scrub.", r.trim.1 - r.trim.0, s.secs), 12.5, crate::theme::W::Regular).color(p.text3)).wrap());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.add(egui::Button::new(RichText::new("Select all").color(ui_kit::ACCENT)).frame(false)).clicked() {
+                    if ui_kit::Btn::ghost("Select all").small().show(ui).clicked() {
                         r.trim = (0.0, s.secs);
                     }
                 });
@@ -413,27 +445,22 @@ impl App {
         }
 
         ui.add_space(20.0);
-        ui.label(RichText::new("Should this save a clip?").size(18.0).strong());
+        ui.label(crate::theme::text("Should this save a clip?", 15.0, crate::theme::W::Semibold).color(p.text));
         ui.add_space(10.0);
-        let gap = 12.0;
+        let gap = 8.0;
         let w = (ui.available_width() - gap) / 2.0;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = gap;
             let chosen = |l: Label| s.meta.label == l;
-            let answer = |ui: &mut egui::Ui, text: &str, primary: bool, on: bool| {
-                let mut b = egui::Button::new(RichText::new(text).size(16.0).color(if primary { Color32::WHITE } else { ui.visuals().text_color() }));
-                if primary {
-                    b = b.fill(ui_kit::ACCENT);
-                }
-                if on {
-                    b = b.stroke(Stroke::new(2.0, if primary { Color32::WHITE } else { ui_kit::ACCENT }));
-                }
-                ui.add_sized([w, 48.0], b).clicked()
-            };
-            if answer(ui, "No", false, chosen(Label::Ignore)) {
+            // The answer already given shows as chosen (a check before it).
+            let no = ui_kit::Btn::normal("No").min_width(w).id("voice_no");
+            let no = if chosen(Label::Ignore) { no.with_icon(egui_phosphor::regular::CHECK) } else { no };
+            if no.show(ui).clicked() {
                 r.judge(Label::Ignore);
             }
-            if answer(ui, "Yes, save a clip", true, chosen(Label::Trigger)) {
+            let yes = ui_kit::Btn::primary("Yes, save a clip").min_width(w).id("voice_yes");
+            let yes = if chosen(Label::Trigger) { yes.with_icon(egui_phosphor::regular::CHECK) } else { yes };
+            if yes.show(ui).clicked() {
                 r.judge(Label::Trigger);
             }
         });
@@ -442,20 +469,22 @@ impl App {
 
         ui.add_space(14.0);
         ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
             for (key, what) in [("Y", "Yes"), ("N", "No"), ("Space", "Play"), ("\u{2190} \u{2192}", "Move"), ("Del", "Delete")] {
-                keycap(ui, key);
-                ui.add_space(-2.0);
-                ui.label(RichText::new(what).size(12.0).color(ui.visuals().weak_text_color()));
+                let w = ui_kit::key_hint_width(ui, &[key.to_owned()], 11.0);
+                let (r, _) = ui.allocate_exact_size(vec2(w, 20.0), Sense::hover());
+                ui_kit::key_hint(ui.painter(), r.left_center(), &[key.to_owned()], 11.0, p.text2);
+                ui.label(crate::theme::text(what, 12.0, crate::theme::W::Regular).color(p.text3));
                 ui.add_space(8.0);
             }
         });
         ui.add_space(10.0);
         ui.horizontal(|ui| {
-            if ui.add(egui::Button::new(RichText::new("Delete sample").color(ui_kit::DANGER)).frame(false)).clicked() {
+            if ui_kit::Btn::new(ui_kit::Kind::DangerText, "Delete sample").with_icon(egui_phosphor::regular::TRASH).small().show(ui).clicked() {
                 r.remove();
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.add(ui_kit::button("Skip", false)).clicked() {
+                if ui_kit::Btn::ghost("Skip").show(ui).clicked() {
                     r.skip();
                 }
             });
@@ -464,30 +493,16 @@ impl App {
     }
 }
 
-/// A key as it looks on a keyboard.
-fn keycap(ui: &mut egui::Ui, key: &str) {
-    let v = ui.visuals().clone();
-    egui::Frame::new()
-        .fill(ui_kit::hover(&v))
-        .stroke(Stroke::new(1.0, ui_kit::line(v.dark_mode)))
-        .corner_radius(4)
-        .inner_margin(egui::Margin::symmetric(6, 1))
-        .show(ui, |ui| ui.label(RichText::new(key).size(11.0).monospace().color(v.strong_text_color())));
-}
-
 /// A round play/stop button.
 fn play_button(ui: &mut egui::Ui, playing: bool) -> egui::Response {
     let (rect, r) = ui.allocate_exact_size(vec2(48.0, 48.0), Sense::click());
     let c = rect.center();
+    let pal = crate::theme::pal(ui);
+    let hv = crate::theme::toggle(ui.ctx(), r.id.with("hv"), r.hovered(), crate::theme::FAST);
     let p = ui.painter();
-    p.circle_filled(c, 24.0, if r.hovered() { ui_kit::ACCENT.gamma_multiply(0.85) } else { ui_kit::ACCENT });
-    if playing {
-        for dx in [-6.0, 2.0] {
-            p.rect_filled(Rect::from_min_size(pos2(c.x + dx, c.y - 8.0), vec2(4.0, 16.0)), 1.0, Color32::WHITE);
-        }
-    } else {
-        p.add(egui::Shape::convex_polygon(vec![pos2(c.x - 6.0, c.y - 10.0), pos2(c.x - 6.0, c.y + 10.0), pos2(c.x + 10.0, c.y)], Color32::WHITE, Stroke::NONE));
-    }
+    p.circle_filled(c, 22.0, crate::theme::mix(pal.primary, if pal.dark { Color32::WHITE } else { Color32::from_gray(60) }, hv * 0.3));
+    let glyph = if playing { egui_phosphor::fill::PAUSE } else { egui_phosphor::fill::PLAY };
+    p.text(c + vec2(if playing { 0.0 } else { 1.5 }, 0.0), egui::Align2::CENTER_CENTER, glyph, egui::FontId::new(18.0, crate::theme::fill_family()), pal.primary_fg);
     r.on_hover_text("Play the highlighted part (Space)")
 }
 
@@ -502,22 +517,24 @@ fn waveform(ui: &mut egui::Ui, wave: &Waveform, secs: f32, trim: &mut (f32, f32)
     let secs = secs.max(0.01);
     let (rect, body) = ui.allocate_exact_size(vec2(ui.available_width(), WAVE_H), Sense::click_and_drag());
     let v = ui.visuals().clone();
+    let pal = crate::theme::pal(ui);
     let p = ui.painter_at(rect);
-    p.rect_filled(rect, ui_kit::RADIUS, v.extreme_bg_color);
+    p.rect_filled(rect, ui_kit::RADIUS, pal.stage);
     let x_of = |t: f32| rect.left() + t / secs * rect.width();
     let t_of = |x: f32| ((x - rect.left()) / rect.width() * secs).clamp(0.0, secs);
 
     // The whole of it dim, the highlighted part over it in colour.
     let lane = rect.shrink2(vec2(0.0, 4.0));
-    let dim = v.weak_text_color().gamma_multiply(0.6);
+    let dim = Color32::from_rgba_unmultiplied(170, 182, 214, 70);
     wave.paint(&p, lane, (0.0, secs as f64), |_| 1.0, |_, _| dim);
     let bright = Rect::from_x_y_ranges(x_of(trim.0)..=x_of(trim.1), rect.y_range());
-    p.rect_filled(bright, 0.0, ui_kit::ACCENT.gamma_multiply(0.12));
-    wave.paint(&p.with_clip_rect(bright), lane, (0.0, secs as f64), |_| 1.0, |_, _| ui_kit::ACCENT);
+    p.rect_filled(bright, 0.0, Color32::from_white_alpha(10));
+    let hi = crate::theme::DARK.wave_hi;
+    wave.paint(&p.with_clip_rect(bright), lane, (0.0, secs as f64), |_| 1.0, |_, _| hi);
 
     if let Some(m) = moment {
         let (x, top) = (x_of(m), rect.top() + 2.0);
-        p.add(egui::Shape::convex_polygon(vec![pos2(x - 5.0, top), pos2(x + 5.0, top), pos2(x, top + 7.0)], v.strong_text_color(), Stroke::NONE));
+        p.add(egui::Shape::convex_polygon(vec![pos2(x - 5.0, top), pos2(x + 5.0, top), pos2(x, top + 7.0)], Color32::WHITE, Stroke::NONE));
     }
 
     // Handles (made after the body, so they win where they overlap it).
@@ -541,7 +558,7 @@ fn waveform(ui: &mut egui::Ui, wave: &Waveform, secs: f32, trim: &mut (f32, f32)
             }
         }
         let x = x_of(if end == 0 { trim.0 } else { trim.1 });
-        let color = if r.hovered() || r.dragged() { Color32::WHITE } else { ui_kit::ACCENT };
+        let color = if r.hovered() || r.dragged() { Color32::WHITE } else { Color32::from_gray(210) };
         p.line_segment([pos2(x, rect.top()), pos2(x, rect.bottom())], Stroke::new(2.0, color));
         p.rect_filled(Rect::from_center_size(pos2(x, rect.center().y), vec2(8.0, 24.0)), 3.0, color);
     }
@@ -553,5 +570,6 @@ fn waveform(ui: &mut egui::Ui, wave: &Waveform, secs: f32, trim: &mut (f32, f32)
     }
     sound.scrub(scrubbing);
     let x = x_of(sound.time() as f32);
-    p.line_segment([pos2(x, rect.top()), pos2(x, rect.bottom())], Stroke::new(1.5, v.strong_text_color()));
+    p.line_segment([pos2(x, rect.top()), pos2(x, rect.bottom())], Stroke::new(1.5, Color32::WHITE));
+    let _ = (v, pal);
 }

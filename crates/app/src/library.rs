@@ -22,15 +22,13 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use egui::{Color32, Pos2, Sense};
+use egui::{Pos2, Sense};
 
 use crate::collections::Collections;
 use crate::theme;
 use crate::ui_kit;
 use crate::{App, clips, share, store};
 
-pub(crate) const REC_RED: Color32 = crate::ui_kit::DANGER;
-pub(crate) const ACCENT: Color32 = crate::ui_kit::ACCENT;
 
 /// The "Rename clip" dialog, or "Rename folder" for one of the library's folders.
 pub(crate) struct Rename {

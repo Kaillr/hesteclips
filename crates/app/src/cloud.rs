@@ -435,88 +435,122 @@ impl Cloud {
 
     /// Breadcrumbs + a clickable list of folders. Files are never shown.
     pub fn browser_ui(&mut self, ui: &mut egui::Ui) {
+        use crate::theme::{self, W};
+        use egui_phosphor::regular as icon;
+        let p = theme::pal(ui);
         let mut go: Option<Option<FolderRef>> = None;
-
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing.x = 2.0;
-            if ui.link("HesteFiles").clicked() {
-                go = Some(None);
+        // A folder row: its icon, name and a note; clicking opens it.
+        let row = |ui: &mut egui::Ui, glyph: &str, name: &str, note: &str, on: bool| -> bool {
+            let (r, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 30.0), egui::Sense::click());
+            let hv = theme::toggle(ui.ctx(), resp.id.with("hv"), resp.hovered(), theme::FAST);
+            if on {
+                ui.painter().rect_filled(r, 5, p.seg_on);
+            } else if hv > 0.0 {
+                ui.painter().rect_filled(r, 5, theme::fade(p.sel, hv));
             }
-            if let Some(at) = &self.browser.at {
-                ui.weak("›");
-                if ui.link(&at.base_name).clicked() {
-                    go = Some(Some(at.ancestor(0)));
-                }
-                for (i, seg) in at.segments().enumerate() {
-                    ui.weak("›");
-                    if ui.link(seg).clicked() {
-                        go = Some(Some(at.ancestor(i + 1)));
-                    }
-                }
+            ui.painter().text(egui::pos2(r.left() + 16.0, r.center().y), egui::Align2::CENTER_CENTER, glyph, egui::FontId::proportional(15.0), p.text2);
+            ui.painter().text(egui::pos2(r.left() + 32.0, r.center().y), egui::Align2::LEFT_CENTER, name, theme::font(13.5, if on { W::Medium } else { W::Regular }), p.text);
+            if !note.is_empty() {
+                ui.painter().text(egui::pos2(r.right() - 8.0, r.center().y), egui::Align2::RIGHT_CENTER, note, theme::font(12.0, W::Regular), p.text3);
             }
-        });
-        ui.separator();
-
-        egui::ScrollArea::vertical().max_height(260.0).auto_shrink([false, true]).show(ui, |ui| {
-            match &self.browser.at {
-                None => match &self.browser.bases {
-                    None => {
-                        ui.spinner();
+            resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+        };
+        egui::Frame::new().fill(p.raise2).corner_radius(8).inner_margin(egui::Margin::same(5)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 1.0;
+            // Where you are: HesteFiles › base › folders, each a way back.
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.add_space(4.0);
+                let crumb = |ui: &mut egui::Ui, text: &str| ui.add(egui::Label::new(theme::text(text, 12.5, W::Regular).color(p.text3)).sense(egui::Sense::click())).on_hover_cursor(egui::CursorIcon::PointingHand).clicked();
+                ui.label(theme::ic(icon::CLOUD, 14.0).color(p.text3));
+                if crumb(ui, "HesteFiles") {
+                    go = Some(None);
+                }
+                if let Some(at) = &self.browser.at {
+                    ui.label(theme::ic(icon::CARET_RIGHT, 10.0).color(p.text3));
+                    if crumb(ui, &at.base_name) {
+                        go = Some(Some(at.ancestor(0)));
                     }
-                    Some(Err(e)) => {
-                        ui.colored_label(ui.visuals().error_fg_color, e);
-                    }
-                    Some(Ok(bases)) => {
-                        for base in bases {
-                            let tag = match (base.owner, base.read_only) {
-                                (true, _) => "",
-                                (false, true) => "  · shared, read-only",
-                                (false, false) => "  · shared",
-                            };
-                            let label = format!("{} {}{tag}", base_icon(base), base.name);
-                            if ui.selectable_label(false, label).clicked() {
-                                go = Some(Some(FolderRef::base(base)));
-                            }
+                    for (i, seg) in at.segments().enumerate() {
+                        ui.label(theme::ic(icon::CARET_RIGHT, 10.0).color(p.text3));
+                        if crumb(ui, seg) {
+                            go = Some(Some(at.ancestor(i + 1)));
                         }
                     }
-                },
-                Some(at) => {
-                    if let Some(parent) = at.parent() {
-                        if ui.selectable_label(false, "..").clicked() {
-                            go = Some(Some(parent));
-                        }
-                    } else if ui.selectable_label(false, "All folders").clicked() {
-                        go = Some(None);
-                    }
-                    match &self.browser.listing {
+                }
+            });
+            ui.add_space(4.0);
+            egui::ScrollArea::vertical().max_height(220.0).auto_shrink([false, true]).show(ui, |ui| {
+                match &self.browser.at {
+                    None => match &self.browser.bases {
                         None => {
-                            ui.spinner();
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| {
+                                ui.add_space(8.0);
+                                ui.spinner();
+                            });
                         }
                         Some(Err(e)) => {
-                            ui.colored_label(ui.visuals().error_fg_color, e);
+                            ui.label(theme::text(e.as_str(), 12.5, W::Regular).color(p.danger));
                         }
-                        Some(Ok((names, _))) if names.is_empty() => {
-                            ui.weak("No subfolders");
+                        Some(Ok(bases)) => {
+                            for base in bases {
+                                let note = match (base.owner, base.read_only) {
+                                    (true, _) => "",
+                                    (false, true) => "shared, read-only",
+                                    (false, false) => "shared",
+                                };
+                                if row(ui, base_icon(base), &base.name, note, false) {
+                                    go = Some(Some(FolderRef::base(base)));
+                                }
+                            }
                         }
-                        Some(Ok((names, _))) => {
-                            for name in names {
-                                if ui.selectable_label(false, format!("{name}")).clicked() {
-                                    go = Some(Some(at.child(name)));
+                    },
+                    Some(at) => {
+                        if let Some(parent) = at.parent() {
+                            if row(ui, icon::ARROW_BEND_LEFT_UP, "Up", "", false) {
+                                go = Some(Some(parent));
+                            }
+                        } else if row(ui, icon::ARROW_BEND_LEFT_UP, "All folders", "", false) {
+                            go = Some(None);
+                        }
+                        match &self.browser.listing {
+                            None => {
+                                ui.add_space(6.0);
+                                ui.horizontal(|ui| {
+                                    ui.add_space(8.0);
+                                    ui.spinner();
+                                });
+                            }
+                            Some(Err(e)) => {
+                                ui.label(theme::text(e.as_str(), 12.5, W::Regular).color(p.danger));
+                            }
+                            Some(Ok((names, _))) if names.is_empty() => {
+                                ui.horizontal(|ui| {
+                                    ui.add_space(32.0);
+                                    ui.label(theme::text("No folders in here", 12.5, W::Regular).color(p.text3));
+                                });
+                            }
+                            Some(Ok((names, _))) => {
+                                for name in names {
+                                    if row(ui, icon::FOLDER_SIMPLE, name, "", false) {
+                                        go = Some(Some(at.child(name)));
+                                    }
                                 }
                             }
                         }
                     }
                 }
+            });
+            if let Some(Ok((_, true))) = &self.browser.listing {
+                ui.add_space(4.0);
+                ui.label(theme::text("Read-only: pick a folder you can save into.", 12.5, W::Regular).color(p.warn));
+            }
+            if let (Some(at), Some(Ok((_, false)))) = (self.browser.at.clone(), &self.browser.listing) {
+                self.new_folder_ui(ui, &at);
             }
         });
-
-        if let Some(Ok((_, true))) = &self.browser.listing {
-            ui.colored_label(ui.visuals().warn_fg_color, "Read-only — pick a folder you can write to.");
-        }
-        if let (Some(at), Some(Ok((_, false)))) = (self.browser.at.clone(), &self.browser.listing) {
-            self.new_folder_ui(ui, &at);
-        }
-
         if let Some(to) = go {
             self.navigate(to);
         }
@@ -526,8 +560,9 @@ impl Cloud {
     /// opened, so it's picked).
     fn new_folder_ui(&mut self, ui: &mut egui::Ui, at: &FolderRef) {
         ui.add_space(4.0);
+        let p = crate::theme::pal(ui);
         let Some(n) = &mut self.browser.new_folder else {
-            if ui.button("New folder").clicked() {
+            if crate::ui_kit::Btn::ghost("New folder").with_icon(egui_phosphor::regular::PLUS).small().show(ui).clicked() {
                 self.browser.new_folder = Some(NewFolder::default());
             }
             return;
@@ -535,7 +570,11 @@ impl Cloud {
         let mut create = false;
         let mut cancel = false;
         ui.horizontal(|ui| {
-            let field = ui.add_enabled(!n.busy, egui::TextEdit::singleline(&mut n.name).hint_text("Folder name").desired_width(220.0));
+            ui.spacing_mut().item_spacing.x = 6.0;
+            let field = ui.add_enabled(
+                !n.busy,
+                egui::TextEdit::singleline(&mut n.name).hint_text("Folder name").desired_width(220.0).font(crate::theme::font(13.5, crate::theme::W::Regular)).margin(egui::Margin::symmetric(8, 5)),
+            );
             if !n.focused {
                 field.request_focus();
                 n.focused = true;
@@ -547,12 +586,12 @@ impl Cloud {
             if n.busy {
                 ui.spinner();
             } else {
-                create |= ui.button("Create").clicked();
-                cancel = ui.button("Cancel").clicked();
+                create |= crate::ui_kit::Btn::normal("Create").small().show(ui).clicked();
+                cancel = crate::ui_kit::Btn::ghost("Cancel").small().show(ui).clicked();
             }
         });
         if let Some(e) = &n.error {
-            ui.colored_label(ui.visuals().error_fg_color, e);
+            ui.label(crate::theme::text(e.as_str(), 12.5, crate::theme::W::Regular).color(p.danger));
         }
         if cancel {
             self.browser.new_folder = None;
@@ -602,5 +641,5 @@ fn check_folder_name(name: &str) -> Result<(), String> {
 }
 
 fn base_icon(base: &BaseFolder) -> &'static str {
-    if base.owner { "🏠" } else { "👥" }
+    if base.owner { egui_phosphor::regular::HOUSE } else { egui_phosphor::regular::USERS }
 }

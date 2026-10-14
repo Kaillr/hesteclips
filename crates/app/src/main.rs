@@ -1212,18 +1212,14 @@ impl App {
             return;
         }
         let (mut keep, mut quit, mut cancel) = (false, false, false);
-        let modal = egui::Modal::new(egui::Id::new("close_dialog")).show(ctx, |ui| {
-            ui.set_width(400.0);
-            ui.heading("Keep HesteClips running?");
-            ui.add_space(6.0);
+        let modal = ui_kit::dialog(ctx, "close_dialog", 420.0, |ui| {
             let place = if cfg!(target_os = "macos") { "menu bar" } else { "tray" };
-            ui.label(format!("In the {place}, your replay buffer and shortcuts keep working, so you can still save clips."));
-            ui_kit::hint(ui, "You can change this in Settings.");
-            ui.add_space(12.0);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                keep = ui.add(ui_kit::button(format!("Keep running in the {place}"), true)).clicked();
-                quit = ui.add(ui_kit::button("Quit", false)).clicked();
-                cancel = ui.add(ui_kit::button("Cancel", false)).clicked();
+            ui_kit::dialog_title(ui, "Keep HesteClips running?");
+            ui_kit::dialog_text(ui, &format!("In the {place}, clipping and shortcuts keep working, so you can still save clips. You can change this in Settings."));
+            ui_kit::dialog_buttons(ui, |ui| {
+                keep = ui.add(ui_kit::button("Keep running", true)).clicked();
+                quit = ui.add(ui_kit::button("Quit", false).ghost()).clicked();
+                cancel = ui.add(ui_kit::button("Cancel", false).ghost()).clicked();
             });
         });
         if keep || quit {

@@ -13,12 +13,9 @@
 //! - **Motion**: hover fades in, a chosen option slides to its place, a
 //!   button that changes its words changes its width smoothly.
 
-use egui::{Align2, Color32, CornerRadius, FontId, Margin, Pos2, Rect, Response, Sense, Stroke, StrokeKind, TextStyle, Vec2, vec2};
+use egui::{Align2, Color32, CornerRadius, FontId, Margin, Pos2, Rect, Response, Sense, Stroke, StrokeKind, TextStyle, vec2};
 
-/// Older pages' accent, until each is redrawn in the monochrome look.
-pub const ACCENT: Color32 = Color32::from_rgb(150, 160, 182);
-/// Destructive and recording red.
-pub const DANGER: Color32 = theme::DARK.rec;
+
 
 use crate::theme::{self, Pal, W, icon};
 
@@ -116,16 +113,6 @@ fn style_for(style: &mut egui::Style, p: &Pal) {
 pub fn repaint_after(ctx: &egui::Context, delay: std::time::Duration) {
     let frame = ctx.input(|i| i.predicted_dt).max(0.0);
     ctx.request_repaint_after(delay + std::time::Duration::from_secs_f32(frame));
-}
-
-/// Hairlines (dividers).
-pub fn line(dark: bool) -> Color32 {
-    if dark { theme::DARK.line } else { theme::LIGHT.line }
-}
-
-/// A row or tile under the pointer.
-pub fn hover(v: &egui::Visuals) -> Color32 {
-    theme::of(v).sel
 }
 
 /// A group: content on the raised surface, padded.
@@ -449,9 +436,6 @@ impl ButtonWidget {
     pub fn ghost(self) -> Self {
         Self(Btn { kind: Kind::Ghost, ..self.0 })
     }
-    pub fn min_size(self, size: Vec2) -> Self {
-        Self(self.0.min_width(size.x))
-    }
 }
 
 impl egui::Widget for ButtonWidget {
@@ -561,6 +545,31 @@ pub fn switch(ui: &mut egui::Ui, on: &mut bool) -> Response {
     let c = Pos2::new(rect.left() + 10.0 + 14.0 * t, rect.center().y);
     ui.painter().circle_filled(c + vec2(0.0, 1.0), 8.0, Color32::from_black_alpha(50));
     ui.painter().circle_filled(c, 8.0, if enabled { knob } else { theme::fade(knob, 0.7) });
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// A box to tick, with its words: for options in a dialog.
+pub fn checkbox(ui: &mut egui::Ui, on: &mut bool, label: &str) -> Response {
+    let p = theme::pal(ui);
+    let g = ui.painter().layout_no_wrap(label.to_owned(), theme::font(13.5, W::Regular), p.text);
+    let (rect, mut resp) = ui.allocate_exact_size(vec2(16.0 + 9.0 + g.size().x, 28.0), Sense::click());
+    if resp.clicked() {
+        *on = !*on;
+        resp.mark_changed();
+    }
+    let t = theme::toggle(ui.ctx(), resp.id, *on, theme::FAST);
+    let hv = theme::toggle(ui.ctx(), resp.id.with("hv"), resp.hovered(), theme::FAST);
+    let b = Rect::from_min_size(Pos2::new(rect.left(), rect.center().y - 8.0), vec2(16.0, 16.0));
+    if t < 1.0 {
+        ui.painter().rect_stroke(b, 4, Stroke::new(1.5, theme::mix(p.text3, p.text2, hv)), StrokeKind::Inside);
+    }
+    if t > 0.0 {
+        ui.painter().rect_filled(b, 4, theme::fade(p.primary, t));
+        let c = b.center();
+        let tick = vec![c + vec2(-3.5, 0.2), c + vec2(-1.0, 2.8), c + vec2(3.8, -2.6)];
+        ui.painter().add(egui::Shape::line(tick, Stroke::new(1.8, theme::fade(p.primary_fg, t))));
+    }
+    ui.painter().galley(Pos2::new(b.right() + 9.0, rect.center().y - g.size().y / 2.0), g, p.text);
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 

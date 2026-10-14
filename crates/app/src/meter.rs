@@ -11,7 +11,7 @@
 use std::time::{Duration, Instant};
 
 use capture::mixer::Levels;
-use egui::{Align2, Color32, FontId, Rect, Sense, Stroke, pos2, vec2};
+use egui::{Align2, Color32, Rect, Sense, Stroke, pos2, vec2};
 
 /// Bottom of the scale, dBFS.
 pub const FLOOR_DB: f32 = -60.0;
@@ -27,9 +27,9 @@ const PEAK_HOLD: Duration = Duration::from_millis(1500);
 /// How long the numeric peak readout holds its maximum.
 const READOUT_HOLD: Duration = Duration::from_secs(3);
 
-pub const GREEN: Color32 = Color32::from_rgb(64, 190, 105);
-pub const YELLOW: Color32 = Color32::from_rgb(232, 192, 56);
-pub const RED: Color32 = Color32::from_rgb(232, 64, 56);
+pub const GREEN: Color32 = crate::theme::DARK.meter_g;
+pub const YELLOW: Color32 = crate::theme::DARK.meter_y;
+pub const RED: Color32 = crate::theme::DARK.meter_r;
 /// Scale labels, chosen so they never crowd: denser at the top where it matters.
 const TICKS: [f32; 9] = [-60.0, -48.0, -36.0, -24.0, -18.0, -12.0, -6.0, -3.0, 0.0];
 
@@ -148,7 +148,7 @@ pub fn stereo(ui: &mut egui::Ui, id: egui::Id, state: &MeterState, style: &Style
     // Faint zone backgrounds and tick lines, so the scale reads even when silent.
     for c in 0..2 {
         let bar = Rect::from_min_size(pos2(bars.left(), bars.top() + c as f32 * (style.bar_h + style.gap)), vec2(bars.width(), style.bar_h));
-        p.rect_filled(bar, 0.0, v.extreme_bg_color);
+        p.rect_filled(bar, 2.0, crate::theme::of(v).meter_bg);
         for (from, to, color) in zones() {
             let zone = Rect::from_x_y_ranges(x_of(from)..=x_of(to), bar.y_range());
             p.rect_filled(zone, 0.0, color.gamma_multiply(0.10));
@@ -171,24 +171,24 @@ pub fn stereo(ui: &mut egui::Ui, id: egui::Id, state: &MeterState, style: &Style
         p.line_segment([pos2(x, bars.top()), pos2(x, bars.bottom())], Stroke::new(1.0, v.panel_fill.gamma_multiply(0.55)));
     }
     if style.scale {
-        let font = FontId::proportional(10.0);
+        let font = crate::theme::font(10.5, crate::theme::W::Regular);
         for db in TICKS {
             let x = x_of(db);
             let label = if db == 0.0 { "0".to_owned() } else { format!("{db:.0}") };
             let align = if db == FLOOR_DB { Align2::LEFT_TOP } else if db == 0.0 { Align2::RIGHT_TOP } else { Align2::CENTER_TOP };
-            p.text(pos2(x, bars.bottom() + 2.0), align, label, font.clone(), v.weak_text_color());
+            p.text(pos2(x, bars.bottom() + 3.0), align, label.replace('-', "−"), font.clone(), v.weak_text_color());
         }
     }
 
     // Clip light: latches until clicked.
     let clip = Rect::from_min_size(pos2(bars.right() + 6.0, bars.top()), vec2(clip_w, bars_h));
     let r = ui.interact(clip, id.with("clip"), Sense::click());
-    let fill = if state.clipped { RED } else { v.extreme_bg_color };
+    let fill = if state.clipped { RED } else { crate::theme::of(v).meter_bg };
     p.rect_filled(clip, 2.0, fill);
     if !state.clipped {
         p.rect_stroke(clip, 2.0, Stroke::new(1.0, RED.gamma_multiply(0.35)), egui::StrokeKind::Inside);
     }
-    let tip = if state.clipped { "Clipped: a sample hit full scale and distorted. Click to reset." } else { "Lights up if the audio clips (distorts)." };
+    let tip = if state.clipped { "Too loud: a sample hit full scale and distorted. Click to reset." } else { "Lights up if the sound gets too loud and distorts." };
     r.on_hover_text(tip).clicked() && state.clipped
 }
 
@@ -278,7 +278,7 @@ pub fn reduction(ui: &mut egui::Ui, db: f32, width: f32) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(width, 14.0), Sense::hover());
     let bar = Rect::from_min_size(rect.left_center() - vec2(0.0, h / 2.0), vec2(width, h));
     let p = ui.painter();
-    p.rect_filled(bar, 0.0, ui.visuals().extreme_bg_color);
+    p.rect_filled(bar, 2.0, crate::theme::pal(ui).meter_bg);
     // 0..12 dB of reduction across the bar.
     let f = (db / 12.0).clamp(0.0, 1.0);
     if f > 0.0 {
@@ -296,7 +296,7 @@ pub fn to_db(x: f32) -> f32 {
 /// shift anything.
 pub fn fixed_label(ui: &mut egui::Ui, width: f32, text: &str, color: Color32, tip: &str) {
     let (rect, resp) = ui.allocate_exact_size(vec2(width, 18.0), Sense::hover());
-    ui.painter().text(rect.right_center(), Align2::RIGHT_CENTER, text, FontId::monospace(12.0), color);
+    ui.painter().text(rect.right_center(), Align2::RIGHT_CENTER, text, crate::theme::font(12.5, crate::theme::W::Medium), color);
     resp.on_hover_text(tip);
 }
 

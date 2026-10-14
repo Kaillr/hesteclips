@@ -14,7 +14,8 @@ use capture::webcam::{Placement, Status};
 use egui::{Color32, CursorIcon, Pos2, Rect, Stroke, vec2};
 
 use crate::App;
-use crate::library::ACCENT;
+/// The webcam's box outline on the preview.
+const ACCENT: Color32 = Color32::WHITE;
 use crate::settings::{PlacementCfg, WebcamCfg};
 
 /// Smallest the webcam's box gets, as a fraction of the frame.

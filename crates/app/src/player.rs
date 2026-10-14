@@ -94,7 +94,7 @@ pub fn paint_proxy_bar(ui: &egui::Ui, player: &crate::player::Player, lane: egui
         let on = built[k];
         let run = built[k..].iter().take_while(|b| **b == on).count();
         let x0 = lane.left() + k as f32 * step;
-        let color = if on { crate::library::ACCENT } else { egui::Color32::from_white_alpha(25) };
+        let color = if on { egui::Color32::from_white_alpha(150) } else { egui::Color32::from_white_alpha(25) };
         p.rect_filled(egui::Rect::from_x_y_ranges(x0..=x0 + run as f32 * step, y.clone()), 0, color);
         k += run;
     }

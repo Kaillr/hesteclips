@@ -183,7 +183,7 @@ impl Waveform {
         }
         let mut shapes = vec![Shape::mesh(peaks), Shape::mesh(body)];
         // Clipping: a red tick at the top and bottom where it happens.
-        let red = Stroke::new(step.max(1.0), crate::library::REC_RED);
+        let red = Stroke::new(step.max(1.0), crate::theme::DARK.meter_r);
         for x in clipped {
             shapes.push(Shape::vline(x, lane.top()..=lane.top() + 3.0, red));
             shapes.push(Shape::vline(x, lane.bottom() - 3.0..=lane.bottom(), red));
