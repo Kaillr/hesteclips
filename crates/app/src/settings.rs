@@ -35,13 +35,6 @@ pub enum Theme {
 
 impl Theme {
     pub const ALL: [Theme; 3] = [Theme::System, Theme::Light, Theme::Dark];
-    pub fn label(self) -> &'static str {
-        match self {
-            Theme::System => "System",
-            Theme::Light => "Light",
-            Theme::Dark => "Dark",
-        }
-    }
     pub fn preference(self) -> egui::ThemePreference {
         match self {
             Theme::System => egui::ThemePreference::System,
@@ -67,12 +60,6 @@ impl Container {
         match self {
             Container::Mp4 => "mp4",
             Container::Mov => "mov",
-        }
-    }
-    pub fn label(self) -> &'static str {
-        match self {
-            Container::Mp4 => "MP4 (plays everywhere)",
-            Container::Mov => "MOV (QuickTime)",
         }
     }
 }

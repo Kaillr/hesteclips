@@ -13,7 +13,7 @@
 //! - **Motion**: hover fades in, a chosen option slides to its place, a
 //!   button that changes its words changes its width smoothly.
 
-use egui::{Align2, Color32, CornerRadius, FontId, Margin, Pos2, Rect, Response, RichText, Sense, Stroke, StrokeKind, TextStyle, Vec2, vec2};
+use egui::{Align2, Color32, CornerRadius, FontId, Margin, Pos2, Rect, Response, Sense, Stroke, StrokeKind, TextStyle, Vec2, vec2};
 
 /// Older pages' accent, until each is redrawn in the monochrome look.
 pub const ACCENT: Color32 = Color32::from_rgb(150, 160, 182);
@@ -123,11 +123,6 @@ pub fn line(dark: bool) -> Color32 {
     if dark { theme::DARK.line } else { theme::LIGHT.line }
 }
 
-/// Groups: a shade off the page.
-pub fn surface(v: &egui::Visuals) -> Color32 {
-    theme::of(v).raise
-}
-
 /// A row or tile under the pointer.
 pub fn hover(v: &egui::Visuals) -> Color32 {
     theme::of(v).sel
@@ -146,21 +141,6 @@ pub fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
         .inner
 }
 
-/// A titled group: its title above, its content in a card.
-pub fn section<R>(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    ui.add_space(22.0);
-    group_title(ui, title);
-    card(ui, add)
-}
-
-/// The small heading over a group of rows.
-pub fn group_title(ui: &mut egui::Ui, title: &str) -> Response {
-    let p = theme::pal(ui);
-    let r = ui.label(theme::text(title, 13.0, W::Semibold).color(p.text2));
-    ui.add_space(4.0);
-    r
-}
-
 /// Scrolling content with a slim scrollbar in the page's right margin.
 pub fn scroll<R>(ui: &mut egui::Ui, id: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     let reset = ui.ctx().data(|d| d.get_temp::<bool>(scroll_reset_id())).unwrap_or(false);
@@ -173,12 +153,18 @@ pub fn scroll<R>(ui: &mut egui::Ui, id: &str, add: impl FnOnce(&mut egui::Ui) ->
     if reset {
         scroll = scroll.vertical_scroll_offset(0.0);
     }
-    scroll
-        .show(&mut area, |ui| {
-            ui.set_max_width(ui.available_width() - gutter);
-            add(ui)
-        })
-        .inner
+    let out = scroll.show(&mut area, |ui| {
+        ui.set_max_width(ui.available_width() - gutter);
+        add(ui)
+    });
+    // How far it's scrolled, for anything that follows it (Settings' section list).
+    ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(("scroll_offset", id)), out.state.offset.y));
+    out.inner
+}
+
+/// How far the [`scroll`] area `id` was scrolled last frame.
+pub fn scroll_offset(ctx: &egui::Context, id: &str) -> f32 {
+    ctx.data(|d| d.get_temp::<f32>(egui::Id::new(("scroll_offset", id)))).unwrap_or(0.0)
 }
 
 fn overlay_id() -> egui::Id {
@@ -329,11 +315,6 @@ impl<'a> Btn<'a> {
     /// button's place in the layout changes.
     pub fn id(mut self, id: impl std::hash::Hash + std::fmt::Debug) -> Self {
         self.id = Some(egui::Id::new(id));
-        self
-    }
-    /// A thin progress line along the bottom (saving a clip).
-    pub fn progress(mut self, f: Option<f32>) -> Self {
-        self.progress = f;
         self
     }
 
@@ -672,35 +653,6 @@ pub fn segmented_opts(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::De
         }
     }
     clicked
-}
-
-/// [`segmented_opts`] with words only, each fitting its text.
-pub fn segmented_with(ui: &mut egui::Ui, labels: &[&str], chosen: usize, equal: bool) -> Vec<Response> {
-    let id = ui.next_auto_id();
-    let opts: Vec<Seg> = labels.iter().map(|l| Seg::from(*l)).collect();
-    let full = equal.then(|| ui.available_width());
-    let picked = segmented_opts(ui, id, &opts, chosen, full, ui.is_enabled());
-    // Old call sites read a response per option: hand back one that's
-    // "clicked" for the option picked.
-    labels
-        .iter()
-        .enumerate()
-        .map(|(i, _)| {
-            let r = ui.interact(Rect::NOTHING, id.with(("compat", i)), Sense::click());
-            if picked == Some(i) {
-                let mut r = r;
-                r.flags.insert(egui::response::Flags::CLICKED);
-                r
-            } else {
-                r
-            }
-        })
-        .collect()
-}
-
-/// [`segmented_with`], the options sharing the row's width.
-pub fn segmented(ui: &mut egui::Ui, labels: &[&str], chosen: usize) -> Vec<Response> {
-    segmented_with(ui, labels, chosen, true)
 }
 
 /// A menu's trigger: the current value and a ∨. Open it with
@@ -1180,26 +1132,6 @@ pub fn well(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::Debug, open:
     ui.allocate_space(vec2(avail, h.unwrap_or(real_h)));
 }
 
-/// A small "?" that opens the screen's keyboard and mouse shortcuts. `rows`:
-/// (keys, what they do).
-pub fn shortcuts_button(ui: &mut egui::Ui, rows: &[(&str, &str)]) -> Response {
-    let r = Btn::icon(Kind::Ghost, icon::KEYBOARD).tip("Keyboard shortcuts").show(ui);
-    egui::Popup::menu(&r).id(ui.id().with("shortcuts")).frame(pop_frame(ui)).show(|ui| {
-        ui.set_min_width(300.0);
-        let p = theme::pal(ui);
-        ui.label(theme::text("Keyboard shortcuts", 14.0, W::Semibold).color(p.text));
-        ui.add_space(6.0);
-        egui::Grid::new("shortcuts_grid").num_columns(2).spacing(vec2(16.0, 7.0)).show(ui, |ui| {
-            for (keys, what) in rows {
-                ui.label(theme::text(*keys, 13.5, W::Semibold).color(p.text));
-                ui.label(theme::text(*what, 13.5, W::Regular).color(p.text2));
-                ui.end_row();
-            }
-        });
-    });
-    r
-}
-
 // --- Dialogs ---
 
 /// A dialog: a scrim over the window, the box rising in.
@@ -1297,6 +1229,148 @@ pub fn text_field(ui: &mut egui::Ui, text: &mut String, hint: &str) -> egui::tex
     out
 }
 
+// --- Value fields ---
+
+/// A number you type in place ("90", "2:30", "1080", "Native"), with its unit
+/// after it and the common values under its ∨. Enter or clicking away
+/// applies; Esc puts it back; arrow keys step through the common values. A
+/// value that isn't one of them just shows as itself.
+pub struct ValueField<'a> {
+    pub id: egui::Id,
+    /// What it shows now.
+    pub text: String,
+    pub unit: &'a str,
+    pub width: f32,
+    pub hint: &'a str,
+    /// The common values: (label, its value as text, a note).
+    pub presets: Vec<(String, String, String)>,
+    /// What the field's text currently is, among the presets, if any.
+    pub current: Option<usize>,
+    /// What "Type your own…" says about the range.
+    pub range: &'a str,
+}
+
+/// What happened to a [`ValueField`] this frame.
+pub enum Typed {
+    None,
+    /// Typed and applied: parse it.
+    Text(String),
+    /// A common value was picked (or stepped to with the arrows).
+    Preset(usize),
+}
+
+impl ValueField<'_> {
+    pub fn show(self, ui: &mut egui::Ui) -> Typed {
+        let p = theme::pal(ui);
+        let mut out = Typed::None;
+        let edit_id = self.id.with("text");
+        let editing_key = self.id.with("editing");
+        let mut editing: Option<String> = ui.data(|d| d.get_temp(editing_key));
+        let (rect, _) = ui.allocate_exact_size(vec2(self.width, CONTROL_H), Sense::hover());
+        let focused = ui.memory(|m| m.has_focus(edit_id));
+        let hovered = ui.rect_contains_pointer(rect);
+        let menu_open = egui::Popup::is_id_open(ui.ctx(), self.id.with("dd").with("menu"));
+        let hv = theme::toggle(ui.ctx(), self.id.with("hv"), (hovered || menu_open) && !focused, theme::FAST);
+        let fc = theme::toggle(ui.ctx(), self.id.with("fc"), focused, theme::FAST);
+        ui.painter().rect_filled(rect, RADIUS, theme::mix(p.control, p.control_h, hv));
+        if fc > 0.0 {
+            ui.painter().rect_stroke(rect, RADIUS, Stroke::new(1.5, theme::fade(p.text2, fc)), StrokeKind::Inside);
+        }
+        let dd = Rect::from_min_max(Pos2::new(rect.right() - 26.0, rect.top()), rect.max);
+        let field = Rect::from_min_max(Pos2::new(rect.left() + 10.0, rect.top()), Pos2::new(dd.left(), rect.bottom()));
+        let mut text = editing.clone().unwrap_or_else(|| self.text.clone());
+        let font = theme::font(13.0, W::Medium);
+        let tw = ui.painter().layout_no_wrap(if text.is_empty() { " ".into() } else { text.clone() }, font.clone(), p.text).size().x;
+        let unit_w = if self.unit.is_empty() { 0.0 } else { ui.painter().layout_no_wrap(self.unit.to_owned(), font.clone(), p.text3).size().x + 4.0 };
+        let input_w = (tw + 1.0).min(field.width() - unit_w).max(14.0);
+        let mut fui = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_size(field.min, vec2(input_w, field.height()))).layout(egui::Layout::left_to_right(egui::Align::Center)));
+        let resp = egui::TextEdit::singleline(&mut text)
+            .id(edit_id)
+            .frame(egui::Frame::NONE)
+            .font(font.clone())
+            .text_color(p.text)
+            .desired_width(input_w)
+            .margin(Margin::ZERO)
+            .show(&mut fui)
+            .response
+            .response;
+        let resp = resp.on_hover_text(self.hint).on_hover_cursor(egui::CursorIcon::Text);
+        if !self.unit.is_empty() {
+            ui.painter().text(Pos2::new(field.left() + input_w + 2.0, rect.center().y), Align2::LEFT_CENTER, self.unit, font, p.text3);
+        }
+        // Clicking anywhere in the box (not just on the digits) types.
+        let box_resp = ui.interact(field, self.id.with("box"), Sense::click());
+        if box_resp.clicked() {
+            resp.request_focus();
+        }
+        if resp.gained_focus() {
+            editing = Some(self.text.clone());
+        }
+        if resp.has_focus() {
+            editing = Some(text.clone());
+            let (up, down, esc) = ui.input_mut(|i| (i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp), i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown), i.key_pressed(egui::Key::Escape)));
+            if esc {
+                editing = None;
+                resp.surrender_focus();
+            } else if (up || down) && !self.presets.is_empty() {
+                // Up goes to the next bigger one: presets are listed biggest
+                // first or smallest first, so step by their order.
+                let n = self.presets.len();
+                let at = self.current.unwrap_or(0);
+                let next = if up { at.saturating_sub(1) } else { (at + 1).min(n - 1) };
+                out = Typed::Preset(next);
+                editing = Some(self.presets[next].1.clone());
+            }
+        }
+        if resp.lost_focus() {
+            if let Some(t) = editing.take() {
+                if t.trim() != self.text.trim() {
+                    out = Typed::Text(t);
+                }
+            }
+        }
+        ui.data_mut(|d| match &editing {
+            Some(t) => {
+                d.insert_temp(editing_key, t.clone());
+            }
+            None => d.remove::<String>(editing_key),
+        });
+        // The ∨: common values, and "Type your own…".
+        let ddr = ui.interact(dd, self.id.with("dd"), Sense::click());
+        let dhv = theme::toggle(ui.ctx(), ddr.id.with("hv"), ddr.hovered() || menu_open, theme::FAST);
+        if dhv > 0.0 {
+            ui.painter().rect_filled(dd, CornerRadius { nw: 0, sw: 0, ne: RADIUS, se: RADIUS }, theme::fade(p.control_h, dhv));
+        }
+        let turn = theme::toggle(ui.ctx(), ddr.id.with("turn"), menu_open, theme::NORMAL);
+        chevron(ui.painter(), dd.center(), 3.5, turn, theme::mix(p.text3, p.text, dhv));
+        let ddr = ddr.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Common values");
+        let mut focus = false;
+        menu_popup(&ddr, false, 240.0, |ui| {
+            for (i, (label, _, note)) in self.presets.iter().enumerate() {
+                let mut item = Item::new(label.clone()).check(self.current == Some(i));
+                if !note.is_empty() {
+                    item = item.value(note.clone());
+                }
+                if item.show(ui).clicked() {
+                    out = Typed::Preset(i);
+                }
+            }
+            if self.current.is_none() {
+                menu_sep(ui);
+                Item::new(format!("{}{}{}", self.text, if self.unit.is_empty() { "" } else { " " }, self.unit)).check(true).value("yours").show(ui);
+            }
+            menu_sep(ui);
+            if Item::new("Type your own…").icon(icon::TEXT_T).value(self.range.to_owned()).show(ui).clicked() {
+                focus = true;
+            }
+        });
+        if focus {
+            ui.memory_mut(|m| m.request_focus(edit_id));
+        }
+        out
+    }
+}
+
 // --- Pointer ---
 
 /// The pointing hand over anything that can be clicked. egui only does it
@@ -1374,11 +1448,6 @@ pub fn replay_click(ctx: &egui::Context, raw: &mut egui::RawInput) {
     for pressed in [true, false] {
         raw.events.push(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers });
     }
-}
-
-/// Plain words in a size, weight and colour.
-pub fn words(text: impl Into<String>, size: f32, w: W, color: Color32) -> RichText {
-    theme::text(text, size, w).color(color)
 }
 
 #[cfg(test)]

@@ -11,7 +11,7 @@
 //! so the camera, its format, and adding or removing it all apply at once.
 
 use capture::webcam::{Placement, Status};
-use egui::{Color32, CursorIcon, Pos2, Rect, RichText, Stroke, vec2};
+use egui::{Color32, CursorIcon, Pos2, Rect, Stroke, vec2};
 
 use crate::App;
 use crate::library::ACCENT;
@@ -276,144 +276,131 @@ impl App {
             }
         }
 
-        crate::sources_ui::card(ui, |ui| {
-            let cam = self.settings.webcam.clone();
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Webcam").size(15.0).strong());
-                if let Some(cam) = &cam {
-                    ui.add_space(6.0);
-                    let (color, text) = match &status {
-                        _ if !cam.enabled => (ui.visuals().weak_text_color(), "Off"),
-                        Status::Live { .. } => (crate::meter::GREEN, "In your clips"),
-                        Status::Opening => (ui.visuals().weak_text_color(), "Opening…"),
-                        Status::Unavailable(_) => (ui.visuals().warn_fg_color, "Not working"),
-                        _ => (ui.visuals().weak_text_color(), "Off"),
-                    };
-                    crate::sources_ui::status_tag(ui, text, color);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Remove").on_hover_text("Take the webcam out of your clips").clicked() {
-                            self.settings.webcam = None;
-                        }
-                        ui.add_space(8.0);
-                        // Works while capturing too: it only hides it.
-                        let mut on = cam.enabled;
-                        let tip = if on { "Turn the webcam off: it leaves your clips, and its place, size, crop and format are kept for when you turn it on" } else { "Turn the webcam back on, where it was" };
-                        if crate::sources_ui::toggle(ui, &mut on).on_hover_text(tip).changed() {
-                            if let Some(w) = self.settings.webcam.as_mut() {
-                                w.enabled = on;
-                            }
-                        }
-                    });
-                }
-            });
-            ui.add_space(6.0);
-
-            let Some(cam) = cam else {
-                crate::ui_kit::hint(ui, "Put your camera in your clips, placed and sized on the preview above.");
-                ui.add_space(8.0);
-                {
-                    let add = ui.menu_button(RichText::new("Add webcam").size(14.0), |ui| {
-                        ui.set_min_width(240.0);
-                        if self.webcam_view.cameras.is_empty() {
-                            ui.weak("No cameras found.");
-                        }
-                        for c in self.webcam_view.cameras.clone() {
-                            if ui.button(&c.name).clicked() {
-                                self.settings.webcam = Some(WebcamCfg {
-                                    id: c.id,
-                                    name: c.name,
-                                    format: None,
-                                    placement: PlacementCfg::laid_out(Placement::default_for(16.0 / 9.0, frame_aspect), frame_aspect),
-                                    enabled: true,
-                                });
-                                self.webcam_view.ask_fit();
-                                ui.close();
-                            }
-                        }
-                    });
-                    if add.response.clicked() {
+        use crate::theme::{self, W};
+        use crate::ui_kit::{Btn, Item};
+        use egui_phosphor::regular as icon;
+        let pal = theme::pal(ui);
+        let cam = self.settings.webcam.clone();
+        // The heading, with the webcam's switch (works while capturing too:
+        // off only hides it, and its place, size, crop and format are kept).
+        crate::sources_ui::column_head(ui, "Webcam", |ui| {
+            let mut on = cam.as_ref().is_some_and(|c| c.enabled);
+            let tip = if on { "Turn the webcam off: it leaves your clips, and its place, size, crop and format are kept" } else { "Put your webcam in your clips" };
+            if crate::ui_kit::switch(ui, &mut on).on_hover_text(tip).changed() {
+                match self.settings.webcam.as_mut() {
+                    Some(w) => w.enabled = on,
+                    // None set up yet: the first camera, in the corner.
+                    None => {
                         self.webcam_view.cameras = capture::webcam::list_cameras();
+                        if let Some(c) = self.webcam_view.cameras.first().cloned() {
+                            self.settings.webcam = Some(WebcamCfg {
+                                id: c.id,
+                                name: c.name,
+                                format: None,
+                                placement: PlacementCfg::laid_out(Placement::default_for(16.0 / 9.0, frame_aspect), frame_aspect),
+                                enabled: true,
+                            });
+                            self.webcam_view.ask_fit();
+                        } else {
+                            self.toast_error("No cameras found");
+                        }
                     }
                 }
-                return;
-            };
+            }
+            if cam.as_ref().is_some_and(|c| c.enabled) {
+                let (color, text) = match &status {
+                    Status::Live { .. } => (pal.text3, "In your clips"),
+                    Status::Opening => (pal.text3, "Opening…"),
+                    Status::Unavailable(_) => (pal.warn, "Not working"),
+                    _ => (pal.text3, ""),
+                };
+                ui.label(theme::text(text, 12.5, W::Regular).color(color));
+            }
+        });
 
-            if !cam.enabled {
-                // The "Off" tag by the title says it all.
-            } else if let Status::Unavailable(why) = &status {
-                // Under the "Not working" tag: just why, as a sentence.
+        let Some(cam) = cam.filter(|c| c.enabled) else {
+            crate::sources_ui::group(ui, |ui| {
+                ui.label(theme::text("Put your camera in your clips, placed and sized on the preview.", 13.0, W::Regular).color(pal.text3));
+            });
+            return;
+        };
+        crate::sources_ui::group(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            if let Status::Unavailable(why) = &status {
                 let mut why = why.clone();
                 if let Some(first) = why.get(..1) {
                     why.replace_range(..1, &first.to_uppercase());
                 }
-                ui.colored_label(ui.visuals().warn_fg_color, format!("{why}."));
-                ui.add_space(4.0);
+                ui.add(egui::Label::new(theme::text(format!("{why}."), 12.5, W::Regular).color(pal.warn)).wrap());
+                ui.add_space(8.0);
             }
-            egui::Grid::new("webcam_settings").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-                ui.label("Camera");
-                {
-                    let combo = egui::ComboBox::from_id_salt("webcam_device").selected_text(&cam.name).width(240.0).truncate().show_ui(ui, |ui| {
-                        for c in self.webcam_view.cameras.clone() {
-                            if ui.selectable_label(c.id == cam.id, &c.name).clicked() && c.id != cam.id {
-                                if let Some(w) = self.settings.webcam.as_mut() {
-                                    w.id = c.id;
-                                    w.name = c.name;
-                                    w.format = None; // that camera's own formats
-                                }
-                                self.webcam_view.ask_fit();
-                            }
-                        }
-                    });
-                    if combo.response.clicked() {
-                        self.webcam_view.cameras = capture::webcam::list_cameras();
-                    }
-                }
-                ui.end_row();
-
-                ui.label("Format");
+            let row = |ui: &mut egui::Ui, label: &str, add: &mut dyn FnMut(&mut egui::Ui)| {
                 ui.horizontal(|ui| {
-                    let formats = capture::webcam::formats(&cam.id);
-                    let current = cam.format.map(capture::webcam::Format::from);
-                    let label = current.map_or_else(|| "Automatic".to_owned(), |f| f.label());
-                    {
-                        egui::ComboBox::from_id_salt("webcam_format")
-                            .selected_text(label)
-                            .width(240.0)
-                            .show_ui(ui, |ui| {
-                                if ui.selectable_label(current.is_none(), "Automatic").on_hover_text("The sharpest picture up to 1080p at 30 fps or more").clicked() {
-                                    if let Some(w) = self.settings.webcam.as_mut() {
-                                        w.format = None;
-                                    }
-                                    self.webcam_view.ask_fit();
-                                }
-                                if formats.is_empty() {
-                                    crate::ui_kit::hint(ui, "The camera's formats show once it's open.");
-                                }
-                                for f in formats {
-                                    if ui.selectable_label(current == Some(f), f.label()).clicked() && current != Some(f) {
-                                        if let Some(w) = self.settings.webcam.as_mut() {
-                                            w.format = Some(f.into());
-                                        }
-                                        self.webcam_view.ask_fit();
-                                    }
-                                }
-                            });
+                    ui.set_min_height(42.0);
+                    ui.label(theme::text(label, 13.5, W::Regular).color(pal.text));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| add(ui));
+                });
+            };
+            row(ui, "Camera", &mut |ui| {
+                let r = crate::ui_kit::select(ui, &cam.name, 180.0);
+                if r.clicked() {
+                    self.webcam_view.cameras = capture::webcam::list_cameras();
+                }
+                crate::ui_kit::menu_popup(&r, false, 240.0, |ui| {
+                    for c in self.webcam_view.cameras.clone() {
+                        if Item::new(c.name.clone()).check(c.id == cam.id).show(ui).clicked() && c.id != cam.id {
+                            if let Some(w) = self.settings.webcam.as_mut() {
+                                w.id = c.id;
+                                w.name = c.name;
+                                w.format = None; // that camera's own formats
+                            }
+                            self.webcam_view.ask_fit();
+                        }
                     }
-                    if capture::webcam::HAS_SETTINGS
-                        && ui
-                        .button("Camera settings…")
-                        .on_hover_text("The camera's own settings: exposure, focus, white balance and more. They apply to the camera right away, in every app.")
-                        .clicked()
-                    {
-                        capture::webcam::open_settings(&cam.id, &cam.name);
+                    if self.webcam_view.cameras.is_empty() {
+                        crate::ui_kit::menu_head(ui, "No cameras found.");
+                    }
+                    crate::ui_kit::menu_sep(ui);
+                    if Item::new("Remove the webcam").icon(icon::TRASH).danger().tip("Take it out of your clips, and forget its place").show(ui).clicked() {
+                        self.settings.webcam = None;
                     }
                 });
-                ui.end_row();
-
-                ui.label("Position");
-                ui.horizontal(|ui| {
-                    if ui.button("Reset").on_hover_text("Back to the bottom-right corner, uncropped").clicked() {
-                        // Back to upright, too.
+            });
+            crate::ui_kit::divider(ui, 0.0);
+            row(ui, "Format", &mut |ui| {
+                let formats = capture::webcam::formats(&cam.id);
+                let current = cam.format.map(capture::webcam::Format::from);
+                let label = current.map_or_else(|| "Automatic".to_owned(), |f| f.label());
+                let r = crate::ui_kit::select(ui, &label, 180.0);
+                crate::ui_kit::menu_popup(&r, false, 240.0, |ui| {
+                    if Item::new("Automatic").check(current.is_none()).tip("The sharpest picture up to 1080p at 30 fps or more").show(ui).clicked() {
+                        if let Some(w) = self.settings.webcam.as_mut() {
+                            w.format = None;
+                        }
+                        self.webcam_view.ask_fit();
+                    }
+                    if formats.is_empty() {
+                        crate::ui_kit::menu_head(ui, "The camera's formats show once it's open.");
+                    }
+                    for f in formats {
+                        if Item::new(f.label()).check(current == Some(f)).show(ui).clicked() && current != Some(f) {
+                            if let Some(w) = self.settings.webcam.as_mut() {
+                                w.format = Some(f.into());
+                            }
+                            self.webcam_view.ask_fit();
+                        }
+                    }
+                });
+            });
+            crate::ui_kit::divider(ui, 0.0);
+            ui.horizontal(|ui| {
+                ui.set_min_height(42.0);
+                ui.label(theme::text("Drag it on the preview to move it.", 12.5, W::Regular).color(pal.text3)).on_hover_text(
+                    "Drag a corner or edge to resize it, and past the opposite side to flip it. Hold Alt to crop, Ctrl to stop snapping. Right-click it to mirror, flip or turn it a quarter.",
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    if Btn::ghost("Reset").small().tip("Back to the bottom-right corner, uncropped").show(ui).clicked() {
                         let camera_aspect = match status {
                             Status::Live { width, height } => width as f32 / height.max(1) as f32,
                             _ => 16.0 / 9.0,
@@ -422,12 +409,12 @@ impl App {
                             w.placement = PlacementCfg::laid_out(Placement::default_for(camera_aspect, frame_aspect), frame_aspect);
                         }
                     }
-                    crate::ui_kit::hint(ui, "Drag it on the preview to move or resize it; right-click to flip or turn it.").on_hover_text(
-                        "Drag a corner or edge to resize it, and past the opposite side to flip it. Hold Alt to crop, Ctrl to stop snapping. \
-                         Right-click it to mirror, flip or turn it a quarter.",
-                    );
+                    if capture::webcam::HAS_SETTINGS
+                        && Btn::ghost("Camera settings…").small().tip("The camera's own settings: exposure, focus, white balance. They apply right away, in every app.").show(ui).clicked()
+                    {
+                        capture::webcam::open_settings(&cam.id, &cam.name);
+                    }
                 });
-                ui.end_row();
             });
         });
     }

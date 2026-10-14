@@ -203,29 +203,6 @@ pub fn command(key: &str) -> Vec<String> {
     vec![if cfg!(target_os = "macos") { "Cmd" } else { "Ctrl" }.to_owned(), key.to_owned()]
 }
 
-/// Draw keys as keycaps: a small rounded box per key, side by side.
-pub fn keycaps(ui: &mut egui::Ui, keys: &[String], size: f32) -> egui::Response {
-    let v = ui.visuals().clone();
-    let font = egui::FontId::proportional(size);
-    let pad = egui::vec2((size * 0.45).round(), (size * 0.18).round());
-    let gap = (size * 0.3).round();
-    let galleys: Vec<_> = keys.iter().map(|k| ui.painter().layout_no_wrap(k.clone(), font.clone(), v.strong_text_color())).collect();
-    let h = size + pad.y * 2.0 + 2.0;
-    let w: f32 = galleys.iter().map(|g| g.size().x.max(size * 0.7) + pad.x * 2.0).sum::<f32>() + gap * galleys.len().saturating_sub(1) as f32;
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
-    let mut x = rect.left();
-    for g in galleys {
-        let cap = egui::Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(g.size().x.max(size * 0.7) + pad.x * 2.0, h - 2.0));
-        // A slightly darker lip under the cap, like a real key.
-        ui.painter().rect_filled(cap.translate(egui::vec2(0.0, 2.0)), 5, v.widgets.noninteractive.bg_stroke.color);
-        ui.painter().rect_filled(cap, 5, v.widgets.inactive.weak_bg_fill);
-        ui.painter().rect_stroke(cap, 5, egui::Stroke::new(1.0, v.widgets.noninteractive.bg_stroke.color), egui::StrokeKind::Inside);
-        ui.painter().galley(cap.center() - g.size() / 2.0, g, v.strong_text_color());
-        x = cap.right() + gap;
-    }
-    resp
-}
-
 fn key_name(code: Code) -> String {
     let raw = code.to_string();
     let name = raw.strip_prefix("Key").or_else(|| raw.strip_prefix("Digit")).unwrap_or(&raw);

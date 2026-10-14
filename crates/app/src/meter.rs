@@ -238,6 +238,39 @@ fn zone_color(db: f32) -> Color32 {
     }
 }
 
+/// A source's level drawn along its fader's track (`x_of`: where a dB value
+/// sits on it): peak and average in the meter's colours, a held peak line.
+pub fn fader_meter(p: &egui::Painter, track: Rect, state: &MeterState, dimmed: bool, x_of: impl Fn(f32) -> f32, pal: &crate::theme::Pal) {
+    p.rect_filled(track, 3, pal.meter_bg);
+    let painter = p.with_clip_rect(track);
+    let alpha = if dimmed { 0.35 } else { 1.0 };
+    let zones = [(FLOOR_DB, YELLOW_FROM, pal.meter_g), (YELLOW_FROM, RED_FROM, pal.meter_y), (RED_FROM, 12.0, pal.meter_r)];
+    // Both channels as one bar: the louder of the two.
+    let level = state.ch[0].level_db.max(state.ch[1].level_db);
+    let rms = state.ch[0].rms_db.max(state.ch[1].rms_db);
+    let hold = state.ch[0].hold_db.max(state.ch[1].hold_db);
+    for (from, to, color) in zones {
+        painter.rect_filled(Rect::from_x_y_ranges(x_of(from)..=x_of(to), track.y_range()), 0, color.gamma_multiply(0.14));
+    }
+    for (db, a) in [(level, 0.5 * alpha), (rms, alpha)] {
+        if db <= FLOOR_DB {
+            continue;
+        }
+        let end = x_of(db);
+        for (from, to, color) in zones {
+            let (x0, x1) = (x_of(from).max(track.left()), x_of(to).min(end));
+            if x1 > x0 {
+                painter.rect_filled(Rect::from_x_y_ranges(x0..=x1, track.y_range()), 0, color.gamma_multiply(a));
+            }
+        }
+    }
+    if hold > FLOOR_DB {
+        let x = x_of(hold);
+        let color = zones.iter().find(|(f, t, _)| hold >= *f && hold < *t).map_or(pal.meter_r, |z| z.2);
+        painter.rect_filled(Rect::from_x_y_ranges(x..=x + 2.0, track.y_range()), 0, color.gamma_multiply(alpha.max(0.6)));
+    }
+}
+
 /// A small single-bar gain-reduction meter for the limiter: how many dB it's
 /// pulling the mix down, growing from the right.
 pub fn reduction(ui: &mut egui::Ui, db: f32, width: f32) -> egui::Response {

@@ -311,3 +311,16 @@ pub fn slider(ui: &mut egui::Ui, value: &mut f32, width: f32) -> egui::Response 
     ui.painter().circle_filled(Pos2::new(x, rect.center().y), k, Color32::WHITE);
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clock_reads_naturally() {
+        assert_eq!(clock(0.0), "0:00.00");
+        assert_eq!(clock(65.344), "1:05.34");
+        assert_eq!(clock(59.999), "0:59.99");
+        assert_eq!(clock(3725.5), "1:02:05.50");
+    }
+}

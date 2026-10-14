@@ -379,7 +379,6 @@ struct App {
     /// Days folded away in the library.
     pub(crate) folded: library::FoldedDays,
     /// Adding a custom clip-saved sound failed: why.
-    pub(crate) sound_error: Option<String>,
     /// Screen-recording permission, re-checked each poll so the banner clears the
     /// moment the user grants it.
     permission: capture::Permission,
@@ -456,6 +455,14 @@ struct App {
     pub(crate) selection: library::Selection,
     /// What's typed in the library's search.
     pub(crate) library_query: String,
+    /// What's typed in Settings' search, the section to scroll to, and
+    /// whether the Clip names page is open.
+    pub(crate) settings_query: String,
+    pub(crate) settings_jump: Option<&'static str>,
+    pub(crate) naming_open: bool,
+    /// The "Connect HesteFiles" dialog, and whether its field has had focus.
+    pub(crate) connect_open: bool,
+    pub(crate) connect_focused: bool,
     /// New clips whose dot has been seen (pointed at).
     pub(crate) seen_new: std::collections::HashSet<PathBuf>,
     /// A clip brought back into view, and when: it flashes.
@@ -579,7 +586,6 @@ impl App {
             hotkeys,
             recording_shortcut: None,
             confirm_reset: false,
-            sound_error: None,
             reveal_clip: None,
             folded,
             permission: capture::screen_permission(),
@@ -632,6 +638,11 @@ impl App {
             rename: None,
             selection: library::Selection::default(),
             library_query: String::new(),
+            settings_query: String::new(),
+            settings_jump: None,
+            naming_open: false,
+            connect_open: false,
+            connect_focused: false,
             seen_new: Default::default(),
             flash_clip: None,
             app_icon_tex: None,
@@ -735,9 +746,15 @@ impl App {
         if open_review {
             app.open_voice_review();
         }
-        // `HESTECLIPS_OPEN_SETTINGS=1` opens on Settings.
-        if std::env::var_os("HESTECLIPS_OPEN_SETTINGS").is_some() {
+        // `HESTECLIPS_OPEN_SETTINGS=1` opens on Settings; `=names` on its
+        // Clip names page, any other value searches for it.
+        if let Some(v) = std::env::var_os("HESTECLIPS_OPEN_SETTINGS") {
             app.page = Page::Settings;
+            match v.to_string_lossy().as_ref() {
+                "1" | "" => {}
+                "names" => app.naming_open = true,
+                q => app.settings_query = q.to_owned(),
+            }
         }
         if !recovered.is_empty() {
             app.toast("Recovered a recording that was cut off last time");

@@ -59,7 +59,6 @@ pub struct Pal {
     pub meter_g: Color32,
     pub meter_y: Color32,
     pub meter_r: Color32,
-    pub wave: Color32,
     pub wave_hi: Color32,
     /// The library panel's chosen filter: a shade darker than its card.
     pub sb_sel: Color32,
@@ -106,7 +105,6 @@ pub const DARK: Pal = Pal {
     meter_g: rgb(0x3DD68C),
     meter_y: rgb(0xF2C94C),
     meter_r: rgb(0xFF5050),
-    wave: rgba(0xAAB6D6, 0.38),
     wave_hi: rgb(0xAAB6D6),
     sb_sel: rgba(0x000000, 0.12),
     sb_hover: rgba(0xFFFFFF, 0.06),
@@ -142,7 +140,6 @@ pub const LIGHT: Pal = Pal {
     meter_g: rgb(0x12A467),
     meter_y: rgb(0xE0A82E),
     meter_r: rgb(0xE0362F),
-    wave: rgba(0x465478, 0.32),
     wave_hi: rgb(0x56607A),
     sb_sel: rgba(0x101218, 0.045),
     sb_hover: rgba(0xFFFFFF, 0.4),
@@ -212,10 +209,6 @@ pub fn ic(name: &str, size: f32) -> egui::RichText {
     egui::RichText::new(name).font(FontId::proportional(size))
 }
 
-/// A filled icon as text at a size.
-pub fn icf(name: &str, size: f32) -> egui::RichText {
-    egui::RichText::new(name).font(FontId::new(size, fill_family()))
-}
 
 /// Install the typeface and icon fonts. egui's own fonts and the system's
 /// symbol font stay as fallbacks for characters Hanken Grotesk lacks.

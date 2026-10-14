@@ -28,7 +28,6 @@ use media::pcm::Pcm;
 use media::{ClipInfo, TrackEdit};
 
 use crate::filmstrip::Filmstrip;
-use crate::meter;
 use crate::player::Player;
 
 /// The timeline: ruler, filmstrip and sound, and the space under it.
@@ -959,34 +958,4 @@ pub fn set_volume(ctx: &egui::Context, volume: (f32, bool)) {
 
 fn volume_id() -> egui::Id {
     egui::Id::new("viewer_volume")
-}
-
-/// Meter colour for a loudness (RMS): green, yellow from -18 dB, red from -6 dB.
-fn zone(db: f32) -> Color32 {
-    if db >= -6.0 {
-        meter::RED
-    } else if db >= -18.0 {
-        meter::YELLOW
-    } else {
-        meter::GREEN
-    }
-}
-
-/// "1:05.3": minutes, seconds and tenths.
-fn clock(t: f64) -> String {
-    let tenths = (t.max(0.0) * 10.0 + 1e-6).floor() as u64;
-    format!("{}:{:02}.{}", tenths / 600, tenths % 600 / 10, tenths % 10)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn clock_reads_naturally() {
-        assert_eq!(clock(0.0), "0:00.0");
-        assert_eq!(clock(65.34), "1:05.3");
-        assert_eq!(clock(59.96), "0:59.9");
-        assert_eq!(clock(600.0), "10:00.0");
-    }
 }

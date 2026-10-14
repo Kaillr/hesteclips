@@ -4,7 +4,7 @@
 use crate::ui_kit::Dismissed as _;
 use std::path::PathBuf;
 
-use crate::{App, cloud, file_name};
+use crate::{App, file_name};
 
 pub(crate) enum Dialog {
     /// Folders-only browser for choosing the default clips folder.
@@ -28,100 +28,6 @@ pub(crate) struct ShareDialog {
 }
 
 impl App {
-    pub(crate) fn hestefiles_settings(&mut self, ui: &mut egui::Ui) {
-        ui.weak("Share clips to your HesteFiles cloud storage. Create an account token on the HesteFiles website.");
-        ui.add_space(6.0);
-
-        egui::Grid::new("hestefiles_settings").num_columns(2).spacing([16.0, 10.0]).show(ui, |ui| {
-            ui.label("Account");
-            match &self.cloud.connection {
-                cloud::Connection::Connected(account) => {
-                    let (user, token) = (&account.user_info, &account.token_info);
-                    let expires = if token.expires == "never" {
-                        "never expires".to_owned()
-                    } else {
-                        format!("expires {}", token.expires)
-                    };
-                    let mut disconnect = false;
-                    let picture = self.cloud.profile_picture().and_then(|url| self.web_images.fresh(ui.ctx(), &url));
-                    ui.horizontal(|ui| {
-                        match &picture {
-                            // Round, as HesteFiles shows it.
-                            Some(tex) => {
-                                ui.add(egui::Image::from_texture((tex.id(), egui::vec2(24.0, 24.0))).corner_radius(12));
-                            }
-                            None => {
-                                ui.colored_label(egui::Color32::from_rgb(90, 190, 110), "●");
-                            }
-                        }
-                        ui.label(format!("Connected as {}", user.username));
-                        ui.weak(format!("· token “{}”, {expires}", token.name));
-                        disconnect = ui.small_button("Disconnect").clicked();
-                    });
-                    if disconnect {
-                        self.cloud.disconnect();
-                    }
-                }
-                cloud::Connection::Connecting => {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label("Checking token…");
-                    });
-                }
-                cloud::Connection::Disconnected | cloud::Connection::Failed(_) => {
-                    let error = match &self.cloud.connection {
-                        cloud::Connection::Failed(e) => Some(e.clone()),
-                        _ => None,
-                    };
-                    ui.vertical(|ui| {
-                        ui.horizontal(|ui| {
-                            let field = ui.add(
-                                egui::TextEdit::singleline(&mut self.cloud.token_input)
-                                    .password(true)
-                                    .hint_text("Paste account token")
-                                    .desired_width(260.0),
-                            );
-                            let enter = field.lost_focus()
-                                && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                            let can = !self.cloud.token_input.trim().is_empty();
-                            if (ui.add_enabled(can, egui::Button::new("Connect")).clicked() || enter)
-                                && can
-                            {
-                                let token = self.cloud.token_input.clone();
-                                self.cloud.connect(&token);
-                            }
-                        });
-                        if let Some(e) = error {
-                            ui.colored_label(ui.visuals().error_fg_color, format!("Couldn't connect: {e}"));
-                        }
-                    });
-                }
-            }
-            ui.end_row();
-
-            ui.label("Default clips folder");
-            ui.horizontal(|ui| {
-                match &self.cloud.default_folder {
-                    Some(f) => ui.label(format!("{}", f.display())),
-                    None => ui.weak("Not set"),
-                };
-                let connected = self.cloud.is_connected();
-                if ui
-                    .add_enabled(connected, egui::Button::new("Choose…"))
-                    .on_disabled_hover_text("Connect your account first.")
-                    .clicked()
-                {
-                    self.cloud.open_browser(self.cloud.default_folder.clone());
-                    self.dialog = Some(Dialog::PickDefaultFolder);
-                }
-                if self.cloud.default_folder.is_some() && ui.small_button("Clear").clicked() {
-                    self.cloud.set_default_folder(None);
-                }
-            });
-            ui.end_row();
-        });
-    }
-
     pub(crate) fn open_share_dialog(&mut self, clip: PathBuf) {
         let target = if self.cloud.default_folder.is_some() {
             ShareTarget::DefaultFolder
