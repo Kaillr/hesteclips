@@ -939,7 +939,7 @@ impl App {
             }
             ui_kit::menu_sep(ui);
             if Item::new(self.delete_label(Some(n))).icon(icon::TRASH).danger().show(ui).clicked() {
-                action = Some(Action::TrashSelected(false));
+                action = Some(Action::TrashSelected);
             }
             return action;
         }
@@ -1041,7 +1041,7 @@ impl App {
             } else if self.selection.is_empty() {
                 None
             } else if i.consume_key(cmd, egui::Key::Backspace) || i.consume_key(egui::Modifiers::NONE, egui::Key::Backspace) || i.consume_key(egui::Modifiers::NONE, egui::Key::Delete) {
-                Some(Action::TrashSelected(true))
+                Some(Action::TrashSelected)
             } else if i.consume_key(egui::Modifiers::NONE, egui::Key::Escape) {
                 Some(Action::Deselect)
             } else {
@@ -1105,7 +1105,7 @@ impl App {
                             }
                             let label = if self.settings.delete_permanently { format!("Delete {n}") } else { format!("Move {n} to {}", crate::store::bin_name()) };
                             if Btn::new(Kind::DangerText, label).with_icon(icon::TRASH).small().show(ui).clicked() {
-                                action = Some(Action::TrashSelected(false));
+                                action = Some(Action::TrashSelected);
                             }
                         });
                     });
@@ -1143,7 +1143,7 @@ impl App {
             },
             Action::Edit(p) => self.open_editor(p),
             Action::Rename(p) => self.rename_clip(p),
-            Action::Trash(p) => self.delete_clips(&[p], false),
+            Action::Trash(p) => self.delete_clips(&[p]),
             Action::MoveTo(paths, folder) => self.move_clips(ctx, &paths, folder),
             Action::MoveSelectedTo(folder) => {
                 let paths: Vec<PathBuf> = self.clips.iter().filter(|c| self.selection.paths.contains(&c.path)).map(|c| c.path.clone()).collect();
@@ -1177,9 +1177,9 @@ impl App {
                     up.cancel();
                 }
             }
-            Action::TrashSelected(ask) => {
+            Action::TrashSelected => {
                 let paths: Vec<PathBuf> = self.clips.iter().filter(|c| self.selection.paths.contains(&c.path)).map(|c| c.path.clone()).collect();
-                self.delete_clips(&paths, ask);
+                self.delete_clips(&paths);
             }
         }
     }

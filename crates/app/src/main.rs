@@ -1508,9 +1508,8 @@ impl App {
                 self.share(frame, clip, choice);
             }
             viewer::ViewerOutcome::Delete => {
-                // Its button says just "Delete", and the key nothing: ask.
                 let clip = v.clip().to_path_buf();
-                self.delete_clips(&[clip], true);
+                self.delete_clips(&[clip]);
             }
             viewer::ViewerOutcome::Rename => {
                 let clip = v.clip().to_path_buf();

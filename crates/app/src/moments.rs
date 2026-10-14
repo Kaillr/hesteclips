@@ -134,6 +134,16 @@ pub fn follow(from: &Path, to: &Path) {
     }
 }
 
+/// Put a clip's moments back (Undo after deleting it).
+pub fn put(clip: &Path, m: Moments) {
+    if m.kills.is_empty() && m.markers.is_empty() {
+        return;
+    }
+    change(clip, |clips, key| {
+        clips.insert(key.to_owned(), m);
+    });
+}
+
 /// Clips that were deleted take their moments with them.
 pub fn forget(clips: &[PathBuf]) {
     for clip in clips {

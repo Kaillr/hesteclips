@@ -45,6 +45,8 @@ pub enum Keys {
 pub enum ToastAction {
     /// Open the clip in the player.
     Show(std::path::PathBuf),
+    /// Put clips just moved to the Bin back.
+    Undelete(crate::library::Binned),
 }
 
 #[derive(Clone)]
@@ -355,6 +357,7 @@ impl App {
                     let _ = frame;
                     self.open_viewer(clip);
                 }
+                ToastAction::Undelete(binned) => self.undelete(binned),
             }
         }
     }

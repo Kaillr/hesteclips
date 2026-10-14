@@ -236,9 +236,8 @@ pub(crate) enum Action {
     Select { path: PathBuf, range: bool },
     SelectAll,
     Deselect,
-    /// Delete the selected clips; `true`: ask first (a key was pressed, which
-    /// doesn't say what it does).
-    TrashSelected(bool),
+    /// Delete the selected clips.
+    TrashSelected,
     CancelUpload(PathBuf),
 }
 
@@ -251,17 +250,14 @@ pub(crate) enum Card<'a> {
 }
 
 impl App {
-    /// Move clips (and their edits) to the Bin. Clips with a save in progress are
-    /// left alone: their file is about to be replaced.
     /// Delete clips the way the setting says: to the Recycle Bin, or for good.
-    /// Asks first when deleting for good, or when `ask` (a key or a plain
-    /// "Delete" button, which don't say where the clip goes); a menu item
-    /// that says "Move to Recycle Bin" just does it.
-    pub(crate) fn delete_clips(&mut self, paths: &[PathBuf], ask: bool) {
+    /// Asks first only when deleting for good: to the Bin, the toast says
+    /// where they went and offers Undo instead of asking twice.
+    pub(crate) fn delete_clips(&mut self, paths: &[PathBuf]) {
         if paths.is_empty() {
             return;
         }
-        if self.settings.delete_permanently || ask {
+        if self.settings.delete_permanently {
             self.confirm_delete = Some(paths.to_vec());
         } else {
             self.delete_now(paths);
@@ -348,6 +344,9 @@ impl App {
         let mut library = self.clips.clone();
         let (mut moved, mut busy) = (Vec::new(), 0);
         let mut error = None;
+        // What's needed to put them back: what went to the Bin, and the
+        // collections and moments they were in.
+        let mut binned = Binned::default();
         for path in paths {
             let Some(i) = library.iter().position(|c| &c.path == path) else { continue };
             if self.renders.iter().any(|j| &j.source == path) {
@@ -357,8 +356,13 @@ impl App {
             // Trash against what's left, so duplicates sharing assets let go of them
             // with the last copy.
             let clip = library.remove(i);
+            let kept = (crate::moments::of(&clip.path), self.collections.list().iter().filter(|c| self.collections.contains(&c.id, &clip.path)).map(|c| c.id.clone()).collect::<Vec<_>>());
             match delete_when_free(&clip, &library, permanently) {
-                Ok(()) => moved.push(clip.path),
+                Ok(trashed) => {
+                    binned.items.extend(trashed);
+                    binned.clips.push((clip.path.clone(), kept.0, kept.1));
+                    moved.push(clip.path);
+                }
                 Err(e) => {
                     library.insert(i, clip);
                     error = Some(e);
@@ -379,7 +383,7 @@ impl App {
         } else if !moved.is_empty() && permanently {
             self.toast_icon(egui_phosphor::regular::TRASH, format!("Deleted {what}"));
         } else if !moved.is_empty() {
-            self.toast_icon(egui_phosphor::regular::TRASH, format!("Moved {what} to the {bin}"));
+            self.toast_action(egui_phosphor::regular::TRASH, format!("Moved {what} to the {bin}"), "Undo", crate::shell::ToastAction::Undelete(binned));
         }
         self.selection.clear();
         self.refresh_clips();
@@ -391,6 +395,23 @@ impl App {
                     self.page = crate::Page::Clips;
                 }
             }
+        }
+    }
+
+    /// Undo: put clips just moved to the Bin back, in their collections, with
+    /// their moments.
+    pub(crate) fn undelete(&mut self, binned: Binned) {
+        match store::restore(&binned.items) {
+            Ok(()) => {
+                for (path, moments, collections) in binned.clips {
+                    crate::moments::put(&path, moments);
+                    for id in collections {
+                        self.collections.add(&id, std::slice::from_ref(&path));
+                    }
+                }
+                self.refresh_clips();
+            }
+            Err(e) => self.toast_error(format!("Couldn't put it back: {e}")),
         }
     }
 
@@ -784,7 +805,7 @@ impl App {
 
 /// Delete a clip, waiting a moment if it's still open (decoders closing
 /// after being told to stop: a few ms, rarely more).
-fn delete_when_free(clip: &clips::Clip, library: &[clips::Clip], permanently: bool) -> Result<(), String> {
+fn delete_when_free(clip: &clips::Clip, library: &[clips::Clip], permanently: bool) -> Result<Vec<store::Trashed>, String> {
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     loop {
         match store::delete(clip, library, permanently) {
@@ -795,6 +816,14 @@ fn delete_when_free(clip: &clips::Clip, library: &[clips::Clip], permanently: bo
             r => return r,
         }
     }
+}
+
+/// Clips just moved to the Bin, for Undo: what went there (the clips and
+/// their edits), and per clip its moments and collections.
+#[derive(Clone, Default)]
+pub struct Binned {
+    items: Vec<store::Trashed>,
+    clips: Vec<(PathBuf, crate::moments::Moments, Vec<String>)>,
 }
 
 fn file_name_of(path: &Path) -> String {

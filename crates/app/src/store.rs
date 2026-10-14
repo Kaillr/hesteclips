@@ -283,11 +283,14 @@ pub fn free_up(target: &EditTarget, how: FreeUp, permanently: bool) -> Result<u6
 }
 
 /// Delete a clip, with its assets unless another copy of the clip
-/// (duplicated in Finder) still uses them: to the Bin, or for good.
-pub fn delete(clip: &Clip, library: &[Clip], permanently: bool) -> Result<(), String> {
-    let remove = |path: &Path| -> Result<(), String> {
+/// (duplicated in Finder) still uses them: to the Bin, or for good. What
+/// went to the Bin, to put back with [`restore`].
+pub fn delete(clip: &Clip, library: &[Clip], permanently: bool) -> Result<Vec<Trashed>, String> {
+    let mut binned = Vec::new();
+    let mut remove = |path: &Path| -> Result<(), String> {
         if !permanently {
-            return trash::delete(path).map_err(|e| e.to_string());
+            binned.push(to_bin(path)?);
+            return Ok(());
         }
         let r = if path.is_dir() { std::fs::remove_dir_all(path) } else { std::fs::remove_file(path) };
         r.map_err(|e| e.to_string())
@@ -300,7 +303,65 @@ pub fn delete(clip: &Clip, library: &[Clip], permanently: bool) -> Result<(), St
             remove(&dir)?;
         }
     }
+    Ok(binned)
+}
+
+/// Something moved to the Bin: where it was, and where it went (macOS; the
+/// other systems find it by where it was).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Trashed {
+    pub from: PathBuf,
+    #[cfg(target_os = "macos")]
+    to: PathBuf,
+}
+
+/// Move `path` to the Bin.
+#[cfg(target_os = "macos")]
+fn to_bin(path: &Path) -> Result<Trashed, String> {
+    use objc2_foundation::{NSFileManager, NSString, NSURL};
+    let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
+    let mut landed: Option<objc2::rc::Retained<NSURL>> = None;
+    NSFileManager::defaultManager().trashItemAtURL_resultingItemURL_error(&url, Some(&mut landed)).map_err(|e| e.localizedDescription().to_string())?;
+    let to = landed.and_then(|u| u.path()).map(|p| PathBuf::from(p.to_string())).ok_or("the Trash didn't say where it put it")?;
+    Ok(Trashed { from: path.to_path_buf(), to })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn to_bin(path: &Path) -> Result<Trashed, String> {
+    trash::delete(path).map_err(|e| e.to_string())?;
+    Ok(Trashed { from: path.to_path_buf() })
+}
+
+/// Put things back from the Bin where they were (Undo after deleting).
+/// Something already back in its place, or emptied from the Bin, is skipped.
+#[cfg(target_os = "macos")]
+pub fn restore(items: &[Trashed]) -> Result<(), String> {
+    for t in items {
+        if t.from.exists() || !t.to.exists() {
+            continue;
+        }
+        if let Some(dir) = t.from.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        std::fs::rename(&t.to, &t.from).map_err(|e| e.to_string())?;
+    }
     Ok(())
+}
+
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+pub fn restore(items: &[Trashed]) -> Result<(), String> {
+    let wanted: Vec<&Path> = items.iter().filter(|t| !t.from.exists()).map(|t| t.from.as_path()).collect();
+    let mut found: Vec<trash::TrashItem> = trash::os_limited::list().map_err(|e| e.to_string())?.into_iter().filter(|i| wanted.contains(&i.original_path().as_path())).collect();
+    // The same path binned before too: the newest is the one just deleted.
+    found.sort_by_key(|i| std::cmp::Reverse(i.time_deleted));
+    let mut seen = std::collections::HashSet::new();
+    found.retain(|i| seen.insert(i.original_path()));
+    trash::os_limited::restore_all(found).map_err(|e| e.to_string())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+pub fn restore(_: &[Trashed]) -> Result<(), String> {
+    Err("can't put things back from the Bin on this system".into())
 }
 
 /// Edited clips saved before edits kept their clip's date show as made the
@@ -574,6 +635,28 @@ mod free_up_tests {
         let again = EditTarget::of(&target.clip);
         assert_eq!(again.source, target.clip);
         assert!(load_edit(&again).is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod bin_tests {
+    use super::*;
+
+    /// Uses the real Bin: `cargo test -- --ignored bin_and_back`.
+    #[test]
+    #[ignore]
+    fn bin_and_back() {
+        let dir = std::env::temp_dir().join(format!("hc-bin-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("Undo me.mp4");
+        std::fs::write(&file, b"clip").unwrap();
+        let t = to_bin(&file).unwrap();
+        assert!(!file.exists());
+        restore(&[t.clone()]).unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"clip");
+        // Already back: nothing to do.
+        restore(&[t]).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
