@@ -360,13 +360,25 @@ impl App {
             }
             // Narrow: the recorder shrinks to its dot and action, and the
             // left side (title, search) gets what's left, never under it.
-            let compact = rect.width() < 720.0;
-            // The right side's width last frame (it's laid out after).
+            // Compact only when the full one doesn't fit beside what the
+            // left side needs (both as wide as last frame; the left side's
+            // search can shrink, so it counts at its smallest).
+            let full_key = egui::Id::new(("page_head_right", false));
+            let left_key = egui::Id::new(("page_head_left", title, ui.id()));
+            let full_w = ui.data(|d| d.get_temp::<f32>(full_key)).unwrap_or(340.0);
+            let left_need = ui.data(|d| d.get_temp::<f32>(left_key)).unwrap_or(0.0);
+            let room = rect.right() - ui.cursor().min.x;
+            let compact = left_need + 16.0 + full_w > room;
             let key = egui::Id::new(("page_head_right", compact));
             let right_w = ui.data(|d| d.get_temp::<f32>(key)).unwrap_or(if compact { 230.0 } else { 340.0 });
             let left_rect = Rect::from_min_max(ui.cursor().min, Pos2::new((rect.right() - right_w - 16.0).max(ui.cursor().min.x + 40.0), rect.bottom()));
             let mut lui = ui.new_child(egui::UiBuilder::new().max_rect(left_rect).layout(egui::Layout::left_to_right(egui::Align::Center)));
             left(self, &mut lui);
+            // What the left side took, less the search's give (it shrinks to 80).
+            let used = lui.min_rect().width();
+            let give = (ui_kit::SEARCH_W - 80.0).max(0.0);
+            let need = if title.is_empty() { used } else { (used - give).max(0.0) };
+            ui.data_mut(|d| d.insert_temp(left_key, need));
             let right = ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let start = ui.cursor().max.x;
                 self.recorder(ui, compact);
