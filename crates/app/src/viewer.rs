@@ -361,7 +361,7 @@ impl Viewer {
                     if Item::new("Rename…").icon(icon::PENCIL_SIMPLE).keys(Some(vec!["F2".into()])).show(ui).clicked() {
                         out = ViewerOutcome::Rename;
                     }
-                    if Item::new("Add a marker here").icon(icon::FLAG).keys(Some(vec!["B".into()])).enabled(matches!(self.state, State::Ready(_))).tip("A pin on the timeline to come back to: [ and ] jump between them").show(ui).clicked() {
+                    if Item::new("Add a marker here").icon(icon::BOOKMARK_SIMPLE).keys(Some(vec!["B".into()])).enabled(matches!(self.state, State::Ready(_))).tip("A pin on the timeline to come back to: [ and ] jump between them").show(ui).clicked() {
                         mark = true;
                     }
                     if Item::new("Open in another player").icon(icon::ARROW_SQUARE_OUT).show(ui).clicked() {

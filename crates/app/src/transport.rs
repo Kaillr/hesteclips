@@ -316,7 +316,7 @@ pub fn ruler(ui: &mut egui::Ui, rect: Rect, view: (f64, f64), fps: f64, frames: 
         let (fill, fg) = if m.marker { (p.warn, Color32::from_rgb(42, 30, 6)) } else { (p.text, p.base) };
         painter.circle_filled(c, r + 2.0, p.base);
         painter.circle_filled(c, r, fill);
-        let glyph = if m.marker { egui_phosphor::fill::FLAG } else { icon::CROSSHAIR_SIMPLE };
+        let glyph = if m.marker { egui_phosphor::fill::BOOKMARK_SIMPLE } else { icon::CROSSHAIR_SIMPLE };
         painter.text(c, Align2::CENTER_CENTER, glyph, FontId::new(11.0, if m.marker { theme::fill_family() } else { egui::FontFamily::Proportional }), fg);
         let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(&m.label);
         if resp.clicked() {
