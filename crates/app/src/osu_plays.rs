@@ -40,6 +40,9 @@ pub struct Stats {
     pub misses: u64,
     pub slider_breaks: u64,
     pub combo: u64,
+    /// The play's best combo so far: it only grows during a play, and starts
+    /// over at 0 with a retry (osu! resets it; tosu reads it from osu!).
+    pub max_combo: u64,
     pub pp: f64,
     /// "HDDT"; empty or "NM" without mods.
     pub mods: String,
@@ -104,10 +107,14 @@ impl Tracker {
         match r.screen {
             Screen::Playing => {
                 let Some(map) = r.map.clone() else { return };
+                // A retry starts over: the play's best combo goes back to
+                // 0 (seen however soon it's retried), or the map back to its
+                // start (when only the window's title is read).
+                let max_combo = |s: &Option<Stats>| s.as_ref().map(|s| s.max_combo);
                 let same = self.plays.back().is_some_and(|p| {
                     p.outcome == Outcome::Playing
                         && p.map == map
-                        // A retry starts over from the beginning.
+                        && !matches!((max_combo(&p.stats), max_combo(&r.stats)), (Some(a), Some(b)) if b < a)
                         && !matches!((p.progress, r.progress), (Some(a), Some(b)) if b + 0.02 < a)
                 });
                 if !same {
@@ -257,7 +264,7 @@ pub fn example(f: &GameTitles) -> String {
         other_player: None,
         start: now,
         end: now,
-        stats: Some(Stats { accuracy: 97.1, misses: 3, slider_breaks: 0, combo: 1200, pp: 412.0, mods: "HDDT".into() }),
+        stats: Some(Stats { accuracy: 97.1, misses: 3, slider_breaks: 0, combo: 1200, max_combo: 1200, pp: 412.0, mods: "HDDT".into() }),
         progress: Some(1.0),
         failed: false,
         outcome: Outcome::Passed,
@@ -352,6 +359,7 @@ fn from_v2(v: &Value) -> Option<Reading> {
         misses: p["hits"]["0"].as_u64().unwrap_or(0),
         slider_breaks: p["hits"]["sliderBreaks"].as_u64().unwrap_or(0),
         combo: p["combo"]["current"].as_u64().unwrap_or(0),
+        max_combo: p["combo"]["max"].as_u64().unwrap_or(0),
         pp: p["pp"]["current"].as_f64().unwrap_or(0.0),
         mods: text(&p["mods"]["name"]),
     };
@@ -361,6 +369,7 @@ fn from_v2(v: &Value) -> Option<Reading> {
         misses: rs["hits"]["0"].as_u64().unwrap_or(0),
         slider_breaks: 0,
         combo: rs["maxCombo"].as_u64().unwrap_or(0),
+        max_combo: rs["maxCombo"].as_u64().unwrap_or(0),
         pp: rs["pp"]["current"].as_f64().unwrap_or(0.0),
         mods: text(&rs["mods"]["name"]),
     };
@@ -389,6 +398,7 @@ fn from_v1(v: &Value) -> Option<Reading> {
         misses: g["hits"]["0"].as_u64().unwrap_or(0),
         slider_breaks: g["hits"]["sliderBreaks"].as_u64().unwrap_or(0),
         combo: g["combo"]["current"].as_u64().unwrap_or(0),
+        max_combo: g["combo"]["max"].as_u64().unwrap_or(0),
         pp: g["pp"]["current"].as_f64().unwrap_or(0.0),
         mods: text(&menu["mods"]["str"]),
     };
@@ -402,6 +412,7 @@ fn from_v1(v: &Value) -> Option<Reading> {
         misses: rs["0"].as_u64().unwrap_or(0),
         slider_breaks: 0,
         combo: rs["maxCombo"].as_u64().unwrap_or(0),
+        max_combo: rs["maxCombo"].as_u64().unwrap_or(0),
         pp: 0.0,
         mods: text(&rs["mods"]["str"]),
     });
@@ -467,7 +478,7 @@ mod tests {
             screen: Screen::Playing,
             map: Some(map()),
             other_player: None,
-            stats: Some(Stats { accuracy, misses, slider_breaks: 0, combo: 500, pp: 300.0, mods: "HDDT".into() }),
+            stats: Some(Stats { accuracy, misses, slider_breaks: 0, combo: 500, max_combo: 500, pp: 300.0, mods: "HDDT".into() }),
             progress: Some(progress),
             failed: false,
             results: None,
@@ -495,7 +506,7 @@ mod tests {
         }
         let mut results = playing(1.0, 0.0, 0).unwrap();
         results.screen = Screen::Results;
-        results.results = Some(Stats { accuracy: 98.52, misses: 0, slider_breaks: 0, combo: 2000, pp: 412.3, mods: "HDDT".into() });
+        results.results = Some(Stats { accuracy: 98.52, misses: 0, slider_breaks: 0, combo: 2000, max_combo: 2000, pp: 412.3, mods: "HDDT".into() });
         t.update(at(41), Some(results.clone()));
         t.update(at(45), Some(results));
         for s in 46..=55 {
@@ -553,7 +564,7 @@ mod tests {
             other_player: None,
             start: Instant::now(),
             end: Instant::now(),
-            stats: Some(Stats { accuracy: 97.1, misses: 3, slider_breaks: 0, combo: 1, pp: 350.0, mods: String::new() }),
+            stats: Some(Stats { accuracy: 97.1, misses: 3, slider_breaks: 0, combo: 1, max_combo: 1, pp: 350.0, mods: String::new() }),
             progress: Some(1.0),
             failed: false,
             outcome: Outcome::Passed,
@@ -586,6 +597,36 @@ mod tests {
         assert_eq!(map_from_title("osu!  - xi - FREEDOM DiVE [FOUR DIMENSIONS].osu"), None);
     }
 
+    /// A retry a moment into the map (before it's 2% in, where going back
+    /// to the start can't be told from the clock's jitter) is still a new
+    /// attempt: the play's best combo starts over.
+    #[test]
+    fn a_quick_retry_is_a_new_attempt() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let attempt = |progress: f64, max_combo: u64| {
+            let mut r = playing(progress, 100.0, 0).unwrap();
+            r.stats.as_mut().unwrap().max_combo = max_combo;
+            Some(r)
+        };
+        let mut t = Tracker::default();
+        t.update(at(0), attempt(0.000, 0));
+        t.update(at(500), attempt(0.008, 12));
+        t.update(at(1000), attempt(0.015, 25));
+        // Retried: the clock's back near the start, but not 2% back.
+        t.update(at(1500), attempt(0.002, 0));
+        t.update(at(2000), attempt(0.010, 14));
+        assert_eq!(t.plays.len(), 2, "two attempts");
+        assert_eq!(t.plays[0].outcome, Outcome::Quit);
+        // The same attempt going on is one play (its best combo only grows,
+        // even when the combo itself breaks).
+        let mut t = Tracker::default();
+        for (ms, max) in [(0, 0), (500, 40), (1000, 40), (1500, 41)] {
+            t.update(at(ms), attempt(ms as f64 / 100_000.0, max));
+        }
+        assert_eq!(t.plays.len(), 1);
+    }
+
     #[test]
     fn tosu_v2() {
         let v = serde_json::json!({
@@ -601,7 +642,7 @@ mod tests {
         assert_eq!(r.screen, Screen::Playing);
         assert_eq!(r.other_player, None);
         assert_eq!(r.progress, Some(0.5));
-        assert_eq!(r.stats.unwrap(), Stats { accuracy: 98.5, misses: 2, slider_breaks: 1, combo: 321, pp: 200.0, mods: "HD".into() });
+        assert_eq!(r.stats.unwrap(), Stats { accuracy: 98.5, misses: 2, slider_breaks: 1, combo: 321, max_combo: 400, pp: 200.0, mods: "HD".into() });
         let mut replay = v.clone();
         replay["play"]["playerName"] = "WhiteCat".into();
         assert_eq!(from_v2(&replay).unwrap().other_player.as_deref(), Some("WhiteCat"));
