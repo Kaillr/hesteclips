@@ -926,8 +926,6 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         #[cfg(target_os = "macos")]
         shell::keep_window_buttons(frame);
-        #[cfg(target_os = "windows")]
-        shell::tint_title_bar(frame, ui.visuals().dark_mode);
         let ctx = ui.ctx().clone();
         let mut laps = Laps::start();
 
@@ -978,11 +976,28 @@ impl eframe::App for App {
         // The viewer in fullscreen: the picture from edge to edge.
         let edge_to_edge = self.page == Page::View && ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
         let p = theme::pal(ui);
+        // The title bar is the rail's colour, framing the page with it; with
+        // no rail (the player, editor) it's the page's, so it reads as the
+        // page's own top. It changes as the rail goes and comes back.
+        #[cfg(target_os = "windows")]
+        {
+            let t = theme::toggle(&ctx, egui::Id::new("title_bar_page"), full, theme::NORMAL);
+            shell::tint_title_bar(frame, theme::mix(p.ground, p.base, t), p.dark);
+        }
+        let framed = !full && shell::framed_page();
+        let page_rect = ui.available_rect_before_wrap();
+        // The frame's colour shows round the page's rounded corner.
+        if framed {
+            ui.painter().rect_filled(page_rect, 0, p.ground);
+        }
         let central = if edge_to_edge || full {
             egui::Frame::NONE.fill(if edge_to_edge { Color32::BLACK } else { p.base })
         } else {
             // Pages that scroll run to the window's bottom edge.
-            egui::Frame::new().fill(p.base).inner_margin(egui::Margin { left: ui_kit::PAGE_MARGIN, right: ui_kit::PAGE_MARGIN, top: if shell::under_titlebar() { 0 } else { 4 }, bottom: 0 })
+            egui::Frame::new()
+                .fill(p.base)
+                .corner_radius(egui::CornerRadius { nw: if framed { shell::PAGE_CORNER } else { 0 }, ..Default::default() })
+                .inner_margin(egui::Margin { left: ui_kit::PAGE_MARGIN, right: ui_kit::PAGE_MARGIN, top: if shell::under_titlebar() { 0 } else { 4 }, bottom: 0 })
         };
         laps.lap("bars");
         // A dialog or menu open (now, or drawn last frame): it gets the keys.
@@ -1022,6 +1037,9 @@ impl eframe::App for App {
                 Page::Edit => ui_kit::arrive(ui, |ui| self.editor_page(ui)),
                 Page::View => ui_kit::arrive_on(ui, if edge_to_edge { Color32::BLACK } else { p.base }, |ui| self.viewer_page(ui, frame)),
             });
+        if framed {
+            shell::page_edge(ui.painter(), page_rect, p.line);
+        }
 
         laps.lap(match self.page {
             Page::Clips => "library page",

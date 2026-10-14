@@ -108,30 +108,59 @@ fn place_window_buttons(view: &objc2_app_kit::NSView) {
     }
 }
 
-/// Windows: the title bar in the rail's colour (and the app's text colour),
-/// so the window's top reads as part of it, in either look. Runs every
-/// frame; only tells Windows when the look changes. (Windows 10 ignores the
-/// colours and keeps its own, light or dark.)
+/// Whether the page sits in a frame of the rail's colour, under a title bar
+/// of that colour (Windows): its top-left corner is rounded, with a hairline
+/// round its top and left edges, so the title bar and rail read as one frame
+/// around it. (macOS has no title bar; Linux's is the desktop's own colour.)
+pub fn framed_page() -> bool {
+    cfg!(target_os = "windows")
+}
+
+/// How round the page's top-left corner is, in the frame: Windows 11's own
+/// window corners.
+pub const PAGE_CORNER: u8 = 8;
+
+/// The hairline round a framed page's top and left edges (see
+/// [`framed_page`]), on the page's outermost pixel. Drawn over the page.
+pub fn page_edge(painter: &egui::Painter, page: Rect, color: Color32) {
+    let (l, t) = (page.left() + 0.5, page.top() + 0.5);
+    let r = PAGE_CORNER as f32 - 0.5;
+    let mut points = vec![Pos2::new(l, page.bottom())];
+    // The corner, a quarter circle from the left edge round to the top.
+    let steps = 8;
+    for i in 0..=steps {
+        let a = std::f32::consts::PI + std::f32::consts::FRAC_PI_2 * i as f32 / steps as f32;
+        points.push(Pos2::new(l + r + r * a.cos(), t + r + r * a.sin()));
+    }
+    points.push(Pos2::new(page.right(), t));
+    painter.add(egui::Shape::line(points, Stroke::new(1.0, color)));
+}
+
+/// Windows: the title bar in `caption` (the rail's colour, or the page's
+/// where there's no rail) with the app's text colour, so it reads as part of
+/// the window. Runs every frame; only tells Windows when something changed.
+/// (Windows 10 ignores the colours and keeps its own, light or dark.)
 #[cfg(target_os = "windows")]
-pub fn tint_title_bar(window: &impl raw_window_handle::HasWindowHandle, dark: bool) {
+pub fn tint_title_bar(window: &impl raw_window_handle::HasWindowHandle, caption: Color32, dark: bool) {
     use raw_window_handle::RawWindowHandle;
-    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::atomic::{AtomicU32, Ordering};
     use windows::Win32::Foundation::{COLORREF, HWND};
     use windows::core::BOOL;
     use windows::Win32::Graphics::Dwm::{DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute};
-    // 0: not yet, 1: light, 2: dark.
-    static DONE: AtomicU8 = AtomicU8::new(0);
-    let look = if dark { 2 } else { 1 };
-    if DONE.load(Ordering::Relaxed) == look {
+    let colorref = |c: Color32| u32::from(c.r()) | u32::from(c.g()) << 8 | u32::from(c.b()) << 16;
+    // What Windows was last told: the caption colour, the dark flag, and a
+    // bit so it's never 0 (not yet).
+    static DONE: AtomicU32 = AtomicU32::new(0);
+    let now = colorref(caption) | u32::from(dark) << 24 | 1 << 25;
+    if DONE.load(Ordering::Relaxed) == now {
         return;
     }
     let Ok(handle) = window.window_handle() else { return };
     let RawWindowHandle::Win32(h) = handle.as_raw() else { return };
     let hwnd = HWND(h.hwnd.get() as *mut _);
     let p = if dark { &theme::DARK } else { &theme::LIGHT };
-    let colorref = |c: Color32| COLORREF(u32::from(c.r()) | u32::from(c.g()) << 8 | u32::from(c.b()) << 16);
-    let caption = colorref(p.ground);
-    let text = colorref(p.text);
+    let caption = COLORREF(colorref(caption));
+    let text = COLORREF(colorref(p.text));
     // The window buttons' glyphs follow the dark flag, not the caption colour.
     let dark_flag = BOOL::from(dark);
     // SAFETY: `hwnd` is our live top-level window; each value is the size
@@ -141,7 +170,7 @@ pub fn tint_title_bar(window: &impl raw_window_handle::HasWindowHandle, dark: bo
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_CAPTION_COLOR, &caption as *const _ as *const _, size_of::<COLORREF>() as u32);
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_TEXT_COLOR, &text as *const _ as *const _, size_of::<COLORREF>() as u32);
     }
-    DONE.store(look, Ordering::Relaxed);
+    DONE.store(now, Ordering::Relaxed);
 }
 
 /// Which screen's keyboard shortcuts to show.
@@ -230,8 +259,11 @@ impl App {
         drag_window_area(ui, rest, "rail_top");
         let below = Rect::from_min_max(Pos2::new(rect.left(), y), rect.max);
         drag_window_area(ui, below, "rail_below");
-        // The edge between the rail and the page.
-        ui.painter().vline(rect.right() - 0.5, rect.y_range(), Stroke::new(1.0, p.line));
+        // The edge between the rail and the page (a framed page draws its own,
+        // round its corner).
+        if !framed_page() {
+            ui.painter().vline(rect.right() - 0.5, rect.y_range(), Stroke::new(1.0, p.line));
+        }
     }
 
     /// The recorder: the status (its ∨ opens the other options) and the one
