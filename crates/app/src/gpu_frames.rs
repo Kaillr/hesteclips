@@ -117,6 +117,14 @@ impl Shown {
         ui.painter().add(egui_wgpu::Callback::new_paint_callback(rect, Draw(self.clone(), rect)));
     }
 
+    /// Its colours, blurred very wide, over `cover` (clipped to `painter`'s
+    /// clip): the stage's ambient light. Made from the frame on the GPU each
+    /// time it changes (see [`Glow`]); `id` keeps one stage's light apart
+    /// from another's.
+    pub fn paint_glow(&self, painter: &egui::Painter, cover: egui::Rect, id: egui::Id) {
+        painter.add(egui_wgpu::Callback::new_paint_callback(cover, Ambient(self.clone(), id)));
+    }
+
     /// Where pass 1's output goes for drawing it at `place` (screen pixels:
     /// left, top, width, height).
     fn rows_key(&self, place: [i32; 4]) -> RowsKey {
@@ -162,7 +170,40 @@ struct Scaler {
     groups: HashMap<(usize, usize), (Vec<wgpu::BindGroup>, Instant)>,
     /// Pass 1's output, per place on screen it's drawn to.
     rows: HashMap<RowsKey, (Rows, Instant)>,
+    /// The ambient light: shrinking a frame to a few dozen pixels (RGBA,
+    /// NV12 with each matrix), easing it into the last, blurring it across
+    /// and down, and drawing it big.
+    glow_shrink: [wgpu::RenderPipeline; 3],
+    /// Blurring the shrunk frame and easing the light towards it, in one;
+    /// and starting the light afresh from it.
+    glow_blur: [wgpu::RenderPipeline; 2],
+    glow_show: wgpu::RenderPipeline,
+    /// Two textures and a sampler (the ease and the show read with one).
+    glow_layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    glows: HashMap<egui::Id, (Glow, Instant)>,
 }
+
+/// One stage's ambient light: the frame shrunk (`small`), and the light,
+/// blurred and eased towards each new frame, in turns (`light`); each
+/// `GLOW_W`×`GLOW_H`.
+struct Glow {
+    small: wgpu::TextureView,
+    light: [wgpu::TextureView; 2],
+    /// Read `light[0]` or `light[1]`, for drawing it.
+    show: [wgpu::BindGroup; 2],
+    /// Which of `light` holds the light now.
+    flip: usize,
+    /// The frame it last took in (the same one drawn again isn't eased in twice).
+    last: Option<(usize, usize)>,
+    /// When it last took one in: a long gap (a seek, a new clip) starts over
+    /// instead of fading from a picture that's gone.
+    at: Instant,
+}
+
+/// The ambient light's size: small enough that drawing it big is a wide blur.
+const GLOW_W: u32 = 64;
+const GLOW_H: u32 = 36;
 
 /// Which [`Rows`] picture: where on the screen (so two pictures drawn at
 /// once don't share one), the planes' sizes and the kind.
@@ -183,6 +224,31 @@ struct Rows {
 
 /// Draws a frame with the filter, as an egui paint callback.
 struct Draw(Shown, egui::Rect);
+
+/// Draws a stage's ambient light from a frame, as an egui paint callback.
+struct Ambient(Shown, egui::Id);
+
+impl CallbackTrait for Ambient {
+    fn prepare(
+        &self,
+        device: &wgpu::Device,
+        _queue: &wgpu::Queue,
+        _screen: &ScreenDescriptor,
+        encoder: &mut wgpu::CommandEncoder,
+        resources: &mut CallbackResources,
+    ) -> Vec<wgpu::CommandBuffer> {
+        if let Some(scaler) = resources.get_mut::<Scaler>() {
+            scaler.glow(device, encoder, &self.0, self.1);
+        }
+        Vec::new()
+    }
+
+    fn paint(&self, _info: egui::PaintCallbackInfo, pass: &mut wgpu::RenderPass<'static>, resources: &CallbackResources) {
+        if let Some(scaler) = resources.get::<Scaler>() {
+            scaler.show_glow(pass, self.1);
+        }
+    }
+}
 
 impl CallbackTrait for Draw {
     fn prepare(
@@ -250,7 +316,65 @@ impl Scaler {
             .map(|(source, layout, format)| scope.spawn(move || pipeline(device, layout, format, &source)));
             jobs.map(|j| j.join().expect("frame filter compile"))
         });
-        Self { one, two, across_rgba, across_luma, across_chroma, down_rgba, down_nv12: [bt709, bt601], groups: HashMap::new(), rows: HashMap::new() }
+        let glow_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("ambient light"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
+            ],
+        });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("ambient light"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            ..Default::default()
+        });
+        let light = wgpu::TextureFormat::Rgba16Float;
+        let shrink_nv12 = |bt601: &str| format!("{COMMON}{GLOW_AVERAGE}{GLOW_SHRINK_NV12}").replace("BT601", bt601);
+        let show = format!("{COMMON}{GLOW_SHOW}").replace("SRGB_TARGET", srgb);
+        let gl = &glow_layout;
+        let [s_rgba, s_709, s_601, blur, fresh, show] = std::thread::scope(|scope| {
+            let jobs = [
+                (format!("{COMMON}{GLOW_AVERAGE}{GLOW_SHRINK_RGBA}"), one_ref, light),
+                (shrink_nv12("false"), two_ref, light),
+                (shrink_nv12("true"), two_ref, light),
+                (format!("{COMMON}{GLOW_BLUR}").replace("EASE", "0.2"), gl, light),
+                (format!("{COMMON}{GLOW_BLUR}").replace("EASE", "1.0"), gl, light),
+                (show, gl, target),
+            ]
+            .map(|(source, layout, format)| scope.spawn(move || pipeline(device, layout, format, &source)));
+            jobs.map(|j| j.join().expect("ambient light compile"))
+        });
+        Self {
+            one,
+            two,
+            across_rgba,
+            across_luma,
+            across_chroma,
+            down_rgba,
+            down_nv12: [bt709, bt601],
+            groups: HashMap::new(),
+            rows: HashMap::new(),
+            glow_shrink: [s_rgba, s_709, s_601],
+            glow_blur: [blur, fresh],
+            glow_show: show,
+            glow_layout,
+            sampler,
+            glows: HashMap::new(),
+        }
     }
 
     /// Pass 1 for drawing `shown` at `place`: its rows filtered across, into
@@ -262,21 +386,7 @@ impl Scaler {
         let now = Instant::now();
         self.groups.retain(|_, (_, used)| now.duration_since(*used).as_secs() < 2);
         self.rows.retain(|_, (_, used)| now.duration_since(*used).as_secs() < 2);
-        let views = shown.planes.views();
-        let groups = &mut self.groups.entry(shown.key).or_insert_with(|| {
-            let groups = views
-                .iter()
-                .map(|v| {
-                    device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("decoded frame"),
-                        layout: &self.one,
-                        entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(v) }],
-                    })
-                })
-                .collect();
-            (groups, now)
-        });
-        groups.1 = now;
+        self.frame_groups(device, shown);
         let key = shown.rows_key(place);
         let rows = &mut self.rows.entry(key).or_insert_with(|| {
             let formats: &[wgpu::TextureFormat] = match key.kind {
@@ -331,6 +441,129 @@ impl Scaler {
             pass.set_bind_group(0, group, &[]);
             pass.draw(0..3, 0..1);
         }
+    }
+
+    /// Bind groups reading the frame's planes: one per plane, then (for
+    /// NV12) both together for the ambient light's shrink.
+    fn frame_groups(&mut self, device: &wgpu::Device, shown: &Shown) {
+        let now = Instant::now();
+        let views = shown.planes.views();
+        let groups = &mut self.groups.entry(shown.key).or_insert_with(|| {
+            let mut groups: Vec<wgpu::BindGroup> = views
+                .iter()
+                .map(|v| {
+                    device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("decoded frame"),
+                        layout: &self.one,
+                        entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(v) }],
+                    })
+                })
+                .collect();
+            if views.len() == 2 {
+                let entries: Vec<_> = views.iter().enumerate().map(|(i, v)| wgpu::BindGroupEntry { binding: i as u32, resource: wgpu::BindingResource::TextureView(v) }).collect();
+                groups.push(device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("decoded frame planes"), layout: &self.two, entries: &entries }));
+            }
+            (groups, now)
+        });
+        groups.1 = now;
+    }
+
+    /// The ambient light for stage `id`: `shown` shrunk to a few dozen
+    /// pixels, eased into the light so far (a cut fades in over a moment
+    /// instead of flashing), then blurred across and down.
+    fn glow(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, shown: &Shown, id: egui::Id) {
+        let now = Instant::now();
+        self.glows.retain(|_, (_, used)| now.duration_since(*used).as_secs() < 2);
+        self.frame_groups(device, shown);
+        let tex = |label| {
+            device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some(label),
+                    size: wgpu::Extent3d { width: GLOW_W, height: GLOW_H, depth_or_array_layers: 1 },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                })
+                .create_view(&wgpu::TextureViewDescriptor::default())
+        };
+        let (layout, sampler) = (&self.glow_layout, &self.sampler);
+        let (glow, used) = self.glows.entry(id).or_insert_with(|| {
+            let light = [tex("ambient: light"), tex("ambient: light")];
+            let show = |v: &wgpu::TextureView| {
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("ambient light"),
+                    layout,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(v) },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(v) },
+                        wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(sampler) },
+                    ],
+                })
+            };
+            let show = [show(&light[0]), show(&light[1])];
+            (Glow { small: tex("ambient: small"), light, show, flip: 0, last: None, at: now }, now)
+        });
+        *used = now;
+        if glow.last == Some(shown.key) {
+            return;
+        }
+        // Not drawn for a moment (paused, a new clip, a jump): this frame
+        // alone, no fade from what was.
+        let fresh = glow.last.is_none() || now.duration_since(glow.at).as_millis() > 250;
+        glow.last = Some(shown.key);
+        glow.at = now;
+        let pair = |a: &wgpu::TextureView, b: &wgpu::TextureView| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("ambient light"),
+                layout: &self.glow_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(a) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(b) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                ],
+            })
+        };
+        let step = |encoder: &mut wgpu::CommandEncoder, target: &wgpu::TextureView, pipeline: &wgpu::RenderPipeline, group: &wgpu::BindGroup| {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("ambient light"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, group, &[]);
+            pass.draw(0..3, 0..1);
+        };
+        // Shrink: from the frame's planes.
+        let frame = &self.groups[&shown.key].0;
+        let (shrink, group) = match shown.planes.kind() {
+            Kind::Rgba => (&self.glow_shrink[0], &frame[0]),
+            Kind::Nv12 { bt601 } => (&self.glow_shrink[1 + usize::from(bt601)], &frame[2]),
+        };
+        step(encoder, &glow.small, shrink, group);
+        // Blurred, and the light so far eased towards it (blurring and
+        // easing in either order come to the same). Fresh: it alone.
+        let (from, to) = (glow.flip, 1 - glow.flip);
+        step(encoder, &glow.light[to], &self.glow_blur[usize::from(fresh)], &pair(&glow.small, &glow.light[from]));
+        glow.flip = to;
+    }
+
+    /// Draw stage `id`'s ambient light over `pass`'s viewport.
+    fn show_glow(&self, pass: &mut wgpu::RenderPass<'_>, id: egui::Id) {
+        let Some((glow, _)) = self.glows.get(&id) else { return };
+        pass.set_pipeline(&self.glow_show);
+        pass.set_bind_group(0, &glow.show[glow.flip], &[]);
+        pass.draw(0..3, 0..1);
     }
 
     /// Pass 2: the rows [`Self::across`] made for `place` filtered down,
@@ -499,6 +732,145 @@ fn fs(in: Out) -> @location(0) vec4<f32> {
 }
 "#;
 
+/// The ambient light, step 1: each pixel the average of the part of the
+/// frame it covers, in linear light, so a bright spot lights the surround as
+/// much as it would a wall. 3×3 looks across it: the wide blur after hides
+/// how few, and easing frame to frame keeps a small bright thing from
+/// flickering (6×6 cost twice as much for no visible difference).
+const GLOW_AVERAGE: &str = r#"
+fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
+    let v = clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
+    return select(pow((v + 0.055) / 1.055, vec3<f32>(2.4)), v / 12.92, v <= vec3<f32>(0.04045));
+}
+
+const LOOKS: i32 = 3;
+"#;
+
+const GLOW_SHRINK_RGBA: &str = r#"
+@group(0) @binding(0) var frame: texture_2d<f32>;
+
+@fragment
+fn fs(in: Out) -> @location(0) vec4<f32> {
+    let dims = vec2<f32>(textureDimensions(frame));
+    let cell = vec2<f32>(1.0 / 64.0, 1.0 / 36.0);
+    let corner = floor(in.uv / cell) * cell;
+    var sum = vec3<f32>(0.0);
+    for (var j = 0; j < LOOKS; j++) {
+        for (var i = 0; i < LOOKS; i++) {
+            let uv = corner + (vec2<f32>(f32(i), f32(j)) + 0.5) / f32(LOOKS) * cell;
+            let p = vec2<i32>(clamp(uv * dims, vec2<f32>(0.0), dims - 1.0));
+            sum += srgb_to_linear(textureLoad(frame, p, 0).rgb);
+        }
+    }
+    return vec4<f32>(sum / f32(LOOKS * LOOKS), 1.0);
+}
+"#;
+
+const GLOW_SHRINK_NV12: &str = r#"
+@group(0) @binding(0) var luma: texture_2d<f32>;
+@group(0) @binding(1) var chroma: texture_2d<f32>;
+
+@fragment
+fn fs(in: Out) -> @location(0) vec4<f32> {
+    let ly = vec2<f32>(textureDimensions(luma));
+    let lc = vec2<f32>(textureDimensions(chroma));
+    let cell = vec2<f32>(1.0 / 64.0, 1.0 / 36.0);
+    let corner = floor(in.uv / cell) * cell;
+    var sum = vec3<f32>(0.0);
+    for (var j = 0; j < LOOKS; j++) {
+        for (var i = 0; i < LOOKS; i++) {
+            let uv = corner + (vec2<f32>(f32(i), f32(j)) + 0.5) / f32(LOOKS) * cell;
+            let y = textureLoad(luma, vec2<i32>(clamp(uv * ly, vec2<f32>(0.0), ly - 1.0)), 0).r;
+            let c = textureLoad(chroma, vec2<i32>(clamp(uv * lc, vec2<f32>(0.0), lc - 1.0)), 0).rg;
+            let yy = (y * 255.0 - 16.0) / 219.0;
+            let cb = (c.x * 255.0 - 128.0) / 224.0;
+            let cr = (c.y * 255.0 - 128.0) / 224.0;
+            var rgb: vec3<f32>;
+            if BT601 {
+                rgb = vec3<f32>(yy + 1.402 * cr, yy - 0.344136 * cb - 0.714136 * cr, yy + 1.772 * cb);
+            } else {
+                rgb = vec3<f32>(yy + 1.5748 * cr, yy - 0.187324 * cb - 0.468124 * cr, yy + 1.8556 * cb);
+            }
+            sum += srgb_to_linear(rgb);
+        }
+    }
+    return vec4<f32>(sum / f32(LOOKS * LOOKS), 1.0);
+}
+"#;
+
+/// Step 2: the shrunk frame blurred wide (a 2D Gaussian, about a third of
+/// the picture across, so the light is a soft wash, not shapes), and the
+/// light so far (`previous`) a step towards it (`EASE`; 1 starts afresh): a
+/// cut fades over about a tenth of a second instead of flashing.
+const GLOW_BLUR: &str = r#"
+@group(0) @binding(0) var small: texture_2d<f32>;
+@group(0) @binding(1) var previous: texture_2d<f32>;
+@group(0) @binding(2) var smp: sampler;
+
+@fragment
+fn fs(in: Out) -> @location(0) vec4<f32> {
+    let texel = 1.0 / vec2<f32>(textureDimensions(small));
+    var sum = vec4<f32>(0.0);
+    var total = 0.0;
+    // Every other texel (the sampler blends the one between), out to 12.
+    for (var j = -6; j <= 6; j++) {
+        for (var i = -6; i <= 6; i++) {
+            let d = vec2<f32>(f32(i), f32(j)) * 2.0;
+            let w = exp(-dot(d, d) / (2.0 * 6.0 * 6.0));
+            sum += textureSample(small, smp, in.uv + texel * (d + 0.5)) * w;
+            total += w;
+        }
+    }
+    let blurred = sum / total;
+    return mix(textureSample(previous, smp, in.uv), blurred, EASE);
+}
+"#;
+
+/// Step 3: the light drawn big, sampled smoothly (bicubic B-spline from four
+/// bilinear looks: plain bilinear shows a grid of diamonds this enlarged),
+/// back to sRGB for the screen.
+const GLOW_SHOW: &str = r#"
+@group(0) @binding(0) var light: texture_2d<f32>;
+@group(0) @binding(1) var unused: texture_2d<f32>;
+@group(0) @binding(2) var smp: sampler;
+
+fn to_srgb(c: vec3<f32>) -> vec3<f32> {
+    let v = clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
+    return select(1.055 * pow(v, vec3<f32>(1.0 / 2.4)) - 0.055, v * 12.92, v <= vec3<f32>(0.0031308));
+}
+
+fn smooth_sample(uv: vec2<f32>) -> vec4<f32> {
+    let size = vec2<f32>(textureDimensions(light));
+    let p = uv * size - 0.5;
+    let f = fract(p);
+    let base = floor(p);
+    // B-spline weights, folded into two bilinear looks per axis.
+    let w0 = (1.0 - f) * (1.0 - f) * (1.0 - f) / 6.0;
+    let w1 = (4.0 - 6.0 * f * f + 3.0 * f * f * f) / 6.0;
+    let w2 = (1.0 + 3.0 * f + 3.0 * f * f - 3.0 * f * f * f) / 6.0;
+    let w3 = f * f * f / 6.0;
+    let g0 = w0 + w1;
+    let g1 = w2 + w3;
+    let h0 = (base - 0.5 + w1 / g0) / size;
+    let h1 = (base + 1.5 + w3 / g1) / size;
+    let a = textureSample(light, smp, vec2<f32>(h0.x, h0.y));
+    let b = textureSample(light, smp, vec2<f32>(h1.x, h0.y));
+    let c = textureSample(light, smp, vec2<f32>(h0.x, h1.y));
+    let d = textureSample(light, smp, vec2<f32>(h1.x, h1.y));
+    return mix(mix(a, b, g1.x / (g0.x + g1.x)), mix(c, d, g1.x / (g0.x + g1.x)), g1.y / (g0.y + g1.y));
+}
+
+@fragment
+fn fs(in: Out) -> @location(0) vec4<f32> {
+    var c = smooth_sample(in.uv).rgb;
+    // A little more colour: spread this wide it greys out.
+    let grey = dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
+    c = max(mix(vec3<f32>(grey), c, 1.35), vec3<f32>(0.0)) * 0.8;
+    if SRGB_TARGET { return vec4<f32>(c, 1.0); }
+    return vec4<f32>(to_srgb(c), 1.0);
+}
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -513,6 +885,11 @@ mod tests {
             format!("{COMMON}{DOWN}{DOWN_RGBA}").replace("SRGB_TARGET", "false"),
             format!("{COMMON}{DOWN}{DOWN_NV12}").replace("SRGB_TARGET", "true").replace("BT601", "false"),
             format!("{COMMON}{DOWN}{DOWN_NV12}").replace("SRGB_TARGET", "false").replace("BT601", "true"),
+            format!("{COMMON}{GLOW_AVERAGE}{GLOW_SHRINK_RGBA}"),
+            format!("{COMMON}{GLOW_AVERAGE}{GLOW_SHRINK_NV12}").replace("BT601", "false"),
+            format!("{COMMON}{GLOW_BLUR}").replace("EASE", "0.2"),
+            format!("{COMMON}{GLOW_SHOW}").replace("SRGB_TARGET", "true"),
+            format!("{COMMON}{GLOW_SHOW}").replace("SRGB_TARGET", "false"),
         ];
         for code in sources {
             let module = naga::front::wgsl::parse_str(&code).unwrap_or_else(|e| panic!("{}", e.emit_to_string(&code)));
@@ -761,5 +1138,202 @@ mod tests {
             assert!(mean < 1.5, "mean difference {mean}");
             assert!(bias.iter().all(|b| b.abs() < 0.75), "colour shifted: {bias:?}");
         }
+    }
+
+    /// The stage's light, as the app makes it: `frames` taken in one after
+    /// another (each a new frame, as playing gives), then drawn `w`×`h`.
+    fn glow_after(device: &wgpu::Device, queue: &wgpu::Queue, frames: &[&Shown], (w, h): (u32, u32)) -> Vec<u8> {
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let mut scaler = Scaler::new(device, format);
+        let id = egui::Id::new("test stage");
+        for f in frames {
+            let mut enc = device.create_command_encoder(&Default::default());
+            scaler.glow(device, &mut enc, f, id);
+            queue.submit([enc.finish()]);
+        }
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let row = (w * 4).div_ceil(256) * 256;
+        let buf = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: (row * h) as u64, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+        let mut enc = device.create_command_encoder(&Default::default());
+        {
+            let view = target.create_view(&Default::default());
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &view, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store } })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            scaler.show_glow(&mut pass, id);
+        }
+        enc.copy_texture_to_buffer(
+            target.as_image_copy(),
+            wgpu::TexelCopyBufferInfo { buffer: &buf, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: None } },
+            target.size(),
+        );
+        queue.submit([enc.finish()]);
+        buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        let mapped = buf.slice(..).get_mapped_range().unwrap();
+        let out: Vec<u8> = (0..h as usize).flat_map(|r| mapped[r * row as usize..r * row as usize + w as usize * 4].to_vec()).collect();
+        drop(mapped);
+        buf.unmap();
+        out
+    }
+
+    /// A frame of one colour (RGBA), as a new decoder buffer `key`.
+    fn solid(device: &wgpu::Device, queue: &wgpu::Queue, key: usize, rgb: [u8; 3]) -> Shown {
+        let (w, h) = (320u32, 180u32);
+        let data: Vec<u8> = (0..w * h).flat_map(|_| [rgb[0], rgb[1], rgb[2], 255]).collect();
+        Shown { key: (key, 0), planes: Planes::Rgba(upload(device, queue, (w, h), wgpu::TextureFormat::Rgba8Unorm, 4, &data)) }
+    }
+
+    /// A red frame lights the stage red; a cut to blue fades rather than
+    /// flips; drawn big, the light is smooth (no step between neighbours).
+    /// `cargo test -p hesteclips stage_light -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs a graphics card"]
+    fn stage_light() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter = pollster::block_on(instance.request_adapter(&Default::default())).expect("adapter");
+        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).expect("device");
+        let red = solid(&device, &queue, 1, [220, 30, 30]);
+        let blue = solid(&device, &queue, 2, [30, 30, 220]);
+        let px = |img: &[u8], w: usize, x: usize, y: usize| [img[(y * w + x) * 4], img[(y * w + x) * 4 + 1], img[(y * w + x) * 4 + 2]];
+        let (w, h) = (400usize, 225usize);
+        let lit = glow_after(&device, &queue, &[&red], (w as u32, h as u32));
+        let c = px(&lit, w, w / 2, h / 2);
+        assert!(c[0] > 150 && c[1] < 60 && c[2] < 60, "red lights red: {c:?}");
+        // One frame after the cut: still mostly red, a little blue.
+        let cut = glow_after(&device, &queue, &[&red, &blue], (w as u32, h as u32));
+        let c = px(&cut, w, w / 2, h / 2);
+        assert!(c[0] > c[2] && c[2] > 40, "a cut fades in: {c:?}");
+        // Smooth: neighbouring pixels a step or two apart at most.
+        let mut half = vec![0u8; 320 * 180 * 4];
+        for (i, p) in half.chunks_mut(4).enumerate() {
+            let v = if i % 320 < 160 { 0 } else { 255 };
+            p.copy_from_slice(&[v, v, v, 255]);
+        }
+        let edge = Shown { key: (4, 0), planes: Planes::Rgba(upload(&device, &queue, (320, 180), wgpu::TextureFormat::Rgba8Unorm, 4, &half)) };
+        let soft = glow_after(&device, &queue, &[&edge], (w as u32, h as u32));
+        let worst = (1..w).map(|x| (px(&soft, w, x, h / 2)[0] as i32 - px(&soft, w, x - 1, h / 2)[0] as i32).abs()).max().unwrap();
+        assert!(worst <= 3, "a hard edge spreads out smoothly (largest step {worst})");
+    }
+
+    /// What the light costs next to drawing the frame itself: a 2560×1440
+    /// NV12 frame, each timed over many runs on the GPU.
+    /// `cargo test -p hesteclips stage_light_cost -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs a graphics card"]
+    fn stage_light_cost() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter = pollster::block_on(instance.request_adapter(&Default::default())).expect("adapter");
+        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).expect("device");
+        let (w, h) = (2560usize, 1440usize);
+        let luma = pattern(w, h, 1, 1);
+        let chroma = pattern(w / 2, h / 2, 2, 2);
+        let make = |key| Shown {
+            key: (key, 0),
+            planes: Planes::Nv12 {
+                y: upload(&device, &queue, (w as u32, h as u32), wgpu::TextureFormat::R8Unorm, 1, &luma),
+                cbcr: upload(&device, &queue, (w as u32 / 2, h as u32 / 2), wgpu::TextureFormat::Rg8Unorm, 2, &chroma),
+                bt601: false,
+            },
+        };
+        let frames: Vec<Shown> = (0..4).map(make).collect();
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let mut scaler = Scaler::new(&device, format);
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d { width: 1686, height: 948, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = target.create_view(&Default::default());
+        let wait = || {
+            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        };
+        let runs = 300;
+        let mut time = |f: &mut dyn FnMut(&mut Scaler, &mut wgpu::CommandEncoder, &Shown)| {
+            // Warm up.
+            for s in &frames {
+                let mut enc = device.create_command_encoder(&Default::default());
+                f(&mut scaler, &mut enc, s);
+                queue.submit([enc.finish()]);
+            }
+            wait();
+            let t = std::time::Instant::now();
+            for i in 0..runs {
+                let mut enc = device.create_command_encoder(&Default::default());
+                f(&mut scaler, &mut enc, &frames[i % frames.len()]);
+                queue.submit([enc.finish()]);
+            }
+            wait();
+            t.elapsed().as_secs_f64() * 1000.0 / runs as f64
+        };
+        let place = [0, 0, 1686, 948];
+        let frame_ms = time(&mut |sc, enc, s| {
+            sc.across(&device, enc, s, place);
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &view, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store } })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            sc.down(&mut pass, s, place);
+        });
+        let id = egui::Id::new("bench");
+        let glow_ms = time(&mut |sc, enc, s| {
+            sc.glow(&device, enc, s, id);
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &view, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store } })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            sc.show_glow(&mut pass, id);
+        });
+        // The light drawn big alone (the frame it's from already taken in).
+        let show_ms = time(&mut |sc, enc, _| {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &view, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store } })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            sc.show_glow(&mut pass, id);
+        });
+        // An empty pass: what any pass costs here, for scale.
+        let empty_ms = time(&mut |_, enc, _| {
+            let _pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &view, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store } })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+        });
+        println!("2560×1440 NV12 frame drawn 1686×948: {frame_ms:.3} ms; its stage light (shrink, ease, blur, drawn 1686×948): {glow_ms:.3} ms ({:.0}% of the frame); drawing the light alone {show_ms:.3} ms; an empty pass {empty_ms:.3} ms", glow_ms / frame_ms * 100.0);
     }
 }

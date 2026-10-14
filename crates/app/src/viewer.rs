@@ -531,9 +531,8 @@ impl Ready {
         let (preview, preview_resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), preview_h), Sense::click_and_drag());
         self.player.set_stepping(self.stepping_back);
         let size = self.player.update(&ctx, scrubbing);
-        let glow = self.strip.near(self.player.time()).cloned();
         let player = &self.player;
-        crate::transport::stage(ui, preview, size, glow.as_ref(), false, |r| player.paint(ui, r));
+        crate::transport::stage(ui, preview, size, |p, cover| player.paint_glow(p, cover, egui::Id::new("viewer_stage")), |r| player.paint(ui, r));
         if let Some(f) = self.flash_play.filter(|(_, at)| at.elapsed() < Duration::from_millis(450)) {
             // A big play / pause sign that grows and fades where you clicked.
             let t = f.1.elapsed().as_secs_f32() / 0.45;

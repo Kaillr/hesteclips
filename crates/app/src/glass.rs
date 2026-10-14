@@ -234,7 +234,7 @@ fn make(ctx: &egui::Context, glass: &mut Glass, tiles: &[&Tile], left: f32, p: &
 }
 /// One box blur pass of radius `r`, along rows (`horizontal`) or columns,
 /// edges clamped.
-fn box_blur(buf: &mut [[f32; 4]], w: usize, h: usize, r: usize, horizontal: bool) {
+pub(crate) fn box_blur(buf: &mut [[f32; 4]], w: usize, h: usize, r: usize, horizontal: bool) {
     let (n, lines) = if horizontal { (w, h) } else { (h, w) };
     let idx = |line: usize, i: usize| if horizontal { line * w + i } else { i * w + line };
     let mut tmp = vec![[0f32; 4]; n];

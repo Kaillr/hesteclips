@@ -199,6 +199,9 @@ pub struct Player {
     pub audio_error: Option<String>,
     /// Latest frame for display.
     texture: Option<egui::TextureHandle>,
+    /// That frame's colours, blurred wide: the stage's light (a frame on the
+    /// GPU makes its own there).
+    glow: Option<egui::TextureHandle>,
     /// What's on screen.
     display: Option<Display>,
     /// The GPU frame on screen, held so its texture isn't reused meanwhile.
@@ -313,6 +316,7 @@ impl Player {
             _stream: stream,
             audio_error,
             texture: None,
+            glow: None,
             display: None,
             on_screen: None,
             retired: Default::default(),
@@ -578,6 +582,26 @@ impl Player {
         }
     }
 
+    /// The picture's colours, blurred very wide, over `cover` (clipped to
+    /// `painter`): the light the stage around it takes. `id`: which stage.
+    pub fn paint_glow(&self, painter: &egui::Painter, cover: egui::Rect, id: egui::Id) -> bool {
+        match &self.display {
+            Some(Display::Image(..)) => match &self.glow {
+                Some(tex) => {
+                    painter.image(tex.id(), cover, egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+                    true
+                }
+                None => false,
+            },
+            #[cfg(hw_decode)]
+            Some(Display::Gpu(shown, _)) => {
+                shown.paint_glow(painter, cover, id);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// [`Self::update`] with the hardware decoder.
     /// `scrubbing`: a drag or wheel scrub is under way (proxy frames only).
     fn update_hw(&mut self, ctx: &egui::Context, scrubbing: bool) {
@@ -767,6 +791,12 @@ impl Player {
     }
 
     fn set_texture(&mut self, ctx: &egui::Context, img: egui::ColorImage) {
+        // The stage's light, made here for a picture that isn't on the GPU.
+        let glow = crate::transport::glow_image(&img);
+        match &mut self.glow {
+            Some(tex) => tex.set(glow, egui::TextureOptions::LINEAR),
+            None => self.glow = Some(ctx.load_texture("stage light", glow, egui::TextureOptions::LINEAR)),
+        }
         match &mut self.texture {
             Some(tex) => tex.set(img, egui::TextureOptions::LINEAR),
             None => self.texture = Some(ctx.load_texture("preview", img, egui::TextureOptions::LINEAR)),

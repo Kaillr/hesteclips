@@ -494,9 +494,8 @@ impl Ready {
         let preview_h = (total * *preview_share).max(total - below_max).min(total - below_min).max(MIN_PREVIEW_H);
         let (preview_rect, preview_resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), preview_h), Sense::click());
         let size = self.player.update(&ctx, self.dragging.is_some());
-        let glow = self.strip.near(self.player.time()).cloned();
         let player = &self.player;
-        crate::transport::stage(ui, preview_rect, size, glow.as_ref(), false, |r| player.paint(ui, r));
+        crate::transport::stage(ui, preview_rect, size, |p, cover| player.paint_glow(p, cover, egui::Id::new("editor_stage")), |r| player.paint(ui, r));
         if preview_resp.clicked() {
             self.toggle_play();
         }

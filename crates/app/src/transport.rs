@@ -79,38 +79,82 @@ pub fn header(ui: &mut egui::Ui, title: &str, unsaved: bool, centre_w: f32, mut 
     (back, renamed)
 }
 
-/// The stage: the picture fitted into `rect` on whole pixels, with its own
-/// colours glowing softly in the surround (an ambient TV). `glow`: a small
-/// picture of the frame, stretched and faded behind. `paint` draws the
-/// picture into the rect it's given. Returns where the picture is.
-pub fn stage(ui: &egui::Ui, rect: Rect, size: Option<Vec2>, glow: Option<&egui::TextureHandle>, round: bool, paint: impl FnOnce(Rect)) -> Option<Rect> {
+/// The stage: the picture fitted into `rect` on whole pixels, the surround
+/// lit by its colours, blurred very wide and kept dark (an ambient TV), live
+/// with the video. `glow` draws that light over the rect it's given (the
+/// picture's shape grown to cover the stage) and says whether it could;
+/// `paint` draws the picture. Returns where the picture is.
+pub fn stage(ui: &egui::Ui, rect: Rect, size: Option<Vec2>, glow: impl FnOnce(&egui::Painter, Rect) -> bool, paint: impl FnOnce(Rect)) -> Option<Rect> {
     let p = theme::pal(ui);
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, if round { 0 } else { 0 }, p.stage);
+    painter.rect_filled(rect, 0, p.stage);
     let size = size?;
     let scale = (rect.width() / size.x).min(rect.height() / size.y);
     let ppp = ui.ctx().pixels_per_point();
     let r = Rect::from_center_size(rect.center(), size * scale);
     let r = Rect::from_min_size(((r.min.to_vec2() * ppp).round() / ppp).to_pos2(), r.size());
-    if let Some(tex) = glow {
-        // The frame's colours, spread wide: the picture stretched past the
-        // stage and laid down at low opacity in rings that fade outwards
-        // (egui can't blur; spreading a tiny picture does nearly the same).
-        let opacity = if p.dark { 0.55 } else { 0.4 };
-        for (grow, a) in [(1.25, 0.35), (1.12, 0.45), (1.03, 0.6)] {
-            let g = Rect::from_center_size(rect.center(), rect.size() * grow);
-            painter.image(tex.id(), g, Rect::from_min_max(Pos2::new(0.1, 0.1), Pos2::new(0.9, 0.9)), Color32::from_white_alpha((255.0 * a * opacity) as u8));
-        }
-        // Darken towards the edges so the glow sits behind, not on top.
-        let edge = theme::fade(p.stage, 0.55);
-        painter.rect_filled(rect, 0, edge);
+    // The light: the picture's shape grown past the stage on every side, so
+    // what's at its edges spreads out to the stage's.
+    let cover = (rect.width() / size.x).max(rect.height() / size.y) * 1.15;
+    if glow(&painter, Rect::from_center_size(rect.center(), size * cover)) {
+        // Kept dark, so it sits behind the picture.
+        painter.rect_filled(rect, 0, theme::fade(p.stage, if p.dark { 0.82 } else { 0.7 }));
         // A soft shadow under the picture.
-        let shadow = egui::Shadow { offset: [0, 10], blur: 40, spread: 0, color: Color32::from_black_alpha(115) };
+        let shadow = egui::Shadow { offset: [0, 10], blur: 48, spread: 0, color: Color32::from_black_alpha(140) };
         painter.add(shadow.as_shape(r, 2));
     }
     painter.rect_filled(r, 0, Color32::BLACK);
     paint(r);
     Some(r)
+}
+
+/// A picture's colours as the stage's light, for one that isn't on the GPU
+/// (the same look the GPU makes from a frame there): averaged down to a few
+/// dozen pixels in linear light, blurred wide, a little more colourful.
+pub fn glow_image(img: &egui::ColorImage) -> egui::ColorImage {
+    const W: usize = 64;
+    const H: usize = 36;
+    let [iw, ih] = img.size;
+    let lin = |v: u8| {
+        let c = v as f32 / 255.0;
+        if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+    };
+    let mut buf = vec![[0f32; 4]; W * H];
+    if iw > 0 && ih > 0 {
+        // Each cell the average of 3×3 looks across the part it covers.
+        for (i, cell) in buf.iter_mut().enumerate() {
+            let (cx, cy) = (i % W, i / W);
+            let mut sum = [0f32; 3];
+            for j in 0..3 {
+                for k in 0..3 {
+                    let x = ((cx as f32 + (k as f32 + 0.5) / 3.0) / W as f32 * iw as f32) as usize;
+                    let y = ((cy as f32 + (j as f32 + 0.5) / 3.0) / H as f32 * ih as f32) as usize;
+                    let p = img.pixels[y.min(ih - 1) * iw + x.min(iw - 1)];
+                    sum[0] += lin(p.r());
+                    sum[1] += lin(p.g());
+                    sum[2] += lin(p.b());
+                }
+            }
+            *cell = [sum[0] / 9.0, sum[1] / 9.0, sum[2] / 9.0, 1.0];
+        }
+    }
+    for _ in 0..3 {
+        crate::glass::box_blur(&mut buf, W, H, 4, true);
+        crate::glass::box_blur(&mut buf, W, H, 4, false);
+    }
+    let srgb = |c: f32| {
+        let c = c.clamp(0.0, 1.0);
+        ((if c <= 0.003_130_8 { c * 12.92 } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 }) * 255.0).round() as u8
+    };
+    let pixels = buf
+        .iter()
+        .map(|c| {
+            let grey = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+            let s = |v: f32| (grey + (v - grey) * 1.35).max(0.0) * 0.8;
+            Color32::from_rgb(srgb(s(c[0])), srgb(s(c[1])), srgb(s(c[2])))
+        })
+        .collect();
+    egui::ColorImage { size: [W, H], pixels, source_size: Vec2::new(W as f32, H as f32) }
 }
 
 /// A moment on the timeline: a kill or your own marker.
