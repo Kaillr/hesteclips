@@ -79,13 +79,89 @@ pub fn paint(ui: &mut egui::Ui, card: Rect, app: &mut App) {
     app.glass_tiles = tiles;
     if let Some(tex) = &app.glass.texture {
         let r = Rect::from_min_size(origin + app.glass.origin.to_vec2(), app.glass.size);
-        let mut mesh = egui::Mesh::with_texture(tex.id());
-        mesh.add_rect_with_uv(r, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
-        painter.add(egui::Shape::mesh(mesh));
+        painter.add(egui::Shape::mesh(rounded_mesh(tex.id(), card, 8.0, r)));
     }
     let tint = if p.dark { Color32::from_rgba_unmultiplied(24, 25, 29, 56) } else { Color32::from_rgba_unmultiplied(250, 250, 251, 92) };
     painter.rect_filled(card, 8, tint);
     painter.rect_stroke(card, 8, egui::Stroke::new(1.0, if p.dark { Color32::from_white_alpha(13) } else { Color32::from_black_alpha(15) }), egui::StrokeKind::Inside);
+}
+
+/// The picture laid over `r` (screen points), showing only where it's
+/// inside `card` with its corners rounded by `radius`: a fan of triangles
+/// over that outline (egui clips to rectangles only, so the picture's own
+/// corners would show past the card's rounded ones).
+fn rounded_mesh(texture: egui::TextureId, card: Rect, radius: f32, r: Rect) -> egui::Mesh {
+    let radius = radius.min(card.width() / 2.0).min(card.height() / 2.0);
+    let mut outline = Vec::new();
+    // Each corner's arc, clockwise from the top left.
+    let corners = [
+        (Pos2::new(card.left() + radius, card.top() + radius), 180.0f32),
+        (Pos2::new(card.right() - radius, card.top() + radius), 270.0),
+        (Pos2::new(card.right() - radius, card.bottom() - radius), 0.0),
+        (Pos2::new(card.left() + radius, card.bottom() - radius), 90.0),
+    ];
+    const STEPS: usize = 6;
+    for (c, start) in corners {
+        for k in 0..=STEPS {
+            let a = (start + 90.0 * k as f32 / STEPS as f32).to_radians();
+            outline.push(c + egui::vec2(a.cos(), a.sin()) * radius);
+        }
+    }
+    // Only where the picture is (it spans the grid, which may be shorter).
+    let outline = clip_to(outline, r);
+    let mut mesh = egui::Mesh::with_texture(texture);
+    if outline.len() < 3 {
+        return mesh;
+    }
+    let uv = |p: Pos2| Pos2::new((p.x - r.left()) / r.width().max(1.0), (p.y - r.top()) / r.height().max(1.0));
+    let centre = outline.iter().fold(Pos2::ZERO, |a, p| a + p.to_vec2()) / outline.len() as f32;
+    mesh.vertices.push(egui::epaint::Vertex { pos: centre, uv: uv(centre), color: Color32::WHITE });
+    for p in &outline {
+        mesh.vertices.push(egui::epaint::Vertex { pos: *p, uv: uv(*p), color: Color32::WHITE });
+    }
+    let n = outline.len() as u32;
+    for i in 0..n {
+        mesh.add_triangle(0, 1 + i, 1 + (i + 1) % n);
+    }
+    mesh
+}
+
+/// A convex outline cut to the part inside `r` (Sutherland–Hodgman).
+fn clip_to(mut pts: Vec<Pos2>, r: Rect) -> Vec<Pos2> {
+    // Each edge of `r`: is a point inside it, and where a line crosses it.
+    type Inside = fn(Pos2, Rect) -> bool;
+    let edges: [(Inside, usize, fn(Rect) -> f32); 4] = [
+        (|p, r| p.x >= r.left(), 0, |r| r.left()),
+        (|p, r| p.x <= r.right(), 0, |r| r.right()),
+        (|p, r| p.y >= r.top(), 1, |r| r.top()),
+        (|p, r| p.y <= r.bottom(), 1, |r| r.bottom()),
+    ];
+    for (inside, axis, at) in edges {
+        if pts.is_empty() {
+            break;
+        }
+        let v = at(r);
+        let cross = |a: Pos2, b: Pos2| {
+            let (pa, pb) = if axis == 0 { (a.x, b.x) } else { (a.y, b.y) };
+            let t = (v - pa) / (pb - pa);
+            a + (b - a) * t
+        };
+        let mut out = Vec::with_capacity(pts.len() + 2);
+        for i in 0..pts.len() {
+            let (a, b) = (pts[i], pts[(i + 1) % pts.len()]);
+            match (inside(a, r), inside(b, r)) {
+                (true, true) => out.push(b),
+                (true, false) => out.push(cross(a, b)),
+                (false, true) => {
+                    out.push(cross(a, b));
+                    out.push(b);
+                }
+                (false, false) => {}
+            }
+        }
+        pts = out;
+    }
+    pts
 }
 
 /// Make the glass picture: the grid's clips near the card, blurred, one

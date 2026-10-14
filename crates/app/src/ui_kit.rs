@@ -1108,7 +1108,9 @@ impl<'a> Row<'a> {
                             ui.multiply_opacity(0.7);
                             control(ui)
                         });
-                        let resp = ui.interact(inner.response.rect, ui.id().with("locked"), Sense::click()).on_hover_cursor(egui::CursorIcon::NotAllowed);
+                        // Named after its row: every locked row's control
+                        // column has the same id.
+                        let resp = ui.interact(inner.response.rect, ui.id().with(("locked", self.label)), Sense::click()).on_hover_cursor(egui::CursorIcon::NotAllowed);
                         if let Some(why) = &self.locked {
                             let resp = resp.on_hover_text(why);
                             clicked_locked = resp.clicked();
@@ -1207,8 +1209,10 @@ pub fn dialog<R>(ctx: &egui::Context, id: &str, width: f32, add: impl FnOnce(&mu
     let p = theme::ctx_pal(ctx);
     let id = egui::Id::new(id);
     // Shown last frame too: it carries on; else it rises in from now.
+    // (The time is read first: egui's locks don't nest.)
     let pass = ctx.cumulative_pass_nr();
-    let (now, seen, born) = ctx.data(|d| (ctx.input(|i| i.time), d.get_temp::<u64>(id.with("seen")), d.get_temp::<f64>(id.with("born"))));
+    let now = ctx.input(|i| i.time);
+    let (seen, born) = ctx.data(|d| (d.get_temp::<u64>(id.with("seen")), d.get_temp::<f64>(id.with("born"))));
     let born = match (seen, born) {
         (Some(s), Some(b)) if s + 1 >= pass => b,
         _ => now,
@@ -1552,6 +1556,26 @@ mod tests {
 
     /// Pressed on a button, moved 20 points, let go over it: egui alone
     /// doesn't click; with the replay, it does (once).
+    /// Shown for the first time and after: no lock taken inside another
+    /// (egui's locks don't nest; it hung the app on the first dialog).
+    #[test]
+    fn a_dialog_shows() {
+        let ctx = egui::Context::default();
+        apply(&ctx);
+        let mut shown = 0;
+        for _ in 0..3 {
+            let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0))), ..Default::default() };
+            let mut out = ctx.run_ui(raw, |ui| {
+                dialog(ui.ctx(), "test_dialog", 300.0, |ui| {
+                    dialog_title(ui, "A dialog");
+                    shown += 1;
+                });
+            });
+            out.textures_delta.clear();
+        }
+        assert_eq!(shown, 3);
+    }
+
     #[test]
     fn a_wobbly_click_still_clicks() {
         let ctx = egui::Context::default();
