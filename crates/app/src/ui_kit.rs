@@ -920,49 +920,43 @@ impl<'a> Item<'a> {
     }
 }
 
-/// A menu's width and its widest row, kept by the menu's own `Ui`: as wide
-/// as asked, or as its widest row last frame when that's wider (a row can't
-/// see the ones after it). Never as wide as the room around it: a popup
-/// keeps the size its first frame had, and rows that filled the room made
-/// every menu as wide as the window.
+/// The menu being laid out: its width, and the widest row seen so far this
+/// frame (by its id). Its rows are all as wide as its widest; a popup keeps
+/// the size of its first frame, so a row may not fill the room around it
+/// (that made every menu as wide as the window). Menus inside menus
+/// (submenus) stack.
 #[derive(Clone, Copy, Default)]
 struct MenuWidth {
     asked: f32,
     widest: f32,
-    /// The widest row so far this frame.
     seen: f32,
 }
 
-/// The menu `ui` is in: its key, and its width. Rows sit in the menu's own
-/// `Ui` or a few levels inside it (a horizontal group, a scroll area).
-fn menu_of(ui: &egui::Ui) -> Option<(egui::Id, MenuWidth)> {
-    ui.stack().iter().take(6).find_map(|frame| {
-        let key = frame.id.with("ui_kit_menu_w");
-        ui.data(|d| d.get_temp::<MenuWidth>(key)).map(|m| (key, m))
-    })
+thread_local! {
+    static MENUS: std::cell::RefCell<Vec<egui::Id>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// The width rows of the menu `ui` is in are laid out at.
+/// The width rows of the menu being laid out are drawn at.
 fn menu_min_width(ui: &egui::Ui) -> f32 {
-    menu_of(ui).map_or(0.0, |(_, m)| m.asked.max(m.widest))
+    let Some(key) = MENUS.with(|m| m.borrow().last().copied()) else { return 0.0 };
+    ui.data(|d| d.get_temp::<MenuWidth>(key)).map_or(0.0, |m| m.asked.max(m.widest))
 }
 
-/// A row that needs `w` was laid out in the menu `ui` is in.
+/// A row that needs `w` was laid out in the menu being laid out.
 fn menu_saw(ui: &egui::Ui, w: f32) {
-    if let Some((key, _)) = menu_of(ui) {
-        ui.data_mut(|d| {
-            let m = d.get_temp_mut_or_default::<MenuWidth>(key);
-            m.seen = m.seen.max(w);
-        });
-    }
+    let Some(key) = MENUS.with(|m| m.borrow().last().copied()) else { return };
+    ui.data_mut(|d| {
+        let m = d.get_temp_mut_or_default::<MenuWidth>(key);
+        m.seen = m.seen.max(w);
+    });
 }
 
-/// Lay out a menu's content `w` wide (wider when a row needs it).
-pub fn menu_width(ui: &mut egui::Ui, w: f32) {
+/// Lay out a menu's content: `add` at `w` wide, or as wide as its widest row
+/// (from last frame) when that's wider.
+pub fn menu_body<R>(ui: &mut egui::Ui, w: f32, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     let key = ui.id().with("ui_kit_menu_w");
     let m = ui.data_mut(|d| {
         let m = d.get_temp_mut_or_default::<MenuWidth>(key);
-        // Last frame's rows: the widest is the width now.
         if m.seen > 0.0 {
             m.widest = m.seen;
         }
@@ -971,6 +965,10 @@ pub fn menu_width(ui: &mut egui::Ui, w: f32) {
         *m
     });
     ui.set_width(m.asked.max(m.widest));
+    MENUS.with(|s| s.borrow_mut().push(key));
+    let r = add(ui);
+    MENUS.with(|s| s.borrow_mut().pop());
+    r
 }
 
 /// A row that opens a submenu to its right on hover.
@@ -986,21 +984,19 @@ pub fn submenu<R>(ui: &mut egui::Ui, item: Item, content: impl FnOnce(&mut egui:
     });
     egui::containers::menu::SubMenu::new()
         .config(egui::containers::menu::MenuConfig::new().style(egui::style::StyleModifier::new(move |s: &mut egui::Style| *s = (*style).clone())))
-        .show(ui, &resp, |ui| {
-            menu_width(ui, menu_floor(220.0));
-            content(ui)
-        })
+        .show(ui, &resp, |ui| menu_body(ui, menu_floor(220.0), content))
         .map(|r| r.inner)
 }
 
 /// A divider between a menu's groups.
 pub fn menu_sep(ui: &mut egui::Ui) {
     let p = theme::pal(ui);
-    ui.add_space(4.0);
-    let w = menu_min_width(ui).max(1.0);
-    let (r, _) = ui.allocate_exact_size(vec2(w, 1.0), Sense::hover());
-    ui.painter().hline(r.x_range().shrink(4.0), r.center().y, Stroke::new(1.0, p.line));
-    ui.add_space(4.0);
+    // One band, the line in its middle, from the rows' text on one side to
+    // the other's (as macOS draws them).
+    let w = menu_min_width(ui).max(ui.available_width()).max(1.0);
+    let (r, _) = ui.allocate_exact_size(vec2(w, 9.0), Sense::hover());
+    let y = (r.center().y * ui.ctx().pixels_per_point()).round() / ui.ctx().pixels_per_point() + 0.5 / ui.ctx().pixels_per_point();
+    ui.painter().hline(r.x_range().shrink(9.0), y, Stroke::new(1.0, p.line2));
 }
 
 /// A quiet line of words in a menu (what the items under it are).
@@ -1026,7 +1022,7 @@ pub fn menu_popup<R>(resp: &Response, left: bool, width: f32, content: impl FnOn
         let (pass, count, done) = resp.ctx.data(|d| d.get_temp::<(u64, u64, bool)>(key)).unwrap_or_default();
         let now = resp.ctx.cumulative_pass_nr();
         let count = if pass == now { count } else { 0 };
-        let open = !done && count == n && resp.ctx.input(|i| i.time) > 2.5;
+        let open = !done && count == n && resp.ctx.input(|i| i.time) > std::env::var("HESTECLIPS_OPEN_MENU_AT").ok().and_then(|s| s.parse().ok()).unwrap_or(2.5);
         resp.ctx.data_mut(|d| d.insert_temp(key, (now, count + 1, done || open)));
         if open {
             egui::Popup::open_id(&resp.ctx, id);
@@ -1039,11 +1035,8 @@ pub fn menu_popup<R>(resp: &Response, left: bool, width: f32, content: impl FnOn
         .align(if left { egui::RectAlign::BOTTOM_START } else { egui::RectAlign::BOTTOM_END })
         .frame(ui_frame)
         .style(menu_style)
-        .show(|ui| {
-            // Never narrower than what opened it (a dropdown hangs from its field).
-            menu_width(ui, menu_floor(width).max(resp.rect.width() - 12.0));
-            content(ui)
-        })
+        // Never narrower than what opened it (a dropdown hangs from its field).
+        .show(|ui| menu_body(ui, menu_floor(width).max(resp.rect.width() - 12.0), content))
         .map(|r| r.inner)
 }
 
@@ -1053,10 +1046,7 @@ pub fn context_menu<R>(resp: &Response, width: f32, content: impl FnOnce(&mut eg
     egui::Popup::context_menu(resp)
         .frame(frame)
         .style(menu_style)
-        .show(|ui| {
-            menu_width(ui, menu_floor(width));
-            content(ui)
-        })
+        .show(|ui| menu_body(ui, menu_floor(width), content))
         .map(|r| r.inner)
 }
 
@@ -1517,7 +1507,10 @@ pub fn pointer_cursor(ctx: &egui::Context) {
     }
     let screen = ctx.content_rect().area();
     let hovered: Vec<egui::Id> = ctx.interaction_snapshot(|s| s.hovered.iter().copied().collect());
-    let clickable = hovered.into_iter().filter_map(|id| ctx.read_response(id)).any(|r| r.enabled() && r.sense.senses_click() && r.rect.area() < screen / 4.0);
+    // Buttons and other things that are only clicked; not what's also
+    // dragged (the window's drag areas, backgrounds, the timeline), where a
+    // hand looked as if any empty space were a button.
+    let clickable = hovered.into_iter().filter_map(|id| ctx.read_response(id)).any(|r| r.enabled() && r.sense.senses_click() && !r.sense.senses_drag() && r.rect.area() < screen / 4.0);
     if clickable {
         ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
     }

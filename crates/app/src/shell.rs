@@ -258,10 +258,7 @@ impl App {
                 .align(egui::RectAlign::BOTTOM_END)
                 .frame(ui_kit::menu_frame(ui))
                 .style(ui_kit::menu_style)
-                .show(|ui| {
-                    ui_kit::menu_width(ui, 220.0);
-                    self.recorder_menu(ui);
-                });
+                .show(|ui| ui_kit::menu_body(ui, 220.0, |ui| self.recorder_menu(ui)));
             if btn.show(ui).clicked() {
                 match state {
                     RecState::Idle => self.start_replay_buffer(),
@@ -512,6 +509,13 @@ pub fn drag_window_area(ui: &egui::Ui, rect: Rect, id: &str) {
         return;
     }
     let resp = ui.interact(rect, egui::Id::new(("drag_window", id)), Sense::click_and_drag());
+    // Only its own empty space: on a button or field in it, the button gets
+    // the click and the drag (egui hands a drag to whatever senses drags, so
+    // this asks which widget the pointer is on).
+    let mine = ui.ctx().interaction_snapshot(|s| s.contains_pointer.iter().all(|w| *w == resp.id || !is_interactive(ui.ctx(), *w)));
+    if !mine {
+        return;
+    }
     if resp.drag_started_by(egui::PointerButton::Primary) {
         ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
     }
@@ -519,6 +523,11 @@ pub fn drag_window_area(ui: &egui::Ui, rect: Rect, id: &str) {
         let max = ui.ctx().input(|i| i.viewport().maximized.unwrap_or(false));
         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Maximized(!max));
     }
+}
+
+/// Whether widget `id` (as drawn last frame) takes clicks or drags.
+fn is_interactive(ctx: &egui::Context, id: egui::Id) -> bool {
+    ctx.read_response(id).is_some_and(|r| r.sense.senses_click() || r.sense.senses_drag())
 }
 
 /// A clip length as a clock: "1:00", "15:00", "1:00:00".
