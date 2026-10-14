@@ -675,18 +675,18 @@ impl App {
         });
     }
 
-    /// The clip length: type any length ("90", "2:30", "5 min") or pick one.
+    /// The clip length: type any length (digits fill the clock: "230" is 2:30)
+    /// or pick one.
     fn length_field(&mut self, ui: &mut egui::Ui) {
         let secs = self.settings.replay_seconds;
         let presets: Vec<(String, String, String)> = REPLAY_CHOICES.iter().map(|&s| (length_words(s), clock_label(s), String::new())).collect();
         let current = REPLAY_CHOICES.iter().position(|&s| s == secs);
-        let field = ValueField { id: egui::Id::new("vf_length"), text: clock_label(secs), unit: "", width: 116.0, hint: "Type a length like 90, 2:30 or 5 min", presets, current, range: "5 s – 1 h" };
-        match field.show(ui) {
+        let field = ValueField { id: egui::Id::new("vf_length"), text: clock_label(secs), unit: "", width: 116.0, hint: "Type the digits: 230 is 2:30. ↑ ↓ change the part chosen", presets, current, range: "5 s – 1 h" };
+        match field.show_time(ui, f64::from(secs), 5.0, 3600.0) {
             Typed::Preset(i) => self.settings.replay_seconds = REPLAY_CHOICES[i],
-            Typed::Text(t) => match parse_length(&t).map(|v| v.round() as i64) {
-                Some(v) if (5..=3600).contains(&v) => self.settings.replay_seconds = v as u32,
-                _ => self.toast_error(format!("“{}” isn't a length from 5 seconds to an hour", t.trim())),
-            },
+            Typed::Secs(v) if (5.0..=3600.0).contains(&v.round()) => self.settings.replay_seconds = v.round() as u32,
+            Typed::Secs(v) => self.toast_error(format!("{} isn't a length from 5 seconds to an hour", length_words(v.round() as u32))),
+            Typed::Text(t) => self.toast_error(format!("“{}” isn't a length from 5 seconds to an hour", t.trim())),
             Typed::None => {}
         }
     }
@@ -722,7 +722,7 @@ impl App {
                     }
                 }
             }
-            Typed::None => {}
+            Typed::None | Typed::Secs(_) => {}
         }
     }
 
@@ -741,7 +741,7 @@ impl App {
                 Ok(v) if (10..=360).contains(&v) => self.settings.fps = v,
                 _ => self.toast_error(format!("“{}” isn't a frame rate from 10 to 360", t.trim())),
             },
-            Typed::None => {}
+            Typed::None | Typed::Secs(_) => {}
         }
     }
 
@@ -766,7 +766,7 @@ impl App {
                 Ok(v) if (1.0..=300.0).contains(&v) => self.settings.video_bitrate_mbps = v.round() as u32,
                 _ => self.toast_error(format!("“{}” isn't a bitrate from 1 to 300 Mbps", t.trim())),
             },
-            Typed::None => {}
+            Typed::None | Typed::Secs(_) => {}
         }
         if !presets.is_empty() {
             let opts: Vec<Seg> = presets.iter().map(|(n, _)| Seg { icon: None, label: n, tip: None }).collect();
@@ -814,7 +814,7 @@ impl App {
                     }
                 }
             }
-            Typed::None => {}
+            Typed::None | Typed::Secs(_) => {}
         }
     }
 
@@ -1271,23 +1271,6 @@ fn clock_label(secs: u32) -> String {
     format!("{}:{:02}", secs / 60, secs % 60)
 }
 
-/// A typed length, in seconds: "90", "2:30", "5 min", "45s", "1h".
-pub(crate) fn parse_length(text: &str) -> Option<f64> {
-    let t = text.trim().to_lowercase();
-    if let Some((m, s)) = t.split_once(':') {
-        return Some(m.trim().parse::<f64>().ok()? * 60.0 + s.trim().parse::<f64>().ok()?);
-    }
-    let digits: String = t.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
-    let n: f64 = digits.parse().ok()?;
-    let unit = t[digits.len()..].trim();
-    match unit {
-        "" | "s" | "sec" | "secs" | "second" | "seconds" => Some(n),
-        "m" | "min" | "mins" | "minute" | "minutes" => Some(n * 60.0),
-        "h" | "hr" | "hour" | "hours" => Some(n * 3600.0),
-        _ => None,
-    }
-}
-
 /// A bitrate rounded to something readable: whole Mbps under 20, else to 5.
 fn round_mbps(mbps: f64) -> u32 {
     if mbps < 20.0 { (mbps.round() as u32).max(2) } else { ((mbps / 5.0).round() * 5.0) as u32 }
@@ -1299,12 +1282,6 @@ mod length_tests {
 
     #[test]
     fn typed_lengths() {
-        assert_eq!(parse_length("90"), Some(90.0));
-        assert_eq!(parse_length("2:30"), Some(150.0));
-        assert_eq!(parse_length("5 min"), Some(300.0));
-        assert_eq!(parse_length("45s"), Some(45.0));
-        assert_eq!(parse_length("1h"), Some(3600.0));
-        assert_eq!(parse_length("soon"), None);
         assert_eq!(clock_label(30), "0:30");
         assert_eq!(clock_label(1200), "20:00");
         assert_eq!(clock_label(75), "1:15");

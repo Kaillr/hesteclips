@@ -863,12 +863,41 @@ impl Ready {
     }
 
     /// The kept length under the timeline: shown, and on a click typed over
-    /// ("12", "0:12.5", or frames when times show as frames). Enter makes the
-    /// kept part that long around its middle (as long as the clip allows),
-    /// Esc or clicking away leaves it.
+    /// (digits fill the clock, "1250" is 12:50 and "12.5" 12.5 seconds; or
+    /// frames when times show as frames). Enter, or ↑ ↓, makes the kept part
+    /// that long around its middle (as long as the clip allows).
     fn length_field(&mut self, ui: &mut egui::Ui, rect: Rect, shown: &str) {
         let pal = crate::theme::pal(ui);
         let id = ui.id().with("length_field");
+        if !self.show_frames {
+            let tid = id.with("time");
+            let focused = ui.memory(|m| m.has_focus(tid));
+            let hv = crate::theme::toggle(ui.ctx(), id.with("hv"), ui.rect_contains_pointer(rect), crate::theme::FAST);
+            ui.painter().rect_filled(rect, 5, if focused { pal.control } else { crate::theme::mix(pal.base, pal.control, hv) });
+            let field = crate::time_field::TimeField {
+                id: tid,
+                secs: self.edit.duration(),
+                min: 1.0 / self.info.fps.max(1.0),
+                max: self.info.duration,
+                decimals: 2,
+                font: crate::theme::font(12.0, crate::theme::W::Semibold),
+                align: egui::Align::Center,
+                hint: "The kept part's length: click to type another (500 is 5:00)",
+            };
+            if let crate::time_field::Timed::Stepped(secs) | crate::time_field::Timed::Typed(secs) = field.show(ui, rect)
+                && secs > 0.0
+            {
+                let was = self.edit.clone();
+                (self.edit.start, self.edit.end) = trim_to_length(&self.info, self.edit.start, self.edit.end, secs);
+                if !same_edit(&self.edit, &was) {
+                    self.push_undo(was);
+                }
+            }
+            if focused {
+                ui.painter().rect_stroke(rect, 5, Stroke::new(1.5, pal.text2), egui::StrokeKind::Inside);
+            }
+            return;
+        }
         match self.typing_length.as_mut() {
             None => {
                 let resp = ui.interact(rect, id, Sense::click());
@@ -896,7 +925,7 @@ impl Ready {
                     let typed = std::mem::take(text);
                     self.typing_length = None;
                     if enter && !esc {
-                        let secs = if self.show_frames { typed.trim().parse::<f64>().ok().map(|f| f / self.info.fps) } else { crate::settings_ui::parse_length(&typed) };
+                        let secs = typed.trim().parse::<f64>().ok().map(|f| f / self.info.fps);
                         match secs.filter(|s| *s > 0.0) {
                             Some(secs) => {
                                 let was = self.edit.clone();
@@ -1326,7 +1355,8 @@ impl Ready {
         // the timeline takes its clicks, so it gets its own).
         let len_label = {
             let g = p.layout_no_wrap(len_text.clone(), crate::theme::font(12.0, crate::theme::W::Semibold), pal.text);
-            let w = if self.typing_length.is_some() { 90.0 } else { g.size().x + 16.0 };
+            // (A little wider than the time: room for the caret as it's typed.)
+            let w = if self.typing_length.is_some() { 90.0 } else { g.size().x + 22.0 };
             (w < range.width().max(110.0)).then(|| Rect::from_center_size(Pos2::new(range.center().x, dim_y), Vec2::new(w, 20.0)))
         };
 

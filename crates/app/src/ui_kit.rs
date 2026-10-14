@@ -1702,10 +1702,23 @@ pub enum Typed {
     Text(String),
     /// A common value was picked (or stepped to with the arrows).
     Preset(usize),
+    /// A length typed or stepped in a time field ([`ValueField::show_time`]).
+    Secs(f64),
 }
 
 impl ValueField<'_> {
     pub fn show(self, ui: &mut egui::Ui) -> Typed {
+        self.show_inner(ui, None)
+    }
+
+    /// A length: the box takes it as a clock ([`crate::time_field`]), now
+    /// `secs`, with ↑ ↓ stepping it between `min` and `max`. Words that
+    /// aren't a length come back as [`Typed::Text`].
+    pub fn show_time(self, ui: &mut egui::Ui, secs: f64, min: f64, max: f64) -> Typed {
+        self.show_inner(ui, Some((secs, min, max)))
+    }
+
+    fn show_inner(self, ui: &mut egui::Ui, time: Option<(f64, f64, f64)>) -> Typed {
         let p = theme::pal(ui);
         let mut out = Typed::None;
         let edit_id = self.id.with("text");
@@ -1723,6 +1736,15 @@ impl ValueField<'_> {
         }
         let dd = Rect::from_min_max(Pos2::new(rect.right() - 26.0, rect.top()), rect.max);
         let field = Rect::from_min_max(Pos2::new(rect.left() + 10.0, rect.top()), Pos2::new(dd.left(), rect.bottom()));
+        if let Some((secs, min, max)) = time {
+            let font = theme::font(13.0, W::Medium);
+            let tf = crate::time_field::TimeField { id: edit_id, secs, min, max, decimals: 0, font, align: egui::Align::Min, hint: self.hint };
+            out = match tf.show(ui, field) {
+                crate::time_field::Timed::None => Typed::None,
+                crate::time_field::Timed::Stepped(v) | crate::time_field::Timed::Typed(v) => Typed::Secs(v),
+                crate::time_field::Timed::Unreadable(t) => Typed::Text(t),
+            };
+        } else {
         let mut text = editing.clone().unwrap_or_else(|| self.text.clone());
         let font = theme::font(13.0, W::Medium);
         let tw = ui.painter().layout_no_wrap(if text.is_empty() { " ".into() } else { text.clone() }, font.clone(), p.text).size().x;
@@ -1780,6 +1802,7 @@ impl ValueField<'_> {
             }
             None => d.remove::<String>(editing_key),
         });
+        }
         // The ∨: common values, and "Type your own…".
         let ddr = ui.interact(dd, self.id.with("dd"), Sense::click());
         let dhv = theme::toggle(ui.ctx(), ddr.id.with("hv"), ddr.hovered() || menu_open, theme::FAST);

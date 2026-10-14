@@ -49,6 +49,7 @@ mod store;
 mod thumbs;
 mod tray;
 mod theme;
+mod time_field;
 mod ui_kit;
 mod update;
 #[cfg(target_os = "linux")]
