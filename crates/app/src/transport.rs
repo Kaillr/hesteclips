@@ -203,14 +203,27 @@ pub fn play_button(ui: &mut egui::Ui, playing: bool) -> Centre {
     let t = theme::toggle(ui.ctx(), resp.id.with("playing"), playing, theme::FAST);
     let fg = p.primary_fg;
     if t < 1.0 {
-        // ▶, nudged right to look centred.
-        ui.painter().text(rr.center() + vec2(1.5, 0.0), Align2::CENTER_CENTER, egui_phosphor::fill::PLAY, FontId::new(16.0 * (1.0 - 0.3 * t), theme::fill_family()), theme::fade(fg, 1.0 - t));
+        // ▶ centred by its shape: its ink's middle, nudged right a sixth of
+        // its width (a triangle looks centred on its centroid).
+        glyph_centred(ui.painter(), rr.center(), egui_phosphor::fill::PLAY, 16.0 * (1.0 - 0.3 * t), theme::fade(fg, 1.0 - t), 1.0 / 6.0);
     }
     if t > 0.0 {
-        ui.painter().text(rr.center(), Align2::CENTER_CENTER, egui_phosphor::fill::PAUSE, FontId::new(16.0 * (0.7 + 0.3 * t), theme::fill_family()), theme::fade(fg, t));
+        glyph_centred(ui.painter(), rr.center(), egui_phosphor::fill::PAUSE, 16.0 * (0.7 + 0.3 * t), theme::fade(fg, t), 0.0);
     }
     c.play = resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Play or pause  (Space)").clicked();
     c
+}
+
+/// A glyph with the middle of its ink at `c` (a font's line box isn't
+/// centred on what it draws), moved right by `nudge` of its width.
+fn glyph_centred(painter: &egui::Painter, c: Pos2, glyph: &str, size: f32, color: Color32, nudge: f32) {
+    let g = painter.layout_no_wrap(glyph.to_owned(), FontId::new(size, theme::fill_family()), color);
+    let ink = g.rows.iter().map(|r| r.visuals.mesh_bounds.translate(r.pos.to_vec2())).fold(Rect::NOTHING, |a, b| a.union(b));
+    if !ink.is_positive() {
+        return;
+    }
+    let pos = c - ink.center().to_vec2() + vec2(ink.width() * nudge, 0.0);
+    painter.galley(pos, g, color);
 }
 
 /// The time: "0:22.13 / 0:59.80", or frames. Click to switch. Fixed-width

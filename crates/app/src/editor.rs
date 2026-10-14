@@ -853,7 +853,10 @@ impl Ready {
         let reach = 8.0 / px_per_s.max(1e-6);
         let mut targets = vec![0.0, self.info.duration];
         targets.extend(self.moments.iter().map(|m| m.t));
-        if except != Some(Drag::Playhead) {
+        // Not while a trim edge moves: the playhead follows the edge, and
+        // snapping to it made the edge chase its own shadow (back and forth
+        // while held still).
+        if !matches!(except, Some(Drag::Playhead | Drag::In | Drag::Out)) {
             targets.push(self.info.snap(self.player.time()));
         }
         if except != Some(Drag::In) {
@@ -1427,8 +1430,14 @@ impl Ready {
                 if d != Drag::Playhead {
                     self.before_drag = Some(self.edit.clone());
                 }
-                // Where in the selection it was grabbed, so it moves with the pointer.
-                self.grab_offset = self.info.snap(t_of(pos.x)) - self.edit.start;
+                // Where it was grabbed (in the selection, or beside an edge),
+                // so it moves with the pointer instead of jumping to it.
+                let at = t_of(pos.x);
+                self.grab_offset = match d {
+                    Drag::In => at - self.edit.start,
+                    Drag::Out => at - self.edit.end,
+                    _ => self.info.snap(at) - self.edit.start,
+                };
                 // Moving the playhead or a trim pauses while you drag and carries on
                 // after; shaping the volume never interrupts playback.
                 if matches!(d, Drag::In | Drag::Out | Drag::Range | Drag::Playhead) {
@@ -1450,12 +1459,12 @@ impl Ready {
                 let t = self.info.snap(t_of(pos.x));
                 match d {
                     Drag::In => {
-                        let t = self.info.snap(self.snapped(t, px_per_s, Some(Drag::In)));
+                        let t = self.info.snap(self.snapped(t_of(pos.x) - self.grab_offset, px_per_s, Some(Drag::In)));
                         self.edit.start = t.min(self.edit.end - fd);
                         self.player.seek(self.edit.start);
                     }
                     Drag::Out => {
-                        let t = self.snapped(t + fd, px_per_s, Some(Drag::Out));
+                        let t = self.snapped(t_of(pos.x) - self.grab_offset, px_per_s, Some(Drag::Out));
                         self.edit.end = self.info.snap(t).clamp(self.edit.start + fd, self.info.duration);
                         self.player.seek(self.edit.end - fd);
                     }
