@@ -116,9 +116,10 @@ impl App {
                 y += 28.0;
             }
             ui.painter().vline(x - 0.75, line_top..=y, egui::Stroke::new(1.5, p.line2));
-            // The marker slides to the section you're at.
+            // The marker slides to the section you're at (which section eases,
+            // not where it is: the list moving with the window takes it along).
             if let Some(i) = tops.iter().position(|(n, _)| Some(*n) == at) {
-                let my = theme::value(ui.ctx(), egui::Id::new("settings_marker"), line_top + i as f32 * 28.0, theme::NORMAL);
+                let my = line_top + theme::value(ui.ctx(), egui::Id::new("settings_marker"), i as f32, theme::NORMAL) * 28.0;
                 ui.painter().vline(x - 0.75, my..=my + 28.0, egui::Stroke::new(1.5, p.text));
             }
         }

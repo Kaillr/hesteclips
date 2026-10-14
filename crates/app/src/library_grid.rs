@@ -303,6 +303,15 @@ impl Layout {
         l
     }
 
+    /// The same cards at another width (the window resizing): the index of
+    /// cards is kept (it doesn't depend on the width), only the places are
+    /// found again: cheap, however many clips.
+    pub fn resized(&self, groups: &[Group], metrics: Metrics, open: impl Fn(usize) -> f32) -> Self {
+        let mut l = Layout { metrics, groups: Vec::new(), index: self.index.clone(), height: 0.0 };
+        l.place_groups(groups, open);
+        l
+    }
+
     /// Where each group is, with how open each is now: cheap (one step per
     /// day), so a day folding moves what's below every frame.
     pub fn place_groups(&mut self, groups: &[Group], open: impl Fn(usize) -> f32) {
@@ -401,16 +410,34 @@ impl Moves {
     /// cards before the change, by group (to find what was in view).
     /// `make`: the new layout, called only when `id` changed; `place`: each
     /// frame, the groups placed with how open they are now.
-    pub fn update(&mut self, id: LayoutId, now: f64, still: bool, make: impl FnOnce() -> Layout, place: impl FnOnce(&mut Layout), before_items: impl FnOnce() -> Vec<Vec<(Key, GridItem)>>) {
+    /// `resize`: the same cards at the new width, from the layout now (only
+    /// called when just the width changed).
+    #[allow(clippy::too_many_arguments)]
+    pub fn update(
+        &mut self,
+        id: LayoutId,
+        now: f64,
+        still: bool,
+        make: impl FnOnce() -> Layout,
+        resize: impl FnOnce(&Layout) -> Layout,
+        place: impl FnOnce(&mut Layout),
+        before_items: impl FnOnce() -> Vec<Vec<(Key, GridItem)>>,
+    ) {
         if let Some((layout, was)) = &mut self.now
             && *was == id
         {
             place(layout);
             return;
         }
-        let layout = make();
+        let layout = match &self.now {
+            // Only the width: the cards are where they were in the list.
+            Some((old, was)) if was.shown == id.shown => resize(old),
+            _ => make(),
+        };
         match &self.now {
-            Some((old, _)) if !still => {
+            // Only what's shown changing moves things; another width (the
+            // window resizing) or column count puts them in place at once.
+            Some((old, was)) if !still && was.shown != id.shown => {
                 let (top, bottom) = self.view;
                 let items = before_items();
                 let mut seen = Vec::new();
@@ -539,9 +566,9 @@ mod tests {
         let mut m = Moves::default();
         let id = |s| LayoutId { shown: s, metrics: (4, 900) };
         let view = (0.0, 800.0);
-        m.update(id(1), 0.0, false, || all.clone(), |_| {}, Vec::new);
+        m.update(id(1), 0.0, false, || all.clone(), |_| unreachable!(), |_| {}, Vec::new);
         m.set_view(view);
-        m.update(id(2), 10.0, false, || osu.clone(), |_| {}, Vec::new);
+        m.update(id(2), 10.0, false, || osu.clone(), |_| unreachable!(), |_| {}, Vec::new);
         // An osu! clip that was below the view in All clips and is in view now:
         // it comes up from just past the view's bottom edge.
         let (key, was, target) = (0..200)
@@ -564,6 +591,27 @@ mod tests {
         let near = Key::Clip(clips[2].path.clone());
         let p = m.place(&near, osu.card(&near).unwrap(), 10.0, view);
         assert_eq!(p.at, all.card(&near).unwrap());
+    }
+
+    /// The window resizing: cards are in place at once, every frame (they
+    /// follow the window, never trail it); only what's shown changing slides.
+    #[test]
+    fn resizing_never_slides() {
+        let clips: Vec<Clip> = (0..40).map(|i| clip(i, "osu!")).collect();
+        let (_, wide) = layout_of(&clips, &Filter::All, 1200.0);
+        let (_, narrow) = layout_of(&clips, &Filter::All, 700.0);
+        let mut m = Moves::default();
+        let view = (0.0, 800.0);
+        m.update(LayoutId { shown: 1, metrics: (wide.metrics.cols, 1200) }, 0.0, false, || wide.clone(), |_| unreachable!(), |_| {}, Vec::new);
+        m.set_view(view);
+        let groups = layout_of(&clips, &Filter::All, 700.0).0.groups;
+        m.update(LayoutId { shown: 1, metrics: (narrow.metrics.cols, 700) }, 1.0, false, || unreachable!("only the width changed"), |old| old.resized(&groups, narrow.metrics, |_| 1.0), |_| {}, Vec::new);
+        assert!(!m.moving(1.0));
+        let key = Key::Clip(clips[7].path.clone());
+        let target = narrow.card(&key).unwrap();
+        assert_ne!(wide.card(&key).unwrap(), target, "it did move");
+        let p = m.place(&key, target, 1.0, view);
+        assert_eq!((p.at, p.shown), (target, 1.0));
     }
 
     /// Worked out again only when something changed.

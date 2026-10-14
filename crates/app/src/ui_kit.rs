@@ -815,10 +815,15 @@ pub fn segmented_opts(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::De
         x += w + 2.0;
     }
     let base_id = egui::Id::new(id);
-    // The chosen pill slides to its option and to its width.
-    if let Some(&cx) = xs.get(chosen) {
-        let px = theme::value(ui.ctx(), base_id.with("x"), cx - inner.left(), theme::NORMAL);
-        let pw = theme::value(ui.ctx(), base_id.with("w"), ws[chosen], theme::NORMAL);
+    // The chosen pill slides to its option and to its width. What eases is
+    // which option it's on (a fraction of the way between them), not points:
+    // the control stretching with the window takes the pill along at once.
+    if xs.get(chosen).is_some() {
+        let at = theme::value(ui.ctx(), base_id.with("at"), chosen as f32, theme::NORMAL);
+        let (lo, hi) = (at.floor() as usize, (at.ceil() as usize).min(xs.len() - 1));
+        let f = at - lo as f32;
+        let px = xs[lo] + (xs[hi] - xs[lo]) * f - inner.left();
+        let pw = ws[lo] + (ws[hi] - ws[lo]) * f;
         let pill = Rect::from_min_size(Pos2::new(inner.left() + px, inner.top()), vec2(pw, inner.height()));
         if p.dark {
             painter.rect_filled(pill.translate(vec2(0.0, 1.0)), 4, Color32::from_black_alpha(56));

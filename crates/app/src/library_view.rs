@@ -203,6 +203,9 @@ impl App {
             // every frame (a day folding moves what's below).
             let clips = &self.clips;
             let groups = &self.shown.groups;
+            // What's shown changing makes things slide; the window's width
+            // doesn't (cards follow it exactly, never trailing): the places
+            // are found again, without a slide.
             let id = crate::library_grid::LayoutId { shown: self.shown.version, metrics: (m.cols, avail.round() as i32) };
             let before = &self.shown.before;
             // Folding moves what's below by itself: nothing slides then.
@@ -211,6 +214,7 @@ impl App {
                 now,
                 arriving || folding,
                 || crate::library_grid::Layout::new(groups, m, |g| opens[g], |it| crate::library_grid::key_for(it, clips, &render_dests)),
+                |old| old.resized(groups, m, |g| opens[g]),
                 |l| l.place_groups(groups, |g| opens[g]),
                 || before.clone(),
             );

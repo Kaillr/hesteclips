@@ -36,6 +36,12 @@ pub struct Glass {
     /// and its size in points.
     origin: Pos2,
     size: egui::Vec2,
+    /// The first clip's place when it was made (to stretch it with the
+    /// clips while the window resizes), and the window's size and when it
+    /// last changed.
+    made_for: Option<(PathBuf, Rect)>,
+    window: egui::Vec2,
+    resized_at: f64,
 }
 
 /// A clip on the grid, for the glass: its picture's place in the grid's
@@ -68,17 +74,47 @@ pub fn paint(ui: &mut egui::Ui, card: Rect, app: &mut App) {
         t.small.is_some().hash(&mut sig);
     }
     let sig = sig.finish();
-    if sig != app.glass.signature {
+    // While the window is being resized (its size changed in the last few
+    // frames), the picture isn't made again every frame: it would cost a
+    // frame's time each time (the resize stuttered). The last one stays,
+    // stretched to where the clips are now; it's made again once the size
+    // settles. Blurred this much, the stretch can't be seen.
+    let now = ui.input(|i| i.time);
+    let size = ui.ctx().content_rect().size();
+    if app.glass.window != size {
+        app.glass.window = size;
+        app.glass.resized_at = now;
+    }
+    let resizing = now - app.glass.resized_at < 0.15;
+    if resizing {
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(160));
+    }
+    if sig != app.glass.signature && !(resizing && app.glass.texture.is_some()) {
         app.glass.signature = sig;
         if near.is_empty() {
             app.glass.texture = None;
         } else {
             make(ui.ctx(), &mut app.glass, &near, card.left() - origin.x, p);
+            app.glass.made_for = near.first().map(|t| (t.path.clone(), t.rect));
         }
     }
+    // Stretched with the clips while it's waiting to be made again: one
+    // clip's place now against when it was made (the same clip, found by
+    // its file).
+    let stretch = app.glass.made_for.as_ref().and_then(|(path, was)| {
+        let is = tiles.iter().find(|t| &t.path == path)?.rect;
+        (is != *was && was.width() > 0.0).then_some((*was, is))
+    });
     app.glass_tiles = tiles;
     if let Some(tex) = &app.glass.texture {
-        let r = Rect::from_min_size(origin + app.glass.origin.to_vec2(), app.glass.size);
+        let mut r = Rect::from_min_size(app.glass.origin, app.glass.size);
+        if let Some((was, is)) = stretch {
+            // Scaled about the first clip: its column widths and rows grow
+            // with the window, and so does the picture.
+            let k = is.width() / was.width();
+            r = Rect::from_min_size(is.min + (r.min - was.min) * k, r.size() * k);
+        }
+        let r = r.translate(origin.to_vec2());
         painter.add(egui::Shape::mesh(rounded_mesh(tex.id(), card, 8.0, r)));
     }
     let tint = if p.dark { Color32::from_rgba_unmultiplied(24, 25, 29, 56) } else { Color32::from_rgba_unmultiplied(250, 250, 251, 92) };
@@ -261,5 +297,29 @@ pub(crate) fn box_blur(buf: &mut [[f32; 4]], w: usize, h: usize, r: usize, horiz
         for i in 0..n {
             buf[idx(line, i)] = tmp[i];
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// How long making the glass takes (it's made again whenever the clips
+    /// near the card move: every frame while the window is resized):
+    /// `cargo test -p hesteclips glass_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn glass_cost() {
+        let ctx = egui::Context::default();
+        let small = std::sync::Arc::new((40usize, 23usize, vec![128u8; 40 * 23 * 4]));
+        // Two columns of clips near the card, down a long grid.
+        let tiles: Vec<Tile> = (0..60).map(|i| Tile { rect: Rect::from_min_size(Pos2::new((i % 2) as f32 * 216.0, (i / 2) as f32 * 180.0), vec2(200.0, 112.0)), path: PathBuf::from(format!("/c{i}")), small: Some(small.clone()) }).collect();
+        let near: Vec<&Tile> = tiles.iter().collect();
+        let mut glass = Glass::default();
+        let t = std::time::Instant::now();
+        for _ in 0..10 {
+            make(&ctx, &mut glass, &near, -260.0, &theme::DARK);
+        }
+        println!("glass, made again: {:.1} ms", t.elapsed().as_secs_f64() * 100.0);
     }
 }

@@ -1022,6 +1022,11 @@ mod scale_tests {
         time("a frame's layout (days placed)", &mut || {
             layout.place_groups(groups, |_| 1.0);
         });
+        let mut w = 1200.0;
+        time("a frame while resizing (another width)", &mut || {
+            w += 3.0;
+            layout = layout.resized(groups, crate::library_grid::Metrics::for_width(w), |_| 1.0);
+        });
         time("days only", &mut || {
             std::hint::black_box(clips.iter().map(|c| c.day()).count());
         });
