@@ -87,7 +87,7 @@ impl App {
         let every = if capture::preview::AVAILABLE { Duration::from_secs_f64(0.5 / self.settings.fps.max(1) as f64) } else { Duration::from_millis(16) };
         crate::ui_kit::repaint_after(ui.ctx(), every);
 
-        self.page_head(ui, "Sources", |_, _| {}, false);
+        self.page_head(ui, "Sources", |_, _| {});
         crate::ui_kit::arrive(ui, |ui| crate::ui_kit::scroll(ui, "sources_page", |ui| {
             let w = ui.available_width();
             // Picture on the left, sound on the right, when there's room;

@@ -54,7 +54,6 @@ impl App {
                     crate::library_view::search_field(ui, "settings_search", &mut app.settings_query, "Search");
                 });
             },
-            false,
         );
         ui_kit::arrive(ui, |ui| self.settings_content(ui, width));
         self.reset_dialog(ui.ctx());
@@ -1026,7 +1025,6 @@ impl App {
                 let p = theme::pal(ui);
                 ui.label(theme::text("Clip names", 20.0, W::Semibold).color(p.text));
             },
-            false,
         );
         if back {
             self.naming_open = false;

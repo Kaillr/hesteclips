@@ -121,7 +121,7 @@ impl App {
     /// The recorder: the status (its ∨ opens the other options) and the one
     /// action that makes sense now, with its shortcut. `main`: its action is
     /// the screen's main one (on Clips); elsewhere it's a normal button.
-    pub(crate) fn recorder(&mut self, ui: &mut egui::Ui, main: bool) {
+    pub(crate) fn recorder(&mut self, ui: &mut egui::Ui) {
         let p = theme::pal(ui);
         let state = self.rec_state;
         let elapsed = self.rec_started.map_or(Duration::ZERO, |t| t.elapsed());
@@ -138,7 +138,8 @@ impl App {
         let stat_w = theme::value(ui.ctx(), egui::Id::new("rec_stat_w"), stat_target, theme::NORMAL);
         // The one action.
         let saving = self.saving > 0;
-        let kind = if main { Kind::Primary } else { Kind::Raised };
+        // The app's main action, the same on every page.
+        let kind = Kind::Primary;
         let btn = match state {
             RecState::Idle => Btn::new(kind, "Start clipping")
                 .keys(self.shortcut_keys(A::ToggleBuffer))
@@ -273,7 +274,7 @@ impl App {
     /// A page's heading row: the title (and whatever `left` adds after it),
     /// then the recorder on the right. Dragging its empty space moves the
     /// window.
-    pub(crate) fn page_head(&mut self, ui: &mut egui::Ui, title: &str, left: impl FnOnce(&mut Self, &mut egui::Ui), main: bool) {
+    pub(crate) fn page_head(&mut self, ui: &mut egui::Ui, title: &str, left: impl FnOnce(&mut Self, &mut egui::Ui)) {
         let p = theme::pal(ui);
         let rect = Rect::from_min_size(ui.cursor().min, vec2(ui.available_width(), HEAD_H));
         drag_window_area(ui, rect, "page_head");
@@ -286,7 +287,7 @@ impl App {
             }
             left(self, ui);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                self.recorder(ui, main);
+                self.recorder(ui);
                 self.update_button(ui);
                 self.skipped_warning(ui);
             });

@@ -174,7 +174,6 @@ impl App {
                     }
                 }
             },
-            true,
         );
         if head_action.is_some() {
             action = head_action;
@@ -619,7 +618,7 @@ impl App {
     /// do it, and the shortcut you'll use.
     fn empty_state(&mut self, ui: &mut egui::Ui) {
         let p = theme::pal(ui);
-        self.page_head(ui, "", |_, _| {}, false);
+        self.page_head(ui, "", |_, _| {});
         let save = self.shortcut_keys(crate::settings::ShortcutAction::SaveClip);
         let len = crate::settings_ui::length_words(self.settings.replay_seconds);
         let len = if len == "1 minute" { "minute".to_owned() } else { len };

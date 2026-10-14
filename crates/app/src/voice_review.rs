@@ -232,7 +232,6 @@ impl App {
                     ui.label(crate::theme::text(format!("{answered} of {total} answered"), 13.5, crate::theme::W::Regular).color(p.text3));
                 }
             },
-            false,
         );
         ui_kit::page(ui, "voice_review", 720.0, |ui| {
             let top = ui.allocate_space(vec2(1.0, 1.0)).1;

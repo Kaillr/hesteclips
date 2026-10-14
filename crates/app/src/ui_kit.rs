@@ -273,9 +273,6 @@ pub enum Kind {
     DangerText,
     /// On, like a toggled tool (snapping on).
     On,
-    /// A step above the control it sits in (the recorder's action when it
-    /// isn't the screen's main one).
-    Raised,
 }
 
 /// A button: an optional icon, a label, an optional trailing icon or keycap.
@@ -431,14 +428,10 @@ impl<'a> Btn<'a> {
                 Kind::Stop => (theme::mix(p.rec, Color32::WHITE, hv * 0.12), Color32::WHITE),
                 Kind::DangerText => (theme::fade(p.sel, hv).blend(theme::fade(p.control, if p.dark { 0.0 } else { hv })), p.danger),
                 Kind::On => (p.seg_on, p.text),
-                Kind::Raised => (theme::mix(if p.dark { p.raise } else { Color32::WHITE }, if p.dark { p.raise2 } else { p.raise2 }, hv), p.text),
             };
             let fg = if self.enabled { fg } else { theme::fade(fg, 0.38) };
             let fill = if self.enabled || self.kind == Kind::Primary || self.kind == Kind::Stop { fill } else { Color32::TRANSPARENT };
             let rect_d = if pressed { rect.shrink(0.5) } else { rect };
-            if self.kind == Kind::Raised && !p.dark {
-                ui.painter().rect_filled(rect_d.translate(vec2(0.0, 1.0)), self.corners, Color32::from_black_alpha(22));
-            }
             ui.painter().rect_filled(rect_d, self.corners, if self.enabled { fill } else { theme::fade(fill, 0.4) });
             // Content: centred when it fits, clipped when the width is still
             // catching up.
