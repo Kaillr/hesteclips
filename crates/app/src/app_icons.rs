@@ -3,6 +3,9 @@
 //! a thread of their own (from its bundle or executable), kept while the app
 //! runs; one that has none (Linux, a program without a bundle, an app on
 //! Windows that isn't running) is asked again now and then, as it may start.
+//! Each icon read is also saved, so an app that isn't running (Windows can
+//! only find its executable then) still shows its icon from the last time;
+//! it's read again once the app is running, in case it changed.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -16,17 +19,28 @@ const SIZE: u32 = 64;
 const RETRY: Duration = Duration::from_secs(10);
 
 enum Slot {
-    Loading,
+    /// Being read; the saved icon shows meanwhile, if there was one.
+    Loading(Option<egui::TextureHandle>),
+    /// Read from the app itself: final.
     Ready(egui::TextureHandle),
+    /// The one saved last time, as of then: the app wasn't running to read.
+    Saved(egui::TextureHandle, Instant),
     /// None to be had, as of then.
     Missing(Instant),
+}
+
+/// What a read found.
+enum Found {
+    Live(Vec<u8>),
+    Saved(Vec<u8>),
+    None,
 }
 
 #[derive(Default)]
 pub struct AppIcons {
     slots: HashMap<String, Slot>,
     /// Pixels read on a thread, waiting to become textures.
-    done: Arc<Mutex<Vec<(String, Option<Vec<u8>>)>>>,
+    done: Arc<Mutex<Vec<(String, Found)>>>,
 }
 
 impl AppIcons {
@@ -37,28 +51,68 @@ impl AppIcons {
             return None;
         }
         let finished: Vec<_> = std::mem::take(&mut *self.done.lock().unwrap());
-        for (app, px) in finished {
-            let slot = match px {
-                Some(px) => Slot::Ready(ctx.load_texture(format!("app icon {app}"), egui::ColorImage::from_rgba_unmultiplied([SIZE as usize, SIZE as usize], &px), egui::TextureOptions::LINEAR)),
-                None => Slot::Missing(Instant::now()),
+        for (app, found) in finished {
+            let texture = |px: &[u8]| ctx.load_texture(format!("app icon {app}"), egui::ColorImage::from_rgba_unmultiplied([SIZE as usize, SIZE as usize], px), egui::TextureOptions::LINEAR);
+            let slot = match found {
+                Found::Live(px) => Slot::Ready(texture(&px)),
+                Found::Saved(px) => Slot::Saved(texture(&px), Instant::now()),
+                // Not running again: the saved one it had stays.
+                Found::None => match self.slots.remove(&app) {
+                    Some(Slot::Loading(Some(tex))) => Slot::Saved(tex, Instant::now()),
+                    _ => Slot::Missing(Instant::now()),
+                },
             };
             self.slots.insert(app, slot);
         }
-        match self.slots.get(id) {
+        let shown = match self.slots.get(id) {
             Some(Slot::Ready(tex)) => return Some(tex.clone()),
-            Some(Slot::Loading) => return None,
+            Some(Slot::Loading(tex)) => return tex.clone(),
+            Some(Slot::Saved(tex, at)) if at.elapsed() < RETRY => return Some(tex.clone()),
             Some(Slot::Missing(at)) if at.elapsed() < RETRY => return None,
-            _ => {}
-        }
-        self.slots.insert(id.to_owned(), Slot::Loading);
+            Some(Slot::Saved(tex, _)) => Some(tex.clone()),
+            _ => None,
+        };
+        // Saved icons are looked for only the first time.
+        let first = !self.slots.contains_key(id);
+        self.slots.insert(id.to_owned(), Slot::Loading(shown.clone()));
         let (done, app, ctx) = (self.done.clone(), id.to_owned(), ctx.clone());
         std::thread::spawn(move || {
-            let px = capture::app_icon(&app, SIZE);
-            done.lock().unwrap().push((app, px));
+            let found = match capture::app_icon(&app, SIZE) {
+                Some(px) => {
+                    save(&app, &px);
+                    Found::Live(px)
+                }
+                None => match first.then(|| load(&app)).flatten() {
+                    Some(px) => Found::Saved(px),
+                    None => Found::None,
+                },
+            };
+            done.lock().unwrap().push((app, found));
             ctx.request_repaint();
         });
-        None
+        shown
     }
+}
+
+/// Where app `id`'s icon is saved.
+fn saved_path(id: &str) -> Option<std::path::PathBuf> {
+    // Executables' names are the same in any case on Windows.
+    let name: String = id.to_lowercase().chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' }).collect();
+    dirs::cache_dir().map(|d| d.join("hesteclips").join("app-icons").join(format!("{name}.png")))
+}
+
+fn save(id: &str, px: &[u8]) {
+    let Some(path) = saved_path(id) else { return };
+    let Some(img) = image::RgbaImage::from_raw(SIZE, SIZE, px.to_vec()) else { return };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = img.save(&path);
+}
+
+fn load(id: &str) -> Option<Vec<u8>> {
+    let img = image::open(saved_path(id)?).ok()?.into_rgba8();
+    (img.dimensions() == (SIZE, SIZE)).then(|| img.into_raw())
 }
 
 /// Draw app `id`'s icon into `rect` if there is one; false if not (draw the
