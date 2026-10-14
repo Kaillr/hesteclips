@@ -32,6 +32,7 @@ use crate::video::Video;
 #[cfg(not(hw_decode))]
 struct Picture {
     index: u64,
+    width: u32,
 }
 #[cfg(not(hw_decode))]
 struct Scrubbed {
