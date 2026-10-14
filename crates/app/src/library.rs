@@ -988,7 +988,7 @@ mod scale_tests {
         };
         let mut shown = crate::library_grid::Shown::default();
         let mut version = 0;
-        let mut update = |shown: &mut crate::library_grid::Shown, f: &Filter, q: &str, v: u64| {
+        let update = |shown: &mut crate::library_grid::Shown, f: &Filter, q: &str, v: u64| {
             shown.update(
                 crate::library_grid::Inputs { clips: &clips, library_version: v, collections: &cols, filter: f, query: q, sort: crate::settings::LibrarySort::Newest, lengths_version: 0, placeholders: 0, new_renders: Vec::new(), renders: &[] },
                 false,
