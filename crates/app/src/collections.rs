@@ -31,6 +31,9 @@ struct File {
 pub struct Collections {
     lib: PathBuf,
     list: Vec<Collection>,
+    /// Goes up with every change: what's worked out from them (the library's
+    /// counts and what a collection shows) is worked out again.
+    version: u64,
 }
 
 impl Collections {
@@ -40,14 +43,27 @@ impl Collections {
             .and_then(|b| serde_json::from_slice::<File>(&b).ok())
             .map(|f| f.collections)
             .unwrap_or_default();
-        Self { lib: lib.to_path_buf(), list }
+        Self { lib: lib.to_path_buf(), list, version: 0 }
+    }
+
+    /// See [`Collections::version`]: changes whenever any collection does.
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    /// Each collection's clips, as a set: membership at a glance (a
+    /// collection's list is checked once per clip otherwise, thousands of
+    /// times for a big library).
+    pub fn sets(&self) -> std::collections::HashMap<String, std::collections::HashSet<PathBuf>> {
+        self.list.iter().map(|c| (c.id.clone(), c.clips.iter().map(|k| self.lib.join(k)).collect())).collect()
     }
 
     pub fn library(&self) -> &Path {
         &self.lib
     }
 
-    fn save(&self) {
+    fn save(&mut self) {
+        self.version += 1;
         let path = file_path(&self.lib);
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);

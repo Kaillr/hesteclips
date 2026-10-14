@@ -49,6 +49,8 @@ pub struct Thumbs {
     /// Clip lengths read from the disk cache, so sorting by length doesn't
     /// read a file per clip every frame.
     durations: HashMap<u64, Option<Duration>>,
+    /// Goes up when a clip's length becomes known: sorting by length sorts again.
+    lengths_version: u64,
 }
 
 /// Pictures kept however long ago they were shown: a screenful or two and
@@ -81,7 +83,7 @@ impl Thumbs {
                 }
             });
         }
-        Self { ctx: app_ctx, ready: HashMap::new(), pending: HashSet::new(), job_tx, done_rx, swept: Instant::now(), durations: HashMap::new() }
+        Self { ctx: app_ctx, ready: HashMap::new(), pending: HashSet::new(), job_tx, done_rx, swept: Instant::now(), durations: HashMap::new(), lengths_version: 0 }
     }
 
     pub fn ctx(&self) -> egui::Context {
@@ -93,6 +95,10 @@ impl Thumbs {
         while let Ok(done) = self.done_rx.try_recv() {
             self.pending.remove(&done.key);
             let small = done.image.as_ref().map(|img| std::sync::Arc::new(shrink(img, SMALL_W)));
+            // A length newly known (looked up before or not): sorting by length sorts again.
+            if done.duration.is_some() && self.durations.insert(done.key, done.duration) != Some(done.duration) {
+                self.lengths_version += 1;
+            }
             let texture = done.image.map(|img| {
                 ctx.load_texture(format!("thumb-{}", done.key), img, egui::TextureOptions::LINEAR)
             });
@@ -129,12 +135,16 @@ impl Thumbs {
         if let Some(d) = self.durations.get(&k) {
             return *d;
         }
+        // Read once, found or not ([`Thumbs::lengths_version`] says when one
+        // turns up later).
         let d = std::fs::read_to_string(cache_dir().join(format!("{k:016x}.dur"))).ok().and_then(|s| s.trim().parse::<f64>().ok()).map(Duration::from_secs_f64);
-        // Not made yet: asked for again once its picture is in (then `ready` has it).
-        if d.is_some() {
-            self.durations.insert(k, d);
-        }
+        self.durations.insert(k, d);
         d
+    }
+
+    /// Goes up whenever a clip's length becomes known (its picture was made).
+    pub fn lengths_version(&self) -> u64 {
+        self.lengths_version
     }
 }
 

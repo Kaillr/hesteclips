@@ -25,6 +25,7 @@ mod games;
 mod osu_plays;
 mod library;
 mod library_view;
+mod library_grid;
 mod glass;
 mod hover_play;
 #[cfg(target_os = "linux")]
@@ -488,6 +489,11 @@ struct App {
     pub(crate) glass_tiles: Vec<glass::Tile>,
     pub(crate) glass_origin: egui::Pos2,
     pub(crate) glass: glass::Glass,
+    /// What the library shows and where, worked out once per change (see
+    /// `library_grid`), and the library's list's version.
+    pub(crate) shown: library_grid::Shown,
+    pub(crate) moves: library_grid::Moves,
+    pub(crate) library_version: u64,
     /// The keyboard shortcuts dialog, for this screen.
     pub(crate) show_keys: Option<shell::Keys>,
     /// Clips being dragged inside the window, to a game or collection.
@@ -669,6 +675,9 @@ impl App {
             glass_tiles: Vec::new(),
             glass_origin: egui::Pos2::ZERO,
             glass: Default::default(),
+            shown: Default::default(),
+            moves: Default::default(),
+            library_version: 0,
             show_keys: None,
             last_poll: None,
             library_stamp: Vec::new(),
@@ -789,6 +798,7 @@ impl App {
     fn refresh_clips(&mut self) {
         store::set_library(&self.settings.output_dir);
         self.clips = clips::scan(&self.settings.output_dir);
+        self.library_version += 1;
         if self.collections.library() != self.settings.output_dir {
             self.collections = collections::Collections::load(&self.settings.output_dir);
         }

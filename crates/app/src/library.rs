@@ -94,7 +94,9 @@ pub(crate) struct View {
 /// What the sidebar lists: the games (the library's folders, by name, with
 /// Desktop and then Other — clips in no folder — last, as they aren't games)
 /// and the collections (by name). No games when the library has no folders.
-pub(crate) fn views(clips: &[clips::Clip], cols: &Collections) -> (Vec<View>, Vec<View>) {
+/// The collections' counts are left at 0: the grid counts them its own,
+/// quicker way (`library_grid::Shown`).
+pub(crate) fn views_without_counts(clips: &[clips::Clip], cols: &Collections) -> (Vec<View>, Vec<View>) {
     let mut games: Vec<View> = Vec::new();
     let mut loose = 0;
     // Newest first, so a folder's place is its newest clip's.
@@ -117,8 +119,7 @@ pub(crate) fn views(clips: &[clips::Clip], cols: &Collections) -> (Vec<View>, Ve
         .iter()
         .map(|c| {
             let filter = Filter::Collection(c.id.clone());
-            let count = clips.iter().filter(|clip| filter.matches(clip, cols)).count();
-            View { filter, label: c.name.clone(), count }
+            View { filter, label: c.name.clone(), count: 0 }
         })
         .collect();
     collections.sort_by_key(|v| v.label.to_lowercase());
@@ -239,14 +240,6 @@ pub(crate) enum Action {
     /// Delete the selected clips.
     TrashSelected,
     CancelUpload(PathBuf),
-}
-
-pub(crate) enum Card<'a> {
-    /// Recording or saving a replay clip.
-    Placeholder,
-    /// A "Save as new clip" render that has no file yet.
-    NewRender(usize),
-    Clip(&'a clips::Clip),
 }
 
 impl App {
@@ -950,5 +943,87 @@ mod folded_tests {
         let again = FoldedDays::load(&lib);
         assert!(again.contains(&a) && !again.contains(&b));
         std::fs::remove_dir_all(&lib).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod scale_tests {
+    use super::*;
+    use std::time::{Instant, SystemTime};
+
+    /// What the library does every frame, timed on a big library:
+    /// `cargo test -p hesteclips library_frame_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn library_frame_cost() {
+        let lib = std::env::temp_dir().join("hc-scale-lib");
+        let n = 5000;
+        let clips: Vec<clips::Clip> = (0..n)
+            .map(|i| {
+                let day = 1 + (i / 40) % 28;
+                let folder = ["Counter-Strike 2", "osu!", "Desktop", "Dota 2"][i % 4].to_owned();
+                clips::Clip {
+                    path: lib.join(&folder).join(format!("clip_2026-{:02}-{day:02}_12-{:02}-{:02}.mp4", 1 + i / 1120, (i / 60) % 60, i % 60)),
+                    name: String::new(),
+                    modified: SystemTime::now(),
+                    created: None,
+                    size_bytes: 1000 + i as u64,
+                    id: None,
+                    original: None,
+                    folder: Some(folder),
+                }
+            })
+            .collect();
+        let _ = std::fs::create_dir_all(&lib);
+        let mut cols = Collections::load(&lib);
+        let id = cols.create("Best");
+        let some: Vec<PathBuf> = clips.iter().step_by(3).map(|c| c.path.clone()).collect();
+        cols.add(&id, &some);
+        let time = |what: &str, f: &mut dyn FnMut()| {
+            let t = Instant::now();
+            for _ in 0..10 {
+                f();
+            }
+            println!("{what}: {:.2} ms", t.elapsed().as_secs_f64() * 100.0);
+        };
+        let mut shown = crate::library_grid::Shown::default();
+        let mut version = 0;
+        let mut update = |shown: &mut crate::library_grid::Shown, f: &Filter, q: &str, v: u64| {
+            shown.update(
+                crate::library_grid::Inputs { clips: &clips, library_version: v, collections: &cols, filter: f, query: q, sort: crate::settings::LibrarySort::Newest, lengths_version: 0, placeholders: 0, new_renders: Vec::new(), renders: &[] },
+                false,
+                |_| None,
+            )
+        };
+        update(&mut shown, &Filter::All, "", 0);
+        time("a frame, nothing changed", &mut || {
+            update(&mut shown, &Filter::All, "", 0);
+        });
+        time("another game (worked out again)", &mut || {
+            version += 1;
+            update(&mut shown, &Filter::Folder("osu!".into()), "", version);
+        });
+        time("a collection (worked out again)", &mut || {
+            version += 1;
+            update(&mut shown, &Filter::Collection(id.clone()), "", version);
+        });
+        time("a search (worked out again)", &mut || {
+            version += 1;
+            update(&mut shown, &Filter::All, "12-3", version);
+        });
+        version += 1;
+        update(&mut shown, &Filter::All, "", version);
+        let groups = &shown.groups;
+        println!("{} groups, {} cards", groups.len(), groups.iter().map(|g| g.items.len()).sum::<usize>());
+        time("the layout, made again (a change)", &mut || {
+            std::hint::black_box(crate::library_grid::Layout::new(groups, crate::library_grid::Metrics::for_width(1200.0), |_| 1.0, |it| crate::library_grid::key_for(it, &clips, &[])));
+        });
+        let mut layout = crate::library_grid::Layout::new(groups, crate::library_grid::Metrics::for_width(1200.0), |_| 1.0, |it| crate::library_grid::key_for(it, &clips, &[]));
+        time("a frame's layout (days placed)", &mut || {
+            layout.place_groups(groups, |_| 1.0);
+        });
+        time("days only", &mut || {
+            std::hint::black_box(clips.iter().map(|c| c.day()).count());
+        });
     }
 }
