@@ -1669,14 +1669,16 @@ fn same_edit(a: &Edit, b: &Edit) -> bool {
         })
 }
 
-/// The volume line, only where it's been changed: a line at the track's
-/// level, with its points as diamonds.
+/// The volume line, striped (so it reads as a control over the waveform, not
+/// part of it): faint where it's unchanged, bright with its points as
+/// diamonds where it's been changed.
 fn draw_envelope(p: &egui::Painter, pal: &crate::theme::Pal, lane: Rect, track: &media::TrackEdit, dur: f64, x_of: impl Fn(f64) -> f32) {
     let flat = track.points.is_empty() && (track.gain - 1.0).abs() < 0.005;
     let color = if track.muted { pal.text3 } else { pal.text };
     if flat {
         // Unchanged: just a faint line at 0 dB to grab.
-        p.hline(lane.x_range(), y_of_db(lane, 0.0), Stroke::new(1.0, crate::theme::fade(pal.text, 0.12)));
+        let y = y_of_db(lane, 0.0);
+        p.extend(egui::Shape::dashed_line(&[Pos2::new(lane.left(), y), Pos2::new(lane.right(), y)], Stroke::new(1.0, crate::theme::fade(pal.text, 0.22)), 5.0, 4.0));
         return;
     }
     let mut pts = vec![Pos2::new(x_of(0.0), y_of_db(lane, track.db_at(0.0)))];
@@ -1684,7 +1686,7 @@ fn draw_envelope(p: &egui::Painter, pal: &crate::theme::Pal, lane: Rect, track: 
         pts.push(Pos2::new(x_of(pt.t), y_of_db(lane, pt.db)));
     }
     pts.push(Pos2::new(x_of(dur), y_of_db(lane, track.db_at(dur))));
-    p.add(egui::Shape::line(pts, Stroke::new(1.5, crate::theme::fade(color, 0.85))));
+    p.extend(egui::Shape::dashed_line(&pts, Stroke::new(1.5, crate::theme::fade(color, 0.85)), 6.0, 4.0));
     for pt in &track.points {
         let c = Pos2::new(x_of(pt.t), y_of_db(lane, pt.db));
         let d = 5.5;
