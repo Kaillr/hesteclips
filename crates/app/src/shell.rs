@@ -205,7 +205,10 @@ impl App {
         let p = theme::pal(ui);
         let rect = ui.max_rect();
         ui.painter().rect_filled(rect, 0, p.ground);
-        let top = rect.top() + if under_titlebar() { 52.0 } else { 14.0 };
+        // With the window's own title bar above (not macOS), the first
+        // place's pill is centred on the page heading's row, level with its
+        // title and buttons.
+        let top = rect.top() + if under_titlebar() { 52.0 } else { 9.0 };
         let on = match self.page {
             Page::Clips | Page::View | Page::Edit => Page::Clips,
             Page::VoiceReview | Page::Settings => Page::Settings,
