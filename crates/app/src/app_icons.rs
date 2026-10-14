@@ -15,6 +15,10 @@ use std::time::{Duration, Instant};
 /// they're shown in on a 2× display.
 const SIZE: u32 = 64;
 
+/// Smooth however small it's drawn: plain linear filtering only blends the
+/// four nearest pixels, so shrinking 64 to 26 made edges jagged.
+const MIPMAPPED: egui::TextureOptions = egui::TextureOptions::LINEAR.with_mipmap_mode(Some(egui::TextureFilter::Linear));
+
 /// How long before asking again for an app that had no icon.
 const RETRY: Duration = Duration::from_secs(10);
 
@@ -52,7 +56,7 @@ impl AppIcons {
         }
         let finished: Vec<_> = std::mem::take(&mut *self.done.lock().unwrap());
         for (app, found) in finished {
-            let texture = |px: &[u8]| ctx.load_texture(format!("app icon {app}"), egui::ColorImage::from_rgba_unmultiplied([SIZE as usize, SIZE as usize], px), egui::TextureOptions::LINEAR);
+            let texture = |px: &[u8]| ctx.load_texture(format!("app icon {app}"), egui::ColorImage::from_rgba_unmultiplied([SIZE as usize, SIZE as usize], px), MIPMAPPED);
             let slot = match found {
                 Found::Live(px) => Slot::Ready(texture(&px)),
                 Found::Saved(px) => Slot::Saved(texture(&px), Instant::now()),
