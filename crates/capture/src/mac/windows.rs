@@ -145,8 +145,16 @@ pub(crate) fn bundle_file_name(id: &str) -> Option<String> {
     app.bundleURL().or_else(|| app.executableURL()).and_then(|u| u.lastPathComponent()).map(|n| n.to_string())
 }
 
+/// How much of a macOS icon's square the icon itself fills: Apple's grid puts
+/// it on an 824-point plate in 1024 (room for its shadow), so in a box it
+/// looked a fifth smaller than the same app's icon on Windows, which fills its
+/// square. Measured on Safari, Music, Discord, Calculator, Chrome and Notes:
+/// 52 of 64 pixels, each.
+const PLATE: f64 = 52.0 / 64.0;
+
 /// The icon of the app with bundle id `id` (installed, running or not), as
-/// `size`×`size` RGBA (straight alpha, rows top to bottom). `None` for an id
+/// `size`×`size` RGBA (straight alpha, rows top to bottom), cropped to its
+/// plate so it fills the square as a Windows icon does. `None` for an id
 /// without an app bundle (a program run from a folder).
 pub fn app_icon(id: &str, size: u32) -> Option<Vec<u8>> {
     use objc2_core_foundation::{CGPoint, CGSize};
@@ -156,7 +164,10 @@ pub fn app_icon(id: &str, size: u32) -> Option<Vec<u8>> {
     let url = ws.URLForApplicationWithBundleIdentifier(&NSString::from_str(id))?;
     let path = url.path()?;
     let image = ws.iconForFile(&path);
-    let mut rect = NSRect::new(objc2_foundation::NSPoint::new(0.0, 0.0), objc2_foundation::NSSize::new(size as f64, size as f64));
+    // Asked for at the size it's drawn at (bigger than the square), so the
+    // picture chosen is sharp there.
+    let big = (size as f64 / PLATE).ceil();
+    let mut rect = NSRect::new(objc2_foundation::NSPoint::new(0.0, 0.0), objc2_foundation::NSSize::new(big, big));
     // SAFETY: a proposed rect we own; no context or hints.
     let cg = unsafe { image.CGImageForProposedRect_context_hints(&mut rect, None, None) }?;
     let (w, h) = (size as usize, size as usize);
@@ -165,7 +176,11 @@ pub fn app_icon(id: &str, size: u32) -> Option<Vec<u8>> {
     // SAFETY: `px` holds w*h*4 bytes and outlives the context, which is
     // dropped at the end of this function.
     let ctx = unsafe { CGBitmapContextCreate(px.as_mut_ptr().cast(), w, h, 8, w * 4, Some(&space), CGImageAlphaInfo::PremultipliedLast.0) }?;
-    CGContext::draw_image(Some(&ctx), objc2_core_foundation::CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(w as f64, h as f64)), Some(&cg));
+    // Drawn bigger than the square, centred, so the plate fills it and the
+    // margin around it falls outside.
+    let big = size as f64 / PLATE;
+    let at = (size as f64 - big) / 2.0;
+    CGContext::draw_image(Some(&ctx), objc2_core_foundation::CGRect::new(CGPoint::new(at, at), CGSize::new(big, big)), Some(&cg));
     drop(ctx);
     // Premultiplied to straight alpha.
     for p in px.chunks_exact_mut(4) {
@@ -177,4 +192,20 @@ pub fn app_icon(id: &str, size: u32) -> Option<Vec<u8>> {
         }
     }
     Some(px)
+}
+
+#[cfg(test)]
+mod icon_tests {
+    /// A Mac app's icon fills its square, as a Windows icon does: its plate,
+    /// not Apple's margin around it (`cargo test -p capture icon_fills
+    /// -- --ignored`, on a Mac with Safari).
+    #[test]
+    #[ignore]
+    fn icon_fills_the_square() {
+        let px = super::app_icon("com.apple.Safari", 64).expect("Safari's icon");
+        let alpha = |x: usize, y: usize| px[(y * 64 + x) * 4 + 3];
+        // Opaque right up to a pixel or so from each edge (the plate's
+        // rounded corners aside), where before it started 6 pixels in.
+        assert!(alpha(32, 1) > 200 && alpha(1, 32) > 200 && alpha(62, 32) > 200 && alpha(32, 62) > 200, "edges: {} {} {} {}", alpha(32, 1), alpha(1, 32), alpha(62, 32), alpha(32, 62));
+    }
 }

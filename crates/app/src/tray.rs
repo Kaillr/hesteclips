@@ -53,6 +53,41 @@ struct Inner {
     buffering: std::cell::Cell<Option<bool>>,
 }
 
+/// The tray / menu bar icon: the logo's glyph alone, as the bar's other icons
+/// are (the app icon, with its dark plate, looked small and boxed in there).
+/// Made from its SVG by `scripts/tray-icons.sh`.
+#[cfg(any(windows, target_os = "macos"))]
+fn tray_image() -> Option<tray_icon::Icon> {
+    // macOS: 18 points high on a 2x display; macOS sizes it to the bar.
+    #[cfg(target_os = "macos")]
+    let png: &[u8] = include_bytes!("../assets/tray-mac.png");
+    // Windows: drawn at exactly the size the tray shows it at, which depends
+    // on the display's scale (16 px at 100%, 24 at 150%, ...). Windows scaled
+    // a bigger one down coarsely: it looked pixelated.
+    #[cfg(windows)]
+    let png: &[u8] = {
+        use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSMICON};
+        // SAFETY: no arguments to get wrong.
+        let want = unsafe { GetSystemMetrics(SM_CXSMICON) }.max(16);
+        const SIZES: [(i32, &[u8]); 8] = [
+            (16, include_bytes!("../assets/tray/windows-16.png")),
+            (20, include_bytes!("../assets/tray/windows-20.png")),
+            (24, include_bytes!("../assets/tray/windows-24.png")),
+            (28, include_bytes!("../assets/tray/windows-28.png")),
+            (32, include_bytes!("../assets/tray/windows-32.png")),
+            (40, include_bytes!("../assets/tray/windows-40.png")),
+            (48, include_bytes!("../assets/tray/windows-48.png")),
+            (64, include_bytes!("../assets/tray/windows-64.png")),
+        ];
+        // The size asked for, else the next bigger one (scaled down a little,
+        // which stays smooth), else the biggest.
+        SIZES.iter().find(|(s, _)| *s >= want).unwrap_or(&SIZES[SIZES.len() - 1]).1
+    };
+    let img = image::load_from_memory_with_format(png, image::ImageFormat::Png).ok()?.to_rgba8();
+    let (w, h) = img.dimensions();
+    tray_icon::Icon::from_rgba(img.into_raw(), w, h).ok()
+}
+
 impl Tray {
     /// The tray icon, or `None` where there's none. `tx`: commands from
     /// elsewhere too (another launch asking to be shown).
@@ -68,8 +103,17 @@ impl Tray {
             let quit = MenuItem::new("Quit HesteClips", true, None);
             let menu = Menu::new();
             menu.append_items(&[&open, &PredefinedMenuItem::separator(), &save, &buffer, &PredefinedMenuItem::separator(), &quit]).ok()?;
-            let image = tray_icon::Icon::from_rgba(icon.rgba.clone(), icon.width, icon.height).ok()?;
-            let built = TrayIconBuilder::new().with_tooltip("HesteClips").with_icon(image).with_menu(Box::new(menu)).with_menu_on_left_click(false).build();
+            let _ = icon;
+            let image = tray_image()?;
+            // macOS: a template image, tinted by macOS to suit the menu bar
+            // (white on a dark one, black on a light one), as its own icons.
+            let built = TrayIconBuilder::new()
+                .with_tooltip("HesteClips")
+                .with_icon(image)
+                .with_icon_as_template(cfg!(target_os = "macos"))
+                .with_menu(Box::new(menu))
+                .with_menu_on_left_click(false)
+                .build();
             let tray = match built {
                 Ok(t) => t,
                 Err(e) => {
