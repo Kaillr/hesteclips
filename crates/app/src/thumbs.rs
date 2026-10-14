@@ -140,8 +140,14 @@ impl Thumbs {
 
 /// The cached thumbnail JPEG for `clip`, if it's been generated.
 pub fn cached_jpeg(clip: &Clip) -> Option<PathBuf> {
-    let p = cache_dir().join(format!("{:016x}.jpg", key(clip)));
+    let p = jpeg_path(key(clip));
     p.exists().then_some(p)
+}
+
+/// Where a clip's thumbnail is kept. `-first`: taken from the first frame
+/// (older ones, from a second in, are made again).
+fn jpeg_path(key: u64) -> PathBuf {
+    cache_dir().join(format!("{key:016x}-first.jpg"))
 }
 
 fn key(clip: &Clip) -> u64 {
@@ -158,7 +164,7 @@ fn cache_dir() -> PathBuf {
 }
 
 fn generate(key: u64, video: &Path) -> (Option<egui::ColorImage>, Option<Duration>) {
-    let jpg = cache_dir().join(format!("{key:016x}.jpg"));
+    let jpg = jpeg_path(key);
     let dur_file = cache_dir().join(format!("{key:016x}.dur"));
     let cached = std::fs::read_to_string(&dur_file).ok().and_then(|s| s.trim().parse::<f64>().ok());
     let duration = match cached {
@@ -174,11 +180,9 @@ fn generate(key: u64, video: &Path) -> (Option<egui::ColorImage>, Option<Duratio
     };
     if !jpg.exists() {
         let _ = std::fs::create_dir_all(cache_dir());
-        // Skip a little way in: the very first frame of a capture is often black or a
-        // half-drawn window. Short clips grab from the middle instead.
-        let at = duration.map_or(0.0, |d| (d.as_secs_f64() * 0.5).min(1.0));
+        // The first frame: what you see when the clip starts playing.
         let _ = media::ffmpeg_background()
-            .args(["-hide_banner", "-loglevel", "error", "-y", "-ss", &format!("{at:.2}"), "-i"])
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
             .arg(video)
             .args(["-frames:v", "1", "-vf", &format!("scale={WIDTH}:-2"), "-q:v", "4"])
             .arg(&jpg)
