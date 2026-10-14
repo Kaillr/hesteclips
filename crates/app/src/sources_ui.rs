@@ -700,6 +700,15 @@ impl App {
     /// open and nothing records (a running capture feeds the preview itself).
     /// Restarts when what to record changes.
     pub(crate) fn ensure_video_preview(&mut self) {
+        // Off the page: the capture's buffers opened for drawing are let go
+        // too (each texture keeps its whole frame alive). They were kept until
+        // 64 had been opened: every visit's captures stayed, ~5 MB a visit at
+        // 1080p. The last frame stays, to show at once when the page opens.
+        #[cfg(target_os = "macos")]
+        if !self.wants_sources_capture() && self.sources_view.preview_gpu.is_some() {
+            self.sources_view.preview_gpu = None;
+            self.sources_view.preview_frames = Default::default();
+        }
         let want = capture::preview::AVAILABLE && self.wants_sources_capture() && self.rec_state == crate::RecState::Idle;
         if !want {
             self.video_preview = None;
