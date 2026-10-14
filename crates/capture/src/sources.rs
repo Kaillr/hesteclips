@@ -434,11 +434,12 @@ impl LevelMonitor {
         let capture = AudioCapture::start(sources, &live, clock.clone())?;
         let inputs = mix_inputs(sources, &capture.feeds, &live, |_| None);
         let stop = Arc::new(AtomicBool::new(false));
-        // Short latency: meters should feel live; a late block only costs a blip.
-        // Longer on Linux, where PipeWire's timestamps include the device's
-        // buffering, which runs to a fifth of a second for Bluetooth mics and
-        // in virtual machines: their audio would always arrive too late.
-        let latency = if cfg!(target_os = "linux") { 0.25 } else { 0.08 };
+        // The meters look ahead at fresh audio on their own (`METER_LAG`);
+        // the mix here only clears what they've seen, so it stays well behind
+        // them, as a recording's does. Close behind, it took audio away before
+        // the meters got to it (a source sends its sound in blocks), and they
+        // stood still.
+        let latency = 0.3;
         let mixer = spawn_mixer(inputs, None, None, live, clock, host_now, latency, stop.clone());
         Ok(Self { capture: Some(capture), stop, mixer: Some(mixer) })
     }
