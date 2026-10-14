@@ -119,6 +119,8 @@ struct Ready {
     hover: Option<(u64, egui::TextureHandle)>,
     volume: f32,
     muted: bool,
+    /// How fast it plays (1.0 as recorded).
+    speed: f32,
     /// The picture was dragged this frame: share the clip by drag and drop.
     drag_out: bool,
     /// Times shown as frames instead of minutes and seconds.
@@ -409,12 +411,31 @@ impl Ready {
             hover: None,
             volume: volume.0,
             muted: volume.1,
+            speed: speed(ctx),
             drag_out: false,
             show_frames: false,
             flash_play: None,
         };
         r.apply_volume(ctx);
+        r.player.set_speed(r.speed);
         r
+    }
+
+    /// Play at `speed` (one of [`SPEEDS`]); every clip opened after plays
+    /// at it too.
+    fn set_speed(&mut self, ctx: &egui::Context, speed: f32) {
+        self.speed = speed;
+        self.player.set_speed(speed);
+        ctx.data_mut(|d| d.insert_temp(speed_id(), speed));
+    }
+
+    /// One step faster (`up`) or slower through [`SPEEDS`].
+    fn step_speed(&mut self, ctx: &egui::Context, up: bool) {
+        let i = SPEEDS.iter().position(|s| *s >= self.speed).unwrap_or(SPEEDS.len() - 1);
+        let to = if up { SPEEDS.get(i + 1) } else { i.checked_sub(1).and_then(|i| SPEEDS.get(i)) };
+        if let Some(&to) = to {
+            self.set_speed(ctx, to);
+        }
     }
 
     fn apply_volume(&self, ctx: &egui::Context) {
@@ -628,6 +649,21 @@ impl Ready {
                     self.muted = !self.muted;
                     self.apply_volume(ui.ctx());
                 }
+                // How fast it plays: lit when it isn't as recorded.
+                let kind = if self.speed == 1.0 { Kind::Ghost } else { Kind::On };
+                let r = Btn::new(kind, speed_label(self.speed)).small().id("viewer_speed").tip("Playback speed  (< >)").show(ui);
+                let mut chosen = None;
+                crate::ui_kit::menu_popup(&r, false, 130.0, |ui| {
+                    for s in SPEEDS {
+                        let label = if s == 1.0 { "1×  Normal".to_owned() } else { speed_label(s) };
+                        if crate::ui_kit::Item::new(label).check(self.speed == s).show(ui).clicked() {
+                            chosen = Some(s);
+                        }
+                    }
+                });
+                if let Some(s) = chosen {
+                    self.set_speed(ui.ctx(), s);
+                }
             }
             },
         );
@@ -754,6 +790,11 @@ impl Ready {
             return;
         }
         let none = egui::Modifiers::NONE;
+        // < and >: slower and faster.
+        let (slower, faster) = ctx.input_mut(|i| (i.consume_key(egui::Modifiers::SHIFT, Key::Comma), i.consume_key(egui::Modifiers::SHIFT, Key::Period)));
+        if slower || faster {
+            self.step_speed(ctx, faster);
+        }
         let (space, k, left, right, j, l, mut comma, mut period, home, end, m, mut held) = ctx.input_mut(|i| {
             // A held key's repeats: looked at before the presses are taken.
             let repeat = i.events.iter().any(|e| matches!(e, egui::Event::Key { key: Key::Comma, pressed: true, repeat: true, .. }));
@@ -958,4 +999,32 @@ pub fn set_volume(ctx: &egui::Context, volume: (f32, bool)) {
 
 fn volume_id() -> egui::Id {
     egui::Id::new("viewer_volume")
+}
+
+/// The speeds offered.
+const SPEEDS: [f32; 7] = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
+
+/// The speed last chosen (shared by every clip opened).
+fn speed(ctx: &egui::Context) -> f32 {
+    ctx.data(|d| d.get_temp::<f32>(speed_id())).unwrap_or(1.0)
+}
+
+fn speed_id() -> egui::Id {
+    egui::Id::new("viewer_speed")
+}
+
+/// "0.25×", "1×", "1.5×".
+fn speed_label(s: f32) -> String {
+    format!("{}×", (s * 100.0).round() / 100.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn speeds_read_plainly() {
+        let labels: Vec<String> = SPEEDS.iter().map(|s| speed_label(*s)).collect();
+        assert_eq!(labels, ["0.25×", "0.5×", "0.75×", "1×", "1.25×", "1.5×", "2×"]);
+    }
 }

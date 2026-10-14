@@ -16,7 +16,7 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 
@@ -149,6 +149,8 @@ struct Shared {
     /// those steps, so this says when the next frame can come up.
     moved_at_us: AtomicU64,
     step_us: AtomicU64,
+    /// How fast it plays (1.0 = as recorded), as `f32` bits.
+    speed: AtomicU32,
 }
 
 impl Shared {
@@ -161,7 +163,12 @@ impl Shared {
             mix: Mutex::new(mix),
             moved_at_us: AtomicU64::new(0),
             step_us: AtomicU64::new(0),
+            speed: AtomicU32::new(1.0f32.to_bits()),
         }
+    }
+
+    fn speed(&self) -> f64 {
+        f64::from(f32::from_bits(self.speed.load(Ordering::Relaxed)))
     }
 
     /// How long until the clock (`pos`) shows `t` seconds or later: the first
@@ -169,7 +176,7 @@ impl Shared {
     fn until(&self, t: f64) -> std::time::Duration {
         let now = uptime();
         let pos = self.pos.load(Ordering::Relaxed) as f64 / PREVIEW_RATE as f64;
-        let ahead = (t - pos).max(0.0);
+        let ahead = (t - pos).max(0.0) / self.speed().max(0.01);
         let step = self.step_us.load(Ordering::Relaxed) as f64 / 1e6;
         let wake = if step > 0.0 {
             // The callback that moved it to `pos`, then whole steps on.
@@ -389,6 +396,11 @@ impl Player {
             }
         }
         self.shared.playing.store(true, Ordering::Relaxed);
+    }
+
+    /// How fast it plays: 1.0 as recorded, 0.5 half speed.
+    pub fn set_speed(&self, speed: f32) {
+        self.shared.speed.store(speed.clamp(0.1, 4.0).to_bits(), Ordering::Relaxed);
     }
 
     pub fn pause(&mut self) {
@@ -1042,8 +1054,9 @@ fn start_audio(shared: Arc<Shared>, pcm: Arc<Pcm>) -> Result<cpal::Stream, Strin
     let channels = supported.channels() as usize;
     let out_rate = supported.sample_rate() as f64;
     let config = cpal::StreamConfig { channels: supported.channels(), sample_rate: supported.sample_rate(), buffer_size: cpal::BufferSize::Default };
-    // Source frames advanced per output frame (1.0 when the device runs at 48 kHz).
-    let step = PREVIEW_RATE as f64 / out_rate;
+    // Source frames advanced per output frame at normal speed (1.0 when the
+    // device runs at 48 kHz).
+    let base_step = PREVIEW_RATE as f64 / out_rate;
     let mut frac = 0.0f64;
     let n_tracks = pcm.len();
     let mut was_playing = false;
@@ -1097,6 +1110,10 @@ fn start_audio(shared: Arc<Shared>, pcm: Arc<Pcm>) -> Result<cpal::Stream, Strin
         let mut track_peak = vec![0.0f32; n_tracks];
         let mut track_sq = vec![0.0f64; n_tracks];
         let (mut m_peak, mut m_sq, mut count) = (0.0f32, 0.0f64, 0usize);
+        // Faster or slower: through the sound in bigger or smaller steps,
+        // between its samples where a step lands between two (the pitch
+        // follows, like tape).
+        let step = base_step * shared.speed();
 
         for frame in out.chunks_mut(channels) {
             if pos >= end {
@@ -1112,6 +1129,10 @@ fn start_audio(shared: Arc<Shared>, pcm: Arc<Pcm>) -> Result<cpal::Stream, Strin
             for (t, track) in pcm.tracks().iter().enumerate() {
                 // Not decoded yet (just opened, jumped far ahead): silence.
                 if let Some((a, b)) = track.frame(pos as usize) {
+                    let (a, b) = match track.frame(pos as usize + 1).filter(|_| frac > 0.0) {
+                        Some((a2, b2)) => (a + (a2 - a) * frac as f32, b + (b2 - b) * frac as f32),
+                        None => (a, b),
+                    };
                     let g = gains.get(t).copied().unwrap_or(1.0);
                     let (tl, tr) = (a * g, b * g);
                     l += tl;

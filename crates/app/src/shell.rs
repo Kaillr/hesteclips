@@ -373,6 +373,7 @@ impl App {
                 ("Home  End", "Start or end"),
                 ("Scroll", "Scrub"),
                 ("M", "Mute"),
+                ("<  >", "Slower or faster"),
                 ("F", "Fullscreen"),
                 ("Q  E", "Previous or next clip"),
                 ("F2", "Rename"),
