@@ -44,7 +44,9 @@ pub fn list_shareable() -> Devices {
                 unsafe {
                     for display in content.displays().iter() {
                         let id = display.displayID();
-                        let (w, h) = (display.width(), display.height());
+                        // In pixels, as it's recorded (and as the Picture
+                        // heading says), not in points.
+                        let (w, h) = crate::mac::video::display_pixels(&display);
                         devices.screens.push(Device {
                             id: id.to_string(),
                             name: format!("Display {id} ({w}×{h})"),

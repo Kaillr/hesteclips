@@ -214,8 +214,9 @@ pub(crate) fn pick_display(content: &SCShareableContent, id: &str) -> Option<Ret
     id.parse().ok().and_then(by_id).or_else(|| by_id(CGMainDisplayID())).or_else(|| displays.iter().next())
 }
 
-/// A display's size in pixels.
-fn display_pixels(display: &SCDisplay) -> (usize, usize) {
+/// A display's size in pixels (on a Retina display, twice its size in
+/// points each way: what's recorded).
+pub(crate) fn display_pixels(display: &SCDisplay) -> (usize, usize) {
     let mode = CGDisplayCopyDisplayMode(unsafe { display.displayID() });
     let (w, h) = (CGDisplayMode::pixel_width(mode.as_deref()), CGDisplayMode::pixel_height(mode.as_deref()));
     if w == 0 || h == 0 { unsafe { (display.width() as usize, display.height() as usize) } } else { (w, h) }
