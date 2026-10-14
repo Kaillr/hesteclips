@@ -647,9 +647,7 @@ impl App {
             });
             ui.add_space(8.0);
             let style = meter::Style { bar_h: 7.0, gap: 3.0, scale: true, dimmed: false };
-            if meter::stereo(ui, egui::Id::new("master_meter"), &view.master, &style) {
-                view.master.reset_clip();
-            }
+            meter::stereo(ui, egui::Id::new("master_meter"), &view.master, &style);
             ui.add_space(10.0);
             crate::ui_kit::divider(ui, 0.0);
             ui.add_space(10.0);

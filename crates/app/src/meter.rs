@@ -5,8 +5,9 @@
 //! The scale gives the top 18 dB half the bar, where levels actually get set.
 //! Colours are zones on a fixed scale — green up to -18 dBFS (where speech and
 //! game audio should sit), yellow up to -6, red above — clipped to the bar, so
-//! the bar changes colour at exact dB marks with square edges. A clip light on
-//! the right latches when a sample reaches full scale; click it to reset.
+//! the bar changes colour at exact dB marks with square edges. Each channel
+//! has a clip light that lights when a sample reaches full scale, stays a few
+//! seconds after the last time and then fades: no need to reset it.
 
 use std::time::{Duration, Instant};
 
@@ -26,6 +27,10 @@ const FALL_DB_PER_S: f32 = 20.0;
 const PEAK_HOLD: Duration = Duration::from_millis(1500);
 /// How long the numeric peak readout holds its maximum.
 const READOUT_HOLD: Duration = Duration::from_secs(3);
+/// How long a clip light stays lit after the last sample that distorted, and
+/// how long it then takes to fade.
+const CLIP_HOLD: Duration = Duration::from_secs(3);
+const CLIP_FADE: Duration = Duration::from_millis(600);
 
 pub const GREEN: Color32 = crate::theme::DARK.meter_g;
 pub const YELLOW: Color32 = crate::theme::DARK.meter_y;
@@ -62,12 +67,13 @@ impl Ballistics {
     }
 }
 
-/// One meter's state: two channels, a clip latch and the numeric peak readout.
+/// One meter's state: two channels, their clip lights and the numeric peak
+/// readout.
 #[derive(Clone)]
 pub struct MeterState {
     ch: [Ballistics; 2],
-    /// Latched until clicked, per channel (left, right).
-    clipped: [bool; 2],
+    /// When each channel (left, right) last distorted.
+    clipped_at: [Option<Instant>; 2],
     /// Highest peak over the last few seconds, for the readout.
     readout_db: f32,
     readout_at: Option<Instant>,
@@ -77,7 +83,7 @@ impl Default for MeterState {
     /// Silent. (A derived default would read 0 dB: a full meter that takes
     /// seconds to fall.)
     fn default() -> Self {
-        Self { ch: [Ballistics::default(); 2], clipped: [false; 2], readout_db: SILENCE_DB, readout_at: None }
+        Self { ch: [Ballistics::default(); 2], clipped_at: [None; 2], readout_db: SILENCE_DB, readout_at: None }
     }
 }
 
@@ -89,7 +95,7 @@ impl MeterState {
         let peak = levels.max_peak();
         for c in 0..2 {
             if levels.peak[c] >= 0.999 {
-                self.clipped[c] = true;
+                self.clipped_at[c] = Some(now);
             }
         }
         let db = to_db(peak);
@@ -99,13 +105,17 @@ impl MeterState {
         }
     }
 
-    /// Either channel distorted (since the light was last reset).
-    pub fn clipped(&self) -> bool {
-        self.clipped[0] || self.clipped[1]
+    /// How lit a channel's clip light is: 1 for a few seconds after it
+    /// distorted, then fading to 0.
+    fn clip_light(&self, c: usize) -> f32 {
+        let Some(at) = self.clipped_at[c] else { return 0.0 };
+        let since = at.elapsed().saturating_sub(CLIP_HOLD);
+        1.0 - (since.as_secs_f32() / CLIP_FADE.as_secs_f32()).min(1.0)
     }
 
-    pub fn reset_clip(&mut self) {
-        self.clipped = [false; 2];
+    /// Either channel distorted in the last few seconds (its light is lit).
+    pub fn clipped(&self) -> bool {
+        (0..2).any(|c| self.clip_light(c) > 0.0)
     }
 
     /// The recent peak as text: "-12.4" / "-∞".
@@ -136,10 +146,10 @@ pub struct Style {
     pub dimmed: bool,
 }
 
-/// Draw a stereo meter filling the available width. Returns whether the clip
-/// light was clicked (to reset it).
-pub fn stereo(ui: &mut egui::Ui, id: egui::Id, state: &MeterState, style: &Style) -> bool {
-    let clip_w = 12.0;
+/// Draw a stereo meter filling the available width, each channel's clip
+/// light at the end of its bar.
+pub fn stereo(ui: &mut egui::Ui, id: egui::Id, state: &MeterState, style: &Style) {
+    let clip_w = style.bar_h.max(7.0);
     let scale_h = if style.scale { 14.0 } else { 0.0 };
     let bars_h = style.bar_h * 2.0 + style.gap;
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), bars_h + scale_h), Sense::hover());
@@ -183,23 +193,34 @@ pub fn stereo(ui: &mut egui::Ui, id: egui::Id, state: &MeterState, style: &Style
         }
     }
 
-    // Clip light: latches until clicked.
-    let clip = Rect::from_min_size(pos2(bars.right() + 6.0, bars.top()), vec2(clip_w, bars_h));
-    let r = ui.interact(clip, id.with("clip"), Sense::click());
-    let fill = if state.clipped() { RED } else { crate::theme::of(v).meter_bg };
-    p.rect_filled(clip, 2.0, fill);
-    if !state.clipped() {
-        p.rect_stroke(clip, 2.0, Stroke::new(1.0, RED.gamma_multiply(0.35)), egui::StrokeKind::Inside);
+    // Each channel's clip light, at the end of its bar.
+    let lights = Rect::from_min_size(pos2(bars.right() + 6.0, bars.top()), vec2(clip_w, bars_h));
+    for c in 0..2 {
+        let light = Rect::from_min_size(pos2(lights.left(), bars.top() + c as f32 * (style.bar_h + style.gap)), vec2(clip_w, style.bar_h));
+        clip_light(&p, light, state.clip_light(c), crate::theme::of(v).meter_bg);
     }
-    let tip = if state.clipped() { "Too loud: a sample hit full scale and distorted. Click to reset." } else { "Lights up if the sound gets too loud and distorts." };
-    r.on_hover_text(tip).clicked() && state.clipped()
+    ui.interact(lights.expand(3.0), id.with("clip"), Sense::hover()).on_hover_text(clip_tip(state));
+    if state.clipped() {
+        ui.ctx().request_repaint_after(Duration::from_millis(16));
+    }
+}
+
+/// A clip light, lit by `lit` (0 to 1): red, or a faint red outline when out.
+fn clip_light(p: &egui::Painter, light: Rect, lit: f32, bg: Color32) {
+    p.rect_filled(light, 2.0, crate::theme::mix(bg, RED, lit));
+    if lit < 1.0 {
+        p.rect_stroke(light, 2.0, Stroke::new(1.0, RED.gamma_multiply(0.35 * (1.0 - lit))), egui::StrokeKind::Inside);
+    }
+}
+
+fn clip_tip(state: &MeterState) -> &'static str {
+    if state.clipped() { "Too loud: a sample hit full scale and distorted (left, right)." } else { "Light up if the sound gets too loud and distorts, left and right." }
 }
 
 /// A stereo meter standing up in `rect`: the readout of the recent peak on
 /// top, the clip light under it, then two bars (left, right) with the dB
-/// scale beside them; peak, average and held peak as on [`stereo`]. Returns
-/// whether the clip light was clicked (to reset it).
-pub fn stereo_vertical(ui: &mut egui::Ui, rect: Rect, id: egui::Id, state: &MeterState) -> bool {
+/// scale beside them; peak, average and held peak as on [`stereo`].
+pub fn stereo_vertical(ui: &mut egui::Ui, rect: Rect, id: egui::Id, state: &MeterState) {
     let v = ui.visuals().clone();
     let pal = crate::theme::of(&v);
     let p = ui.painter_at(rect.expand(2.0));
@@ -212,18 +233,16 @@ pub fn stereo_vertical(ui: &mut egui::Ui, rect: Rect, id: egui::Id, state: &Mete
     let lights_y = readout.bottom() + 4.0;
     let bars = Rect::from_min_max(pos2(rect.right() - 5.0 - bar_w * 2.0 - gap, lights_y + bar_w + 4.0), pos2(rect.right() - 5.0, rect.bottom() - 2.0));
     let lights = Rect::from_min_max(pos2(bars.left(), lights_y), pos2(bars.right(), lights_y + bar_w));
-    let r = ui.interact(lights.expand(3.0), id.with("clip"), Sense::click());
     for c in 0..2 {
         let light = Rect::from_min_size(pos2(bars.left() + c as f32 * (bar_w + gap), lights_y), vec2(bar_w, bar_w));
-        p.rect_filled(light, 2.0, if state.clipped[c] { RED } else { pal.meter_bg });
-        if !state.clipped[c] {
-            p.rect_stroke(light, 2.0, Stroke::new(1.0, RED.gamma_multiply(0.35)), egui::StrokeKind::Inside);
-        }
+        clip_light(&p, light, state.clip_light(c), pal.meter_bg);
     }
-    let tip = if state.clipped() { "Too loud: a sample hit full scale and distorted (left, right). Click to reset." } else { "Light up if the sound gets too loud and distorts, left and right." };
-    let clicked = r.on_hover_text(tip).clicked() && state.clipped();
+    ui.interact(lights.expand(3.0), id.with("clip"), Sense::hover()).on_hover_text(clip_tip(state));
+    if state.clipped() {
+        ui.ctx().request_repaint_after(Duration::from_millis(16));
+    }
     if bars.height() < 20.0 {
-        return clicked;
+        return;
     }
     let y_of = |db: f32| bars.bottom() - bars.height() * scale_pos(db);
     for c in 0..2 {
@@ -264,7 +283,6 @@ pub fn stereo_vertical(ui: &mut egui::Ui, rect: Rect, id: egui::Id, state: &Mete
             last_y = y;
         }
     }
-    clicked
 }
 
 /// Where `db` sits along a meter, 0..=1. Piecewise, like hardware meters: the top
@@ -378,6 +396,23 @@ pub fn fixed_label(ui: &mut egui::Ui, width: f32, text: &str, color: Color32, ti
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A clip light lights per channel, stays lit a few seconds after the
+    /// last time and then fades out by itself.
+    #[test]
+    fn a_clip_light_goes_out_by_itself() {
+        let mut m = MeterState::default();
+        let now = Instant::now();
+        m.update(Levels { peak: [1.0, 0.5], rms: [0.5, 0.2] }, now, 0.016);
+        assert_eq!((m.clip_light(0), m.clip_light(1)), (1.0, 0.0));
+        m.clipped_at[0] = Some(now - CLIP_HOLD + Duration::from_millis(100));
+        assert_eq!(m.clip_light(0), 1.0, "still held");
+        m.clipped_at[0] = Some(now - CLIP_HOLD - CLIP_FADE / 2);
+        assert!(m.clip_light(0) > 0.2 && m.clip_light(0) < 0.8, "fading");
+        m.clipped_at[0] = Some(now - CLIP_HOLD - CLIP_FADE);
+        assert_eq!(m.clip_light(0), 0.0);
+        assert!(!m.clipped());
+    }
 
     #[test]
     fn scale_is_monotonic_and_anchored() {

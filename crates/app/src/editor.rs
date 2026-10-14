@@ -1216,9 +1216,7 @@ impl Ready {
         // --- The mix's meter, on the right ---
         p.vline(meter_col.left() - 0.5, meter_col.y_range(), Stroke::new(1.0, pal.line));
         let mix = Rect::from_min_max(meter_col.min + Vec2::new(6.0, 4.0), meter_col.max);
-        if crate::meter::stereo_vertical(ui, mix, ui.id().with("mix_meter"), &self.mix_meter) {
-            self.mix_meter.reset_clip();
-        }
+        crate::meter::stereo_vertical(ui, mix, ui.id().with("mix_meter"), &self.mix_meter);
         ui.interact(mix.with_max_y(mix.top() + 16.0), ui.id().with("mix_tip"), Sense::hover()).on_hover_text("The clip's mix: every track together. The number is its loudest peak in the last few seconds.");
         // --- Header column: each lane's name ---
 
