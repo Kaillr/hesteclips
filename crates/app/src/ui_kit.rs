@@ -1219,6 +1219,35 @@ impl<'a> Row<'a> {
     }
 }
 
+/// Round `rect`'s corners by `radius` over something drawn square (a video
+/// from the GPU, which egui can only cut to rectangles): the bit outside
+/// each corner's curve painted over in `bg`, the colour behind it.
+pub fn round_corners(painter: &egui::Painter, rect: Rect, radius: f32, bg: Color32) {
+    const STEPS: usize = 8;
+    let corners = [
+        (rect.left_top(), Pos2::new(rect.left() + radius, rect.top() + radius), 180.0f32),
+        (rect.right_top(), Pos2::new(rect.right() - radius, rect.top() + radius), 270.0),
+        (rect.right_bottom(), Pos2::new(rect.right() - radius, rect.bottom() - radius), 0.0),
+        (rect.left_bottom(), Pos2::new(rect.left() + radius, rect.bottom() - radius), 90.0),
+    ];
+    for (corner, centre, start) in corners {
+        // The corner point, then the curve from one edge to the other.
+        let mut pts = vec![corner];
+        for k in 0..=STEPS {
+            let a = (start + 90.0 * k as f32 / STEPS as f32).to_radians();
+            pts.push(centre + vec2(a.cos(), a.sin()) * radius);
+        }
+        let mut mesh = egui::Mesh::default();
+        for p in &pts {
+            mesh.colored_vertex(*p, bg);
+        }
+        for i in 1..pts.len() as u32 - 1 {
+            mesh.add_triangle(0, i, i + 1);
+        }
+        painter.add(egui::Shape::mesh(mesh));
+    }
+}
+
 /// A group of rows on the raised surface, hairlines between them.
 pub fn list<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut List) -> R) -> R {
     let p = theme::pal(ui);

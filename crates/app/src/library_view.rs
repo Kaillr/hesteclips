@@ -786,7 +786,10 @@ impl App {
         }
         if let Some(h) = self.hover_play.as_mut().filter(|h| h.clip() == clip.path) {
             if let Some(size) = h.update(&ctx) {
-                h.paint(ui, thumb_rect, size);
+                if h.paint(ui, thumb_rect, size) {
+                    // The card's corners, round like the thumbnail's.
+                    ui_kit::round_corners(&ui.painter_at(thumb_rect), thumb_rect, ui_kit::RADIUS as f32, p.base);
+                }
             }
         }
         // Selected: an outline a little outside the picture.
