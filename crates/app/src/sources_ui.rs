@@ -659,9 +659,7 @@ impl App {
             crate::ui_kit::divider(ui, 0.0);
             ui.add_space(10.0);
             ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 10.0;
-                crate::ui_kit::switch(ui, &mut self.settings.limiter);
-                ui.label(theme::text("Limiter", 13.5, W::Regular).color(pal.text));
+                labelled_switch(ui, &mut self.settings.limiter, "Limiter", "");
                 crate::ui_kit::info(ui, "Limiter", "When sources add up too loud, the mix is turned down for a moment instead of distorting. Ceiling −1 dB.");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let shown = theme::toggle(ui.ctx(), egui::Id::new("limiter_shown"), self.settings.limiter, theme::NORMAL);
@@ -1044,19 +1042,16 @@ fn source_card(
                 });
             }
         });
-        // Noise reduction: a setting of the mic that stays on, so a switch
-        // with its name, as every other on/off setting is.
+        // Noise reduction: a setting of the mic that stays on, so a switch.
+        // The switch right before its name (as the clip mix's Limiter), not
+        // across the card from it: there, among the card's other controls,
+        // the two read as unrelated things. Its name switches it too.
         if matches!(source.kind, SourceKind::Microphone { .. }) {
-            ui.add_space(6.0);
+            ui.add_space(10.0);
+            let tip = if source.noise_removal { "On: background noise is taken out" } else { "Off" };
             ui.horizontal(|ui| {
-                ui.label(theme::text("Noise reduction", 13.0, W::Regular).color(pal.text));
+                labelled_switch(ui, &mut source.noise_removal, "Noise reduction", tip);
                 crate::ui_kit::info(ui, "Noise reduction", "Takes out steady sounds behind your voice (fans, a keyboard, hum) and keeps your voice. Changes apply straight away.");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let mut nr = source.noise_removal;
-                    if crate::ui_kit::switch(ui, &mut nr).on_hover_text(if nr { "On: background noise is taken out" } else { "Off" }).clicked() {
-                        source.noise_removal = nr;
-                    }
-                });
             });
         }
         if let Some(latency) = listening {
@@ -1066,6 +1061,23 @@ fn source_card(
         }
     });
     action
+}
+
+/// A switch with its name right after it, in a row laid out left to right:
+/// clicking the name switches it too. `tip`: on the switch, if any.
+/// Returns whether it was switched.
+fn labelled_switch(ui: &mut egui::Ui, on: &mut bool, label: &str, tip: &str) -> bool {
+    use crate::theme::{self, W};
+    let pal = theme::pal(ui);
+    ui.spacing_mut().item_spacing.x = 10.0;
+    let sw = crate::ui_kit::switch(ui, on);
+    let sw = if tip.is_empty() { sw } else { sw.on_hover_text(tip) };
+    let name = ui.add(egui::Label::new(theme::text(label, 13.5, W::Regular).color(pal.text)).sense(Sense::click())).on_hover_cursor(egui::CursorIcon::PointingHand);
+    if name.clicked() {
+        *on = !*on;
+    }
+    ui.spacing_mut().item_spacing.x = 6.0;
+    sw.clicked() || name.clicked()
 }
 
 /// A source's volume and level as one control: the meter runs along the
