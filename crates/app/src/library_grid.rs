@@ -477,8 +477,12 @@ impl Moves {
     }
 
     /// Where `key` (now at `target`, content coordinates) is drawn, given
-    /// the view now (top, bottom, content coordinates).
-    pub fn place(&self, key: &Key, target: Pos2, now: f64, view: (f32, f32)) -> Placed {
+    /// the view now (top, bottom, content coordinates). `day`: the day the
+    /// card is under (its heading's key): a card that wasn't shown before
+    /// moves with its day's heading as it fades in, so a day's cards and its
+    /// heading arrive together (switching between games with no clip in
+    /// common, every card is new).
+    pub fn place(&self, key: &Key, target: Pos2, now: f64, view: (f32, f32), day: Option<chrono::NaiveDate>) -> Placed {
         let Some(b) = &self.before else { return Placed { at: target, shown: 1.0 } };
         let t = ((now - b.changed) as f32 / SLIDE).clamp(0.0, 1.0);
         if t >= 1.0 {
@@ -489,20 +493,33 @@ impl Moves {
             Key::Day(d) => b.layout.day(*d),
             k => b.layout.card(k),
         };
-        let Some(from) = from else {
-            // New: fades in where it lands.
+        if let Some(from) = from {
+            let from = b.start(from, target, view);
+            return Placed { at: from + (target - from) * e, shown: 1.0 };
+        }
+        // New. Under a day that was shown: it starts as far from its place as
+        // the heading does from its own, and travels with it, fading in.
+        let heading = day.and_then(|d| Some((b.layout.day(d)?, self.layout().day(d)?)));
+        let Some((was, is)) = heading else {
             return Placed { at: target, shown: e };
         };
-        // Where it was on screen then, kept on screen now (the view may have
-        // scrolled to the top); from far off, just past the view's edge on
-        // its side, so it arrives from the right direction without crossing
-        // the whole library.
-        let margin = b.layout.metrics.card.y;
-        let on_screen = from.y - b.view.0 + view.0;
-        let was_seen = from.y + margin >= b.view.0 && from.y <= b.view.1;
-        let y = if was_seen { on_screen } else if from.y < b.view.0 { (view.0 - margin).min(target.y) } else { (view.1 + margin).max(target.y) };
-        let from = Pos2::new(from.x, y);
-        Placed { at: from + (target - from) * e, shown: 1.0 }
+        let start = b.start(was, is, view);
+        Placed { at: target + (start - is) * (1.0 - e), shown: e }
+    }
+}
+
+impl Before {
+    /// Where something that was at `from` (content coordinates, before the
+    /// change) starts sliding to `target` from: where it was on screen then,
+    /// kept on screen now (the view may have scrolled to the top); from far
+    /// off, just past the view's edge on its side, so it arrives from the
+    /// right direction without crossing the whole library.
+    fn start(&self, from: Pos2, target: Pos2, view: (f32, f32)) -> Pos2 {
+        let margin = self.layout.metrics.card.y;
+        let on_screen = from.y - self.view.0 + view.0;
+        let was_seen = from.y + margin >= self.view.0 && from.y <= self.view.1;
+        let y = if was_seen { on_screen } else if from.y < self.view.0 { (view.0 - margin).min(target.y) } else { (view.1 + margin).max(target.y) };
+        Pos2::new(from.x, y)
     }
 }
 
@@ -577,19 +594,19 @@ mod tests {
             .map(|k| (k.clone(), all.card(&k).unwrap(), osu.card(&k).unwrap()))
             .find(|(_, was, target)| was.y > view.1 && target.y < view.1 - 100.0)
             .expect("a clip from below the view into it");
-        let p = m.place(&key, target, 10.0, view);
+        let p = m.place(&key, target, 10.0, view, None);
         assert_eq!(p.shown, 1.0);
         assert!(p.at.y > view.1 && p.at.y <= view.1 + all.metrics.card.y + 0.5, "starts just past the view's bottom (was {}): {}", was.y, p.at.y);
-        let p = m.place(&key, target, 10.0 + f64::from(SLIDE), view);
+        let p = m.place(&key, target, 10.0 + f64::from(SLIDE), view, None);
         assert_eq!(p.at, target);
         // Far below before and after: never seen moving, so it's simply there.
         let far = Key::Clip(clips[198].path.clone());
         let (fwas, ftarget) = (all.card(&far).unwrap(), osu.card(&far).unwrap());
         assert!(fwas.y > view.1 && ftarget.y > view.1);
-        assert_eq!(m.place(&far, ftarget, 10.0, view).at, ftarget);
+        assert_eq!(m.place(&far, ftarget, 10.0, view, None).at, ftarget);
         // In view before and after: slides all the way from where it was.
         let near = Key::Clip(clips[2].path.clone());
-        let p = m.place(&near, osu.card(&near).unwrap(), 10.0, view);
+        let p = m.place(&near, osu.card(&near).unwrap(), 10.0, view, None);
         assert_eq!(p.at, all.card(&near).unwrap());
     }
 
@@ -610,8 +627,44 @@ mod tests {
         let key = Key::Clip(clips[7].path.clone());
         let target = narrow.card(&key).unwrap();
         assert_ne!(wide.card(&key).unwrap(), target, "it did move");
-        let p = m.place(&key, target, 1.0, view);
+        let p = m.place(&key, target, 1.0, view, None);
         assert_eq!((p.at, p.shown), (target, 1.0));
+    }
+
+    /// Two games with no clip in common: every card is new, and each moves
+    /// with its day's heading (from where the heading was) while it fades
+    /// in, so a day arrives together instead of its heading sliding past
+    /// cards that are already in place.
+    #[test]
+    fn new_cards_move_with_their_day() {
+        // Days 1-3: osu! has one clip a day, Dota 2 has ten a day, so in Dota 2
+        // day 2's heading is far lower than in osu!.
+        let mut clips: Vec<Clip> = (0..30).map(|i| clip(i, "Dota 2")).collect();
+        for d in 0..3 {
+            let mut c = clip(d * 10, "osu!");
+            c.path = PathBuf::from(format!("/lib/osu!/clip_2026-01-{:02}_09-00-00.mp4", d + 1));
+            clips.push(c);
+        }
+        let (_, osu) = layout_of(&clips, &Filter::Folder("osu!".into()), 900.0);
+        let (_, dota) = layout_of(&clips, &Filter::Folder("Dota 2".into()), 900.0);
+        let mut m = Moves::default();
+        let id = |s| LayoutId { shown: s, metrics: (4, 900) };
+        let view = (0.0, 2000.0);
+        m.update(id(1), 0.0, false, || osu.clone(), |_| unreachable!(), |_| {}, Vec::new);
+        m.set_view(view);
+        m.update(id(2), 10.0, false, || dota.clone(), |_| unreachable!(), |_| {}, Vec::new);
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 1, 2).unwrap();
+        let (was, is) = (osu.day(day).unwrap(), dota.day(day).unwrap());
+        assert!(is.y - was.y > 100.0, "the heading moves down");
+        let card = Key::Clip(clips[15].path.clone());
+        let target = dota.card(&card).unwrap();
+        let p = m.place(&card, target, 10.0, view, Some(day));
+        assert_eq!(p.shown, 0.0);
+        assert!((p.at.y - (target.y - (is.y - was.y))).abs() < 0.5, "starts as far up as its heading: {} vs {}", p.at.y, target.y);
+        let heading = m.place(&Key::Day(day), is, 10.0 + f64::from(SLIDE) / 2.0, view, None);
+        let p = m.place(&card, target, 10.0 + f64::from(SLIDE) / 2.0, view, Some(day));
+        assert!(((p.at.y - target.y) - (heading.at.y - is.y)).abs() < 0.5, "travels with it");
+        assert_eq!(m.place(&card, target, 10.0 + f64::from(SLIDE), view, Some(day)).at, target);
     }
 
     /// Worked out again only when something changed.

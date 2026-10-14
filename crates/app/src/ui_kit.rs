@@ -281,6 +281,8 @@ pub fn scroll<R>(ui: &mut egui::Ui, id: &str, add: impl FnOnce(&mut egui::Ui) ->
     let mut scroll = egui::ScrollArea::vertical().id_salt(id).auto_shrink([false, false]);
     if reset {
         scroll = scroll.vertical_scroll_offset(0.0);
+    } else if let Some(y) = dev_scroll(ui.ctx(), id) {
+        scroll = scroll.vertical_scroll_offset(y);
     }
     let out = scroll.show(&mut area, |ui| {
         ui.set_max_width(ui.available_width() - gutter);
@@ -289,6 +291,29 @@ pub fn scroll<R>(ui: &mut egui::Ui, id: &str, add: impl FnOnce(&mut egui::Ui) ->
     // How far it's scrolled, for anything that follows it (Settings' section list).
     ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(("scroll_offset", id)), out.state.offset.y));
     out.inner
+}
+
+/// Dev aid: `HESTECLIPS_DEV_SCROLL=<area>:<from s>:<secs>:<points>` scrolls
+/// the [`scroll`] area `<area>` steadily down by `<points>` over `<secs>`,
+/// starting `<from s>` after launch, as a trackpad would: to measure
+/// scrolling without touching it (with `HESTECLIPS_DEV_LAPS`).
+fn dev_scroll(ctx: &egui::Context, id: &str) -> Option<f32> {
+    static PLAN: std::sync::OnceLock<Option<(String, f64, f64, f32)>> = std::sync::OnceLock::new();
+    let plan = PLAN.get_or_init(|| {
+        let spec = std::env::var("HESTECLIPS_DEV_SCROLL").ok()?;
+        let mut it = spec.split(':');
+        Some((it.next()?.to_owned(), it.next()?.parse().ok()?, it.next()?.parse().ok()?, it.next()?.parse().ok()?))
+    });
+    let (area, from, secs, points) = plan.as_ref()?;
+    if area != id {
+        return None;
+    }
+    let t = ((ctx.input(|i| i.time) - from) / secs) as f32;
+    if !(0.0..=1.0).contains(&t) {
+        return None;
+    }
+    ctx.request_repaint();
+    Some(points * t)
 }
 
 /// How far the [`scroll`] area `id` was scrolled last frame.

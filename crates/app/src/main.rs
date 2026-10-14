@@ -488,6 +488,8 @@ struct App {
     /// content is on screen now, for the panel's glass.
     pub(crate) glass_tiles: Vec<glass::Tile>,
     pub(crate) glass_origin: egui::Pos2,
+    /// The grid's part on screen, in its content (top, bottom).
+    pub(crate) glass_view: (f32, f32),
     pub(crate) glass: glass::Glass,
     /// What the library shows and where, worked out once per change (see
     /// `library_grid`), and the library's list's version.
@@ -674,6 +676,7 @@ impl App {
             app_icon_tex: None,
             glass_tiles: Vec::new(),
             glass_origin: egui::Pos2::ZERO,
+            glass_view: (0.0, 0.0),
             glass: Default::default(),
             shown: Default::default(),
             moves: Default::default(),

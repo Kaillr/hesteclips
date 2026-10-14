@@ -19,6 +19,7 @@
 use egui::{Color32, FontFamily, FontId, Id};
 
 /// The colours of one look.
+#[derive(Clone, Copy)]
 pub struct Pal {
     pub dark: bool,
     /// The rail, behind everything.

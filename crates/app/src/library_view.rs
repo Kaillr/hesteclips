@@ -182,6 +182,7 @@ impl App {
         let mut grid_ui = page_ui.new_child(egui::UiBuilder::new().max_rect(grid_rect));
         let mut tiles: Vec<crate::glass::Tile> = Vec::new();
         let mut origin = Pos2::ZERO;
+        let mut grid_view = (0.0, 0.0);
         // Another page: the cards are simply in place (and arrive with the
         // page), not sliding over from where they were.
         let arriving = ui_kit::just_arrived(page_ui.ctx());
@@ -224,6 +225,7 @@ impl App {
             let clip_rect = ui.clip_rect();
             let view = (clip_rect.top() - origin.y, clip_rect.bottom() - origin.y);
             self.moves.set_view(view);
+            grid_view = view;
             let reach = (view.0 - m.card.y * 2.0, view.1 + m.card.y * 2.0);
             let moving = self.moves.moving(now);
             if moving {
@@ -251,7 +253,7 @@ impl App {
                 // The day's heading, sliding with its clips.
                 if let (Some(d), Some(head)) = (day, place.head) {
                     let target = Pos2::new(0.0, head);
-                    let p = self.moves.place(&Key::Day(d), target, now, view);
+                    let p = self.moves.place(&Key::Day(d), target, now, view, None);
                     if (p.at.y + DAY_H >= reach.0 && p.at.y <= reach.1) || (head + DAY_H >= reach.0 && head <= reach.1) {
                         let rect = Rect::from_min_size(origin + p.at.to_vec2(), vec2(avail, DAY_H));
                         let mut hui = ui.new_child(egui::UiBuilder::new().max_rect(rect).id_salt(("day", d)));
@@ -269,9 +271,13 @@ impl App {
                 let top = origin + vec2(0.0, place.cards);
                 let area = Rect::from_min_size(top, vec2(avail, place.height));
                 // The places of the clips that light the panel (its first
-                // columns), drawn or not: only those near the view.
+                // columns), drawn or not: those within the part of the grid
+                // its picture may cover (the view and a screen or so around it).
                 if open >= 1.0 {
-                    let near = self.moves.layout().visible(gi, len, view.0 - crate::glass::REACH * 2.0, view.1 + crate::glass::REACH * 2.0);
+                    // (One screen more than it covers: a picture made for the
+                    // view at either end of what it covers has all its clips.)
+                    let ahead = (view.1 - view.0) * (crate::glass::AHEAD * 2.0 + 1.0) + crate::glass::REACH;
+                    let near = self.moves.layout().visible(gi, len, view.0 - ahead, view.1 + ahead);
                     for i in near {
                         let off = m.offset(i);
                         if off.x > crate::glass::REACH {
@@ -280,7 +286,8 @@ impl App {
                         if let GridItem::Clip(ci) = self.shown.groups[gi].items[i] {
                             let c = &self.clips[ci];
                             let rect = Rect::from_min_size(Pos2::new(off.x, place.cards + off.y), vec2(m.card.x, m.card.x * 9.0 / 16.0));
-                            tiles.push(crate::glass::Tile { rect, path: c.path.clone(), small: self.thumbs.small(c) });
+                            let small = self.thumbs.small(&ctx, c);
+                            tiles.push(crate::glass::Tile { rect, path: c.path.clone(), small });
                         }
                     }
                 }
@@ -299,7 +306,7 @@ impl App {
                     let item = self.shown.groups[gi].items[i].clone();
                     let target = Pos2::new(0.0, place.cards) + m.offset(i);
                     let key = crate::library_grid::key_for(&item, &self.clips, &render_dests);
-                    let p = self.moves.place(&key, target, now, view);
+                    let p = self.moves.place(&key, target, now, view, day);
                     let rect = Rect::from_min_size(origin + p.at.to_vec2(), m.card);
                     let mut cui = ui.new_child(egui::UiBuilder::new().max_rect(rect));
                     cui.set_clip_rect(clip);
@@ -329,6 +336,7 @@ impl App {
         }
         self.glass_tiles = tiles;
         self.glass_origin = origin;
+        self.glass_view = grid_view;
         // The panel, after the grid: its glass follows the grid as it is now.
         if wide {
             let mut panel_ui = ui.new_child(egui::UiBuilder::new().max_rect(panel).layout(egui::Layout::top_down(egui::Align::Min)));
@@ -385,7 +393,8 @@ impl App {
         hui.allocate_ui(vec2(ui_kit::SEARCH_W.min(hui.available_width()), ui_kit::CONTROL_H), |ui| search_field(ui, "library_search", &mut self.library_query, "Search"));
         // The card.
         let card = Rect::from_min_max(Pos2::new(inner.left(), head.bottom()), inner.max);
-        crate::glass::paint(ui, card, self);
+        let view = self.glass_view;
+        crate::glass::paint(ui, card, self, view);
         let mut cui = ui.new_child(egui::UiBuilder::new().max_rect(card.shrink(6.0)).layout(egui::Layout::top_down(egui::Align::Min)));
         cui.set_clip_rect(card.intersect(ui.clip_rect()));
         egui::ScrollArea::vertical().id_salt("library_panel_scroll").auto_shrink([false, false]).show(&mut cui, |ui| {

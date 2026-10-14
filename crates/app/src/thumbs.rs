@@ -23,9 +23,6 @@ const WIDTH: u32 = 480;
 pub struct Thumb {
     pub texture: Option<egui::TextureHandle>,
     pub duration: Option<Duration>,
-    /// The picture at a tiny size (RGBA, [`SMALL_W`] wide), for the library
-    /// panel's glass, which blurs it on the CPU.
-    pub small: Option<std::sync::Arc<(usize, usize, Vec<u8>)>>,
 }
 
 /// Width of [`Thumb::small`].
@@ -51,6 +48,10 @@ pub struct Thumbs {
     durations: HashMap<u64, Option<Duration>>,
     /// Goes up when a clip's length becomes known: sorting by length sorts again.
     lengths_version: u64,
+    /// Every tiny picture made so far (a few KB each), kept when the big one
+    /// is let go: the library panel's glass blurs them, also for clips
+    /// scrolled away.
+    smalls: HashMap<u64, std::sync::Arc<(usize, usize, Vec<u8>)>>,
 }
 
 /// Pictures kept however long ago they were shown: a screenful or two and
@@ -83,18 +84,22 @@ impl Thumbs {
                 }
             });
         }
-        Self { ctx: app_ctx, ready: HashMap::new(), pending: HashSet::new(), job_tx, done_rx, swept: Instant::now(), durations: HashMap::new(), lengths_version: 0 }
+        Self { ctx: app_ctx, ready: HashMap::new(), pending: HashSet::new(), job_tx, done_rx, swept: Instant::now(), durations: HashMap::new(), lengths_version: 0, smalls: HashMap::new() }
     }
 
     pub fn ctx(&self) -> egui::Context {
         self.ctx.clone()
     }
 
-    /// The clip's preview, queuing generation on first request. `None` while loading.
-    pub fn get(&mut self, ctx: &egui::Context, clip: &Clip) -> Option<&Thumb> {
+    /// Take in the pictures made since last time.
+    fn receive(&mut self, ctx: &egui::Context) {
         while let Ok(done) = self.done_rx.try_recv() {
             self.pending.remove(&done.key);
-            let small = done.image.as_ref().map(|img| std::sync::Arc::new(shrink(img, SMALL_W)));
+            // The picture at a tiny size (RGBA, [`SMALL_W`] wide), for the
+            // library panel's glass, which blurs it on the CPU.
+            if let Some(img) = &done.image {
+                self.smalls.insert(done.key, std::sync::Arc::new(shrink(img, SMALL_W)));
+            }
             // A length newly known (looked up before or not): sorting by length sorts again.
             if done.duration.is_some() && self.durations.insert(done.key, done.duration) != Some(done.duration) {
                 self.lengths_version += 1;
@@ -102,8 +107,13 @@ impl Thumbs {
             let texture = done.image.map(|img| {
                 ctx.load_texture(format!("thumb-{}", done.key), img, egui::TextureOptions::LINEAR)
             });
-            self.ready.insert(done.key, (Thumb { texture, duration: done.duration, small }, Instant::now()));
+            self.ready.insert(done.key, (Thumb { texture, duration: done.duration }, Instant::now()));
         }
+    }
+
+    /// The clip's preview, queuing generation on first request. `None` while loading.
+    pub fn get(&mut self, ctx: &egui::Context, clip: &Clip) -> Option<&Thumb> {
+        self.receive(ctx);
         let now = Instant::now();
         if self.ready.len() > KEEP && now.duration_since(self.swept) > Duration::from_secs(5) {
             self.swept = now;
@@ -120,9 +130,19 @@ impl Thumbs {
 }
 
 impl Thumbs {
-    /// The tiny picture of a clip whose picture is loaded.
-    pub fn small(&self, clip: &Clip) -> Option<std::sync::Arc<(usize, usize, Vec<u8>)>> {
-        self.ready.get(&key(clip)).and_then(|(t, _)| t.small.clone())
+    /// The tiny picture of a clip, made once and kept; asked for if it
+    /// hasn't been made (it turns up in a moment, without loading the big one
+    /// onto the graphics card).
+    pub fn small(&mut self, ctx: &egui::Context, clip: &Clip) -> Option<std::sync::Arc<(usize, usize, Vec<u8>)>> {
+        self.receive(ctx);
+        let key = key(clip);
+        if let Some(s) = self.smalls.get(&key) {
+            return Some(s.clone());
+        }
+        if !self.ready.contains_key(&key) && self.pending.insert(key) {
+            let _ = self.job_tx.send((key, clip.path.clone()));
+        }
+        None
     }
 
     /// The clip's length, if its picture has been made (it's found then),

@@ -42,7 +42,35 @@ pub struct Glass {
     made_for: Option<(PathBuf, Rect)>,
     window: egui::Vec2,
     resized_at: f64,
+    /// The part of the grid it covers (content coordinates, top and bottom):
+    /// scrolling inside it only moves the picture; past it, it's made again
+    /// for the part around the view then.
+    covers: (f32, f32),
+    /// The places it was made for, how many pictures it had then and has
+    /// now, and when the last one turned up.
+    places: u64,
+    pictures: (usize, usize),
+    pictures_at: f64,
+    /// The picture being made on a thread, if one is: what it's for (its
+    /// signature) and where it comes back.
+    making: Option<(u64, std::sync::mpsc::Receiver<Made>)>,
 }
+
+/// A picture made on a thread, with what it was made for.
+struct Made {
+    image: egui::ColorImage,
+    origin: Pos2,
+    size: egui::Vec2,
+    covers: (f32, f32),
+    made_for: Option<(PathBuf, Rect)>,
+}
+
+/// How much of the grid the picture covers beyond what's on screen, above
+/// and below, in screens: scrolling that far needs no new picture.
+pub const AHEAD: f32 = 2.0;
+/// A picture turning up for a clip it covers makes it again only once none
+/// has for this long: pictures arrive in bursts, and one blur does for all.
+const SETTLE: f64 = 0.3;
 
 /// A clip on the grid, for the glass: its picture's place in the grid's
 /// content (scrolling not applied, where it's going if it's moving) and its
@@ -54,32 +82,55 @@ pub struct Tile {
 }
 
 /// Paint the card with its glass. `origin`: where the grid's content
-/// top-left is on screen now. Call where the card is drawn, after the grid.
-pub fn paint(ui: &mut egui::Ui, card: Rect, app: &mut App) {
+/// top-left is on screen now; `view`: the grid's part on screen (content
+/// coordinates, top and bottom); the app's tiles cover [`AHEAD`] screens
+/// beyond it. Call where the card is drawn, after the grid.
+pub fn paint(ui: &mut egui::Ui, card: Rect, app: &mut App, view: (f32, f32)) {
     let p = theme::pal(ui);
     let painter = ui.painter_at(card);
     painter.rect_filled(card, 8, p.raise);
     let origin = app.glass_origin;
     let tiles = std::mem::take(&mut app.glass_tiles);
+    // Scrolled past the part it covers: made again around the view.
+    let left_cover = view.0 < app.glass.covers.0 || view.1 > app.glass.covers.1;
     // Only clips within a blur radius of the card light it: the grid's first
-    // column or two.
-    let near: Vec<&Tile> = tiles.iter().filter(|t| t.rect.left() < REACH).collect();
+    // column or two; and only those in the part it covers (the tiles cover
+    // more, so it's made for the part around the view when it's made again).
+    let screen = view.1 - view.0;
+    let span = if left_cover || app.glass.texture.is_none() { (view.0 - screen * AHEAD, view.1 + screen * AHEAD) } else { app.glass.covers };
+    let near: Vec<&Tile> = tiles.iter().filter(|t| t.rect.left() < REACH && t.rect.bottom() >= span.0 - RADIUS && t.rect.top() <= span.1 + RADIUS).collect();
+    // What it's made of: the look and places (`sig`), and which clips have
+    // their tiny picture yet (`pictures`).
     use std::hash::{Hash, Hasher};
     let mut sig = std::collections::hash_map::DefaultHasher::new();
     p.dark.hash(&mut sig);
     ((card.width() as i32), (card.height() as i32), ((card.left() - origin.x) as i32)).hash(&mut sig);
+    (span.0 as i32, span.1 as i32).hash(&mut sig);
     for t in &near {
         t.path.hash(&mut sig);
         (t.rect.min.x as i32, t.rect.min.y as i32, t.rect.width() as i32).hash(&mut sig);
-        t.small.is_some().hash(&mut sig);
     }
-    let sig = sig.finish();
+    let places = sig.finish();
+    let pictures = near.iter().filter(|t| t.small.is_some()).count();
+    let now = ui.input(|i| i.time);
+    // Only pictures turned up (the same clips in the same places): made again
+    // once they've stopped arriving, so a burst of them costs one blur.
+    if places == app.glass.places && pictures != app.glass.pictures.0 {
+        if app.glass.pictures.1 != pictures {
+            app.glass.pictures.1 = pictures;
+            app.glass.pictures_at = now;
+        }
+        if now - app.glass.pictures_at < SETTLE {
+            ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64(SETTLE));
+        }
+    }
+    let settled = now - app.glass.pictures_at >= SETTLE;
+    let sig = if places != app.glass.places || settled { places ^ (pictures as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) } else { app.glass.signature };
     // While the window is being resized (its size changed in the last few
     // frames), the picture isn't made again every frame: it would cost a
     // frame's time each time (the resize stuttered). The last one stays,
     // stretched to where the clips are now; it's made again once the size
     // settles. Blurred this much, the stretch can't be seen.
-    let now = ui.input(|i| i.time);
     let size = ui.ctx().content_rect().size();
     if app.glass.window != size {
         app.glass.window = size;
@@ -89,13 +140,55 @@ pub fn paint(ui: &mut egui::Ui, card: Rect, app: &mut App) {
     if resizing {
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(160));
     }
+    // A picture made on a thread is in: shown from now (unless a newer one
+    // was asked for meanwhile; that one's still coming).
+    if let Some((for_sig, rx)) = &app.glass.making
+        && let Ok(made) = rx.try_recv()
+    {
+        let current = *for_sig == app.glass.signature;
+        app.glass.making = None;
+        if current {
+            app.glass.texture = Some(ui.ctx().load_texture("library_glass", made.image, egui::TextureOptions::LINEAR));
+            app.glass.origin = made.origin;
+            app.glass.size = made.size;
+            app.glass.covers = made.covers;
+            app.glass.made_for = made.made_for;
+        }
+    }
     if sig != app.glass.signature && !(resizing && app.glass.texture.is_some()) {
         app.glass.signature = sig;
+        app.glass.places = places;
+        app.glass.pictures = (pictures, pictures);
         if near.is_empty() {
             app.glass.texture = None;
+            app.glass.making = None;
         } else {
-            make(ui.ctx(), &mut app.glass, &near, card.left() - origin.x, p);
-            app.glass.made_for = near.first().map(|t| (t.path.clone(), t.rect));
+            // Blurred on a thread: no frame waits for it (it took a frame's
+            // time or more, so scrolling and resizing stuttered). The picture
+            // there stays meanwhile, and covers what it covers. The very
+            // first one is made at once, so the card isn't bare.
+            let job = Job { tiles: near.iter().map(|t| (t.rect, t.small.clone())).collect(), left: card.left() - origin.x, pal: *p, span, made_for: near.first().map(|t| (t.path.clone(), t.rect)) };
+            if app.glass.texture.is_none() {
+                let made = job.run();
+                app.glass.texture = Some(ui.ctx().load_texture("library_glass", made.image, egui::TextureOptions::LINEAR));
+                app.glass.origin = made.origin;
+                app.glass.size = made.size;
+                app.glass.covers = made.covers;
+                app.glass.made_for = made.made_for;
+                app.glass.making = None;
+            } else {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let ctx = ui.ctx().clone();
+                std::thread::spawn(move || {
+                    if tx.send(job.run()).is_ok() {
+                        ctx.request_repaint();
+                    }
+                });
+                app.glass.making = Some((sig, rx));
+                // Until it's in, what it will cover counts as covered: no
+                // second picture is asked for while scrolling on.
+                app.glass.covers = (app.glass.covers.0.min(span.0), app.glass.covers.1.max(span.1));
+            }
         }
     }
     // Stretched with the clips while it's waiting to be made again: one
@@ -200,13 +293,36 @@ fn clip_to(mut pts: Vec<Pos2>, r: Rect) -> Vec<Pos2> {
     pts
 }
 
-/// Make the glass picture: the grid's clips near the card, blurred, one
-/// picture the height of the grid (scrolling only moves it). `left`: the
-/// card's left edge in grid content coordinates.
-fn make(ctx: &egui::Context, glass: &mut Glass, tiles: &[&Tile], left: f32, p: &theme::Pal) {
-    let top = tiles.iter().map(|t| t.rect.top()).fold(f32::INFINITY, f32::min).min(0.0) - RADIUS;
-    let bottom = tiles.iter().map(|t| t.rect.bottom()).fold(0.0, f32::max) + RADIUS;
-    // Very long libraries: no taller than a GPU texture allows.
+/// What a glass picture is made from: plain data, so it can be made on a
+/// thread.
+struct Job {
+    /// The clips near the card: their picture's place in the grid's content
+    /// and their tiny picture.
+    tiles: Vec<(Rect, Option<std::sync::Arc<(usize, usize, Vec<u8>)>>)>,
+    /// The card's left edge in grid content coordinates.
+    left: f32,
+    pal: theme::Pal,
+    /// The part of the grid it covers (content coordinates).
+    span: (f32, f32),
+    made_for: Option<(PathBuf, Rect)>,
+}
+
+impl Job {
+    /// Make the glass picture: the grid's clips near the card, blurred, one
+    /// picture covering the span of the grid (scrolling inside it only moves
+    /// it). Its size doesn't grow with the library or with how far down it
+    /// is: just the span and a blur radius around it.
+    fn run(self) -> Made {
+        let Job { tiles, left, pal, span, made_for } = self;
+        let image = render(&tiles, left, &pal, span);
+        Made { image: image.0, origin: image.1, size: image.2, covers: span, made_for }
+    }
+}
+
+fn render(tiles: &[(Rect, Option<std::sync::Arc<(usize, usize, Vec<u8>)>>)], left: f32, p: &theme::Pal, span: (f32, f32)) -> (egui::ColorImage, Pos2, egui::Vec2) {
+    let top = span.0.max(0.0) - RADIUS;
+    let bottom = span.1 + RADIUS;
+    // No taller than a GPU texture allows.
     let bottom = bottom.min(top + 8000.0 / SCALE);
     let right = REACH;
     let area = Rect::from_min_max(Pos2::new(left, top), Pos2::new(right.max(left + 1.0), bottom));
@@ -215,13 +331,13 @@ fn make(ctx: &egui::Context, glass: &mut Glass, tiles: &[&Tile], left: f32, p: &
     // Premultiplied light, linear, f32.
     let mut buf = vec![[0f32; 4]; w * h];
     let lin = |v: u8| (v as f32 / 255.0).powf(2.2);
-    for t in tiles {
-        let Some(small) = &t.small else { continue };
+    for (rect, small) in tiles {
+        let Some(small) = small else { continue };
         let (sw, sh, px) = (small.0, small.1, &small.2);
-        let x0 = ((t.rect.left() - area.left()) * SCALE).floor() as i32;
-        let y0 = ((t.rect.top() - area.top()) * SCALE).floor() as i32;
-        let tw = ((t.rect.width() * SCALE).round() as i32).max(1);
-        let th = ((t.rect.height() * SCALE).round() as i32).max(1);
+        let x0 = ((rect.left() - area.left()) * SCALE).floor() as i32;
+        let y0 = ((rect.top() - area.top()) * SCALE).floor() as i32;
+        let tw = ((rect.width() * SCALE).round() as i32).max(1);
+        let th = ((rect.height() * SCALE).round() as i32).max(1);
         for y in 0..th {
             let yy = y0 + y;
             if yy < 0 || yy >= h as i32 {
@@ -264,9 +380,7 @@ fn make(ctx: &egui::Context, glass: &mut Glass, tiles: &[&Tile], left: f32, p: &
             img.pixels[y * w + x] = Color32::from_rgb(enc(out[0]), enc(out[1]), enc(out[2]));
         }
     }
-    glass.texture = Some(ctx.load_texture("library_glass", img, egui::TextureOptions::LINEAR));
-    glass.origin = area.min;
-    glass.size = vec2(w as f32 / SCALE, h as f32 / SCALE);
+    (img, area.min, vec2(w as f32 / SCALE, h as f32 / SCALE))
 }
 /// One box blur pass of radius `r`, along rows (`horizontal`) or columns,
 /// edges clamped.
@@ -314,11 +428,11 @@ mod tests {
         let small = std::sync::Arc::new((40usize, 23usize, vec![128u8; 40 * 23 * 4]));
         // Two columns of clips near the card, down a long grid.
         let tiles: Vec<Tile> = (0..60).map(|i| Tile { rect: Rect::from_min_size(Pos2::new((i % 2) as f32 * 216.0, (i / 2) as f32 * 180.0), vec2(200.0, 112.0)), path: PathBuf::from(format!("/c{i}")), small: Some(small.clone()) }).collect();
-        let near: Vec<&Tile> = tiles.iter().collect();
-        let mut glass = Glass::default();
+        let near: Vec<(Rect, _)> = tiles.iter().map(|t| (t.rect, t.small.clone())).collect();
+        let _ = ctx;
         let t = std::time::Instant::now();
         for _ in 0..10 {
-            make(&ctx, &mut glass, &near, -260.0, &theme::DARK);
+            std::hint::black_box(render(&near, -260.0, &theme::DARK, (0.0, 2400.0)));
         }
         println!("glass, made again: {:.1} ms", t.elapsed().as_secs_f64() * 100.0);
     }
