@@ -78,8 +78,17 @@ pub fn keep_window_buttons(window: &impl raw_window_handle::HasWindowHandle) {
 
 #[cfg(target_os = "macos")]
 fn place_window_buttons(view: &objc2_app_kit::NSView) {
-    use objc2_app_kit::NSWindowButton;
+    use objc2_app_kit::{NSWindowButton, NSWindowStyleMask};
     let Some(window) = view.window() else { return };
+    // Fullscreen keeps a window's toolbar on screen: ours is empty (it's only
+    // there to centre the buttons), so it showed as a grey bar over the
+    // picture. Hidden while fullscreen, back after.
+    let fullscreen = window.styleMask().contains(NSWindowStyleMask::FullScreen);
+    if let Some(toolbar) = window.toolbar()
+        && toolbar.isVisible() == fullscreen
+    {
+        toolbar.setVisible(!fullscreen);
+    }
     let buttons = [NSWindowButton::CloseButton, NSWindowButton::MiniaturizeButton, NSWindowButton::ZoomButton];
     // Each button's frame is its own size; they're spaced evenly, centred
     // as a group over the rail.
