@@ -108,6 +108,42 @@ fn place_window_buttons(view: &objc2_app_kit::NSView) {
     }
 }
 
+/// Windows: the title bar in the rail's colour (and the app's text colour),
+/// so the window's top reads as part of it, in either look. Runs every
+/// frame; only tells Windows when the look changes. (Windows 10 ignores the
+/// colours and keeps its own, light or dark.)
+#[cfg(target_os = "windows")]
+pub fn tint_title_bar(window: &impl raw_window_handle::HasWindowHandle, dark: bool) {
+    use raw_window_handle::RawWindowHandle;
+    use std::sync::atomic::{AtomicU8, Ordering};
+    use windows::Win32::Foundation::{COLORREF, HWND};
+    use windows::core::BOOL;
+    use windows::Win32::Graphics::Dwm::{DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute};
+    // 0: not yet, 1: light, 2: dark.
+    static DONE: AtomicU8 = AtomicU8::new(0);
+    let look = if dark { 2 } else { 1 };
+    if DONE.load(Ordering::Relaxed) == look {
+        return;
+    }
+    let Ok(handle) = window.window_handle() else { return };
+    let RawWindowHandle::Win32(h) = handle.as_raw() else { return };
+    let hwnd = HWND(h.hwnd.get() as *mut _);
+    let p = if dark { &theme::DARK } else { &theme::LIGHT };
+    let colorref = |c: Color32| COLORREF(u32::from(c.r()) | u32::from(c.g()) << 8 | u32::from(c.b()) << 16);
+    let caption = colorref(p.ground);
+    let text = colorref(p.text);
+    // The window buttons' glyphs follow the dark flag, not the caption colour.
+    let dark_flag = BOOL::from(dark);
+    // SAFETY: `hwnd` is our live top-level window; each value is the size
+    // and type the attribute takes.
+    unsafe {
+        let _ = DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark_flag as *const _ as *const _, size_of::<BOOL>() as u32);
+        let _ = DwmSetWindowAttribute(hwnd, DWMWA_CAPTION_COLOR, &caption as *const _ as *const _, size_of::<COLORREF>() as u32);
+        let _ = DwmSetWindowAttribute(hwnd, DWMWA_TEXT_COLOR, &text as *const _ as *const _, size_of::<COLORREF>() as u32);
+    }
+    DONE.store(look, Ordering::Relaxed);
+}
+
 /// Which screen's keyboard shortcuts to show.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Keys {
