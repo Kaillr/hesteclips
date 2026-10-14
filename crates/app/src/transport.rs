@@ -35,7 +35,11 @@ pub enum Part {
 pub fn header(ui: &mut egui::Ui, title: &str, unsaved: bool, centre_w: f32, mut part: impl FnMut(&mut egui::Ui, Part)) -> (bool, bool) {
     let p = theme::pal(ui);
     let rect = Rect::from_min_size(ui.cursor().min, vec2(ui.available_width(), HEAD_H));
+    // What's under it starts right at its edge: a gap made it look taller
+    // than the pages' headings, its contents high in it.
+    let gap = ui.spacing().item_spacing.y;
     ui.allocate_rect(rect, Sense::hover());
+    ui.add_space(-gap);
     crate::shell::drag_window_area(ui, rect, "viewer_head");
     // Clear of the traffic lights on macOS.
     let left_pad = if crate::shell::under_titlebar() { 82.0 } else { 12.0 };
