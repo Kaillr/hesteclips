@@ -909,6 +909,8 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        #[cfg(target_os = "macos")]
+        shell::keep_window_buttons(frame);
         let ctx = ui.ctx().clone();
         let mut laps = Laps::start();
 

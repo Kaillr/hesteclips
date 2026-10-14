@@ -77,7 +77,7 @@ objc2 = "0.6.4"
 objc2-io-surface = { version = "0.3.2", default-features = false, features = ["std", "IOSurfaceRef", "objc2"] }
 objc2-metal = { version = "0.3.2", default-features = false, features = ["std", "MTLAllocation", "MTLDevice", "MTLPixelFormat", "MTLResource", "MTLTexture", "objc2-io-surface"] }
 objc2-foundation = { version = "0.3.2", features = ["NSArray", "NSString", "NSURL", "NSGeometry", "NSFileManager", "NSError"] }
-objc2-app-kit = { version = "0.3.2", features = ["NSSharingService", "NSView", "NSResponder", "NSWindow", "NSToolbar"] }
+objc2-app-kit = { version = "0.3.2", features = ["NSSharingService", "NSView", "NSResponder", "NSWindow", "NSToolbar", "NSButton", "NSControl"] }
 
 # Windows-only: the system Share UI, and opening files with their default app.
 [target.'cfg(target_os = "windows")'.dependencies]

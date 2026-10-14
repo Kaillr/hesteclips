@@ -54,6 +54,49 @@ pub fn centre_window_buttons(window: &impl raw_window_handle::HasWindowHandle) {
     let toolbar = NSToolbar::initWithIdentifier(mtm.alloc(), &NSString::from_str("hesteclips"));
     window.setToolbar(Some(&toolbar));
     window.setToolbarStyle(NSWindowToolbarStyle::Unified);
+    place_window_buttons(view);
+}
+
+/// macOS: the window's buttons centred over the rail (the toolbar centres
+/// them up and down; across, macOS puts them nearer the edge). macOS lays
+/// them out again now and then (resizing, fullscreen, focus), so this runs
+/// every frame; it only moves them when they've moved.
+#[cfg(target_os = "macos")]
+pub fn keep_window_buttons(window: &impl raw_window_handle::HasWindowHandle) {
+    use objc2_app_kit::NSView;
+    use raw_window_handle::RawWindowHandle;
+    let Ok(handle) = window.window_handle() else { return };
+    let RawWindowHandle::AppKit(h) = handle.as_raw() else { return };
+    if objc2::MainThreadMarker::new().is_none() {
+        return;
+    }
+    // SAFETY: eframe's AppKit handle points at the live content NSView, on
+    // the main thread (checked above).
+    let view: &NSView = unsafe { h.ns_view.cast::<NSView>().as_ref() };
+    place_window_buttons(view);
+}
+
+#[cfg(target_os = "macos")]
+fn place_window_buttons(view: &objc2_app_kit::NSView) {
+    use objc2_app_kit::NSWindowButton;
+    let Some(window) = view.window() else { return };
+    let buttons = [NSWindowButton::CloseButton, NSWindowButton::MiniaturizeButton, NSWindowButton::ZoomButton];
+    // Each button's frame is its own size; they're spaced evenly, centred
+    // as a group over the rail.
+    let frames: Vec<_> = buttons.iter().filter_map(|b| window.standardWindowButton(*b)).collect();
+    let Some(first) = frames.first() else { return };
+    let w = first.frame().size.width;
+    let gap = frames.get(1).map_or(6.0, |b| b.frame().origin.x - first.frame().origin.x - w);
+    let group = w * frames.len() as f64 + gap * (frames.len() as f64 - 1.0);
+    let left = ((RAIL_W as f64 - group) / 2.0).round();
+    for (i, b) in frames.iter().enumerate() {
+        let mut f = b.frame();
+        let x = left + i as f64 * (w + gap);
+        if (f.origin.x - x).abs() > 0.5 {
+            f.origin.x = x;
+            b.setFrameOrigin(f.origin);
+        }
+    }
 }
 
 /// Which screen's keyboard shortcuts to show.
