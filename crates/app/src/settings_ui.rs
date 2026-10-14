@@ -199,7 +199,7 @@ impl App {
         let heavy = capture::total_memory().is_some_and(|t| bytes > t as f64 / 4.0);
         let note = format!("Save clip keeps the last {}. About {} in memory.", length_words(self.settings.replay_seconds), human_bytes(bytes));
         let note = if heavy { format!("{note} That's over a quarter of this computer's memory: games may slow down.") } else { note };
-        ui_kit::list(ui, |l| {
+        ui_kit::list(ui, "clipping", |l| {
             if f.shows(&["clip length", "replay buffer duration", "memory"]) {
                 l.row(Row::new("Clip length").tip("Clip length", "How far back Save clip reaches. While clipping, that much is kept in memory, so a longer or sharper clip uses more of it.").note(note).warn(heavy), |ui| {
                     self.length_field(ui);
@@ -237,7 +237,7 @@ impl App {
         let preset = rec.and_then(|r| [("Smaller", round_mbps(r as f64 * 0.5)), ("Balanced", r), ("High", round_mbps(r as f64 * 2.0))].into_iter().position(|(_, m)| m == self.settings.video_bitrate_mbps));
         let quality_note = format!("{}about {per_min} per minute", if preset.is_some() { "" } else { "Your own bitrate, " });
         let mut locked_click = false;
-        ui_kit::list(ui, |l| {
+        ui_kit::list(ui, "video", |l| {
             if f.shows(&["resolution", "height", "size", "native"]) {
                 let (_, c) = l.row(Row::new("Resolution").tip("Resolution", "Lower makes smaller files that are quicker to share. Native keeps every pixel of your display.").note(res_note.clone()).locked(lock.clone()), |ui| self.resolution_field(ui));
                 locked_click |= c;
@@ -297,7 +297,7 @@ impl App {
         let p = theme::pal(ui);
         let t = &self.settings.game_titles;
         let example = if t.cs2 { "3 kills on Mirage".to_owned() } else if t.osu { crate::osu_plays::example(t) } else if t.league { "Pentakill as Jinx".to_owned() } else { "Rampage as Juggernaut".to_owned() };
-        ui_kit::list(ui, |l| {
+        ui_kit::list(ui, "clips", |l| {
             if f.shows(&["clips folder", "location", "directory", "output"]) {
                 let path = self.settings.output_dir.display().to_string();
                 let home = dirs::home_dir().map(|h| h.display().to_string()).unwrap_or_default();
@@ -351,7 +351,7 @@ impl App {
         let picture = self.cloud.profile_picture().and_then(|url| self.web_images.fresh(ui.ctx(), &url));
         let mut disconnect = false;
         let mut pick = false;
-        ui_kit::list(ui, |l| {
+        ui_kit::list(ui, "sharing", |l| {
             if f.shows(&["hestefiles", "cloud", "upload", "account", "token", "public link", "default folder", "share"]) {
                 let note = match &self.cloud.connection {
                     crate::cloud::Connection::Connected(account) => format!("Connected as {}", account.user_info.username),
@@ -466,7 +466,7 @@ impl App {
 
     fn sound_group(&mut self, ui: &mut egui::Ui, f: &Filter) {
         let mut add = false;
-        ui_kit::list(ui, |l| {
+        ui_kit::list(ui, "sound", |l| {
             l.row(Row::new("Play a sound when a clip is saved"), |ui| ui_kit::switch(ui, &mut self.settings.save_sound.enabled));
             let on = self.settings.save_sound.enabled;
             l.well("save_sound_well", on, |l| {
@@ -546,7 +546,7 @@ impl App {
             ui.add_space(6.0);
         }
         let desktop = self.hotkeys.as_ref().is_ok_and(|h| h.via_desktop());
-        ui_kit::list(ui, |l| {
+        ui_kit::list(ui, "shortcuts", |l| {
             for action in ShortcutAction::ALL {
                 if !f.shows(&[action.label(), "shortcut", "hotkey", "keyboard"]) {
                     continue;
@@ -576,7 +576,7 @@ impl App {
         };
         let (to_hear, all) = self.voice_review.summary();
         let mut review = false;
-        ui_kit::list(ui, |l| {
+        ui_kit::list(ui, "voice", |l| {
             if f.shows(&["save by voice", "hashtag", "speech", "command", "voice"]) {
                 l.row(Row::new("Save by voice").tip("Save by voice", "While clipping, say “hashtag HesteClip that” to save a clip. Listening happens on this computer, for this phrase only.").note(note), |ui| ui_kit::switch(ui, &mut self.settings.voice_clip));
             }
@@ -609,7 +609,7 @@ impl App {
             Status::Failed(e) => e.clone(),
         };
         let idle = self.rec_state == RecState::Idle;
-        ui_kit::list(ui, |l| {
+        ui_kit::list(ui, "app", |l| {
             if f.shows(&["appearance", "theme", "dark", "light", "system"]) {
                 l.row(Row::new("Appearance"), |ui| {
                     let chosen = settings::Theme::ALL.iter().position(|t| *t == self.settings.theme).unwrap_or(0);
@@ -1097,7 +1097,8 @@ impl App {
 /// A game on the Clip names page: its switch, what it names, what it needs.
 fn game_card(ui: &mut egui::Ui, game: &str, on: &mut bool, what: &str, setup: Option<&str>) {
     let p = theme::pal(ui);
-    egui::Frame::new().fill(p.raise).corner_radius(8).inner_margin(egui::Margin { left: 16, right: 16, top: 12, bottom: 12 }).show(ui, |ui| {
+    let frame = egui::Frame::new().fill(p.raise).corner_radius(8).inner_margin(egui::Margin { left: 16, right: 16, top: 12, bottom: 12 });
+    ui_kit::eased_frame(ui, egui::Id::new(("game_card", game)), frame, |ui| {
         ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 12.0;

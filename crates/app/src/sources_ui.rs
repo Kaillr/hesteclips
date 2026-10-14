@@ -56,6 +56,8 @@ pub(crate) struct SourcesView {
     /// When the open apps were last checked, for the games-and-apps statuses.
     apps_checked: Option<Instant>,
     renaming: Option<String>,
+    /// The clip mix's note last shown (too loud, limiting), kept while it fades out.
+    last_note: Option<(egui::Color32, &'static str)>,
     /// The last preview frame and what it was of (picture, size, rate,
     /// webcam): shown again at once when the page opens on the same, while
     /// the preview's capture starts (that takes a moment).
@@ -187,16 +189,18 @@ impl App {
         self.keep_listening();
         self.add_source_buttons(ui);
 
-        if self.rec_state != crate::RecState::Idle {
+        let capturing = self.rec_state != crate::RecState::Idle;
+        let recording = self.rec_state == crate::RecState::Recording;
+        crate::ui_kit::reveal(ui, "sources_locked", capturing, |ui| {
             ui.add_space(12.0);
             let mic = if cfg!(target_os = "linux") { ", noise removal" } else { ", noise removal and which microphone" };
-            let stop = if self.rec_state == crate::RecState::Recording { "Stop recording" } else { "Stop clipping" };
+            let stop = if recording { "Stop recording" } else { "Stop clipping" };
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 ui.label(crate::theme::ic(egui_phosphor::regular::LOCK_SIMPLE, 12.0).color(pal.text3));
                 ui.add(egui::Label::new(crate::theme::text(format!("Volume, mute{mic} change right away. {stop} to add or remove sources."), 12.5, crate::theme::W::Regular).color(pal.text3)).wrap());
             });
-        }
+        });
     }
 
     /// "Listen" on source `i`: hear it live, or stop.
@@ -380,7 +384,7 @@ impl App {
             CaptureTarget::Apps { apps, away_screen } if capture::APP_CAPTURE => self.app_list(ui, apps, away_screen, frame.as_deref()),
             // Linux on Wayland: the desktop's own dialog picks the screen (once; it's remembered).
             _ if cfg!(target_os = "linux") && !capture::screens_listed() => {
-                group(ui, |ui| {
+                group(ui, "screen", |ui| {
                     ui.horizontal(|ui| {
                         ui.label(crate::theme::text("Screen", 13.5, crate::theme::W::Regular).color(pal.text));
                         ui.label(crate::theme::text("picked in your desktop's sharing dialog", 12.5, crate::theme::W::Regular).color(pal.text3));
@@ -395,7 +399,7 @@ impl App {
                 });
             }
             _ => {
-                group(ui, |ui| {
+                group(ui, "display", |ui| {
                     ui.horizontal(|ui| {
                         ui.label(crate::theme::text("Display", 13.5, crate::theme::W::Medium).color(pal.text));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -525,7 +529,7 @@ impl App {
         let mut list = apps.clone();
         let mut away = away_screen;
         let mut remove = None;
-        group(ui, |ui| {
+        group(ui, "apps", |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             if list.is_empty() {
                 ui.add_space(4.0);
@@ -602,7 +606,7 @@ impl App {
             crate::ui_kit::hint(ui, "Records the one you're using, and keeps it while you click into something else as long as it's on screen.");
         }
         ui.add_space(10.0);
-        group(ui, |ui| {
+        group(ui, "tabbed_out", |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 ui.label(theme::text("Show “Tabbed out” when it's minimized", 13.5, W::Regular).color(pal.text));
@@ -634,7 +638,7 @@ impl App {
             view.limiting_at = Some(now);
         }
         let limiting = self.settings.limiter && view.limiting_at.is_some_and(|t| now - t < LIMIT_HOLD);
-        group(ui, |ui| {
+        group(ui, "clip_mix", |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 ui.label(theme::text("Clip mix", 14.0, W::Semibold).color(pal.text));
@@ -667,6 +671,7 @@ impl App {
                     }
                 });
             });
+            // Comes and goes with the sound: slides in and out, not jumping.
             let note = if view.master.clipped() {
                 Some((pal.meter_r, "Too loud: it distorted. Turn some sources down."))
             } else if limiting {
@@ -674,10 +679,16 @@ impl App {
             } else {
                 None
             };
-            if let Some((color, text)) = note {
-                ui.add_space(6.0);
-                ui.add(egui::Label::new(theme::text(text, 12.5, W::Regular).color(color)).wrap());
+            if note.is_some() {
+                view.last_note = note;
             }
+            let shown = view.last_note;
+            crate::ui_kit::reveal(ui, "clip_mix_note", note.is_some(), |ui| {
+                if let Some((color, text)) = shown {
+                    ui.add_space(6.0);
+                    ui.add(egui::Label::new(theme::text(text, 12.5, W::Regular).color(color)).wrap());
+                }
+            });
         });
     }
 
@@ -872,7 +883,8 @@ fn source_card(
     // A mic can switch device while capturing (its track stays); on Linux
     // mics are set when capture starts.
     let picker_locked = locked.filter(|_| cfg!(target_os = "linux") || !matches!(source.kind, SourceKind::Microphone { .. }));
-    group(ui, |ui| {
+    let card_id = source.id.clone();
+    group(ui, ("source", card_id), |ui| {
         ui.multiply_opacity(if source.enabled { 1.0 } else { 0.6 });
         // --- Its icon, name, what it is; device; ⋯ ---
         ui.horizontal(|ui| {
@@ -1169,9 +1181,12 @@ fn status_text(status: SourceStatus) -> Option<(&'static str, fn(&crate::theme::
 }
 
 /// A group on the page: the raised surface, padded.
-pub(crate) fn group(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
+/// A group on the Sources page: its height eases when what's in it changes
+/// (see [`crate::ui_kit::eased_frame`]); `id` names it on the page.
+pub(crate) fn group(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::Debug, add: impl FnOnce(&mut egui::Ui)) {
     let pal = crate::theme::pal(ui);
-    egui::Frame::new().fill(pal.raise).corner_radius(8).inner_margin(egui::Margin { left: 14, right: 12, top: 12, bottom: 12 }).show(ui, |ui| {
+    let frame = egui::Frame::new().fill(pal.raise).corner_radius(8).inner_margin(egui::Margin { left: 14, right: 12, top: 12, bottom: 12 });
+    crate::ui_kit::eased_frame(ui, egui::Id::new(("sources_group", id)), frame, |ui| {
         ui.set_width(ui.available_width());
         add(ui);
     });

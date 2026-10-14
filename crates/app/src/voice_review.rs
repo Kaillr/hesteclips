@@ -246,7 +246,7 @@ impl App {
             ui.add_space(16.0);
 
             if total == 0 {
-                ui_kit::card(ui, |ui| {
+                ui_kit::card(ui, "voice_main", |ui| {
                     let p = crate::theme::pal(ui);
                     ui.add_space(8.0);
                     ui.label(crate::theme::text("No samples yet", 15.0, crate::theme::W::Semibold).color(p.text));
@@ -263,9 +263,9 @@ impl App {
             }
 
             if let Some(s) = r.current().cloned() {
-                ui_kit::card(ui, |ui| self.review_card(ui, &mut r, &s, &mut say));
+                ui_kit::card(ui, "voice_main", |ui| self.review_card(ui, &mut r, &s, &mut say));
             } else {
-                ui_kit::card(ui, |ui| {
+                ui_kit::card(ui, "voice_main", |ui| {
                     let p = crate::theme::pal(ui);
                     ui.add_space(8.0);
                     ui.label(crate::theme::text("All caught up", 15.0, crate::theme::W::Semibold).color(p.text));
@@ -280,7 +280,7 @@ impl App {
             ui.add_space(26.0);
             ui.label(crate::theme::text("Help improve the detector", 13.0, crate::theme::W::Semibold).color(crate::theme::pal(ui).text2));
             ui.add_space(6.0);
-            ui_kit::card(ui, |ui| {
+            ui_kit::card(ui, "voice_export", |ui| {
                 ui_kit::hint(
                     ui,
                     "Export your answers as one zip file and send it to the developer yourself. It holds only the highlighted part of each sample and your answer, with no name. Nothing is uploaded. Delete any sample you don't want to share.",

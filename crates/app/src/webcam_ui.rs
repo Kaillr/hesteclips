@@ -320,12 +320,12 @@ impl App {
         });
 
         let Some(cam) = cam.filter(|c| c.enabled) else {
-            crate::sources_ui::group(ui, |ui| {
+            crate::sources_ui::group(ui, "webcam", |ui| {
                 ui.label(theme::text("Put your camera in your clips, placed and sized on the preview.", 13.0, W::Regular).color(pal.text3));
             });
             return;
         };
-        crate::sources_ui::group(ui, |ui| {
+        crate::sources_ui::group(ui, "webcam", |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             if let Status::Unavailable(why) = &status {
                 let mut why = why.clone();

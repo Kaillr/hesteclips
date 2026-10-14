@@ -117,17 +117,130 @@ pub fn repaint_after(ctx: &egui::Context, delay: std::time::Duration) {
     ctx.request_repaint_after(delay + std::time::Duration::from_secs_f32(frame));
 }
 
-/// A group: content on the raised surface, padded.
-pub fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    egui::Frame::new()
-        .fill(theme::pal(ui).raise)
-        .corner_radius(CARD_RADIUS)
-        .inner_margin(Margin::symmetric(16, 12))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            add(ui)
-        })
-        .inner
+// --- Size changes ---
+
+#[derive(Clone, Copy)]
+struct Eased {
+    /// The content's own height and the width last frame.
+    natural: f32,
+    width: f32,
+    /// Where the height was and is going, and since when.
+    from: f32,
+    to: f32,
+    start: f64,
+    pass: u64,
+}
+
+fn moving_id() -> egui::Id {
+    egui::Id::new("ui_kit_eased_moving")
+}
+
+/// Something in an [`eased_frame`] is changing size smoothly by itself this
+/// frame (a well opening, a [`reveal`]): the frame follows it exactly
+/// instead of easing again behind it.
+fn moving(ctx: &egui::Context) {
+    let pass = ctx.cumulative_pass_nr();
+    ctx.data_mut(|d| d.insert_temp(moving_id(), pass));
+}
+
+/// `frame` with `add` in it, its height easing to the content's whenever it
+/// changes (a line of text appearing, a note going away), so what's below
+/// slides instead of jumping; the content is clipped to it meanwhile. At once
+/// when it first appears, when the width changes (the window resizing) and
+/// while what's in it moves smoothly by itself. `id` must stay the same while
+/// things around it change (egui's own ids shift when something above
+/// appears).
+pub fn eased_frame<R>(ui: &mut egui::Ui, id: egui::Id, frame: egui::Frame, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let ctx = ui.ctx().clone();
+    let (now, pass) = (ctx.input(|i| i.time), ctx.cumulative_pass_nr());
+    let under = ui.painter().add(egui::Shape::Noop);
+    let outer = ui.available_rect_before_wrap();
+    let margin = egui::epaint::MarginF32::from(frame.inner_margin) + egui::epaint::MarginF32::from(frame.stroke.width) + egui::epaint::MarginF32::from(frame.outer_margin);
+    let width = outer.width();
+    let inner_max = Rect::from_min_max(outer.min + margin.left_top(), Pos2::new(outer.max.x - margin.right, outer.min.y + 100_000.0));
+    let mut content = ui.new_child(egui::UiBuilder::new().max_rect(inner_max).layout(*ui.layout()));
+    let before = ctx.data(|d| d.get_temp::<Eased>(id));
+    let clip_to = |content: &mut egui::Ui, h: f32| {
+        let r = Rect::from_min_size(outer.min, vec2(width, h)) - egui::epaint::MarginF32::from(frame.outer_margin);
+        content.set_clip_rect(r.intersect(ui.clip_rect()));
+    };
+    if let Some(e) = before {
+        clip_to(&mut content, eased_now(&e, now));
+    }
+    let was_moving = ctx.data(|d| d.get_temp::<u64>(moving_id()));
+    let r = add(&mut content);
+    let inside_moved = ctx.data(|d| d.get_temp::<u64>(moving_id())) != was_moving;
+    let natural = content.min_rect().height() + margin.sum().y;
+    let next = match before {
+        Some(e) if e.natural == natural && e.width == width => Eased { pass, ..e },
+        // Moving by itself, or after a while unseen, or another width: there at once.
+        Some(e) if !inside_moved && e.width == width && e.pass + 1 >= pass => Eased { natural, width, from: eased_now(&e, now), to: natural, start: now, pass },
+        _ => Eased { natural, width, from: natural, to: natural, start: now, pass },
+    };
+    ctx.data_mut(|d| d.insert_temp(id, next));
+    let h = eased_now(&next, now);
+    if h != natural {
+        ctx.request_repaint();
+        // A frame inside another: that one follows this one.
+        moving(&ctx);
+    }
+    clip_to(&mut content, h);
+    let rect = Rect::from_min_size(outer.min, vec2(width, h));
+    let fill = rect - egui::epaint::MarginF32::from(frame.outer_margin);
+    if ui.is_rect_visible(fill) {
+        let mut f = frame;
+        f.inner_margin = Margin::ZERO;
+        f.outer_margin = Margin::ZERO;
+        ui.painter().set(under, f.paint(fill));
+    }
+    ui.allocate_rect(rect, Sense::hover());
+    r
+}
+
+fn eased_now(e: &Eased, now: f64) -> f32 {
+    let t = ((now - e.start) as f32 / theme::NORMAL).clamp(0.0, 1.0);
+    e.from + (e.to - e.from) * theme::ease_out(t)
+}
+
+/// Something that comes and goes (a note, a warning): while `shown` it's
+/// there; it fades and its height slides as it changes, so what's below
+/// moves smoothly. Keeps the last content to fade it out with when `add`
+/// isn't given (pass the same `id`).
+pub fn reveal(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::Debug, shown: bool, add: impl FnOnce(&mut egui::Ui)) {
+    let id = egui::Id::new(id).with("reveal");
+    let t = theme::toggle(ui.ctx(), id, shown, theme::NORMAL);
+    if t <= 0.0 {
+        return;
+    }
+    if t < 1.0 {
+        moving(ui.ctx());
+    }
+    let full = ui.data(|d| d.get_temp::<f32>(id.with("h")));
+    let top = ui.cursor().min;
+    let width = ui.available_width();
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_size(top, vec2(width, 100_000.0))).layout(egui::Layout::top_down(egui::Align::Min)));
+    let h = full.map(|f| f * theme::ease_out(t));
+    if let Some(h) = h.filter(|_| t < 1.0) {
+        child.set_clip_rect(Rect::from_min_size(top, vec2(width, h)).intersect(ui.clip_rect()));
+    }
+    child.multiply_opacity(t);
+    add(&mut child);
+    let real = child.min_rect().height();
+    if shown {
+        ui.data_mut(|d| d.insert_temp(id.with("h"), real));
+    }
+    let h = if t >= 1.0 { real } else { full.unwrap_or(real) * theme::ease_out(t) };
+    ui.allocate_space(vec2(width, h));
+}
+
+/// A group: content on the raised surface, padded. Its height eases when
+/// what's in it changes (see [`eased_frame`]); `id` names it on its page.
+pub fn card<R>(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::Debug, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let frame = egui::Frame::new().fill(theme::pal(ui).raise).corner_radius(CARD_RADIUS).inner_margin(Margin::symmetric(16, 12));
+    eased_frame(ui, egui::Id::new(("card", id)), frame, |ui| {
+        ui.set_width(ui.available_width());
+        add(ui)
+    })
 }
 
 /// Scrolling content with a slim scrollbar in the page's right margin.
@@ -1258,19 +1371,17 @@ pub fn round_corners(painter: &egui::Painter, rect: Rect, radius: f32, bg: Color
     }
 }
 
-/// A group of rows on the raised surface, hairlines between them.
-pub fn list<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut List) -> R) -> R {
-    let p = theme::pal(ui);
-    egui::Frame::new()
-        .fill(p.raise)
-        .corner_radius(CARD_RADIUS)
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.spacing_mut().item_spacing.y = 0.0;
-            let mut l = List { ui, rows: 0 };
-            add(&mut l)
-        })
-        .inner
+/// A group of rows on the raised surface, hairlines between them. Its
+/// height eases when rows or notes come and go (see [`eased_frame`]); `id`
+/// names it on its page.
+pub fn list<R>(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::Debug, add: impl FnOnce(&mut List) -> R) -> R {
+    let frame = egui::Frame::new().fill(theme::pal(ui).raise).corner_radius(CARD_RADIUS);
+    eased_frame(ui, egui::Id::new(("list", id)), frame, |ui| {
+        ui.set_width(ui.available_width());
+        ui.spacing_mut().item_spacing.y = 0.0;
+        let mut l = List { ui, rows: 0 };
+        add(&mut l)
+    })
 }
 
 /// Rows of a [`list`]: call [`List::row`] for each, [`List::well`] for the
@@ -1311,6 +1422,9 @@ pub fn well(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::Debug, open:
     let t = theme::toggle(ui.ctx(), id, open, theme::NORMAL);
     if t <= 0.0 {
         return;
+    }
+    if t < 1.0 {
+        moving(ui.ctx());
     }
     let p = theme::pal(ui);
     let full_h = ui.data(|d| d.get_temp::<f32>(id.with("h"))).unwrap_or(0.0);
@@ -1876,6 +1990,38 @@ mod tests {
         assert_eq!(done.len(), 2);
         assert_eq!((rect(&done[0]).fill, rect(&done[0]).blur_width), (Color32::BLACK, 0.0));
         assert_eq!(rect(&done[1]).fill, Color32::WHITE);
+    }
+
+    /// A card's height: there at once the first time and at another width;
+    /// a line appearing in it eases it to its new height.
+    #[test]
+    fn a_card_eases_its_height() {
+        let ctx = egui::Context::default();
+        apply(&ctx);
+        let frame_at = |time: f64, width: f32, lines: usize| {
+            let raw = egui::RawInput { time: Some(time), screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 600.0))), ..Default::default() };
+            let mut h = 0.0;
+            let mut out = ctx.run_ui(raw, |ui| {
+                let top = ui.cursor().min.y;
+                card(ui, "test", |ui| {
+                    for _ in 0..lines {
+                        ui.allocate_space(egui::vec2(10.0, 20.0));
+                    }
+                });
+                h = ui.cursor().min.y - top;
+            });
+            out.textures_delta.clear();
+            h
+        };
+        let one = frame_at(0.0, 400.0, 1);
+        assert_eq!(frame_at(0.1, 400.0, 1), one, "steady");
+        let mid = frame_at(1.0, 400.0, 2);
+        assert_eq!(mid, one, "starts where it was");
+        let half = frame_at(1.0 + f64::from(theme::NORMAL) / 2.0, 400.0, 2);
+        assert!(half > one && half < one + 20.0 + 8.0, "half way: {half}");
+        let two = frame_at(2.0, 400.0, 2);
+        assert!(two > half);
+        assert_eq!(frame_at(3.0, 500.0, 1), one, "another width: at once");
     }
 
     #[test]
