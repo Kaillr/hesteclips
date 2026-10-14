@@ -81,6 +81,8 @@ struct Ready {
     /// Smoothed meter values (peak, rms) per track, then master; and peak holds.
     meters: Vec<Meter>,
     master: Meter,
+    /// The kept length being typed (click the length under the timeline).
+    typing_length: Option<String>,
     /// The mix's meter on the right of the timeline (as on Sources).
     mix_meter: crate::meter::MeterState,
     dragging: Option<Drag>,
@@ -300,6 +302,7 @@ impl Ready {
             meters: vec![Meter::default(); n],
             master: Meter::default(),
             mix_meter: Default::default(),
+            typing_length: None,
             dragging: None,
             resume: false,
             grab_offset: 0.0,
@@ -850,6 +853,57 @@ impl Ready {
         }
     }
 
+    /// The kept length under the timeline: shown, and on a click typed over
+    /// ("12", "0:12.5", or frames when times show as frames). Enter moves the
+    /// end to make it that long (the start stays; as long as the clip
+    /// allows), Esc or clicking away leaves it.
+    fn length_field(&mut self, ui: &mut egui::Ui, rect: Rect, shown: &str) {
+        let pal = crate::theme::pal(ui);
+        let id = ui.id().with("length_field");
+        match self.typing_length.as_mut() {
+            None => {
+                let resp = ui.interact(rect, id, Sense::click());
+                let hv = crate::theme::toggle(ui.ctx(), id.with("hv"), resp.hovered(), crate::theme::FAST);
+                ui.painter().rect_filled(rect, 5, crate::theme::mix(pal.base, pal.control, hv));
+                ui.painter().text(rect.center(), Align2::CENTER_CENTER, shown, crate::theme::font(12.0, crate::theme::W::Semibold), pal.text);
+                if resp.on_hover_cursor(egui::CursorIcon::Text).on_hover_text("The kept part's length: click to type another").clicked() {
+                    self.typing_length = Some(shown.trim_end_matches(" frames").to_owned());
+                    ui.memory_mut(|m| m.request_focus(id.with("edit")));
+                }
+            }
+            Some(text) => {
+                ui.painter().rect_filled(rect, 5, pal.control);
+                let out = egui::TextEdit::singleline(text)
+                    .id(id.with("edit"))
+                    .frame(egui::Frame::NONE)
+                    .font(crate::theme::font(12.0, crate::theme::W::Semibold))
+                    .horizontal_align(egui::Align::Center)
+                    .desired_width(rect.width() - 8.0)
+                    .show(&mut ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink2(Vec2::new(4.0, 2.0)))));
+                ui.painter().rect_stroke(rect, 5, Stroke::new(1.5, pal.text2), egui::StrokeKind::Inside);
+                let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                if out.response.lost_focus() || esc {
+                    let typed = std::mem::take(text);
+                    self.typing_length = None;
+                    if enter && !esc {
+                        let secs = if self.show_frames { typed.trim().parse::<f64>().ok().map(|f| f / self.info.fps) } else { crate::settings_ui::parse_length(&typed) };
+                        match secs.filter(|s| *s > 0.0) {
+                            Some(secs) => {
+                                let was = self.edit.clone();
+                                (self.edit.start, self.edit.end) = trim_to_length(&self.info, self.edit.start, secs);
+                                if !same_edit(&self.edit, &was) {
+                                    self.push_undo(was);
+                                }
+                            }
+                            None => {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Snap `t` to the playhead, the trim edges or the clip's ends when it's
     /// within a few points of one (and snapping is on). `except`: what's being
     /// moved, which mustn't snap to itself.
@@ -1242,12 +1296,13 @@ impl Ready {
         p.hline(range.x_range(), dim_y, Stroke::new(1.0, rc));
         p.vline(range.left(), dim_y - 5.0..=dim_y + 5.0, Stroke::new(1.0, if range_hv { pal.text2 } else { pal.text3 }));
         p.vline(range.right(), dim_y - 5.0..=dim_y + 5.0, Stroke::new(1.0, if range_hv { pal.text2 } else { pal.text3 }));
-        let g = p.layout_no_wrap(len_text, crate::theme::font(12.0, crate::theme::W::Semibold), pal.text);
-        if g.size().x + 16.0 < range.width() {
-            let label = Rect::from_center_size(Pos2::new(range.center().x, dim_y), g.size() + Vec2::new(16.0, 2.0));
-            p.rect_filled(label, 0, pal.base);
-            p.galley(label.min + Vec2::new(8.0, 1.0), g, pal.text);
-        }
+        // The length itself: click it to type another (drawn last, after
+        // the timeline takes its clicks, so it gets its own).
+        let len_label = {
+            let g = p.layout_no_wrap(len_text.clone(), crate::theme::font(12.0, crate::theme::W::Semibold), pal.text);
+            let w = if self.typing_length.is_some() { 90.0 } else { g.size().x + 16.0 };
+            (w < range.width().max(110.0)).then(|| Rect::from_center_size(Pos2::new(range.center().x, dim_y), Vec2::new(w, 20.0)))
+        };
 
         // The playhead, on the start of the frame showing, with that frame's
         // width marked once zoomed in far enough to see it.
@@ -1373,6 +1428,12 @@ impl Ready {
         let hit_area = Rect::from_x_y_ranges(lanes.left() - handle_w - 4.0..=lanes.right() + handle_w + 4.0, ruler.top()..=body_bottom + LENGTH_H);
         let resp = ui.interact(hit_area, ui.id().with("timeline"), Sense::click_and_drag());
         let pointer = resp.hover_pos();
+        if let Some(label) = len_label {
+            self.length_field(ui, label, &len_text);
+        }
+        // A press on the length is the length's, not the timeline's.
+        let on_label = len_label.is_some_and(|l| ui.input(|i| i.pointer.press_origin()).is_some_and(|p| l.contains(p)));
+        let resp = if on_label { ui.interact(Rect::NOTHING, ui.id().with("timeline_off"), Sense::hover()) } else { resp };
 
         // What's under the pointer, in priority order.
         let hit = |pos: Pos2, this: &Self| -> Option<Drag> {
@@ -1672,6 +1733,18 @@ fn same_edit(a: &Edit, b: &Edit) -> bool {
         })
 }
 
+/// The kept part made `secs` long from `start`: the end moves; past the
+/// clip's end, the end stays there and the start comes back instead (as far
+/// as the clip allows). On frames, at least one long.
+fn trim_to_length(info: &media::ClipInfo, start: f64, secs: f64) -> (f64, f64) {
+    let fd = info.frame_duration();
+    if start + secs > info.duration {
+        let start = info.snap((info.duration - secs).max(0.0));
+        return (start, info.duration);
+    }
+    (start, info.snap(start + secs).max(start + fd))
+}
+
 /// The volume line, striped (so it reads as a control over the waveform, not
 /// part of it): faint where it's unchanged, bright with its points as
 /// diamonds where it's been changed.
@@ -1707,5 +1780,23 @@ fn zone(pal: &crate::theme::Pal, lin: f32) -> Color32 {
         pal.meter_y
     } else {
         pal.meter_g
+    }
+}
+
+#[cfg(test)]
+mod length_tests {
+    use super::*;
+
+    fn info() -> media::ClipInfo {
+        media::ClipInfo { duration: 60.0, fps: 60.0, width: 1920, height: 1080, video_kbps: None, audio: Vec::new(), id: None }
+    }
+
+    #[test]
+    fn typed_length_moves_the_end() {
+        assert_eq!(trim_to_length(&info(), 10.0, 12.5), (10.0, 22.5));
+        // Longer than what's left: the end stays at the clip's, the start comes back.
+        assert_eq!(trim_to_length(&info(), 50.0, 20.0), (40.0, 60.0));
+        // Longer than the whole clip: all of it.
+        assert_eq!(trim_to_length(&info(), 5.0, 90.0), (0.0, 60.0));
     }
 }

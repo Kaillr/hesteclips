@@ -1271,7 +1271,7 @@ fn clock_label(secs: u32) -> String {
 }
 
 /// A typed length, in seconds: "90", "2:30", "5 min", "45s", "1h".
-fn parse_length(text: &str) -> Option<f64> {
+pub(crate) fn parse_length(text: &str) -> Option<f64> {
     let t = text.trim().to_lowercase();
     if let Some((m, s)) = t.split_once(':') {
         return Some(m.trim().parse::<f64>().ok()? * 60.0 + s.trim().parse::<f64>().ok()?);
