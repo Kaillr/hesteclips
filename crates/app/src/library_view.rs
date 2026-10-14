@@ -9,9 +9,11 @@
 //!   game and file size (what matters when sharing); hover the size for when.
 //! - **Selection floats**: a bar rises at the bottom instead of pushing the
 //!   grid down.
-//! - **Motion**: cards slide to their new places when clips come and go or the
-//!   window changes width; a day folds with its height; hovering lifts a
-//!   card's picture a little.
+//! - **Motion**: when the grid is laid out again (another game or collection,
+//!   a search, another order, clips coming and going, another number of
+//!   columns) the cards and day headings still shown slide to their new
+//!   places and new ones fade in, instead of the page fading in again; a day
+//!   folds with its height; hovering lifts a card's picture a little.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -31,6 +33,8 @@ const MIN_CARD_W: f32 = 190.0;
 const GAP_X: f32 = 16.0;
 const GAP_Y: f32 = 22.0;
 const CAPTION_H: f32 = 48.0;
+/// A day's heading's height.
+const DAY_H: f32 = 22.0;
 /// The window is too narrow for the panel below this page width: its list
 /// moves into a menu on the title.
 const PANEL_FROM: f32 = 700.0;
@@ -209,15 +213,33 @@ impl App {
         let mut grid_ui = page_ui.new_child(egui::UiBuilder::new().max_rect(grid_rect));
         let mut tiles: Vec<crate::glass::Tile> = Vec::new();
         let mut origin = Pos2::ZERO;
-        // Another game or collection: its cards are simply in place (and
-        // arrive with the page), not sliding over from where they were.
+        // Another page: the cards are simply in place (and arrive with the
+        // page), not sliding over from where they were.
         let arriving = ui_kit::just_arrived(page_ui.ctx());
+        // (Two clips being saved at once each have their own.)
+        let mut waiting = 0;
+        let keys: Vec<Vec<String>> = groups
+            .iter()
+            .map(|(_, cards)| {
+                cards
+                    .iter()
+                    .map(|c| match c {
+                        Card::Placeholder => {
+                            waiting += 1;
+                            format!("placeholder:{waiting}")
+                        }
+                        c => card_key(c, &self.renders),
+                    })
+                    .collect()
+            })
+            .collect();
         ui_kit::arrive(&mut grid_ui, |ui| ui_kit::scroll(ui, "library_clips", |ui| {
             origin = ui.cursor().min;
             let avail = ui.available_width();
             let cols = (((avail + GAP_X) / (MIN_CARD_W + GAP_X)).floor() as usize).clamp(1, 6);
             let card_w = (avail - GAP_X * (cols - 1) as f32) / cols as f32;
             let card_h = card_w * 9.0 / 16.0 + CAPTION_H;
+            let motion = Motion::new(ui.ctx(), layout_signature(cols, &groups, &keys), arriving);
             if shown.is_empty() && placeholders == 0 {
                 self.no_results(ui, &query);
             }
@@ -226,9 +248,19 @@ impl App {
                 let folded = day.is_some_and(|d| self.folded.contains(&d));
                 if let Some(d) = day {
                     ui.add_space(if gi == 0 { 6.0 } else { 14.0 });
-                    if day_header(ui, &clips::day_label(*d), n, folded).clicked() {
+                    // The heading moves with its clips when the grid is laid out again.
+                    let key = format!("day:{d}");
+                    let slot = Rect::from_min_size(ui.cursor().min, vec2(avail, DAY_H));
+                    let (at, shown) = motion.place(ui.ctx(), &key, slot.min);
+                    motion.drawn(ui.ctx(), &key, at);
+                    let mut hui = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_size(at, slot.size())).id_salt(&key));
+                    if shown < 1.0 {
+                        hui.multiply_opacity(shown);
+                    }
+                    if day_header(&mut hui, &clips::day_label(*d), n, folded).clicked() {
                         self.folded.set(*d, !folded);
                     }
+                    ui.allocate_space(slot.size());
                     ui.add_space(12.0);
                 } else {
                     ui.add_space(6.0);
@@ -257,24 +289,26 @@ impl App {
                     }
                 }
                 if open > 0.0 {
-                    let clip = area.intersect(ui.clip_rect());
+                    // Folding: the cards are cut off at the group's edge. Open,
+                    // a card sliding to another day can pass over its own.
+                    let clip = if open < 1.0 { area.intersect(ui.clip_rect()) } else { ui.clip_rect() };
                     for (i, card) in cards.iter().enumerate() {
                         let (r, c) = (i / cols, i % cols);
                         let target = Pos2::new(top.x + c as f32 * (card_w + GAP_X), top.y + r as f32 * (card_h + GAP_Y));
-                        // Only cards on screen (or nearly) are drawn and
-                        // animate; the others are kept where they belong, so
-                        // one coming into view slides in from there.
-                        let key = card_key(card, &self.renders);
-                        let near = ui.is_rect_visible(Rect::from_min_size(target, vec2(card_w, card_h)).expand(card_h * 2.0));
-                        let pos = self.card_pos(ui.ctx(), &key, target, top, near && !arriving);
-                        if !near {
+                        let key = &keys[gi][i];
+                        let (pos, shown) = motion.place(ui.ctx(), key, target);
+                        // Only cards on screen (or nearly, or sliding from
+                        // there) are drawn.
+                        let near = |at: Pos2| ui.is_rect_visible(Rect::from_min_size(at, vec2(card_w, card_h)).expand(card_h * 2.0));
+                        if !near(target) && !near(pos) {
                             continue;
                         }
+                        motion.drawn(ui.ctx(), key, pos);
                         let rect = Rect::from_min_size(pos, vec2(card_w, card_h));
                         let mut cui = ui.new_child(egui::UiBuilder::new().max_rect(rect));
                         cui.set_clip_rect(clip);
-                        if open < 1.0 {
-                            cui.multiply_opacity(open);
+                        if open * shown < 1.0 {
+                            cui.multiply_opacity(open * shown);
                         }
                         match card {
                             Card::Placeholder => self.placeholder_card(&mut cui, rect),
@@ -320,17 +354,6 @@ impl App {
             self.hover_play = None;
         }
         self.do_action(ui.ctx(), frame, action, &shown);
-    }
-
-    /// Where a card is drawn: sliding to `target` when its place changes.
-    /// Places are relative to the group's top, so scrolling doesn't animate.
-    fn card_pos(&mut self, ctx: &egui::Context, key: &str, target: Pos2, origin: Pos2, animate: bool) -> Pos2 {
-        let id = egui::Id::new(("card_pos", key));
-        let rel = target - origin;
-        let secs = if animate { theme::NORMAL * 1.4 } else { 0.0 };
-        let x = theme::value(ctx, id.with("x"), rel.x, secs);
-        let y = theme::value(ctx, id.with("y"), rel.y, secs);
-        origin + vec2(x, y)
     }
 
     /// What a filter is called.
@@ -1215,12 +1238,102 @@ impl App {
     }
 }
 
-/// A key the grid's card animation follows a card by.
+/// A key the grid's card animation follows a card by. A new clip being
+/// made has the key of the clip it becomes, so its card simply stays.
 fn card_key(card: &Card, renders: &[crate::RenderJob]) -> String {
     match card {
         Card::Placeholder => "placeholder".into(),
-        Card::NewRender(i) => format!("render:{}", renders.get(*i).map(|r| r.dest.display().to_string()).unwrap_or_default()),
+        Card::NewRender(i) => renders.get(*i).map(|r| r.dest.display().to_string()).unwrap_or_default(),
         Card::Clip(c) => c.path.display().to_string(),
+    }
+}
+
+/// What the grid's layout is made of: the columns, the days and the cards
+/// in order. When it changes, the grid is laid out again (see [`Motion`]).
+fn layout_signature(cols: usize, groups: &[(Option<chrono::NaiveDate>, Vec<Card>)], keys: &[Vec<String>]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    cols.hash(&mut h);
+    for ((day, _), keys) in groups.iter().zip(keys) {
+        day.hash(&mut h);
+        keys.hash(&mut h);
+    }
+    h.finish()
+}
+
+/// How things on the grid move when it's laid out again (another game or
+/// collection, a search, another order, clips coming and going, another
+/// number of columns): what was on screen slides from where it was to its new
+/// place, what wasn't fades in where it lands, and what's gone goes at once.
+/// The page itself doesn't fade in again. Places are on screen, so a slide
+/// still starts where the card was when the grid scrolls back to the top.
+struct Motion {
+    relaid: bool,
+    now: f64,
+    pass: u64,
+}
+
+/// One card's (or day heading's) motion.
+#[derive(Clone, Copy)]
+struct Moved {
+    /// Where it was drawn, on screen, and in which pass.
+    at: Pos2,
+    pass: u64,
+    /// The slide: how far from its place it started, and when.
+    from: Vec2,
+    start: f64,
+    /// It came into view with a new layout: fading in since then.
+    fade: Option<f64>,
+}
+
+const SLIDE: f32 = theme::NORMAL * 1.4;
+const FADE: f32 = theme::NORMAL * 1.4;
+
+impl Motion {
+    /// `layout`: the grid's [`layout_signature`] now. Arriving from another
+    /// page, everything's simply in place.
+    fn new(ctx: &egui::Context, layout: u64, arriving: bool) -> Self {
+        let (now, pass) = (ctx.input(|i| i.time), ctx.cumulative_pass_nr());
+        let id = egui::Id::new("library_layout");
+        let before = ctx.data(|d| d.get_temp::<u64>(id));
+        if before != Some(layout) {
+            ctx.data_mut(|d| d.insert_temp(id, layout));
+        }
+        Motion { relaid: before.is_some_and(|b| b != layout) && !arriving, now, pass }
+    }
+
+    /// Where `key`, whose place is `target` (on screen), is drawn now, and
+    /// how visible it is.
+    fn place(&self, ctx: &egui::Context, key: &str, target: Pos2) -> (Pos2, f32) {
+        let id = egui::Id::new(("grid_motion", key));
+        let mut moved = ctx.data(|d| d.get_temp::<Moved>(id));
+        if self.relaid {
+            let next = match moved.filter(|m| m.pass + 1 == self.pass) {
+                // Drawn just now: it slides from there (still fading in, if it was).
+                Some(m) => Moved { from: m.at - target, start: self.now, ..m },
+                None => Moved { at: target, pass: 0, from: Vec2::ZERO, start: self.now, fade: Some(self.now) },
+            };
+            ctx.data_mut(|d| d.insert_temp(id, next));
+            moved = Some(next);
+        }
+        let Some(m) = moved else { return (target, 1.0) };
+        let slide = ((self.now - m.start) as f32 / SLIDE).clamp(0.0, 1.0);
+        let fade = m.fade.map_or(1.0, |f| ((self.now - f) as f32 / FADE).clamp(0.0, 1.0));
+        if (slide < 1.0 && m.from != Vec2::ZERO) || fade < 1.0 {
+            ctx.request_repaint();
+        }
+        (target + m.from * (1.0 - theme::ease_out(slide)), theme::ease_out(fade))
+    }
+
+    /// `key` was drawn at `at` (on screen): a new layout slides it from there.
+    fn drawn(&self, ctx: &egui::Context, key: &str, at: Pos2) {
+        let id = egui::Id::new(("grid_motion", key));
+        let pass = self.pass;
+        ctx.data_mut(|d| {
+            let m = d.get_temp_mut_or_insert_with(id, || Moved { at, pass, from: Vec2::ZERO, start: 0.0, fade: None });
+            m.at = at;
+            m.pass = pass;
+        });
     }
 }
 
@@ -1281,7 +1394,7 @@ fn day_header(ui: &mut egui::Ui, label: &str, clips: usize, folded: bool) -> egu
     let count = if clips == 1 { "1 clip".to_owned() } else { format!("{clips} clips") };
     let cg = ui.painter().layout_no_wrap(count, theme::font(13.0, W::Regular), p.text3);
     let w = 18.0 + lg.size().x + 8.0 + cg.size().x;
-    let (rect, resp) = ui.allocate_exact_size(vec2(w, 22.0), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(vec2(w, DAY_H), Sense::click());
     let turn = theme::toggle(ui.ctx(), id.with("turn"), folded, theme::NORMAL);
     let hv = theme::toggle(ui.ctx(), id.with("hv"), resp.hovered(), theme::FAST);
     // ∨ open, › folded: the chevron turns.
@@ -1476,4 +1589,52 @@ fn view_menu(ui: &mut egui::Ui, filter: &Filter) -> Option<Action> {
         Filter::All | Filter::Loose => {}
     }
     action
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One frame at `time`: the layout `layout`, card "a" at `a` and, when
+    /// given, card "b" at `b`. Returns where each is drawn and how visible.
+    fn frame(ctx: &egui::Context, time: f64, layout: u64, arriving: bool, a: Pos2, b: Option<Pos2>) -> ((Pos2, f32), Option<(Pos2, f32)>) {
+        let raw = egui::RawInput { time: Some(time), screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0))), ..Default::default() };
+        let mut out = None;
+        let mut done = ctx.run_ui(raw, |ui| {
+            let m = Motion::new(ui.ctx(), layout, arriving);
+            let ra = m.place(ui.ctx(), "a", a);
+            m.drawn(ui.ctx(), "a", ra.0);
+            let rb = b.map(|b| {
+                let r = m.place(ui.ctx(), "b", b);
+                m.drawn(ui.ctx(), "b", r.0);
+                r
+            });
+            out = Some((ra, rb));
+        });
+        done.textures_delta.clear();
+        out.unwrap()
+    }
+
+    /// Another layout (a filter): a card still shown slides from where it
+    /// was and lands; a new one fades in where it belongs; from another
+    /// page, everything is simply in place.
+    #[test]
+    fn the_grid_rearranges() {
+        let ctx = egui::Context::default();
+        let (p1, p2, q) = (Pos2::new(0.0, 300.0), Pos2::new(0.0, 0.0), Pos2::new(200.0, 0.0));
+        assert_eq!(frame(&ctx, 0.0, 1, false, p1, None).0, (p1, 1.0));
+        // The filter changes: "a" moves up, "b" appears.
+        let (a, b) = frame(&ctx, 1.0, 2, false, p2, Some(q));
+        assert_eq!(a, (p1, 1.0), "starts where it was");
+        assert_eq!(b.unwrap(), (q, 0.0), "a new card starts unseen, in its place");
+        let (a, b) = frame(&ctx, 1.0 + f64::from(SLIDE) / 2.0, 2, false, p2, Some(q));
+        assert!(a.0.y > p2.y && a.0.y < p1.y, "half way: {:?}", a.0);
+        assert!(b.unwrap().1 > 0.0 && b.unwrap().1 < 1.0);
+        let (a, b) = frame(&ctx, 2.0, 2, false, p2, Some(q));
+        assert_eq!(a, (p2, 1.0));
+        assert_eq!(b.unwrap(), (q, 1.0));
+        // Another page and back: in place at once.
+        let (a, _) = frame(&ctx, 3.0, 3, true, p1, None);
+        assert_eq!(a, (p1, 1.0));
+    }
 }

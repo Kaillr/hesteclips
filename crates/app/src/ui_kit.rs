@@ -186,8 +186,8 @@ fn page_arrived_id() -> egui::Id {
     egui::Id::new("ui_kit_page_arrived")
 }
 
-/// Another page (or game, or collection) is shown from this frame: its
-/// content arrives with [`arrive`]. Set by the app.
+/// Another page is shown from this frame: its content arrives with
+/// [`arrive`]. Set by the app.
 pub fn page_changed(ctx: &egui::Context) {
     let now = ctx.input(|i| i.time);
     ctx.data_mut(|d| d.insert_temp(page_arrived_id(), now));

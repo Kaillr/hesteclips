@@ -1001,8 +1001,9 @@ impl eframe::App for App {
             (*page != view.0 && !matches!(page, Page::Edit | Page::View)) || (*filter != view.1 && view.0 == Page::Clips)
         });
         ui_kit::set_scroll_reset(&ctx, reset);
-        // Another page's content fades in and rises.
-        let arrived = self.last_view.as_ref().is_some_and(|(page, filter, naming)| *page != view.0 || (*filter != view.1 && view.0 == Page::Clips) || *naming != view.2);
+        // Another page's content fades in and rises. (Another game or
+        // collection doesn't: the grid rearranges itself.)
+        let arrived = self.last_view.as_ref().is_some_and(|(page, _, naming)| *page != view.0 || *naming != view.2);
         if arrived {
             ui_kit::page_changed(&ctx);
         }
