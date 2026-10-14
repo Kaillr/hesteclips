@@ -168,7 +168,6 @@ impl App {
                 CardAction::MoveUp if i > 0 => move_up = Some(i),
                 CardAction::Listen => self.toggle_listening(i),
                 CardAction::Locked => self.toast_icon(egui_phosphor::regular::LOCK_SIMPLE, locked.unwrap_or_default().trim_end_matches('.')),
-                CardAction::NoiseRemoval(on) => self.toast_icon(egui_phosphor::regular::MAGIC_WAND, if on { "Background noise removal on" } else { "Background noise removal off" }),
                 _ => {}
             }
             // Volume applies live, even mid-recording.
@@ -803,7 +802,6 @@ enum CardAction {
     Listen,
     /// Something locked while capturing was clicked: say why.
     Locked,
-    NoiseRemoval(bool),
 }
 
 /// Hearing a microphone live: which source, from which device.
@@ -1011,20 +1009,32 @@ fn source_card(
             crate::ui_kit::info(ui, "Where it goes", "Clip sound: part of what everyone hears when you play or share a clip. Own track: also kept on its own, so you can change its volume later in the editor.");
             if matches!(source.kind, SourceKind::Microphone { .. }) {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Listen: something you do for a moment, so a button, with
+                    // its word; lit while you're listening.
                     let on = listening.is_some();
                     let tip = if on { "Stop listening" } else { "Listen through your headphones, to check it works and how it sounds" };
-                    if Btn::icon(if on { Kind::On } else { Kind::Ghost }, icon::HEADPHONES).small().tip(tip).show(ui).clicked() {
+                    let btn = if on { Btn::new(Kind::On, "Listening") } else { Btn::ghost("Listen") };
+                    if btn.with_icon(icon::HEADPHONES).small().id(("listen", source.id.as_str())).tip(tip).show(ui).clicked() {
                         action = CardAction::Listen;
-                    }
-                    let nr = source.noise_removal;
-                    let tip = format!("Remove background noise: {}. Takes out steady sounds behind your voice (fans, a keyboard, hum) and keeps your voice.", if nr { "on" } else { "off" });
-                    if Btn::icon(if nr { Kind::On } else { Kind::Ghost }, icon::MAGIC_WAND).small().tip(tip).show(ui).clicked() {
-                        source.noise_removal = !nr;
-                        action = CardAction::NoiseRemoval(!nr);
                     }
                 });
             }
         });
+        // Noise reduction: a setting of the mic that stays on, so a switch
+        // with its name, as every other on/off setting is.
+        if matches!(source.kind, SourceKind::Microphone { .. }) {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(theme::text("Noise reduction", 13.0, W::Regular).color(pal.text));
+                crate::ui_kit::info(ui, "Noise reduction", "Takes out steady sounds behind your voice (fans, a keyboard, hum) and keeps your voice. Changes apply straight away.");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let mut nr = source.noise_removal;
+                    if crate::ui_kit::switch(ui, &mut nr).on_hover_text(if nr { "On: background noise is taken out" } else { "Off" }).clicked() {
+                        source.noise_removal = nr;
+                    }
+                });
+            });
+        }
         if let Some(latency) = listening {
             ui.add_space(6.0);
             let ms = latency.map_or(String::new(), |ms| format!(", {ms:.0} ms delay"));
