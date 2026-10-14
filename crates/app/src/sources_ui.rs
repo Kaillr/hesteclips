@@ -20,8 +20,6 @@ const FADER_MIN_DB: f32 = -60.0;
 const FADER_MAX_DB: f32 = 12.0;
 /// How long the "limiting" note stays after the limiter last worked.
 const LIMIT_HOLD: Duration = Duration::from_secs(3);
-/// One column never gets wider than this.
-const MAX_WIDTH: f32 = 680.0;
 /// Picture and sound side by side from this page width.
 const TWO_COLUMNS: f32 = 860.0;
 
@@ -113,7 +111,6 @@ impl App {
                     });
                 });
             } else {
-                let w = w.min(MAX_WIDTH);
                 ui.vertical(|ui| {
                     ui.set_width(w);
                     if capture::preview::AVAILABLE {
