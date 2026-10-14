@@ -123,6 +123,9 @@ struct Ready {
     confirm_revert: bool,
     /// The Save as new name was selected for typing over.
     save_as_focused: bool,
+    /// The clip's kills and your markers, as pins (the editor shows the
+    /// whole recording, which they're kept for).
+    moments: Vec<crate::transport::Moment>,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -316,6 +319,7 @@ impl Ready {
             was_playing: false,
             confirm_revert: false,
             save_as_focused: false,
+            moments: crate::moments::of(&target.clip).pins(full),
         }
     }
 
@@ -683,9 +687,8 @@ impl Ready {
         use crate::ui_kit::{Btn, Kind};
         use egui_phosphor::regular as icon;
         let t = self.player.time();
-        let moments: Vec<crate::transport::Moment> = Vec::new();
-        let prev = moments.iter().rev().find(|m| m.t < t - 0.05).cloned();
-        let next = moments.iter().find(|m| m.t > t + 0.05).cloned();
+        let prev = self.moments.iter().rev().find(|m| m.t < t - 0.05).cloned();
+        let next = self.moments.iter().find(|m| m.t > t + 0.05).cloned();
         let (mut undo, mut redo, mut set_in, mut set_out, mut play, mut jump) = (false, false, false, false, false, None);
         let (mut zoom_by, mut zoom_to) = (None, None);
         let mut frames = self.show_frames;
@@ -730,7 +733,7 @@ impl Ready {
                 if Btn::icon(kind(self.looping), icon::REPEAT).tip("Loop the kept part").show(ui).clicked() {
                     self.looping = !self.looping;
                 }
-                if Btn::icon(kind(self.snap), icon::MAGNET).tip("Snapping  (N): edges snap to the playhead and the clip's ends").show(ui).clicked() {
+                if Btn::icon(kind(self.snap), icon::MAGNET).tip("Snapping  (N): edges snap to the playhead, the clip's ends and its moments").show(ui).clicked() {
                     self.snap = !self.snap;
                 }
             }
@@ -823,6 +826,7 @@ impl Ready {
         }
         let reach = 8.0 / px_per_s.max(1e-6);
         let mut targets = vec![0.0, self.info.duration];
+        targets.extend(self.moments.iter().map(|m| m.t));
         if except != Some(Drag::Playhead) {
             targets.push(self.info.snap(self.player.time()));
         }
@@ -1078,7 +1082,14 @@ impl Ready {
 
         // --- Ruler ---
         let ruler = Rect::from_min_size(Pos2::new(lanes.left(), outer.top()), Vec2::new(lanes.width(), RULER_H));
-        crate::transport::ruler(ui, ruler, (v0, span), self.info.fps, self.show_frames, &[]);
+        // Pins: click one to go there (markers are added and taken away
+        // while watching).
+        let moments = std::mem::take(&mut self.moments);
+        let pinned = crate::transport::ruler(ui, ruler, (v0, span), self.info.fps, self.show_frames, &moments, false);
+        self.moments = moments;
+        if let Some(crate::transport::Pinned::Go(t)) = pinned {
+            self.player.seek(t);
+        }
         // Zoomed in: which part of the clip is showing, along the ruler's top.
         let zoomed = theme_fade(&ctx, "ed_zoomed", span < dur - 1e-9);
         if zoomed > 0.0 {

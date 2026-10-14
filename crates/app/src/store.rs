@@ -62,7 +62,7 @@ pub fn set_library(lib: &Path) {
 
 /// The library a clip belongs to: the folder above its own when that's the
 /// library (a game's folder), else its own folder.
-fn library_of(clip: &Path) -> PathBuf {
+pub fn library_of(clip: &Path) -> PathBuf {
     let dir = clip.parent().unwrap_or(Path::new("."));
     let lib = LIBRARY.read().ok().and_then(|l| l.clone());
     match lib {
@@ -215,6 +215,11 @@ pub fn free_up(target: &EditTarget, how: FreeUp, permanently: bool) -> Result<u6
     let size = |p: &Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
     match how {
         FreeUp::Delete => {
+            // The saved clip becomes the recording: its moments are now
+            // counted from its own start.
+            if let (Some(edit), Ok(info)) = (load_edit(target), media::probe(&original)) {
+                crate::moments::rebase(&target.clip, &target.clip, info.duration, edit.start, edit.end - edit.start);
+            }
             let dir = assets_dir(lib, id);
             let freed = std::fs::read_dir(&dir).map(|d| d.flatten().map(|e| size(&e.path())).sum()).unwrap_or(0);
             // The editor or player that just closed may still hold the
@@ -253,6 +258,7 @@ pub fn free_up(target: &EditTarget, how: FreeUp, permanently: bool) -> Result<u6
             };
             let before = size(&original);
             let edit = edit.shifted(from - at);
+            crate::moments::rebase(&target.clip, &target.clip, info.duration, from - at, to - from + at);
             // The edit first: should the swap fail, the old edit goes back.
             let old = std::fs::read(edit_path(lib, id)).map_err(|e| e.to_string())?;
             std::fs::write(edit_path(lib, id), serde_json::to_vec_pretty(&edit).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;

@@ -193,9 +193,18 @@ pub fn clock(t: f64) -> String {
     if h > 0 { format!("{h}:{m:02}:{s:02}.{c:02}") } else { format!("{m}:{s:02}.{c:02}") }
 }
 
+/// What was done on the ruler's pins.
+pub enum Pinned {
+    /// Clicked: go there.
+    Go(f64),
+    /// Your marker there removed (from its right-click menu).
+    Remove(f64),
+}
+
 /// The ruler over the timeline: ticks and times for `view` (start, length in
-/// seconds), and the moments as pins. Returns a moment clicked.
-pub fn ruler(ui: &mut egui::Ui, rect: Rect, view: (f64, f64), fps: f64, frames: bool, moments: &[Moment]) -> Option<f64> {
+/// seconds), and the moments as pins. `removable`: your markers can be taken
+/// away from their right-click menu.
+pub fn ruler(ui: &mut egui::Ui, rect: Rect, view: (f64, f64), fps: f64, frames: bool, moments: &[Moment], removable: bool) -> Option<Pinned> {
     let p = theme::pal(ui);
     let painter = ui.painter_at(rect.expand2(vec2(10.0, 0.0)));
     let (v0, span) = view;
@@ -211,7 +220,12 @@ pub fn ruler(ui: &mut egui::Ui, rect: Rect, view: (f64, f64), fps: f64, frames: 
         if x >= rect.left() - 1.0 {
             painter.vline(x, rect.bottom() - 8.0..=rect.bottom() - 4.0, Stroke::new(1.0, theme::fade(p.text3, 0.6)));
             let label = if frames { format!("{}", (t * fps).round() as u64) } else { short_clock(t, step) };
-            painter.text(Pos2::new(x + 4.0, rect.bottom() - 13.0), Align2::LEFT_BOTTOM, label, theme::font(11.0, W::Regular), p.text3);
+            let g = painter.layout_no_wrap(label, theme::font(11.0, W::Regular), p.text3);
+            // A pin over its time hides it: the pin is what matters there.
+            let span_x = x + 4.0 - 12.0..=x + 4.0 + g.size().x + 12.0;
+            if !moments.iter().any(|m| span_x.contains(&x_of(m.t))) {
+                painter.galley(Pos2::new(x + 4.0, rect.bottom() - 13.0 - g.size().y), g, p.text3);
+            }
         }
         for k in 1..minor {
             let xm = x + (step * px_per_s) as f32 * k as f32 / minor as f32;
@@ -237,8 +251,15 @@ pub fn ruler(ui: &mut egui::Ui, rect: Rect, view: (f64, f64), fps: f64, frames: 
         painter.circle_filled(c, r, fill);
         let glyph = if m.marker { egui_phosphor::fill::FLAG } else { icon::CROSSHAIR_SIMPLE };
         painter.text(c, Align2::CENTER_CENTER, glyph, FontId::new(11.0, if m.marker { theme::fill_family() } else { egui::FontFamily::Proportional }), fg);
-        if resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(&m.label).clicked() {
-            clicked = Some(m.t);
+        let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(&m.label);
+        if resp.clicked() {
+            clicked = Some(Pinned::Go(m.t));
+        }
+        if m.marker && removable {
+            let t = m.t;
+            if crate::ui_kit::context_menu(&resp, 200.0, |ui| crate::ui_kit::Item::new("Remove marker").icon(icon::TRASH).show(ui).clicked()).unwrap_or(false) {
+                clicked = Some(Pinned::Remove(t));
+            }
         }
     }
     clicked

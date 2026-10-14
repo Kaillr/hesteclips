@@ -12,11 +12,13 @@ use std::time::Duration;
 
 use capture::{EncodeSettings, Mode};
 
+use crate::games::Details;
+
 enum Cmd {
     Start(Mode, EncodeSettings),
     /// Save the replay buffer as a clip in this folder, its name ending in what
     /// happened in the game, if known.
-    SaveClip(PathBuf, Option<String>),
+    SaveClip(PathBuf, Details),
     /// Change what the running capture records, if it can without a restart.
     UpdateVideo(capture::VideoSource),
     /// How far back the running replay buffer reaches.
@@ -24,7 +26,7 @@ enum Cmd {
     /// Switch a microphone source (by id) to another device.
     SetMic(String, String),
     /// Stop; a recording goes into this folder, named after what happened.
-    Stop(Option<PathBuf>, Option<String>),
+    Stop(Option<PathBuf>, Details),
     /// Stop, then signal once the file is finished (app being killed).
     StopAndAck(Sender<()>),
     /// The app is closing: end the thread (dropping the recorder finishes any
@@ -131,7 +133,7 @@ impl CaptureService {
                         Ok(pending) => {
                             let evt_tx = evt_tx.clone();
                             thread::spawn(move || match pending.finish() {
-                                Ok(path) => send(&evt_tx, Evt::Saved(named(path, details))),
+                                Ok(path) => send(&evt_tx, Evt::Saved(landed(path, details))),
                                 Err(e) => {
                                     eprintln!("saving a clip failed: {e:#}");
                                     send(&evt_tx, Evt::Error(describe(&e)));
@@ -154,7 +156,7 @@ impl CaptureService {
                     }
                     Cmd::Stop(dir, details) => {
                         match recorder.stop(dir.as_deref()) {
-                            Ok(Some(path)) => send(&evt_tx, Evt::Saved(named(path, details))),
+                            Ok(Some(path)) => send(&evt_tx, Evt::Saved(landed(path, details))),
                             Ok(None) => {}
                             Err(e) => send(&evt_tx, Evt::Error(describe(&e))),
                         }
@@ -181,10 +183,10 @@ impl CaptureService {
         QuickSave { tx, games, armed: Default::default() }
     }
 
-    pub fn save_clip(&self, dir: PathBuf, details: Option<String>) {
+    pub fn save_clip(&self, dir: PathBuf, details: Details) {
         self.send(Cmd::SaveClip(dir, details));
     }
-    pub fn stop(&self, dir: Option<PathBuf>, details: Option<String>) {
+    pub fn stop(&self, dir: Option<PathBuf>, details: Details) {
         self.send(Cmd::Stop(dir, details));
     }
     pub fn update_video(&self, video: capture::VideoSource) {
@@ -246,6 +248,16 @@ impl Drop for CaptureService {
 
 fn send(tx: &Sender<Evt>, evt: Evt) {
     let _ = tx.send(evt);
+}
+
+/// A just-saved clip: named after what happened in the game, its moments
+/// kept with it.
+fn landed(path: PathBuf, details: Details) -> PathBuf {
+    let path = named(path, details.summary);
+    if !details.moments.is_empty() {
+        crate::moments::keep(&path, &details.moments);
+    }
+    path
 }
 
 /// A just-saved clip, renamed to end in what happened in the game:

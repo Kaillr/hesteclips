@@ -28,6 +28,7 @@ mod glass;
 #[cfg(target_os = "linux")]
 mod linux_desktop;
 mod meter;
+mod moments;
 mod nav;
 mod player;
 #[cfg(target_os = "linux")]
@@ -1637,7 +1638,11 @@ impl App {
             };
             let rendered = media::render_with_progress(&target.source, &info, &edit, &dest, clip_id.as_deref(), report).map_err(|e| e.to_string());
             let result = match &clip_id {
-                None => rendered.map(|()| dest),
+                None => rendered.map(|()| {
+                    // A new clip of part of this one: the moments in that part.
+                    moments::rebase(&target.clip, &dest, info.duration, edit.start, edit.end - edit.start);
+                    dest
+                }),
                 Some(clip_id) => {
                     let committed = rendered.and_then(|()| store::commit_render(&target, &dest, clip_id, &edit).map_err(|e| e.to_string()));
                     if committed.is_err() {
@@ -1795,7 +1800,7 @@ impl App {
             RecState::Recording => self.stop(),
             // One keypress should do what the user means: stop buffering, record.
             RecState::Buffering => {
-                self.service.stop(None, None);
+                self.service.stop(None, games::Details::default());
                 self.start_recording();
             }
         }
@@ -1848,7 +1853,7 @@ impl App {
     }
 
     fn stop(&mut self) {
-        let (mut dir, mut details) = (None, None);
+        let (mut dir, mut details) = (None, games::Details::default());
         if self.rec_state == RecState::Recording {
             self.saving += 1; // finishing the file
             dir = Some(self.clip_folder());

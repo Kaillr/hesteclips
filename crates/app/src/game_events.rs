@@ -36,6 +36,8 @@ const CFG_NAME: &str = "gamestate_integration_hesteclips.cfg";
 /// recording's summary only needs its kills, kept up to the cap).
 const KEEP: Duration = Duration::from_secs(4 * 3600);
 const MAX_EVENTS: usize = 5000;
+/// An ace or multikill this close to a kill is that kill's (see `moments`).
+const MERGE: Duration = Duration::from_millis(1500);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Game {
@@ -153,6 +155,45 @@ impl Events {
 }
 
 /// Read osu! twice a second while its names are wanted.
+impl Events {
+    /// The kills (and aces, multikills) from `since` to `until`, for a clip
+    /// spanning that time: how long before `until` each was, and what to
+    /// call it ("Headshot", "Ace", "Triple kill"). Only games whose
+    /// details are turned on.
+    pub fn moments(&self, since: Instant, until: Instant) -> Vec<(Duration, String)> {
+        let Some(options) = self.options.lock().unwrap().clone() else { return Vec::new() };
+        let on = |g: Game| match g {
+            Game::Cs2 => options.cs2,
+            Game::Dota2 => options.dota2,
+            Game::League => options.league,
+        };
+        let s = self.state.lock().unwrap();
+        let mut out: Vec<(Duration, String)> = Vec::new();
+        for e in s.events.iter().filter(|e| e.at >= since && e.at <= until && on(e.game)) {
+            let ago = until.saturating_duration_since(e.at);
+            let label = match e.kind {
+                Kind::Kill { headshot: true, .. } => "Headshot".to_owned(),
+                Kind::Kill { .. } => "Kill".to_owned(),
+                Kind::Ace => "Ace".to_owned(),
+                Kind::Multikill(n) => match n {
+                    2..=5 => ["Double kill", "Triple kill", "Quadra kill", "Pentakill"][(n - 2) as usize].to_owned(),
+                    _ => format!("{n} kills"),
+                },
+            };
+            // An ace or multikill comes with the kill that made it: that
+            // kill is called by it, not pinned twice.
+            if matches!(e.kind, Kind::Ace | Kind::Multikill(_))
+                && let Some(last) = out.last_mut().filter(|(a, _)| a.abs_diff(ago) <= MERGE)
+            {
+                last.1 = label;
+                continue;
+            }
+            out.push((ago, label));
+        }
+        out
+    }
+}
+
 fn poll_osu(events: &Events) {
     let mut reader = crate::osu_plays::Reader::new();
     loop {
@@ -682,6 +723,25 @@ mod tests {
         assert!(t.update(&data).is_empty(), "events are only counted once");
         let found = found.into_iter().map(|(_, k, c)| (k, c)).collect();
         assert_eq!(summary_of(found, Game::League).as_deref(), Some("Double kill as Jinx"));
+    }
+
+    #[test]
+    fn moments_pin_each_kill_once() {
+        let titles = GameTitles { league: true, ..GameTitles::default() };
+        let events = Events { state: Default::default(), options: Arc::new(Mutex::new(Some(titles))), installed: Default::default() };
+        let now = Instant::now();
+        {
+            let mut s = events.state.lock().unwrap();
+            let kill = Kind::Kill { headshot: false, round: 0 };
+            s.push(now - Duration::from_secs(20), Game::League, kill.clone(), None);
+            s.push(now - Duration::from_secs(8), Game::League, kill, None);
+            // The multikill comes with the second kill: it names it.
+            s.push(now - Duration::from_secs(8), Game::League, Kind::Multikill(2), None);
+            // Before the clip.
+            s.push(now - Duration::from_secs(90), Game::League, Kind::Kill { headshot: false, round: 0 }, None);
+        }
+        let m = events.moments(now - Duration::from_secs(60), now);
+        assert_eq!(m, vec![(Duration::from_secs(20), "Kill".to_owned()), (Duration::from_secs(8), "Double kill".to_owned())]);
     }
 
     #[test]

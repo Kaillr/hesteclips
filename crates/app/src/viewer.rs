@@ -79,6 +79,9 @@ struct Loaded {
     info: ClipInfo,
     /// The mix, filling in as it's decoded (it plays from the start at once).
     pcm: Arc<Pcm>,
+    /// Where this file starts in the recording and how long that was: an
+    /// edited clip is part of its original (moments are kept for that).
+    span: (f64, f64),
 }
 
 enum State {
@@ -127,6 +130,11 @@ struct Ready {
     show_frames: bool,
     /// The big play / pause sign after a click on the picture: which, and when.
     flash_play: Option<(bool, Instant)>,
+    /// The clip's kills and your markers (see `moments.rs`), and where this
+    /// file sits in the recording they're kept for.
+    moments: crate::moments::Moments,
+    span: (f64, f64),
+    clip: PathBuf,
 }
 
 impl Viewer {
@@ -155,7 +163,8 @@ impl Viewer {
                         eprintln!("{:>8.3} viewer: sound all decoded", crate::player::uptime());
                     }
                 });
-                Ok(Loaded { info, pcm })
+                let span = recording_span(&src, info.duration);
+                Ok(Loaded { info, pcm, span })
             })();
             if let Err(e) = &result {
                 eprintln!("couldn't open {} in the player: {e}", src.display());
@@ -307,6 +316,7 @@ impl Viewer {
         // While its edit saves, the clip's file is about to change.
         let ready = !matches!(self.state, State::Saving);
         let wait = "Wait for the edit to finish saving";
+        let mut mark = false;
         let (back, rename) = crate::transport::header(
             ui,
             &title,
@@ -350,6 +360,9 @@ impl Viewer {
                     if Item::new("Rename…").icon(icon::PENCIL_SIMPLE).keys(Some(vec!["F2".into()])).show(ui).clicked() {
                         out = ViewerOutcome::Rename;
                     }
+                    if Item::new("Add a marker here").icon(icon::FLAG).keys(Some(vec!["B".into()])).enabled(matches!(self.state, State::Ready(_))).tip("A pin on the timeline to come back to: [ and ] jump between them").show(ui).clicked() {
+                        mark = true;
+                    }
                     if Item::new("Open in another player").icon(icon::ARROW_SQUARE_OUT).show(ui).clicked() {
                         out = ViewerOutcome::OpenExternal;
                     }
@@ -380,6 +393,9 @@ impl Viewer {
         }
         if rename {
             out = ViewerOutcome::Rename;
+        }
+        if mark && let State::Ready(r) = &mut self.state {
+            r.toggle_marker();
         }
         out
     }
@@ -415,6 +431,9 @@ impl Ready {
             drag_out: false,
             show_frames: false,
             flash_play: None,
+            moments: crate::moments::of(clip),
+            span: l.span,
+            clip: clip.to_path_buf(),
         };
         r.apply_volume(ctx);
         r.player.set_speed(r.speed);
@@ -427,6 +446,30 @@ impl Ready {
         self.speed = speed;
         self.player.set_speed(speed);
         ctx.data_mut(|d| d.insert_temp(speed_id(), speed));
+    }
+
+    /// The clip's moments as pins on this file's timeline.
+    fn pins(&self) -> Vec<crate::transport::Moment> {
+        let (start, recording) = self.span;
+        let mut pins = self.moments.pins(recording);
+        for m in &mut pins {
+            m.t -= start;
+        }
+        pins.retain(|m| (0.0..=self.info.duration).contains(&m.t));
+        pins
+    }
+
+    /// Add a marker where the playhead is (`B`), or take away the one
+    /// that's there.
+    fn toggle_marker(&mut self) {
+        let t = self.info.snap(self.player.time());
+        let at = t + self.span.0;
+        if let Some(&m) = self.moments.markers.iter().find(|m| (*m - at).abs() < self.info.frame_duration().max(0.02)) {
+            crate::moments::remove_marker(&self.clip, m);
+        } else {
+            crate::moments::add_marker(&self.clip, at);
+        }
+        self.moments = crate::moments::of(&self.clip);
     }
 
     /// One step faster (`up`) or slower through [`SPEEDS`].
@@ -608,7 +651,7 @@ impl Ready {
         let ctx = ui.ctx().clone();
         let bar = Rect::from_min_size(ui.cursor().min, Vec2::new(ui.available_width(), crate::transport::BAR_H));
         ui.allocate_rect(bar, Sense::hover());
-        let moments: Vec<crate::transport::Moment> = Vec::new();
+        let moments = self.pins();
         let t = self.player.time();
         let prev = moments.iter().rev().find(|m| m.t < t - 0.05).cloned();
         let next = moments.iter().find(|m| m.t > t + 0.05).cloned();
@@ -694,8 +737,13 @@ impl Ready {
         let x_of = |t: f64| outer.left() + (t / dur) as f32 * outer.width();
         let t_of = |x: f32| ((x - outer.left()) / outer.width()).clamp(0.0, 1.0) as f64 * dur;
 
-        if let Some(t) = crate::transport::ruler(ui, ruler, (0.0, dur), self.info.fps, self.show_frames, moments) {
-            self.seek(t);
+        match crate::transport::ruler(ui, ruler, (0.0, dur), self.info.fps, self.show_frames, moments, true) {
+            Some(crate::transport::Pinned::Go(t)) => self.seek(t),
+            Some(crate::transport::Pinned::Remove(t)) => {
+                crate::moments::remove_marker(&self.clip, t + self.span.0);
+                self.moments = crate::moments::of(&self.clip);
+            }
+            None => {}
         }
         painter.rect_filled(video, 5, p.raise2);
         self.strip.paint(ui, video, 0.0, dur, dur);
@@ -794,6 +842,19 @@ impl Ready {
         let (slower, faster) = ctx.input_mut(|i| (i.consume_key(egui::Modifiers::SHIFT, Key::Comma), i.consume_key(egui::Modifiers::SHIFT, Key::Period)));
         if slower || faster {
             self.step_speed(ctx, faster);
+        }
+        // [ and ]: the previous or next moment. B: a marker here.
+        let (back, ahead, mark) = ctx.input_mut(|i| (i.consume_key(none, Key::OpenBracket), i.consume_key(none, Key::CloseBracket), i.consume_key(none, Key::B)));
+        if back || ahead {
+            let t = self.player.time();
+            let pins = self.pins();
+            let to = if ahead { pins.iter().find(|m| m.t > t + 0.05) } else { pins.iter().rev().find(|m| m.t < t - 0.05) };
+            if let Some(m) = to {
+                self.seek(m.t);
+            }
+        }
+        if mark {
+            self.toggle_marker();
         }
         let (space, k, left, right, j, l, mut comma, mut period, home, end, m, mut held) = ctx.input_mut(|i| {
             // A held key's repeats: looked at before the presses are taken.
@@ -999,6 +1060,18 @@ pub fn set_volume(ctx: &egui::Context, volume: (f32, bool)) {
 
 fn volume_id() -> egui::Id {
     egui::Id::new("viewer_volume")
+}
+
+/// Where the clip at `path` starts in its recording, and how long that
+/// recording is: `(0, duration)` unless it's been trimmed.
+fn recording_span(path: &Path, duration: f64) -> (f64, f64) {
+    let target = crate::store::EditTarget::of(path);
+    if target.source == target.clip {
+        return (0.0, duration);
+    }
+    let Some(edit) = crate::store::load_edit(&target) else { return (0.0, duration) };
+    let whole = media::probe(&target.source).map_or(edit.end, |i| i.duration);
+    (edit.start, whole)
 }
 
 /// The speeds offered.

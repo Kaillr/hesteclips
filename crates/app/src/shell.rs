@@ -370,6 +370,8 @@ impl App {
                 ("← →", "Back or ahead 5 seconds"),
                 ("J  L", "Back or ahead 10 seconds"),
                 (",  .", "One frame back or ahead"),
+                ("[  ]", "Previous or next moment"),
+                ("B", "Add a marker, or take it away"),
                 ("Home  End", "Start or end"),
                 ("Scroll", "Scrub"),
                 ("M", "Mute"),

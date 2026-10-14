@@ -46,6 +46,15 @@ struct State {
     started: Option<std::time::Instant>,
 }
 
+/// What happened in the game in a clip, as it's saved.
+#[derive(Debug, Clone, Default)]
+pub struct Details {
+    /// For its name: "3 kills on Mirage".
+    pub summary: Option<String>,
+    /// Each kill: how long before the clip's end, and what it was.
+    pub moments: Vec<(Duration, String)>,
+}
+
 /// Notes what's in focus while capture runs.
 #[derive(Clone)]
 pub struct Tracker {
@@ -101,20 +110,21 @@ impl Tracker {
     }
 
     /// What happened in the game in a replay clip saved now ("3 kills on
-    /// Mirage"), if the game reports it and anything did.
-    pub fn clip_details(&self) -> Option<String> {
+    /// Mirage", and when each kill was), if the game reports it.
+    pub fn clip_details(&self) -> Details {
         let secs = match self.state.lock().unwrap().capturing {
             Some(Capturing::Buffer(secs)) => secs,
-            _ => return None,
+            _ => return Details::default(),
         };
-        let since = std::time::Instant::now().checked_sub(Duration::from_secs(secs.into()))?;
-        self.events.summary(since)
+        let now = std::time::Instant::now();
+        let Some(since) = now.checked_sub(Duration::from_secs(secs.into())) else { return Details::default() };
+        Details { summary: self.events.summary(since), moments: self.events.moments(since, now) }
     }
 
     /// What happened in the game during the recording that's being stopped.
-    pub fn recording_details(&self) -> Option<String> {
-        let started = self.state.lock().unwrap().started?;
-        self.events.summary(started)
+    pub fn recording_details(&self) -> Details {
+        let Some(started) = self.state.lock().unwrap().started else { return Details::default() };
+        Details { summary: self.events.summary(started), moments: self.events.moments(started, std::time::Instant::now()) }
     }
 
     /// The app in focus now and the game it is, if it's one.

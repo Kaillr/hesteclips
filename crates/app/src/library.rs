@@ -366,6 +366,7 @@ impl App {
             }
         }
         self.collections.forget(&moved);
+        crate::moments::forget(&moved);
         let bin = store::bin_name();
         let what = match moved.as_slice() {
             [one] => crate::clips::title_for_stem(&one.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()),
@@ -574,6 +575,7 @@ impl App {
     /// editor and the "new" highlight follow it.
     pub(crate) fn follow_rename(&mut self, ctx: &egui::Context, from: &Path, to: &Path) {
         self.collections.follow(from, to);
+        crate::moments::follow(from, to);
         if let Some((p, _)) = &mut self.last_saved
             && p == from
         {
