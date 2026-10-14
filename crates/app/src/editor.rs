@@ -28,6 +28,8 @@ const AUDIO_H: f32 = 52.0;
 const LENGTH_H: f32 = 28.0;
 const DIVIDER_H: f32 = 9.0;
 /// The lane headers' width.
+/// The mix meter's column, on the right of the timeline.
+const MIX_W: f32 = 56.0;
 const HEADER_W: f32 = 150.0;
 const MIN_PREVIEW_H: f32 = 120.0;
 /// Deepest timeline zoom: this many frames across.
@@ -79,6 +81,8 @@ struct Ready {
     /// Smoothed meter values (peak, rms) per track, then master; and peak holds.
     meters: Vec<Meter>,
     master: Meter,
+    /// The mix's meter on the right of the timeline (as on Sources).
+    mix_meter: crate::meter::MeterState,
     dragging: Option<Drag>,
     /// Was playing when a playhead or trim drag began: carry on after it.
     resume: bool,
@@ -295,6 +299,7 @@ impl Ready {
             strip,
             meters: vec![Meter::default(); n],
             master: Meter::default(),
+            mix_meter: Default::default(),
             dragging: None,
             resume: false,
             grab_offset: 0.0,
@@ -351,10 +356,12 @@ impl Ready {
             m.feed(if playing { *l } else { (0.0, 0.0) }, dt);
         }
         self.master.feed(if playing { master_level } else { (0.0, 0.0) }, dt);
+        let stereo = if playing { self.player.master_stereo() } else { Default::default() };
+        self.mix_meter.update(stereo, std::time::Instant::now(), dt);
         // Keep animating until the meters have fallen back to rest: about 60
         // times a second is smooth (every refresh of a fast display redrew
         // the whole editor for nothing).
-        if self.meters.iter().chain([&self.master]).any(|m| m.peak > 1e-3 || m.hold > 1e-3) {
+        if self.meters.iter().chain([&self.master]).any(|m| m.peak > 1e-3 || m.hold > 1e-3) || playing {
             crate::ui_kit::repaint_after(&ctx, std::time::Duration::from_millis(16));
         }
 
@@ -1074,7 +1081,9 @@ impl Ready {
         let body_bottom = outer.top() + total_h;
         let audio_view = Rect::from_x_y_ranges(outer.x_range(), outer.top() + RULER_H + VIDEO_H..=body_bottom);
         let max_scroll = (lanes_h - audio_view.height()).max(0.0);
-        let lanes_x = outer.left() + HEADER_W..=outer.right() - 14.0;
+        // The mix's meter stands at the right, as tall as the timeline.
+        let meter_col = Rect::from_min_max(Pos2::new(outer.right() - MIX_W, outer.top()), Pos2::new(outer.right(), body_bottom));
+        let lanes_x = outer.left() + HEADER_W..=meter_col.left() - 12.0;
         let lanes = Rect::from_x_y_ranges(lanes_x.clone(), outer.top()..=body_bottom);
         let p = ui.painter_at(outer);
 
@@ -1129,20 +1138,14 @@ impl Ready {
             lp.rect_filled(Rect::from_x_y_ranges(a..=b.max(a + 4.0), track.y_range()), 2, crate::theme::fade(pal.text3, zoomed));
         }
 
-        // --- Header column: the mix's meter, then each lane's name ---
-        let mix_head = Rect::from_min_max(Pos2::new(outer.left(), outer.top()), Pos2::new(lanes.left() - 8.0, ruler.bottom()));
-        p.text(Pos2::new(mix_head.left() + 16.0, mix_head.center().y), Align2::LEFT_CENTER, "Mix", crate::theme::font(12.0, crate::theme::W::Regular), pal.text3);
-        let mm = Rect::from_min_max(Pos2::new(mix_head.left() + 44.0, mix_head.center().y - 3.5), Pos2::new(mix_head.right() - 4.0, mix_head.center().y + 3.5));
-        draw_hmeter(&p, pal, mm, self.master);
-        let mix_tip = ui.interact(mix_head, ui.id().with("mix_head"), Sense::hover());
-        let db = media::to_db(self.master.hold);
-        mix_tip.on_hover_text(if self.master.hold >= 0.999 {
-            "The clip's mix: every track together. It's too loud: turn a track down.".to_owned()
-        } else if db > METER_FLOOR {
-            format!("The clip's mix: every track together. Peak {db:.0} dB")
-        } else {
-            "The clip's mix: every track together. Play to see its level.".to_owned()
-        });
+        // --- The mix's meter, on the right ---
+        p.vline(meter_col.left() - 0.5, meter_col.y_range(), Stroke::new(1.0, pal.line));
+        let mix = Rect::from_min_max(meter_col.min + Vec2::new(6.0, 4.0), meter_col.max);
+        if crate::meter::stereo_vertical(ui, mix, ui.id().with("mix_meter"), &self.mix_meter) {
+            self.mix_meter.reset_clip();
+        }
+        ui.interact(mix.with_max_y(mix.top() + 16.0), ui.id().with("mix_tip"), Sense::hover()).on_hover_text("The clip's mix: every track together. The number is its loudest peak in the last few seconds.");
+        // --- Header column: each lane's name ---
 
         // --- Video lane ---
         let video = Rect::from_min_size(Pos2::new(lanes.left(), ruler.bottom()), Vec2::new(lanes.width(), VIDEO_H));
@@ -1692,22 +1695,6 @@ fn draw_envelope(p: &egui::Painter, pal: &crate::theme::Pal, lane: Rect, track: 
         let d = 5.5;
         let diamond = vec![c + Vec2::new(0.0, -d), c + Vec2::new(d, 0.0), c + Vec2::new(0.0, d), c + Vec2::new(-d, 0.0)];
         p.add(egui::Shape::convex_polygon(diamond, color, Stroke::new(1.5, pal.base)));
-    }
-}
-
-/// A horizontal meter (the mix): two thin bars, the level in the meter's
-/// colours, a held peak.
-fn draw_hmeter(p: &egui::Painter, pal: &crate::theme::Pal, rect: Rect, m: Meter) {
-    p.rect_filled(rect, 2, pal.meter_bg);
-    let x_of = |lin: f32| {
-        let db = media::to_db(lin).max(METER_FLOOR);
-        rect.left() + (1.0 - db / METER_FLOOR) * rect.width()
-    };
-    if m.rms > 0.0 {
-        p.rect_filled(Rect::from_min_max(rect.min, Pos2::new(x_of(m.rms), rect.bottom())), 2, zone(pal, m.rms));
-    }
-    if m.hold > 0.0 {
-        p.vline(x_of(m.hold), rect.y_range(), Stroke::new(2.0, zone(pal, m.hold)));
     }
 }
 

@@ -133,6 +133,8 @@ pub struct Mix {
     /// Peak/RMS of what was just played, per track and for the master, for meters.
     pub track_levels: Vec<(f32, f32)>,
     pub master_level: (f32, f32),
+    /// The same, per channel (left, right), for a stereo meter.
+    pub master_stereo: capture::mixer::Levels,
 }
 
 struct Shared {
@@ -299,7 +301,7 @@ impl Player {
 
     fn with_pcm(ctx: &egui::Context, source: &Path, info: ClipInfo, pcm: Arc<Pcm>, gains: Vec<TrackEdit>) -> Self {
         let n = pcm.len();
-        let shared = Arc::new(Shared::new(Mix { tracks: gains, track_levels: vec![(0.0, 0.0); n], master_level: (0.0, 0.0) }));
+        let shared = Arc::new(Shared::new(Mix { tracks: gains, track_levels: vec![(0.0, 0.0); n], master_level: (0.0, 0.0), master_stereo: Default::default() }));
         let (stream, audio_error) = match start_audio(shared.clone(), pcm.clone()) {
             Ok(s) => (Some(s), None),
             Err(e) => (None, Some(e)),
@@ -453,6 +455,11 @@ impl Player {
             Ok(m) => (m.track_levels.clone(), m.master_level),
             Err(_) => (Vec::new(), (0.0, 0.0)),
         }
+    }
+
+    /// The master's level per channel (left, right), for a stereo meter.
+    pub fn master_stereo(&self) -> capture::mixer::Levels {
+        self.shared.mix.lock().map(|m| m.master_stereo).unwrap_or_default()
     }
 
     /// Bring the displayed frame in line with the clock. Call once per UI frame.
@@ -1115,6 +1122,7 @@ fn start_audio(shared: Arc<Shared>, pcm: Arc<Pcm>) -> Result<cpal::Stream, Strin
             if let Ok(mut m) = shared.mix.lock() {
                 m.track_levels = track_levels;
                 m.master_level = (peak, rms);
+                m.master_stereo = capture::mixer::Levels { peak: [peak; 2], rms: [rms; 2] };
             }
             return;
         }
@@ -1124,6 +1132,7 @@ fn start_audio(shared: Arc<Shared>, pcm: Arc<Pcm>) -> Result<cpal::Stream, Strin
             if let Ok(mut m) = shared.mix.try_lock() {
                 m.track_levels.iter_mut().for_each(|l| *l = (0.0, 0.0));
                 m.master_level = (0.0, 0.0);
+                m.master_stereo = Default::default();
             }
             return;
         }
@@ -1140,6 +1149,7 @@ fn start_audio(shared: Arc<Shared>, pcm: Arc<Pcm>) -> Result<cpal::Stream, Strin
         let mut track_peak = vec![0.0f32; n_tracks];
         let mut track_sq = vec![0.0f64; n_tracks];
         let (mut m_peak, mut m_sq, mut count) = (0.0f32, 0.0f64, 0usize);
+        let (mut lr_peak, mut lr_sq) = ([0.0f32; 2], [0.0f64; 2]);
         // Faster or slower: through the sound in bigger or smaller steps,
         // between its samples where a step lands between two (the pitch
         // follows, like tape).
@@ -1173,6 +1183,10 @@ fn start_audio(shared: Arc<Shared>, pcm: Arc<Pcm>) -> Result<cpal::Stream, Strin
                 }
             }
             m_peak = m_peak.max(l.abs().max(r.abs()));
+            for (c, v) in [l, r].into_iter().enumerate() {
+                lr_peak[c] = lr_peak[c].max(v.abs());
+                lr_sq[c] += (v as f64).powi(2);
+            }
             m_sq += (l.abs().max(r.abs()) as f64).powi(2);
             count += 1;
             match channels {
@@ -1196,6 +1210,7 @@ fn start_audio(shared: Arc<Shared>, pcm: Arc<Pcm>) -> Result<cpal::Stream, Strin
                 let rms = |sq: f64| (sq / count as f64).sqrt() as f32;
                 m.track_levels = (0..n_tracks).map(|t| (track_peak[t], rms(track_sq[t]))).collect();
                 m.master_level = (m_peak, rms(m_sq));
+                m.master_stereo = capture::mixer::Levels { peak: lr_peak, rms: [rms(lr_sq[0]), rms(lr_sq[1])] };
             }
         }
     };
@@ -1247,7 +1262,7 @@ impl SoundPlayer {
     /// `pcm`'s one track is stereo at [`PREVIEW_RATE`], `duration` seconds long.
     pub fn new(pcm: Arc<Pcm>, duration: f64) -> Self {
         let tracks = vec![TrackEdit { index: 0, gain: 1.0, muted: false, points: Vec::new() }];
-        let shared = Arc::new(Shared::new(Mix { tracks, track_levels: vec![(0.0, 0.0)], master_level: (0.0, 0.0) }));
+        let shared = Arc::new(Shared::new(Mix { tracks, track_levels: vec![(0.0, 0.0)], master_level: (0.0, 0.0), master_stereo: Default::default() }));
         let (stream, error) = match start_audio(shared.clone(), pcm) {
             Ok(s) => (Some(s), None),
             Err(e) => (None, Some(e)),

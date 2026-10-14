@@ -192,6 +192,73 @@ pub fn stereo(ui: &mut egui::Ui, id: egui::Id, state: &MeterState, style: &Style
     r.on_hover_text(tip).clicked() && state.clipped
 }
 
+/// A stereo meter standing up in `rect`: the readout of the recent peak on
+/// top, the clip light under it, then two bars (left, right) with the dB
+/// scale beside them; peak, average and held peak as on [`stereo`]. Returns
+/// whether the clip light was clicked (to reset it).
+pub fn stereo_vertical(ui: &mut egui::Ui, rect: Rect, id: egui::Id, state: &MeterState) -> bool {
+    let v = ui.visuals().clone();
+    let pal = crate::theme::of(&v);
+    let p = ui.painter_at(rect.expand(2.0));
+    // The readout, then the clip light.
+    let readout = Rect::from_min_size(rect.min, vec2(rect.width(), 16.0));
+    p.text(readout.center(), Align2::CENTER_CENTER, state.readout().replace('-', "−"), crate::theme::font(11.0, crate::theme::W::Medium), state.readout_color(&v));
+    let clip = Rect::from_center_size(pos2(rect.right() - 13.0, readout.bottom() + 9.0), vec2(16.0, 6.0));
+    let r = ui.interact(clip.expand(3.0), id.with("clip"), Sense::click());
+    p.rect_filled(clip, 2.0, if state.clipped { RED } else { pal.meter_bg });
+    if !state.clipped {
+        p.rect_stroke(clip, 2.0, Stroke::new(1.0, RED.gamma_multiply(0.35)), egui::StrokeKind::Inside);
+    }
+    let tip = if state.clipped { "Too loud: a sample hit full scale and distorted. Click to reset." } else { "Lights up if the sound gets too loud and distorts." };
+    let clicked = r.on_hover_text(tip).clicked() && state.clipped;
+    // The bars, on the right; the scale's labels on their left.
+    let (bar_w, gap) = (7.0, 3.0);
+    let bars = Rect::from_min_max(pos2(rect.right() - 5.0 - bar_w * 2.0 - gap, clip.bottom() + 8.0), pos2(rect.right() - 5.0, rect.bottom() - 2.0));
+    if bars.height() < 20.0 {
+        return clicked;
+    }
+    let y_of = |db: f32| bars.bottom() - bars.height() * scale_pos(db);
+    for c in 0..2 {
+        let bar = Rect::from_min_size(pos2(bars.left() + c as f32 * (bar_w + gap), bars.top()), vec2(bar_w, bars.height()));
+        p.rect_filled(bar, 2.0, pal.meter_bg);
+        for (from, to, color) in zones() {
+            p.rect_filled(Rect::from_x_y_ranges(bar.x_range(), y_of(to)..=y_of(from)), 0.0, color.gamma_multiply(0.10));
+        }
+        let ch = &state.ch[c];
+        let fill = |db: f32, alpha: f32| {
+            if db <= FLOOR_DB {
+                return;
+            }
+            let top = y_of(db);
+            for (from, to, color) in zones() {
+                let (y0, y1) = (y_of(to).max(top), y_of(from));
+                if y1 > y0 {
+                    p.rect_filled(Rect::from_x_y_ranges(bar.x_range(), y0..=y1), 0.0, color.gamma_multiply(alpha));
+                }
+            }
+        };
+        fill(ch.level_db, 0.55);
+        fill(ch.rms_db, 1.0);
+        if ch.hold_db > FLOOR_DB {
+            let y = y_of(ch.hold_db).max(bar.top() + 1.0);
+            p.rect_filled(Rect::from_x_y_ranges(bar.x_range(), y - 2.0..=y), 0.0, zone_color(ch.hold_db));
+        }
+    }
+    // The scale: ticks across both bars, labels to the left where they fit.
+    let font = crate::theme::font(10.0, crate::theme::W::Regular);
+    let mut last_y = f32::INFINITY;
+    for db in TICKS.iter().rev() {
+        let y = y_of(*db).round();
+        p.line_segment([pos2(bars.left(), y), pos2(bars.right(), y)], Stroke::new(1.0, v.panel_fill.gamma_multiply(0.55)));
+        if (last_y - y).abs() >= 12.0 || last_y.is_infinite() {
+            let label = if *db == 0.0 { "0".to_owned() } else { format!("{db:.0}").replace('-', "−") };
+            p.text(pos2(bars.left() - 5.0, y), Align2::RIGHT_CENTER, label, font.clone(), v.weak_text_color());
+            last_y = y;
+        }
+    }
+    clicked
+}
+
 /// Where `db` sits along a meter, 0..=1. Piecewise, like hardware meters: the top
 /// 18 dB, where levels are set, gets half the length; the quiet end is compressed.
 fn scale_pos(db: f32) -> f32 {
