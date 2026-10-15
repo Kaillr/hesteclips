@@ -300,7 +300,7 @@ impl App {
             RecState::Buffering => Btn::new(kind, if saving { "Saving…" } else { "Save clip" })
                 .keys(self.shortcut_keys(A::SaveClip))
                 .tip(format!("Save the last {}", crate::settings_ui::length_words(self.settings.replay_seconds))),
-            RecState::Recording => Btn::new(Kind::Stop, "Stop recording").with_icon(egui_phosphor::fill::STOP).keys(self.shortcut_keys(A::ToggleRecord)).tip("Stop and save the recording"),
+            RecState::Recording => Btn::new(Kind::Stop, "Stop recording").with_icon(egui_phosphor::fill::STOP).filled().keys(self.shortcut_keys(A::ToggleRecord)).tip("Stop and save the recording"),
         }
         .id("recorder_action");
         let btn = if compact { btn.keys(None) } else { btn };
@@ -348,6 +348,17 @@ impl App {
                 .frame(ui_kit::menu_frame(ui))
                 .style(ui_kit::menu_style)
                 .show(|ui| ui_kit::menu_body(ui, 220.0, |ui| self.recorder_menu(ui)));
+            // Stop sits by the status it acts on, so Save clip stays at the edge.
+            if stop_w > 0.5 {
+                let key = self.shortcut_keys(A::ToggleBuffer).map(|k| format!("  {}", ui_kit::key_text(&k))).unwrap_or_default();
+                ui.scope(|ui| {
+                    ui.multiply_opacity((stop_w / 32.0).clamp(0.0, 1.0));
+                    let stop = Btn::icon(Kind::DangerText, egui_phosphor::fill::STOP).filled().id("recorder_stop").tip(format!("Stop clipping{key}")).enabled(!saving);
+                    if stop.show(ui).clicked() {
+                        self.stop();
+                    }
+                });
+            }
             if btn.show(ui).clicked() {
                 match state {
                     RecState::Idle => self.start_replay_buffer(),
@@ -355,19 +366,7 @@ impl App {
                     RecState::Recording => self.stop(),
                 }
             }
-            if stop_w > 0.5 {
-                let key = self.shortcut_keys(A::ToggleBuffer).map(|k| format!("  {}", ui_kit::key_text(&k))).unwrap_or_default();
-                ui.scope(|ui| {
-                    ui.multiply_opacity((stop_w / 32.0).clamp(0.0, 1.0));
-                    let stop = Btn::icon(Kind::Ghost, egui_phosphor::fill::STOP).id("recorder_stop").tip(format!("Stop clipping{key}")).enabled(!saving);
-                    if stop.show(ui).clicked() {
-                        self.stop();
-                    }
-                });
-            }
         });
-
-
     }
 
     /// The recorder's ∨: the other things to do now, then shortcuts to what's

@@ -449,6 +449,8 @@ pub enum Kind {
 pub struct Btn<'a> {
     kind: Kind,
     icon: Option<&'a str>,
+    /// The icon is from the filled set (`egui_phosphor::fill`), so it's drawn in that family.
+    filled: bool,
     label: String,
     trail: Option<&'a str>,
     keys: Option<Vec<String>>,
@@ -466,6 +468,7 @@ impl<'a> Btn<'a> {
         Self {
             kind,
             icon: None,
+            filled: false,
             label: label.into(),
             trail: None,
             keys: None,
@@ -493,6 +496,10 @@ impl<'a> Btn<'a> {
     }
     pub fn with_icon(mut self, icon: &'a str) -> Self {
         self.icon = Some(icon);
+        self
+    }
+    pub fn filled(mut self) -> Self {
+        self.filled = true;
         self
     }
     pub fn trail(mut self, icon: &'a str) -> Self {
@@ -530,6 +537,10 @@ impl<'a> Btn<'a> {
         self
     }
 
+    fn icon_font(&self, size: f32) -> FontId {
+        if self.filled { FontId::new(size, theme::fill_family()) } else { FontId::proportional(size) }
+    }
+
     /// How wide it's drawn this frame (its width eases to fit its words).
     /// Needs an [`Btn::id`] to match what [`Btn::show`] draws.
     pub fn width(&self, ui: &egui::Ui) -> f32 {
@@ -546,7 +557,7 @@ impl<'a> Btn<'a> {
         let icon_size = if self.small { 14.0 } else { 15.5 };
         let text_w = |t: &str, f: FontId| ui.painter().layout_no_wrap(t.to_owned(), f, Color32::PLACEHOLDER).size().x;
         let label_w = (!self.label.is_empty()).then(|| text_w(&self.label, theme::font(size, W::Medium)));
-        let icon_w = self.icon.map(|i| text_w(i, FontId::proportional(icon_size)));
+        let icon_w = self.icon.map(|i| text_w(i, self.icon_font(icon_size)));
         let trail_w = self.trail.map(|i| text_w(i, FontId::proportional(icon_size - 1.5)));
         let keys_w = self.keys.as_ref().map(|k| key_hint_width(ui, k, 11.0));
         let only_icon = label_w.is_none() && trail_w.is_none() && keys_w.is_none();
@@ -567,7 +578,7 @@ impl<'a> Btn<'a> {
         let font = theme::font(size, W::Medium);
         let icon_size = if self.small { 14.0 } else { 15.5 };
         let galley = (!self.label.is_empty()).then(|| ui.painter().layout_no_wrap(self.label.clone(), font.clone(), Color32::PLACEHOLDER));
-        let icon_g = self.icon.map(|i| ui.painter().layout_no_wrap(i.to_owned(), FontId::proportional(icon_size), Color32::PLACEHOLDER));
+        let icon_g = self.icon.map(|i| ui.painter().layout_no_wrap(i.to_owned(), self.icon_font(icon_size), Color32::PLACEHOLDER));
         let trail_g = self.trail.map(|i| ui.painter().layout_no_wrap(i.to_owned(), FontId::proportional(icon_size - 1.5), Color32::PLACEHOLDER));
         let keys_w = self.keys.as_ref().map_or(0.0, |k| key_hint_width(ui, k, 11.0));
         let gap = 7.0;
