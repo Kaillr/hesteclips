@@ -304,7 +304,10 @@ impl App {
         }
         .id("recorder_action");
         let btn = if compact { btn.keys(None) } else { btn };
-        let total = 2.0 + stat_w + 2.0 + btn.width(ui) + 2.0;
+        // While clipping, a quiet square Stop beside Save clip: the pill grows to
+        // make room and it fades in as it does. Not while a clip is being saved.
+        let stop_w = theme::value(ui.ctx(), egui::Id::new("rec_stop_w"), if state == RecState::Buffering { 32.0 } else { 0.0 }, theme::NORMAL);
+        let total = 2.0 + stat_w + 2.0 + btn.width(ui) + stop_w + 2.0;
         // Status first, then the action: laid out left to right in a box
         // allocated from the right.
         ui.allocate_ui_with_layout(vec2(total, 34.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
@@ -312,6 +315,7 @@ impl App {
             ui.painter().rect_filled(outer, 8, p.control);
             let mut inner = ui.new_child(egui::UiBuilder::new().max_rect(outer.shrink(2.0)).layout(egui::Layout::left_to_right(egui::Align::Center)));
             let ui = &mut inner;
+            ui.set_clip_rect(outer.shrink(2.0).intersect(ui.clip_rect()));
             ui.spacing_mut().item_spacing.x = 2.0;
             let (r, resp) = ui.allocate_exact_size(vec2(stat_w, 30.0), Sense::click());
             let menu_id = egui::Id::new("recorder_menu");
@@ -350,6 +354,16 @@ impl App {
                     RecState::Buffering => self.save_clip(),
                     RecState::Recording => self.stop(),
                 }
+            }
+            if stop_w > 0.5 {
+                let key = self.shortcut_keys(A::ToggleBuffer).map(|k| format!("  {}", ui_kit::key_text(&k))).unwrap_or_default();
+                ui.scope(|ui| {
+                    ui.multiply_opacity((stop_w / 32.0).clamp(0.0, 1.0));
+                    let stop = Btn::icon(Kind::Ghost, egui_phosphor::fill::STOP).id("recorder_stop").tip(format!("Stop clipping{key}")).enabled(!saving);
+                    if stop.show(ui).clicked() {
+                        self.stop();
+                    }
+                });
             }
         });
 
