@@ -28,7 +28,7 @@ use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, 
 use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetThreadDpiAwarenessContext};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GW_OWNER, GWL_EXSTYLE, GetClientRect, GetWindow, GetWindowLongW, GetWindowRect, GetWindowTextLengthW,
+    EnumWindows, GW_OWNER, GWL_EXSTYLE, GetClientRect, GetWindow, GetWindowLongW, GetWindowRect, InternalGetWindowText,
     GetForegroundWindow, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, WS_EX_TOOLWINDOW,
 };
 use windows::core::{BOOL, Interface, PCWSTR};
@@ -310,7 +310,9 @@ fn app_windows() -> Vec<(HWND, u32)> {
                 && !owned
                 && cloaked == 0
                 && ex_style & WS_EX_TOOLWINDOW.0 == 0
-                && GetWindowTextLengthW(hwnd) > 0
+                // Has a title. Read without asking the window (which waits
+                // for it: one of ours, busy, held up the capture for as long).
+                && InternalGetWindowText(hwnd, &mut [0u16; 2]) > 0
             {
                 let mut pid = 0;
                 GetWindowThreadProcessId(hwnd, Some(&mut pid));

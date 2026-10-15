@@ -314,6 +314,9 @@ struct FeedState {
 impl SourceFeed {
     /// Correct timing once it's off by more than this; smaller jitter is ignored.
     const TOLERANCE: f64 = 0.04;
+    /// A gap longer than this starts the feed over instead of being filled
+    /// with silence (a guess: longer than any dropout worth keeping in step).
+    const RESTART_AFTER: f64 = 1.0;
 
     pub(crate) fn new(rate: u32, clock: Arc<Clock>) -> Arc<Self> {
         let resampler = (rate != RATE)
@@ -365,6 +368,19 @@ impl SourceFeed {
         let expected = ((start - t0) * rate).round() as i64;
         let mut st = self.st.lock().unwrap();
 
+        // Back after a long gap (playback paused, a device that stopped):
+        // start over at its time, as on its first sound, rather than fill the
+        // gap with silence: the mixer reads silence where nothing arrived
+        // anyway, and filling it at the source's rate went through the
+        // resampler (384 kHz output: a long pause took tens of seconds, in an
+        // audio callback the player's closing waited on).
+        if st.next_in.is_some_and(|next| expected - next > (Self::RESTART_AFTER * rate) as i64) {
+            st.next_in = None;
+            st.pending.iter_mut().for_each(Vec::clear);
+            if let Some(r) = st.resampler.as_mut() {
+                r.reset();
+            }
+        }
         if st.next_in.is_none() {
             st.next_in = Some(expected);
             st.out.clear();
@@ -467,13 +483,18 @@ impl FeedState {
         }
         self.pending[0].extend_from_slice(l);
         self.pending[1].extend_from_slice(r);
+        // Chunks are read from `used` on and the start cut off once at the
+        // end: cutting each chunk off the front moved all the rest every
+        // time, quadratic in a long run of input.
+        let mut used = 0;
         loop {
             let resampler = self.resampler.as_mut().unwrap();
             let need = resampler.input_frames_next();
-            if self.pending[0].len() < need {
+            if self.pending[0].len() - used < need {
                 break;
             }
-            let input: Vec<Vec<f32>> = self.pending.iter_mut().map(|p| p.drain(..need).collect()).collect();
+            let input: Vec<Vec<f32>> = self.pending.iter().map(|p| p[used..used + need].to_vec()).collect();
+            used += need;
             let out_frames = resampler.output_frames_next();
             let mut output = vec![vec![0f32; out_frames]; 2];
             let done = SequentialSliceOfVecs::new(&input, 2, need)
@@ -483,6 +504,9 @@ impl FeedState {
             let Some((_, written)) = done else { break };
             let frames: Vec<[f32; 2]> = (0..written).map(|i| [output[0][i], output[1][i]]).collect();
             self.append(frames.into_iter());
+        }
+        for p in &mut self.pending {
+            p.drain(..used);
         }
     }
 
@@ -834,6 +858,37 @@ mod tests {
         let out = feed.take(0, 40_000);
         let mid = &out[2000..38_000];
         assert!(mid.iter().all(|f| (f[0] - 0.5).abs() < 0.01), "resampled level holds");
+    }
+
+    /// A 384 kHz output (the player's, on a card that runs that fast) that
+    /// stops for a minute and starts again: placed at its new time, fast (the
+    /// gap was filled with silence through the resampler: tens of seconds).
+    #[test]
+    fn long_gap_starts_the_feed_over() {
+        let feed = SourceFeed::new(384_000, clock_at_zero());
+        feed.push(1000.0, &vec![0.5; 38_400 * 2], 2); // 100 ms
+        let _ = feed.take(0, 4_800);
+        let t = std::time::Instant::now();
+        feed.push(1060.0, &vec![0.5; 384_000 * 2], 2); // 1 s, a minute later
+        assert!(t.elapsed() < std::time::Duration::from_millis(500), "took {:?}", t.elapsed());
+        let at = 60 * RATE as i64;
+        // Silence in the gap, up to its time; then the sound.
+        assert!(feed.take(4_800, 4_800).iter().all(|f| f[0] == 0.0));
+        assert!(feed.take(at - 4_800, 4_800).iter().all(|f| f[0] == 0.0), "nothing before its time");
+        let out = feed.take(at, RATE as usize);
+        assert!(out[4_000..44_000].iter().all(|f| (f[0] - 0.5).abs() < 0.01), "its level, in place");
+    }
+
+    /// A short gap is still filled, so what follows stays in step.
+    #[test]
+    fn short_gap_is_filled() {
+        let feed = SourceFeed::new(RATE, clock_at_zero());
+        feed.push(1000.0, &vec![1.0; 480 * 2], 2); // 10 ms at 0
+        feed.push(1000.5, &vec![1.0; 480 * 2], 2); // 10 ms at 500 ms
+        let out = feed.take(0, 25_000);
+        assert!(out[..480].iter().all(|f| f[0] == 1.0));
+        assert!(out[480..24_000].iter().all(|f| f[0] == 0.0));
+        assert!(out[24_000..24_480].iter().all(|f| f[0] == 1.0));
     }
 
     #[test]
