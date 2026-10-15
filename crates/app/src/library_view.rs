@@ -687,12 +687,11 @@ impl App {
         let mut cui = ui.new_child(egui::UiBuilder::new().max_rect(avail.translate(vec2(0.0, 8.0 * (1.0 - t) - 30.0))).layout(egui::Layout::top_down(egui::Align::Center)));
         cui.multiply_opacity(t);
         cui.add_space((avail.height() * 0.5 - 140.0).max(20.0));
-        // The app's icon.
-        let tex = self.app_icon_texture(cui.ctx());
-        let (r, _) = cui.allocate_exact_size(vec2(64.0, 64.0), Sense::hover());
-        let shadow = egui::Shadow { offset: [0, 8], blur: 24, spread: 0, color: Color32::from_black_alpha(if p.dark { 90 } else { 40 }) };
-        cui.painter().add(shadow.as_shape(r, 15));
-        egui::Image::from_texture((tex.id(), r.size())).corner_radius(15).paint_at(&cui, r);
+        // The app's glyph without the macOS plate: a black square would show
+        // as a box on the dark page.
+        let tex = self.glyph_texture(cui.ctx());
+        let (r, _) = cui.allocate_exact_size(vec2(76.0, 76.0), Sense::hover());
+        egui::Image::from_texture((tex.id(), r.size())).paint_at(&cui, r);
         cui.add_space(22.0);
         cui.label(theme::text("Your clips will show up here", 22.0, W::Semibold).color(p.text));
         cui.add_space(8.0);
@@ -726,12 +725,14 @@ impl App {
         });
     }
 
-    fn app_icon_texture(&mut self, ctx: &egui::Context) -> egui::TextureHandle {
+    fn glyph_texture(&mut self, ctx: &egui::Context) -> egui::TextureHandle {
         self.app_icon_tex
             .get_or_insert_with(|| {
-                let icon = crate::app_icon();
-                let img = egui::ColorImage::from_rgba_unmultiplied([icon.width as usize, icon.height as usize], &icon.rgba);
-                ctx.load_texture("app_icon", img, egui::TextureOptions::LINEAR)
+                let img = image::load_from_memory_with_format(include_bytes!("../assets/icon-windows-256.png"), image::ImageFormat::Png)
+                    .expect("bundled icon is a valid PNG")
+                    .to_rgba8();
+                let img = egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw());
+                ctx.load_texture("app_glyph", img, egui::TextureOptions::LINEAR)
             })
             .clone()
     }
