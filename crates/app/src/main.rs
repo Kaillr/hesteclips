@@ -483,7 +483,7 @@ struct App {
     pub(crate) hover_play: Option<hover_play::HoverPlay>,
     /// A card was under the pointer this frame (else `hover_play` stops).
     pub(crate) hover_seen: bool,
-    pub(crate) app_icon_tex: Option<egui::TextureHandle>,
+    pub(crate) app_icon_tex: Option<(u32, egui::TextureHandle)>,
     /// The grid's clips (in the grid's content coordinates) and where that
     /// content is on screen now, for the panel's glass.
     pub(crate) glass_tiles: Vec<glass::Tile>,

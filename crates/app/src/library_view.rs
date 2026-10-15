@@ -689,7 +689,7 @@ impl App {
         cui.add_space((avail.height() * 0.5 - 140.0).max(20.0));
         // The app's glyph, one colour for the theme (white on dark, black on
         // light). The picture has 1/3 margin around it.
-        let glyph = self.glyph_texture(cui.ctx());
+        let glyph = self.glyph_texture(cui.ctx(), 76.0 * 1.5);
         let (r, _) = cui.allocate_exact_size(vec2(76.0, 76.0), Sense::hover());
         let canvas = Rect::from_center_size(r.center(), r.size() * 1.5);
         egui::Image::from_texture((glyph.id(), canvas.size()))
@@ -728,15 +728,25 @@ impl App {
         });
     }
 
-    /// The glyph (`assets/glyph.png`, made by scripts/tray-icons.sh).
-    fn glyph_texture(&mut self, ctx: &egui::Context) -> egui::TextureHandle {
-        self.app_icon_tex
-            .get_or_insert_with(|| {
-                let img = image::load_from_memory_with_format(include_bytes!("../assets/glyph.png"), image::ImageFormat::Png).expect("bundled glyph is a valid PNG").to_rgba8();
-                let img = egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw());
-                ctx.load_texture("glyph", img, egui::TextureOptions::LINEAR)
-            })
-            .clone()
+    /// The glyph (`assets/glyph.png`, made by scripts/tray-icons.sh), resized to
+    /// the pixels it's drawn in (`size` points): the picture is 768 px, and the
+    /// graphics card's filtering alone makes a 3-6x smaller copy choppy.
+    fn glyph_texture(&mut self, ctx: &egui::Context, size: f32) -> egui::TextureHandle {
+        let px = (size * ctx.pixels_per_point()).round().max(1.0) as u32;
+        if let Some((have, tex)) = &self.app_icon_tex {
+            if *have == px {
+                return tex.clone();
+            }
+        }
+        let mut img = image::load_from_memory_with_format(include_bytes!("../assets/glyph.png"), image::ImageFormat::Png).expect("bundled glyph is a valid PNG").to_rgba8();
+        // Only the alpha matters (the theme tints it): white everywhere, so the
+        // transparent parts' colour can't bleed into the edges when resizing.
+        img.pixels_mut().for_each(|p| p.0[..3].fill(255));
+        let img = image::imageops::resize(&img, px, px, image::imageops::FilterType::Lanczos3);
+        let img = egui::ColorImage::from_rgba_unmultiplied([px as usize, px as usize], img.as_raw());
+        let tex = ctx.load_texture("glyph", img, egui::TextureOptions::LINEAR);
+        self.app_icon_tex = Some((px, tex.clone()));
+        tex
     }
 
     /// A card for something on its way: a recording, a clip being saved.
