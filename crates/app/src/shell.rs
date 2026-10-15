@@ -278,7 +278,7 @@ impl App {
         let p = theme::pal(ui);
         let state = self.rec_state;
         let elapsed = self.rec_started.map_or(Duration::ZERO, |t| t.elapsed());
-        let len = clock(self.settings.replay_seconds);
+        let len = reach(self.settings.replay_seconds);
         let (dot, title, sub) = match state {
             RecState::Idle => (None, "Not clipping".to_owned(), None),
             RecState::Buffering => (Some(p.live), "Clipping".to_owned(), Some(len)),
@@ -304,10 +304,12 @@ impl App {
         }
         .id("recorder_action");
         let btn = if compact { btn.keys(None) } else { btn };
-        // While clipping, a quiet square Stop beside Save clip: the pill grows to
-        // make room and it fades in as it does. Not while a clip is being saved.
-        let stop_w = theme::value(ui.ctx(), egui::Id::new("rec_stop_w"), if state == RecState::Buffering { 32.0 } else { 0.0 }, theme::NORMAL);
-        let total = 2.0 + stat_w + 2.0 + btn.width(ui) + stop_w + 2.0;
+        // While clipping, Stop before Save clip: its slot (the button and the
+        // gap after it) opens from nothing, so the pill and Save clip move with
+        // it instead of the button arriving at full width.
+        let stop_t = theme::toggle(ui.ctx(), egui::Id::new("rec_stop"), state == RecState::Buffering, theme::NORMAL);
+        let stop_w = (ui_kit::CONTROL_H + 2.0) * stop_t;
+        let total = 2.0 + stat_w + 2.0 + stop_w + btn.width(ui) + 2.0;
         // Status first, then the action: laid out left to right in a box
         // allocated from the right.
         ui.allocate_ui_with_layout(vec2(total, 34.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
@@ -349,15 +351,11 @@ impl App {
                 .style(ui_kit::menu_style)
                 .show(|ui| ui_kit::menu_body(ui, 220.0, |ui| self.recorder_menu(ui)));
             // Stop sits by the status it acts on, so Save clip stays at the edge.
-            if stop_w > 0.5 {
-                let key = self.shortcut_keys(A::ToggleBuffer).map(|k| format!("  {}", ui_kit::key_text(&k))).unwrap_or_default();
-                ui.scope(|ui| {
-                    ui.multiply_opacity((stop_w / 32.0).clamp(0.0, 1.0));
-                    let stop = Btn::icon(Kind::DangerText, egui_phosphor::fill::STOP).filled().id("recorder_stop").tip(format!("Stop clipping{key}")).enabled(!saving);
-                    if stop.show(ui).clicked() {
-                        self.stop();
-                    }
-                });
+            ui.spacing_mut().item_spacing.x = 0.0;
+            let (slot, _) = ui.allocate_exact_size(vec2(stop_w, ui_kit::CONTROL_H), Sense::hover());
+            ui.spacing_mut().item_spacing.x = 2.0;
+            if stop_t > 0.0 && self.stop_clipping_button(ui, slot, stop_t, state == RecState::Buffering && !saving) {
+                self.stop();
             }
             if btn.show(ui).clicked() {
                 match state {
@@ -367,6 +365,27 @@ impl App {
                 }
             }
         });
+    }
+
+    /// The recorder's Stop clipping, at the left of `slot` (cut to it while it
+    /// opens), `t` of the way in. Quiet until pointed at, then red: Save clip
+    /// stays the bright thing in the bar. True when clicked.
+    fn stop_clipping_button(&self, ui: &mut egui::Ui, slot: Rect, t: f32, enabled: bool) -> bool {
+        let p = theme::pal(ui);
+        let rect = Rect::from_min_size(slot.left_top(), vec2(ui_kit::CONTROL_H, ui_kit::CONTROL_H));
+        let resp = ui.interact(rect.intersect(slot), egui::Id::new("recorder_stop"), if enabled { Sense::click() } else { Sense::hover() });
+        let hv = theme::toggle(ui.ctx(), resp.id.with("hv"), enabled && resp.hovered(), theme::FAST);
+        let pressed = enabled && resp.is_pointer_button_down_on();
+        let painter = ui.painter_at(slot);
+        let alpha = t * if enabled || self.rec_state != RecState::Buffering { 1.0 } else { 0.4 };
+        let fill = theme::mix(p.control_h, p.rec, hv);
+        let rect = if pressed { rect.shrink(0.5) } else { rect };
+        painter.rect_filled(rect, ui_kit::RADIUS, theme::fade(fill, alpha));
+        let square = Rect::from_center_size(rect.center(), vec2(10.0, 10.0));
+        painter.rect_filled(square, 2, theme::fade(theme::mix(p.text2, Color32::WHITE, hv), alpha));
+        let key = self.shortcut_keys(A::ToggleBuffer).map(|k| format!("  {}", ui_kit::key_text(&k))).unwrap_or_default();
+        let resp = if enabled { resp.on_hover_cursor(egui::CursorIcon::PointingHand) } else { resp };
+        resp.on_hover_text(format!("Stop clipping{key}")).clicked() && enabled
     }
 
     /// The recorder's ∨: the other things to do now, then shortcuts to what's
@@ -673,13 +692,11 @@ fn is_interactive(ctx: &egui::Context, id: egui::Id) -> bool {
     ctx.read_response(id).is_some_and(|r| r.sense.senses_click() || r.sense.senses_drag())
 }
 
-/// A clip length as a clock: "1:00", "15:00", "1:00:00".
-pub fn clock(secs: u32) -> String {
-    if secs >= 3600 {
-        format!("{}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60)
-    } else {
-        format!("{}:{:02}", secs / 60, secs % 60)
-    }
+/// How far back a clip reaches, short: "last 1 hr", "last 1 min 30 sec". In
+/// words, as a clock ("1:00:00") read as a timer standing still.
+pub fn reach(secs: u32) -> String {
+    let parts: Vec<String> = [(secs / 3600, "hr"), (secs / 60 % 60, "min"), (secs % 60, "sec")].into_iter().filter(|(n, _)| *n > 0).map(|(n, u)| format!("{n} {u}")).collect();
+    if parts.is_empty() { "last 0 sec".into() } else { format!("last {}", parts.join(" ")) }
 }
 
 #[cfg(test)]
