@@ -686,7 +686,7 @@ impl App {
         let t = theme::since(ui.ctx(), born, theme::SLOW);
         let mut cui = ui.new_child(egui::UiBuilder::new().max_rect(avail.translate(vec2(0.0, 8.0 * (1.0 - t) - 30.0))).layout(egui::Layout::top_down(egui::Align::Center)));
         cui.multiply_opacity(t);
-        cui.add_space((avail.height() * 0.5 - 170.0).max(20.0));
+        cui.add_space((avail.height() * 0.5 - 140.0).max(20.0));
         // The app's icon.
         let tex = self.app_icon_texture(cui.ctx());
         let (r, _) = cui.allocate_exact_size(vec2(64.0, 64.0), Sense::hover());
@@ -717,15 +717,6 @@ impl App {
                 }
                 if Btn::normal("Choose what's recorded").show(ui).clicked() {
                     self.page = crate::Page::Sources;
-                }
-            });
-        });
-        cui.add_space(40.0);
-        cui.allocate_ui(vec2(420.0, 20.0), |ui| {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 28.0;
-                for (glyph, word) in [(icon::GAME_CONTROLLER, "Play"), (icon::KEYBOARD, "Press the shortcut"), (icon::EXPORT, "Share or trim it")] {
-                    ui.label(theme::text(format!("{glyph}  {word}"), 13.0, W::Regular).color(p.text3));
                 }
             });
         });
