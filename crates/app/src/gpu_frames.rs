@@ -262,17 +262,27 @@ impl CallbackTrait for Draw {
         // Still being made (right after launch): no picture yet, rather than
         // the window stuck compiling it here.
         let Some(scaler) = resources.get_mut::<Scaler>() else { return Vec::new() };
-        // Where egui puts it (rounded to pixels, kept on the screen).
-        let place = egui::epaint::ViewportInPixels::from_points(&self.1, screen.pixels_per_point, screen.size_in_pixels);
-        scaler.across(device, encoder, &self.0, [place.left_px, place.top_px, place.width_px, place.height_px]);
+        scaler.across(device, encoder, &self.0, whole_picture(&self.1, screen.pixels_per_point));
         Vec::new()
     }
 
     fn paint(&self, info: egui::PaintCallbackInfo, pass: &mut wgpu::RenderPass<'static>, resources: &CallbackResources) {
         let Some(scaler) = resources.get::<Scaler>() else { return };
-        let place = info.viewport_in_pixels();
-        scaler.down(pass, &self.0, [place.left_px, place.top_px, place.width_px, place.height_px]);
+        let place = whole_picture(&self.1, info.pixels_per_point);
+        // egui's own viewport is cut to the window: scrolled partly off it,
+        // the whole picture would squeeze into what's left. The scissor
+        // (the clip) still hides what's outside.
+        pass.set_viewport(place[0] as f32, place[1] as f32, place[2] as f32, place[3] as f32, 0.0, 1.0);
+        scaler.down(pass, &self.0, place);
     }
+}
+
+/// Where the picture goes, in screen pixels (left, top, width, height),
+/// rounded but not cut to the window: it may reach past its edge.
+fn whole_picture(rect: &egui::Rect, ppp: f32) -> [i32; 4] {
+    let (left, top) = ((rect.min.x * ppp).round(), (rect.min.y * ppp).round());
+    let (right, bottom) = ((rect.max.x * ppp).round(), (rect.max.y * ppp).round());
+    [left as i32, top as i32, (right - left) as i32, (bottom - top) as i32]
 }
 
 impl Scaler {
