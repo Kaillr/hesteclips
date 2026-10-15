@@ -708,14 +708,18 @@ impl App {
             });
         });
         cui.add_space(18.0);
-        let row_w = if self.rec_state == RecState::Idle { 332.0 } else { 190.0 };
+        // The row is as wide as its buttons, so it centres on them.
+        let start = (self.rec_state == RecState::Idle).then(|| Btn::primary("Start clipping").min_width(130.0));
+        let choose = Btn::normal("Choose what's recorded");
+        let gap = 8.0;
+        let row_w = choose.width(&cui) + start.as_ref().map_or(0.0, |b| b.width(&cui) + gap);
         cui.allocate_ui(vec2(row_w, 36.0), |ui| {
             ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 8.0;
-                if self.rec_state == RecState::Idle && Btn::primary("Start clipping").min_width(130.0).show(ui).clicked() {
+                ui.spacing_mut().item_spacing.x = gap;
+                if start.is_some_and(|b| b.show(ui).clicked()) {
                     self.start_replay_buffer();
                 }
-                if Btn::normal("Choose what's recorded").show(ui).clicked() {
+                if choose.show(ui).clicked() {
                     self.page = crate::Page::Sources;
                 }
             });
