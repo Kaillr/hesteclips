@@ -531,7 +531,7 @@ struct App {
     pub(crate) presence: discord::Presence,
     /// Saves a clip as Save clip is pressed, frames or not.
     quick_save: service::QuickSave,
-    /// Listens for "hashtag HesteClip that".
+    /// Listens for "HasteClip that".
     pub(crate) voice: voice::Voice,
     pub(crate) voice_review: voice_review::Review,
     /// The game being clipped, for Discord: its app's id, the game, and when
@@ -1195,7 +1195,7 @@ impl App {
             }
         }
 
-        // "Hashtag HesteClip that": saved already, as it was said.
+        // "HasteClip that": saved already, as it was said.
         for _ in 0..self.voice.heard() {
             self.clip_saving();
         }
@@ -1417,7 +1417,7 @@ impl App {
         }
     }
 
-    /// The microphone "hashtag HesteClip that" is heard through: the first
+    /// The microphone "HasteClip that" is heard through: the first
     /// one on the Sources page that's being captured.
     fn voice_mic(&self) -> Option<String> {
         self.settings.audio_sources.iter().find(|s| s.enabled && matches!(s.kind, settings::SourceKind::Microphone { .. })).map(|s| s.id.clone())

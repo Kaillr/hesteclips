@@ -1,7 +1,7 @@
 //! The page where the snippets the voice detector kept
 //! ([`crate::voice_samples`]) are listened to, trimmed to what matters and
-//! judged: should the highlighted part save a clip? It should when "hashtag
-//! HesteClip that" is said well enough that you'd want it to; a muddled try is a
+//! judged: should the highlighted part save a clip? It should when "HasteClip
+//! that" is said well enough that you'd want it to; a muddled try is a
 //! no.
 //! Nothing is assumed from what made the detector keep one: it may have fired
 //! on a laugh, and a near miss may be the phrase said in a way it didn't take.

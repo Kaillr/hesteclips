@@ -32,7 +32,7 @@ rfd = "0.17.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 trash = "5"
-# "Hashtag HesteClip that" (voice.rs): runs its small ONNX models, pure Rust.
+# "HasteClip that" (voice.rs): runs its small ONNX models, pure Rust.
 tract-onnx = "0.23.8"
 uuid = { version = "1", features = ["v4"] }
 discord-rich-presence = "1.1.0"

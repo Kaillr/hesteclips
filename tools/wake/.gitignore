@@ -1,0 +1,13 @@
+# Everything a run makes or downloads stays out of the repo.
+venv/
+dl/
+data/
+gen/
+feats/
+models/
+kokoro/
+logs/
+wintts/
+voices/*
+!voices/pick.py
+__pycache__/

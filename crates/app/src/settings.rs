@@ -559,7 +559,7 @@ pub struct RecordSettings {
     pub auto_update: bool,
     /// Show what you're clipping on your Discord profile (Rich Presence).
     pub discord_presence: bool,
-    /// Saying "hashtag HesteClip that" saves a clip (while the replay buffer runs).
+    /// Saying "HasteClip that" saves a clip (while the replay buffer runs).
     pub voice_clip: bool,
     /// Keep short snippets of the microphone around what the voice detector fires on or
     /// nearly fires on, to listen through and label (never sent anywhere by itself).

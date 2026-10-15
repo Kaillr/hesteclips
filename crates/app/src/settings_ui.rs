@@ -135,7 +135,7 @@ impl App {
             "Sharing" => f.shows(&["hestefiles", "cloud", "upload", "account", "token", "public link", "default folder", "discord", "activity", "rich presence"]),
             "Saved sound" => f.shows(&["play a sound when a clip is saved", "sound", "volume", "record the sound", "in clip", "add your own"]),
             "Shortcuts" => f.shows(&["shortcuts", "hotkey", "keyboard", "save clip", "start or stop clipping", "start or stop recording"]),
-            "Voice" => f.shows(&["save by voice", "hashtag", "speech", "command", "voice samples", "review"]),
+            "Voice" => f.shows(&["save by voice", "hasteclip that", "speech", "command", "voice samples", "review"]),
             "App" => f.shows(&["appearance", "theme", "dark", "light", "open at login", "autostart", "startup", "closing the window", "tray", "menu bar", "update", "version", "reset"]),
             _ => false,
         };
@@ -560,16 +560,16 @@ impl App {
             match (problem, self.voice_mic().is_none()) {
                 (Some(p), _) => format!("Can't listen: {p}"),
                 (None, true) => "Add a microphone on the Sources page to use it".to_owned(),
-                _ => "Say “hashtag HesteClip that”".to_owned(),
+                _ => "Say “HasteClip that”".to_owned(),
             }
         } else {
-            "Say “hashtag HesteClip that”".to_owned()
+            "Say “HasteClip that”".to_owned()
         };
         let (to_hear, all) = self.voice_review.summary();
         let mut review = false;
         ui_kit::list(ui, "voice", |l| {
-            if f.shows(&["save by voice", "hashtag", "speech", "command", "voice"]) {
-                l.row(Row::new("Save by voice").tip("Save by voice", "While clipping, say “hashtag HesteClip that” to save a clip. Listening happens on this computer, for this phrase only.").note(note), |ui| ui_kit::switch(ui, &mut self.settings.voice_clip));
+            if f.shows(&["save by voice", "hasteclip that", "speech", "command", "voice"]) {
+                l.row(Row::new("Save by voice").tip("Save by voice", "While clipping, say “HasteClip that” to save a clip. Listening happens on this computer, for this phrase only.").note(note), |ui| ui_kit::switch(ui, &mut self.settings.voice_clip));
             }
             if f.shows(&["voice samples", "keep", "review", "improve"]) {
                 l.row(Row::new("Keep voice samples").tip("Keep voice samples", "Keeps about 6 seconds of your microphone each time the command saves a clip or nearly does. You can listen to them and mark which should have saved a clip, to help improve the detector. They stay on this computer."), |ui| ui_kit::switch(ui, &mut self.settings.voice_samples));
