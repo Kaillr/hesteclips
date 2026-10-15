@@ -861,7 +861,7 @@ mod tests {
     }
 }
 
-/// The days folded away in the library, kept in its `.hesteclips` folder so
+/// The days folded away in the library, kept in its `.hasteclip` folder so
 /// they stay folded next time. A new day starts open.
 pub(crate) struct FoldedDays {
     lib: PathBuf,
@@ -952,7 +952,7 @@ mod scale_tests {
     use std::time::{Instant, SystemTime};
 
     /// What the library does every frame, timed on a big library:
-    /// `cargo test -p hesteclips library_frame_cost -- --ignored --nocapture`.
+    /// `cargo test -p hasteclip library_frame_cost -- --ignored --nocapture`.
     #[test]
     #[ignore]
     fn library_frame_cost() {

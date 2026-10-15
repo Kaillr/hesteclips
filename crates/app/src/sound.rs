@@ -3,8 +3,8 @@
 //!
 //! Sounds are decoded once (ffmpeg, so any audio file works) and kept in
 //! memory; playing one opens the default output for as long as it lasts.
-//! Desktop capture leaves out what HesteClips plays, so as it plays the cue is
-//! also handed to the sources recording HesteClips' sound
+//! Desktop capture leaves out what HasteClip plays, so as it plays the cue is
+//! also handed to the sources recording HasteClip' sound
 //! (`capture::sources::own_sound`), unless that's turned off: like any other
 //! app's sound, it's in the clips saved after it.
 
@@ -70,7 +70,7 @@ pub fn gain(volume: f32) -> f32 {
     v * v
 }
 
-/// Add a sound file: check it plays, then copy it into HesteClips' sounds
+/// Add a sound file: check it plays, then copy it into HasteClip' sounds
 /// folder so it keeps working if the original is moved.
 pub fn add_custom(from: &Path, existing: &[CustomSound]) -> Result<CustomSound, String> {
     decode(Source::File(from)).map_err(|e| format!("Couldn't read that sound: {e}"))?;
@@ -109,7 +109,7 @@ pub fn id_of(sound: &CustomSound) -> String {
 }
 
 fn sounds_dir() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("hesteclips").join("sounds"))
+    dirs::config_dir().map(|d| d.join("hasteclip").join("sounds"))
 }
 
 enum Source<'a> {

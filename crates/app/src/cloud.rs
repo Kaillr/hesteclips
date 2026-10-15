@@ -14,7 +14,7 @@ use std::sync::Arc;
 use hestefiles::{Account, BaseFolder, Client, UploadProgress};
 use serde::{Deserialize, Serialize};
 
-const KEYCHAIN_SERVICE: &str = "hesteclips";
+const KEYCHAIN_SERVICE: &str = "hasteclip";
 const KEYCHAIN_USER: &str = "hestefiles-token";
 
 /// A folder in HesteFiles: a base folder plus a path inside it.
@@ -81,7 +81,7 @@ impl Default for Config {
 }
 
 fn config_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("hesteclips").join("hestefiles.json"))
+    dirs::config_dir().map(|d| d.join("hasteclip").join("hestefiles.json"))
 }
 
 fn keychain() -> Option<keyring::Entry> {
@@ -214,9 +214,9 @@ impl Cloud {
             cloud.connect(&token);
             return cloud;
         }
-        // `HESTECLIPS_NO_KEYCHAIN=1`: a test instance that stays disconnected
+        // `HASTECLIP_NO_KEYCHAIN=1`: a test instance that stays disconnected
         // (no password prompt for each one launched to check a screen).
-        if std::env::var_os("HESTECLIPS_NO_KEYCHAIN").is_some() {
+        if std::env::var_os("HASTECLIP_NO_KEYCHAIN").is_some() {
             cloud.connection = Connection::Disconnected;
             return cloud;
         }

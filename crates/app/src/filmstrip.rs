@@ -36,7 +36,7 @@ pub enum Filmstrip {
 impl Filmstrip {
     pub fn build(ctx: &egui::Context, source: &Path, info: &ClipInfo) -> Self {
         #[cfg(hw_decode)]
-        if std::env::var_os("HESTECLIPS_NO_HW_DECODE").is_none() {
+        if std::env::var_os("HASTECLIP_NO_HW_DECODE").is_none() {
             return Self::Exact(exact::Exact::open(ctx, source, info));
         }
         let _ = info;
@@ -177,7 +177,7 @@ mod exact {
                         let got = dec.frame(i);
                         match got {
                             Ok(Some(p)) => {
-                                if std::env::var_os("HESTECLIPS_DEBUG_VIDEO").is_some() {
+                                if std::env::var_os("HASTECLIP_DEBUG_VIDEO").is_some() {
                                     eprintln!("{:>8.3} filmstrip: frame {i}", crate::player::uptime());
                                 }
                                 if got_tx.send((i, p)).is_err() {

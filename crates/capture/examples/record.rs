@@ -5,7 +5,7 @@
 //! goes (default both). Env: REPLAY=1, SECS=n, EXT=mov, HEIGHT=n (0 = native),
 //! FPS=n, BLEND=n (looks per frame), SOFTWARE=1, LIST=1 (list the inputs), SWITCH_MIC=<device> (the first source, a mic, switches to it halfway), SCREEN=<id>, WEBCAM=<id|1>, WEBCAM_FORMAT=WxH, APP=<exe>[,<exe>…] (record those apps' windows,
 //! following focus), HOOK=0 (never the game capture hook), ALLOW=<exe>[,…]
-//! (games with anti-cheat it may be used on), HESTECLIPS_FORCE_HOOK=<exe>[,…] (always, for testing).
+//! (games with anti-cheat it may be used on), HASTECLIP_FORCE_HOOK=<exe>[,…] (always, for testing).
 use capture::sources::{AudioSource, SourceKind};
 use capture::{EncodeSettings, Mode, mixer::LiveAudio};
 

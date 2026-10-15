@@ -129,7 +129,7 @@ impl App {
     fn settings_group(&mut self, ui: &mut egui::Ui, name: &'static str, f: &Filter, jump: bool) -> bool {
         // Measure first: a group with no matching rows doesn't show at all.
         let matches = match name {
-            "Clipping" => f.shows(&["clip length", "replay buffer duration", "start clipping when hesteclips opens", "auto start"]),
+            "Clipping" => f.shows(&["clip length", "replay buffer duration", "start clipping when hasteclip opens", "auto start"]),
             "Video" => f.shows(&["resolution", "height", "size", "frame rate", "fps", "quality", "bitrate", "mbps", "frame blending", "motion blur", "encoder", "hardware", "software", "file format", "mp4", "mov", "game capture", "anti-cheat", "obs"]),
             "Clips" => f.shows(&["clips folder", "location", "directory", "folder per game", "name clips after what happened", "game events", "osu", "names", "delete", "trash", "permanently"]),
             "Sharing" => f.shows(&["hestefiles", "cloud", "upload", "account", "token", "public link", "default folder", "discord", "activity", "rich presence"]),
@@ -196,8 +196,8 @@ impl App {
                     self.length_field(ui);
                 });
             }
-            if f.shows(&["start clipping when hesteclips opens", "auto start"]) {
-                l.row(Row::new("Start clipping when HesteClips opens"), |ui| ui_kit::switch(ui, &mut self.settings.auto_start_buffer));
+            if f.shows(&["start clipping when hasteclip opens", "auto start"]) {
+                l.row(Row::new("Start clipping when HasteClip opens"), |ui| ui_kit::switch(ui, &mut self.settings.auto_start_buffer));
             }
         });
     }
@@ -388,7 +388,7 @@ impl App {
                 } else {
                     ""
                 };
-                l.row(Row::new("Discord activity").tip("Discord activity", "Your Discord profile shows “Clipping osu!” while HesteClips captures. Needs Discord running.").note(note), |ui| ui_kit::switch(ui, &mut self.settings.discord_presence));
+                l.row(Row::new("Discord activity").tip("Discord activity", "Your Discord profile shows “Clipping osu!” while HasteClip captures. Needs Discord running.").note(note), |ui| ui_kit::switch(ui, &mut self.settings.discord_presence));
             }
         });
         if disconnect {
@@ -596,7 +596,7 @@ impl App {
             Status::Checking => "Checking for updates…".to_owned(),
             Status::Downloading(p) => format!("Downloading an update… {p}%"),
             Status::UpToDate => "You have the latest version.".to_owned(),
-            Status::Ready(v) => format!("Version {v} is ready and installs when you quit HesteClips."),
+            Status::Ready(v) => format!("Version {v} is ready and installs when you quit HasteClip."),
             Status::Failed(e) => e.clone(),
         };
         let idle = self.rec_state == RecState::Idle;
@@ -632,7 +632,7 @@ impl App {
                 });
             }
             if f.shows(&["update", "version", "what's new"]) {
-                let title = format!("HesteClips {}", self.updater.version());
+                let title = format!("HasteClip {}", self.updater.version());
                 l.row(Row::new(&title).note(line.clone()), |ui| {
                     if Btn::ghost("What's new").small().show(ui).clicked() {
                         ui.ctx().open_url(egui::OpenUrl::new_tab(format!("{}/releases", crate::update::REPO)));
@@ -1034,7 +1034,7 @@ impl App {
                 ui.set_width(width);
                 let p = theme::pal(ui);
                 let t = self.settings.game_titles.clone();
-                ui.add(egui::Label::new(theme::text("Clips get named after what happened in the game, for games that tell HesteClips. Clips where nothing happened keep their time.", 13.5, W::Regular).color(p.text2)).wrap());
+                ui.add(egui::Label::new(theme::text("Clips get named after what happened in the game, for games that tell HasteClip. Clips where nothing happened keep their time.", 13.5, W::Regular).color(p.text2)).wrap());
                 ui.add_space(18.0);
                 ui.label(theme::text("Your clips will be called", 13.0, W::Semibold).color(p.text2));
                 ui.add_space(6.0);

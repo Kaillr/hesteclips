@@ -221,7 +221,7 @@ impl Build {
             let frames = self.frames.lock().unwrap().frames.clone();
             match cache::finish(data, &frames, path) {
                 Err(e) => eprintln!("scrub proxy: couldn't keep it: {e}"),
-                Ok(()) if std::env::var_os("HESTECLIPS_DEBUG_VIDEO").is_some() => {
+                Ok(()) if std::env::var_os("HASTECLIP_DEBUG_VIDEO").is_some() => {
                     eprintln!("{:>8.3} scrub proxy: kept on disk in {:.0} ms", crate::player::uptime(), t.elapsed().as_secs_f64() * 1000.0);
                 }
                 Ok(()) => {}
@@ -297,7 +297,7 @@ fn start(ctx: &egui::Context, b: &Arc<Build>) {
     if let Some(path) = &b.cache {
         let t = std::time::Instant::now();
         if let Some((data, store)) = cache::load(path, b.total) {
-            if std::env::var_os("HESTECLIPS_DEBUG_VIDEO").is_some() {
+            if std::env::var_os("HASTECLIP_DEBUG_VIDEO").is_some() {
                 eprintln!("{:>8.3} scrub proxy: {} frames from the cache in {:.0} ms", crate::player::uptime(), store.ready, t.elapsed().as_secs_f64() * 1000.0);
             }
             let _ = b.data.set(data);
@@ -330,7 +330,7 @@ fn start(ctx: &egui::Context, b: &Arc<Build>) {
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
     #[cfg(hw_decode)]
-    if std::env::var_os("HESTECLIPS_NO_HW_DECODE").is_none() && hw::build(ctx, b) {
+    if std::env::var_os("HASTECLIP_NO_HW_DECODE").is_none() && hw::build(ctx, b) {
         return;
     }
     let mut slot = b.child.lock().unwrap();
@@ -548,7 +548,7 @@ mod hw {
     /// Start building; false if the decoder can't open the clip.
     pub fn build(ctx: &egui::Context, b: &Arc<Build>) -> bool {
         let (source, fps, total) = (&b.source, b.fps, b.total);
-        let debug = std::env::var_os("HESTECLIPS_DEBUG_VIDEO").is_some();
+        let debug = std::env::var_os("HASTECLIP_DEBUG_VIDEO").is_some();
         if debug {
             eprintln!("{:>8.3} scrub proxy: opening the decoder", crate::player::uptime());
         }
@@ -833,7 +833,7 @@ mod cache {
     const FOOTER: u64 = 24;
 
     pub fn dir() -> PathBuf {
-        dirs::cache_dir().unwrap_or_else(std::env::temp_dir).join("hesteclips").join("proxy")
+        dirs::cache_dir().unwrap_or_else(std::env::temp_dir).join("hasteclip").join("proxy")
     }
 
     pub fn key(source: &Path, fps: f64, total: usize) -> Option<u64> {
@@ -855,7 +855,7 @@ mod cache {
         let name = format!("{}-{}", std::process::id(), n);
         match kept {
             Some(p) => p.with_extension(format!("{name}.partial")),
-            None => std::env::temp_dir().join(format!("hesteclips-proxy-{name}.partial")),
+            None => std::env::temp_dir().join(format!("hasteclip-proxy-{name}.partial")),
         }
     }
 
@@ -962,7 +962,7 @@ mod cache {
 
         #[test]
         fn kept_proxies_read_back() {
-            let kept = std::env::temp_dir().join(format!("hesteclips-proxy-test-{}.proxy", std::process::id()));
+            let kept = std::env::temp_dir().join(format!("hasteclip-proxy-test-{}.proxy", std::process::id()));
             let data = Data::create(partial_path(Some(&kept))).unwrap();
             let a = data.append(&[1, 1, 1]).unwrap();
             let b = data.append(&[2, 2]).unwrap();
@@ -1068,7 +1068,7 @@ mod tests {
 
 #[cfg(test)]
 mod speed {
-    /// `cargo test --release -p hesteclips proxy_jpeg_speed -- --ignored --nocapture`
+    /// `cargo test --release -p hasteclip proxy_jpeg_speed -- --ignored --nocapture`
     #[test]
     #[ignore]
     fn proxy_jpeg_speed() {
@@ -1095,7 +1095,7 @@ mod speed {
 #[cfg(test)]
 mod formats {
     /// JPEG vs PNG vs raw for a proxy frame: `PROXY_FRAME=<640x360 rgba file>
-    /// cargo test --release -p hesteclips proxy_formats -- --ignored --nocapture`
+    /// cargo test --release -p hasteclip proxy_formats -- --ignored --nocapture`
     #[test]
     #[ignore]
     fn proxy_formats() {
@@ -1129,7 +1129,7 @@ mod formats {
 #[cfg(test)]
 mod quality {
     /// Size and colour error of proxy JPEGs: `PROXY_DIR=<dir with f640/f960/f1280.raw>
-    /// cargo test --release -p hesteclips proxy_quality -- --ignored --nocapture`
+    /// cargo test --release -p hasteclip proxy_quality -- --ignored --nocapture`
     #[test]
     #[ignore]
     fn proxy_quality() {

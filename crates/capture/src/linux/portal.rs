@@ -101,13 +101,13 @@ struct State {
     size: Option<(u32, u32)>,
 }
 
-/// `$XDG_STATE_HOME/hesteclips/screencast` (`~/.local/state/…`).
+/// `$XDG_STATE_HOME/hasteclip/screencast` (`~/.local/state/…`).
 fn state_file() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))?;
-    Some(base.join("hesteclips").join("screencast"))
+    Some(base.join("hasteclip").join("screencast"))
 }
 
 /// Two lines: the restore token (may be empty), and `WIDTHxHEIGHT`.

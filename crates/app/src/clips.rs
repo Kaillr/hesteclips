@@ -91,7 +91,7 @@ pub fn scan(lib: &Path) -> Vec<Clip> {
     clips
 }
 
-/// The library's folders, by name. Hidden ones (`.hesteclips`, the edits)
+/// The library's folders, by name. Hidden ones (`.hasteclip`, the edits)
 /// aren't clips.
 pub fn folders(lib: &Path) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(lib) else { return Vec::new() };
@@ -419,11 +419,11 @@ mod tests {
         let lib = std::env::temp_dir().join(format!("hc-scan-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&lib);
         std::fs::create_dir_all(lib.join("osu!")).unwrap();
-        std::fs::create_dir_all(lib.join(".hesteclips").join("abcdef12")).unwrap();
+        std::fs::create_dir_all(lib.join(".hasteclip").join("abcdef12")).unwrap();
         std::fs::write(lib.join("clip_2026-10-01_14-51-01.mp4"), b"x").unwrap();
         std::fs::write(lib.join("osu!").join("clip_2026-10-02_14-51-01.mp4"), b"x").unwrap();
         std::fs::write(lib.join("osu!").join(".clip_2026-10-02_14-52-01.mp4"), b"x").unwrap();
-        std::fs::write(lib.join(".hesteclips").join("abcdef12").join("original.mp4"), b"x").unwrap();
+        std::fs::write(lib.join(".hasteclip").join("abcdef12").join("original.mp4"), b"x").unwrap();
         let found: Vec<(String, Option<String>)> = scan(&lib).into_iter().map(|c| (c.name, c.folder)).collect();
         assert_eq!(
             found,

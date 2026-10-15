@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 /// Where releases are published.
-pub const REPO: &str = "https://github.com/Kaillr/hesteclips";
+pub const REPO: &str = "https://github.com/Kaillr/hasteclip";
 
 /// First check after launch: right away, but after the window is up.
 const FIRST_CHECK_AFTER: Duration = Duration::from_secs(3);

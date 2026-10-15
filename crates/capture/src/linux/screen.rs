@@ -312,7 +312,7 @@ fn run(fd: Option<OwnedFd>, node: u32, latest: &Arc<Latest>, ready: &mpsc::Sende
     };
     let stream = pw::stream::StreamRc::new(
         core.clone(),
-        "hesteclips-screen",
+        "hasteclip-screen",
         pw::properties::properties! {
             *pw::keys::MEDIA_TYPE => "Video",
             *pw::keys::MEDIA_CATEGORY => "Capture",

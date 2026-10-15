@@ -104,7 +104,7 @@ fn saved_path(id: &str) -> Option<std::path::PathBuf> {
     let name: String = id.to_lowercase().chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' }).collect();
     // (`app-icons-2`: macOS icons cropped to their plate since; the ones
     // saved before have the margin.)
-    dirs::cache_dir().map(|d| d.join("hesteclips").join("app-icons-2").join(format!("{name}.png")))
+    dirs::cache_dir().map(|d| d.join("hasteclip").join("app-icons-2").join(format!("{name}.png")))
 }
 
 fn save(id: &str, px: &[u8]) {

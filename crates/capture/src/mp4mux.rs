@@ -793,7 +793,7 @@ mod tests {
             fps: 60,
             audio_titles: vec!["Mix".into(), "Mic".into()],
             audio_bitrate: 192_000,
-            comment: "hesteclips:mix=1".into(),
+            comment: "hasteclip:mix=1".into(),
             mov,
         }
     }
@@ -940,7 +940,7 @@ mod tests {
         let moov = &bytes[moov.1..moov.1 + moov.2];
         let text = String::from_utf8_lossy(moov);
         assert!(text.contains("Video\0") && text.contains("Mix\0") && text.contains("Mic\0"));
-        assert!(text.contains("hesteclips:mix=1"));
+        assert!(text.contains("hasteclip:mix=1"));
         assert!(text.contains("elst"), "audio starting late gets an empty edit");
     }
 

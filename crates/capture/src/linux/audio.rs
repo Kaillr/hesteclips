@@ -7,7 +7,7 @@
 //! - **Mic**: connected to its device by the session manager (WirePlumber).
 //! - **Desktop and apps**: connected by us, the way a patchbay would — every
 //!   app's playback stream is linked straight into ours, and PipeWire adds up
-//!   what arrives. The desktop is every app except HesteClips itself (its
+//!   what arrives. The desktop is every app except HasteClip itself (its
 //!   clip previews and sounds), and, when asked, except the apps that are
 //!   sources of their own; an app source is the playback of programs by that
 //!   name. Like WASAPI's process loopback on Windows, and unlike recording
@@ -290,9 +290,9 @@ fn open_stream(core: &pw::core::CoreRc, source: &AudioSource, feed: Arc<SourceFe
         *pw::keys::MEDIA_TYPE => "Audio",
         *pw::keys::MEDIA_CATEGORY => "Capture",
         *pw::keys::MEDIA_ROLE => "Production",
-        *pw::keys::NODE_NAME => format!("hesteclips.{}", source.id),
-        *pw::keys::NODE_DESCRIPTION => format!("HesteClips: {}", source.name),
-        *pw::keys::APP_NAME => "HesteClips",
+        *pw::keys::NODE_NAME => format!("hasteclip.{}", source.id),
+        *pw::keys::NODE_DESCRIPTION => format!("HasteClip: {}", source.name),
+        *pw::keys::APP_NAME => "HasteClip",
         // Small packets, so the meters move smoothly.
         *pw::keys::NODE_LATENCY => format!("{}/{RATE}", RATE / 100),
     };
@@ -303,7 +303,7 @@ fn open_stream(core: &pw::core::CoreRc, source: &AudioSource, feed: Arc<SourceFe
     if let Some(device) = &device {
         props.insert("target.object", device.as_str());
     }
-    let stream = pw::stream::StreamRc::new(core.clone(), &format!("hesteclips-{}", source.id), props)?;
+    let stream = pw::stream::StreamRc::new(core.clone(), &format!("hasteclip-{}", source.id), props)?;
     let listener = stream
         .add_local_listener_with_user_data(())
         .process(move |stream, _| {

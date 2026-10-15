@@ -1,4 +1,4 @@
-//! The tray icon (Windows, Linux) / menu bar icon (macOS): HesteClips keeps
+//! The tray icon (Windows, Linux) / menu bar icon (macOS): HasteClip keeps
 //! running there when its window is closed, so the replay buffer and
 //! shortcuts keep working. Its menu: open the window, save a clip, start or
 //! stop the replay buffer, quit. Clicking the icon opens the window.
@@ -97,10 +97,10 @@ impl Tray {
             use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
             use tray_icon::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 
-            let open = MenuItem::new("Open HesteClips", true, None);
+            let open = MenuItem::new("Open HasteClip", true, None);
             let save = MenuItem::new("Save clip", false, None);
             let buffer = MenuItem::new("Start replay buffer", true, None);
-            let quit = MenuItem::new("Quit HesteClips", true, None);
+            let quit = MenuItem::new("Quit HasteClip", true, None);
             let menu = Menu::new();
             menu.append_items(&[&open, &PredefinedMenuItem::separator(), &save, &buffer, &PredefinedMenuItem::separator(), &quit]).ok()?;
             let _ = icon;
@@ -108,7 +108,7 @@ impl Tray {
             // macOS: a template image, tinted by macOS to suit the menu bar
             // (white on a dark one, black on a light one), as its own icons.
             let built = TrayIconBuilder::new()
-                .with_tooltip("HesteClips")
+                .with_tooltip("HasteClip")
                 .with_icon(image)
                 .with_icon_as_template(cfg!(target_os = "macos"))
                 .with_menu(Box::new(menu))
@@ -219,13 +219,13 @@ mod linux {
             crate::portal_shortcuts::APP_ID.into()
         }
         fn title(&self) -> String {
-            "HesteClips".into()
+            "HasteClip".into()
         }
         fn icon_pixmap(&self) -> Vec<ksni::Icon> {
             self.icon.clone()
         }
         fn tool_tip(&self) -> ksni::ToolTip {
-            ksni::ToolTip { title: "HesteClips".into(), ..Default::default() }
+            ksni::ToolTip { title: "HasteClip".into(), ..Default::default() }
         }
         /// A left click opens the window.
         fn activate(&mut self, _x: i32, _y: i32) {
@@ -237,12 +237,12 @@ mod linux {
                 StandardItem { label: label.into(), enabled, activate: Box::new(move |this: &mut Self| this.send(cmd)), ..Default::default() }.into()
             };
             vec![
-                item("Open HesteClips", true, Cmd::Open),
+                item("Open HasteClip", true, Cmd::Open),
                 ksni::MenuItem::Separator,
                 item("Save clip", self.buffering, Cmd::SaveClip),
                 item(if self.buffering { "Stop replay buffer" } else { "Start replay buffer" }, true, Cmd::ToggleBuffer),
                 ksni::MenuItem::Separator,
-                item("Quit HesteClips", true, Cmd::Quit),
+                item("Quit HasteClip", true, Cmd::Quit),
             ]
         }
         /// The desktop stopped showing tray icons (its panel restarted, say):
@@ -278,7 +278,7 @@ mod linux {
     }
 }
 
-/// One HesteClips at a time: opening it again (a shortcut, a second click)
+/// One HasteClip at a time: opening it again (a shortcut, a second click)
 /// shows the one already running, in the tray maybe. The first listens on a
 /// local port; a later one tells it to show itself and exits.
 ///

@@ -529,7 +529,7 @@ impl GameTitles {
     }
 }
 
-/// Persisted to `<config_dir>/hesteclips/settings.json`. `#[serde(default)]` lets
+/// Persisted to `<config_dir>/hasteclip/settings.json`. `#[serde(default)]` lets
 /// older files load after new fields are added.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -578,7 +578,7 @@ pub struct RecordSettings {
     pub game_folders: std::collections::BTreeMap<String, String>,
     /// Light, dark, or the system's.
     pub theme: Theme,
-    /// Closing the window keeps HesteClips running in the tray (where
+    /// Closing the window keeps HasteClip running in the tray (where
     /// there is one) instead of quitting.
     pub close_to_tray: bool,
     /// The first close asked which (then it just does it).
@@ -677,7 +677,7 @@ pub struct SaveSound {
     pub sound: String,
     /// 0..=1, applied on a curve (see `sound::gain`).
     pub volume: f32,
-    /// Sounds you've added, copied into HesteClips' own folder.
+    /// Sounds you've added, copied into HasteClip' own folder.
     pub custom: Vec<CustomSound>,
     /// Recorded like any other app's sound (in what's recorded after it).
     pub recorded: bool,
@@ -790,24 +790,24 @@ pub fn fps_choices(hz: Option<u32>) -> Vec<u32> {
 /// encoder takes 1080p at up to ~540 fps (2 ms a frame, one at a time).
 pub const MAX_FPS: u32 = 600;
 
-/// `~/Movies/hesteclips` on macOS, the platform video dir elsewhere, falling back
+/// `~/Movies/hasteclip` on macOS, the platform video dir elsewhere, falling back
 /// to the current dir if none is known.
 pub fn default_output_dir() -> PathBuf {
     dirs::video_dir()
         .or_else(dirs::home_dir)
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("hesteclips")
+        .join("hasteclip")
 }
 
 fn settings_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("hesteclips").join("settings.json"))
+    dirs::config_dir().map(|d| d.join("hasteclip").join("settings.json"))
 }
 
-/// Dev aid: `HESTECLIPS_SETTINGS=<file>` loads the settings from that file
+/// Dev aid: `HASTECLIP_SETTINGS=<file>` loads the settings from that file
 /// instead (to check a setup without touching the real one; dev-hook
 /// launches never save).
 fn load_path() -> Option<PathBuf> {
-    std::env::var_os("HESTECLIPS_SETTINGS").map(PathBuf::from).or_else(settings_path)
+    std::env::var_os("HASTECLIP_SETTINGS").map(PathBuf::from).or_else(settings_path)
 }
 
 impl RecordSettings {

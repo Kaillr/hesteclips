@@ -1121,7 +1121,7 @@ struct BlendPacer {
     diag: Option<EncodeDiag>,
 }
 
-/// `HESTECLIPS_ENCODE_LOG=1`: where frames wait, logged every 5 s. How late
+/// `HASTECLIP_ENCODE_LOG=1`: where frames wait, logged every 5 s. How late
 /// the pacer closed frames and how long closing took (CPU), how long the GPU
 /// took to finish a frame's work after it was submitted, how long the encoder
 /// held frames, the fewest free encoder frames, and why frames were skipped.
@@ -1141,7 +1141,7 @@ struct EncodeDiag {
 
 impl EncodeDiag {
     fn new() -> Option<Self> {
-        std::env::var_os("HESTECLIPS_ENCODE_LOG").map(|_| Self {
+        std::env::var_os("HASTECLIP_ENCODE_LOG").map(|_| Self {
             since: Instant::now(),
             frames: 0,
             late_max: 0.0,

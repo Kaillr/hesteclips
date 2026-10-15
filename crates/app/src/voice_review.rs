@@ -301,7 +301,7 @@ impl App {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let label = if ready == 0 { "Export".to_owned() } else { format!("Export {ready}") };
                         if ui_kit::Btn::normal(label).enabled(ready > 0).show(ui).clicked() {
-                            let picked = rfd::FileDialog::new().set_file_name("hesteclips-voice-samples.zip").add_filter("Zip file", &["zip"]).save_file();
+                            let picked = rfd::FileDialog::new().set_file_name("hasteclip-voice-samples.zip").add_filter("Zip file", &["zip"]).save_file();
                             if let Some(path) = picked {
                                 say = Some(match voice_samples::export(&path, &r.list) {
                                     Ok(n) => (format!("Saved {n} samples to {}", path.display()), false),

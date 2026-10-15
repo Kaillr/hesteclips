@@ -279,7 +279,7 @@ unsafe impl Send for Map {}
 impl Map {
     fn new(size: usize) -> Result<Self> {
         // SAFETY: a fresh anonymous file, ours alone.
-        let fd = unsafe { libc::memfd_create(c"hesteclips-screen".as_ptr(), libc::MFD_CLOEXEC) };
+        let fd = unsafe { libc::memfd_create(c"hasteclip-screen".as_ptr(), libc::MFD_CLOEXEC) };
         if fd < 0 {
             bail!("memfd_create: {}", std::io::Error::last_os_error());
         }

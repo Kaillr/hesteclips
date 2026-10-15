@@ -1,13 +1,13 @@
 [Desktop Entry]
 Type=Application
-Name=HesteClips
+Name=HasteClip
 GenericName=Clip Recorder
 Comment=Keep a replay buffer running and save clips with a hotkey
-Exec=hesteclips
-Icon=io.github.kaillr.HesteClips
+Exec=hasteclip
+Icon=io.github.kaillr.HasteClip
 Terminal=false
 Categories=AudioVideo;Video;Recorder;
 Keywords=clip;replay;record;screen;capture;game;
-StartupWMClass=io.github.kaillr.HesteClips
+StartupWMClass=io.github.kaillr.HasteClip
 SingleMainWindow=true
 X-KDE-Wayland-Interfaces=zkde_screencast_unstable_v1,org_kde_plasma_window_management

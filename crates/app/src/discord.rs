@@ -1,8 +1,8 @@
-//! "Clipping osu!" on your Discord profile, while HesteClips records (opt-in,
+//! "Clipping osu!" on your Discord profile, while HasteClip records (opt-in,
 //! Settings → Discord).
 //!
 //! Discord Rich Presence: the Discord app on this computer takes an activity
-//! from us over its local pipe. The activity belongs to the "HesteClips"
+//! from us over its local pipe. The activity belongs to the "HasteClip"
 //! application in Discord's developer portal ([`CLIENT_ID`]), whose `logo` art
 //! asset is the small badge. The game's own picture and name come from
 //! Discord's public list of games it detects, matched by executable.
@@ -17,9 +17,9 @@ use discord_rich_presence::activity::{Activity, Assets, Timestamps};
 use discord_rich_presence::{DiscordIpc, DiscordIpcClient};
 use serde::{Deserialize, Serialize};
 
-/// The HesteClips application in Discord's developer portal.
+/// The HasteClip application in Discord's developer portal.
 const CLIENT_ID: &str = "1556434870572679198";
-/// Its art asset with the HesteClips logo (`assets/discord-logo.png`).
+/// Its art asset with the HasteClip logo (`assets/discord-logo.png`).
 const LOGO: &str = "logo";
 /// While wanted but not connected (Discord not running yet), try again this often.
 const RETRY_EVERY: Duration = Duration::from_secs(15);
@@ -118,16 +118,16 @@ fn run(rx: mpsc::Receiver<Option<Status>>, connected: Arc<AtomicBool>) {
 fn activity(status: &Status) -> Activity<'_> {
     let doing = if status.recording { "Recording" } else { "Clipping" };
     // As Medal does it: the activity is named after the game ("osu! with
-    // HesteClips") instead of the app, so it reads like the game itself.
+    // HasteClip") instead of the app, so it reads like the game itself.
     let (name, details) = match &status.game {
-        Some(g) => (Some(format!("{} with HesteClips", g.name)), format!("{doing} {} with HesteClips", g.name)),
+        Some(g) => (Some(format!("{} with HasteClip", g.name)), format!("{doing} {} with HasteClip", g.name)),
         None if status.recording => (None, "Recording".to_owned()),
         None => (None, "Replay buffer on".to_owned()),
     };
     let assets = match status.game.as_ref().and_then(|g| Some((g, g.icon.as_deref()?))) {
-        // The game's picture, with HesteClips as the badge in its corner.
-        Some((g, icon)) => Assets::new().large_image(icon).large_text(g.name.as_str()).small_image(LOGO).small_text("HesteClips"),
-        None => Assets::new().large_image(LOGO).large_text("HesteClips"),
+        // The game's picture, with HasteClip as the badge in its corner.
+        Some((g, icon)) => Assets::new().large_image(icon).large_text(g.name.as_str()).small_image(LOGO).small_text("HasteClip"),
+        None => Assets::new().large_image(LOGO).large_text("HasteClip"),
     };
     // In seconds: Discord takes milliseconds as seconds (whatever the crate
     // says), and a start that far ahead shows a timer stuck at 0:00.
@@ -190,7 +190,7 @@ impl KnownGame {
 }
 
 fn games_cache() -> Option<PathBuf> {
-    dirs::cache_dir().map(|d| d.join("hesteclips").join("discord-games-2.json"))
+    dirs::cache_dir().map(|d| d.join("hasteclip").join("discord-games-2.json"))
 }
 
 /// Discord's games, from our cache while it's fresh, else downloaded (and cached).
@@ -273,7 +273,7 @@ fn download_games() -> Option<HashMap<String, KnownGame>> {
 
 #[cfg(test)]
 mod tests {
-    /// Downloads Discord's real list: `cargo test -p hesteclips discord -- --ignored`.
+    /// Downloads Discord's real list: `cargo test -p hasteclip discord -- --ignored`.
     #[test]
     #[ignore = "network"]
     fn finds_games_by_executable() {

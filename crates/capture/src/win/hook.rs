@@ -76,9 +76,9 @@ pub(crate) fn plan(exe: &str, window: HWND, settings: &crate::GameHook) -> (Plan
     if !available() {
         return (Plan::Wgc, "the hook's files aren't there".into());
     }
-    // For testing: `HESTECLIPS_FORCE_HOOK=<exe>[,…]` hooks those whatever they are.
-    if std::env::var("HESTECLIPS_FORCE_HOOK").is_ok_and(|v| v.split(',').any(|e| e.eq_ignore_ascii_case(exe))) {
-        return (Plan::Hook, "forced (HESTECLIPS_FORCE_HOOK)".into());
+    // For testing: `HASTECLIP_FORCE_HOOK=<exe>[,…]` hooks those whatever they are.
+    if std::env::var("HASTECLIP_FORCE_HOOK").is_ok_and(|v| v.split(',').any(|e| e.eq_ignore_ascii_case(exe))) {
+        return (Plan::Hook, "forced (HASTECLIP_FORCE_HOOK)".into());
     }
     if !settings.auto {
         return (Plan::Wgc, "the hook is off".into());

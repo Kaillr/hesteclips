@@ -2,7 +2,7 @@
 //!
 //! A clip lives in one place on disk (its game's folder), but can be in any
 //! number of collections — they're lists, not folders, so adding a clip to one
-//! never moves it. They're kept in the library's `.hesteclips/collections.json`,
+//! never moves it. They're kept in the library's `.hasteclip/collections.json`,
 //! by the clip's path inside the library. Renaming or moving a clip in the app
 //! takes its memberships along; one moved to another folder outside the app is
 //! found again by its file name.
@@ -201,7 +201,7 @@ impl Collections {
 }
 
 fn file_path(lib: &Path) -> PathBuf {
-    lib.join(".hesteclips").join("collections.json")
+    lib.join(".hasteclip").join("collections.json")
 }
 
 /// Check a name typed for a collection (`current`: the one being renamed).

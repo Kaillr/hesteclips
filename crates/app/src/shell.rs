@@ -51,7 +51,7 @@ pub fn centre_window_buttons(window: &impl raw_window_handle::HasWindowHandle) {
     // this runs on the main thread (checked above).
     let view: &NSView = unsafe { h.ns_view.cast::<NSView>().as_ref() };
     let Some(window) = view.window() else { return };
-    let toolbar = NSToolbar::initWithIdentifier(mtm.alloc(), &NSString::from_str("hesteclips"));
+    let toolbar = NSToolbar::initWithIdentifier(mtm.alloc(), &NSString::from_str("hasteclip"));
     window.setToolbar(Some(&toolbar));
     window.setToolbarStyle(NSWindowToolbarStyle::Unified);
     place_window_buttons(view);

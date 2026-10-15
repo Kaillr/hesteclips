@@ -420,7 +420,7 @@ mod tests {
 
     /// How long making the glass takes (it's made again whenever the clips
     /// near the card move: every frame while the window is resized):
-    /// `cargo test -p hesteclips glass_cost -- --ignored --nocapture`.
+    /// `cargo test -p hasteclip glass_cost -- --ignored --nocapture`.
     #[test]
     #[ignore]
     fn glass_cost() {

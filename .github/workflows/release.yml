@@ -5,8 +5,8 @@
 #    version is, without releasing anything. No release-worthy commits → the
 #    rest is skipped.
 # 2. windows, linux, mac: build that version for the platforms ticked when
-#    running it (installer and update packages, HesteClips-linux-x64.tar.gz,
-#    HesteClips-mac-arm64.dmg), all at once.
+#    running it (installer and update packages, HasteClip-linux-x64.tar.gz,
+#    HasteClip-mac-arm64.dmg), all at once.
 # 3. publish: only once every ticked build is done, semantic-release tags
 #    vX.Y.Z and publishes the GitHub release with everything on it, which the
 #    installed apps update from. A failed build means no release, never half
@@ -136,7 +136,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: linux
-          path: Releases/HesteClips-linux-x64.tar.gz*
+          path: Releases/HasteClip-linux-x64.tar.gz*
           if-no-files-found: error
 
   mac:
@@ -163,7 +163,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: mac
-          path: Releases/HesteClips-mac-arm64.dmg
+          path: Releases/HasteClip-mac-arm64.dmg
           if-no-files-found: error
 
   publish:

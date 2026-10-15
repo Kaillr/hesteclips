@@ -18,7 +18,7 @@
 //!   The full-size frame comes when the scrub stops (on a 240 fps recording
 //!   with 480 frames between keyframes, 30-480 ms: decoded from the keyframe).
 //!
-//!   Measured with `HESTECLIPS_DEV_DRAG` (debug build; a release build is
+//!   Measured with `HASTECLIP_DEV_DRAG` (debug build; a release build is
 //!   the same: the decoder sets the pace), frames behind the playhead once
 //!   steady: 1080p60 recording, 1-10× back 0.2-7, 1× back and forth 0.2,
 //!   30× forward 40; a 1440p clip with B-frames, 1-3× back 0.2-0.8, 30×
@@ -732,7 +732,7 @@ fn open_decoder(path: &Path) -> anyhow::Result<Decoder> {
         let on_gpu = crate::gpu_frames::share_luid().and_then(|luid| {
             Decoder::open(path, u32::MAX, Some(luid)).inspect_err(|e| eprintln!("sharing decoded frames isn't possible, copying them: {e:#}")).ok()
         });
-        if std::env::var_os("HESTECLIPS_DEBUG_VIDEO").is_some() {
+        if std::env::var_os("HASTECLIP_DEBUG_VIDEO").is_some() {
             eprintln!("video: decoded frames {}", if on_gpu.is_some() { "drawn from the GPU" } else { "copied to the CPU" });
         }
         match on_gpu {

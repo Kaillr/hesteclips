@@ -65,7 +65,7 @@ pub fn init(state: Option<&RenderState>, ctx: &egui::Context) {
             s.renderer.write().callback_resources.insert(scaler);
             // A picture waiting for it is drawn now.
             ctx.request_repaint();
-            if std::env::var_os("HESTECLIPS_DEBUG_VIDEO").is_some() {
+            if std::env::var_os("HASTECLIP_DEBUG_VIDEO").is_some() {
                 eprintln!("frame filter ready in {} ms", started.elapsed().as_millis());
             }
         })
@@ -610,7 +610,7 @@ fn pipeline(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, target: wgpu:
         multiview_mask: None,
         cache: None,
     });
-    if std::env::var_os("HESTECLIPS_DEBUG_VIDEO").is_some() {
+    if std::env::var_os("HASTECLIP_DEBUG_VIDEO").is_some() {
         eprintln!("frame filter pipeline ({target:?}) in {} ms", t0.elapsed().as_millis());
     }
     pipeline
@@ -1021,7 +1021,7 @@ mod tests {
     /// The two passes draw what the one pass did (the shader before them,
     /// worked through on the CPU), shrunk, at 1:1 and enlarged, RGBA and
     /// NV12: within a level, the 16-bit rows' rounding.
-    /// `cargo test -p hesteclips two_passes -- --ignored --nocapture`
+    /// `cargo test -p hasteclip two_passes -- --ignored --nocapture`
     #[test]
     #[ignore = "needs a graphics card"]
     fn two_passes_match_one() {
@@ -1081,7 +1081,7 @@ mod tests {
     }
 
     /// A live preview frame (a ScreenCaptureKit buffer) opens as textures.
-    /// `cargo test -p hesteclips sck_preview -- --ignored --nocapture`
+    /// `cargo test -p hasteclip sck_preview -- --ignored --nocapture`
     #[cfg(target_os = "macos")]
     #[test]
     #[ignore]
@@ -1110,13 +1110,13 @@ mod tests {
 
     /// A decoded NV12 frame drawn by the real filter matches ffmpeg's
     /// conversion of the same frame: at 1:1 and shrunk (Lanczos both).
-    /// `HESTECLIPS_TEST_CLIP=<mp4> cargo test -p hesteclips nv12 -- --ignored --nocapture`
+    /// `HASTECLIP_TEST_CLIP=<mp4> cargo test -p hasteclip nv12 -- --ignored --nocapture`
     #[cfg(target_os = "macos")]
     #[test]
     #[ignore]
     fn nv12_matches_ffmpeg() {
         use capture::decode::{Decoder, Output};
-        let clip = std::path::PathBuf::from(std::env::var("HESTECLIPS_TEST_CLIP").expect("HESTECLIPS_TEST_CLIP"));
+        let clip = std::path::PathBuf::from(std::env::var("HASTECLIP_TEST_CLIP").expect("HASTECLIP_TEST_CLIP"));
         let frame: u64 = 600;
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor { backends: wgpu::Backends::METAL, ..wgpu::InstanceDescriptor::new_without_display_handle() });
         let adapter = pollster::block_on(instance.request_adapter(&Default::default())).expect("adapter");
@@ -1210,7 +1210,7 @@ mod tests {
 
     /// A red frame lights the stage red; a cut to blue fades rather than
     /// flips; drawn big, the light is smooth (no step between neighbours).
-    /// `cargo test -p hesteclips stage_light -- --ignored --nocapture`
+    /// `cargo test -p hasteclip stage_light -- --ignored --nocapture`
     #[test]
     #[ignore = "needs a graphics card"]
     fn stage_light() {
@@ -1242,7 +1242,7 @@ mod tests {
 
     /// What the light costs next to drawing the frame itself: a 2560×1440
     /// NV12 frame, each timed over many runs on the GPU.
-    /// `cargo test -p hesteclips stage_light_cost -- --ignored --nocapture`
+    /// `cargo test -p hasteclip stage_light_cost -- --ignored --nocapture`
     #[test]
     #[ignore = "needs a graphics card"]
     fn stage_light_cost() {

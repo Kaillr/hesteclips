@@ -98,7 +98,7 @@ pub(crate) struct Changes {
     last_new: f64,
     /// How long without a new picture before the cursor moving counts as one.
     quiet: f64,
-    /// `HESTECLIPS_HOOK_LOG=1`: looks, new pictures, comparisons dropped unread, since `counted.0`.
+    /// `HASTECLIP_HOOK_LOG=1`: looks, new pictures, comparisons dropped unread, since `counted.0`.
     counted: (std::time::Instant, u32, u32, u32),
 }
 
@@ -211,7 +211,7 @@ impl Changes {
         self.pending.push_back(p);
         self.counted.1 += 1;
         if self.counted.0.elapsed() >= std::time::Duration::from_secs(5) {
-            if std::env::var_os("HESTECLIPS_HOOK_LOG").is_some() {
+            if std::env::var_os("HASTECLIP_HOOK_LOG").is_some() {
                 let secs = self.counted.0.elapsed().as_secs_f64();
                 eprintln!("game hook: {:.0} looks/s, {:.0} new pictures/s, {} comparisons unread", self.counted.1 as f64 / secs, self.counted.2 as f64 / secs, self.counted.3);
             }

@@ -257,12 +257,12 @@ mod detector {
         sure: usize,
         /// When the phrase was last heard (a clip saved).
         said_at: Option<f64>,
-        /// `HESTECLIPS_DEBUG_VOICE=1`: the loudest sample and the surest
+        /// `HASTECLIP_DEBUG_VOICE=1`: the loudest sample and the surest
         /// frame since they were last logged, and when that was.
         peak: f32,
         best: f32,
         logged_at: f64,
-        /// `HESTECLIPS_VOICE_DUMP=<file.wav>`: everything heard, kept to
+        /// `HASTECLIP_VOICE_DUMP=<file.wav>`: everything heard, kept to
         /// replay through the tests (written when listening stops).
         dump: Option<(std::path::PathBuf, Vec<f32>)>,
         /// Whether to keep snippets to review; set by the app.
@@ -277,15 +277,15 @@ mod detector {
         snippet_at: f64,
     }
 
-    /// `HESTECLIPS_VOICE_TRACE=1`: every frame's confidence, to see why a take wasn't heard.
+    /// `HASTECLIP_VOICE_TRACE=1`: every frame's confidence, to see why a take wasn't heard.
     fn trace() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("HESTECLIPS_VOICE_TRACE").is_some())
+        *ON.get_or_init(|| std::env::var_os("HASTECLIP_VOICE_TRACE").is_some())
     }
 
     fn debug() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("HESTECLIPS_DEBUG_VOICE").is_some())
+        *ON.get_or_init(|| std::env::var_os("HASTECLIP_DEBUG_VOICE").is_some())
     }
 
     impl Drop for Listening {
@@ -321,7 +321,7 @@ mod detector {
 
     impl Listening {
         pub(super) fn new(mic: String, sound: Receiver<Vec<f32>>) -> Self {
-            let dump = std::env::var_os("HESTECLIPS_VOICE_DUMP").map(|p| (std::path::PathBuf::from(p), Vec::new()));
+            let dump = std::env::var_os("HASTECLIP_VOICE_DUMP").map(|p| (std::path::PathBuf::from(p), Vec::new()));
             Self {
                 mic,
                 sound,
@@ -679,13 +679,13 @@ mod detector {
         }
 
         /// How often a long recording (many takes, some talk) triggers it, for
-        /// tuning: `HESTECLIPS_VOICE_SESSION=session.wav cargo test -- --ignored
+        /// tuning: `HASTECLIP_VOICE_SESSION=session.wav cargo test -- --ignored
         /// --nocapture counts_a_session` (16 or 48 kHz).
         #[test]
         #[ignore]
         fn counts_a_session() {
             let models = Models::load().expect("load the model");
-            let file = std::env::var("HESTECLIPS_VOICE_SESSION").expect("HESTECLIPS_VOICE_SESSION");
+            let file = std::env::var("HASTECLIP_VOICE_SESSION").expect("HASTECLIP_VOICE_SESSION");
             let (samples, rate) = read(std::path::Path::new(&file));
             let t = std::time::Instant::now();
             let at = heard_in(&models, &samples, rate);
@@ -713,13 +713,13 @@ mod detector {
         }
 
         /// Recordings of real people saying the phrase, kept out of the repo:
-        /// `HESTECLIPS_VOICE_TAKES=a.wav;b.wav cargo test -- --ignored voice`
+        /// `HASTECLIP_VOICE_TAKES=a.wav;b.wav cargo test -- --ignored voice`
         /// (WAV, e.g. `ffmpeg -i take.mp3 -ac 1 -ar 16000 take.wav`).
         #[test]
         #[ignore]
         fn hears_real_takes() {
             let models = Models::load().expect("load the model");
-            let takes = std::env::var("HESTECLIPS_VOICE_TAKES").expect("HESTECLIPS_VOICE_TAKES");
+            let takes = std::env::var("HASTECLIP_VOICE_TAKES").expect("HASTECLIP_VOICE_TAKES");
             for file in takes.split(';') {
                 let (samples, rate) = read(std::path::Path::new(file));
                 assert!(!heard_in(&models, &samples, rate).is_empty(), "not heard in {file}");

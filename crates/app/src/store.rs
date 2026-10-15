@@ -6,14 +6,14 @@
 //! its permanent id, which is written into the video's own metadata:
 //!
 //! ```text
-//! Clutch ace.mp4              ← comment "hesteclips:mix=1,2 id=3f9c…"
-//! .hesteclips/3f9c…/
+//! Clutch ace.mp4              ← comment "hasteclip:mix=1,2 id=3f9c…"
+//! .hasteclip/3f9c…/
 //!     original.mp4            ← the untouched recording
 //!     edit.json               ← trim + volume, to reopen and change the edit
 //! ```
 //!
 //! Clips in the library's folders (one per game) keep theirs in the same
-//! `.hesteclips` at the library's top. Because the id travels inside the file,
+//! `.hasteclip` at the library's top. Because the id travels inside the file,
 //! renaming a clip or moving it to another folder never loses its edit. A clip gets its id the first time it's edited; clips
 //! that were never edited are just their file.
 
@@ -24,7 +24,7 @@ use media::Edit;
 use crate::clips::Clip;
 
 /// The hidden folder in the library that holds every clip's assets.
-pub const DIR: &str = ".hesteclips";
+pub const DIR: &str = ".hasteclip";
 
 /// A clip as the editor sees it: the file in the library, the file to decode
 /// (its original once it's been edited), and its id if it has one.
@@ -76,7 +76,7 @@ pub fn assets_dir(lib: &Path, id: &str) -> PathBuf {
 }
 
 /// Create a clip's asset folder. On Windows the leading dot doesn't hide
-/// `.hesteclips` the way it does on macOS and Linux, so it's marked hidden.
+/// `.hasteclip` the way it does on macOS and Linux, so it's marked hidden.
 pub fn create_assets_dir(lib: &Path, id: &str) -> std::io::Result<PathBuf> {
     let dir = assets_dir(lib, id);
     std::fs::create_dir_all(&dir)?;
@@ -124,7 +124,7 @@ pub fn read_id(clip: &Path) -> Option<String> {
     let comment = match capture::mp4meta::read_comment(clip) {
         Some(c) => Some(c),
         // Not MP4/MOV (e.g. older MKV clips): ask ffprobe.
-        None if !is_mp4_family(clip) => media::probe(clip).ok().and_then(|i| i.id).map(|id| format!("hesteclips: id={id}")),
+        None if !is_mp4_family(clip) => media::probe(clip).ok().and_then(|i| i.id).map(|id| format!("hasteclip: id={id}")),
         None => None,
     }?;
     media::parse_clip_tag(&comment).id.filter(|id| valid_id(id))
@@ -578,7 +578,7 @@ mod free_up_tests {
             .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=320x240:rate=30:duration=10"])
             .args(["-f", "lavfi", "-i", "sine=frequency=440:duration=10"])
             .args(["-map", "0", "-map", "1", "-c:v", "libx264", "-g", "30", "-c:a", "aac"])
-            .args(["-metadata", &format!("comment=hesteclips:mix=1 id={id}")])
+            .args(["-metadata", &format!("comment=hasteclip:mix=1 id={id}")])
             .arg(path)
             .status()
             .unwrap();

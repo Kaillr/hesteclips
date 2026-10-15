@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Builds the macOS release into Releases/: HesteClips-mac-arm64.dmg, holding
-# HesteClips.app with ffmpeg inside, so there's nothing else to install. Drag
+# Builds the macOS release into Releases/: HasteClip-mac-arm64.dmg, holding
+# HasteClip.app with ffmpeg inside, so there's nothing else to install. Drag
 # it to Applications and open it.
 #
 # Not signed with a Developer ID (there isn't one), only ad hoc, which Apple
@@ -21,9 +21,9 @@ ffmpeg_url="https://ffmpeg.martin-riedl.de/download/macos/arm64/1789931890_9.0.2
 ffmpeg_sha256="c8ed4c4e6978a03c485edbfe4e0a5dc2380f8a30bba5150531b31b094492d924"
 ffprobe_sha256="fcbe839537485eaee7a7a8bc5cbc0f90d53617e80943e8a5b2e31cb851197ea6"
 
-name="HesteClips-mac-arm64"
+name="HasteClip-mac-arm64"
 work="target/release-package"
-app="$work/dmg/HesteClips.app"
+app="$work/dmg/HasteClip.app"
 out="Releases"
 rm -rf "$work/dmg" "$out"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources" "$out"
@@ -38,13 +38,13 @@ restore() {
 }
 trap restore EXIT
 sed -i.bak -E "s/^version = \"[^\"]*\"/version = \"$version\"/" Cargo.toml && rm Cargo.toml.bak
-MACOSX_DEPLOYMENT_TARGET=13.0 cargo build --release -p hesteclips --target aarch64-apple-darwin
+MACOSX_DEPLOYMENT_TARGET=13.0 cargo build --release -p hasteclip --target aarch64-apple-darwin
 restore
 trap - EXIT
 
-cp target/aarch64-apple-darwin/release/hesteclips "$app/Contents/MacOS/"
-strip -x "$app/Contents/MacOS/hesteclips"
-cp crates/app/assets/hesteclips.icns "$app/Contents/Resources/"
+cp target/aarch64-apple-darwin/release/hasteclip "$app/Contents/MacOS/"
+strip -x "$app/Contents/MacOS/hasteclip"
+cp crates/app/assets/hasteclip.icns "$app/Contents/Resources/"
 
 # Next to the app's binary, where media::tool looks first.
 fetch() { # name sha256
@@ -66,28 +66,28 @@ cat > "$app/Contents/Info.plist" <<PLIST
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>CFBundleName</key><string>HesteClips</string>
-    <key>CFBundleDisplayName</key><string>HesteClips</string>
-    <key>CFBundleIdentifier</key><string>io.github.kaillr.HesteClips</string>
-    <key>CFBundleExecutable</key><string>hesteclips</string>
-    <key>CFBundleIconFile</key><string>hesteclips</string>
+    <key>CFBundleName</key><string>HasteClip</string>
+    <key>CFBundleDisplayName</key><string>HasteClip</string>
+    <key>CFBundleIdentifier</key><string>io.github.kaillr.HasteClip</string>
+    <key>CFBundleExecutable</key><string>hasteclip</string>
+    <key>CFBundleIconFile</key><string>hasteclip</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>$version</string>
     <key>CFBundleVersion</key><string>$version</string>
     <key>LSMinimumSystemVersion</key><string>13.0</string>
     <key>LSApplicationCategoryType</key><string>public.app-category.video</string>
     <key>NSHighResolutionCapable</key><true/>
-    <key>NSMicrophoneUsageDescription</key><string>HesteClips records your microphone into your clips when you add it as a source.</string>
-    <key>NSCameraUsageDescription</key><string>HesteClips puts your webcam into your clips when you turn it on.</string>
+    <key>NSMicrophoneUsageDescription</key><string>HasteClip records your microphone into your clips when you add it as a source.</string>
+    <key>NSCameraUsageDescription</key><string>HasteClip puts your webcam into your clips when you turn it on.</string>
 </dict>
 </plist>
 PLIST
 
 # Ad hoc: ffmpeg keeps its own signature; the app is sealed around it.
-codesign --force --sign - "$app/Contents/MacOS/hesteclips"
+codesign --force --sign - "$app/Contents/MacOS/hasteclip"
 codesign --force --sign - "$app"
 codesign --verify --strict "$app"
 
 ln -s /Applications "$work/dmg/Applications"
-hdiutil create -volname HesteClips -srcfolder "$work/dmg" -fs HFS+ -format UDZO -ov "$out/$name.dmg" >/dev/null
+hdiutil create -volname HasteClip -srcfolder "$work/dmg" -fs HFS+ -format UDZO -ov "$out/$name.dmg" >/dev/null
 echo "built $out/$name.dmg"

@@ -31,12 +31,12 @@ fi
 
 for t in "${tests[@]}"; do
     m=$(machine "$t")
-    docker build -q -t "hesteclips-test-$m" -f "$here/$m.Dockerfile" "$here" >/dev/null || { echo "couldn't build the $m machine"; exit 1; }
+    docker build -q -t "hasteclip-test-$m" -f "$here/$m.Dockerfile" "$here" >/dev/null || { echo "couldn't build the $m machine"; exit 1; }
     echo "=== $t (on $m)"
     # Builds go to a volume per machine, so each test doesn't rebuild everything.
     docker run --rm \
         -v "$root":/src -v "$out":/out -v "$here/$t.sh":/test.sh \
-        -v "hesteclips-test-target-$m":/target -v "hesteclips-test-cargo":/root/.cargo/registry \
+        -v "hasteclip-test-target-$m":/target -v "hasteclip-test-cargo":/root/.cargo/registry \
         -e CARGO_TARGET_DIR=/target -e GRANT=1 -e TRAY=1 \
-        "hesteclips-test-$m" bash /test.sh 2>&1 | grep -vE 'pw\.conf|conf\.c|PipeWire: Creation failed'
+        "hasteclip-test-$m" bash /test.sh 2>&1 | grep -vE 'pw\.conf|conf\.c|PipeWire: Creation failed'
 done

@@ -190,7 +190,7 @@ fn key(clip: &Clip) -> u64 {
 }
 
 fn cache_dir() -> PathBuf {
-    dirs::cache_dir().unwrap_or_else(std::env::temp_dir).join("hesteclips").join("thumbs")
+    dirs::cache_dir().unwrap_or_else(std::env::temp_dir).join("hasteclip").join("thumbs")
 }
 
 fn generate(key: u64, video: &Path) -> (Option<egui::ColorImage>, Option<Duration>) {

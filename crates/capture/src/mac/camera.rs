@@ -223,7 +223,7 @@ fn open_session(feed: &Arc<CameraFeed>) -> Result<(Retained<AVCaptureSession>, R
         output.setVideoSettings(Some(&settings));
         output.setAlwaysDiscardsLateVideoFrames(true);
         let delegate = CameraOutput::new(feed.clone());
-        let queue = DispatchQueue::new("hesteclips.camera", None);
+        let queue = DispatchQueue::new("hasteclip.camera", None);
         output.setSampleBufferDelegate_queue(Some(ProtocolObject::from_ref(&*delegate)), Some(&queue));
         if !session.canAddOutput(&output) {
             bail!("the camera's pictures can't be read");

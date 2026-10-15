@@ -19,9 +19,9 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 
-const TARBALL: &str = "HesteClips-linux-x64.tar.gz";
+const TARBALL: &str = "HasteClip-linux-x64.tar.gz";
 /// GitHub's API for the repo's releases, newest first.
-const RELEASES: &str = "https://api.github.com/repos/Kaillr/hesteclips/releases?per_page=10";
+const RELEASES: &str = "https://api.github.com/repos/Kaillr/hasteclip/releases?per_page=10";
 
 /// The installed app: the folder the binary is in, if it's one we can update
 /// (unpacked from a release, ours to write to).
@@ -33,7 +33,7 @@ pub fn install_dir() -> Option<PathBuf> {
         return None;
     }
     // A release folder has the desktop entry beside the binary.
-    if !dir.join("io.github.kaillr.HesteClips.desktop").is_file() {
+    if !dir.join("io.github.kaillr.HasteClip.desktop").is_file() {
         return None;
     }
     Some(dir)
@@ -43,7 +43,7 @@ pub fn install_dir() -> Option<PathBuf> {
 /// version is unpacked) can be written: not when it's somewhere like /opt.
 pub fn writable(dir: &Path) -> bool {
     let probe = |d: &Path| {
-        let f = d.join(format!(".hesteclips-write-test-{}", std::process::id()));
+        let f = d.join(format!(".hasteclip-write-test-{}", std::process::id()));
         let ok = std::fs::write(&f, b"").is_ok();
         let _ = std::fs::remove_file(&f);
         ok
@@ -72,10 +72,10 @@ pub fn check(current: &str) -> Result<Option<Release>> {
         prerelease: bool,
         assets: Vec<Asset>,
     }
-    // `HESTECLIPS_RELEASES=<url>`: another list in GitHub's form, to try an update.
-    let url = std::env::var("HESTECLIPS_RELEASES").unwrap_or_else(|_| RELEASES.to_owned());
+    // `HASTECLIP_RELEASES=<url>`: another list in GitHub's form, to try an update.
+    let url = std::env::var("HASTECLIP_RELEASES").unwrap_or_else(|_| RELEASES.to_owned());
     let releases: Vec<GhRelease> = ureq::get(&url)
-        .header("User-Agent", "HesteClips-updater")
+        .header("User-Agent", "HasteClip-updater")
         .header("Accept", "application/vnd.github+json")
         .call()
         .context("GitHub didn't answer")?
@@ -103,17 +103,17 @@ fn newer(a: &str, b: &str) -> bool {
 /// against its checksum. `progress` gets 0–100. Returns the unpacked folder.
 pub fn download(release: &Release, dir: &Path, mut progress: impl FnMut(u8)) -> Result<PathBuf> {
     let parent = dir.parent().context("the app's folder has no parent")?;
-    let staging = parent.join(".hesteclips-update");
+    let staging = parent.join(".hasteclip-update");
     let _ = std::fs::remove_dir_all(&staging);
     std::fs::create_dir_all(&staging).context("can't write next to the app's folder")?;
 
-    let expected = ureq::get(&release.checksum).header("User-Agent", "HesteClips-updater").call()?.body_mut().read_to_string()?;
+    let expected = ureq::get(&release.checksum).header("User-Agent", "HasteClip-updater").call()?.body_mut().read_to_string()?;
     let expected = expected.split_whitespace().next().unwrap_or_default().to_ascii_lowercase();
     if expected.len() != 64 {
         bail!("the release's checksum file is malformed");
     }
 
-    let mut response = ureq::get(&release.tarball).header("User-Agent", "HesteClips-updater").call()?;
+    let mut response = ureq::get(&release.tarball).header("User-Agent", "HasteClip-updater").call()?;
     let total = response.headers().get("content-length").and_then(|v| v.to_str().ok()?.parse::<u64>().ok());
     let mut body = response.body_mut().with_config().limit(1 << 30).reader();
     let file_path = staging.join(TARBALL);
@@ -150,11 +150,11 @@ pub fn download(release: &Release, dir: &Path, mut progress: impl FnMut(u8)) -> 
         bail!("couldn't unpack the update");
     }
     let _ = std::fs::remove_file(&file_path);
-    if !partial.join("HesteClips-linux-x64").join("hesteclips").is_file() {
+    if !partial.join("HasteClip-linux-x64").join("hasteclip").is_file() {
         bail!("the update doesn't contain the app");
     }
-    let unpacked = staging.join("HesteClips-linux-x64");
-    std::fs::rename(partial.join("HesteClips-linux-x64"), &unpacked)?;
+    let unpacked = staging.join("HasteClip-linux-x64");
+    std::fs::rename(partial.join("HasteClip-linux-x64"), &unpacked)?;
     let _ = std::fs::remove_dir(&partial);
     Ok(unpacked)
 }
@@ -162,8 +162,8 @@ pub fn download(release: &Release, dir: &Path, mut progress: impl FnMut(u8)) -> 
 /// An update downloaded earlier and left unpacked (the app didn't quit
 /// normally since), with its version from the folder's README.
 pub fn pending(dir: &Path) -> Option<(PathBuf, String)> {
-    let unpacked = dir.parent()?.join(".hesteclips-update").join("HesteClips-linux-x64");
-    if !unpacked.join("hesteclips").is_file() {
+    let unpacked = dir.parent()?.join(".hasteclip-update").join("HasteClip-linux-x64");
+    if !unpacked.join("hasteclip").is_file() {
         return None;
     }
     let readme = std::fs::read_to_string(unpacked.join("README.txt")).ok()?;
@@ -199,7 +199,7 @@ pub fn apply(unpacked: &Path, dir: &Path, restart: bool) -> Result<()> {
     }
     if restart {
         // With the arguments we were started with (`--background` from autostart).
-        Command::new(dir.join("hesteclips")).args(std::env::args_os().skip(1)).spawn().context("couldn't start the new version")?;
+        Command::new(dir.join("hasteclip")).args(std::env::args_os().skip(1)).spawn().context("couldn't start the new version")?;
     }
     Ok(())
 }
@@ -235,21 +235,21 @@ mod tests {
     #[test]
     fn update_replaces_files_in_place() {
         let root = std::env::temp_dir().join(format!("hc-update-test-{}", std::process::id()));
-        let (old, new) = (root.join("app"), root.join(".hesteclips-update").join("HesteClips-linux-x64"));
+        let (old, new) = (root.join("app"), root.join(".hasteclip-update").join("HasteClip-linux-x64"));
         std::fs::create_dir_all(old.join("lib")).unwrap();
         std::fs::create_dir_all(new.join("lib")).unwrap();
-        std::fs::write(old.join("hesteclips"), "old").unwrap();
+        std::fs::write(old.join("hasteclip"), "old").unwrap();
         std::fs::write(old.join("lib/a.so"), "old").unwrap();
         std::fs::write(old.join("mine.txt"), "kept").unwrap();
-        std::fs::write(new.join("hesteclips"), "new").unwrap();
+        std::fs::write(new.join("hasteclip"), "new").unwrap();
         std::fs::write(new.join("lib/a.so"), "new").unwrap();
         std::fs::write(new.join("lib/b.so"), "new").unwrap();
         apply(&new, &old, false).unwrap();
-        assert_eq!(std::fs::read_to_string(old.join("hesteclips")).unwrap(), "new");
+        assert_eq!(std::fs::read_to_string(old.join("hasteclip")).unwrap(), "new");
         assert_eq!(std::fs::read_to_string(old.join("lib/a.so")).unwrap(), "new");
         assert_eq!(std::fs::read_to_string(old.join("lib/b.so")).unwrap(), "new");
         assert_eq!(std::fs::read_to_string(old.join("mine.txt")).unwrap(), "kept");
-        assert!(!root.join(".hesteclips-update").exists());
+        assert!(!root.join(".hasteclip-update").exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 }

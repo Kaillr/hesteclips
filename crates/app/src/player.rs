@@ -58,10 +58,10 @@ impl Video {
     fn open_for(&self) -> Option<std::time::Duration> { match *self {} }
 }
 
-/// `HESTECLIPS_DEBUG_VIDEO=1`: log what playback does, with times.
+/// `HASTECLIP_DEBUG_VIDEO=1`: log what playback does, with times.
 pub fn debug() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("HESTECLIPS_DEBUG_VIDEO").is_some())
+    *ON.get_or_init(|| std::env::var_os("HASTECLIP_DEBUG_VIDEO").is_some())
 }
 
 macro_rules! trace {
@@ -838,10 +838,10 @@ fn still_worker(ctx: &egui::Context, source: &Path) -> (Sender<(u64, f64)>, Rece
 }
 
 /// The hardware decoder for `source`, on Windows and macOS (unless
-/// `HESTECLIPS_NO_HW_DECODE` is set, to compare with the ffmpeg path).
+/// `HASTECLIP_NO_HW_DECODE` is set, to compare with the ffmpeg path).
 fn open_video(ctx: &egui::Context, source: &Path, fps: f64) -> Option<Video> {
     #[cfg(hw_decode)]
-    if std::env::var_os("HESTECLIPS_NO_HW_DECODE").is_none() {
+    if std::env::var_os("HASTECLIP_NO_HW_DECODE").is_none() {
         return Some(Video::open(ctx, source, fps));
     }
     let _ = (ctx, source, fps);
@@ -1216,7 +1216,7 @@ fn start_audio(shared: Arc<Shared>, pcm: Arc<Pcm>) -> Result<cpal::Stream, Strin
         }
     };
     let muted = dev_muted();
-    // Recorded like any other app's sound (desktop capture leaves HesteClips
+    // Recorded like any other app's sound (desktop capture leaves HasteClip
     // out, see `capture::sources::own_sound`).
     let mut recorded = capture::sources::own_sound::Playing::at(out_rate as u32);
     let stream = device
@@ -1242,11 +1242,11 @@ fn start_audio(shared: Arc<Shared>, pcm: Arc<Pcm>) -> Result<cpal::Stream, Strin
     Ok(stream)
 }
 
-/// Dev aid: `HESTECLIPS_MUTE=1` plays everything silently, with the same
+/// Dev aid: `HASTECLIP_MUTE=1` plays everything silently, with the same
 /// timing (test instances that play and scrub clips).
 pub(crate) fn dev_muted() -> bool {
     static MUTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *MUTED.get_or_init(|| std::env::var_os("HESTECLIPS_MUTE").is_some())
+    *MUTED.get_or_init(|| std::env::var_os("HASTECLIP_MUTE").is_some())
 }
 
 /// Only the sound of a short clip, through the same engine as the editor's

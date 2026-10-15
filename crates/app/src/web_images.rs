@@ -83,5 +83,5 @@ fn cache_path(url: &str) -> Option<PathBuf> {
     let file = parts.next()?;
     let app = parts.next()?;
     let name: String = format!("{app}-{file}").chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.')).collect();
-    Some(dirs::cache_dir()?.join("hesteclips").join("game-icons").join(name))
+    Some(dirs::cache_dir()?.join("hasteclip").join("game-icons").join(name))
 }

@@ -115,7 +115,7 @@ pub fn dir() -> Option<PathBuf> {
     if let Some(d) = TEST_DIR.lock().unwrap().clone() {
         return Some(d);
     }
-    dirs::data_local_dir().map(|d| d.join("hesteclips").join("voice-samples"))
+    dirs::data_local_dir().map(|d| d.join("hasteclip").join("voice-samples"))
 }
 
 fn paths(id: &str) -> Option<(PathBuf, PathBuf)> {
@@ -278,7 +278,7 @@ pub fn export(to: &Path, samples: &[Sample]) -> Result<usize, String> {
     Ok(index.samples.len())
 }
 
-const README: &str = "Voice samples from HesteClips, for improving the \"hashtag HesteClip that\" detector.\n\
+const README: &str = "Voice samples from HasteClip, for improving the \"hashtag HesteClip that\" detector.\n\
 \n\
 samples/*.wav   16 kHz mono sound, only the part the person trimmed it to\n\
 samples.json    for each: label (trigger = it should save a clip, ignore = it shouldn't),\n\

@@ -12,7 +12,7 @@
 //! the shortcuts closes it and binds the new set in a new one. Binding is
 //! what makes the desktop ask the user, so it's only done when the desktop
 //! doesn't already have these shortcuts as last asked for (remembered in
-//! `$XDG_STATE_HOME/hesteclips/shortcuts`): not at every launch.
+//! `$XDG_STATE_HOME/hasteclip/shortcuts`): not at every launch.
 
 use std::pin::pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -29,7 +29,7 @@ use crate::settings::ShortcutAction;
 
 /// The app's id with the desktop: the portal keeps our shortcuts under it,
 /// and it names the `.desktop` file that says what we're called.
-pub const APP_ID: &str = "io.github.kaillr.HesteClips";
+pub const APP_ID: &str = "io.github.kaillr.HasteClip";
 
 /// Tell the desktop portal who we are, before anything else talks to it (it
 /// can't tell for an app that isn't sandboxed). Best effort: older portals
@@ -152,13 +152,13 @@ fn request_key(wanted: &[(ShortcutAction, String)]) -> String {
     wanted.iter().map(|(a, keys)| format!("{}={}", id(*a), trigger(keys).unwrap_or_default())).collect::<Vec<_>>().join(";")
 }
 
-/// `$XDG_STATE_HOME/hesteclips/shortcuts` (`~/.local/state/…`).
+/// `$XDG_STATE_HOME/hasteclip/shortcuts` (`~/.local/state/…`).
 fn state_file() -> Option<std::path::PathBuf> {
     let base = std::env::var_os("XDG_STATE_HOME")
         .map(std::path::PathBuf::from)
         .filter(|p| p.is_absolute())
         .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/state")))?;
-    Some(base.join("hesteclips").join("shortcuts"))
+    Some(base.join("hasteclip").join("shortcuts"))
 }
 
 /// What the desktop was last asked for and granted.

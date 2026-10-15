@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="crates/app/assets/icon-1024.png" width="128" alt="HesteClips icon">
+  <img src="crates/app/assets/icon-1024.png" width="128" alt="HasteClip icon">
 </p>
 
-<h1 align="center">HesteClips</h1>
+<h1 align="center">HasteClip</h1>
 
 <p align="center">
   A fast, no-nonsense clip recorder and trimmer.<br>
@@ -33,11 +33,11 @@
 
 ## Install
 
-**Windows:** download `HesteClips-win-Setup.exe` from the [latest release](https://github.com/Kaillr/hesteclips/releases/latest) and run it. It installs for your user only (no admin prompt), ffmpeg included. Updates download in the background and install when you quit; turn that off in *Settings → Updates*.
+**Windows:** download `HasteClip-win-Setup.exe` from the [latest release](https://github.com/Kaillr/hasteclip/releases/latest) and run it. It installs for your user only (no admin prompt), ffmpeg included. Updates download in the background and install when you quit; turn that off in *Settings → Updates*.
 
-**macOS (Apple Silicon):** download `HesteClips-mac-arm64.dmg` from the [latest release](https://github.com/Kaillr/hesteclips/releases/latest), open it and drag HesteClips to Applications. ffmpeg is included. The app isn't signed by Apple yet, so macOS blocks the first launch: open it once, then go to *System Settings → Privacy & Security* and click *Open Anyway* (or run `xattr -dr com.apple.quarantine /Applications/HesteClips.app`). After each update macOS may ask for Screen Recording permission again. It doesn't update itself yet: download new releases by hand.
+**macOS (Apple Silicon):** download `HasteClip-mac-arm64.dmg` from the [latest release](https://github.com/Kaillr/hasteclip/releases/latest), open it and drag HasteClip to Applications. ffmpeg is included. The app isn't signed by Apple yet, so macOS blocks the first launch: open it once, then go to *System Settings → Privacy & Security* and click *Open Anyway* (or run `xattr -dr com.apple.quarantine /Applications/HasteClip.app`). After each update macOS may ask for Screen Recording permission again. It doesn't update itself yet: download new releases by hand.
 
-**Linux (x86-64):** download `HesteClips-linux-x64.tar.gz` from the [latest release](https://github.com/Kaillr/hesteclips/releases/latest), unpack it where you want to keep it and run `./hesteclips`; it adds itself to your apps on first launch. ffmpeg is included; you need PipeWire and an xdg-desktop-portal. It doesn't update itself yet: download new releases by hand.
+**Linux (x86-64):** download `HasteClip-linux-x64.tar.gz` from the [latest release](https://github.com/Kaillr/hasteclip/releases/latest), unpack it where you want to keep it and run `./hasteclip`; it adds itself to your apps on first launch. ffmpeg is included; you need PipeWire and an xdg-desktop-portal. It doesn't update itself yet: download new releases by hand.
 
 ## Requirements (building from source)
 
@@ -50,14 +50,14 @@
 ## Getting started
 
 ```sh
-git clone https://github.com/Kaillr/hesteclips.git
-cd hesteclips
+git clone https://github.com/Kaillr/hasteclip.git
+cd hasteclip
 cargo run --release
 ```
 
 On first launch macOS asks for **Screen & System Audio Recording** permission (and **Microphone** if you record one). Grant them in System Settings → Privacy & Security, then restart the app. When running from a terminal, the permission belongs to the terminal app.
 
-On Linux, the first time you record (or open **Sources**) your desktop asks which screen to share; HesteClips remembers the choice (*Sources → Choose another…* asks again). On Wayland the global shortcuts go through the desktop too, which may ask you once to allow them, and you can change their keys in its keyboard settings. HesteClips adds itself to your apps (`~/.local/share/applications`) on first launch, which the desktop needs for that.
+On Linux, the first time you record (or open **Sources**) your desktop asks which screen to share; HasteClip remembers the choice (*Sources → Choose another…* asks again). On Wayland the global shortcuts go through the desktop too, which may ask you once to allow them, and you can change their keys in its keyboard settings. HasteClip adds itself to your apps (`~/.local/share/applications`) on first launch, which the desktop needs for that.
 
 On Windows there's nothing to grant, except microphone access if *Settings → Privacy & security → Microphone* is turned off for desktop apps. Note that some GPU overlays bind the same hotkeys (NVIDIA's Instant Replay uses <kbd>Alt</kbd> + <kbd>F10</kbd>); Settings shows if a shortcut couldn't be registered.
 
@@ -72,7 +72,7 @@ On Windows there's nothing to grant, except microphone access if *Settings → P
 Hotkeys work while other apps (and games) are focused. On Windows and Linux use <kbd>Alt</kbd> instead of <kbd>Option</kbd>.
 
 - **Sources** — set up your mic, desktop sound and apps, and adjust their levels.
-- **Settings** — replay length, resolution, frame rate, quality, file format and where clips are saved (`~/Movies/hesteclips` on macOS, `Videos\hesteclips` on Windows, `~/Videos/hesteclips` on Linux by default).
+- **Settings** — replay length, resolution, frame rate, quality, file format and where clips are saved (`~/Movies/hasteclip` on macOS, `Videos\hasteclip` on Windows, `~/Videos/hasteclip` on Linux by default).
 - **Library** — click a clip to play it, hover for **Edit** and **Share**, right-click for more.
 
 ## Project structure

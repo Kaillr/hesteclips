@@ -6,7 +6,7 @@ members = ["crates/app", "crates/capture", "crates/hestefiles", "crates/media"]
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/Kaillr/hesteclips"
+repository = "https://github.com/Kaillr/hasteclip"
 
 # Optimize dependencies even in debug builds so capture/encode/preview stay smooth
 # while iterating. Our own crates stay fast to compile at opt-level 0.

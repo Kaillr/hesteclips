@@ -253,11 +253,11 @@ pub struct ClipTag {
     pub id: Option<String>,
 }
 
-/// The file comment for a clip: `hesteclips:mix=1,2 id=3f9c…`. Recordings start
+/// The file comment for a clip: `hasteclip:mix=1,2 id=3f9c…`. Recordings start
 /// with just the mix; the id is added the first time the clip is edited.
 pub fn clip_tag(mix: &[usize], id: Option<&str>) -> String {
     let list: Vec<String> = mix.iter().map(|n| n.to_string()).collect();
-    let mut tag = format!("hesteclips:mix={}", list.join(","));
+    let mut tag = format!("hasteclip:mix={}", list.join(","));
     if let Some(id) = id {
         tag += &format!(" id={id}");
     }
@@ -273,7 +273,7 @@ pub fn render_tag(edit: &Edit, id: Option<&str>) -> String {
 }
 
 pub fn parse_clip_tag(comment: &str) -> ClipTag {
-    let Some(rest) = comment.strip_prefix("hesteclips:") else { return ClipTag::default() };
+    let Some(rest) = comment.strip_prefix("hasteclip:") else { return ClipTag::default() };
     let mut tag = ClipTag::default();
     for field in rest.split_whitespace() {
         if let Some(list) = field.strip_prefix("mix=") {
@@ -871,7 +871,7 @@ pub fn render_with_progress(
     // new" of the same clip), and they must never share intermediate files.
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let work = std::env::temp_dir().join(format!("hesteclips-render-{}-{n}", std::process::id()));
+    let work = std::env::temp_dir().join(format!("hasteclip-render-{}-{n}", std::process::id()));
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(&work)?;
     let result = (|| -> Result<()> {
@@ -1456,11 +1456,11 @@ mod tests {
 
     #[test]
     fn clip_tags() {
-        assert_eq!(clip_tag(&[1, 2], None), "hesteclips:mix=1,2");
-        assert_eq!(clip_tag(&[1], Some("ab12")), "hesteclips:mix=1 id=ab12");
-        assert_eq!(parse_clip_tag("hesteclips:mix=1,2,3"), ClipTag { mix: Some(vec![1, 2, 3]), id: None });
-        assert_eq!(parse_clip_tag("hesteclips:mix=1 id=ab12"), ClipTag { mix: Some(vec![1]), id: Some("ab12".into()) });
-        assert_eq!(parse_clip_tag("hesteclips:mix="), ClipTag { mix: Some(vec![]), id: None });
+        assert_eq!(clip_tag(&[1, 2], None), "hasteclip:mix=1,2");
+        assert_eq!(clip_tag(&[1], Some("ab12")), "hasteclip:mix=1 id=ab12");
+        assert_eq!(parse_clip_tag("hasteclip:mix=1,2,3"), ClipTag { mix: Some(vec![1, 2, 3]), id: None });
+        assert_eq!(parse_clip_tag("hasteclip:mix=1 id=ab12"), ClipTag { mix: Some(vec![1]), id: Some("ab12".into()) });
+        assert_eq!(parse_clip_tag("hasteclip:mix="), ClipTag { mix: Some(vec![]), id: None });
         assert_eq!(parse_clip_tag("made with something else"), ClipTag::default());
     }
 }

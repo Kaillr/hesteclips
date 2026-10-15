@@ -65,8 +65,8 @@ NEG_PARTS = [
     ["hashtag", "that"], ["heste", "that"], ["hashtag", "hashtag"],
 ]
 NEG_TEXT_EN = [
-    "has the clip that", "has to clip that", "hashtag clips", "hashtag hesteclips", "open hesteclips",
-    "hesteclips", "hashtag best clip that", "hashtag festival clip", "hey steve clip that", "hashtag hasty clip",
+    "has the clip that", "has to clip that", "hashtag clips", "hashtag hasteclip", "open hasteclip",
+    "hasteclip", "hashtag best clip that", "hashtag festival clip", "hey steve clip that", "hashtag hasty clip",
     "hashtag this clip", "hashtag hester", "clip it", "clip that please", "did you clip that", "hashtag", "hashtag blessed",
     "hashtag test clip", "has the clip", "that clip was crazy", "nice clip", "hashtag guest list", "I'll get the helmet",
     "hastily clip that", "hash browns", "chester clipped that", "hester clip that", "the best clip", "hesitate",

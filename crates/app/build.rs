@@ -13,7 +13,7 @@ fn main() {
     {
         println!("cargo:rerun-if-changed=assets/icon.ico");
         let mut res = winresource::WindowsResource::new();
-        res.set_icon("assets/icon.ico").set("ProductName", "HesteClips").set("FileDescription", "HesteClips");
+        res.set_icon("assets/icon.ico").set("ProductName", "HasteClip").set("FileDescription", "HasteClip");
         res.compile().expect("embedding the Windows icon");
     }
 }

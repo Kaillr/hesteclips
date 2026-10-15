@@ -659,6 +659,6 @@ mod app_icon_tests {
         assert_eq!(px.len(), 32 * 32 * 4);
         assert!(px.chunks_exact(4).any(|p| p[3] == 255), "some of it is opaque");
         assert!(px.chunks_exact(4).filter(|p| p[3] > 0).count() > 200, "it covers most of the square");
-        assert!(super::app_icon("no.such.app.hesteclips", 32).is_none());
+        assert!(super::app_icon("no.such.app.hasteclip", 32).is_none());
     }
 }

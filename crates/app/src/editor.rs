@@ -447,8 +447,8 @@ impl Ready {
             if export.clicked() {
                 self.export_open = !self.export_open;
             }
-            // Dev aid: `HESTECLIPS_OPEN_EXPORT=1` opens it at launch.
-            if std::env::var_os("HESTECLIPS_OPEN_EXPORT").is_some() && !self.export_shown {
+            // Dev aid: `HASTECLIP_OPEN_EXPORT=1` opens it at launch.
+            if std::env::var_os("HASTECLIP_OPEN_EXPORT").is_some() && !self.export_shown {
                 self.export_shown = true;
                 self.export_open = true;
             }

@@ -1,17 +1,17 @@
 //! The installed app's log. A release build on Windows has no console, and on
 //! Linux an app started from the app menu has nowhere to print, so what it
 //! prints (errors, what audio sources are doing, panics) would go nowhere: it
-//! goes to `%LOCALAPPDATA%\hesteclips\logs\hesteclips.log` on Windows,
-//! `~/.local/share/hesteclips/logs/hesteclips.log` on Linux, for someone to
+//! goes to `%LOCALAPPDATA%\hasteclip\logs\hasteclip.log` on Windows,
+//! `~/.local/share/hasteclip/logs/hasteclip.log` on Linux, for someone to
 //! send when something doesn't work. Each launch starts it afresh; the one
-//! before is kept as `hesteclips.previous.log`.
+//! before is kept as `hasteclip.previous.log`.
 
 #![cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
 
 use std::path::PathBuf;
 
 pub fn dir() -> Option<PathBuf> {
-    dirs::data_local_dir().map(|d| d.join("hesteclips").join("logs"))
+    dirs::data_local_dir().map(|d| d.join("hasteclip").join("logs"))
 }
 
 /// Send stderr to the log file, and note what's running where.
@@ -25,8 +25,8 @@ pub fn start() {
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
-    let path = dir.join("hesteclips.log");
-    let _ = std::fs::rename(&path, dir.join("hesteclips.previous.log"));
+    let path = dir.join("hasteclip.log");
+    let _ = std::fs::rename(&path, dir.join("hasteclip.previous.log"));
     let Ok(file) = std::fs::File::create(&path) else { return };
     // Rust's stderr asks Windows for the handle on every write, so this takes
     // over `eprintln!` and panic messages from here on. The file stays open
@@ -37,7 +37,7 @@ pub fn start() {
         return;
     }
     eprintln!(
-        "HesteClips {} on {}, started {}",
+        "HasteClip {} on {}, started {}",
         env!("CARGO_PKG_VERSION"),
         windows_version(),
         chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
@@ -55,8 +55,8 @@ pub fn start() {
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
-    let path = dir.join("hesteclips.log");
-    let _ = std::fs::rename(&path, dir.join("hesteclips.previous.log"));
+    let path = dir.join("hasteclip.log");
+    let _ = std::fs::rename(&path, dir.join("hasteclip.previous.log"));
     let Ok(mut file) = std::fs::File::create(&path) else { return };
     // stderr becomes a pipe, read by a thread that writes each piece to the
     // file and to wherever stderr went before. Panics included, since they
@@ -94,7 +94,7 @@ pub fn start() {
         return;
     }
     eprintln!(
-        "HesteClips {} on {} ({}), started {}",
+        "HasteClip {} on {} ({}), started {}",
         env!("CARGO_PKG_VERSION"),
         linux_version(),
         linux_session(),
@@ -121,12 +121,12 @@ fn linux_session() -> String {
     format!("{desktop} on {session}")
 }
 
-/// `HESTECLIPS_CURSOR_LOG=1`: log the cursor ten times a second when it
+/// `HASTECLIP_CURSOR_LOG=1`: log the cursor ten times a second when it
 /// changes — shown or not, which image, which app has focus — to find out why
-/// it vanishes in some games while HesteClips runs.
+/// it vanishes in some games while HasteClip runs.
 #[cfg(windows)]
 pub fn log_cursor() {
-    if std::env::var_os("HESTECLIPS_CURSOR_LOG").is_none() {
+    if std::env::var_os("HASTECLIP_CURSOR_LOG").is_none() {
         return;
     }
     std::thread::spawn(|| {

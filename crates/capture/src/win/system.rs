@@ -55,9 +55,9 @@ pub(crate) fn com_init() {
 /// ("Audio", "Capture": tasks Windows defines): it's woken on time even
 /// while a game keeps every core busy. For threads that mostly sleep: a
 /// thread that doesn't is held back by the scheduler. Lasts as long as the
-/// thread. `HESTECLIPS_NO_MMCSS=1` leaves threads as they are.
+/// thread. `HASTECLIP_NO_MMCSS=1` leaves threads as they are.
 pub(crate) fn multimedia_thread(task: &str) {
-    if std::env::var_os("HESTECLIPS_NO_MMCSS").is_some() {
+    if std::env::var_os("HASTECLIP_NO_MMCSS").is_some() {
         return;
     }
     let mut index = 0u32;
@@ -360,7 +360,7 @@ pub fn foreground_exe() -> Option<String> {
 }
 
 /// Processes as apps: by executable, named by their file description, without
-/// shell processes (or HesteClips itself, unless `with_own`), sorted by name.
+/// shell processes (or HasteClip itself, unless `with_own`), sorted by name.
 fn apps_of(mut pids: Vec<u32>, with_own: bool) -> Vec<Device> {
     let own = std::process::id();
     if with_own {

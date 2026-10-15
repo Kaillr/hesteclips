@@ -1,7 +1,7 @@
 //! A clip's moments: the kills in it (as the game reported them while it was
 //! recorded) and your own markers, shown as pins on its timeline.
 //!
-//! Kept in the library's `.hesteclips/moments.json`, by the clip's path inside
+//! Kept in the library's `.hasteclip/moments.json`, by the clip's path inside
 //! the library, like collections: renaming or moving a clip in the app takes
 //! its moments along. Kills are kept as how long before the clip's end they
 //! were (that's what's known when it's saved); markers as where they are.

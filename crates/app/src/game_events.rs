@@ -36,8 +36,8 @@ use crate::settings::GameTitles;
 /// config files. (Picked to be unlikely to clash; nothing special about it.)
 const GSI_PORT: u16 = 52130;
 /// Sent back by the games with each post, so stray local posts are ignored.
-const GSI_TOKEN: &str = "hesteclips";
-const CFG_NAME: &str = "gamestate_integration_hesteclips.cfg";
+const GSI_TOKEN: &str = "hasteclip";
+const CFG_NAME: &str = "gamestate_integration_hasteclip.cfg";
 /// Events older than this are dropped (longer than any replay buffer; a
 /// recording's summary only needs its kills, kept up to the cap).
 const KEEP: Duration = Duration::from_secs(4 * 3600);
@@ -289,7 +289,7 @@ fn cfg_text(game: Game) -> String {
     };
     let data: String = data.iter().map(|d| format!("        \"{d}\" \"1\"\n")).collect();
     format!(
-        "\"HesteClips\"\n{{\n    \"uri\" \"http://127.0.0.1:{GSI_PORT}/{path}\"\n    \"timeout\" \"1.0\"\n    \"buffer\" \"0.1\"\n    \"throttle\" \"0.1\"\n    \"heartbeat\" \"30.0\"\n    \"auth\"\n    {{\n        \"token\" \"{GSI_TOKEN}\"\n    }}\n    \"data\"\n    {{\n{data}    }}\n}}\n"
+        "\"HasteClip\"\n{{\n    \"uri\" \"http://127.0.0.1:{GSI_PORT}/{path}\"\n    \"timeout\" \"1.0\"\n    \"buffer\" \"0.1\"\n    \"throttle\" \"0.1\"\n    \"heartbeat\" \"30.0\"\n    \"auth\"\n    {{\n        \"token\" \"{GSI_TOKEN}\"\n    }}\n    \"data\"\n    {{\n{data}    }}\n}}\n"
     )
 }
 

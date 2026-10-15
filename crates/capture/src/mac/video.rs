@@ -295,7 +295,7 @@ impl Picture {
         }
         let filter = unsafe { SCContentFilter::initWithDisplay_excludingWindows(SCContentFilter::alloc(), display, &NSArray::new()) };
         let stream = unsafe { SCStream::initWithFilter_configuration_delegate(SCStream::alloc(), &filter, &config, None) };
-        let queue = DispatchQueue::new("hesteclips.sck.video", None);
+        let queue = DispatchQueue::new("hasteclip.sck.video", None);
         unsafe { stream.addStreamOutput_type_sampleHandlerQueue_error(ProtocolObject::from_ref(&*output), SCStreamOutputType::Screen, Some(&queue)) }
             .map_err(|e| anyhow::anyhow!("can't capture the screen: {}", e.localizedDescription()))?;
         {

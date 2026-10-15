@@ -1,11 +1,11 @@
 [package]
-name = "hesteclips"
+name = "hasteclip"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "hesteclips"
+name = "hasteclip"
 path = "src/main.rs"
 
 [dependencies]
@@ -44,7 +44,7 @@ egui-phosphor = { version = "0.14", default-features = false, features = ["fill"
 # window, which eframe doesn't have.
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 drag = "2"
-# The tray / menu bar icon (closing the window keeps HesteClips running).
+# The tray / menu bar icon (closing the window keeps HasteClip running).
 tray-icon = "0.21"
 
 # Linux: global shortcuts through the desktop portal (Wayland has no other

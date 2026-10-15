@@ -284,7 +284,7 @@ mod tests {
 
     #[test]
     fn reads_comment_in_both_layouts() {
-        let text = "hesteclips:mix=1 id=ab12";
+        let text = "hasteclip:mix=1 id=ab12";
         // MP4 (ffmpeg, AVAssetWriter): udta/meta(full box)/hdlr+ilst/©cmt/data.
         let mut data = vec![0, 0, 0, 1, 0, 0, 0, 0];
         data.extend_from_slice(text.as_bytes());

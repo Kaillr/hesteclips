@@ -56,5 +56,5 @@ OBS Studio's game capture hook, version $obsVersion, unchanged, from
 https://github.com/obsproject/obs-studio/releases/tag/$obsVersion
 Licensed under the GNU GPL v2 (OBS-LICENSE.txt). Its source code:
 https://github.com/obsproject/obs-studio/tree/$obsVersion/plugins/win-capture
-HesteClips runs these as separate programs; they aren't part of HesteClips.
+HasteClip runs these as separate programs; they aren't part of HasteClip.
 "@ | Set-Content (Join-Path $Dest 'README.txt')

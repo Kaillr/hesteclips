@@ -1,4 +1,4 @@
-//! Starting HesteClips with the computer: the user's startup list on Windows
+//! Starting HasteClip with the computer: the user's startup list on Windows
 //! (the registry's Run key, no admin needed), a login item (LaunchAgent) on
 //! macOS, an autostart entry on Linux. It starts in the tray (`--background`).
 //! The switch reads and writes that entry itself, so it always shows what's
@@ -18,7 +18,7 @@ pub fn label() -> &'static str {
     }
 }
 
-/// Whether HesteClips starts with the computer now.
+/// Whether HasteClip starts with the computer now.
 pub fn is_on() -> bool {
     imp::is_on()
 }
@@ -40,7 +40,7 @@ mod imp {
     use windows::core::HSTRING;
 
     const KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
-    const NAME: &str = "HesteClips";
+    const NAME: &str = "HasteClip";
 
     pub fn is_on() -> bool {
         let (key, name) = (HSTRING::from(KEY), HSTRING::from(NAME));
@@ -66,7 +66,7 @@ mod imp {
 #[cfg(target_os = "macos")]
 mod imp {
     fn plist() -> Option<std::path::PathBuf> {
-        Some(dirs::home_dir()?.join("Library").join("LaunchAgents").join("com.hesteclips.app.plist"))
+        Some(dirs::home_dir()?.join("Library").join("LaunchAgents").join("com.hasteclip.app.plist"))
     }
 
     pub fn is_on() -> bool {
@@ -82,7 +82,7 @@ mod imp {
             };
         }
         let xml = format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>com.hesteclips.app</string>\n<key>ProgramArguments</key><array><string>{}</string><string>{}</string></array>\n<key>RunAtLoad</key><true/>\n</dict></plist>\n",
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>com.hasteclip.app</string>\n<key>ProgramArguments</key><array><string>{}</string><string>{}</string></array>\n<key>RunAtLoad</key><true/>\n</dict></plist>\n",
             exe.display(),
             super::BACKGROUND
         );
@@ -94,7 +94,7 @@ mod imp {
 #[cfg(not(any(windows, target_os = "macos")))]
 mod imp {
     fn entry() -> Option<std::path::PathBuf> {
-        Some(dirs::config_dir()?.join("autostart").join("hesteclips.desktop"))
+        Some(dirs::config_dir()?.join("autostart").join("hasteclip.desktop"))
     }
 
     pub fn is_on() -> bool {
@@ -112,7 +112,7 @@ mod imp {
         // KDE gives its screencast and window list to the first entry it finds
         // whose Exec is us, so this one asks for them too, like the app's own.
         let desktop = format!(
-            "[Desktop Entry]\nType=Application\nName=HesteClips\nExec=\"{}\" {}\nX-GNOME-Autostart-enabled=true\nX-KDE-Wayland-Interfaces=zkde_screencast_unstable_v1,org_kde_plasma_window_management\n",
+            "[Desktop Entry]\nType=Application\nName=HasteClip\nExec=\"{}\" {}\nX-GNOME-Autostart-enabled=true\nX-KDE-Wayland-Interfaces=zkde_screencast_unstable_v1,org_kde_plasma_window_management\n",
             exe.display(),
             super::BACKGROUND
         );

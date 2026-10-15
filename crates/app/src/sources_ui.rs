@@ -613,7 +613,7 @@ impl App {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 ui.label(theme::text("Show “Tabbed out” when it's minimized", 13.5, W::Regular).color(pal.text));
-                crate::ui_kit::info(ui, "Tabbed out", "When the game you were in stops showing (most games minimize when you alt-tab), clips show the HesteClips logo with “Tabbed out”. Off: they keep the last picture. A window that's still on screen keeps being recorded either way.");
+                crate::ui_kit::info(ui, "Tabbed out", "When the game you were in stops showing (most games minimize when you alt-tab), clips show the HasteClip logo with “Tabbed out”. Off: they keep the last picture. A window that's still on screen keeps being recorded either way.");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     crate::ui_kit::switch(ui, &mut away);
                 });

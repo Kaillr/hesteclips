@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use crate::portal_shortcuts::APP_ID;
 
-const DESKTOP_FILE: &str = include_str!("../assets/io.github.kaillr.HesteClips.desktop");
+const DESKTOP_FILE: &str = include_str!("../assets/io.github.kaillr.HasteClip.desktop");
 const ICON: &[u8] = include_bytes!("../assets/icon.svg");
 
 /// Make sure the desktop can find us. Call before talking to the portal.
@@ -23,12 +23,12 @@ pub fn integrate() {
     }
     let Some(home) = data_home() else { return };
     let Ok(exe) = std::env::current_exe() else { return };
-    let entry = DESKTOP_FILE.replace("Exec=hesteclips", &format!("Exec={}", quote_exec(&exe)));
+    let entry = DESKTOP_FILE.replace("Exec=hasteclip", &format!("Exec={}", quote_exec(&exe)));
     let desktop = home.join("applications").join(format!("{APP_ID}.desktop"));
     let icon = home.join("icons/hicolor/scalable/apps").join(format!("{APP_ID}.svg"));
     let wrote = write_if_changed(&desktop, entry.as_bytes()) | write_if_changed(&icon, ICON);
     if wrote {
-        eprintln!("added HesteClips to the desktop's apps ({})", desktop.display());
+        eprintln!("added HasteClip to the desktop's apps ({})", desktop.display());
     }
 }
 
@@ -70,8 +70,8 @@ mod tests {
 
     #[test]
     fn exec_paths_are_quoted_when_needed() {
-        assert_eq!(quote_exec(Path::new("/opt/hesteclips/hesteclips")), "/opt/hesteclips/hesteclips");
-        assert_eq!(quote_exec(Path::new("/home/a b/hesteclips")), "\"/home/a b/hesteclips\"");
+        assert_eq!(quote_exec(Path::new("/opt/hasteclip/hasteclip")), "/opt/hasteclip/hasteclip");
+        assert_eq!(quote_exec(Path::new("/home/a b/hasteclip")), "\"/home/a b/hasteclip\"");
         assert_eq!(quote_exec(Path::new("/x/$y")), "\"/x/\\\\$y\"");
     }
 }

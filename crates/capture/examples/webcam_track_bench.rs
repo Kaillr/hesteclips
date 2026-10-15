@@ -14,7 +14,7 @@
 fn main() -> anyhow::Result<()> {
     use capture::mac::bench::{LiveMode, RenderMode, live, save_render};
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let dir = std::env::temp_dir().join("hesteclips-bench");
+    let dir = std::env::temp_dir().join("hasteclip-bench");
     std::fs::create_dir_all(&dir)?;
     match args.first().map(String::as_str) {
         Some("render") => {
