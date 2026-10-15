@@ -16,4 +16,9 @@ mkdir -p tray
 for s in 16 20 24 28 32 40 48 64; do
     rsvg-convert -w $s -h $s icon-windows.svg -o tray/windows-$s.png
 done
+# The empty library page: the glyph in white on transparent (tinted black or white
+# by the theme at runtime) and its blurred silhouette (the drop shadow, which
+# follows the horse instead of a box). Both on a 768 canvas, glyph 512 in the middle.
+rsvg-convert -w 512 -h 512 icon-tray.svg | magick - -background none -gravity center -extent 768x768 glyph.png
+magick glyph.png -channel A -blur 0x18 -level 0,70% +channel -fill black -colorize 100 glyph-shadow.png
 echo "tray icons made"
