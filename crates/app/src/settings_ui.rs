@@ -719,18 +719,22 @@ impl App {
 
     fn fps_field(&mut self, ui: &mut egui::Ui) {
         let fps = self.settings.fps;
-        let max = capture::max_blend_rate(&self.video_source());
-        let presets: Vec<(String, String, String)> = settings::FPS_CHOICES
+        let hz = capture::display_refresh(&self.video_source());
+        let choices = settings::fps_choices(hz);
+        let presets: Vec<(String, String, String)> = choices
             .iter()
-            .map(|&f| (format!("{f} fps"), f.to_string(), max.filter(|hz| f > *hz).map_or(String::new(), |hz| format!("above {hz} Hz"))))
+            .map(|&f| (format!("{f} fps"), f.to_string(), hz.filter(|hz| f > *hz).map_or(String::new(), |hz| format!("above {hz} Hz"))))
             .collect();
-        let current = settings::FPS_CHOICES.iter().position(|&f| f == fps);
-        let field = ValueField { id: egui::Id::new("vf_fps"), text: fps.to_string(), unit: "fps", width: 104.0, hint: "Type any frame rate from 10 to 360", presets, current, range: "10–360" };
+        let current = choices.iter().position(|&f| f == fps);
+        let max = settings::MAX_FPS;
+        let hint = format!("Type any frame rate from 10 to {max}");
+        let range = format!("10–{max}");
+        let field = ValueField { id: egui::Id::new("vf_fps"), text: fps.to_string(), unit: "fps", width: 104.0, hint: &hint, presets, current, range: &range };
         match field.show(ui) {
-            Typed::Preset(i) => self.settings.fps = settings::FPS_CHOICES[i],
+            Typed::Preset(i) => self.settings.fps = choices[i],
             Typed::Text(t) => match t.trim().trim_end_matches("fps").trim().parse::<u32>() {
-                Ok(v) if (10..=360).contains(&v) => self.settings.fps = v,
-                _ => self.toast_error(format!("“{}” isn't a frame rate from 10 to 360", t.trim())),
+                Ok(v) if (10..=max).contains(&v) => self.settings.fps = v,
+                _ => self.toast_error(format!("“{}” isn't a frame rate from 10 to {max}", t.trim())),
             },
             Typed::None | Typed::Secs(_) => {}
         }

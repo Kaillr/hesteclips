@@ -158,6 +158,29 @@ pub fn max_blend_rate(source: &VideoSource) -> Option<u32> {
     }
 }
 
+/// The refresh rate of the display a recording shows (the fastest display's
+/// when recording games and apps), if known: what the frame rate presets go
+/// up to.
+pub fn display_refresh(source: &VideoSource) -> Option<u32> {
+    let id = match source {
+        VideoSource::Screen { id, .. } => Some(id.as_str()),
+        VideoSource::Apps { .. } => None,
+    };
+    #[cfg(target_os = "macos")]
+    {
+        mac::display_refresh(id)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        win::system::display_refresh(id)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = id;
+        None
+    }
+}
+
 /// What a recording's video shows. This is the bottom layer of the picture;
 /// overlays (a webcam) will go on top of it.
 #[derive(Debug, Clone, PartialEq, Eq)]

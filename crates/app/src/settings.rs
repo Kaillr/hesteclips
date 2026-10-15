@@ -748,14 +748,19 @@ impl Shortcuts {
     }
 }
 
-/// Common frame-rate choices for the picker.
-/// The blend rates offered for a frame rate: whole multiples of it, up to a
-/// rate the screen and the GPU copying can plausibly keep up with (a guess),
-/// or `max` where the system can't look faster (macOS: the display's
-/// refresh rate).
+/// The blend rates offered for a frame rate: whole multiples of it, up to 16
+/// times and [`MAX_BLEND`], or `max` where the system can't look faster
+/// (macOS: the display's refresh rate).
 pub fn blend_choices(fps: u32, max: Option<u32>) -> Vec<u32> {
-    (2..=8).map(|k| fps * k).filter(|&r| r <= max.unwrap_or(960).min(960)).collect()
+    (2..=16).map(|k| fps * k).filter(|&r| r <= max.unwrap_or(MAX_BLEND).min(MAX_BLEND)).collect()
 }
+
+/// The fastest blend rate offered: 60 fps from 1920. Measured on an RTX
+/// 4060 Ti: the cost follows the game's pictures, not the looks (repeated
+/// looks are added in one pass; the game capture's looks copy only new
+/// pictures), and looks at 1200/s timed a 600 fps game's pictures exactly.
+/// Beyond, a guess.
+pub const MAX_BLEND: u32 = 2000;
 
 impl RecordSettings {
     /// Looks at the screen per recorded frame: the blend rate over the frame
@@ -765,7 +770,25 @@ impl RecordSettings {
     }
 }
 
-pub const FPS_CHOICES: [u32; 6] = [30, 60, 120, 144, 165, 240];
+/// Common frame rates for the picker; those above the display's refresh
+/// rate (and 240) aren't offered.
+pub const FPS_CHOICES: [u32; 9] = [30, 60, 120, 144, 165, 240, 360, 480, 540];
+
+/// The frame rate presets for a display refreshing `hz` times a second
+/// (None: not known): up to it (and at least up to 240), and it itself.
+pub fn fps_choices(hz: Option<u32>) -> Vec<u32> {
+    let top = hz.unwrap_or(240).max(240);
+    let mut out: Vec<u32> = FPS_CHOICES.iter().copied().filter(|&f| f <= top).collect();
+    if let Some(hz) = hz.filter(|hz| (10..=MAX_FPS).contains(hz) && !out.contains(hz)) {
+        out.push(hz);
+        out.sort_unstable();
+    }
+    out
+}
+
+/// The highest frame rate that can be typed. Measured: an RTX 4060 Ti's
+/// encoder takes 1080p at up to ~540 fps (2 ms a frame, one at a time).
+pub const MAX_FPS: u32 = 600;
 
 /// `~/Movies/hesteclips` on macOS, the platform video dir elsewhere, falling back
 /// to the current dir if none is known.
@@ -882,6 +905,25 @@ mod placement_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Presets go up to the display's refresh rate (it included), and to 240
+    /// on slower or unknown displays.
+    #[test]
+    fn fps_presets_follow_the_display() {
+        assert_eq!(fps_choices(Some(540)), [30, 60, 120, 144, 165, 240, 360, 480, 540]);
+        assert_eq!(fps_choices(Some(175)), [30, 60, 120, 144, 165, 175, 240]);
+        assert_eq!(fps_choices(Some(60)), [30, 60, 120, 144, 165, 240]);
+        assert_eq!(fps_choices(None), [30, 60, 120, 144, 165, 240]);
+    }
+
+    #[test]
+    fn blend_rates_go_to_sixteen_times_within_the_limit() {
+        let at60 = blend_choices(60, None);
+        assert_eq!((at60.first(), at60.last(), at60.len()), (Some(&120), Some(&960), 15));
+        assert_eq!(blend_choices(300, None).last(), Some(&1800));
+        // macOS: no faster than the display.
+        assert_eq!(blend_choices(60, Some(120)), [120]);
+    }
 
     #[test]
     fn a_webcam_from_before_the_switch_is_on() {

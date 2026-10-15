@@ -32,8 +32,10 @@ use crate::EncodeSettings;
 use crate::mp4mux::{AvcConfig, annexb_to_avcc};
 use crate::writer::{Command, Media};
 
-/// Frames waiting for the encoder before the pacer starts dropping them.
-const QUEUE: usize = 4;
+/// Frames waiting for the encoder before the pacer starts dropping them:
+/// enough for the pacer's bursts after a stall at high rates (4 skipped 10%
+/// of a 540 fps recording; 8, 0.4%). A guess beyond that.
+const QUEUE: usize = 8;
 
 /// One frame to encode: pool slot `slot`, presented at `n / fps`.
 pub(crate) struct Frame {
@@ -95,7 +97,17 @@ impl Encoder {
     pub(crate) fn finish(mut self) {
         drop(self.tx.take());
         if let Some(t) = self.thread.take() {
-            let _ = t.join();
+            // It waits on the encoder's events: one that went quiet mustn't
+            // hold up stopping for good.
+            let since = Instant::now();
+            while !t.is_finished() && since.elapsed() < Duration::from_secs(5) {
+                thread::sleep(Duration::from_millis(5));
+            }
+            if t.is_finished() {
+                let _ = t.join();
+            } else {
+                eprintln!("video encoder didn't finish in 5 s; left behind");
+            }
         }
     }
 }
@@ -311,78 +323,54 @@ impl Run {
         }
     }
 
-    /// The hardware encoder's loop. It sleeps until the next frame while the
-    /// encoder only waits for one (it polled every 1-2 ms the whole time it
-    /// recorded); while the encoder is busy, it looks for its events every
-    /// millisecond. An encoded frame waiting to be taken out while it sleeps
-    /// is taken with the next frame, a frame later: the writer doesn't mind.
+    /// The hardware encoder's loop: waits for the encoder's events (blocked,
+    /// woken by each), and when it asks for a frame, for the pacer's next.
+    /// Frames queue in the channel meanwhile (the pacer skips one when it's
+    /// full). An encoded frame ready while it waits for the pacer is taken
+    /// with the next: the writer doesn't mind. Looking for the events every
+    /// millisecond instead held a 1080p recording to ~365 fps however fast it
+    /// was asked for (540, 1000: the rest were skipped), with the encoder
+    /// holding each frame only 3 ms.
     fn run_async(&mut self, mft: &IMFTransform, events: &IMFMediaEventGenerator, rx: Receiver<Frame>) -> Result<()> {
-        let mut draining: Option<Instant> = None;
-        // Inputs the encoder asked for that we haven't given yet.
-        let mut wanted = 0usize;
-        // Frames taken from the pacer before the encoder asked for them.
-        let mut waiting: std::collections::VecDeque<Frame> = Default::default();
-        // The pacer is done (no more frames), since when.
-        let mut ended: Option<Instant> = None;
         loop {
-            // Everything the encoder has to say.
-            loop {
-                match unsafe { events.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
-                    Ok(event) => {
-                        let kind = MF_EVENT_TYPE(unsafe { event.GetType()? } as i32);
-                        if kind == METransformNeedInput {
-                            wanted += 1;
-                        } else if kind == METransformHaveOutput {
-                            self.process_output(mft)?;
-                        } else if kind == METransformDrainComplete {
-                            return Ok(());
-                        }
+            let event = unsafe { events.GetEvent(MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS(0))? };
+            let kind = MF_EVENT_TYPE(unsafe { event.GetType()? } as i32);
+            if kind == METransformNeedInput {
+                match rx.recv() {
+                    Ok(frame) => self.input_hardware(mft, frame)?,
+                    // The pacer is done: finish what's in.
+                    Err(_) => break,
+                }
+            } else if kind == METransformHaveOutput {
+                self.process_output(mft)?;
+            } else if kind == METransformDrainComplete {
+                return Ok(());
+            }
+        }
+        unsafe {
+            mft.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0)?;
+            mft.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0)?;
+        }
+        // Not blocked here: an encoder that never finishes mustn't hold up
+        // stopping.
+        let since = Instant::now();
+        loop {
+            match unsafe { events.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
+                Ok(event) => {
+                    let kind = MF_EVENT_TYPE(unsafe { event.GetType()? } as i32);
+                    if kind == METransformHaveOutput {
+                        self.process_output(mft)?;
+                    } else if kind == METransformDrainComplete {
+                        return Ok(());
                     }
-                    Err(e) if e.code() == MF_E_NO_EVENTS_AVAILABLE => break,
-                    Err(e) => return Err(e.into()),
                 }
-            }
-            // What it asked for.
-            while wanted > 0 && draining.is_none() {
-                let Some(frame) = waiting.pop_front() else { break };
-                wanted -= 1;
-                self.input_hardware(mft, frame)?;
-            }
-            if let Some(since) = draining {
-                if since.elapsed() > Duration::from_secs(3) {
-                    bail!("the encoder didn't finish");
+                Err(e) if e.code() == MF_E_NO_EVENTS_AVAILABLE => {
+                    if since.elapsed() > Duration::from_secs(3) {
+                        bail!("the encoder didn't finish");
+                    }
+                    thread::sleep(Duration::from_millis(1));
                 }
-                thread::sleep(Duration::from_millis(1));
-                continue;
-            }
-            // Done once what's in hand is in, or if the encoder won't take it.
-            if ended.is_some_and(|at| waiting.is_empty() || at.elapsed() > Duration::from_secs(1)) {
-                for f in waiting.drain(..) {
-                    self.pool.give(f.slot);
-                }
-                unsafe {
-                    mft.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0)?;
-                    mft.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0)?;
-                }
-                draining = Some(Instant::now());
-                continue;
-            }
-            let got = if ended.is_some() || waiting.len() >= QUEUE {
-                // Waiting on the encoder, with frames in hand.
-                thread::sleep(Duration::from_millis(1));
-                continue;
-            } else if wanted > 0 {
-                // Waiting on the pacer only: sleep until a frame comes.
-                rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected)
-            } else {
-                // Waiting on the encoder (it asks for more once it's taken in
-                // what it has): look again in a moment, taking a frame meanwhile.
-                rx.recv_timeout(Duration::from_millis(1))
-            };
-            match got {
-                Ok(frame) => waiting.push_back(frame),
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => ended = Some(Instant::now()),
+                Err(e) => return Err(e.into()),
             }
         }
     }

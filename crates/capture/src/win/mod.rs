@@ -281,17 +281,19 @@ impl Session {
                 }
             });
             let overlay = camera.as_ref().zip(s.webcam.as_ref()).map(|(c, w)| (&c.latest, w.placement.clone()));
-            // With blending, frames come from an average of the pictures shown
-            // during them, not the newest picture.
-            let blend = if s.blend_samples > 1 { Some(FrameBlend::new(&gpu, &latest)?) } else { None };
-            latest.set_wants_queue(blend.is_some());
-            let converter_source = blend.as_ref().map_or(&latest, |b| &b.average);
-            let converter = d3d::Converter::new(&gpu, converter_source, overlay.clone(), &encoder.pool.textures, true, width, height, s.fps)?;
+            // Each frame comes from the pictures shown during it, timed by
+            // when each came up (see `FrameBlend`): with blending their
+            // average, without it the one up at the frame's time. Taking the
+            // newest picture on the clock instead repeated and skipped
+            // pictures of a game at the recording's rate (a 300 fps game
+            // recorded at 300: up to 22% of frames), as the clock and the
+            // game's pictures drifted past each other.
+            let looks = s.blend_samples.max(1);
+            let blend = FrameBlend::new(&gpu, &latest, looks)?;
+            latest.set_wants_queue(true);
+            let converter = d3d::Converter::new(&gpu, &blend.average, overlay.clone(), &encoder.pool.textures, true, width, height, s.fps)?;
             let preview = d3d::Previewer::new(&gpu, &latest, overlay, width, height, s.fps, crate::preview::new_producer())?;
-            session.pacer = Some(match blend {
-                Some(blend) => spawn_blend_pacer(s.fps, s.blend_samples, latest, blend, converter, encoder, preview, camera, clock),
-                None => spawn_pacer(s.fps, latest, converter, encoder, preview, camera, clock),
-            });
+            session.pacer = Some(spawn_blend_pacer(s.fps, looks, latest, blend, converter, encoder, preview, camera, clock));
             Ok(())
         })();
         if let Err(e) = started {
@@ -983,9 +985,9 @@ struct FrameBlend {
     held_keep: Option<windows::Win32::Graphics::Direct3D11::ID3D11Texture2D>,
     held_size: (u32, u32),
     /// The average so far, as light (16-bit float, so faint ghosts and dark
-    /// colours keep their precision).
-    light_target: windows::Win32::Graphics::Direct3D11::ID3D11RenderTargetView,
-    light_view: windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView,
+    /// colours keep their precision). None with one look a frame: the
+    /// picture is copied as it is.
+    light: Option<(windows::Win32::Graphics::Direct3D11::ID3D11RenderTargetView, windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView)>,
     /// The finished frame, back in sRGB: the converter reads it.
     average: Arc<d3d::Latest>,
     target: windows::Win32::Graphics::Direct3D11::ID3D11RenderTargetView,
@@ -999,16 +1001,23 @@ struct FrameBlend {
 }
 
 impl FrameBlend {
-    fn new(gpu: &d3d::Gpu, latest: &Arc<d3d::Latest>) -> Result<Self> {
+    /// `looks` a frame; one is timing alone (each frame the picture that was
+    /// up at its time).
+    fn new(gpu: &d3d::Gpu, latest: &Arc<d3d::Latest>, looks: u32) -> Result<Self> {
         let average = d3d::Latest::new(gpu, latest.width, latest.height)?;
         let own = d3d::Latest::new(gpu, latest.width, latest.height)?;
         let own_view = quad::shader_view(gpu, &own.texture)?;
         use windows::Win32::Graphics::Direct3D11::{D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_USAGE_DEFAULT};
         let bind = (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32;
-        let light = gpu.texture(latest.width, latest.height, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT, bind, D3D11_USAGE_DEFAULT, 0)?;
+        let light = match looks > 1 {
+            true => {
+                let t = gpu.texture(latest.width, latest.height, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT, bind, D3D11_USAGE_DEFAULT, 0)?;
+                Some((quad::target_view(gpu, &t)?, quad::shader_view(gpu, &t)?))
+            }
+            false => None,
+        };
         Ok(Self {
-            light_target: quad::target_view(gpu, &light)?,
-            light_view: quad::shader_view(gpu, &light)?,
+            light,
             quad: quad::Quad::new(gpu)?,
             gpu: gpu.clone(),
             held_view: own_view.clone(),
@@ -1053,7 +1062,9 @@ impl FrameBlend {
         }
         self.count += steps;
         // Mixing in by its share of the total so far keeps it the average.
-        self.quad.average_light(&self.gpu, &self.light_target, (self.own.width, self.own.height), &self.held_view, steps as f32 / self.count as f32);
+        if let Some((target, _)) = &self.light {
+            self.quad.average_light(&self.gpu, target, (self.own.width, self.own.height), &self.held_view, steps as f32 / self.count as f32);
+        }
     }
 
     /// The frame is done: its average is ready for the converter, and the next
@@ -1063,7 +1074,11 @@ impl FrameBlend {
         if self.count == 0 {
             return None;
         }
-        self.quad.from_light(&self.gpu, &self.target, (self.own.width, self.own.height), &self.light_view);
+        match &self.light {
+            Some((_, view)) => self.quad.from_light(&self.gpu, &self.target, (self.own.width, self.own.height), view),
+            // One look: the picture itself.
+            None => unsafe { self.gpu.context.CopyResource(&self.average.texture, self.held_keep.as_ref().unwrap_or(&self.own.texture)) },
+        }
         self.average.mark_frame(self.held_size);
         Some(std::mem::take(&mut self.count))
     }
@@ -1333,7 +1348,8 @@ impl BlendStats {
         self.most = self.most.max(different);
         if self.since.elapsed() >= Duration::from_secs(5) {
             eprintln!(
-                "frame blending: the game showed {:.0} pictures/s; {looks} looks per frame, {}-{} different pictures in each, {:.0}% of frames with {looks}; {} pictures too late, over {} frames",
+                "{}: the game showed {:.0} pictures/s; {looks} looks per frame, {}-{} different pictures in each, {:.0}% of frames with {looks}; {} pictures too late, over {} frames",
+                if looks == 1 { "frame timing" } else { "frame blending" },
                 self.pictures as f64 / self.since.elapsed().as_secs_f64(),
                 self.fewest,
                 self.most,
@@ -1426,73 +1442,4 @@ fn skipped(dropped: &mut u64) {
     if dropped.is_power_of_two() {
         eprintln!("video encoder is behind: {dropped} frames skipped");
     }
-}
-
-/// Encode the newest screen image every 1/fps on the host clock. WGC only sends
-/// frames when the screen changes; repeating the last one keeps the output CFR.
-/// Frame N is stamped N/fps seconds after t0, the same clock the audio uses.
-fn spawn_pacer(
-    fps: u32,
-    latest: Arc<d3d::Latest>,
-    converter: d3d::Converter,
-    encoder: h264::Encoder,
-    preview: d3d::Previewer,
-    mut camera: Option<camera::CameraLayer>,
-    clock: Arc<Clock>,
-) -> (Arc<AtomicBool>, JoinHandle<()>) {
-    let stop = Arc::new(AtomicBool::new(false));
-    let stop2 = stop.clone();
-    let handle = thread::spawn(move || {
-        // On time even while a game keeps every core busy: a late look
-        // repeats a frame in the file.
-        system::multimedia_thread("Capture");
-        let fps_f = fps as f64;
-        let t0 = host_now();
-        clock.set(t0);
-        let mut next: i64 = 0;
-        let mut dropped = 0u64;
-
-        while !stop2.load(Ordering::Relaxed) {
-            let now = host_now();
-            let due = ((now - t0) * fps_f) as i64;
-            // After a stall, catch up gradually rather than in one huge burst.
-            let mut burst = 0;
-            while next <= due && burst < fps * 2 {
-                if let Some(c) = camera.as_mut() {
-                    c.pull();
-                }
-                if latest.has_frame() {
-                    match encoder.pool.take() {
-                        Some(slot) => match converter.convert(slot) {
-                            Ok(()) => {
-                                if encoder.encode(slot, next) {
-                                    encoded();
-                                } else {
-                                    skipped(&mut dropped);
-                                }
-                            }
-                            Err(e) => {
-                                encoder.pool.give(slot);
-                                eprintln!("{e:#}");
-                            }
-                        },
-                        None => skipped(&mut dropped),
-                    }
-                }
-                next += 1;
-                burst += 1;
-            }
-            // The Sources page is showing the preview: hand it this picture too.
-            if let Err(e) = preview.submit() {
-                eprintln!("preview: {e:#}");
-            }
-            let wake = t0 + next as f64 / fps_f;
-            let wait = wake - host_now();
-            if wait > 0.0 {
-                thread::sleep(Duration::from_secs_f64(wait));
-            }
-        }
-        encoder.finish();
-    });
-    (stop, handle)
 }

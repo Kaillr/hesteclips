@@ -44,6 +44,32 @@ float4 ps_diff(V i) : SV_Target {
     }
     return float4(most, most, most, 1);
 }
+// A picture's signature: in each block of `area.z` texels square (within
+// `area.xy`), sums of every texel of every `area.w`-th row, plain and weighted
+// by where in the block it is, so that anything moving or changing within a
+// block changes them (a plain sum stays put for a thing moving inside it).
+float4 ps_signature(V i) : SV_Target {
+    int2 origin = int2(i.pos.xy) * (int)area.z;
+    float4 sum = 0;
+    [loop] for (int y = 0; y < (int)area.z; y += (int)area.w) {
+        [loop] for (int x = 0; x < (int)area.z; x++) {
+            int2 at = origin + int2(x, y);
+            if (at.x < (int)area.x && at.y < (int)area.y) {
+                float3 c = image.Load(int3(at, 0)).rgb * 255;
+                float v = c.r + 3 * c.g + 7 * c.b;
+                sum += float4(v, v * (x + 1), v * (y + 1), v * ((x * 7 + y * 3) % 16 + 1));
+            }
+        }
+    }
+    return sum;
+}
+// Passes (draws) only where two signatures differ: counted by an occlusion
+// predicate that says whether the picture changed.
+float4 ps_changed(V i) : SV_Target {
+    int3 at = int3(i.pos.xy, 0);
+    if (all(image.Load(at) == other.Load(at))) discard;
+    return 1;
+}
 float4 ps_opaque(V i) : SV_Target { return float4(image.Sample(linear_clamp, i.uv).rgb, 1); }
 // sRGB colour to light (what a screen gives off, which adds up linearly), and back.
 float3 to_light(float3 c) { return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4); }
@@ -71,6 +97,8 @@ pub(crate) struct Quad {
     ps: ID3D11PixelShader,
     ps_opaque: ID3D11PixelShader,
     ps_diff: ID3D11PixelShader,
+    ps_signature: ID3D11PixelShader,
+    ps_changed: ID3D11PixelShader,
     ps_to_light: ID3D11PixelShader,
     ps_from_light: ID3D11PixelShader,
     block: ID3D11Buffer,
@@ -115,6 +143,8 @@ impl Quad {
         let ps_code = compile(s!("ps"), s!("ps_4_0"))?;
         let ps_opaque_code = compile(s!("ps_opaque"), s!("ps_4_0"))?;
         let ps_diff_code = compile(s!("ps_diff"), s!("ps_4_0"))?;
+        let ps_signature_code = compile(s!("ps_signature"), s!("ps_4_0"))?;
+        let ps_changed_code = compile(s!("ps_changed"), s!("ps_4_0"))?;
         let ps_to_light_code = compile(s!("ps_to_light"), s!("ps_4_0"))?;
         let ps_from_light_code = compile(s!("ps_from_light"), s!("ps_4_0"))?;
         unsafe {
@@ -126,6 +156,10 @@ impl Quad {
             dev.CreatePixelShader(bytes(&ps_opaque_code), None, Some(&mut ps_opaque))?;
             let mut ps_diff = None;
             dev.CreatePixelShader(bytes(&ps_diff_code), None, Some(&mut ps_diff))?;
+            let mut ps_signature = None;
+            dev.CreatePixelShader(bytes(&ps_signature_code), None, Some(&mut ps_signature))?;
+            let mut ps_changed = None;
+            dev.CreatePixelShader(bytes(&ps_changed_code), None, Some(&mut ps_changed))?;
             let mut ps_to_light = None;
             dev.CreatePixelShader(bytes(&ps_to_light_code), None, Some(&mut ps_to_light))?;
             let mut ps_from_light = None;
@@ -169,6 +203,8 @@ impl Quad {
                 ps: ps.context("no pixel shader")?,
                 ps_opaque: ps_opaque.context("no pixel shader")?,
                 ps_diff: ps_diff.context("no pixel shader")?,
+                ps_signature: ps_signature.context("no pixel shader")?,
+                ps_changed: ps_changed.context("no pixel shader")?,
                 ps_to_light: ps_to_light.context("no pixel shader")?,
                 ps_from_light: ps_from_light.context("no pixel shader")?,
                 block: block.context("no constant buffer")?,
@@ -204,8 +240,28 @@ impl Quad {
     /// largest colour difference in a block of them, nonzero where they do.
     pub(crate) fn difference(&self, gpu: &Gpu, target: &ID3D11RenderTargetView, out: (u32, u32), now: &ID3D11ShaderResourceView, before: &ID3D11ShaderResourceView, size: (u32, u32)) {
         let block = size.0.div_ceil(out.0).max(size.1.div_ceil(out.1)).max(1);
+        self.blocks(gpu, target, out, &self.ps_diff, now, Some(before), [size.0 as f32, size.1 as f32, block as f32, 0.0]);
+    }
+
+    /// `source`'s signature (`size` of it valid) into `target` (`out` pixels,
+    /// a float texture): see `ps_signature`. Reads every `rows`-th row.
+    pub(crate) fn signature(&self, gpu: &Gpu, target: &ID3D11RenderTargetView, out: (u32, u32), source: &ID3D11ShaderResourceView, size: (u32, u32), rows: u32) {
+        let block = size.0.div_ceil(out.0).max(size.1.div_ceil(out.1)).max(1);
+        self.blocks(gpu, target, out, &self.ps_signature, source, None, [size.0 as f32, size.1 as f32, block as f32, rows.max(1) as f32]);
+    }
+
+    /// Draws into `target` (`out` pixels, its contents of no use) only where
+    /// signatures `now` and `before` differ: inside an occlusion predicate,
+    /// that says whether they do.
+    pub(crate) fn changed(&self, gpu: &Gpu, target: &ID3D11RenderTargetView, out: (u32, u32), now: &ID3D11ShaderResourceView, before: &ID3D11ShaderResourceView) {
+        self.blocks(gpu, target, out, &self.ps_changed, now, Some(before), [out.0 as f32, out.1 as f32, 1.0, 0.0]);
+    }
+
+    /// One pixel shader over all of `target` (`out` pixels), reading `image`
+    /// (and `other`), with `area` in its constant buffer.
+    #[allow(clippy::too_many_arguments)]
+    fn blocks(&self, gpu: &Gpu, target: &ID3D11RenderTargetView, out: (u32, u32), ps: &ID3D11PixelShader, image: &ID3D11ShaderResourceView, other: Option<&ID3D11ShaderResourceView>, area: [f32; 4]) {
         let place = [-1.0f32, 1.0, 1.0, -1.0, 0.0, 0.0, 1.0, 1.0];
-        let area = [size.0 as f32, size.1 as f32, block as f32, 0.0];
         let _lock = gpu.exclusive();
         let ctx = &gpu.context;
         unsafe {
@@ -219,9 +275,9 @@ impl Quad {
             ctx.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
             ctx.VSSetShader(&self.vs, None);
             ctx.VSSetConstantBuffers(0, Some(&[Some(self.place.clone())]));
-            ctx.PSSetShader(&self.ps_diff, None);
+            ctx.PSSetShader(ps, None);
             ctx.PSSetConstantBuffers(1, Some(&[Some(self.block.clone())]));
-            ctx.PSSetShaderResources(0, Some(&[Some(now.clone()), Some(before.clone())]));
+            ctx.PSSetShaderResources(0, Some(&[Some(image.clone()), other.cloned()]));
             ctx.Draw(4, 0);
             ctx.OMSetRenderTargets(None, None);
             ctx.PSSetShaderResources(0, Some(&[None, None]));

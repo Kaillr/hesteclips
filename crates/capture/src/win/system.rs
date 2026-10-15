@@ -100,6 +100,8 @@ struct Monitor {
     primary: bool,
     width: u32,
     height: u32,
+    /// Refresh rate, Hz (0: not known).
+    hz: u32,
 }
 
 fn monitors() -> Vec<Monitor> {
@@ -119,13 +121,14 @@ fn monitors() -> Vec<Monitor> {
             let device = from_wide(&info.szDevice);
             // The mode's real pixels, whatever this process's DPI awareness.
             let mut mode = DEVMODEW { dmSize: std::mem::size_of::<DEVMODEW>() as u16, ..Default::default() };
-            let (width, height) = if unsafe { EnumDisplaySettingsW(PCWSTR(info.szDevice.as_ptr()), ENUM_CURRENT_SETTINGS, &mut mode) }.as_bool() {
-                (mode.dmPelsWidth, mode.dmPelsHeight)
+            let (width, height, hz) = if unsafe { EnumDisplaySettingsW(PCWSTR(info.szDevice.as_ptr()), ENUM_CURRENT_SETTINGS, &mut mode) }.as_bool() {
+                // 0 or 1 means the hardware's default: not known.
+                (mode.dmPelsWidth, mode.dmPelsHeight, if mode.dmDisplayFrequency > 1 { mode.dmDisplayFrequency } else { 0 })
             } else {
                 let r = info.monitorInfo.rcMonitor;
-                ((r.right - r.left) as u32, (r.bottom - r.top) as u32)
+                ((r.right - r.left) as u32, (r.bottom - r.top) as u32, 0)
             };
-            Some(Monitor { handle, device, primary: info.monitorInfo.dwFlags & 1 != 0, width, height })
+            Some(Monitor { handle, device, primary: info.monitorInfo.dwFlags & 1 != 0, width, height, hz })
         })
         .collect();
     // The main display first: it's the default choice.
@@ -143,6 +146,17 @@ pub fn list_screens() -> Vec<Device> {
             Device { name: format!("Display {n} ({}×{}{main})", m.width, m.height), id: m.device }
         })
         .collect()
+}
+
+/// A display's refresh rate, by device name; `None`: the fastest display's
+/// (a game can be on any of them).
+pub(crate) fn display_refresh(id: Option<&str>) -> Option<u32> {
+    let all = monitors();
+    match id.filter(|id| !id.is_empty()) {
+        Some(id) => all.iter().find(|m| m.device == id).map(|m| m.hz),
+        None => all.iter().map(|m| m.hz).max(),
+    }
+    .filter(|&hz| hz > 0)
 }
 
 /// A monitor's size in pixels, by device name (`None`: the main one), else

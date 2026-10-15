@@ -4,7 +4,8 @@
 //! the way osu! and Geometry Dash draw. Closes after `SECS` seconds (10).
 //! `FPS=n`: exactly n pictures a second, the bar 4 px further in each (to
 //! check frame blending: each recorded frame should show the bar's
-//! positions in its time, evenly).
+//! positions in its time, evenly). `NOVSYNC=1` (OpenGL): faster than the
+//! display's refresh rate. `SIZE=WxH`: draw that big (800×600).
 //!
 //!   cargo run -p capture --example hook_target
 //!   APP=hook_target.exe HOOK=1 SECS=5 HEIGHT=0 cargo run -p capture --example record
@@ -24,7 +25,8 @@ fn main() -> windows::core::Result<()> {
     let gl = std::env::var("GL").is_ok_and(|v| v == "1");
     // STATIC=1: the same picture every frame (still presented each frame).
     let still = std::env::var("STATIC").is_ok_and(|v| v == "1");
-    let (w, h) = (800, 600);
+    // SIZE=WxH: the window's drawing size (800×600).
+    let (w, h) = std::env::var("SIZE").ok().and_then(|s| s.split_once('x').and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?)))).unwrap_or((800, 600));
     let hwnd = unsafe {
         let instance = GetModuleHandleW(None)?;
         let class = WNDCLASSW { lpfnWndProc: Some(proc), hInstance: instance.into(), lpszClassName: w!("hook_target"), ..Default::default() };
@@ -50,6 +52,7 @@ fn main() -> windows::core::Result<()> {
     let start = std::time::Instant::now();
     let cap: Option<f64> = std::env::var("FPS").ok().and_then(|s| s.parse().ok());
     let mut shown = 0u64;
+    let mut late = 0u64;
     let mut draw: Box<dyn FnMut(f32)> = if gl {
         use windows::Win32::Graphics::Gdi::HDC;
         use windows::Win32::Graphics::OpenGL::*;
@@ -68,6 +71,14 @@ fn main() -> windows::core::Result<()> {
             SetPixelFormat(dc, format, &pfd)?;
             let ctx = wglCreateContext(dc)?;
             wglMakeCurrent(dc, ctx)?;
+            // NOVSYNC=1: not held to the display's refresh, like a game with
+            // vsync off (else `FPS` above the refresh rate isn't reached).
+            if std::env::var("NOVSYNC").is_ok_and(|v| v == "1") {
+                if let Some(f) = wglGetProcAddress(windows::core::s!("wglSwapIntervalEXT")) {
+                    let swap_interval: extern "system" fn(i32) -> i32 = std::mem::transmute(f);
+                    swap_interval(0);
+                }
+            }
         }
         Box::new(move |t| unsafe {
             glViewport(0, 0, w, h);
@@ -156,6 +167,17 @@ fn main() -> windows::core::Result<()> {
             None => start.elapsed().as_secs_f32(),
         };
         draw(if still { 0.0 } else { t });
+        // How many pictures were shown late: more than half a picture after
+        // their time (then the recording rightly shows them in a later frame).
+        if let Some(fps) = cap {
+            let due = (shown - 1) as f64 / fps;
+            if start.elapsed().as_secs_f64() - due > 0.5 / fps {
+                late += 1;
+            }
+        }
+    }
+    if let Some(fps) = cap {
+        println!("{shown} pictures at {fps} fps, {late} shown more than half a picture late");
     }
     Ok(())
 }

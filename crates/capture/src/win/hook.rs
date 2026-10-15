@@ -278,6 +278,9 @@ impl HookCapture {
         let (stop2, ended2, gpu, latest) = (stop.clone(), ended.clone(), gpu.clone(), latest.clone());
         let window = super::d3d::Shared(window);
         let thread = thread::Builder::new().name("game hook".into()).spawn(move || {
+            // On time, like the pacer: a look that comes late times a game
+            // picture late, and it can land in the frame after its own.
+            super::system::multimedia_thread("Capture");
             let window = window;
             let result = run(&dir, &gpu, window.0, &latest, fps, &stop2);
             let reason = match result {
@@ -391,9 +394,13 @@ fn run(dir: &Path, gpu: &Gpu, window: HWND, latest: &Arc<Latest>, fps: u32, stop
         (*hook_info).force_shmem = false;
         (*hook_info).unused_use_scale = false;
         (*hook_info).allow_srgb_alias = true;
-        // Copy at most twice per recorded frame (as OBS does): copying every
-        // frame of a game running at 1000 fps would cost it.
-        (*hook_info).frame_interval = 1_000_000_000 / (2 * fps.max(1) as u64);
+        // Copy at most four times per look (`fps` is looks a second): copying
+        // every frame of a game running at thousands of fps would cost it.
+        // Twice (as OBS does) left a game at twice the rate right on the
+        // limit, where its timing noise decides which pictures get copied:
+        // a 600 fps game recorded at 300 came out in steps of 1 and 3
+        // pictures as well as 2.
+        (*hook_info).frame_interval = 1_000_000_000 / (4 * fps.max(1) as u64);
     }
     let event = |name: &str| open_event(&format!("{name}{pid}")).with_context(|| format!("the hook has no {name} event"));
     let (hook_stop, hook_init, hook_ready, hook_exit) = (event("CaptureHook_Stop")?, event("CaptureHook_Initialize")?, event("CaptureHook_HookReady")?, event("CaptureHook_Exit")?);
@@ -411,8 +418,8 @@ fn run(dir: &Path, gpu: &Gpu, window: HWND, latest: &Arc<Latest>, fps: u32, stop
     let quad = Quad::new(gpu)?;
     let target = super::quad::target_view(gpu, &latest.texture)?;
     let mut cursor = super::cursor::CursorLayer::new();
-    let every = Duration::from_secs_f64(1.0 / (2.0 * fps.max(1) as f64));
-    let mut changes = super::changes::Changes::new(gpu, latest.width, latest.height, every.as_secs_f64())?;
+    let every = Duration::from_secs_f64(1.0 / reads_per_second(fps));
+    let mut changes = super::changes::Changes::new(gpu, latest.width, latest.height, 1.0 / (2.0 * fps.max(1) as f64))?;
     let mut next = Instant::now();
     let result = loop {
         if stop.load(Ordering::Relaxed) {
@@ -457,15 +464,30 @@ fn run(dir: &Path, gpu: &Gpu, window: HWND, latest: &Arc<Latest>, fps: u32, stop
             // Into a slot of its own: whether it's new is known a few
             // milliseconds on (`Changes`), and the picture is kept till then.
             let (i, picture, slot_target) = changes.slot();
-            match s.copy(gpu, &quad, &slot_target, &picture, &mutexes) {
-                Ok(Some(size)) => {
-                    let mut at = windows::Win32::Foundation::POINT::default();
-                    let _ = unsafe { windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut at) };
-                    changes.submit(gpu, &quad, i, size, (at.x, at.y));
-                    unsafe { gpu.context.Flush() };
+            let mut at = windows::Win32::Foundation::POINT::default();
+            let _ = unsafe { windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut at) };
+            match &s.signature_view {
+                // Copied only if it changed.
+                Some(view) => {
+                    let mut failed = None;
+                    changes.read(gpu, &quad, i, view, (s.cx, s.cy), (at.x, at.y), &mut || {
+                        s.copy(gpu, &quad, &slot_target, &picture, &mutexes).unwrap_or_else(|e| {
+                            failed = Some(e);
+                            None
+                        })
+                    });
+                    if let Some(e) = failed {
+                        eprintln!("game hook: {e:#}");
+                    }
                 }
-                Ok(None) => {}
-                Err(e) => eprintln!("game hook: {e:#}"),
+                None => match s.copy(gpu, &quad, &slot_target, &picture, &mutexes) {
+                    Ok(Some(size)) => {
+                        changes.submit(gpu, &quad, i, size, (at.x, at.y));
+                        unsafe { gpu.context.Flush() };
+                    }
+                    Ok(None) => {}
+                    Err(e) => eprintln!("game hook: {e:#}"),
+                },
             }
         }
         // What's new goes up, with the cursor drawn on it.
@@ -481,6 +503,16 @@ fn run(dir: &Path, gpu: &Gpu, window: HWND, latest: &Arc<Latest>, fps: u32, stop
     let _ = unsafe { SetEvent(hook_stop.0) };
     drop(keepalive);
     result
+}
+
+/// How often to look at the hook's copy of the game's picture, for `fps`
+/// looks a second: four times per look, so that when each picture came up is
+/// known to a quarter of a look (twice, a game at twice the rate came out in
+/// uneven steps), but at most 2400 a second (a guess at what's cheap; each
+/// look still makes a signature), and never under twice per look.
+fn reads_per_second(fps: u32) -> f64 {
+    let fps = fps.max(1) as f64;
+    (4.0 * fps).min(2400.0).max(2.0 * fps)
 }
 
 /// Start loading the hook into the game with OBS's helper, the way OBS does
@@ -507,6 +539,10 @@ struct Source {
     /// Shared memory frames: two buffers the hook alternates between, rows
     /// `pitch` bytes apart.
     memory: Option<(View, u32)>,
+    /// To make signatures of the shared texture with (see `Changes::read`);
+    /// None for shared memory (uploaded by the copy) or a texture shaders
+    /// can't read.
+    signature_view: Option<ID3D11ShaderResourceView>,
 }
 
 impl Source {
@@ -544,7 +580,8 @@ impl Source {
         unsafe { input.GetDesc(&mut desc) };
         let copyable = matches!(desc.Format, DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB | DXGI_FORMAT_B8G8R8A8_TYPELESS) && !info.flip;
         let view = if copyable { None } else { Some(super::quad::shader_view(gpu, &input)?) };
-        Ok(Self { cx, cy, flip: info.flip, input, view, memory })
+        let signature_view = if memory.is_some() { None } else { view.clone().or_else(|| super::quad::shader_view(gpu, &input).ok()) };
+        Ok(Self { cx, cy, flip: info.flip, input, view, memory, signature_view })
     }
 
     /// Copy the newest frame into `latest` (through `target`, its render
