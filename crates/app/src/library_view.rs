@@ -688,14 +688,10 @@ impl App {
         cui.multiply_opacity(t);
         cui.add_space((avail.height() * 0.5 - 140.0).max(20.0));
         // The app's glyph, one colour for the theme (white on dark, black on
-        // light) with its own silhouette blurred as the shadow, so both follow
-        // the horse instead of a box. The pictures have 1/3 margin around it.
-        let (glyph, shadow) = self.glyph_textures(cui.ctx());
+        // light). The picture has 1/3 margin around it.
+        let glyph = self.glyph_texture(cui.ctx());
         let (r, _) = cui.allocate_exact_size(vec2(76.0, 76.0), Sense::hover());
         let canvas = Rect::from_center_size(r.center(), r.size() * 1.5);
-        egui::Image::from_texture((shadow.id(), canvas.size()))
-            .tint(Color32::from_black_alpha(if p.dark { 150 } else { 70 }))
-            .paint_at(&cui, canvas.translate(vec2(0.0, 7.0)));
         egui::Image::from_texture((glyph.id(), canvas.size()))
             .tint(if p.dark { Color32::WHITE } else { Color32::BLACK })
             .paint_at(&cui, canvas);
@@ -732,16 +728,13 @@ impl App {
         });
     }
 
-    /// The glyph and its shadow (`assets/glyph*.png`, made by scripts/tray-icons.sh).
-    fn glyph_textures(&mut self, ctx: &egui::Context) -> (egui::TextureHandle, egui::TextureHandle) {
+    /// The glyph (`assets/glyph.png`, made by scripts/tray-icons.sh).
+    fn glyph_texture(&mut self, ctx: &egui::Context) -> egui::TextureHandle {
         self.app_icon_tex
             .get_or_insert_with(|| {
-                let load = |name: &str, png: &[u8]| {
-                    let img = image::load_from_memory_with_format(png, image::ImageFormat::Png).expect("bundled glyph is a valid PNG").to_rgba8();
-                    let img = egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw());
-                    ctx.load_texture(name, img, egui::TextureOptions::LINEAR)
-                };
-                (load("glyph", include_bytes!("../assets/glyph.png")), load("glyph_shadow", include_bytes!("../assets/glyph-shadow.png")))
+                let img = image::load_from_memory_with_format(include_bytes!("../assets/glyph.png"), image::ImageFormat::Png).expect("bundled glyph is a valid PNG").to_rgba8();
+                let img = egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw());
+                ctx.load_texture("glyph", img, egui::TextureOptions::LINEAR)
             })
             .clone()
     }
