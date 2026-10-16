@@ -1118,9 +1118,12 @@ impl Ready {
             self.player.pause();
             return;
         }
-        // Play within the trim; starting from outside it (or the end) restarts at in.
+        // Play within the trim; starting from outside it (or the end) restarts
+        // at in. The last kept frame counts as the end: dragging the out
+        // handle leaves the playhead on it, and playing from there would show
+        // that one frame and stop.
         let t = self.player.time();
-        if t < self.edit.start || t >= self.edit.end - self.info.frame_duration() * 0.5 {
+        if t < self.edit.start || t >= self.edit.end - self.info.frame_duration() * 1.5 {
             self.player.seek(self.edit.start);
         }
         self.player.play(self.edit.end);
