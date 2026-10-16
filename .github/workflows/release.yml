@@ -29,11 +29,11 @@ on:
       linux:
         description: Linux
         type: boolean
-        default: false
+        default: true
       mac:
         description: macOS
         type: boolean
-        default: false
+        default: true
 
 permissions:
   contents: write
