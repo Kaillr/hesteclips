@@ -62,7 +62,7 @@ impl App {
 
     /// Ask for `.hesteclips` files, then import them.
     pub(crate) fn import_clips_dialog(&mut self) {
-        let Some(files) = rfd::FileDialog::new().set_title("Import clips").add_filter("HesteClips clips", &[archive::EXT]).pick_files() else { return };
+        let Some(files) = rfd::FileDialog::new().set_title("Import clips").add_filter("HesteClips clips", &[archive::EXT, archive::OTHER_EXT]).pick_files() else { return };
         self.import_clips(files);
     }
 
@@ -101,7 +101,7 @@ impl App {
 
     /// `.hesteclips` files dropped on the window are imported.
     pub(crate) fn import_dropped(&mut self, ctx: &egui::Context) {
-        let files: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case(archive::EXT))).collect());
+        let files: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| archive::is_archive(p)).collect());
         self.import_clips(files);
     }
 

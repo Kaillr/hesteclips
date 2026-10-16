@@ -28,6 +28,13 @@ use crate::moments::Moments;
 
 /// The file's extension.
 pub const EXT: &str = "hesteclips";
+/// The public version's: its files hold the same, and import here.
+pub const OTHER_EXT: &str = "hasteclip";
+
+/// Whether a path is a clips file of either version.
+pub fn is_archive(path: &Path) -> bool {
+    path.extension().is_some_and(|e| e.eq_ignore_ascii_case(EXT) || e.eq_ignore_ascii_case(OTHER_EXT))
+}
 /// The newest manifest this app writes and reads.
 const FORMAT: u32 = 1;
 
@@ -470,6 +477,14 @@ mod tests {
         assert_eq!(inside(dir, ""), None);
         assert_eq!(safe_name(".."), "");
         assert!(!safe_name("a/b").contains('/'));
+    }
+
+    /// Either version's extension is a clips file.
+    #[test]
+    fn both_extensions_import() {
+        assert!(is_archive(Path::new("a.hesteclips")));
+        assert!(is_archive(Path::new(&format!("a.{OTHER_EXT}"))));
+        assert!(!is_archive(Path::new("a.mp4")));
     }
 
     /// A file from a newer app says so instead of half-importing.
