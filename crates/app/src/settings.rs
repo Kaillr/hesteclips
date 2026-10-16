@@ -612,6 +612,10 @@ pub struct RecordSettings {
     /// The editor's preview height, as a share of the window (the timeline
     /// gets the rest), as last dragged.
     pub editor_preview_share: f32,
+    /// The editor's snapping (the magnet, N): trim edges and the playhead
+    /// snap to each other, the clip's ends and its moments. Off unless you
+    /// turn it on (it caught on kills while trimming), then kept as you left it.
+    pub editor_snap: bool,
     /// The clip player's volume (0..=1 on its slider) and mute, as last set,
     /// so a clip never opens at full blast after you'd turned it down.
     pub player_volume: f32,
@@ -661,6 +665,7 @@ impl Default for RecordSettings {
             shortcuts: Shortcuts::default(),
             save_sound: SaveSound::default(),
             editor_preview_share: 0.5,
+            editor_snap: false,
             player_volume: 1.0,
             player_muted: false,
             audio_tracks: None,

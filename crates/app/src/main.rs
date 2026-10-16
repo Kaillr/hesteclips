@@ -1521,7 +1521,7 @@ impl App {
             self.toast_error("Stop recording before editing a clip.");
             return;
         }
-        self.editor = Some(editor::Editor::open(&self.ctx(), &clip, self.settings.editor_preview_share));
+        self.editor = Some(editor::Editor::open(&self.ctx(), &clip, self.settings.editor_preview_share, self.settings.editor_snap));
         self.page = Page::Edit;
     }
 
@@ -1637,6 +1637,7 @@ impl App {
         };
         let outcome = ed.ui(ui);
         self.settings.editor_preview_share = ed.preview_share();
+        self.settings.editor_snap = ed.snap();
         match outcome {
             editor::EditorOutcome::Stay => {}
             editor::EditorOutcome::Keys => self.show_keys = Some(shell::Keys::Editor),

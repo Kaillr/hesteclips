@@ -169,12 +169,14 @@ pub struct Editor {
     state: State,
     /// How much of the height the preview gets; the timeline has the rest.
     preview_share: f32,
+    /// Snapping, as the app keeps it (settings), until the clip has loaded.
+    snap: bool,
 }
 
 impl Editor {
     /// Edit the clip at `clip`. An edited clip is decoded from its original, so
     /// every earlier decision can still be changed.
-    pub fn open(ctx: &egui::Context, clip: &Path, preview_share: f32) -> Self {
+    pub fn open(ctx: &egui::Context, clip: &Path, preview_share: f32, snap: bool) -> Self {
         let target = EditTarget::of(clip);
         let (tx, rx) = mpsc::channel();
         let src = target.source.clone();
@@ -201,7 +203,7 @@ impl Editor {
             let _ = tx.send(result);
             repaint.request_repaint();
         });
-        Self { target, state: State::Loading(rx), preview_share }
+        Self { target, state: State::Loading(rx), preview_share, snap }
     }
 
     /// The clip was renamed from `from` to `to`: saved under the new name.
@@ -223,7 +225,7 @@ impl Editor {
                 r.player.renamed(ctx, to);
                 r.strip.renamed(to);
             }
-            _ => *self = Self::open(ctx, to, self.preview_share),
+            _ => *self = Self::open(ctx, to, self.preview_share, self.snap()),
         }
     }
 
@@ -237,11 +239,19 @@ impl Editor {
         self.preview_share
     }
 
+    /// Snapping, as it's set now (the magnet, N), to keep for next time.
+    pub fn snap(&self) -> bool {
+        match &self.state {
+            State::Ready(r) => r.snap,
+            _ => self.snap,
+        }
+    }
+
     pub fn ui(&mut self, ui: &mut egui::Ui) -> EditorOutcome {
         if let State::Loading(rx) = &self.state {
             if let Ok(result) = rx.try_recv() {
                 self.state = match result {
-                    Ok(l) => State::Ready(Box::new(Ready::new(ui.ctx(), &self.target, l))),
+                    Ok(l) => State::Ready(Box::new(Ready::new(ui.ctx(), &self.target, l, self.snap))),
                     Err(e) => State::Failed(e),
                 };
             }
@@ -280,7 +290,7 @@ impl Editor {
 }
 
 impl Ready {
-    fn new(ctx: &egui::Context, target: &EditTarget, l: Loaded) -> Self {
+    fn new(ctx: &egui::Context, target: &EditTarget, l: Loaded, snap: bool) -> Self {
         let source = &target.source;
         let mut edit = store::load_edit(target).unwrap_or_else(|| Edit::new(&l.info));
         // Sidecar from an older layout or a hand-edited file: make it fit.
@@ -324,7 +334,7 @@ impl Ready {
             undo: Vec::new(),
             redo: Vec::new(),
             before_drag: None,
-            snap: true,
+            snap,
             looping: false,
             solo: None,
             show_frames: false,
