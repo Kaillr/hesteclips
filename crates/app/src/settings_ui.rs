@@ -136,7 +136,7 @@ impl App {
             "Saved sound" => f.shows(&["play a sound when a clip is saved", "sound", "volume", "record the sound", "in clip", "add your own"]),
             "Shortcuts" => f.shows(&["shortcuts", "hotkey", "keyboard", "save clip", "start or stop clipping", "start or stop recording"]),
             "Voice" => f.shows(&["save by voice", "hashtag", "speech", "command", "voice samples", "review"]),
-            "App" => f.shows(&["appearance", "theme", "dark", "light", "open at login", "autostart", "startup", "closing the window", "tray", "menu bar", "update", "version", "reset"]),
+            "App" => f.shows(&["appearance", "theme", "dark", "light", "open at login", "autostart", "startup", "closing the window", "tray", "menu bar", "update", "version", "license", "licence", "about", "source code", "copyright", "open source", "reset"]),
             _ => false,
         };
         if !matches {
@@ -654,6 +654,14 @@ impl App {
                     }
                 });
                 l.row(Row::new("Update automatically"), |ui| ui_kit::switch(ui, &mut self.settings.auto_update));
+            }
+            // The copyright notice the GPL asks copies to keep showing.
+            if f.shows(&["license", "licence", "about", "source code", "copyright", "open source"]) {
+                l.row(Row::new("License").note("© Kaillr. Free software under the GNU GPL, version 3 or later."), |ui| {
+                    if Btn::ghost("Source code").small().show(ui).clicked() {
+                        ui.ctx().open_url(egui::OpenUrl::new_tab(crate::update::REPO));
+                    }
+                });
             }
             if f.shows(&["reset", "defaults"]) {
                 l.row(Row::new("Reset all settings").note("Your clips, folders, sources and HesteFiles account are kept."), |ui| {

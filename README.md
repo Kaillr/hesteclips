@@ -87,3 +87,9 @@ Hotkeys work while other apps (and games) are focused. On Windows and Linux use 
 ## Releasing
 
 Releases are cut by hand: *Actions → Release → Run workflow* on `main`. [semantic-release](https://semantic-release.gitbook.io) picks the version from the [Conventional Commits](https://www.conventionalcommits.org) since the last tag — `fix:` → patch, `feat:` → minor, `feat!:` or a `BREAKING CHANGE:` footer → major; `chore:`, `docs:`, `refactor:`, `ci:` and the like don't release on their own. `scripts/release.ps1` builds the app, bundles ffmpeg and OBS Studio's game capture hook, and packs it with [Velopack](https://velopack.io) into the installer and the (delta) update packages the installed app updates from. `scripts/release-mac.sh` and `scripts/release-linux.sh` build the macOS `.dmg` and the Linux tarball, ffmpeg included, and add them to the release.
+
+## License
+
+HesteClips is free software: you can use, change and share it under the [GNU General Public License, version 3 or later](LICENSE). Copies and changed versions must stay under the same license, with their source available and this project's copyright notices kept.
+
+Bundled with the releases: [ffmpeg](https://ffmpeg.org) (GPL), [OBS Studio](https://obsproject.com)'s game capture hook on Windows (GPL-2.0-or-later) and the [Hanken Grotesk](https://fonts.google.com/specimen/Hanken+Grotesk) font (SIL Open Font License).

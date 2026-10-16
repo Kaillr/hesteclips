@@ -5,7 +5,7 @@ members = ["crates/app", "crates/capture", "crates/hestefiles", "crates/media"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-license = "MIT"
+license = "GPL-3.0-or-later"
 repository = "https://github.com/Kaillr/hesteclips"
 
 # Optimize dependencies even in debug builds so capture/encode/preview stay smooth
