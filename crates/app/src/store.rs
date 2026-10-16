@@ -52,6 +52,11 @@ impl EditTarget {
 /// The library folder, as the app has it (Settings → Clips folder).
 static LIBRARY: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
 
+/// Tests that set the library (it's one for the whole app) take turns: they
+/// run in parallel otherwise, and one's library is under another.
+#[cfg(test)]
+pub static LIBRARY_TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Tell the store where the library is, so clips in its folders find their
 /// assets at its top.
 pub fn set_library(lib: &Path) {
@@ -136,7 +141,7 @@ fn is_mp4_family(path: &Path) -> bool {
         .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "mp4" | "mov" | "m4v"))
 }
 
-fn valid_id(id: &str) -> bool {
+pub(crate) fn valid_id(id: &str) -> bool {
     (8..=64).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
@@ -537,6 +542,7 @@ mod tests {
 
     #[test]
     fn game_folders_share_the_library_assets() {
+        let _turn = LIBRARY_TURN.lock().unwrap_or_else(|e| e.into_inner());
         let dir = lib("folders");
         std::fs::create_dir_all(dir.join("osu!")).unwrap();
         let clip = dir.join("osu!").join("Ace.mp4");

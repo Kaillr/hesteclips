@@ -1089,6 +1089,9 @@ impl App {
             }
         }
         ui_kit::menu_sep(ui);
+        if Item::new("Import clips…").icon(icon::DOWNLOAD_SIMPLE).tip("Clips exported from HesteClips on another computer (.hesteclips files). Or drop the files on the window").show(ui).clicked() {
+            action = Some(Action::Import);
+        }
         if Item::new(format!("Show clips folder in {}", crate::file_manager())).icon(icon::FOLDER_OPEN).show(ui).clicked()
             && let Err(e) = clips::open_in_default_app(&self.settings.output_dir)
         {
@@ -1172,6 +1175,9 @@ impl App {
                                     }
                                 });
                             }
+                            if Btn::ghost("Export").with_icon(icon::PACKAGE).small().tip("To a file with their originals, markers and collections, to import into HesteClips on another computer").show(ui).clicked() {
+                                action = Some(Action::Export(selected.clone()));
+                            }
                             let label = if self.settings.delete_permanently { format!("Delete {n}") } else { format!("Move {n} to {}", crate::store::bin_name()) };
                             if Btn::new(Kind::DangerText, label).with_icon(icon::TRASH).small().show(ui).clicked() {
                                 action = Some(Action::TrashSelected);
@@ -1250,6 +1256,8 @@ impl App {
                 let paths: Vec<PathBuf> = self.clips.iter().filter(|c| self.selection.paths.contains(&c.path)).map(|c| c.path.clone()).collect();
                 self.delete_clips(&paths);
             }
+            Action::Export(paths) => self.export_clips(&paths),
+            Action::Import => self.import_clips_dialog(),
         }
     }
 }
@@ -1425,6 +1433,14 @@ pub(crate) fn share_items(ui: &mut egui::Ui, anchor: Pos2, full: bool) -> Option
     ui_kit::menu_sep(ui);
     if Item::new("Save the sound as MP3…").icon(icon::FILE_AUDIO).show(ui).clicked() {
         choice = Some(ShareChoice::Mp3);
+    }
+    if Item::new("Export with its edit…")
+        .icon(icon::PACKAGE)
+        .tip("A file with the clip, its original, markers and collections, to import into HesteClips on another computer")
+        .show(ui)
+        .clicked()
+    {
+        choice = Some(ShareChoice::Export);
     }
     if Item::new(crate::reveal_label()).icon(icon::FOLDER_OPEN).show(ui).clicked() {
         choice = Some(ShareChoice::Reveal);

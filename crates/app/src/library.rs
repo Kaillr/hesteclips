@@ -215,6 +215,11 @@ pub(crate) enum Action {
     /// Dragged clips were dropped here.
     Drop(Vec<PathBuf>, DropOn),
     Share(PathBuf, ShareChoice),
+    /// Write these clips, with their edits, markers and collections, to a
+    /// `.hesteclips` file (for another library).
+    Export(Vec<PathBuf>),
+    /// Ask for `.hesteclips` files and import their clips.
+    Import,
     Rename(PathBuf),
     Open(PathBuf),
     /// Play it in the OS default video player instead.
@@ -722,6 +727,8 @@ pub(crate) enum ShareChoice {
     Upload,
     Reveal,
     Mp3,
+    /// To a `.hesteclips` file, with its edit, markers and collections.
+    Export,
 }
 
 /// The ways to get a clip out, shared by the library's Share button and
@@ -750,6 +757,7 @@ impl App {
                 }
             }
             ShareChoice::Mp3 => self.save_mp3(file),
+            ShareChoice::Export => self.export_clips(&[file]),
         }
     }
 

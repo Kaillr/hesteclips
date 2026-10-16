@@ -253,6 +253,10 @@ pub struct ClipTag {
     pub id: Option<String>,
 }
 
+/// What clips from the public version of this app (HasteClip) carry in front
+/// of the same fields: clips imported from it read the same.
+const OTHER_TAG: &str = "hasteclip:";
+
 /// The file comment for a clip: `hesteclips:mix=1,2 id=3f9c…`. Recordings start
 /// with just the mix; the id is added the first time the clip is edited.
 pub fn clip_tag(mix: &[usize], id: Option<&str>) -> String {
@@ -273,7 +277,8 @@ pub fn render_tag(edit: &Edit, id: Option<&str>) -> String {
 }
 
 pub fn parse_clip_tag(comment: &str) -> ClipTag {
-    let Some(rest) = comment.strip_prefix("hesteclips:") else { return ClipTag::default() };
+    // The other version's spelling of the tag reads the same.
+    let Some(rest) = comment.strip_prefix("hesteclips:").or_else(|| comment.strip_prefix(OTHER_TAG)) else { return ClipTag::default() };
     let mut tag = ClipTag::default();
     for field in rest.split_whitespace() {
         if let Some(list) = field.strip_prefix("mix=") {
@@ -1459,6 +1464,7 @@ mod tests {
         assert_eq!(clip_tag(&[1, 2], None), "hesteclips:mix=1,2");
         assert_eq!(clip_tag(&[1], Some("ab12")), "hesteclips:mix=1 id=ab12");
         assert_eq!(parse_clip_tag("hesteclips:mix=1,2,3"), ClipTag { mix: Some(vec![1, 2, 3]), id: None });
+        assert_eq!(parse_clip_tag(&format!("{OTHER_TAG}mix=1 id=ab12")), ClipTag { mix: Some(vec![1]), id: Some("ab12".into()) }, "the public version's spelling");
         assert_eq!(parse_clip_tag("hesteclips:mix=1 id=ab12"), ClipTag { mix: Some(vec![1]), id: Some("ab12".into()) });
         assert_eq!(parse_clip_tag("hesteclips:mix="), ClipTag { mix: Some(vec![]), id: None });
         assert_eq!(parse_clip_tag("made with something else"), ClipTag::default());
