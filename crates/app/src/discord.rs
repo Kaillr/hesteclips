@@ -146,7 +146,7 @@ fn activity(status: &Status) -> Activity<'_> {
 pub fn known_game(exe: &str) -> Option<Game> {
     #[cfg(target_os = "macos")]
     let exe = &capture::app_file_name(exe)?;
-    games()?.get(&exe.to_lowercase()).map(KnownGame::game)
+    games()?.by_exe.get(&exe.to_lowercase()).map(KnownGame::game)
 }
 
 /// A game Discord knows, by the library folder its clips go in
@@ -157,7 +157,7 @@ pub fn game_for_folder(folder: &str) -> Option<Game> {
         Some(map) => map,
         None => {
             let games = games()?;
-            BY_FOLDER.get_or_init(|| games.values().map(|g| (crate::clips::folder_name(&g.name).to_lowercase(), g.game())).collect())
+            BY_FOLDER.get_or_init(|| games.by_name.iter().map(|(folder, g)| (folder.clone(), g.game())).collect())
         }
     };
     by_folder.get(&folder.to_lowercase()).cloned()
@@ -165,8 +165,8 @@ pub fn game_for_folder(folder: &str) -> Option<Game> {
 
 /// Discord's games by executable, once loaded: the first ask starts loading
 /// them in the background.
-fn games() -> Option<&'static HashMap<String, KnownGame>> {
-    static GAMES: OnceLock<Option<HashMap<String, KnownGame>>> = OnceLock::new();
+fn games() -> Option<&'static Games> {
+    static GAMES: OnceLock<Option<Games>> = OnceLock::new();
     static LOADING: AtomicBool = AtomicBool::new(false);
     if GAMES.get().is_none() && !LOADING.swap(true, Ordering::Relaxed) {
         std::thread::spawn(|| {
@@ -176,7 +176,17 @@ fn games() -> Option<&'static HashMap<String, KnownGame>> {
     GAMES.get()?.as_ref()
 }
 
+/// What's known of Discord's games.
 #[derive(Serialize, Deserialize)]
+struct Games {
+    /// By executable, for this OS only (to tell what's running).
+    by_exe: HashMap<String, KnownGame>,
+    /// By library folder name (lowercase), whatever OS the game is for: a
+    /// folder keeps its icon on a Mac for a game that only runs on Windows.
+    by_name: HashMap<String, KnownGame>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 struct KnownGame {
     name: String,
     id: String,
@@ -190,11 +200,11 @@ impl KnownGame {
 }
 
 fn games_cache() -> Option<PathBuf> {
-    dirs::cache_dir().map(|d| d.join("hesteclips").join("discord-games-2.json"))
+    dirs::cache_dir().map(|d| d.join("hesteclips").join("discord-games-3.json"))
 }
 
 /// Discord's games, from our cache while it's fresh, else downloaded (and cached).
-fn load_games() -> Option<HashMap<String, KnownGame>> {
+fn load_games() -> Option<Games> {
     let cache = games_cache()?;
     let fresh = std::fs::metadata(&cache).and_then(|m| m.modified()).is_ok_and(|t| t.elapsed().is_ok_and(|age| age < GAMES_MAX_AGE));
     let cached = || serde_json::from_slice(&std::fs::read(&cache).ok()?).ok();
@@ -214,7 +224,7 @@ fn load_games() -> Option<HashMap<String, KnownGame>> {
     }
 }
 
-fn download_games() -> Option<HashMap<String, KnownGame>> {
+fn download_games() -> Option<Games> {
     #[derive(Deserialize)]
     struct App {
         id: String,
@@ -244,8 +254,10 @@ fn download_games() -> Option<HashMap<String, KnownGame>> {
     // Some are only told apart by their arguments (`>javaw.exe`), and a few
     // names are shared by several games (`game.exe`): those can't be matched.
     let mut by_exe: HashMap<String, Option<KnownGame>> = HashMap::new();
+    let mut by_name: HashMap<String, KnownGame> = HashMap::new();
     for app in apps {
         let Some(icon) = app.icon_hash else { continue };
+        by_name.entry(crate::clips::folder_name(&app.name).to_lowercase()).or_insert_with(|| KnownGame { name: app.name.clone(), id: app.id.clone(), icon: icon.clone() });
         // Discord's names for the OSes.
         let ours = match std::env::consts::OS {
             "windows" => "win32",
@@ -268,7 +280,7 @@ fn download_games() -> Option<HashMap<String, KnownGame>> {
                 .or_insert(Some(game));
         }
     }
-    Some(by_exe.into_iter().filter_map(|(exe, g)| Some((exe, g?))).collect())
+    Some(Games { by_exe: by_exe.into_iter().filter_map(|(exe, g)| Some((exe, g?))).collect(), by_name })
 }
 
 #[cfg(test)]
@@ -278,8 +290,9 @@ mod tests {
     #[ignore = "network"]
     fn finds_games_by_executable() {
         let games = super::download_games().expect("download and parse Discord's games");
-        assert_eq!(games["osu!.exe"].name, "osu!");
-        assert_eq!(games["cs2.exe"].name, "Counter-Strike 2");
-        assert!(!games.contains_key("game.exe"), "names shared by several games are dropped");
+        assert_eq!(games.by_exe["osu!.exe"].name, "osu!");
+        assert_eq!(games.by_exe["cs2.exe"].name, "Counter-Strike 2");
+        assert!(!games.by_exe.contains_key("game.exe"), "names shared by several games are dropped");
+        assert_eq!(games.by_name["counter-strike 2"].name, "Counter-Strike 2");
     }
 }
