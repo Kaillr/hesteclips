@@ -479,6 +479,31 @@ mod tests {
         assert!(!safe_name("a/b").contains('/'));
     }
 
+    /// Writes the real library's small clips (edited ones too) to the file
+    /// named by `HESTECLIPS_EXPORT_TO`: for checking that the other version
+    /// imports it. `cargo test --release archive::tests::export_real -- --ignored`.
+    #[test]
+    #[ignore = "writes a file"]
+    fn export_real() {
+        let _turn = crate::store::LIBRARY_TURN.lock().unwrap_or_else(|e| e.into_inner());
+        let lib = PathBuf::from(std::env::var("HESTECLIPS_TEST_LIBRARY").expect("HESTECLIPS_TEST_LIBRARY"));
+        let out = PathBuf::from(std::env::var("HESTECLIPS_EXPORT_TO").expect("HESTECLIPS_EXPORT_TO"));
+        crate::store::set_library(&lib);
+        let mut clips = Vec::new();
+        for entry in std::fs::read_dir(lib.join("Desktop")).unwrap().flatten() {
+            let p = entry.path();
+            let m = std::fs::metadata(&p).unwrap();
+            if p.extension().is_none_or(|e| e != "mp4") || m.len() > 60 << 20 {
+                continue;
+            }
+            let id = crate::store::read_id(&p);
+            clips.push(Clip { id, path: p, name: String::new(), modified: m.modified().unwrap(), created: None, size_bytes: m.len(), original: None, folder: Some("Desktop".into()) });
+        }
+        let names: Vec<Vec<String>> = clips.iter().map(|_| vec!["From the friends' version".to_owned()]).collect();
+        export(&lib, &clips, &names, &out, &progress()).unwrap();
+        eprintln!("{} clips ({} edited) → {}", clips.len(), clips.iter().filter(|c| c.id.is_some()).count(), out.display());
+    }
+
     /// Either version's extension is a clips file.
     #[test]
     fn both_extensions_import() {
