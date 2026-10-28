@@ -326,6 +326,12 @@ pub fn claim() -> Option<Option<std::net::TcpListener>> {
 /// (nothing special).
 const PORT: u16 = 52131;
 
+/// Another HasteClip runs (or something else has its port): asked before
+/// [`claim`], which may then show that one and exit.
+pub fn another_running() -> bool {
+    std::net::TcpListener::bind(("127.0.0.1", PORT)).is_err()
+}
+
 fn claim_on(port: u16) -> Option<Option<std::net::TcpListener>> {
     use std::io::Write;
     match std::net::TcpListener::bind(("127.0.0.1", port)) {

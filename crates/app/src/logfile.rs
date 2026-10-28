@@ -3,8 +3,9 @@
 //! prints (errors, what audio sources are doing, panics) would go nowhere: it
 //! goes to `%LOCALAPPDATA%\hasteclip\logs\hasteclip.log` on Windows,
 //! `~/.local/share/hasteclip/logs/hasteclip.log` on Linux, for someone to
-//! send when something doesn't work. Each launch starts it afresh; the one
-//! before is kept as `hasteclip.previous.log`.
+//! send when something doesn't work. Each HasteClip that runs starts it
+//! afresh; the one before is kept as `hasteclip.previous.log`. (A launch that
+//! only shows the one running leaves its log alone: see `main`.)
 
 #![cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
 
