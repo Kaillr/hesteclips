@@ -9,10 +9,39 @@
 
 #![cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 pub fn dir() -> Option<PathBuf> {
     dirs::data_local_dir().map(|d| d.join("hasteclip").join("logs"))
+}
+
+/// The file this HasteClip logs to, once it does (a release build; a
+/// development build with `HASTECLIP_LOG`).
+static CURRENT: OnceLock<PathBuf> = OnceLock::new();
+
+pub fn current() -> Option<&'static Path> {
+    CURRENT.get().map(PathBuf::as_path)
+}
+
+/// What HasteClip runs on, as the log's first line says it ("Windows 11
+/// 24H2 (build 26100.4061)").
+pub fn system() -> String {
+    #[cfg(windows)]
+    return windows_version();
+    #[cfg(target_os = "linux")]
+    return format!("{} ({})", linux_version(), linux_session());
+    #[cfg(target_os = "macos")]
+    return mac_version();
+    #[allow(unreachable_code)]
+    std::env::consts::OS.to_owned()
+}
+
+/// "macOS 15.1", from `sw_vers`.
+#[cfg(target_os = "macos")]
+fn mac_version() -> String {
+    let version = std::process::Command::new("sw_vers").arg("-productVersion").output().ok().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned()).filter(|v| !v.is_empty());
+    version.map_or_else(|| "macOS".to_owned(), |v| format!("macOS {v}"))
 }
 
 /// Where stderr went before the log took it over (Windows): the terminal a
@@ -49,6 +78,7 @@ pub fn start() {
     if let Some(h) = before {
         let _ = TERMINAL.set(h.0 as usize);
     }
+    let _ = CURRENT.set(path);
     eprintln!(
         "HasteClip {} on {}, started {}",
         env!("CARGO_PKG_VERSION"),
@@ -124,6 +154,7 @@ pub fn start() {
     if started.is_err() {
         return;
     }
+    let _ = CURRENT.set(path);
     eprintln!(
         "HasteClip {} on {} ({}), started {}",
         env!("CARGO_PKG_VERSION"),

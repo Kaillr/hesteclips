@@ -30,6 +30,7 @@ mod webcam_ui;
 mod discord;
 mod editor;
 mod export_ui;
+mod feedback;
 mod filmstrip;
 mod free_up;
 mod logfile;
@@ -190,12 +191,12 @@ fn main() -> eframe::Result<()> {
             None => return Ok(()),
         }
     };
-    // Scrub frames kept from before scrubbing decoded live. (Not from a test
     // It took over from the one running (a build of your own): its log now.
     #[cfg(any(windows, target_os = "linux"))]
     if log_later {
         logfile::start();
     }
+    // Scrub frames kept from before scrubbing decoded live. (Not from a test
     // instance: the real one beside it may be an older build using them.)
     if !test_instance {
         proxy::forget_kept();
@@ -267,6 +268,9 @@ fn main() -> eframe::Result<()> {
                 shell::cloak(cc, true);
             }
             gpu_frames::init(cc.wgpu_render_state.as_ref(), &cc.egui_ctx);
+            if let Some(render) = cc.wgpu_render_state.as_ref() {
+                feedback::note_gpu(render.adapter.get_info().name);
+            }
             #[cfg(target_os = "macos")]
             shell::centre_window_buttons(cc);
             ui_kit::apply(&cc.egui_ctx);

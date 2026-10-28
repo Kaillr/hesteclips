@@ -1329,6 +1329,16 @@ pub fn menu_head(ui: &mut egui::Ui, text: &str) {
 /// A menu opened by clicking `resp`, under it (aligned to its `left` or
 /// right edge).
 pub fn menu_popup<R>(resp: &Response, left: bool, width: f32, content: impl FnOnce(&mut egui::Ui) -> R) -> Option<R> {
+    menu_popup_at(resp, if left { egui::RectAlign::BOTTOM_START } else { egui::RectAlign::BOTTOM_END }, width, content)
+}
+
+/// A menu opened by clicking `resp`, to its right, its bottom level with
+/// `resp`'s: for something at the bottom of the window.
+pub fn menu_popup_beside<R>(resp: &Response, width: f32, content: impl FnOnce(&mut egui::Ui) -> R) -> Option<R> {
+    menu_popup_at(resp, egui::RectAlign::RIGHT_END, width, content)
+}
+
+fn menu_popup_at<R>(resp: &Response, align: egui::RectAlign, width: f32, content: impl FnOnce(&mut egui::Ui) -> R) -> Option<R> {
     let id = resp.id.with("menu");
     // Dev aid: `HASTECLIP_OPEN_MENU=<n>` opens the n-th menu button drawn
     // (from 0) once, to see it without clicking.
@@ -1348,7 +1358,7 @@ pub fn menu_popup<R>(resp: &Response, left: bool, width: f32, content: impl FnOn
     egui::Popup::menu(resp)
         .id(id)
         .gap(6.0)
-        .align(if left { egui::RectAlign::BOTTOM_START } else { egui::RectAlign::BOTTOM_END })
+        .align(align)
         .frame(ui_frame)
         .style(menu_style)
         // Never narrower than what opened it (a dropdown hangs from its field).

@@ -366,24 +366,7 @@ impl App {
                 self.sources_warm = Some(Instant::now());
             }
             let chosen = on == page;
-            let hv = theme::toggle(ui.ctx(), resp.id.with("hv"), resp.hovered(), theme::FAST);
-            let sel = theme::toggle(ui.ctx(), resp.id.with("on"), chosen, theme::NORMAL);
-            let pill = Rect::from_center_size(Pos2::new(r.center().x, r.top() + 6.0 + 15.0), vec2(44.0, 30.0));
-            let hover_fill = theme::fade(p.sel, hv * (1.0 - sel));
-            ui.painter().rect_filled(pill, ui_kit::RADIUS, hover_fill);
-            if sel > 0.0 {
-                let fill = if p.dark { p.seg_on } else { Color32::WHITE };
-                // Grows into place as it's chosen.
-                let s = 0.8 + 0.2 * sel;
-                let r2 = Rect::from_center_size(pill.center(), pill.size() * s);
-                if !p.dark {
-                    ui.painter().rect_filled(r2.translate(vec2(0.0, 1.0)), ui_kit::RADIUS, theme::fade(Color32::from_black_alpha(30), sel));
-                }
-                ui.painter().rect_filled(r2, ui_kit::RADIUS, theme::fade(fill, sel));
-            }
-            let color = theme::mix(theme::mix(p.text3, p.text, hv), p.text, sel);
-            ui.painter().text(pill.center(), Align2::CENTER_CENTER, glyph, FontId::new(20.0, theme::fill_family()), color);
-            ui.painter().text(Pos2::new(r.center().x, pill.bottom() + 9.0), Align2::CENTER_CENTER, label, theme::font(11.0, W::Medium), color);
+            rail_cell(ui, r, resp.id, glyph, label, resp.hovered(), chosen);
             let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
             let resp = match tip {
                 Some(t) => resp.on_hover_text(t),
@@ -394,10 +377,16 @@ impl App {
             }
             y += 66.0;
         }
+        // Feedback, at the bottom: not one of the places, so apart from them.
+        let feedback = Rect::from_min_size(Pos2::new(rect.center().x - 32.0, rect.bottom() - 66.0), vec2(64.0, 58.0));
+        let feedback = (feedback.top() >= y + 4.0).then_some(feedback);
+        if let Some(choice) = feedback.and_then(|r| crate::feedback::item(ui, r)) {
+            self.feedback(ui.ctx(), choice);
+        }
         // Dragging the empty rail moves the window (it has no title bar).
         let rest = Rect::from_min_max(Pos2::new(rect.left(), rect.top()), Pos2::new(rect.right(), top - 4.0));
         drag_window_area(ui, rest, "rail_top");
-        let below = Rect::from_min_max(Pos2::new(rect.left(), y), rect.max);
+        let below = Rect::from_min_max(Pos2::new(rect.left(), y), Pos2::new(rect.right(), feedback.map_or(rect.bottom(), |r| r.top() - 4.0)));
         drag_window_area(ui, below, "rail_below");
         // The edge between the rail and the page (a framed page draws its own,
         // round its corner).
@@ -1029,6 +1018,30 @@ pub fn drag_window_area(ui: &egui::Ui, rect: Rect, id: &str) {
         let max = ui.ctx().input(|i| i.viewport().maximized.unwrap_or(false));
         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Maximized(!max));
     }
+}
+
+/// One of the rail's items in `r`, as `id`: its glyph in a pill and its
+/// label under it, lit while `hovered` and filled while `chosen`.
+pub(crate) fn rail_cell(ui: &egui::Ui, r: Rect, id: egui::Id, glyph: &str, label: &str, hovered: bool, chosen: bool) {
+    let p = theme::pal(ui);
+    let hv = theme::toggle(ui.ctx(), id.with("hv"), hovered, theme::FAST);
+    let sel = theme::toggle(ui.ctx(), id.with("on"), chosen, theme::NORMAL);
+    let pill = Rect::from_center_size(Pos2::new(r.center().x, r.top() + 6.0 + 15.0), vec2(44.0, 30.0));
+    let hover_fill = theme::fade(p.sel, hv * (1.0 - sel));
+    ui.painter().rect_filled(pill, ui_kit::RADIUS, hover_fill);
+    if sel > 0.0 {
+        let fill = if p.dark { p.seg_on } else { Color32::WHITE };
+        // Grows into place as it's chosen.
+        let s = 0.8 + 0.2 * sel;
+        let r2 = Rect::from_center_size(pill.center(), pill.size() * s);
+        if !p.dark {
+            ui.painter().rect_filled(r2.translate(vec2(0.0, 1.0)), ui_kit::RADIUS, theme::fade(Color32::from_black_alpha(30), sel));
+        }
+        ui.painter().rect_filled(r2, ui_kit::RADIUS, theme::fade(fill, sel));
+    }
+    let color = theme::mix(theme::mix(p.text3, p.text, hv), p.text, sel);
+    ui.painter().text(pill.center(), Align2::CENTER_CENTER, glyph, FontId::new(20.0, theme::fill_family()), color);
+    ui.painter().text(Pos2::new(r.center().x, pill.bottom() + 9.0), Align2::CENTER_CENTER, label, theme::font(11.0, W::Medium), color);
 }
 
 /// Whether widget `id` (as drawn last frame) takes clicks or drags.
