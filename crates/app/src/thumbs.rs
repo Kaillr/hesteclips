@@ -279,14 +279,8 @@ fn load(jpg: &Path) -> Option<egui::ColorImage> {
 }
 
 fn probe_duration(video: &Path) -> Option<Duration> {
-    let out = media::ffprobe()
-        .args(["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0"])
-        .arg(video)
-        .stdin(Stdio::null())
-        .output()
-        .ok()?;
-    let secs: f64 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
-    Some(Duration::from_secs_f64(secs))
+    let secs = media::probe(video).ok()?.duration;
+    (secs.is_finite() && secs >= 0.0).then(|| Duration::from_secs_f64(secs))
 }
 
 /// "0:42", "12:05", "1:02:33".

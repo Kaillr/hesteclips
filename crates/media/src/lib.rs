@@ -6,6 +6,7 @@
 //!
 //! Backed by the `ffmpeg`/`ffprobe` binaries ([`ffmpeg`], [`ffprobe`]).
 
+mod mp4;
 pub mod pcm;
 
 use std::io::Read;
@@ -157,7 +158,54 @@ impl AudioStream {
     }
 }
 
+/// What's in a clip: MP4 and MOV (ours, and most others) read here from
+/// their index, anything else by ffprobe. HASTECLIP_FFPROBE=1 asks ffprobe
+/// every time, to compare.
 pub fn probe(source: &Path) -> Result<ClipInfo> {
+    if std::env::var_os("HASTECLIP_FFPROBE").is_none()
+        && let Ok(info) = probe_mp4(source)
+    {
+        return Ok(info);
+    }
+    probe_ffprobe(source)
+}
+
+/// [`probe`] from an MP4's or MOV's index, the same facts ffprobe gives.
+fn probe_mp4(source: &Path) -> Result<ClipInfo> {
+    let movie = mp4::read(source)?;
+    let video = movie.tracks.iter().find(|t| t.kind == mp4::Kind::Video).context("no video stream")?;
+    let tag = movie.comment.as_deref().map(parse_clip_tag).unwrap_or_default();
+    let audio = movie
+        .tracks
+        .iter()
+        .filter(|t| t.kind == mp4::Kind::Audio)
+        .enumerate()
+        .map(|(index, t)| AudioStream {
+            index,
+            title: t.name.clone().filter(|n| n != "SoundHandler" && n != "AudioHandler"),
+            in_mix: tag.mix.as_ref().is_none_or(|m| m.contains(&index)),
+        })
+        .collect();
+    Ok(ClipInfo {
+        duration: movie.seconds,
+        fps: if video.samples > 0 && video.seconds > 0.0 { video.samples as f64 / video.seconds } else { 60.0 },
+        width: video.width,
+        height: video.height,
+        video_kbps: (video.seconds > 0.0).then(|| (video.bytes as f64 * 8.0 / video.seconds / 1000.0) as u32).filter(|&k| k > 0),
+        audio,
+        id: tag.id,
+        // As ffprobe's colour space: BT.601's matrices, else untagged (2 is
+        // "unspecified") guessed by its size, as players do.
+        bt601: match video.matrix {
+            Some(5 | 6) => true,
+            Some(2) | None => video.height < 720,
+            Some(_) => false,
+        },
+    })
+}
+
+/// [`probe`] by ffprobe.
+fn probe_ffprobe(source: &Path) -> Result<ClipInfo> {
     let out = ffprobe()
         .args(["-v", "error", "-show_entries"])
         .arg("format=duration:format_tags=comment:stream=index,codec_type,width,height,avg_frame_rate,r_frame_rate,bit_rate,color_space:stream_tags=title,handler_name,name")
@@ -1752,6 +1800,67 @@ pub fn from_db(db: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Reading an MP4's or MOV's index here gives what ffprobe gives, for
+    /// files like ours (named tracks, our tag) and others: B-frames, colour
+    /// tagged or not and guessed by size, QuickTime's own comment, no sound,
+    /// a film's frame rate.
+    #[test]
+    fn probing_mp4_matches_ffprobe() {
+        let dir = std::env::temp_dir().join(format!("hc-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let make = |name: &str, args: &[&str]| -> Option<PathBuf> {
+            let out = dir.join(name);
+            let ok = ffmpeg()
+                .args(["-hide_banner", "-loglevel", "error", "-y"])
+                .args(args)
+                .arg(&out)
+                .stdin(Stdio::null())
+                .status()
+                .ok()?
+                .success();
+            ok.then_some(out)
+        };
+        let tone = |f: u32| format!("sine=f={f}:d=2");
+        let cases: Vec<(&str, Vec<String>)> = vec![
+            ("ours.mp4", vec![
+                "-f", "lavfi", "-i", "testsrc2=s=1280x720:r=60:d=2", "-f", "lavfi", "-i", &tone(440), "-f", "lavfi", "-i", &tone(660), "-f", "lavfi", "-i", &tone(880),
+                "-map", "0", "-map", "1", "-map", "2", "-map", "3", "-c:v", "libx264", "-bf", "0", "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-c:a", "aac",
+                "-metadata", "comment=hasteclip:mix=1,2 id=0123456789abcdef",
+                "-metadata:s:a:0", "title=Mix", "-metadata:s:a:0", "handler_name=Mix",
+                "-metadata:s:a:1", "title=Desktop", "-metadata:s:a:1", "handler_name=Desktop",
+                "-metadata:s:a:2", "handler_name=Microphone",
+            ].into_iter().map(String::from).collect()),
+            ("bframes.mp4", ["-f", "lavfi", "-i", "testsrc2=s=640x360:r=30:d=2", "-f", "lavfi", "-i", "sine=d=2", "-c:v", "libx264", "-bf", "3", "-c:a", "aac"].iter().map(|s| s.to_string()).collect()),
+            ("small709.mp4", ["-f", "lavfi", "-i", "testsrc2=s=640x360:r=30:d=1", "-c:v", "libx264", "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"].iter().map(|s| s.to_string()).collect()),
+            ("big601.mp4", ["-f", "lavfi", "-i", "testsrc2=s=1280x720:r=30:d=1", "-c:v", "libx264", "-colorspace", "smpte170m", "-color_primaries", "smpte170m", "-color_trc", "smpte170m"].iter().map(|s| s.to_string()).collect()),
+            ("colr.mp4", ["-f", "lavfi", "-i", "testsrc2=s=1280x720:r=30:d=1", "-c:v", "libx264", "-colorspace", "bt470bg", "-movflags", "+write_colr"].iter().map(|s| s.to_string()).collect()),
+            ("quicktime.mov", ["-f", "lavfi", "-i", "testsrc2=s=1920x1080:r=30:d=1", "-f", "lavfi", "-i", "sine=d=1", "-c:v", "libx264", "-c:a", "aac", "-metadata", "comment=hasteclip:mix=1", "-metadata:s:a:0", "title=Game"].iter().map(|s| s.to_string()).collect()),
+            ("film.mp4", ["-f", "lavfi", "-i", "testsrc2=s=1280x720:r=24000/1001:d=2", "-c:v", "libx264"].iter().map(|s| s.to_string()).collect()),
+        ];
+        let mut checked = 0;
+        for (name, args) in &cases {
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let Some(file) = make(name, &args) else {
+                eprintln!("{name}: ffmpeg couldn't make it (no ffmpeg or x264?): not checked");
+                continue;
+            };
+            let (ours, theirs) = (probe_mp4(&file).unwrap(), probe_ffprobe(&file).unwrap());
+            eprintln!("{name}: {ours:?}");
+            assert!((ours.duration - theirs.duration).abs() < 0.002, "{name}: duration {} against {}", ours.duration, theirs.duration);
+            assert!((ours.fps - theirs.fps).abs() < 0.01, "{name}: fps {} against {}", ours.fps, theirs.fps);
+            assert_eq!((ours.width, ours.height), (theirs.width, theirs.height), "{name}: size");
+            let (a, b) = (ours.video_kbps.unwrap_or(0) as f64, theirs.video_kbps.unwrap_or(0) as f64);
+            assert!((a - b).abs() <= b * 0.02 + 1.0, "{name}: {a} kbps against {b}");
+            let tracks = |i: &ClipInfo| i.audio.iter().map(|a| (a.index, a.title.clone(), a.in_mix)).collect::<Vec<_>>();
+            assert_eq!(tracks(&ours), tracks(&theirs), "{name}: audio tracks");
+            assert_eq!(ours.id, theirs.id, "{name}: id");
+            assert_eq!(ours.bt601, theirs.bt601, "{name}: BT.601");
+            checked += 1;
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!("{checked} of {} files checked", cases.len());
+    }
 
     #[test]
     fn fader_law() {
