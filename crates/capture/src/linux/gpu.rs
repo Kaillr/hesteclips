@@ -10,7 +10,7 @@
 //! come in our memory and are worked on the CPU (`super::image`).
 
 use std::ffi::CStr;
-use std::os::fd::{AsRawFd, BorrowedFd, IntoRawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -38,6 +38,8 @@ pub(crate) struct Gpu {
     /// The layouts (DRM format modifiers) a 4-byte BGRA/RGBA picture can be
     /// imported in: what we offer the compositor.
     pub modifiers: Vec<u64>,
+    /// The card's UUID, which CUDA knows it by too (`super::nvenc`).
+    pub uuid: [u8; 16],
     external_fd: ash::khr::external_memory_fd::Device,
 }
 
@@ -65,7 +67,7 @@ impl Gpu {
             ..Default::default()
         }))
         .context("no Vulkan graphics card")?;
-        let (open, modifiers) = {
+        let (open, modifiers, uuid) = {
             // SAFETY: the adapter is Vulkan (the only backend asked for).
             let hal = unsafe { adapter.as_hal::<Vulkan>() }.context("not a Vulkan adapter")?;
             let caps = hal.physical_device_capabilities();
@@ -73,6 +75,13 @@ impl Gpu {
                 bail!("the driver can't import DMA-BUFs ({} missing)", missing.to_string_lossy());
             }
             let modifiers = importable_modifiers(hal.shared_instance().raw_instance(), hal.raw_physical_device());
+            let uuid = {
+                let mut id = vk::PhysicalDeviceIDProperties::default();
+                let mut props = vk::PhysicalDeviceProperties2::default().push_next(&mut id);
+                // SAFETY: a valid physical device and output structs.
+                unsafe { hal.shared_instance().raw_instance().get_physical_device_properties2(hal.raw_physical_device(), &mut props) };
+                id.device_uuid
+            };
             if modifiers.is_empty() {
                 bail!("the driver can't import a BGRA picture in any layout");
             }
@@ -93,7 +102,7 @@ impl Gpu {
                 )
             }
             .map_err(|e| anyhow!("can't open the graphics card: {e}"))?;
-            (open, modifiers)
+            (open, modifiers, uuid)
         };
         // SAFETY: `open` was made from this adapter.
         let (device, queue) = unsafe {
@@ -105,7 +114,72 @@ impl Gpu {
             let hal = unsafe { device.as_hal::<Vulkan>() }.context("not a Vulkan device")?;
             ash::khr::external_memory_fd::Device::new(hal.shared_instance().raw_instance(), hal.raw_device())
         };
-        Ok(Self { device, queue, modifiers, external_fd })
+        Ok(Self { device, queue, modifiers, uuid, external_fd })
+    }
+
+    /// A storage buffer of `size` bytes whose memory CUDA can take in too
+    /// (NVIDIA's encoder reads the frames made in it, `super::nvenc`): its
+    /// memory as an opaque fd, and the size of that memory, which CUDA is
+    /// told (it can be more than `size`).
+    pub(crate) fn shared_buffer(&self, size: u64) -> Result<(wgpu::Buffer, OwnedFd, u64)> {
+        // SAFETY: the device is Vulkan.
+        let hal = unsafe { self.device.as_hal::<Vulkan>() }.context("not a Vulkan device")?;
+        let raw = hal.raw_device();
+        let opaque = vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD;
+        let mut external = vk::ExternalMemoryBufferCreateInfo::default().handle_types(opaque);
+        let info = vk::BufferCreateInfo::default()
+            .size(size)
+            .usage(vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .push_next(&mut external);
+        // SAFETY: a valid create info.
+        let buffer = unsafe { raw.create_buffer(&info, None) }.context("Vulkan won't make a buffer to share")?;
+        let memory = (|| -> Result<vk::DeviceMemory> {
+            // SAFETY: a buffer of ours.
+            let req = unsafe { raw.get_buffer_memory_requirements(buffer) };
+            // SAFETY: a valid physical device.
+            let props = unsafe { hal.shared_instance().raw_instance().get_physical_device_memory_properties(hal.raw_physical_device()) };
+            let type_index = (0..props.memory_type_count)
+                .find(|&i| req.memory_type_bits & (1 << i) != 0 && props.memory_types[i as usize].property_flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL))
+                .context("no memory on the card for a shared buffer")?;
+            let mut export = vk::ExportMemoryAllocateInfo::default().handle_types(opaque);
+            let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().buffer(buffer);
+            let alloc = vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(type_index).push_next(&mut export).push_next(&mut dedicated);
+            // SAFETY: a valid allocate info.
+            let memory = unsafe { raw.allocate_memory(&alloc, None) }.context("Vulkan won't allocate memory to share")?;
+            // SAFETY: fresh memory for this buffer.
+            if let Err(e) = unsafe { raw.bind_buffer_memory(buffer, memory, 0) } {
+                // SAFETY: unused memory of ours.
+                unsafe { raw.free_memory(memory, None) };
+                bail!("Vulkan won't bind memory to share: {e}");
+            }
+            Ok(memory)
+        })();
+        let memory = match memory {
+            Ok(m) => m,
+            Err(e) => {
+                // SAFETY: a buffer of ours, unused.
+                unsafe { raw.destroy_buffer(buffer, None) };
+                return Err(e);
+            }
+        };
+        // SAFETY: a buffer of ours.
+        let allocated = unsafe { raw.get_buffer_memory_requirements(buffer) }.size;
+        // SAFETY: the buffer and memory are ours, and handed to wgpu, which
+        // destroys them when the buffer is dropped.
+        let hal_buffer = unsafe { wgpu::hal::vulkan::Buffer::from_raw_managed(buffer, memory, 0, size) };
+        let fd = {
+            let info = vk::MemoryGetFdInfoKHR::default().memory(memory).handle_type(opaque);
+            // SAFETY: memory made exportable as an opaque fd.
+            unsafe { self.external_fd.get_memory_fd(&info) }
+        };
+        drop(hal);
+        let desc = wgpu::BufferDescriptor { label: Some("shared"), size, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false };
+        // SAFETY: made on this device, as `desc` says, and bound to memory.
+        let shared = unsafe { self.device.create_buffer_from_hal::<Vulkan>(hal_buffer, &desc) };
+        let fd = fd.map_err(|e| anyhow!("Vulkan won't share the memory: {e}"))?;
+        // SAFETY: a new fd, ours.
+        Ok((shared, unsafe { OwnedFd::from_raw_fd(fd) }, allocated))
     }
 
     /// Take in a DMA-BUF picture (one plane; `fd` is borrowed, and dup'ed for

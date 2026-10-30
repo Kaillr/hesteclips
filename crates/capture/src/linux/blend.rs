@@ -17,7 +17,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use super::screen::Frame;
-use super::{Picture, Previewed, ffmpeg, host_now, submit_preview};
+use super::{Picture, Previewed, host_now, submit_preview};
 use crate::mixer::Clock;
 use crate::shutter::Shutter;
 
@@ -47,7 +47,7 @@ struct BlendPacer {
     /// Different pictures in the frame's own time so far.
     different: u32,
     picture: Picture,
-    encoder: ffmpeg::H264,
+    encoder: super::VideoEncoder,
     skipped: u64,
     stats: BlendStats,
 }
@@ -108,10 +108,9 @@ impl BlendPacer {
         if !g.finish(k) {
             return;
         }
-        let mut frame = self.encoder.buffer();
-        g.nv12(&mut frame);
         self.picture.version += 1;
-        if self.encoder.encode(frame, k) {
+        let Some(g) = &self.picture.gpu else { return };
+        if self.encoder.encode_made(g, self.picture.version, k) {
             super::encoded();
         } else {
             super::skipped(&mut self.skipped, 1);
@@ -186,7 +185,7 @@ impl BlendStats {
 /// Like `super::spawn_pacer`, for frame blending: `looks` looks at the
 /// screen per frame, their light averaged on the graphics card (which
 /// `picture` must be made on).
-pub(super) fn spawn_blend_pacer(fps: u32, looks: u32, shutter: Shutter, mut picture: Picture, encoder: ffmpeg::H264, clock: Arc<Clock>) -> (Arc<AtomicBool>, JoinHandle<()>) {
+pub(super) fn spawn_blend_pacer(fps: u32, looks: u32, shutter: Shutter, mut picture: Picture, encoder: super::VideoEncoder, clock: Arc<Clock>) -> (Arc<AtomicBool>, JoinHandle<()>) {
     let stop = Arc::new(AtomicBool::new(false));
     let stop2 = stop.clone();
     if let Some(g) = &mut picture.gpu {

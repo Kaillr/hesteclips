@@ -263,7 +263,10 @@ const NV12_SHADER: &str = r#"
 struct Size {
     width: u32,
     height: u32,
-    _pad: vec2<u32>,
+    // Bytes from one row to the next: the width, or more (an encoder's
+    // aligned rows).
+    pitch: u32,
+    _pad: u32,
 }
 
 @group(0) @binding(0) var image: texture_2d<f32>;
@@ -274,25 +277,32 @@ fn rgb8(x: u32, y: u32) -> vec3<i32> {
     return vec3<i32>(round(textureLoad(image, vec2<i32>(i32(x), i32(y)), 0).rgb * 255.0));
 }
 
-// One byte of NV12 (BT.709, studio range): as `nv12_pair` on the CPU.
+// One byte of NV12 (BT.709, studio range): as `nv12_pair` on the CPU. A
+// row's padding past the width is 0.
 fn byte_at(b: u32) -> u32 {
     let w = n.width;
     let h = n.height;
-    if (b < w * h) {
-        let c = rgb8(b % w, b / w);
+    let p = n.pitch;
+    if (b < p * h) {
+        let x = b % p;
+        if (x >= w) {
+            return 0u;
+        }
+        let c = rgb8(x, b / p);
         return u32(((47 * c.r + 157 * c.g + 16 * c.b + 128) >> 8u) + 16);
     }
-    let k = b - w * h;
-    if (k >= w * h / 2u) {
+    let k = b - p * h;
+    let x = k % p;
+    if (k >= p * h / 2u || x >= w) {
         return 0u;
     }
-    let cy = k / w;
-    let cx = (k % w) / 2u;
+    let cy = k / p;
+    let cx = x / 2u;
     let y0 = cy * 2u;
     let y1 = min(y0 + 1u, h - 1u);
     let sum = rgb8(cx * 2u, y0) + rgb8(cx * 2u + 1u, y0) + rgb8(cx * 2u, y1) + rgb8(cx * 2u + 1u, y1);
     var v: i32;
-    if (k % 2u == 0u) {
+    if (x % 2u == 0u) {
         v = 128 + ((-26 * sum.r - 86 * sum.g + 112 * sum.b + 512) >> 10u);
     } else {
         v = 128 + ((112 * sum.r - 102 * sum.g - 10 * sum.b + 512) >> 10u);
@@ -338,6 +348,12 @@ pub(crate) struct GpuPicture {
     /// The preview, shrunk on the card: its texture, where it's read back,
     /// and its uniforms.
     preview: Option<PreviewTarget>,
+}
+
+/// Where an encoder takes frames from on the card ([`GpuPicture::nv12_target`]).
+pub(crate) struct Nv12Target {
+    buffer: wgpu::Buffer,
+    bind: wgpu::BindGroup,
 }
 
 /// A small copy of the frame for the preview, kept for its size.
@@ -429,7 +445,7 @@ impl GpuPicture {
                 wgpu::BindGroupEntry { binding: 2, resource: sizes.as_entire_binding() },
             ],
         });
-        let size_bytes: Vec<u8> = [width, height, 0, 0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let size_bytes: Vec<u8> = [width, height, width, 0].iter().flat_map(|v| v.to_le_bytes()).collect();
         gpu.queue.write_buffer(&sizes, 0, &size_bytes);
         let layer = Layer { canvas: Canvas::new(width, height), texture: overlay, rows: None, on: false };
         Self { gpu, width, height, screen, scale, nv12, frame, uniforms, nv12_buf, readback, layer, uploaded: None, nv12_bind, blend: None, preview: None }
@@ -698,6 +714,46 @@ impl GpuPicture {
         self.readback.unmap();
     }
 
+    /// A place an encoder takes frames from on the card (`super::nvenc`):
+    /// `buffer`, NV12 with rows `pitch` bytes apart, made by [`Self::nv12_to`].
+    pub(crate) fn nv12_target(&self, buffer: wgpu::Buffer, pitch: u32) -> Nv12Target {
+        let device = &self.gpu.device;
+        let sizes = device.create_buffer(&wgpu::BufferDescriptor { label: Some("size"), size: 16, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let bytes: Vec<u8> = [self.width, self.height, pitch, 0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        self.gpu.queue.write_buffer(&sizes, 0, &bytes);
+        let frame_view = self.frame.create_view(&Default::default());
+        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("nv12 out"),
+            layout: &self.nv12.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&frame_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: sizes.as_entire_binding() },
+            ],
+        });
+        Nv12Target { buffer, bind }
+    }
+
+    /// The frame as NV12 into `target`, on the card: done when this returns.
+    pub(crate) fn nv12_to(&self, target: &Nv12Target) {
+        let device = &self.gpu.device;
+        let groups = ((target.buffer.size() / 4) as u32).div_ceil(64);
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("nv12 out") });
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.nv12);
+            pass.set_bind_group(0, &target.bind, &[]);
+            pass.dispatch_workgroups(groups.min(65535), groups.div_ceil(65535), 1);
+        }
+        let index = self.gpu.queue.submit([enc.finish()]);
+        let _ = device.poll(wgpu::PollType::Wait { submission_index: Some(index), timeout: None });
+    }
+
+    /// The card it's made on.
+    pub(crate) fn gpu(&self) -> &Arc<Gpu> {
+        &self.gpu
+    }
+
     /// The frame shrunk to fit `max`, as R, G, B, A, for the preview. Its
     /// size. Shrunk on the card (as the frame is made) and only that read
     /// back: reading the whole frame back and shrinking it on the CPU took
@@ -811,7 +867,7 @@ impl GpuPicture {
 }
 
 /// NV12's size: a full-size luma plane, then a half-size plane of U, V pairs.
-fn nv12_len(width: u32, height: u32) -> usize {
+pub(crate) fn nv12_len(width: u32, height: u32) -> usize {
     width as usize * height as usize * 3 / 2
 }
 

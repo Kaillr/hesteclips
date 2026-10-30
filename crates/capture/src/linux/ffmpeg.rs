@@ -1,8 +1,9 @@
 //! Encoding with ffmpeg, which the app needs anyway (editing, thumbnails):
 //! H.264 from NV12 frames, AAC from the mixer's PCM, each in its own ffmpeg
 //! process fed through a pipe. ffmpeg gives us the GPU's encoder where there
-//! is one — NVENC on NVIDIA, VA-API on AMD and Intel — and x264 or OpenH264
-//! otherwise, whichever the installed ffmpeg has.
+//! is one — VA-API on AMD and Intel, NVENC on NVIDIA where ours (`nvenc`)
+//! can't start — and x264 or OpenH264 otherwise, whichever the installed
+//! ffmpeg has.
 //!
 //! What comes back is a raw stream (H.264 Annex B with an access unit
 //! delimiter before each frame, AAC in ADTS frames), cut into packets here and
