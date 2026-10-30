@@ -111,6 +111,9 @@ resvg = { version = "0.48", default-features = false }
 # Vulkan; the same wgpu the app draws with.
 wgpu = { version = "30", default-features = false, features = ["vulkan", "wgsl"] }
 ash = "0.38"
+# Webcams' MJPEG, decoded in the app (the same decoder `image` uses).
+zune-jpeg = "0.5"
+zune-core = "0.5"
 
 [build-dependencies]
 # Linux: the libavcodec shim for in-process video decoding (src/linux/avdec.c).
