@@ -51,6 +51,7 @@ mod mutter;
 mod nvenc;
 mod portal;
 mod screen;
+mod vkenc;
 mod wlr;
 mod wlr_windows;
 mod x11;
@@ -902,21 +903,34 @@ fn skipped(dropped: &mut u64, n: u64) {
     }
 }
 
-/// The recording's video encoder: NVIDIA's, driven directly (`nvenc`), where
-/// there is one; else ffmpeg's (`ffmpeg`: VA-API, x264 or OpenH264).
+/// The recording's video encoder: NVIDIA's, driven directly (`nvenc`); else
+/// the card's through Vulkan Video (`vkenc`: AMD's, Intel's), where the
+/// frame is made on the card; else ffmpeg's (`ffmpeg`: VA-API, x264 or
+/// OpenH264).
 pub(super) enum VideoEncoder {
     Nvenc(nvenc::Nvenc),
+    Vulkan(vkenc::VkEncoder),
     Ffmpeg(ffmpeg::H264),
 }
 
 impl VideoEncoder {
     fn start(width: u32, height: u32, s: &EncodeSettings, out: Sender<writer::Command>, picture: Option<&gpu_frame::GpuPicture>) -> Result<Self> {
-        // HASTECLIP_NO_NVENC: ffmpeg's encoders even on NVIDIA, to compare.
-        if s.use_hardware && std::env::var_os("HASTECLIP_NO_NVENC").is_none() {
+        // HASTECLIP_ENCODER=nvenc, vulkan or ffmpeg: only that one (or
+        // ffmpeg's), even where another would start, to compare.
+        let only = std::env::var("HASTECLIP_ENCODER").ok();
+        let wanted = |name: &str| only.as_deref().is_none_or(|o| o == name);
+        if s.use_hardware && wanted("nvenc") {
             match nvenc::Nvenc::start(width, height, s.fps, s.video_bitrate_kbps, out.clone(), picture) {
                 Ok(Some(e)) => return Ok(Self::Nvenc(e)),
                 Ok(None) => {}
                 Err(e) => eprintln!("NVIDIA's video encoder didn't start: {e:#}"),
+            }
+        }
+        if let (true, true, Some(p)) = (s.use_hardware, wanted("vulkan"), picture) {
+            match vkenc::VkEncoder::start(width, height, s.fps, s.video_bitrate_kbps, out.clone(), p) {
+                Ok(Some(e)) => return Ok(Self::Vulkan(e)),
+                Ok(None) => {}
+                Err(e) => eprintln!("the card's video encoder (Vulkan Video) didn't start: {e:#}"),
             }
         }
         Ok(Self::Ffmpeg(ffmpeg::H264::start(width, height, s, out)?))
@@ -925,7 +939,11 @@ impl VideoEncoder {
     /// Whether it takes the picture as NV12 in our memory (`Picture::nv12`),
     /// rather than from the graphics card.
     fn wants_cpu_nv12(&self, picture: &Picture) -> bool {
-        !matches!(self, Self::Nvenc(_)) || picture.gpu.is_none()
+        match self {
+            Self::Nvenc(_) => picture.gpu.is_none(),
+            Self::Vulkan(_) => false,
+            Self::Ffmpeg(_) => true,
+        }
     }
 
     /// Encode the picture as frame `n`. False if it's skipped: the encoder
@@ -942,6 +960,7 @@ impl VideoEncoder {
                 Some(g) => e.encode_gpu(g, picture.version, n),
                 None => e.encode_cpu(&picture.nv12, picture.version, n),
             },
+            Self::Vulkan(e) => picture.gpu.as_ref().is_some_and(|g| e.encode_gpu(g, picture.version, n)),
         }
     }
 
@@ -955,6 +974,7 @@ impl VideoEncoder {
                 f.encode(frame, n)
             }
             Self::Nvenc(e) => e.encode_gpu(g, version, n),
+            Self::Vulkan(e) => e.encode_gpu(g, version, n),
         }
     }
 
@@ -963,6 +983,7 @@ impl VideoEncoder {
         match self {
             Self::Ffmpeg(f) => f.finish(),
             Self::Nvenc(e) => e.finish(),
+            Self::Vulkan(e) => e.finish(),
         }
     }
 }

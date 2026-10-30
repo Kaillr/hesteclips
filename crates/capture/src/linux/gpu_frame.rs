@@ -354,6 +354,10 @@ pub(crate) struct GpuPicture {
 pub(crate) struct Nv12Target {
     buffer: wgpu::Buffer,
     bind: wgpu::BindGroup,
+    pitch: u32,
+    size: (u32, u32),
+    /// The encoder's picture, copied into.
+    picture: Option<wgpu::Texture>,
 }
 
 /// A small copy of the frame for the preview, kept for its size.
@@ -714,12 +718,14 @@ impl GpuPicture {
         self.readback.unmap();
     }
 
-    /// A place an encoder takes frames from on the card (`super::nvenc`):
-    /// `buffer`, NV12 with rows `pitch` bytes apart, made by [`Self::nv12_to`].
-    pub(crate) fn nv12_target(&self, buffer: wgpu::Buffer, pitch: u32) -> Nv12Target {
+    /// A place an encoder takes frames from on the card (`super::nvenc`,
+    /// `super::vkenc`): `buffer`, NV12 with rows `pitch` bytes apart, made by
+    /// [`Self::nv12_to`] at `size` (the frame's, or more: black past it),
+    /// and then copied into `picture` (NV12 of that size) if there is one.
+    pub(crate) fn nv12_target(&self, buffer: wgpu::Buffer, pitch: u32, size: (u32, u32), picture: Option<wgpu::Texture>) -> Nv12Target {
         let device = &self.gpu.device;
         let sizes = device.create_buffer(&wgpu::BufferDescriptor { label: Some("size"), size: 16, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-        let bytes: Vec<u8> = [self.width, self.height, pitch, 0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let bytes: Vec<u8> = [size.0, size.1, pitch, 0].iter().flat_map(|v| v.to_le_bytes()).collect();
         self.gpu.queue.write_buffer(&sizes, 0, &bytes);
         let frame_view = self.frame.create_view(&Default::default());
         let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -731,7 +737,7 @@ impl GpuPicture {
                 wgpu::BindGroupEntry { binding: 2, resource: sizes.as_entire_binding() },
             ],
         });
-        Nv12Target { buffer, bind }
+        Nv12Target { buffer, bind, pitch, size, picture }
     }
 
     /// The frame as NV12 into `target`, on the card: done when this returns.
@@ -744,6 +750,17 @@ impl GpuPicture {
             pass.set_pipeline(&self.nv12);
             pass.set_bind_group(0, &target.bind, &[]);
             pass.dispatch_workgroups(groups.min(65535), groups.div_ceil(65535), 1);
+        }
+        if let Some(picture) = &target.picture {
+            // Luma, then the U, V pairs at half the size each way.
+            let (w, h) = target.size;
+            for (plane, offset, size) in [(wgpu::TextureAspect::Plane0, 0, (w, h)), (wgpu::TextureAspect::Plane1, target.pitch as u64 * h as u64, (w / 2, h / 2))] {
+                enc.copy_buffer_to_texture(
+                    wgpu::TexelCopyBufferInfo { buffer: &target.buffer, layout: wgpu::TexelCopyBufferLayout { offset, bytes_per_row: Some(target.pitch), rows_per_image: Some(size.1) } },
+                    wgpu::TexelCopyTextureInfo { texture: picture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: plane },
+                    wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 },
+                );
+            }
         }
         let index = self.gpu.queue.submit([enc.finish()]);
         let _ = device.poll(wgpu::PollType::Wait { submission_index: Some(index), timeout: None });

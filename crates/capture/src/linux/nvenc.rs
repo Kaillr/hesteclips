@@ -213,7 +213,7 @@ impl Nvenc {
                     let (buffer, fd, allocated) = p.gpu().shared_buffer(size)?;
                     // SAFETY: the session is open; the fd is handed over.
                     let index = unsafe { hcnv_add_shared(raw, fd.into_raw_fd(), allocated, size, pitch as c_int, why.buf(), why.room()) };
-                    Slot { index, target: Some(p.nv12_target(buffer, pitch)), holds: None }
+                    Slot { index, target: Some(p.nv12_target(buffer, pitch, (width, height), None)), holds: None }
                 }
                 // SAFETY: the session is open.
                 None => Slot { index: unsafe { hcnv_add_own(raw, pitch as c_int, why.buf(), why.room()) }, target: None, holds: None },
