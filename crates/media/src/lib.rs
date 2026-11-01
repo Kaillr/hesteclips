@@ -1338,13 +1338,16 @@ fn render_video(source: &Path, info: &ClipInfo, edit: &Edit, pieces: &[Piece], w
             // ones in its slot (or around it, softly: `blend_graph`). Mixed
             // as light (what a screen gives off), not as pixel values, which
             // are gamma-encoded: a fifth of a bright ghost's value is about
-            // 3% of its light, not 20%. Recordings are BT.709, limited. 16
+            // 3% of its light, not 20%. Recordings are BT.709, limited; a
+            // clip's colours are read by its own matrix (BT.601's read as
+            // BT.709's came out 8.5 levels off in RGB), and saved BT.709. 16
             // bits keep the faintest ghosts (72 dB from float) with half the
             // memory to move.
             Some(b) => {
                 let light = has_filter("zscale");
                 if light {
-                    filters.push("setparams=range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709".to_owned());
+                    let matrix = if info.bt601 { "smpte170m" } else { "bt709" };
+                    filters.push(format!("setparams=range=tv:color_primaries=bt709:color_trc=bt709:colorspace={matrix}"));
                     filters.push("zscale=tin=iec61966-2-1:t=linear,format=gbrp16le".to_owned());
                 }
                 if (b as f64) < info.fps - 0.5 {
