@@ -37,6 +37,9 @@ pub(crate) struct Track {
     /// A video track's colour matrix (H.273: 1 BT.709, 5/6 BT.601), from its
     /// `colr` box or else its H.264 stream's SPS.
     pub matrix: Option<u8>,
+    /// Whether it's to be shown turned or flipped (its `tkhd` matrix isn't
+    /// the identity's: a phone's video held upright, say).
+    pub turned: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -52,6 +55,11 @@ pub(crate) fn read(path: &Path) -> Result<Movie> {
     let mut f = File::open(path)?;
     let len = f.metadata()?.len();
     let moov = find_top(&mut f, len, b"moov")?.context("no moov box")?;
+    // Fragmented (a recording cut off by a crash, as ours are written): the
+    // index is in the fragments, not here.
+    if child(&moov, b"mvex").is_some() {
+        bail!("a fragmented file");
+    }
     let mvhd = child(&moov, b"mvhd").context("no mvhd")?;
     let (timescale, duration) = times(mvhd).context("a short mvhd")?;
     let mut tracks = Vec::new();
@@ -117,10 +125,14 @@ fn track(trak: &[u8], movie_timescale: u32) -> Result<Track> {
     let stbl = child(mdia, b"minf").and_then(|m| child(m, b"stbl")).context("no stbl")?;
     let stsz = child(stbl, b"stsz").context("no stsz")?;
     let (fixed, count) = (be32(stsz.get(4..)).context("a short stsz")?, be32(stsz.get(8..)).context("a short stsz")? as u64);
-    let bytes = if fixed != 0 { fixed as u64 * count } else { (0..count as usize).map(|i| be32(stsz.get(12 + 4 * i..)).unwrap_or(0) as u64).sum() };
+    // At most the sizes there are (a broken count isn't counted out to 4
+    // billion).
+    let listed = stsz.len().saturating_sub(12) / 4;
+    let bytes = if fixed != 0 { fixed as u64 * count } else { (0..(count as usize).min(listed)).map(|i| be32(stsz.get(12 + 4 * i..)).unwrap_or(0) as u64).sum() };
     // The samples' own time, as ffprobe counts it for the frame rate.
     let ticks: u64 = child(stbl, b"stts").map_or(duration, |s| {
-        (0..be32(s.get(4..)).unwrap_or(0) as usize).map(|i| be32(s.get(8 + 8 * i..)).unwrap_or(0) as u64 * be32(s.get(12 + 8 * i..)).unwrap_or(0) as u64).sum()
+        let runs = (be32(s.get(4..)).unwrap_or(0) as usize).min(s.len().saturating_sub(8) / 8);
+        (0..runs).map(|i| be32(s.get(8 + 8 * i..)).unwrap_or(0) as u64 * be32(s.get(12 + 8 * i..)).unwrap_or(0) as u64).sum()
     });
     let seconds = if timescale > 0 { (if ticks > 0 { ticks } else { duration }) as f64 / timescale as f64 } else { 0.0 };
     let (start, shown) = edits(trak, movie_timescale);
@@ -143,7 +155,18 @@ fn track(trak: &[u8], movie_timescale: u32) -> Result<Track> {
             matrix = child(boxes, b"avcC").and_then(avcc_matrix);
         }
     }
-    Ok(Track { kind, name, samples: count, bytes, seconds, start, end, width, height, matrix })
+    // tkhd: the matrix after the times, track number and duration (wider in
+    // version 1), the layer, group and volume. Its a, b, c, d (16.16):
+    // turned or flipped unless a and d are positive and b and c nothing.
+    let turned = child(trak, b"tkhd").is_some_and(|t| {
+        let at = if t.first() == Some(&1) { 52 } else { 40 };
+        let m = |i: usize| be32(t.get(at + 4 * i..)).map(|v| v as i32);
+        match (m(0), m(1), m(3), m(4)) {
+            (Some(a), Some(b), Some(c), Some(d)) => !(a > 0 && d > 0 && b == 0 && c == 0),
+            _ => false,
+        }
+    });
+    Ok(Track { kind, name, samples: count, bytes, seconds, start, end, width, height, matrix, turned })
 }
 
 /// The file comment: `udta/meta/ilst/©cmt` (MP4) or `udta/©cmt` (QuickTime).
@@ -310,7 +333,9 @@ fn find_top(f: &mut File, len: u64, kind: &[u8; 4]) -> Result<Option<Vec<u8>>> {
         } else if size == 0 {
             size = len - at;
         }
-        if size < header {
+        // A box past the file's end is a broken (or half-written) one, not
+        // memory to set aside.
+        if size < header || size > len - at {
             bail!("a broken box");
         }
         if &head[4..8] == kind {
@@ -370,4 +395,10 @@ fn times(header: &[u8]) -> Option<(u32, u64)> {
         1 => Some((be32(header.get(20..))?, be64(header.get(24..))?)),
         _ => Some((be32(header.get(12..))?, be32(header.get(16..))? as u64)),
     }
+}
+
+/// Whether `path`'s video is to be shown turned or flipped (an MP4's or
+/// MOV's that says so; anything else, not known to be).
+pub(crate) fn turned(path: &Path) -> bool {
+    read(path).is_ok_and(|m| m.tracks.iter().any(|t| t.kind == Kind::Video && t.turned))
 }

@@ -1421,7 +1421,9 @@ fn render_video(source: &Path, info: &ClipInfo, edit: &Edit, pieces: &[Piece], w
     if let Some(parts) = encoded {
         let rate = edit.output.frame_rate(info);
         let whole_rate = (rate - rate.round()).abs() < 1e-6 && rate >= 1.0;
-        if whole_rate && std::env::var_os("HASTECLIP_EXPORT_FFMPEG").is_none() {
+        // A video to be shown turned (a phone's) ffmpeg turns as it renders
+        // it; the card's frames are as stored, so it's left to ffmpeg.
+        if whole_rate && std::env::var_os("HASTECLIP_EXPORT_FFMPEG").is_none() && !mp4::turned(source) {
             let out_fps = rate.round() as u32;
             let job = capture::export::Job {
                 source,
@@ -1832,7 +1834,8 @@ mod tests {
     /// Reading an MP4's or MOV's index here gives what ffprobe gives, for
     /// files like ours (named tracks, our tag) and others: B-frames, colour
     /// tagged or not and guessed by size, QuickTime's own comment, no sound,
-    /// a film's frame rate, a copy starting on a keyframe.
+    /// a film's frame rate, a copy starting on a keyframe; a fragmented
+    /// one is left to ffprobe.
     #[test]
     fn probing_mp4_matches_ffprobe() {
         let dir = std::env::temp_dir().join(format!("hc-probe-{}", std::process::id()));
@@ -1889,6 +1892,17 @@ mod tests {
             assert_eq!(ours.id, theirs.id, "{name}: id");
             assert_eq!(ours.bt601, theirs.bt601, "{name}: BT.601");
             checked += 1;
+        }
+        // Turned to be shown upright (a phone's): known, so exports leave it
+        // to ffmpeg, which turns it.
+        if let Some(upright) = make("upright.mp4", &["-display_rotation", "90", "-i", &dir.join("small709.mp4").to_string_lossy(), "-c", "copy"]) {
+            assert!(mp4::turned(&upright), "turned");
+            assert!(!mp4::turned(&dir.join("small709.mp4")), "not turned");
+        }
+        // Fragmented (a recording a crash cut off): ffprobe reads it.
+        if let Some(file) = make("fragmented.mp4", &["-f", "lavfi", "-i", "testsrc2=s=640x360:r=30:d=2", "-c:v", "libx264", "-movflags", "frag_keyframe+empty_moov"]) {
+            assert!(probe_mp4(&file).is_err(), "fragments aren't read here");
+            assert!((probe(&file).unwrap().duration - 2.0).abs() < 0.05, "a fragmented file's length");
         }
         let _ = std::fs::remove_dir_all(&dir);
         eprintln!("{checked} of {} files checked", cases.len());
