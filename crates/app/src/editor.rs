@@ -1562,7 +1562,7 @@ impl Ready {
     /// What the pointer does on the timeline (`resp`, laid out as `l`, as
     /// it was drawn last frame): a drag takes hold of what's under it (a
     /// part's edge, a split, a part, a volume line or point, else the
-    /// playhead) and moves it; a click goes there; a double-click adds a
+    /// playhead) and moves it; a press goes there; a double-click adds a
     /// volume point or takes one away; a right-click picks what the menu is
     /// for. Read first thing in the frame, so the picture, the time, the
     /// playhead and the parts' edges all follow the pointer on the frame it
@@ -1577,6 +1577,16 @@ impl Ready {
         let vol_at = |pos: Pos2, this: &Self| l.vol_at(pos, &this.edit.tracks);
         let hit = |pos: Pos2, this: &Self| l.hit(pos, &this.edit.tracks);
 
+        // The playhead goes where the button goes down, at once, not when
+        // it's let go or a drag gets going (a drag on a part or its edge
+        // then moves it on). Not on the volume, where a drag only shapes it.
+        if resp.is_pointer_button_down_on()
+            && let Some(pos) = ui.input(|i| i.pointer.primary_pressed().then(|| i.pointer.press_origin()).flatten())
+            && !matches!(hit(pos, self), Some(Drag::Line(_) | Drag::Point(..)))
+        {
+            let t = self.snapped(t_of(pos.x), px_per_s, Some(Drag::Playhead));
+            self.player.seek(self.info.snap(t) + 1e-6);
+        }
         if resp.drag_started() {
             // Hit-test where the button went down, not where the pointer is now: a
             // drag only starts after a few pixels of movement, by which time a

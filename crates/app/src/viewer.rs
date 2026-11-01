@@ -882,7 +882,7 @@ impl Ready {
         self.timeline(ui, timeline_lanes(outer), timeline, preview, &moments);
     }
 
-    /// A click or a drag on the timeline (`resp`; `lanes` where it was
+    /// A press or a drag on the timeline (`resp`; `lanes` where it was
     /// drawn) goes there. Click or drag below the ruler, whose pins are
     /// clicked; a drag follows the pointer wherever it goes until it's let
     /// go, over the picture or out of the window too. Playing pauses while
@@ -891,6 +891,14 @@ impl Ready {
         let dur = self.info.duration.max(1e-6);
         let t_of = |x: f32| ((x - lanes.left()) / lanes.width()).clamp(0.0, 1.0) as f64 * dur;
         let below_ruler = |pos: Pos2| pos.y > lanes.top() + crate::transport::RULER_H - 6.0;
+        // The playhead goes there as the button goes down, not when it's let
+        // go or a drag gets going.
+        if resp.is_pointer_button_down_on()
+            && let Some(pos) = ui.input(|i| i.pointer.primary_pressed().then(|| i.pointer.press_origin()).flatten())
+            && below_ruler(pos)
+        {
+            self.seek(t_of(pos.x));
+        }
         if resp.drag_started() && ui.input(|i| i.pointer.press_origin()).or(resp.interact_pointer_pos()).is_some_and(below_ruler) {
             self.dragging = Some(self.player.is_playing());
             self.player.pause();
