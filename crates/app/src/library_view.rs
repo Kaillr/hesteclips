@@ -1031,6 +1031,16 @@ impl App {
             x += 14.0;
         }
         let title = painter.layout_job(ui_kit::single_line_job(&clip.title(), theme::font(13.5, W::Medium), p.text, rect.right() - x - 2.0));
+        // The whole name and game, on them, when they're cut short; no tip
+        // over the card itself, which would cover its picture and buttons'
+        // tips.
+        let card_id = resp.id;
+        let elided_tip = |ui: &egui::Ui, g: &std::sync::Arc<egui::Galley>, at: Pos2, id: &str, text: &str| {
+            if g.elided {
+                ui.interact(Rect::from_min_size(at, g.size()), card_id.with(id), Sense::hover()).on_hover_text(text);
+            }
+        };
+        elided_tip(ui, &title, Pos2::new(x, cap_y), "title", &clip.title());
         painter.galley(Pos2::new(x, cap_y), title, p.text);
         let meta_y = cap_y + 21.0;
         let mut mx = rect.left() + 2.0;
@@ -1050,6 +1060,7 @@ impl App {
         let game_g = painter.layout_job(ui_kit::single_line_job(&game, theme::font(12.5, W::Regular), p.text3, game_w));
         let gy = meta_y + 7.5 - game_g.size().y / 2.0;
         let gw = game_g.size().x;
+        elided_tip(ui, &game_g, Pos2::new(mx, gy), "game", &game);
         painter.galley(Pos2::new(mx, gy), game_g, p.text3);
         mx += gw + 7.0;
         painter.circle_filled(Pos2::new(mx, meta_y + 8.0), 1.5, theme::fade(p.text3, 0.6));
@@ -1069,7 +1080,7 @@ impl App {
         };
         ui.interact(size_rect, resp.id.with("size"), Sense::hover()).on_hover_text(size_tip);
 
-        let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text_at_pointer(clip.title());
+        let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
         if hovered && is_new {
             self.seen_new.insert(clip.path.clone());
         }
