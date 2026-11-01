@@ -6,12 +6,11 @@ is the reason; dropping the bundled ffmpeg (most of the Linux download) is a
 goal once nothing needs it, not a reason on its own.
 
 Linux is done and measured. macOS's exports are made in the app too, on
-`mac-native-media` (off this branch, not merged), measured below. Windows
-already decoded playback on the GPU in the app (D3D11) and recorded with its
-own encoders, so most of Linux's gains it had; what it doesn't have yet is
-exports made in the app (ffmpeg still makes the picture there), and the
-shared changes on this branch haven't run on it. This note is what's known
-so far.
+`mac-native-media` (off this branch, not merged), and Windows's on
+`windows-native-media` (off `mac-native-media`, not merged), both measured
+below. Windows already decoded playback on the GPU in the app (D3D11) and
+recorded with its own encoders, so most of Linux's gains it had; the shared
+changes on this branch have run there too. This note is what's known so far.
 
 ## The bar: what Linux gained
 
@@ -57,6 +56,33 @@ CPU; blending, which ffmpeg did on the CPU, takes a third to a half of the
 time. At the same bitrate the picture's a little better (35.5 dB against
 35.2 at 4 Mbit/s): ffmpeg's encoder put a keyframe every 12 frames.
 
+## What Windows gained
+
+Measured on the Linux desktop (i7-8700K, RTX 4060 Ti) under Windows 11,
+1440p clips made by ffmpeg (`testsrc2`), test builds, against ffmpeg 9.0.2
+(the version the app ships), with the installed HasteClip recording a replay
+buffer meanwhile; runs alternated, card and ffmpeg. CPU in % of one core.
+
+| | ffmpeg | Now |
+|---|---|---|
+| Export: 23.75 s cut from 1440p60, saved at 720p | 9.5 s | 4.1 s |
+| Export: a minute of 1440p60 saved at 1080p | 38.5–44 s, 940% CPU | 8.0 s, 80% |
+| Export: a minute made to fit Discord (10 MB) | 10.9–12.1 s, 890% | 8.0–8.2 s, 430–490% |
+| Export: 12 s of 540 fps blended to 60 | 53–55 s, 890% | 11.2 s, 33% |
+| Export: 10 s of 540 fps blended to 60, soft | 45–49 s | 9.3 s |
+| Reading a clip's length, size, tracks | ffprobe: 64 ms | 0.23 ms |
+| A clip's thumbnail | 100–170 ms | 57 ms (the first of a run, 260–390) |
+
+The card's decoder is the limit here: Media Foundation's, the one playback
+uses, takes ~560 frames a second of 1440p, and every export but a blend
+waits on it (the scaling and NVIDIA's encoder keep up: 1080p is made at
+~450 frames a second, 720p at ~555). An export made to fit a size is still
+encoded by x264 on the CPU, as ffmpeg's was; what's gained there is the
+CPU the decoding and scaling took. At the same bitrate the picture's about
+x264's on ordinary pictures (17.75 dB SSIM against 17.69 at 4 Mbit/s,
+1080p60) and a little under it on very detailed ones (a fractal flown into
+at 8 Mbit/s: 8.97 dB against 9.57, NVENC with Linux's settings 8.73).
+
 ## What has to hold, however it's done
 
 - **Exports are ffmpeg's, frame for frame.** The same source frame in each
@@ -76,10 +102,16 @@ time. At the same bitrate the picture's a little better (35.5 dB against
 
 - Linux's export: `crates/capture/src/linux/export.rs`; macOS's:
   `crates/capture/src/mac/export.rs` (VideoToolbox decoding and encoding,
-  Metal scaling, the recording's blending, our MP4 writer). Both reached
-  through `capture::export::render_video` (which returns `Ok(false)` on
-  Windows, so `media` has ffmpeg make the picture). The sound is added by
-  `media` (`mux_audio`), on every platform.
+  Metal scaling, the recording's blending, our MP4 writer); Windows's:
+  `crates/capture/src/win/export.rs` (D3D11 decoding, the decoder
+  playback uses; Linux's scaler as Direct3D 11 pixel shaders drawing into
+  each plane of an NV12 frame, tried once against the same scaling on the
+  CPU; blending in light as live blending does; Media Foundation's hardware
+  encoder, or x264 through ffmpeg for a size to fit; our MP4 writer). All
+  reached through `capture::export::render_video`, which returns
+  `Ok(false)` where an export can't be made there, so `media` has ffmpeg
+  make the picture. The sound is added by `media` (`mux_audio`), on every
+  platform.
 - Shared, in `crates/capture/src/export.rs`: which source frames make up an
   export (`Timeline`) and the Lanczos weights exports scale by (`lanczos`).
   The colour matrix a clip states, for the decoders and `media`'s probe:
@@ -87,10 +119,6 @@ time. At the same bitrate the picture's a little better (35.5 dB against
   what's taken where it states none (`capture::colours`).
 - Linux's decoding on the card and its check: `crates/capture/src/linux/decode.rs`
   (and `dmabuf.rs`); its encoder check: `linux/vkenc.rs` (`check`).
-- What Windows has that may help: `capture::win::decode` and `direct` (D3D11
-  decoding), `win::d3d` (the video processor), `win::h264` (Media
-  Foundation's encoders), the blend pacer in `win/mod.rs`, and the MP4 writer
-  Linux uses too (`mp4file`).
 
 ## Checking it
 
@@ -108,6 +136,11 @@ export.mp4` says which frames an export kept).
 | `capture` `card_frames_match_the_cpus` and the other `card_` tests | Linux: decoding on the card is the CPU's, byte for byte |
 | `capture` `frames_shown_are_ffmpegs`, `looks_are_ffmpegs`, `a_join_at_a_frames_middle` | Which source frames an export shows: ffmpeg's, as read from its exports |
 | `capture` `scaled_as_linux_scales`, `frames_not_waited_for_are_each_their_own` | macOS: Metal's scaling is Linux's, sample for sample |
+
+On Windows, `export_times` counts the CPU of the test and the ffmpegs it
+starts with a job object (Windows counts no child's time to its parent),
+and `HASTECLIP_ENCODER=x264` leaves the card's encoder out (`mf`, or
+nothing, keeps it).
 
 On macOS, compare with the ffmpeg the app ships: Homebrew's has no `zscale`,
 so its blends mix pixel values, not light. A release build leaves it in
@@ -181,6 +214,32 @@ ffmpeg), `HASTECLIP_ENCODER`, `HASTECLIP_DECODE`, `HASTECLIP_CPU_DECODE=1`,
   else BT.709, for the decoders, the probe and so the exports (within 1.0
   of how players showed it).
 
+## Lessons from Windows
+
+- Media Foundation's H.264 decoder (DXVA) takes about 560 frames a second
+  of 1440p here, one frame decoded ahead: the export's limit, not the card.
+- NVIDIA's encoder through Media Foundation makes no B-frames whatever it's
+  asked, and its slowest setting (quality against speed 100) made a 1080p
+  export no better (+0.007 dB SSIM) at 1.7 times the time; it's left at its
+  default. At a very low bitrate (500 kbit/s at 720p60) its first few frames
+  are softer than x264's (a level and a bit, in 8×8 blocks), as its rate
+  control starts carefully.
+- A decoder's own textures (`Decoder::open_nv12`) aren't shared and need no
+  fence: what reads a frame on the same device is queued after its copy, so
+  a frame goes back to the pool as soon as its draw is queued.
+- A BT.601 clip is made BT.709 through light, as a blend of one look: read
+  by BT.601's matrix, written by BT.709's, then scaled in YUV. Its colours
+  came out 2.6, 1.2 and 2.6 levels (R, G, B) off the source's, ffmpeg's
+  export (which keeps BT.601) 2.2, 1.5 and 2.2, both scaled to a quarter.
+  Before the decoders read the stream's matrix (`capture::h264`), it was
+  taken for BT.709 and its magenta came out pink.
+- Matroska and WebM time frames in whole milliseconds: a frame at 33 ms is
+  0.99 of a frame at 30 fps, numbered one early, where ffmpeg's `fps` takes
+  the nearest. Windows exports only MP4s read by their own index in the app.
+- A clip whose sound runs past its picture is saved as long as the sound,
+  the last frame held (`Timeline`, every stream as long as the parts, on
+  every platform); ffmpeg's export ends the picture where it ends.
+
 ## Working on macOS and Windows at once
 
 One branch each, off `linux-native-nvenc`, merged back when done. Most of the
@@ -188,8 +247,8 @@ work is in each platform's own modules; the places both may want to change
 are the shared export entry (`crates/capture/src/export.rs`), the `media`
 export, and this note: keep changes there small and in their own commits,
 and settle who moves shared code before both do. `Timeline` and `lanczos`
-were moved there on `mac-native-media`: Windows starts from that, or takes
-those changes. Nothing goes into main or out as a release until the
+were moved there on `mac-native-media`, and `windows-native-media` starts
+from that branch. Nothing goes into main or out as a release until the
 maintainer says so.
 
 ## Not tried yet
@@ -207,3 +266,10 @@ maintainer says so.
   thumbnail check (`first_frame_is_ffmpegs`) is 2.27 off ffmpeg's there
   against a bar of 2.0: VideoToolbox interpolates the colours, ffmpeg's
   default scaling doesn't (against its `full_chroma_int+accurate_rnd`, 1.44).
+- On Windows the thumbnail check is 2.57 off on `testsrc2` and 2.32 on a fractal
+  (0.06 on a clip of white squares on black): there it's mostly the video
+  processor's shrinking (2560 to 480 at once), not the colours.
+- Windows exports on AMD's and Intel's cards (their Media Foundation
+  encoders, NV12 drawn into by pixel shaders): only NVIDIA's has run.
+  Windows's other apps' videos (anything but an H.264 MP4) and crash-saved
+  recordings (fragmented: no index) are still made by ffmpeg.
