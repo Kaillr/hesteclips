@@ -82,6 +82,8 @@ time. At the same bitrate the picture's a little better (35.5 dB against
   `media` (`mux_audio`), on every platform.
 - Shared, in `crates/capture/src/export.rs`: which source frames make up an
   export (`Timeline`) and the Lanczos weights exports scale by (`lanczos`).
+  The colour matrix a clip states, for the decoders and `media`'s probe:
+  its MP4's `colr` box, else its H.264 stream's own (`capture::h264`).
 - Linux's decoding on the card and its check: `crates/capture/src/linux/decode.rs`
   (and `dmabuf.rs`); its encoder check: `linux/vkenc.rs` (`check`).
 - What Windows has that may help: `capture::win::decode` and `direct` (D3D11
@@ -158,6 +160,18 @@ ffmpeg), `HASTECLIP_ENCODER`, `HASTECLIP_DECODE`, `HASTECLIP_CPU_DECODE=1`,
 - The media engine decodes and encodes: decoding there may cost the
   encoder a little (exports only scaled were up to 3% slower than ffmpeg's,
   which decodes on the CPU; its first decoder of a run takes 60 ms too).
+- Clips state their colours in their H.264 stream more often than in the
+  MP4 (x264 and ffmpeg write them only there). The decoders read only the
+  `colr` box, so a BT.601 clip from ffmpeg played as BT.709 on every
+  platform, and its export came out labelled BT.709, its colours shifted;
+  `media`'s probe (and ffprobe) read the stream. Now the decoders do too.
+- BT.601 made BT.709 is a 3×3 on Y′CbCr (luma takes its block's colour,
+  the colour's re-mixed), done as the frame's scaled down, rounded once. It
+  came out within 0.5 of a level in RGB of the same picture recorded
+  BT.709, and of ffmpeg's export (which keeps BT.601).
+- ffmpeg's blending stamped every clip BT.709 before reading it into
+  light: a BT.601 clip came out 8.5 levels off in RGB. It's read by its own
+  matrix now.
 
 ## Working on macOS and Windows at once
 
@@ -181,7 +195,11 @@ maintainer says so.
 - Linux since `Timeline` and `lanczos` moved and `Timeline` took ffmpeg's
   frames: not built or run there yet (`card_exports_match_ffmpegs`, and
   `frame-numbers.py` on a 144 fps export at 60).
-- On macOS, BT.601 clips and anything not H.264 in an MP4 are still made by
-  ffmpeg. The thumbnail check (`first_frame_is_ffmpegs`) is 2.27 off ffmpeg's
-  there against a bar of 2.0: VideoToolbox interpolates the colours, ffmpeg's
+- On macOS, anything not H.264 in an MP4 is still made by ffmpeg. The
+  thumbnail check (`first_frame_is_ffmpegs`) is 2.27 off ffmpeg's there
+  against a bar of 2.0: VideoToolbox interpolates the colours, ffmpeg's
   default scaling doesn't (against its `full_chroma_int+accurate_rnd`, 1.44).
+- A clip that doesn't say its colours: `media`'s probe guesses BT.601 below
+  720 lines (as players do), the decoders take BT.709, and so do the exports
+  made in the app (labelled so); ffmpeg's left them unlabelled. One rule for
+  all would be better.
