@@ -175,6 +175,8 @@ impl Nvenc {
         // A file to watch, not to cut clips from: keyframes every few
         // seconds (as x264's), the bitrate free to follow the picture.
         let (gop, max_kbps, buf_kbits) = if export { ((fps * 4).min(600), kbps * 3, kbps * 6) } else { (crate::keyframe_every(fps), kbps * 3 / 2, kbps * 2) };
+        // In bits, NVIDIA's rates are 32-bit.
+        let (max_kbps, buf_kbits) = (max_kbps.min(4_000_000), buf_kbits.min(4_000_000));
         let uuid = picture.map(|p| p.gpu().uuid);
         let (mut why, mut code, mut bframes) = (Why::new(), 0, 0);
         // SAFETY: valid arguments, and room for the error.

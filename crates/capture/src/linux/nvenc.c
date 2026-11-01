@@ -2,9 +2,9 @@
 // directly rather than through an ffmpeg process: a frame goes in where the
 // graphics card made it (Vulkan memory shared with CUDA) and only the
 // encoded frame comes out, so no picture passes through the CPU. Several
-// frames are in flight at once: one thread hands them in, another takes
-// each one's bitstream when it's done, in the same order, as NVIDIA allows
-// in synchronous mode (the only one there is on Linux).
+// frames are in flight at once: one thread hands them in and takes each
+// bitstream out when it's done, in the order handed in, as NVIDIA allows in
+// synchronous mode (the only one there is on Linux).
 //
 // libcuda and libnvidia-encode come with NVIDIA's driver and are opened at
 // run time, so the app starts without them. NVIDIA's API headers, as
@@ -389,8 +389,6 @@ int hcnv_upload(void *p, int slot, const uint8_t *nv12, char *err, int errlen) {
     return ok ? 0 : -1;
 }
 
-// Encode the frame in `slot` as frame `pts`. Its bitstream is taken with
-// `hcnv_lock`, in the order the frames were encoded.
 // Hand slot `slot`'s frame (frame `pts`) in, its bitstream the next one out
 // (in decode order). 0: every frame handed in so far is being encoded, and
 // can be taken out (`hcnv_lock`) in the order handed in; 1: this one waits
