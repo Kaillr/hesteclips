@@ -3068,6 +3068,7 @@ dependencies = [
  "anyhow",
  "capture",
  "jpeg-encoder",
+ "libc",
  "serde",
  "serde_json",
 ]

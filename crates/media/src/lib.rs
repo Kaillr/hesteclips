@@ -2400,12 +2400,24 @@ mod export_bench {
         let dir = std::env::temp_dir().join(format!("hc-export-bench-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         // CPU seconds this process and the ffmpegs it waited for have used.
+        #[cfg(not(target_os = "macos"))]
         let cpu = || {
             let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
             let fields: Vec<f64> = stat.rsplit(')').next().unwrap_or_default().split_whitespace().filter_map(|f| f.parse().ok()).collect();
             // utime, stime, cutime, cstime: fields 14-17; here from ppid
             // (field 4) on, the state (a letter) left out.
             fields.get(10..14).map_or(0.0, |t| t.iter().sum::<f64>() / 100.0)
+        };
+        #[cfg(target_os = "macos")]
+        let cpu = || {
+            let used = |who| {
+                // SAFETY: getrusage only writes the struct it's given.
+                let mut u: libc::rusage = unsafe { std::mem::zeroed() };
+                unsafe { libc::getrusage(who, &mut u) };
+                let secs = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+                secs(u.ru_utime) + secs(u.ru_stime)
+            };
+            used(libc::RUSAGE_SELF) + used(libc::RUSAGE_CHILDREN)
         };
         let run = |name: &str, src: &Path, edit: &dyn Fn(&ClipInfo) -> Edit| {
             let info = probe(src).unwrap();

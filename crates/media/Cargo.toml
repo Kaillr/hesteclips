@@ -11,3 +11,7 @@ capture = { path = "../capture" }
 jpeg-encoder = { version = "0.6", features = ["simd"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+
+# `export_times`: the CPU an export used, on macOS (Linux reads /proc).
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+libc = "0.2"
