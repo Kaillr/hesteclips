@@ -4,7 +4,8 @@
 //! frames are decoded by VideoToolbox (`decode`, the decoder playback uses:
 //! NV12 in IOSurfaces), there cropped and scaled as they are by Metal, in
 //! YUV, each plane on its own ([`Scaler`]: Lanczos, as ffmpeg's export
-//! scaled, with Linux's weights); or, to blend them, mixed in light by the
+//! scaled, with Linux's weights), BT.601's colours made the BT.709 the file
+//! says (as Linux's are); or, to blend them, mixed in light by the
 //! recording's own blending (`blend`: blended just as live). Then they're
 //! encoded by VideoToolbox's H.264 encoder, as ffmpeg's were
 //! (`h264_videotoolbox`), into our MP4 writer (`mp4mux`). A frame neither
@@ -54,8 +55,8 @@ use crate::mp4mux::{AvcConfig, Muxer, Spec};
 use crate::shutter::Shutter;
 
 /// Make `job`'s picture (no sound) at `dest`, an MP4. `Ok(false)` where it
-/// can't be made here (a clip VideoToolbox can't decode, colours that would
-/// have to be converted): ffmpeg makes it then.
+/// can't be made here (a clip VideoToolbox can't decode): ffmpeg makes it
+/// then.
 pub(crate) fn render_video(job: &Job, dest: &Path, progress: &dyn Fn(f32)) -> Result<bool> {
     if job.out_fps == 0 || job.size.0 < 2 || job.size.1 < 2 || job.parts.is_empty() || job.fps <= 0.0 {
         return Ok(false);
@@ -67,12 +68,9 @@ pub(crate) fn render_video(job: &Job, dest: &Path, progress: &dyn Fn(f32)) -> Re
             return Ok(false);
         }
     };
-    // BT.601 (the app records BT.709; another app's clip may say so) would
-    // have to be made the BT.709 the file says: ffmpeg does that.
-    if decoder.bt601() {
-        eprintln!("export: the clip's colours are BT.601");
-        return Ok(false);
-    }
+    // BT.601 (the app records BT.709; another app's clip may say so) is made
+    // the BT.709 the file says, as it's scaled.
+    let bt601 = decoder.bt601();
     decoder.set_fps(job.fps);
     let source = decoder.source_size();
     let timeline = Timeline::new(job);
@@ -81,7 +79,7 @@ pub(crate) fn render_video(job: &Job, dest: &Path, progress: &dyn Fn(f32)) -> Re
     }
     let whole = [0, 0, source.0, source.1];
     let crop = job.crop.unwrap_or(whole);
-    let scaled = crop != whole || job.size != source;
+    let scaled = crop != whole || job.size != source || bt601;
     let shutter = job.blend.map(|(rate, shape)| Shutter::new(rate / job.out_fps, shape));
     // Scaling and blending on one queue: a frame's made before it's blended.
     let (mut scaler, mut blender) = (None, None);
@@ -89,7 +87,7 @@ pub(crate) fn render_video(job: &Job, dest: &Path, progress: &dyn Fn(f32)) -> Re
         let device = MTLCreateSystemDefaultDevice().context("no Metal device")?;
         let queue = device.newCommandQueue().context("no Metal command queue")?;
         if scaled {
-            scaler = Some(Scaler::new(&device, &queue, source, crop, job.size)?);
+            scaler = Some(Scaler::new(&device, &queue, source, crop, job.size, bt601)?);
         }
         if let Some(s) = &shutter {
             blender = Some(Blender::queued(device, queue, job.size.0 as usize, job.size.1 as usize, s.frames_open())?);
@@ -107,15 +105,14 @@ pub(crate) fn render_video(job: &Job, dest: &Path, progress: &dyn Fn(f32)) -> Re
             return Err(e);
         }
     };
+    let steps: Vec<&str> = [(crop != whole || job.size != source, "cropped and scaled"), (bt601, "BT.601 made BT.709"), (blender.is_some(), "blended")]
+        .into_iter()
+        .filter_map(|(done, step)| done.then_some(step))
+        .collect();
     eprintln!(
         "export: decoded and encoded by VideoToolbox ({}), {}",
         if encoder.hardware() { "the media engine" } else { "its software encoder" },
-        match (&scaler, &blender) {
-            (None, None) => "frames as decoded",
-            (Some(_), None) => "cropped and scaled by Metal",
-            (None, Some(_)) => "blended by Metal",
-            (Some(_), Some(_)) => "cropped, scaled and blended by Metal",
-        }
+        if steps.is_empty() { "frames as decoded".to_owned() } else { format!("{} by Metal", steps.join(", ")) }
     );
 
     // The source frames wanted, in order, each once: decoded ahead on a
@@ -320,11 +317,60 @@ struct Way {
     rows: u32,
 }
 
+/// BT.601's colours made BT.709's, studio range both, for the kernels: luma
+/// takes `luma.x` of Cb − 128 and `luma.y` of Cr − 128 more (BT.709 weighs
+/// each colour's light differently), and Cb, Cr are mixed anew by `chroma`
+/// (rows: Cb, Cr). A grey stays as it is. `on` 0: nothing's done.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct Convert {
+    luma: [f32; 4],
+    chroma: [f32; 4],
+    on: [u32; 4],
+}
+
+impl Convert {
+    /// BT.601's matrix (Kr 0.299, Kb 0.114) to BT.709's (0.2126, 0.0722).
+    fn bt601_to_709() -> Self {
+        let m = matrix_between((0.299, 0.114), (0.2126, 0.0722));
+        // Luma's 219 levels, colour's 224.
+        let s = 219.0 / 224.0;
+        Self {
+            luma: [(m[0][1] * s) as f32, (m[0][2] * s) as f32, 0.0, 0.0],
+            chroma: [m[1][1] as f32, m[1][2] as f32, m[2][1] as f32, m[2][2] as f32],
+            on: [1, 0, 0, 0],
+        }
+    }
+}
+
+/// What takes a colour's (Y′, Cb, Cr) in one matrix to its (Y′, Cb, Cr) in
+/// another (each by its Kr, Kb; Y′ 0 to 1, Cb and Cr −½ to ½): back to R′G′B′
+/// by the first, then on by the second. Both share their greys: Y′ comes
+/// through whole, and Cb, Cr take none of it.
+fn matrix_between((kr, kb): (f64, f64), (kr2, kb2): (f64, f64)) -> [[f64; 3]; 3] {
+    let kg = 1.0 - kr - kb;
+    let to_rgb = [[1.0, 0.0, 2.0 * (1.0 - kr)], [1.0, -2.0 * kb * (1.0 - kb) / kg, -2.0 * kr * (1.0 - kr) / kg], [1.0, 2.0 * (1.0 - kb), 0.0]];
+    let kg2 = 1.0 - kr2 - kb2;
+    let to_ycc = [
+        [kr2, kg2, kb2],
+        [-kr2 / (2.0 * (1.0 - kb2)), -kg2 / (2.0 * (1.0 - kb2)), 0.5],
+        [0.5, -kg2 / (2.0 * (1.0 - kr2)), -kb2 / (2.0 * (1.0 - kr2))],
+    ];
+    let mut m = [[0.0; 3]; 3];
+    for (i, row) in m.iter_mut().enumerate() {
+        for (j, v) in row.iter_mut().enumerate() {
+            *v = (0..3).map(|k| to_ycc[i][k] * to_rgb[k][j]).sum();
+        }
+    }
+    m
+}
+
 /// Decoded frames cropped and scaled on the GPU as they are, NV12 to NV12,
 /// each plane on its own, as Linux's export does (`linux::export`'s
 /// `Nv12Scaler`): by Lanczos (3 lobes, as ffmpeg's export scaled), across
 /// into rows of the new width, then down into a frame of the encoder's. The
-/// same size is an exact copy.
+/// same size is an exact copy. BT.601's colours are made BT.709's on the way
+/// down ([`Convert`]), rounded once.
 struct Scaler {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
@@ -342,6 +388,8 @@ struct Scaler {
     chroma_rows: Retained<ProtocolObject<dyn MTLBuffer>>,
     /// Luma across, chroma across, luma down, chroma down.
     ways: [Way; 4],
+    /// The colours made BT.709's, or left.
+    convert: Convert,
     /// The frames made (the encoder holds each a while).
     pool: FramePool,
 }
@@ -351,13 +399,15 @@ unsafe impl Send for Scaler {}
 
 impl Scaler {
     /// For frames `size` big, `crop` of them used (left, top, width, height:
-    /// even), made `frame` big (even), on `queue`.
+    /// even), made `frame` big (even), on `queue`; their colours BT.601's,
+    /// made BT.709's, or BT.709's.
     fn new(
         device: &Retained<ProtocolObject<dyn MTLDevice>>,
         queue: &Retained<ProtocolObject<dyn MTLCommandQueue>>,
         size: (u32, u32),
         crop: [u32; 4],
         frame: (u32, u32),
+        bt601: bool,
     ) -> Result<Self> {
         let [cx, cy, cw, ch] = crop;
         ensure!(cw >= 2 && ch >= 2 && cx + cw <= size.0 && cy + ch <= size.1, "a crop outside the picture");
@@ -387,7 +437,8 @@ impl Scaler {
         let luma_rows = private(fw as usize * ch as usize * 4)?;
         let chroma_rows = private((fw / 2) as usize * (ch / 2) as usize * 8)?;
         let pool = FramePool::new(fw as usize, fh as usize)?;
-        Ok(Self { device, queue, across_luma, across_chroma, down_luma, down_chroma, firsts, weights, luma_rows, chroma_rows, ways, pool })
+        let convert = if bt601 { Convert::bt601_to_709() } else { Convert::default() };
+        Ok(Self { device, queue, across_luma, across_chroma, down_luma, down_chroma, firsts, weights, luma_rows, chroma_rows, ways, convert, pool })
     }
 
     /// `src` (NV12, the size given) cropped and scaled into a new frame, on
@@ -402,7 +453,7 @@ impl Scaler {
             [(&self.across_luma, &planes[0], &self.luma_rows, &self.ways[0]), (&self.across_chroma, &planes[1], &self.chroma_rows, &self.ways[1])],
             [(&self.down_luma, &made[0], &self.luma_rows, &self.ways[2]), (&self.down_chroma, &made[1], &self.chroma_rows, &self.ways[3])],
         ];
-        for pass in passes {
+        for (n, pass) in passes.into_iter().enumerate() {
             let enc = cmd.computeCommandEncoder().context("no compute encoder")?;
             for (pipeline, texture, rows, way) in pass {
                 enc.setComputePipelineState(pipeline);
@@ -412,6 +463,13 @@ impl Scaler {
                     enc.setBuffer_offset_atIndex(Some(rows), 0, 1);
                     enc.setBuffer_offset_atIndex(Some(&self.firsts), 0, 2);
                     enc.setBuffer_offset_atIndex(Some(&self.weights), 0, 3);
+                    if n == 1 {
+                        // Down, the colours made BT.709's: luma takes its
+                        // block's colour, made down as chroma is.
+                        enc.setBytes_length_atIndex(NonNull::from(&self.convert).cast::<c_void>(), std::mem::size_of::<Convert>(), 4);
+                        enc.setBuffer_offset_atIndex(Some(&self.chroma_rows), 0, 5);
+                        enc.setBytes_length_atIndex(NonNull::from(&self.ways[3]).cast::<c_void>(), std::mem::size_of::<Way>(), 6);
+                    }
                 }
                 let size = MTLSize { width: way.width as usize, height: way.rows as usize, depth: 1 };
                 enc.dispatchThreads_threadsPerThreadgroup(size, MTLSize { width: 16, height: 16, depth: 1 });
@@ -445,8 +503,9 @@ fn shared_buffer<T: Copy>(device: &ProtocolObject<dyn MTLDevice>, data: &[T]) ->
 
 /// Across: each of the crop's rows (luma, then the Cb, Cr pairs' rows) made
 /// the frame's width, a sample a thread. Down: each sample of the frame from
-/// the rows made across, rounded as Linux's (to even). In 0–255 throughout,
-/// as Linux's shader is.
+/// the rows made across (BT.601's colours made BT.709's, luma by its 2×2
+/// block's colour), rounded as Linux's (to even). In 0–255 throughout, as
+/// Linux's shader is.
 const SCALE_KERNELS: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -496,21 +555,51 @@ kernel void across_chroma(texture2d<float, access::read> src [[texture(0)]],
     rows[gid.y * w.width + gid.x] = sum;
 }
 
+struct Convert {
+    float4 luma;
+    float4 chroma;
+    uint4 on;
+};
+
+// Sample x of row y of the frame, made down from `rows`.
+float down1(device const float* rows, constant Way& w, device const int* firsts, device const float* weights, uint x, uint y) {
+    int first = firsts[w.first_at + y];
+    device const float* k = weights + w.weight_at + y * w.taps;
+    float sum = 0.0;
+    for (uint t = 0; t < w.taps; t++) {
+        uint r = uint(clamp(first + int(t), w.lo, w.hi) - w.lo);
+        sum += rows[r * w.width + x] * k[t];
+    }
+    return sum;
+}
+
+float2 down2(device const float2* rows, constant Way& w, device const int* firsts, device const float* weights, uint x, uint y) {
+    int first = firsts[w.first_at + y];
+    device const float* k = weights + w.weight_at + y * w.taps;
+    float2 sum = 0.0;
+    for (uint t = 0; t < w.taps; t++) {
+        uint r = uint(clamp(first + int(t), w.lo, w.hi) - w.lo);
+        sum += rows[r * w.width + x] * k[t];
+    }
+    return sum;
+}
+
 kernel void down_luma(texture2d<float, access::write> out [[texture(0)]],
                       constant Way& w [[buffer(0)]],
                       device const float* rows [[buffer(1)]],
                       device const int* firsts [[buffer(2)]],
                       device const float* weights [[buffer(3)]],
+                      constant Convert& c [[buffer(4)]],
+                      device const float2* chroma_rows [[buffer(5)]],
+                      constant Way& cw [[buffer(6)]],
                       uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= w.width || gid.y >= w.rows) return;
-    int first = firsts[w.first_at + gid.y];
-    device const float* k = weights + w.weight_at + gid.y * w.taps;
-    float sum = 0.0;
-    for (uint t = 0; t < w.taps; t++) {
-        uint r = uint(clamp(first + int(t), w.lo, w.hi) - w.lo);
-        sum += rows[r * w.width + gid.x] * k[t];
+    float y = down1(rows, w, firsts, weights, gid.x, gid.y);
+    if (c.on.x != 0) {
+        float2 cbcr = down2(chroma_rows, cw, firsts, weights, gid.x / 2u, gid.y / 2u) - 128.0;
+        y += dot(cbcr, c.luma.xy);
     }
-    out.write(float4(clamp(rint(sum), 0.0, 255.0) / 255.0, 0.0, 0.0, 1.0), gid);
+    out.write(float4(clamp(rint(y), 0.0, 255.0) / 255.0, 0.0, 0.0, 1.0), gid);
 }
 
 kernel void down_chroma(texture2d<float, access::write> out [[texture(0)]],
@@ -518,16 +607,15 @@ kernel void down_chroma(texture2d<float, access::write> out [[texture(0)]],
                         device const float2* rows [[buffer(1)]],
                         device const int* firsts [[buffer(2)]],
                         device const float* weights [[buffer(3)]],
+                        constant Convert& c [[buffer(4)]],
                         uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= w.width || gid.y >= w.rows) return;
-    int first = firsts[w.first_at + gid.y];
-    device const float* k = weights + w.weight_at + gid.y * w.taps;
-    float2 sum = 0.0;
-    for (uint t = 0; t < w.taps; t++) {
-        uint r = uint(clamp(first + int(t), w.lo, w.hi) - w.lo);
-        sum += rows[r * w.width + gid.x] * k[t];
+    float2 cbcr = down2(rows, w, firsts, weights, gid.x, gid.y);
+    if (c.on.x != 0) {
+        float2 d = cbcr - 128.0;
+        cbcr = float2(dot(d, c.chroma.xy), dot(d, c.chroma.zw)) + 128.0;
     }
-    out.write(float4(clamp(rint(sum), 0.0, 255.0) / 255.0, 0.0, 1.0), gid);
+    out.write(float4(clamp(rint(cbcr), 0.0, 255.0) / 255.0, 0.0, 1.0), gid);
 }
 "#;
 
@@ -788,9 +876,13 @@ mod tests {
     }
 
     fn scaler(size: (u32, u32), crop: [u32; 4], frame: (u32, u32)) -> Scaler {
+        scaler_601(size, crop, frame, false)
+    }
+
+    fn scaler_601(size: (u32, u32), crop: [u32; 4], frame: (u32, u32), bt601: bool) -> Scaler {
         let device = MTLCreateSystemDefaultDevice().unwrap();
         let queue = device.newCommandQueue().unwrap();
-        Scaler::new(&device, &queue, size, crop, frame).unwrap()
+        Scaler::new(&device, &queue, size, crop, frame, bt601).unwrap()
     }
 
     /// Detail everywhere: no two neighbours alike, in either plane.
@@ -802,6 +894,16 @@ mod tests {
     /// plane, `comps` values a sample, `w` samples a row) cropped to
     /// `crop` and made `out` big.
     fn scaled_on_cpu(samples: &[u8], w: usize, comps: usize, crop: [u32; 4], out: (u32, u32)) -> Vec<u8> {
+        bytes(&scaled_values(samples, w, comps, crop, out))
+    }
+
+    /// Rounded as the kernels round (to even).
+    fn bytes(values: &[f32]) -> Vec<u8> {
+        values.iter().map(|v| v.round_ties_even().clamp(0.0, 255.0) as u8).collect()
+    }
+
+    /// [`scaled_on_cpu`] before it's rounded.
+    fn scaled_values(samples: &[u8], w: usize, comps: usize, crop: [u32; 4], out: (u32, u32)) -> Vec<f32> {
         let [cx, cy, cw, ch] = crop;
         let (across, down) = (lanczos(cx, cw, out.0), lanczos(cy, ch, out.1));
         let mut rows = vec![0f32; out.0 as usize * ch as usize * comps];
@@ -817,7 +919,7 @@ mod tests {
                 }
             }
         }
-        let mut made = vec![0u8; (out.0 * out.1) as usize * comps];
+        let mut made = vec![0f32; (out.0 * out.1) as usize * comps];
         for y in 0..out.1 as usize {
             for x in 0..out.0 as usize {
                 for c in 0..comps {
@@ -826,11 +928,87 @@ mod tests {
                         let r = (down.0[y] + t as i32).clamp(cy as i32, (cy + ch - 1) as i32) as usize - cy as usize;
                         sum += rows[(r * out.0 as usize + x) * comps + c] * down.1[y * down.2 as usize + t];
                     }
-                    made[(y * out.0 as usize + x) * comps + c] = sum.round_ties_even().clamp(0.0, 255.0) as u8;
+                    made[(y * out.0 as usize + x) * comps + c] = sum;
                 }
             }
         }
         made
+    }
+
+    /// Planes made by [`scaled_values`] (a frame `w`×`h`) made BT.709's as
+    /// the kernels make them: luma by its 2×2 block's colour.
+    fn converted_on_cpu(luma: &[f32], chroma: &[f32], (w, h): (u32, u32), c: &Convert) -> [Vec<u8>; 2] {
+        let (w, h) = (w as usize, h as usize);
+        let mut y = vec![0f32; w * h];
+        for r in 0..h {
+            for x in 0..w {
+                let i = ((r / 2) * (w / 2) + x / 2) * 2;
+                y[r * w + x] = luma[r * w + x] + c.luma[0] * (chroma[i] - 128.0) + c.luma[1] * (chroma[i + 1] - 128.0);
+            }
+        }
+        let cbcr: Vec<f32> = chroma
+            .chunks(2)
+            .flat_map(|p| {
+                let (cb, cr) = (p[0] - 128.0, p[1] - 128.0);
+                [c.chroma[0] * cb + c.chroma[1] * cr + 128.0, c.chroma[2] * cb + c.chroma[3] * cr + 128.0]
+            })
+            .collect();
+        [bytes(&y), bytes(&cbcr)]
+    }
+
+    /// A colour (R′G′B′, 0 to 1) as studio-range Y′CbCr by the matrix with
+    /// this Kr, Kb.
+    fn ycc([r, g, b]: [f64; 3], kr: f64, kb: f64) -> [f64; 3] {
+        let y = kr * r + (1.0 - kr - kb) * g + kb * b;
+        [16.0 + 219.0 * y, 128.0 + 224.0 * (b - y) / (2.0 * (1.0 - kb)), 128.0 + 224.0 * (r - y) / (2.0 * (1.0 - kr))]
+    }
+
+    /// A colour's BT.601 values made BT.709's are its BT.709 values, and a
+    /// grey's are left as they are.
+    #[test]
+    fn bt601_made_bt709_is_the_same_colour() {
+        let m = matrix_between((0.299, 0.114), (0.2126, 0.0722));
+        assert!((m[0][0] - 1.0).abs() < 1e-12 && m[1][0].abs() < 1e-12 && m[2][0].abs() < 1e-12, "greys stay: {m:?}");
+        let c = Convert::bt601_to_709();
+        for rgb in [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [0.5, 0.5, 0.5], [0.9, 0.6, 0.45], [0.1, 0.3, 0.8], [1.0, 1.0, 0.0]] {
+            let [y, cb, cr] = ycc(rgb, 0.299, 0.114).map(|v| v as f32);
+            let want = ycc(rgb, 0.2126, 0.0722).map(|v| v as f32);
+            let (u, v) = (cb - 128.0, cr - 128.0);
+            let got = [y + c.luma[0] * u + c.luma[1] * v, c.chroma[0] * u + c.chroma[1] * v + 128.0, c.chroma[2] * u + c.chroma[3] * v + 128.0];
+            for (g, w) in got.iter().zip(want) {
+                assert!((g - w).abs() < 1e-3, "{rgb:?}: {got:?} against {want:?}");
+            }
+        }
+    }
+
+    /// Made BT.709's on the GPU as on the CPU, at the same size and scaled;
+    /// BT.601's red is BT.709's.
+    #[test]
+    fn bt601_made_bt709_on_the_gpu() {
+        let src = frame(320, 180, busy);
+        let [luma, chroma] = planes(&src);
+        for (crop, out) in [([0, 0, 320, 180], (320, 180)), ([0, 0, 320, 180], (160, 90)), ([64, 32, 192, 108], (128, 72))] {
+            let s = scaler_601((320, 180), crop, out, true);
+            let made = s.scale(src.clone()).unwrap();
+            let [y, c] = planes(made.ready().unwrap());
+            let [cx, cy, cw, ch] = crop;
+            let want = converted_on_cpu(
+                &scaled_values(&luma, 320, 1, crop, out),
+                &scaled_values(&chroma, 160, 2, [cx / 2, cy / 2, cw / 2, ch / 2], (out.0 / 2, out.1 / 2)),
+                out,
+                &s.convert,
+            );
+            for (got, want, plane) in [(&y, &want[0], "luma"), (&c, &want[1], "chroma")] {
+                let worst = got.iter().zip(want).map(|(a, b)| a.abs_diff(*b)).max().unwrap();
+                let off = got.iter().zip(want).filter(|(a, b)| a != b).count();
+                assert!(worst <= 1 && off * 1000 <= got.len(), "{crop:?} to {out:?}, {plane}: {off} samples off, by up to {worst}");
+            }
+        }
+        // Red: BT.601's 81, 90, 240 (rounded); BT.709's 63, 102, 240.
+        let red = frame(64, 32, |x, _, p| if p == 0 { 81 } else if x % 2 == 0 { 90 } else { 240 });
+        let made = scaler_601((64, 32), [0, 0, 64, 32], (64, 32), true).scale(red).unwrap();
+        let [y, c] = planes(made.ready().unwrap());
+        assert!(y.iter().all(|&v| v.abs_diff(63) <= 1) && c.chunks(2).all(|p| p[0].abs_diff(102) <= 1 && p[1].abs_diff(240) <= 1), "{} {} {}", y[0], c[0], c[1]);
     }
 
     /// Cropped and scaled on the GPU as Linux's shader does it (here on the
