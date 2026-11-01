@@ -1496,13 +1496,20 @@ fn mux_audio(source: &Path, info: &ClipInfo, edit: &Edit, id: Option<&str>, vide
     // The sound is read from a second before the first part: a seek lands on
     // the sound's own frames, up to one (21 ms) after where it was asked, so
     // asking early and cutting the parts out by time keeps all of them, in
-    // time with the picture (a part cut from a seek's start came out short,
-    // and the picture lost its last frame to `-shortest`).
+    // time with the picture (a part cut from a seek's start came out short).
     let from = (edit.start - 1.0).max(0.0);
     // The parts, in seconds from there, and how far each join's crossfade
     // reaches either side.
     let kept: Vec<(f64, f64)> = edit.kept().iter().map(|(a, b)| (a - from, b - from)).collect();
     let fades = join_fades(&kept);
+    // Every sound exactly as long as the parts: padded with silence where a
+    // track runs short, trimmed where a crossfade's rounding runs over. The
+    // picture is never cut to the sound: ended by its shortest stream
+    // (`-shortest`), a file whose sound came out a few milliseconds short
+    // (a muted mix, silence made in whole AAC frames) lost the picture's
+    // last frame, or four with NVIDIA's B-frames.
+    let len = edit.duration();
+    let exact = format!("apad=whole_dur={len:.6},atrim=end={len:.6}");
 
     for (i, t) in edit.tracks.iter().enumerate() {
         // eval=frame re-evaluates per audio frame so keyframed volume ramps; `t`
@@ -1510,7 +1517,7 @@ fn mux_audio(source: &Path, info: &ClipInfo, edit: &Edit, id: Option<&str>, vide
         // set before the parts are cut out, on the recording's own time).
         let level = format!("[1:a:{}]volume='{}':eval=frame", t.index, t.volume_expr(from));
         if let [(a, b)] = kept[..] {
-            graph.push(format!("{level},atrim=start={a:.6}:end={b:.6},asetpts=PTS-STARTPTS,asplit=2[m{i}][s{i}]"));
+            graph.push(format!("{level},atrim=start={a:.6}:end={b:.6},asetpts=PTS-STARTPTS,{exact},asplit=2[m{i}][s{i}]"));
         } else {
             // Each part, running on into what's cut out either side of a
             // join by as much as that join crossfades over, then joined: the
@@ -1528,7 +1535,7 @@ fn mux_audio(source: &Path, info: &ClipInfo, edit: &Edit, id: Option<&str>, vide
                 graph.push(format!("{joined}[q{i}_{k}]acrossfade=d={:.6}:c1=tri:c2=tri{to}", 2.0 * fades[k - 1]));
                 joined = to;
             }
-            graph.push(format!("{joined}asplit=2[m{i}][s{i}]"));
+            graph.push(format!("{joined}{exact},asplit=2[m{i}][s{i}]"));
         }
         if t.muted {
             graph.push(format!("[m{i}]anullsink"));
@@ -1548,7 +1555,7 @@ fn mux_audio(source: &Path, info: &ClipInfo, edit: &Edit, id: Option<&str>, vide
     if has_audio {
         if mix_inputs.is_empty() {
             // Everything muted: keep a silent mix so the layout stays the same.
-            graph.push("anullsrc=r=48000:cl=stereo[mix]".into());
+            graph.push(format!("anullsrc=r=48000:cl=stereo,atrim=end={len:.6}[mix]"));
         } else {
             graph.push(format!(
                 "{}amix=inputs={}:normalize=0:duration=longest[mix]",
@@ -1579,7 +1586,7 @@ fn mux_audio(source: &Path, info: &ClipInfo, edit: &Edit, id: Option<&str>, vide
         for m in &maps {
             cmd.args(["-map", m]);
         }
-        cmd.args(["-c:a", "aac", "-b:a", &format!("{RENDER_AUDIO_KBPS}k"), "-shortest"]);
+        cmd.args(["-c:a", "aac", "-b:a", &format!("{RENDER_AUDIO_KBPS}k")]);
         let all_titles = std::iter::once("Mix".to_owned()).chain(titles);
         for (i, t) in all_titles.enumerate() {
             cmd.args([format!("-metadata:s:a:{i}"), format!("title={t}")]);
@@ -2203,6 +2210,20 @@ mod cut_render_tests {
         assert_eq!(String::from_utf8_lossy(&frames.stdout).trim(), "30");
         let sound = decode_audio(&out, 1).unwrap();
         assert!((sound.len() as f64 / 2.0 / PREVIEW_RATE as f64 - 1.0).abs() < 0.002, "the sound lasts {} s", sound.len() as f64 / 2.0 / PREVIEW_RATE as f64);
+
+        // Every track muted, the mix made of silence: still every frame, and
+        // every sound as long as the picture. (Ended by the shortest stream,
+        // the silence, made in whole AAC frames, ran short of the parts and
+        // took the picture's last frames with it.)
+        edit.set_parts(&[(0.5, 2.0), (3.0, 4.6)]);
+        edit.tracks.iter_mut().for_each(|t| t.muted = true);
+        render_to(&src, &info, &edit, &out, None).unwrap();
+        let frames = ffprobe().args(["-v", "error", "-count_frames", "-select_streams", "v:0", "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0"]).arg(&out).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&frames.stdout).trim(), "93", "every frame, every track muted");
+        for stream in 0..2 {
+            let secs = decode_audio(&out, stream).unwrap().len() as f64 / 2.0 / PREVIEW_RATE as f64;
+            assert!((secs - 3.1).abs() < 0.002, "sound {stream} lasts {secs} s, every track muted");
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
