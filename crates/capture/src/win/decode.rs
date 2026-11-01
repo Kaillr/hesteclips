@@ -16,7 +16,8 @@
 //! GPU in a pool of shareable textures that the app's renderer opens once and
 //! draws directly: no copy back, no upload. Shared at the video's own size
 //! they stay NV12 (copied, not converted; the renderer converts as it draws)
-//! where the graphics card can share NV12.
+//! where the graphics card can share NV12. Or (`open_nv12`, for exports)
+//! they stay on the decoder's own device, NV12 as decoded, for work there.
 //!
 //! Feeding the decoder ourselves skips the reader's seek: a jump takes
 //! 1.7-3× less time (a keyframe 15 ms instead of 45, with the picture's
@@ -86,6 +87,9 @@ pub struct Surfaces {
     /// What the textures hold.
     pub format: SurfaceFormat,
     textures: Vec<ID3D11Texture2D>,
+    /// Shared with another device, by these handles (else read on the
+    /// decoder's own, where what's done to a frame follows its copy in).
+    shared: bool,
     handles: Vec<HANDLE>,
     free: Mutex<VecDeque<usize>>,
     /// Signalled after each frame is written, for the other device to wait
@@ -146,6 +150,11 @@ impl Surface {
         self.0.pool.format
     }
 
+    /// The texture, on the decoder's device.
+    pub(crate) fn texture(&self) -> &ID3D11Texture2D {
+        &self.0.pool.textures[self.0.slot]
+    }
+
     /// The pool's shared fence (NT handle, owned by the pool) and the value
     /// that means this frame is written: wait for it before drawing it.
     /// `None` if the graphics card couldn't share a fence (then the frame was
@@ -204,6 +213,22 @@ pub struct Decoder {
 /// on its own before).
 const READ_AHEAD: usize = 3;
 
+/// Where a decoder's frames go.
+#[derive(Clone, Copy)]
+enum Kept {
+    /// Back to the CPU, as RGBA.
+    Cpu,
+    /// Into textures shared with another device on the graphics card with
+    /// this LUID: as many as fit in `bytes`, else playback's few dozen.
+    Shared { luid: u64, bytes: Option<u64> },
+    /// Into textures of the decoder's own device, NV12 as decoded.
+    Own,
+}
+
+/// Frames of a decoder's own ([`Kept::Own`]): enough for the export's
+/// decoding ahead (6) and what it works on, at 4K ~200 MB.
+const OWN_POOL: usize = 16;
+
 // The reader is used from one thread at a time, which owns the decoder.
 unsafe impl Send for Decoder {}
 
@@ -215,7 +240,7 @@ impl Decoder {
     /// Feeds the decoder directly when it can (see `direct`), else through the
     /// file reader; `HASTECLIP_NO_DIRECT_DECODE=1` always uses the reader.
     pub fn open(path: &Path, width: u32, share_on: Option<u64>) -> Result<Self> {
-        Self::open_with(path, width, share_on, std::env::var_os("HASTECLIP_NO_DIRECT_DECODE").is_none(), None)
+        Self::open_with(path, width, kept(share_on), direct_wanted())
     }
 
     /// [`Self::open_direct`] at the video's own size, frames shared on
@@ -224,11 +249,19 @@ impl Decoder {
     /// engine, which keeps hundreds. (A decoder whose textures are all held
     /// waits for one to come free.)
     pub fn open_direct_pooled(path: &Path, share_on: u64, bytes: u64) -> Result<Self> {
-        let d = Self::open_with(path, u32::MAX, Some(share_on), true, Some(bytes))?;
+        let d = Self::open_with(path, u32::MAX, Kept::Shared { luid: share_on, bytes: Some(bytes) }, true)?;
         if d.way() != "direct" {
             bail!("this file can't be decoded directly");
         }
         Ok(d)
+    }
+
+    /// Frames as decoded (NV12, at the video's own size) in textures of the
+    /// decoder's own device ([`Self::gpu`]), for work there: an export's.
+    /// Each is copied out of the decoder's own pictures, so holding a few
+    /// never runs it out of them.
+    pub(crate) fn open_nv12(path: &Path) -> Result<Self> {
+        Self::open_with(path, u32::MAX, Kept::Own, direct_wanted())
     }
 
     /// The dedicated memory of the graphics card with this LUID, in bytes:
@@ -261,7 +294,7 @@ impl Decoder {
     /// [`Self::open`], feeding the decoder directly; an error if the file
     /// can't be read that way.
     pub fn open_direct(path: &Path, width: u32, share_on: Option<u64>) -> Result<Self> {
-        let d = Self::open_with(path, width, share_on, true, None)?;
+        let d = Self::open_with(path, width, kept(share_on), true)?;
         if d.way() != "direct" {
             bail!("this file can't be decoded directly");
         }
@@ -271,7 +304,7 @@ impl Decoder {
     /// [`Self::open`], always through Media Foundation's file reader (to
     /// compare with the direct way).
     pub fn open_file_reader(path: &Path, width: u32, share_on: Option<u64>) -> Result<Self> {
-        Self::open_with(path, width, share_on, false, None)
+        Self::open_with(path, width, kept(share_on), false)
     }
 
     /// Which way frames come: "direct" or "file reader".
@@ -282,15 +315,16 @@ impl Decoder {
         }
     }
 
-    /// `pool_bytes`: the shared pool's size in memory, instead of playback's.
-    fn open_with(path: &Path, width: u32, share_on: Option<u64>, direct: bool, pool_bytes: Option<u64>) -> Result<Self> {
+    fn open_with(path: &Path, width: u32, kept: Kept, direct: bool) -> Result<Self> {
         com_init();
         mf_startup()?;
-        let gpu = match share_on {
-            Some(luid) => Gpu::on_adapter(luid)?,
-            None => Gpu::new()?,
+        let gpu = match kept {
+            Kept::Shared { luid, .. } => Gpu::on_adapter(luid)?,
+            Kept::Cpu | Kept::Own => Gpu::new()?,
         };
-        if share_on.is_some_and(|l| gpu.adapter_luid() != Some(l)) {
+        if let Kept::Shared { luid, .. } = kept
+            && gpu.adapter_luid() != Some(luid)
+        {
             bail!("that graphics card isn't available to share frames on");
         }
         unsafe {
@@ -355,7 +389,11 @@ impl Decoder {
             let width = width.min(sw).max(2) / 2 * 2;
             let height = even_height(width, (sw, sh));
 
-            let (pool, convert) = outputs(&gpu, share_on.is_some(), (sw, sh), (width, height), fps, bt601, pool_bytes)?;
+            let (pool, convert) = match kept {
+                Kept::Cpu => outputs(&gpu, false, (sw, sh), (width, height), fps, bt601, None)?,
+                Kept::Shared { bytes, .. } => outputs(&gpu, true, (sw, sh), (width, height), fps, bt601, bytes)?,
+                Kept::Own => (Some(Arc::new(surfaces(&gpu, width, height, SurfaceFormat::Nv12 { bt601 }, OWN_POOL, false, false)?)), None),
+            };
             let mut d = Self {
                 src,
                 _manager: manager,
@@ -391,6 +429,16 @@ impl Decoder {
     /// The video's own size.
     pub fn source_size(&self) -> (u32, u32) {
         self.source
+    }
+
+    /// Its colours are BT.601 (else BT.709).
+    pub fn bt601(&self) -> bool {
+        self.bt601
+    }
+
+    /// The device frames are decoded on.
+    pub(crate) fn gpu(&self) -> &Gpu {
+        &self.gpu
     }
 
     /// The keyframes' numbers, ascending: a jump to one is a single frame to
@@ -456,7 +504,7 @@ impl Decoder {
         let size = (w, even_height(w, self.source));
         let make = |format: SurfaceFormat, bytes_per_pixel: f64, out: DXGI_COLOR_SPACE_TYPE| -> Result<(Arc<Surfaces>, Convert)> {
             let count = (bytes as f64 / (size.0 as f64 * size.1 as f64 * bytes_per_pixel)).clamp(16.0, 2048.0) as usize;
-            let pool = surfaces(&self.gpu, size.0, size.1, format, count, true)?;
+            let pool = surfaces(&self.gpu, size.0, size.1, format, count, true, true)?;
             let convert = Convert::new(&self.gpu, self.source, size, self.fps, self.bt601, out, pool.textures.clone())?;
             Ok((Arc::new(pool), convert))
         };
@@ -674,6 +722,14 @@ fn hand_over(gpu: &Gpu, pool: Arc<Surfaces>, slot: usize, flush: bool) -> Result
             }
             v
         }
+        // Read on this device: whatever reads it there is queued after the
+        // copy into it.
+        None if !pool.shared => {
+            if flush {
+                unsafe { gpu.context.Flush() };
+            }
+            0
+        }
         // No shared fence: finish writing here before handing it over.
         None => {
             gpu.wait_idle()?;
@@ -694,6 +750,17 @@ fn decoded_texture(sample: &IMFSample) -> Result<(ID3D11Texture2D, u32)> {
     }
 }
 
+/// Frames shared on the graphics card with this LUID, or back on the CPU.
+fn kept(share_on: Option<u64>) -> Kept {
+    share_on.map_or(Kept::Cpu, |luid| Kept::Shared { luid, bytes: None })
+}
+
+/// Feed the decoder directly where it can (see `direct`);
+/// `HASTECLIP_NO_DIRECT_DECODE=1` always uses the file reader.
+fn direct_wanted() -> bool {
+    std::env::var_os("HASTECLIP_NO_DIRECT_DECODE").is_none()
+}
+
 /// Height for `width` keeping `source`'s aspect, even.
 fn even_height(width: u32, source: (u32, u32)) -> u32 {
     (((width as f64) * source.1 as f64 / source.0.max(1) as f64 / 2.0).round() as u32 * 2).max(2)
@@ -712,12 +779,12 @@ fn outputs(gpu: &Gpu, shared: bool, source: (u32, u32), size: (u32, u32), fps: f
     };
     let nv12 = shared && size == source && size.0 % 2 == 0 && size.1 % 2 == 0 && shares_nv12(gpu) && std::env::var_os("HASTECLIP_RGBA_FRAMES").is_none();
     if nv12 {
-        match surfaces(gpu, size.0, size.1, SurfaceFormat::Nv12 { bt601 }, count(1.5), false) {
+        match surfaces(gpu, size.0, size.1, SurfaceFormat::Nv12 { bt601 }, count(1.5), false, true) {
             Ok(pool) => return Ok((Some(Arc::new(pool)), None)),
             Err(e) => eprintln!("decoder: can't share NV12 frames, converting them: {e:#}"),
         }
     }
-    let pool = if shared { Some(Arc::new(surfaces(gpu, size.0, size.1, SurfaceFormat::Rgba, count(4.0), true)?)) } else { None };
+    let pool = if shared { Some(Arc::new(surfaces(gpu, size.0, size.1, SurfaceFormat::Rgba, count(4.0), true, true)?)) } else { None };
     let targets: Vec<ID3D11Texture2D> = match &pool {
         Some(p) => p.textures.clone(),
         None => vec![gpu.texture(size.0, size.1, DXGI_FORMAT_R8G8B8A8_UNORM, D3D11_BIND_RENDER_TARGET.0 as u32, D3D11_USAGE_DEFAULT, 0)?],
@@ -745,9 +812,10 @@ fn shares_nv12(gpu: &Gpu) -> bool {
     asked.is_ok() && options.ExtendedNV12SharedTextureSupported.as_bool()
 }
 
-/// A pool of `count` shared textures; `render_target`: the video processor
-/// draws into them (else frames are copied in).
-fn surfaces(gpu: &Gpu, width: u32, height: u32, format: SurfaceFormat, count: usize, render_target: bool) -> Result<Surfaces> {
+/// A pool of `count` textures, `shared` with another device (else for this
+/// one's own work); `render_target`: the video processor draws into them
+/// (else frames are copied in).
+fn surfaces(gpu: &Gpu, width: u32, height: u32, format: SurfaceFormat, count: usize, render_target: bool, shared: bool) -> Result<Surfaces> {
     static NEXT: AtomicUsize = AtomicUsize::new(1);
     let dxgi = match format {
         SurfaceFormat::Rgba => DXGI_FORMAT_R8G8B8A8_UNORM,
@@ -767,19 +835,20 @@ fn surfaces(gpu: &Gpu, width: u32, height: u32, format: SurfaceFormat, count: us
             Usage: D3D11_USAGE_DEFAULT,
             BindFlags: bind as u32,
             CPUAccessFlags: 0,
-            MiscFlags: (D3D11_RESOURCE_MISC_SHARED.0 | D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0) as u32,
+            MiscFlags: if shared { (D3D11_RESOURCE_MISC_SHARED.0 | D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0) as u32 } else { 0 },
         };
         unsafe {
             let mut tex = None;
             gpu.device.CreateTexture2D(&desc, None, Some(&mut tex))?;
             let tex = tex.context("no texture")?;
-            let res: IDXGIResource1 = tex.cast()?;
-            let handle = res.CreateSharedHandle(None, (DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE).0 | GENERIC_ALL.0, None)?;
+            if shared {
+                let res: IDXGIResource1 = tex.cast()?;
+                handles.push(res.CreateSharedHandle(None, (DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE).0 | GENERIC_ALL.0, None)?);
+            }
             textures.push(tex);
-            handles.push(handle);
         }
     }
-    let fence = unsafe {
+    let fence = shared.then(|| unsafe {
         (|| -> Result<(ID3D11Fence, HANDLE)> {
             let device5: ID3D11Device5 = gpu.device.cast()?;
             let mut fence: Option<ID3D11Fence> = None;
@@ -790,11 +859,13 @@ fn surfaces(gpu: &Gpu, width: u32, height: u32, format: SurfaceFormat, count: us
         })()
         .inspect_err(|e| eprintln!("decoder: no shared fence, waiting on the CPU instead: {e:#}"))
         .ok()
-    };
+    })
+    .flatten();
     Ok(Surfaces {
         id: NEXT.fetch_add(1, Ordering::Relaxed),
         format,
         textures,
+        shared,
         handles,
         free: Mutex::new((0..count).collect()),
         fence,

@@ -1,6 +1,7 @@
 //! Saving an edited clip's picture with the graphics card, for `media`'s
-//! export where the picture is made again: on Linux (`linux::export`) and
-//! macOS (`mac::export`); elsewhere, for now, ffmpeg makes it.
+//! export where the picture is made again: on Linux (`linux::export`),
+//! macOS (`mac::export`) and Windows (`win::export`); elsewhere ffmpeg makes
+//! it.
 
 use std::path::Path;
 
@@ -25,7 +26,8 @@ pub struct Job<'a> {
     /// the looks in a frame are weighed.
     pub blend: Option<(u32, BlendShape)>,
     pub kbps: u32,
-    /// To fit a size: held to `kbps` over short spans (Linux: by x264).
+    /// To fit a size: held to `kbps` over short spans (Linux and Windows: by
+    /// x264).
     pub fit: bool,
 }
 
@@ -40,7 +42,11 @@ pub fn render_video(job: &Job, dest: &Path, progress: &dyn Fn(f32)) -> Result<bo
     {
         crate::mac::export::render_video(job, dest, progress)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(target_os = "windows")]
+    {
+        crate::win::export::render_video(job, dest, progress)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         let _ = (job, dest, progress);
         Ok(false)
@@ -50,14 +56,14 @@ pub fn render_video(job: &Job, dest: &Path, progress: &dyn Fn(f32)) -> Result<bo
 /// The saved video's time: the parts back to back. Which source frame each
 /// saved frame shows (and, blending, each look), as ffmpeg's `fps` and
 /// blending filters pick them; nothing in it is any platform's.
-#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos", target_os = "windows")), allow(dead_code))]
 pub(crate) struct Timeline {
     /// Its length in seconds, and how many frames that is.
     seconds: f64,
     pub(crate) frames: u64,
 }
 
-#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos", target_os = "windows")), allow(dead_code))]
 impl Timeline {
     pub(crate) fn new(job: &Job) -> Self {
         let seconds: f64 = job.parts.iter().map(|(a, b)| (b - a).max(0.0)).sum();
@@ -136,7 +142,7 @@ impl Timeline {
 /// the same size is the samples themselves. How exports scale, as ffmpeg's
 /// did (`scale=…:flags=lanczos`): sharper than averaging the area each pixel
 /// covers, which kept 8% less of a detailed picture's finest detail.
-#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos", target_os = "windows")), allow(dead_code))]
 pub(crate) fn lanczos(at: u32, len: u32, out: u32) -> (Vec<i32>, Vec<f32>, u32) {
     let kernel = |x: f64| {
         if x.abs() < 1e-9 {
