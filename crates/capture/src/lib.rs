@@ -14,6 +14,7 @@ mod aac;
 pub mod audio;
 #[cfg(target_os = "macos")]
 mod avwriter;
+pub mod h264;
 pub mod mixer;
 /// Hearing a microphone live: through PipeWire on Linux (`linux::monitor`).
 #[cfg(not(target_os = "linux"))]

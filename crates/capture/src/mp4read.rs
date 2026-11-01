@@ -40,8 +40,8 @@ pub struct Index {
     /// The `avcC` box's body as stored: what a decoder setup takes whole.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub avcc: Vec<u8>,
-    /// The colour matrix the file states (`colr` box, ISO 23091-2 numbers:
-    /// 1 BT.709, 5/6 BT.601), if it does.
+    /// The colour matrix the file states (ISO 23091-2 numbers: 1 BT.709,
+    /// 5/6 BT.601), if it does: in its `colr` box, else in its SPS.
     pub matrix: Option<u16>,
 }
 
@@ -81,7 +81,7 @@ fn parse_video(mdia: &[u8]) -> Result<Index> {
     ensure!(body.len() >= 78, "short sample entry");
     let (width, height) = (be16(&body[24..]) as u32, be16(&body[26..]) as u32);
     let avcc = child(&body[78..], b"avcC").context("no avcC")?;
-    let matrix = child(&body[78..], b"colr").filter(|c| c.get(..4) == Some(b"nclx") && c.len() >= 10).map(|c| be16(&c[8..]));
+    let colr = child(&body[78..], b"colr").filter(|c| c.get(..4) == Some(b"nclx") && c.len() >= 10).map(|c| be16(&c[8..]));
     ensure!(avcc.len() >= 7, "short avcC");
     let nal_length = (avcc[4] & 3) as usize + 1;
     let mut at = 6;
@@ -98,6 +98,9 @@ fn parse_video(mdia: &[u8]) -> Result<Index> {
     let n_pps = *avcc.get(at).context("short avcC")? as usize;
     at += 1;
     let pps = list(&mut at, n_pps)?;
+    // As players read it: the `colr` box's, else the stream's own (x264
+    // and ffmpeg write it only there).
+    let matrix = colr.or_else(|| sps.first().and_then(|s| crate::h264::sps_matrix(s)).map(u16::from));
 
     // Sizes.
     let stsz = child(stbl, b"stsz").context("no stsz")?;
