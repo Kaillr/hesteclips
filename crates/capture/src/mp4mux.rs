@@ -13,6 +13,11 @@
 //!
 //! Track names (`hdlr`) and the mix tag (`©cmt`, read by ffprobe as `comment`)
 //! are written directly.
+//!
+//! On macOS only exports' pictures are written here (`mac::export`; the
+//! recordings by AVAssetWriter): the sound and the encoders' Annex B go unused.
+
+#![cfg_attr(target_os = "macos", allow(dead_code))]
 
 use std::fs::File;
 use std::io::{BufWriter, Seek, SeekFrom, Write};

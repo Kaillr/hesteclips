@@ -34,7 +34,7 @@ objc2-core-media = { version = "0.3.2", features = ["CMSampleBuffer", "CMBlockBu
 objc2-core-video = { version = "0.3.2", features = ["CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVPixelBufferIOSurface", "CVPixelBufferPool", "CVReturn", "objc2-io-surface"] }
 objc2-io-surface = { version = "0.3.2", default-features = false, features = ["std", "IOSurfaceRef", "IOSurfaceTypes", "objc2", "objc2-core-foundation"] }
 objc2-foundation = { version = "0.3.2", features = ["NSArray", "NSDictionary", "NSString", "NSError", "NSEnumerator", "NSObject", "NSURL", "NSValue"] }
-objc2-metal = { version = "0.3.2", default-features = false, features = ["std", "block2", "MTLAllocation", "MTLBlitCommandEncoder", "MTLCommandBuffer", "MTLCommandEncoder", "MTLCommandQueue", "MTLComputeCommandEncoder", "MTLComputePipeline", "MTLDevice", "MTLLibrary", "MTLPixelFormat", "MTLResource", "MTLTexture", "MTLTypes", "objc2-io-surface"] }
+objc2-metal = { version = "0.3.2", default-features = false, features = ["std", "block2", "MTLAllocation", "MTLBlitCommandEncoder", "MTLBuffer", "MTLCommandBuffer", "MTLCommandEncoder", "MTLCommandQueue", "MTLComputeCommandEncoder", "MTLComputePipeline", "MTLDevice", "MTLLibrary", "MTLPixelFormat", "MTLResource", "MTLTexture", "MTLTypes", "objc2-io-surface"] }
 objc2-screen-capture-kit = { version = "0.3.2", features = ["SCShareableContent", "SCStream", "block2", "dispatch2", "objc2-core-media", "objc2-core-graphics"] }
 objc2-video-toolbox = { version = "0.3.2", features = ["VTCompressionSession", "VTCompressionProperties", "VTDecompressionSession", "VTDecompressionProperties", "VTPixelTransferProperties", "VTSession", "VTErrors", "objc2-core-media", "objc2-core-video"] }
 

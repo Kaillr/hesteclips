@@ -25,7 +25,7 @@ pub mod mp4meta;
 pub(crate) mod mp4read;
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 mod mp4file;
-#[cfg(any(target_os = "windows", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 mod mp4mux;
 pub mod output;
 pub mod preview;
