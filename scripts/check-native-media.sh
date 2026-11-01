@@ -21,6 +21,8 @@ set -u
 cd "$(dirname "$0")/.."
 dir=${1:-target/native-media-check}
 mkdir -p "$dir"
+# Absolute: cargo runs tests from each crate's own folder.
+dir=$(cd "$dir" && { pwd -W 2>/dev/null || pwd; })
 py=$(command -v python3 || command -v python)
 log="$dir/check.log"
 : > "$log"
