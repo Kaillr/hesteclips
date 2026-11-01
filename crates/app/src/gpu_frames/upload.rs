@@ -91,7 +91,7 @@ pub fn card() -> Option<std::sync::Arc<capture::decode::Card>> {
             return None;
         }
         let rs = RENDER.get()?;
-        capture::decode::Card::new(&rs.device).inspect_err(|e| eprintln!("video: decoding on the CPU ({e:#})")).ok()
+        capture::decode::Card::new(&rs.device, &rs.queue).inspect_err(|e| eprintln!("video: decoding on the CPU ({e:#})")).ok()
     })
     .clone()
 }

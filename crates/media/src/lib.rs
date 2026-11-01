@@ -2378,15 +2378,23 @@ mod export_bench {
     fn export_times() {
         let dir = std::env::temp_dir().join(format!("hc-export-bench-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
+        // CPU seconds this process and the ffmpegs it waited for have used.
+        let cpu = || {
+            let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+            let fields: Vec<f64> = stat.rsplit(')').next().unwrap_or_default().split_whitespace().filter_map(|f| f.parse().ok()).collect();
+            // utime, stime, cutime, cstime: fields 14-17; here from ppid
+            // (field 4) on, the state (a letter) left out.
+            fields.get(10..14).map_or(0.0, |t| t.iter().sum::<f64>() / 100.0)
+        };
         let run = |name: &str, src: &Path, edit: &dyn Fn(&ClipInfo) -> Edit| {
             let info = probe(src).unwrap();
             let e = edit(&info);
             let out = dir.join(format!("{}.mp4", name.replace(' ', "-")));
-            let t = std::time::Instant::now();
+            let (t, used) = (std::time::Instant::now(), cpu());
             render_to(src, &info, &e, &out, None).unwrap();
-            let secs = t.elapsed().as_secs_f64();
+            let (secs, used) = (t.elapsed().as_secs_f64(), cpu() - used);
             let o = probe(&out).unwrap();
-            eprintln!("{name}: {secs:.1} s for {:.1} s of video ({}x{} at {:.0} fps, {:.1} MB)", e.duration(), o.width, o.height, o.fps, std::fs::metadata(&out).unwrap().len() as f64 / 1048576.0);
+            eprintln!("{name}: {secs:.1} s for {:.1} s of video ({}x{} at {:.0} fps, {:.1} MB), {:.0}% of a core", e.duration(), o.width, o.height, o.fps, std::fs::metadata(&out).unwrap().len() as f64 / 1048576.0, used / secs * 100.0);
         };
         let src = PathBuf::from(std::env::var("HC_SRC").unwrap());
         run("trim", &src, &|i| Edit { start: 10.0, end: 40.0, ..Edit::new(i) });

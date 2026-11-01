@@ -1241,7 +1241,7 @@ mod tests {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor { backends: wgpu::Backends::VULKAN, ..wgpu::InstanceDescriptor::new_without_display_handle() });
         let adapter = pollster::block_on(instance.request_adapter(&Default::default())).expect("adapter");
         let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).expect("device");
-        let card = match capture::decode::Card::new(&device) {
+        let card = match capture::decode::Card::new(&device, &queue) {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("skipped: {e:#}");

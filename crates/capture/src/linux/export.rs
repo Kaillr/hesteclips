@@ -1,7 +1,8 @@
 //! Saving an edited clip's picture with the graphics card, for `media`'s
 //! export where the picture is made again (a new size, rate, bitrate or
-//! crop, or frame blending). The frames are decoded in the app (`decode`)
-//! and put up on the card, there cropped and scaled as they are, in YUV
+//! crop, or frame blending). The frames are decoded in the app (`decode`:
+//! on NVIDIA's card, there, into our device's memory; else on the CPU, and
+//! put up on the card), there cropped and scaled as they are, in YUV
 //! (`Nv12Scaler`); or, to blend them, turned into RGB and blended by the
 //! recording's own frame code (`gpu_frame`: blended just as live). Then
 //! they're encoded by the recording's encoders (NVIDIA's, or the card's
@@ -15,14 +16,14 @@
 use std::io::Write;
 use std::path::Path;
 use std::process::{Child, ChildStdin, Stdio};
-use std::sync::Arc;
 use std::sync::mpsc;
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 
-use super::decode::{Decoder, Nv12, Output};
+use super::decode::{Card, Decoder, Nv12, Output};
 use super::gpu::{self, Gpu};
 use super::gpu_frame::{GpuPicture, Nv12Source, Nv12Target, nv12_len};
 use super::nvenc::Nvenc;
@@ -43,7 +44,12 @@ pub(crate) fn render_video(job: &Job, dest: &Path, progress: &dyn Fn(f32)) -> Re
     if job.out_fps == 0 || job.size.0 < 2 || job.size.1 < 2 || job.parts.is_empty() || job.fps <= 0.0 {
         return Ok(false);
     }
-    let Ok(mut decoder) = Decoder::open_threads(job.source, Output::Screen, decode_threads()) else { return Ok(false) };
+    // On NVIDIA's card where it can (the CPU free: ~11 ms a 1440p frame
+    // there, every core busy), into our device's memory, which the frames
+    // are read from where they are.
+    let on_card = Card::background().filter(|_| std::env::var_os("HASTECLIP_CPU_DECODE").is_none()).and_then(|c| Decoder::open_card(job.source, &c).ok());
+    let Some(mut decoder) = on_card.or_else(|| Decoder::open_threads(job.source, Output::Screen, decode_threads()).ok()) else { return Ok(false) };
+    eprintln!("export: decoding with {}", decoder.way());
     decoder.set_fps(job.fps);
     let source = decoder.source_size();
     let timeline = Timeline::new(job);
@@ -78,18 +84,21 @@ pub(crate) fn render_video(job: &Job, dest: &Path, progress: &dyn Fn(f32)) -> Re
     // The source frames wanted, in order, each once: decoded ahead on a
     // thread of their own while the card works on the ones before.
     let wanted = timeline.source_frames(job, shutter.as_ref());
-    let (tx, rx) = mpsc::sync_channel::<Result<(u64, Arc<Vec<u8>>, bool)>>(6);
+    let (tx, rx) = mpsc::sync_channel::<Result<(u64, Nv12, bool)>>(6);
+    let on_card = decoder.pool_size().is_some();
     let decoding = {
         let wanted = wanted.clone();
         thread::Builder::new().name("export decode".into()).spawn(move || {
             for i in wanted {
+                // Playback short of the card's video decoder (a clip being
+                // watched meanwhile): it comes first.
+                while on_card && crate::playback_short() {
+                    thread::sleep(Duration::from_millis(20));
+                }
                 let got = decoder.frame(i).and_then(|p| {
                     let p = p.context("a frame the decoder doesn't have")?;
                     let s = p.gpu.context("a frame not in NV12")?;
-                    match s.nv12 {
-                        Nv12::Memory(nv12) => Ok((i, nv12, s.bt601)),
-                        Nv12::Card(_) => bail!("a frame on the renderer's card"),
-                    }
+                    Ok((i, s.nv12, s.bt601))
                 });
                 let failed = got.is_err();
                 if tx.send(got).is_err() || failed {
@@ -99,12 +108,16 @@ pub(crate) fn render_video(job: &Job, dest: &Path, progress: &dyn Fn(f32)) -> Re
         })?
     };
     let made = (|| -> Result<()> {
-        let next = || -> Result<(Arc<Vec<u8>>, bool)> {
+        let next = || -> Result<(Nv12, bool)> {
             let (_, nv12, bt601) = rx.recv().map_err(|_| anyhow!("the decoder stopped"))??;
             Ok((nv12, bt601))
         };
         let mut shown: Option<u64> = None;
         let mut version = 0u64;
+        // Frames on the card put up since the last frame was encoded: their
+        // buffers go back to the decoder once that's done (an encode waits
+        // for everything the card was given before it).
+        let mut held: Vec<Nv12> = Vec::new();
         match (&shutter, &mut maker) {
             (None, _) => {
                 for k in 0..timeline.frames {
@@ -118,10 +131,12 @@ pub(crate) fn render_video(job: &Job, dest: &Path, progress: &dyn Fn(f32)) -> Re
                                 ensure_drawn(pic.draw(&frame, i))?;
                             }
                         }
+                        held.push(nv12);
                         shown = Some(i);
                         version += 1;
                     }
                     encoder.encode(maker.source(), version, k as i64)?;
+                    held.clear();
                     progress(k as f32 / timeline.frames as f32);
                 }
             }
@@ -139,6 +154,7 @@ pub(crate) fn render_video(job: &Job, dest: &Path, progress: &dyn Fn(f32)) -> Re
                     if shown != Some(i) {
                         let (nv12, bt601) = next()?;
                         pic.hold(&upload.put(&card, &nv12, bt601), i);
+                        held.push(nv12);
                         shown = Some(i);
                     }
                     for (k, w) in [(first, weights[0]), (first + 1, weights[1])] {
@@ -153,6 +169,7 @@ pub(crate) fn render_video(job: &Job, dest: &Path, progress: &dyn Fn(f32)) -> Re
                         ensure_drawn(pic.finish(closed))?;
                         version += 1;
                         encoder.encode(&**pic, version, closed)?;
+                        held.clear();
                         progress(closed as f32 / timeline.frames as f32);
                     }
                     m += 1;
@@ -283,16 +300,20 @@ struct Nv12Scaler {
     gpu: Arc<Gpu>,
     across: wgpu::ComputePipeline,
     down: wgpu::ComputePipeline,
-    /// The decoded frame, and its rows made the new width.
+    /// A frame decoded on the CPU, put up, and the rows made the new width.
     decoded: wgpu::Buffer,
     rows: wgpu::Buffer,
     /// Each output sample's first source sample and its weights, for the
     /// four ways (luma across, chroma across, luma down, chroma down).
     firsts: wgpu::Buffer,
     weights: wgpu::Buffer,
-    /// Everything but the encoder's picture (`Scale`, its size and pitch 0).
-    layout: [u32; 24],
+    /// Everything but the encoder's picture (`Scale`, its size and pitch 0),
+    /// for frames as the CPU decodes them.
+    layout: [u32; 28],
     across_bind: wgpu::BindGroup,
+    /// Frames on the card ([`Nv12::Card`], their rows further apart): what
+    /// they're read across with.
+    card_uniforms: OnceLock<wgpu::Buffer>,
     /// How many of `rows` there are.
     row_values: u32,
 }
@@ -315,6 +336,9 @@ struct Scale {
     taps: vec4<u32>,
     first_at: vec4<u32>,
     weight_at: vec4<u32>,
+    // The decoded frame's rows: bytes from one luma row to the next, where
+    // the U, V pairs' rows start, and bytes from one of those to the next.
+    frame_rows: vec4<u32>,
 }
 
 @group(0) @binding(0) var<storage, read> decoded: array<u32>;
@@ -352,15 +376,14 @@ fn across(@builtin(global_invocation_id) id: vec3<u32>) {
     var sum = 0.0;
     if (i < luma) {
         let x = i % fw;
-        let row = (s.crop.y + i / fw) * s.source.x;
+        let row = (s.crop.y + i / fw) * s.frame_rows.x;
         for (var t = 0u; t < s.taps[0]; t += 1u) {
             sum += decoded_byte(row + tap(0u, x, t, s.crop.x, s.crop.x + s.crop.z - 1u)) * weight(0u, x, t);
         }
     } else {
         let k = i - luma;
         let x = (k % fw) / 2u;
-        let pairs = (s.source.x + 1u) / 2u;
-        let row = s.source.x * s.source.y + (s.crop.y / 2u + k / fw) * pairs * 2u + k % 2u;
+        let row = s.frame_rows.y + (s.crop.y / 2u + k / fw) * s.frame_rows.z + k % 2u;
         let lo = s.crop.x / 2u;
         for (var t = 0u; t < s.taps[1]; t += 1u) {
             sum += decoded_byte(row + 2u * tap(1u, x, t, lo, lo + s.crop.z / 2u - 1u)) * weight(1u, x, t);
@@ -472,11 +495,13 @@ impl Nv12Scaler {
         };
         let firsts = storage("lanczos firsts", &firsts.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(), wgpu::BufferUsages::STORAGE);
         let weights = storage("lanczos weights", &weights.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(), wgpu::BufferUsages::STORAGE);
-        let mut layout = [0u32; 24];
+        let mut layout = [0u32; 28];
         layout[..12].copy_from_slice(&[cx, cy, cw, ch, size.0, size.1, fw, fh, 0, 0, 0, 0]);
         layout[12..16].copy_from_slice(&taps);
         layout[16..20].copy_from_slice(&first_at);
         layout[20..24].copy_from_slice(&weight_at);
+        // Rows as the CPU decodes them: tight, the pairs after the luma.
+        layout[24..28].copy_from_slice(&[size.0, size.0 * size.1, size.0.div_ceil(2) * 2, 0]);
         let decoded = decoded_buffer(&gpu, size);
         let row_values = ch * fw + ch / 2 * fw;
         let rows = device.create_buffer(&wgpu::BufferDescriptor { label: Some("rows across"), size: row_values as u64 * 4, usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false });
@@ -492,19 +517,47 @@ impl Nv12Scaler {
                 wgpu::BindGroupEntry { binding: 4, resource: weights.as_entire_binding() },
             ],
         });
-        Self { gpu, across, down, decoded, rows, firsts, weights, layout, across_bind, row_values }
+        Self { gpu, across, down, decoded, rows, firsts, weights, layout, across_bind, card_uniforms: OnceLock::new(), row_values }
     }
 
-    /// The next frame, `nv12` as decoded: up, and made the new width.
-    fn put(&self, nv12: &[u8]) {
-        let len = nv12.len().min(self.decoded.size() as usize) / 4 * 4;
-        self.gpu.queue.write_buffer(&self.decoded, 0, &nv12[..len]);
+    /// The next frame, `nv12` as decoded, made the new width: read where it
+    /// is on the card, or put up first.
+    fn put(&self, nv12: &Nv12) {
+        let card_bind;
+        let bind = match nv12 {
+            Nv12::Memory(nv12) => {
+                let len = nv12.len().min(self.decoded.size() as usize) / 4 * 4;
+                self.gpu.queue.write_buffer(&self.decoded, 0, &nv12[..len]);
+                &self.across_bind
+            }
+            Nv12::Card(f) => {
+                let uniforms = self.card_uniforms.get_or_init(|| {
+                    let mut layout = self.layout;
+                    layout[24..28].copy_from_slice(&[f.pitch(), f.chroma_at() as u32, f.pitch(), 0]);
+                    let buffer = self.gpu.device.create_buffer(&wgpu::BufferDescriptor { label: Some("scale card frames"), size: 112, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+                    self.gpu.queue.write_buffer(&buffer, 0, &layout.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+                    buffer
+                });
+                card_bind = self.gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("across a card frame"),
+                    layout: &self.across.get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: f.buffer().as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: self.rows.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 2, resource: uniforms.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 3, resource: self.firsts.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 4, resource: self.weights.as_entire_binding() },
+                    ],
+                });
+                &card_bind
+            }
+        };
         let groups = self.row_values.div_ceil(64);
         let mut enc = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("across") });
         {
             let mut pass = enc.begin_compute_pass(&Default::default());
             pass.set_pipeline(&self.across);
-            pass.set_bind_group(0, &self.across_bind, &[]);
+            pass.set_bind_group(0, bind, &[]);
             pass.dispatch_workgroups(groups.min(65535), groups.div_ceil(65535), 1);
         }
         self.gpu.queue.submit([enc.finish()]);
@@ -520,7 +573,7 @@ impl Nv12Source for Nv12Scaler {
         let device = &self.gpu.device;
         let mut layout = self.layout;
         layout[8..11].copy_from_slice(&[size.0, size.1, pitch]);
-        let uniforms = device.create_buffer(&wgpu::BufferDescriptor { label: Some("scale nv12"), size: 96, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let uniforms = device.create_buffer(&wgpu::BufferDescriptor { label: Some("scale nv12"), size: 112, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         self.gpu.queue.write_buffer(&uniforms, 0, &layout.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
         let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("down"),
@@ -594,7 +647,12 @@ struct Size {
     width: u32,
     height: u32,
     bt601: u32,
-    _pad: u32,
+    // Bytes from one luma row to the next, where the U, V pairs' rows
+    // start, and bytes from one of those to the next.
+    pitch: u32,
+    chroma_at: u32,
+    chroma_pitch: u32,
+    _pad: vec2<u32>,
 }
 
 @group(0) @binding(0) var<storage, read> nv12: array<u32>;
@@ -612,9 +670,8 @@ fn to_rgb(@builtin(global_invocation_id) id: vec3<u32>) {
     if (id.x >= s.width || id.y >= s.height) {
         return;
     }
-    let cw = (s.width + 1u) / 2u;
-    let l = 1.164 * (byte_at(id.y * s.width + id.x) - 16.0);
-    let c = s.width * s.height + ((id.y / 2u) * cw + id.x / 2u) * 2u;
+    let l = 1.164 * (byte_at(id.y * s.pitch + id.x) - 16.0);
+    let c = s.chroma_at + (id.y / 2u) * s.chroma_pitch + (id.x / 2u) * 2u;
     let cb = byte_at(c) - 128.0;
     let cr = byte_at(c + 1u) - 128.0;
     var k = vec4<f32>(1.793, 0.213, 0.533, 2.112);
@@ -632,7 +689,7 @@ impl Upload {
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("to rgb"), source: wgpu::ShaderSource::Wgsl(TO_RGB_SHADER.into()) });
         let to_rgb = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some("to rgb"), layout: None, module: &module, entry_point: Some("to_rgb"), compilation_options: Default::default(), cache: None });
         let nv12 = decoded_buffer(card, (w, h));
-        let uniforms = device.create_buffer(&wgpu::BufferDescriptor { label: Some("to rgb"), size: 16, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let uniforms = device.create_buffer(&wgpu::BufferDescriptor { label: Some("to rgb"), size: 32, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let texture = || {
             device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("decoded frame"),
@@ -648,20 +705,28 @@ impl Upload {
         Self { to_rgb, nv12, uniforms, textures: [texture(), texture()], next: 0, size: (w, h) }
     }
 
-    /// The frame `nv12` as RGB on the card.
-    fn put(&mut self, card: &Gpu, nv12: &[u8], bt601: bool) -> Frame {
+    /// The frame `nv12` as RGB on the card: read where it is on the card, or
+    /// put up first.
+    fn put(&mut self, card: &Gpu, nv12: &Nv12, bt601: bool) -> Frame {
         let texture = self.textures[self.next].clone();
         self.next = 1 - self.next;
-        let len = (nv12.len().min(self.nv12.size() as usize)) / 4 * 4;
-        card.queue.write_buffer(&self.nv12, 0, &nv12[..len]);
-        let sizes: Vec<u8> = [self.size.0, self.size.1, u32::from(bt601), 0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let (w, h) = self.size;
+        let (source, rows) = match nv12 {
+            Nv12::Memory(nv12) => {
+                let len = (nv12.len().min(self.nv12.size() as usize)) / 4 * 4;
+                card.queue.write_buffer(&self.nv12, 0, &nv12[..len]);
+                (&self.nv12, [w, w * h, w.div_ceil(2) * 2])
+            }
+            Nv12::Card(f) => (f.buffer(), [f.pitch(), f.chroma_at() as u32, f.pitch()]),
+        };
+        let sizes: Vec<u8> = [w, h, u32::from(bt601), rows[0], rows[1], rows[2], 0, 0].iter().flat_map(|v| v.to_le_bytes()).collect();
         card.queue.write_buffer(&self.uniforms, 0, &sizes);
         let view = texture.create_view(&Default::default());
         let bind = card.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("to rgb"),
             layout: &self.to_rgb.get_bind_group_layout(0),
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.nv12.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 0, resource: source.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&view) },
                 wgpu::BindGroupEntry { binding: 2, resource: self.uniforms.as_entire_binding() },
             ],

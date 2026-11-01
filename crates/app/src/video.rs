@@ -303,6 +303,11 @@ impl Video {
                 };
                 let room = {
                     let s = shared.lock().unwrap();
+                    // Playing with hardly a frame ahead of the clock: the
+                    // decoder is what holds playback back.
+                    if playing && !at_end && s.ahead.len() < 3 {
+                        capture::playback_behind();
+                    }
                     // Scrubbing, the frames kept are the read-ahead.
                     !at_end && dir == 0 && s.ahead.len() < if playing { ahead_playing } else { AHEAD_PAUSED }
                 };

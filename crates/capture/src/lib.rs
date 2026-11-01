@@ -643,6 +643,30 @@ pub fn screen_capture_auto_duplicates() -> bool {
     }
 }
 
+/// Until when playback's decoder was last behind, in ms on [`clock_ms`]:
+/// background decoding (the filmstrip, exports) keeps off the decoder
+/// playback uses meanwhile. NVIDIA's card has one, and a 1440p 540 fps clip
+/// needs nearly all of it: the filmstrip decoding there too held playback
+/// to 400 frames a second.
+static PLAYBACK_BEHIND_UNTIL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Milliseconds since the first time this was asked.
+fn clock_ms() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
+
+/// Playback's decoder can't keep ahead of the clock: background decoding
+/// keeps off its decoder for the next moment (said again while it lasts).
+pub fn playback_behind() {
+    PLAYBACK_BEHIND_UNTIL_MS.fetch_max(clock_ms() + 500, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether playback's decoder is behind, or was a moment ago.
+pub fn playback_short() -> bool {
+    clock_ms() < PLAYBACK_BEHIND_UNTIL_MS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// How much memory this computer has, in bytes.
 pub fn total_memory() -> Option<u64> {
     #[cfg(target_os = "windows")]
