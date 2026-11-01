@@ -152,13 +152,15 @@ pub(crate) struct Nvenc {
 impl Nvenc {
     /// Start encoding `width`×`height` frames at `fps` and `kbps` into
     /// `out`: made on the card by `picture`, or (`None`) handed in from the
-    /// CPU. For an `export` (not live: frames can take longer) two presets
-    /// slower and tuned for quality, with B-frames (frames then reach `out`
+    /// CPU. For an `export` (not live: frames can take longer) tuned for
+    /// quality, with B-frames (frames then reach `out`
     /// in decode order, up to 3 before the frames shown first: see
     /// `Spec::reorder`), for a better picture in as many bits. `Ok(None)`
     /// where there's no NVIDIA driver.
     pub(crate) fn start(width: u32, height: u32, fps: u32, kbps: u32, out: Sender<WriterCommand>, picture: Option<&dyn Nv12Source>, export: bool) -> Result<Option<Self>> {
-        let preset = if export { (preset(width, height, fps) + 2).min(7) } else { preset(width, height, fps) };
+        // Exports too: slower presets made the same picture (P6 against P4,
+        // tuned for quality, within 0.01 dB SSIM) at two thirds the speed.
+        let preset = preset(width, height, fps);
         let started = Self::open(width, height, fps, kbps, preset, export, out, picture);
         if let Ok(Some(_)) = &started {
             let from = if picture.is_some() { "made in the card's memory" } else { "copied up from ours" };
