@@ -13,10 +13,11 @@
 //! one's bitstream when it's done, in order, for the writer.
 
 use std::collections::VecDeque;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError};
+use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use ash::vk;
@@ -24,7 +25,8 @@ use ash::vk::native::*;
 use wgpu::hal::api::Vulkan;
 
 use super::gpu::Gpu;
-use super::gpu_frame::{Nv12Source, Nv12Target};
+use super::gpu_frame::{GpuPicture, Nv12Source, Nv12Target};
+use super::screen::{Frame, Order};
 use crate::mp4file::{EncodedFrame, VideoFrame};
 use crate::mp4mux::{AvcConfig, annexb_to_avcc};
 use crate::writer::{Command as WriterCommand, Media};
@@ -283,6 +285,71 @@ impl Drop for Slot {
     }
 }
 
+/// Whether the card's encoder makes what it's given, asked once a run: five
+/// frames drawn on the card (1080p: cropped from whole macroblocks), a
+/// keyframe and four from it, encoded, decoded on the CPU and compared with
+/// what went in (~80 ms). One that fails isn't used (ffmpeg encodes): it's
+/// untried on most cards, and a recording of garbage would only show once
+/// it was made.
+fn check(gpu: &Arc<Gpu>) -> Result<()> {
+    static CHECKED: OnceLock<Result<(), String>> = OnceLock::new();
+    CHECKED
+        .get_or_init(|| check_now(gpu).inspect_err(|e| eprintln!("the card's video encoder (Vulkan Video) failed its check: {e:#}")).map_err(|e| format!("{e:#}")))
+        .clone()
+        .map_err(|e| anyhow!("it failed its check ({e})"))
+}
+
+fn check_now(gpu: &Arc<Gpu>) -> Result<()> {
+    let (w, h, fps, n) = (1920u32, 1080u32, 60u32, 5u32);
+    let mut pic = GpuPicture::new(gpu.clone(), w, h, crate::ScreenPlacement::whole(crate::Framing::Fit));
+    let (tx, rx) = mpsc::channel();
+    let enc = VkEncoder::open(w, h, fps, 20_000, tx, &pic, false)?.context("no encoder")?;
+    let mut wanted = Vec::new();
+    for i in 0..n {
+        // Made at half the size: the card scales it up, as a screen's.
+        ensure!(pic.draw(&check_picture(w / 2, h / 2, i), i as u64 + 1), "a picture couldn't be made");
+        let mut want = Vec::new();
+        pic.nv12(&mut want);
+        wanted.push(want);
+        let until = Instant::now() + Duration::from_secs(2);
+        while !enc.encode_gpu(&pic, i as u64, i as i64) {
+            ensure!(!enc.failed() && Instant::now() < until, "it took no frame");
+            thread::sleep(Duration::from_micros(200));
+        }
+    }
+    enc.finish();
+    let (mut config, mut frames) = (None, Vec::new());
+    for command in rx.try_iter() {
+        let WriterCommand::Media(Media::Video { frame, pts, key }) = command else { continue };
+        if config.is_none() {
+            config = frame.0.config.clone();
+        }
+        frames.push((frame.0.data.clone(), (pts * fps as f64).round() as i64, key));
+    }
+    ensure!(frames.len() == n as usize, "{} frames of {n} came out", frames.len());
+    let config = config.context("no parameter sets")?;
+    let frames: Vec<(&[u8], i64, bool)> = frames.iter().map(|(d, pts, key)| (&d[..], *pts, *key)).collect();
+    let decoded = super::decode::decode_h264(&config.record(), &frames, (w, h))?;
+    ensure!(decoded.len() == n as usize, "{} frames of {n} decode", decoded.len());
+    for (i, ((_, got), want)) in decoded.iter().zip(&wanted).enumerate() {
+        let off = got.iter().zip(want).map(|(a, b)| a.abs_diff(*b) as u64).sum::<u64>() as f64 / want.len().max(1) as f64;
+        ensure!(off < 3.0, "frame {i} comes back off by {off:.1} a byte on average");
+    }
+    Ok(())
+}
+
+/// A picture for checking the encoder (and testing it): gradients moving
+/// with `i`, every pixel different from its neighbours.
+fn check_picture(w: u32, h: u32, i: u32) -> Frame {
+    let mut data = Vec::with_capacity((w * h * 4) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            data.extend_from_slice(&[((x + y) / 2 + i * 3) as u8, (y + i * 2) as u8, (x + i * 4) as u8, 255]);
+        }
+    }
+    Frame { width: w, height: h, stride: w as usize * 4, order: Order::Bgr, data, texture: None }
+}
+
 /// A running encoder.
 pub(crate) struct VkEncoder {
     free: Receiver<Slot>,
@@ -290,14 +357,30 @@ pub(crate) struct VkEncoder {
     worker: Option<JoinHandle<()>>,
     session: Option<Arc<Session>>,
     broken: Arc<AtomicBool>,
+    /// What it is, for the log.
+    about: String,
 }
 
 impl VkEncoder {
     /// Start encoding `width`×`height` frames at `fps` and `kbps` into `out`,
     /// made on the card by `picture`; for an `export` (not live) at the best
     /// quality level but one. `Ok(None)` where the card can't encode H.264
-    /// through Vulkan Video.
+    /// through Vulkan Video; an error where it fails its check ([`check`]).
     pub(crate) fn start(width: u32, height: u32, fps: u32, kbps: u32, out: Sender<WriterCommand>, picture: &dyn Nv12Source, export: bool) -> Result<Option<Self>> {
+        let gpu = picture.gpu().clone();
+        if gpu.video.is_none() {
+            return Ok(None);
+        }
+        check(&gpu)?;
+        let enc = Self::open(width, height, fps, kbps, out, picture, export)?;
+        if let Some(e) = &enc {
+            eprintln!("video encoder: {}", e.about);
+        }
+        Ok(enc)
+    }
+
+    /// [`Self::start`], unchecked.
+    fn open(width: u32, height: u32, fps: u32, kbps: u32, out: Sender<WriterCommand>, picture: &dyn Nv12Source, export: bool) -> Result<Option<Self>> {
         let gpu = picture.gpu().clone();
         let Some(video) = &gpu.video else { return Ok(None) };
         let family = video.family;
@@ -596,17 +679,17 @@ impl VkEncoder {
         let session = Arc::new(session);
         let broken = Arc::new(AtomicBool::new(false));
         let (frames, frames_rx) = mpsc::sync_channel(count);
-        let mut enc = Self { free, frames: Some(frames), worker: None, session: Some(session.clone()), broken: broken.clone() };
-        for slot in slots_made {
-            let _ = free_tx.send(slot);
-        }
-        enc.worker = Some(thread::Builder::new().name("vulkan encode".into()).spawn(move || encode_frames(&session, frames_rx, free_tx, &broken, fps, out))?);
-        eprintln!(
-            "video encoder: Vulkan Video ({width}x{height} at {fps} fps, quality level {quality} of {}, {} {} kbps)",
+        let about = format!(
+            "Vulkan Video ({width}x{height} at {fps} fps, quality level {quality} of {}, {} {} kbps)",
             caps.quality_levels,
             if mode == vk::VideoEncodeRateControlModeFlagsKHR::VBR { "VBR" } else { "CBR" },
             kbps
         );
+        let mut enc = Self { free, frames: Some(frames), worker: None, session: Some(session.clone()), broken: broken.clone(), about };
+        for slot in slots_made {
+            let _ = free_tx.send(slot);
+        }
+        enc.worker = Some(thread::Builder::new().name("vulkan encode".into()).spawn(move || encode_frames(&session, frames_rx, free_tx, &broken, fps, out))?);
         Ok(Some(enc))
     }
 
@@ -1019,23 +1102,9 @@ fn encode_frames(s: &Session, frames: Receiver<(Slot, i64)>, free: Sender<Slot>,
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
-
     use super::super::gpu;
-    use super::super::gpu_frame::{GpuPicture, nv12_len};
-    use super::super::screen::{Frame, Order};
+    use super::super::gpu_frame::nv12_len;
     use super::*;
-
-    /// A picture that moves: gradients shifting with `i`.
-    fn picture(w: u32, h: u32, i: u32) -> Frame {
-        let mut data = Vec::with_capacity((w * h * 4) as usize);
-        for y in 0..h {
-            for x in 0..w {
-                data.extend_from_slice(&[((x + y) / 2 + i * 3) as u8, (y + i * 2) as u8, (x + i * 4) as u8, 255]);
-            }
-        }
-        Frame { width: w, height: h, stride: w as usize * 4, order: Order::Bgr, data, texture: None }
-    }
 
     /// The frames the writer got, as H.264 (Annex B) for ffmpeg, and their times.
     fn stream(rx: &Receiver<WriterCommand>) -> (Vec<u8>, Vec<(f64, bool)>) {
@@ -1079,7 +1148,7 @@ mod tests {
         let enc = VkEncoder::start(w, h, fps, 20_000, tx, &pic, false).unwrap().expect("an encoder");
         let mut wanted = Vec::new();
         for i in 0..n {
-            assert!(pic.draw(&picture(w, h, i), i as u64 + 1));
+            assert!(pic.draw(&check_picture(w, h, i), i as u64 + 1));
             let mut want = Vec::new();
             pic.nv12(&mut want);
             wanted.push(want);

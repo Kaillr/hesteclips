@@ -1236,6 +1236,63 @@ impl Decoder {
     }
 }
 
+/// H.264 frames (each with 4-byte lengths before its NAL units: AVCC) of a
+/// stream set up by `avcc` (an `avcC` box's content), decoded on the CPU:
+/// each frame's time and picture, tight NV12 of `size`, in the order
+/// they're shown. For checking an encoder (`super::vkenc`).
+pub(crate) fn decode_h264(avcc: &[u8], frames: &[(&[u8], i64, bool)], (w, h): (u32, u32)) -> Result<Vec<(i64, Vec<u8>)>> {
+    load()?;
+    let mut err = [0 as c_char; 512];
+    // SAFETY: the setup bytes and the error buffer are valid for the call.
+    let dec = unsafe { hcav_open(avcc.as_ptr(), avcc.len() as c_int, 1, ON_CPU, std::ptr::null_mut(), err.as_mut_ptr(), err.len() as c_int) };
+    ensure!(!dec.is_null(), "{}", text(&err));
+    struct Open(*mut c_void);
+    impl Drop for Open {
+        fn drop(&mut self) {
+            // SAFETY: opened above, closed once.
+            unsafe { hcav_close(self.0) };
+        }
+    }
+    let dec = Open(dec);
+    let mut out = Vec::new();
+    // Every frame that's ready taken out.
+    let take = |out: &mut Vec<(i64, Vec<u8>)>| -> Result<()> {
+        loop {
+            let (mut pts, mut code) = (0i64, 0);
+            // SAFETY: the decoder is open; valid out-parameters.
+            match unsafe { hcav_receive(dec.0, &mut pts, &mut code) } {
+                FRAME => {
+                    let mut buf = vec![0u8; media_frame_bytes((w, h)) as usize];
+                    // SAFETY: the decoder holds the frame; `buf` is a whole frame of that size.
+                    let ok = unsafe { hcav_download(dec.0) == 0 && hcav_take_nv12(dec.0, buf.as_mut_ptr(), w as c_int, h as c_int) == 0 };
+                    ensure!(ok, "a frame isn't {w}x{h}, 8-bit 4:2:0");
+                    out.push((pts, buf));
+                }
+                AGAIN | END => return Ok(()),
+                _ => bail!("the decoder failed: {}", error_text(code)),
+            }
+        }
+    };
+    for &(data, pts, key) in frames {
+        loop {
+            let mut code = 0;
+            // SAFETY: the frame's bytes, valid for the call.
+            match unsafe { hcav_send(dec.0, data.as_ptr(), data.len() as c_int, pts, c_int::from(key), &mut code) } {
+                SENT => break,
+                AGAIN => take(&mut out)?,
+                _ => bail!("the decoder turned frame {pts} down: {}", error_text(code)),
+            }
+        }
+        take(&mut out)?;
+    }
+    let mut code = 0;
+    // SAFETY: a null packet asks for the end.
+    unsafe { hcav_send(dec.0, std::ptr::null(), 0, 0, 0, &mut code) };
+    take(&mut out)?;
+    out.sort_by_key(|f| f.0);
+    Ok(out)
+}
+
 /// The bytes in an NV12 frame of `(width, height)`.
 fn media_frame_bytes((w, h): (u32, u32)) -> u64 {
     w as u64 * h as u64 + 2 * w.div_ceil(2) as u64 * h.div_ceil(2) as u64

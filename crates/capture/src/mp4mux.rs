@@ -59,6 +59,27 @@ pub(crate) struct AvcConfig {
     pub pps: Vec<u8>,
 }
 
+impl AvcConfig {
+    /// As an `avcC` box holds them (the box's content): what a decoder is
+    /// set up from, for frames with 4-byte NAL lengths.
+    pub(crate) fn record(&self) -> Vec<u8> {
+        let (sps, pps) = (&self.sps, &self.pps);
+        let mut avcc = vec![1, sps.get(1).copied().unwrap_or(100), sps.get(2).copied().unwrap_or(0), sps.get(3).copied().unwrap_or(40)];
+        avcc.push(0xFF); // 4-byte NAL lengths
+        avcc.push(0xE1);
+        avcc.put_u16(sps.len() as u16);
+        avcc.extend_from_slice(sps);
+        avcc.push(1);
+        avcc.put_u16(pps.len() as u16);
+        avcc.extend_from_slice(pps);
+        if matches!(sps.get(1), Some(100 | 110 | 122 | 144)) {
+            // 4:2:0, 8-bit, no SPS extensions.
+            avcc.extend_from_slice(&[0xFD, 0xF8, 0xF8, 0]);
+        }
+        avcc
+    }
+}
+
 struct Track {
     id: u32,
     video: bool,
@@ -583,20 +604,7 @@ impl Muxer {
         b.put_u16(0x18);
         b.put_u16(0xFFFF);
 
-        let (sps, pps) = (&self.avc.sps, &self.avc.pps);
-        let mut avcc = vec![1, sps.get(1).copied().unwrap_or(100), sps.get(2).copied().unwrap_or(0), sps.get(3).copied().unwrap_or(40)];
-        avcc.push(0xFF); // 4-byte NAL lengths
-        avcc.push(0xE1);
-        avcc.put_u16(sps.len() as u16);
-        avcc.extend_from_slice(sps);
-        avcc.push(1);
-        avcc.put_u16(pps.len() as u16);
-        avcc.extend_from_slice(pps);
-        if matches!(sps.get(1), Some(100 | 110 | 122 | 144)) {
-            // 4:2:0, 8-bit, no SPS extensions.
-            avcc.extend_from_slice(&[0xFD, 0xF8, 0xF8, 0]);
-        }
-        b.extend(make_box(b"avcC", &avcc));
+        b.extend(make_box(b"avcC", &self.avc.record()));
         // BT.709, limited range — what the encoder is given.
         let mut colr = b"nclx".to_vec();
         colr.put_u16(1);
