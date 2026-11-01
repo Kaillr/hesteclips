@@ -166,7 +166,7 @@ pub(crate) fn render_video(job: &Job, dest: &Path, progress: &dyn Fn(f32)) -> Re
                 let mut queue = Queue { encoder: &encoder, pending: VecDeque::new() };
                 let mut picture: Option<Rc<Made>> = None;
                 for k in 0..timeline.frames {
-                    let i = timeline.source_frame(job, timeline.frame_time(k, job.out_fps));
+                    let i = timeline.shown(job, k);
                     if shown != Some(i) {
                         picture = Some(Rc::new(next()?));
                         shown = Some(i);
@@ -177,7 +177,6 @@ pub(crate) fn render_video(job: &Job, dest: &Path, progress: &dyn Fn(f32)) -> Re
                 queue.flush()?;
             }
             (Some(s), Some(blender)) => {
-                let rate = job.blend.map_or(1, |b| b.0) as f64;
                 let last = timeline.frames as i64 - 1;
                 let mut closed = -1i64;
                 let mut m = s.first_look(0);
@@ -193,7 +192,7 @@ pub(crate) fn render_video(job: &Job, dest: &Path, progress: &dyn Fn(f32)) -> Re
                     if first > last {
                         break;
                     }
-                    let i = timeline.source_frame(job, (m as f64 + 0.5) / rate);
+                    let i = timeline.seen(job, m);
                     if shown != Some(i) {
                         blender.hold(Arc::new(Buffer(next()?.frame)));
                         shown = Some(i);

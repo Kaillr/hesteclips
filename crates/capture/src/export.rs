@@ -66,26 +66,45 @@ impl Timeline {
         Self { seconds, frames }
     }
 
-    /// Frame `k`'s time in the saved video.
-    pub(crate) fn frame_time(&self, k: u64, fps: u32) -> f64 {
-        k as f64 / fps as f64
+    /// The source frame saved frame `k` shows, as ffmpeg's `fps` filter
+    /// picks it: each source frame's time rounded to the nearest new frame's
+    /// (halves up), the last of those kept: the last to start before the
+    /// middle of frame `k`'s time. (Taken at the start of its time instead,
+    /// 144 fps saved at 60 showed frames 0, 2, 4, 7 where ffmpeg's showed 1,
+    /// 3, 5, 8; at half the rate they're the same.) At the source's own
+    /// rate, each frame itself.
+    pub(crate) fn shown(&self, job: &Job, k: u64) -> u64 {
+        self.before(job, (k as f64 + 0.5) / job.out_fps.max(1) as f64)
     }
 
-    /// The source frame showing at `t` seconds of the saved video (before
-    /// its start, the first; past its end, the last).
-    pub(crate) fn source_frame(&self, job: &Job, t: f64) -> u64 {
-        let t = t.clamp(0.0, (self.seconds - 1e-6).max(0.0));
+    /// The source frame blending's look `m` sees: the last to start before
+    /// the look's time (the middle of its step at the blend rate), as
+    /// ffmpeg's `fps` filter makes the blend rate's frames.
+    pub(crate) fn seen(&self, job: &Job, m: i64) -> u64 {
+        let rate = job.blend.map_or(job.out_fps, |b| b.0).max(1) as f64;
+        self.before(job, (m as f64 + 0.5) / rate)
+    }
+
+    /// The last source frame to start before `t` seconds of the saved video
+    /// (at a join, the part before's last). Before a part's start, the frame
+    /// showing there; past the end, the last.
+    fn before(&self, job: &Job, t: f64) -> u64 {
+        let t = t.min(self.seconds);
         let mut before = 0.0;
-        let mut at = job.parts[job.parts.len() - 1].1;
-        for &(a, b) in job.parts {
-            let len = (b - a).max(0.0);
-            if t < before + len {
-                at = a + (t - before);
+        let (mut a, mut at) = (job.parts[0].0, job.parts[0].0);
+        for &(pa, pb) in job.parts {
+            let len = (pb - pa).max(0.0);
+            (a, at) = (pa, pa + (t - before).max(0.0));
+            if t <= before + len + 1e-10 {
                 break;
             }
             before += len;
         }
-        (at * job.fps + 1e-6).floor().max(0.0) as u64
+        // In frames; one starting at `t`, as far as the arithmetic can tell,
+        // isn't before it.
+        let last = (at * job.fps - 1e-6).ceil() - 1.0;
+        let first = (a * job.fps + 1e-6).floor();
+        last.max(first).max(0.0) as u64
     }
 
     /// The source frames wanted, in the order they're used, each once.
@@ -97,13 +116,12 @@ impl Timeline {
             }
         };
         match shutter {
-            None => (0..self.frames).for_each(|k| push(self.source_frame(job, self.frame_time(k, job.out_fps)))),
+            None => (0..self.frames).for_each(|k| push(self.shown(job, k))),
             Some(s) => {
-                let rate = job.blend.map_or(1, |b| b.0) as f64;
                 let last = self.frames as i64 - 1;
                 let mut m = s.first_look(0);
                 while s.split(m).0 <= last {
-                    push(self.source_frame(job, (m as f64 + 0.5) / rate));
+                    push(self.seen(job, m));
                     m += 1;
                 }
             }
@@ -149,6 +167,59 @@ pub(crate) fn lanczos(at: u32, len: u32, out: u32) -> (Vec<i32>, Vec<f32>, u32) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn job(parts: &[(f64, f64)], fps: f64, out_fps: u32, blend: Option<(u32, BlendShape)>) -> Job<'_> {
+        Job { source: Path::new(""), fps, parts, crop: None, size: (2, 2), out_fps, blend, kbps: 1, fit: false }
+    }
+
+    /// At fewer frames a second, the frames ffmpeg's exports show: read from
+    /// them, made from clips whose frames carry their numbers
+    /// (`scripts/frame-numbers.py`), 1 s to 9 s of each.
+    #[test]
+    fn frames_shown_are_ffmpegs() {
+        let shown = |fps: f64, out: u32, parts: &[(f64, f64)]| {
+            let j = job(parts, fps, out, None);
+            let t = Timeline::new(&j);
+            (0..8).map(|k| t.shown(&j, k)).collect::<Vec<_>>()
+        };
+        assert_eq!(shown(144.0, 60, &[(1.0, 9.0)]), [145, 147, 149, 152, 154, 157, 159, 161]);
+        assert_eq!(shown(120.0, 30, &[(1.0, 9.0)]), [121, 125, 129, 133, 137, 141, 145, 149]);
+        assert_eq!(shown(120.0, 60, &[(1.0, 9.0)]), [120, 122, 124, 126, 128, 130, 132, 134]);
+        // 540 fps at 60 from 2 s.
+        assert_eq!(shown(540.0, 60, &[(2.0, 6.0)])[..3], [1084, 1093, 1102]);
+        // The source's own rate: each frame.
+        assert_eq!(shown(60.0, 60, &[(1.0, 9.0)])[..4], [60, 61, 62, 63]);
+    }
+
+    /// A frame whose middle is right at a join shows the part before's last
+    /// frame (the part after's first starts there, not before).
+    #[test]
+    fn a_join_at_a_frames_middle() {
+        // 60 fps saved at 40: frame 2's middle at 2.5 / 40 = 0.0625 s, the
+        // join. The part before's frames start at 0, 1/60, 2/60, 3/60.
+        let parts = [(0.0, 0.0625), (10.0, 11.0)];
+        let j = job(&parts, 60.0, 40, None);
+        let t = Timeline::new(&j);
+        assert_eq!(t.shown(&j, 2), 3);
+        // Frame 3's middle, 0.025 s into the part after: its second frame.
+        assert_eq!(t.shown(&j, 3), 601);
+    }
+
+    /// Blending looks: at the source's rate each sees its own frame; at a
+    /// lower blend rate, the frames ffmpeg's `fps` filter makes it from
+    /// (every other one from the first, at half). Looks before the start see
+    /// the first frame.
+    #[test]
+    fn looks_are_ffmpegs() {
+        let parts = [(1.0, 3.0)];
+        let j = job(&parts, 540.0, 60, Some((540, BlendShape::Even)));
+        let t = Timeline::new(&j);
+        assert_eq!((0..4).map(|m| t.seen(&j, m)).collect::<Vec<_>>(), [540, 541, 542, 543]);
+        let j = job(&parts, 240.0, 60, Some((120, BlendShape::Even)));
+        let t = Timeline::new(&j);
+        assert_eq!((0..4).map(|m| t.seen(&j, m)).collect::<Vec<_>>(), [240, 242, 244, 246]);
+        assert_eq!(t.seen(&j, -2), 240);
+    }
 
     /// Each output sample's weights add up to one, shrinking or growing.
     #[test]
