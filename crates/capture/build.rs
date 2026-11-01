@@ -36,6 +36,9 @@ fn main() {
     build.file("src/linux/avdec.c");
     match include {
         Some(dir) => {
+            // Built again when they change (a system update to another
+            // libavcodec): else the app asks for a library that's gone.
+            println!("cargo:rerun-if-changed={}", dir.join("libavcodec/version_major.h").display());
             build.include(dir);
         }
         None => {
