@@ -2399,7 +2399,7 @@ mod export_bench {
         let dir = std::env::temp_dir().join(format!("hc-export-bench-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         // CPU seconds this process and the ffmpegs it waited for have used.
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", windows)))]
         let cpu = || {
             let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
             let fields: Vec<f64> = stat.rsplit(')').next().unwrap_or_default().split_whitespace().filter_map(|f| f.parse().ok()).collect();
@@ -2417,6 +2417,21 @@ mod export_bench {
                 secs(u.ru_utime) + secs(u.ru_stime)
             };
             used(libc::RUSAGE_SELF) + used(libc::RUSAGE_CHILDREN)
+        };
+        // Windows counts no child's time to its parent: a job does, for
+        // this process and every one it starts from now on, ended or not.
+        #[cfg(windows)]
+        let cpu = {
+            use windows::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JobObjectBasicAccountingInformation, QueryInformationJobObject};
+            let job = unsafe { CreateJobObjectW(None, None) }.unwrap();
+            unsafe { AssignProcessToJobObject(job, windows::Win32::System::Threading::GetCurrentProcess()) }.unwrap();
+            move || {
+                let mut info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+                let size = std::mem::size_of_val(&info) as u32;
+                unsafe { QueryInformationJobObject(Some(job), JobObjectBasicAccountingInformation, (&raw mut info).cast(), size, None) }.unwrap();
+                // In 100 ns.
+                (info.TotalUserTime + info.TotalKernelTime) as f64 / 1e7
+            }
         };
         let run = |name: &str, src: &Path, edit: &dyn Fn(&ClipInfo) -> Edit| {
             let info = probe(src).unwrap();

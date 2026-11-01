@@ -15,3 +15,8 @@ serde_json = "1.0.151"
 # `export_times`: the CPU an export used, on macOS (Linux reads /proc).
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 libc = "0.2"
+
+# `export_times` on Windows: this process's and its ffmpegs' CPU time,
+# counted by a job object.
+[target.'cfg(windows)'.dev-dependencies]
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
