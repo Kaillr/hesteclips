@@ -69,13 +69,15 @@ impl Thumbs {
         let (done_tx, done_rx) = mpsc::channel::<Done>();
         let app_ctx = ctx.clone();
         // A few workers sharing one queue: thumbnails still arrive roughly
-        // newest-first (the order they're requested). Each ffmpeg runs at low
-        // priority and is mostly process start-up, so a capture isn't starved.
+        // newest-first (the order they're requested). Each decodes at low
+        // priority (as ffmpeg did, made one), so a game or a capture isn't
+        // starved.
         let workers = std::thread::available_parallelism().map_or(2, |n| n.get() / 3).clamp(2, 4);
         let job_rx = Arc::new(Mutex::new(job_rx));
         for _ in 0..workers {
             let (job_rx, done_tx, ctx) = (job_rx.clone(), done_tx.clone(), ctx.clone());
             std::thread::spawn(move || {
+                crate::video::lower_priority();
                 loop {
                     let Ok((key, path)) = job_rx.lock().unwrap().recv() else { break };
                     let (image, duration) = generate(key, &path);
