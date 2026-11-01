@@ -197,10 +197,10 @@ impl Decoder {
                 (w, even_height(w, (sw, sh)))
             }
         };
-        // BT.601 only when the file says so, as other players do.
-        let bt601 = matches!(index.matrix, Some(5 | 6));
+        // As the file says, else as players take its size (`colours`).
+        let bt601 = crate::colours::bt601(index.matrix, index.width, index.height);
 
-        let format = format_description(&index)?;
+        let format = format_description(&index, bt601)?;
         let shared = Box::into_raw(Box::new(Shared { out: Mutex::new(Out::default()), ready: Condvar::new() }));
         let session = match create_session(&format, output, width, height, shared) {
             Ok(s) => s,
@@ -488,23 +488,16 @@ fn even_height(width: u32, source: (u32, u32)) -> u32 {
 }
 
 /// The decoder's description of the stream: H.264 with the file's own
-/// `avcC` (its parameter sets, profile and NAL length).
-fn format_description(index: &Index) -> Result<CFRetained<CMFormatDescription>> {
+/// `avcC` (its parameter sets, profile and NAL length), and its colour
+/// matrix, BT.601's or BT.709's, as decided: said outright, so its frames
+/// made RGBA (thumbnails, the filmstrip) are made by it, not by a guess of
+/// VideoToolbox's.
+fn format_description(index: &Index, bt601: bool) -> Result<CFRetained<CMFormatDescription>> {
     let avcc = objc2_core_foundation::CFData::from_bytes(&index.avcc);
     let atoms = CFDictionary::<CFString, CFType>::from_slices(&[&*CFString::from_static_str("avcC")], &[avcc.as_ref()]);
-    // The colour matrix the file states (`colr`), which overrides the
-    // stream's own; BT.601 only when it says so.
-    let matrix = match index.matrix {
-        Some(5 | 6) => Some(unsafe { kCVImageBufferYCbCrMatrix_ITU_R_601_4 }),
-        Some(1) => Some(unsafe { kCVImageBufferYCbCrMatrix_ITU_R_709_2 }),
-        _ => None,
-    };
-    let mut keys = vec![unsafe { kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms }];
-    let mut values: Vec<&CFType> = vec![atoms.as_ref()];
-    if let Some(m) = matrix {
-        keys.push(unsafe { kCMFormatDescriptionExtension_YCbCrMatrix });
-        values.push(m.as_ref());
-    }
+    let matrix = if bt601 { unsafe { kCVImageBufferYCbCrMatrix_ITU_R_601_4 } } else { unsafe { kCVImageBufferYCbCrMatrix_ITU_R_709_2 } };
+    let keys = [unsafe { kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms }, unsafe { kCMFormatDescriptionExtension_YCbCrMatrix }];
+    let values: [&CFType; 2] = [atoms.as_ref(), matrix.as_ref()];
     let extensions = CFDictionary::<CFString, CFType>::from_slices(&keys, &values);
     let mut out: *const CMFormatDescription = ptr::null();
     let status = unsafe {

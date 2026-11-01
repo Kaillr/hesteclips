@@ -194,13 +194,9 @@ fn probe_mp4(source: &Path) -> Result<ClipInfo> {
         video_kbps: (video.seconds > 0.0).then(|| (video.bytes as f64 * 8.0 / video.seconds / 1000.0) as u32).filter(|&k| k > 0),
         audio,
         id: tag.id,
-        // As ffprobe's colour space: BT.601's matrices, else untagged (2 is
-        // "unspecified") guessed by its size, as players do.
-        bt601: match video.matrix {
-            Some(5 | 6) => true,
-            Some(2) | None => video.height < 720,
-            Some(_) => false,
-        },
+        // As the file says, else as players take its size: the rule the
+        // decoders go by (`capture::colours`).
+        bt601: capture::colours::bt601(video.matrix.map(u16::from), video.width, video.height),
     })
 }
 
@@ -292,10 +288,10 @@ fn probe_ffprobe(source: &Path) -> Result<ClipInfo> {
         video_kbps: video.bit_rate.as_deref().and_then(|b| b.parse::<u64>().ok()).map(|b| (b / 1000) as u32).filter(|&k| k > 0),
         audio,
         id: tag.id,
-        // Untagged: as players guess, by its size.
+        // Not said: as players take its size (`capture::colours`).
         bt601: match video.color_space.as_deref() {
             Some("bt470bg" | "smpte170m") => true,
-            Some("unknown") | None => video.height.is_some_and(|h| h < 720),
+            Some("unknown") | None => matches!((video.width, video.height), (Some(w), Some(h)) if capture::colours::bt601(None, w, h)),
             Some(_) => false,
         },
     })

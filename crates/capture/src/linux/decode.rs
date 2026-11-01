@@ -815,8 +815,8 @@ impl Decoder {
                 (w, even_height(w, source))
             }
         };
-        // BT.601 only when the file says so, as other players do.
-        let bt601 = matches!(index.matrix, Some(5 | 6));
+        // As the file says, else as players take its size (`colours`).
+        let bt601 = crate::colours::bt601(index.matrix, index.width, index.height);
         let mut err = [0 as c_char; 512];
         let (kind, hw) = match card.map(|(c, _)| &c.way) {
             None => (ON_CPU, std::ptr::null_mut()),

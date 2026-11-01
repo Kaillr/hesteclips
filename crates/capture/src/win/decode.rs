@@ -317,8 +317,8 @@ impl Decoder {
                 Some(d) => {
                     let size = (d.index.width, d.index.height);
                     let fps = d.fps();
-                    // BT.601 only when the file says so, as the reader does.
-                    let bt601 = matches!(d.index.matrix, Some(5 | 6));
+                    // As the file says, else as players take its size (`colours`).
+                    let bt601 = crate::colours::bt601(d.index.matrix, d.index.width, d.index.height);
                     (Source::Direct(d), size, fps, bt601)
                 }
                 None => {
@@ -336,8 +336,13 @@ impl Decoder {
                     let (sw, sh) = ((size >> 32) as u32, size as u32);
                     let rate = native.GetUINT64(&MF_MT_FRAME_RATE).unwrap_or(60 << 32 | 1);
                     let fps = (rate >> 32) as f64 / (rate as u32).max(1) as f64;
-                    // SD video is usually BT.601; everything else BT.709.
-                    let bt601 = native.GetUINT32(&MF_MT_YUV_MATRIX).ok() == Some(MFVideoTransferMatrix_BT601.0 as u32);
+                    // As the file says (to Media Foundation), else as players
+                    // take its size (`colours`).
+                    let bt601 = match native.GetUINT32(&MF_MT_YUV_MATRIX) {
+                        Ok(m) if m == MFVideoTransferMatrix_BT601.0 as u32 => true,
+                        Ok(m) if m != MFVideoTransferMatrix_Unknown.0 as u32 => false,
+                        _ => crate::colours::bt601(None, sw, sh),
+                    };
 
                     // The decoder's own output: NV12 textures on the GPU, with the file's times.
                     let out = MFCreateMediaType()?;
