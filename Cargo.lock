@@ -3066,6 +3066,7 @@ name = "media"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "capture",
  "jpeg-encoder",
  "serde",
  "serde_json",

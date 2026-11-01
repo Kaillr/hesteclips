@@ -125,11 +125,16 @@ void hcnv_close(void *p);
 // An encoder for `width`×`height` NV12 at `fps`: H.264 High, no B-frames
 // (each frame comes out as it goes in), VBR at `kbps` (at most `max_kbps`
 // over a `buf_kbits` buffer), a keyframe every `gop` frames, NVIDIA's speed
-// preset `preset` (1 fastest, 7 best) tuned for low latency. On the CUDA
-// device whose UUID is `uuid` (the Vulkan device's), or the first if NULL.
+// preset `preset` (1 fastest, 7 best) tuned for low latency; or, for a file
+// that isn't live (`quality`), tuned for quality: B-frames (up to 3, set in
+// `*bframes`: frames then come out in the order they're decoded, some only
+// after later ones went in), two passes over each frame, and more bits
+// where the eye sees them. On the CUDA device whose UUID is `uuid` (the
+// Vulkan device's), or the first if NULL.
 void *hcnv_open(const uint8_t *uuid, int width, int height, int fps, int kbps, int max_kbps, int buf_kbits, int gop,
-                int preset, int *code, char *err, int errlen) {
+                int preset, int quality, int *bframes, int *code, char *err, int errlen) {
     *code = HCNV_FAILED;
+    *bframes = 0;
     Enc *e = calloc(1, sizeof *e);
     if (!e) {
         say(err, errlen, "out of memory");
@@ -202,17 +207,28 @@ void *hcnv_open(const uint8_t *uuid, int width, int height, int fps, int kbps, i
                                      &NV_ENC_PRESET_P4_GUID, &NV_ENC_PRESET_P5_GUID, &NV_ENC_PRESET_P6_GUID,
                                      &NV_ENC_PRESET_P7_GUID};
     GUID preset_guid = *presets[(preset < 1 ? 1 : preset > 7 ? 7 : preset) - 1];
+    NV_ENC_TUNING_INFO tuning = quality ? NV_ENC_TUNING_INFO_HIGH_QUALITY : NV_ENC_TUNING_INFO_LOW_LATENCY;
     NV_ENC_PRESET_CONFIG pc = {.version = NV_ENC_PRESET_CONFIG_VER, .presetCfg = {.version = NV_ENC_CONFIG_VER}};
-    s = e->api.nvEncGetEncodePresetConfigEx(e->session, NV_ENC_CODEC_H264_GUID, preset_guid, NV_ENC_TUNING_INFO_LOW_LATENCY, &pc);
+    s = e->api.nvEncGetEncodePresetConfigEx(e->session, NV_ENC_CODEC_H264_GUID, preset_guid, tuning, &pc);
     if (!nv_ok(e, s, "the encoder's preset", err, errlen)) {
         pop(e);
         goto fail;
+    }
+    // B-frames where the card has them (the middle one a reference too,
+    // where it can be).
+    int b = 0, b_ref = 0;
+    if (quality) {
+        NV_ENC_CAPS_PARAM caps = {.version = NV_ENC_CAPS_PARAM_VER, .capsToQuery = NV_ENC_CAPS_NUM_MAX_BFRAMES};
+        if (e->api.nvEncGetEncodeCaps(e->session, NV_ENC_CODEC_H264_GUID, &caps, &b) != NV_ENC_SUCCESS || b < 0) b = 0;
+        if (b > 3) b = 3;
+        caps.capsToQuery = NV_ENC_CAPS_SUPPORT_BFRAME_REF_MODE;
+        if (b > 1 && e->api.nvEncGetEncodeCaps(e->session, NV_ENC_CODEC_H264_GUID, &caps, &b_ref) != NV_ENC_SUCCESS) b_ref = 0;
     }
     NV_ENC_CONFIG cfg = pc.presetCfg;
     cfg.version = NV_ENC_CONFIG_VER;
     cfg.profileGUID = NV_ENC_H264_PROFILE_HIGH_GUID;
     cfg.gopLength = gop;
-    cfg.frameIntervalP = 1;
+    cfg.frameIntervalP = 1 + b;
     NV_ENC_RC_PARAMS *rc = &cfg.rcParams;
     rc->version = NV_ENC_RC_PARAMS_VER;
     rc->rateControlMode = NV_ENC_PARAMS_RC_VBR;
@@ -220,11 +236,13 @@ void *hcnv_open(const uint8_t *uuid, int width, int height, int fps, int kbps, i
     rc->maxBitRate = (uint32_t)max_kbps * 1000;
     rc->vbvBufferSize = (uint32_t)buf_kbits * 1000;
     rc->vbvInitialDelay = rc->vbvBufferSize;
-    rc->multiPass = NV_ENC_MULTI_PASS_DISABLED;
+    rc->multiPass = quality ? NV_ENC_TWO_PASS_FULL_RESOLUTION : NV_ENC_MULTI_PASS_DISABLED;
+    rc->enableAQ = quality ? 1 : 0;
     rc->enableLookahead = 0;
-    rc->zeroReorderDelay = 1;
+    rc->zeroReorderDelay = b ? 0 : 1;
     NV_ENC_CONFIG_H264 *h = &cfg.encodeCodecConfig.h264Config;
     h->idrPeriod = gop;
+    h->useBFramesAsRef = (b_ref & 2) ? NV_ENC_BFRAME_REF_MODE_MIDDLE : NV_ENC_BFRAME_REF_MODE_DISABLED;
     h->repeatSPSPPS = 1;
     h->outputAUD = 0;
     h->sliceMode = 3;
@@ -256,12 +274,13 @@ void *hcnv_open(const uint8_t *uuid, int width, int height, int fps, int kbps, i
         .encodeConfig = &cfg,
         .maxEncodeWidth = width,
         .maxEncodeHeight = height,
-        .tuningInfo = NV_ENC_TUNING_INFO_LOW_LATENCY,
+        .tuningInfo = tuning,
     };
     s = e->api.nvEncInitializeEncoder(e->session, &init);
     pop(e);
     if (!nv_ok(e, s, "the encoder won't take these settings", err, errlen)) goto fail;
     *code = 0;
+    *bframes = b;
     return e;
 
 fail:
@@ -370,6 +389,10 @@ int hcnv_upload(void *p, int slot, const uint8_t *nv12, char *err, int errlen) {
 
 // Encode the frame in `slot` as frame `pts`. Its bitstream is taken with
 // `hcnv_lock`, in the order the frames were encoded.
+// Hand slot `slot`'s frame (frame `pts`) in, its bitstream the next one out
+// (in decode order). 0: every frame handed in so far is being encoded, and
+// can be taken out (`hcnv_lock`) in the order handed in; 1: this one waits
+// for later frames (B-frames), its slot busy; -1: failed.
 int hcnv_encode(void *p, int slot, int64_t pts, char *err, int errlen) {
     Enc *e = p;
     Slot *s = &e->slots[slot];
@@ -392,9 +415,11 @@ int hcnv_encode(void *p, int slot, int64_t pts, char *err, int errlen) {
         .inputTimeStamp = (uint64_t)pts,
     };
     NVENCSTATUS st = e->api.nvEncEncodePicture(e->session, &pic);
+    if (st == NV_ENC_ERR_NEED_MORE_INPUT) {
+        pop(e);
+        return 1;
+    }
     if (st != NV_ENC_SUCCESS) {
-        // Held back for later frames (NEED_MORE_INPUT) can't happen without
-        // B-frames or lookahead: anything but done is a failure.
         nv_ok(e, st, "encoding a frame", err, errlen);
         e->api.nvEncUnmapInputResource(e->session, s->mapped);
         s->mapped = NULL;
@@ -405,9 +430,10 @@ int hcnv_encode(void *p, int slot, int64_t pts, char *err, int errlen) {
     return 0;
 }
 
-// Wait for `slot`'s frame to be encoded: its bitstream (Annex B) and whether
-// it's a keyframe, readable until `hcnv_unlock`.
-int hcnv_lock(void *p, int slot, const uint8_t **data, uint32_t *len, int *key, char *err, int errlen) {
+// Wait for `slot`'s bitstream to be encoded: it (Annex B), which frame it is
+// (the `pts` it was handed in with) and whether it's a keyframe, readable
+// until `hcnv_unlock`.
+int hcnv_lock(void *p, int slot, const uint8_t **data, uint32_t *len, int64_t *pts, int *key, char *err, int errlen) {
     Enc *e = p;
     Slot *s = &e->slots[slot];
     if (!push(e, err, errlen)) return -1;
@@ -417,22 +443,32 @@ int hcnv_lock(void *p, int slot, const uint8_t **data, uint32_t *len, int *key, 
     if (!ok) return -1;
     *data = lock.bitstreamBufferPtr;
     *len = lock.bitstreamSizeInBytes;
+    *pts = (int64_t)lock.outputTimeStamp;
     *key = lock.pictureType == NV_ENC_PIC_TYPE_IDR;
     return 0;
 }
 
-// Done with `slot`'s bitstream (locked or not): the slot can take a new frame.
+// Done with `slot`'s bitstream (locked or not).
 void hcnv_unlock(void *p, int slot, int locked) {
     Enc *e = p;
     Slot *s = &e->slots[slot];
-    if (e->cu->cuCtxPushCurrent(e->ctx) != CUDA_SUCCESS) return;
-    if (locked) e->api.nvEncUnlockBitstream(e->session, s->bitstream);
-    if (s->mapped) e->api.nvEncUnmapInputResource(e->session, s->mapped);
+    if (!locked || e->cu->cuCtxPushCurrent(e->ctx) != CUDA_SUCCESS) return;
+    e->api.nvEncUnlockBitstream(e->session, s->bitstream);
+    pop(e);
+}
+
+// Done with `slot`'s frame: it's been encoded (its bitstream taken out,
+// wherever that was), or never will be.
+void hcnv_release(void *p, int slot) {
+    Enc *e = p;
+    Slot *s = &e->slots[slot];
+    if (!s->mapped || e->cu->cuCtxPushCurrent(e->ctx) != CUDA_SUCCESS) return;
+    e->api.nvEncUnmapInputResource(e->session, s->mapped);
     s->mapped = NULL;
     pop(e);
 }
 
-// No more frames.
+// No more frames: those waiting are encoded, to be taken out.
 void hcnv_end(void *p) {
     Enc *e = p;
     if (e->cu->cuCtxPushCurrent(e->ctx) != CUDA_SUCCESS) return;

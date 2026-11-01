@@ -24,7 +24,7 @@ use ash::vk::native::*;
 use wgpu::hal::api::Vulkan;
 
 use super::gpu::Gpu;
-use super::gpu_frame::{GpuPicture, Nv12Target};
+use super::gpu_frame::{Nv12Source, Nv12Target};
 use crate::mp4file::{EncodedFrame, VideoFrame};
 use crate::mp4mux::{AvcConfig, annexb_to_avcc};
 use crate::writer::{Command as WriterCommand, Media};
@@ -294,9 +294,10 @@ pub(crate) struct VkEncoder {
 
 impl VkEncoder {
     /// Start encoding `width`×`height` frames at `fps` and `kbps` into `out`,
-    /// made on the card by `picture`. `Ok(None)` where the card can't encode
-    /// H.264 through Vulkan Video.
-    pub(crate) fn start(width: u32, height: u32, fps: u32, kbps: u32, out: Sender<WriterCommand>, picture: &GpuPicture) -> Result<Option<Self>> {
+    /// made on the card by `picture`; for an `export` (not live) at the best
+    /// quality level but one. `Ok(None)` where the card can't encode H.264
+    /// through Vulkan Video.
+    pub(crate) fn start(width: u32, height: u32, fps: u32, kbps: u32, out: Sender<WriterCommand>, picture: &dyn Nv12Source, export: bool) -> Result<Option<Self>> {
         let gpu = picture.gpu().clone();
         let Some(video) = &gpu.video else { return Ok(None) };
         let family = video.family;
@@ -325,7 +326,13 @@ impl VkEncoder {
         let avg = (kbps * 1000).min(most);
         let rate = (avg, if mode == vk::VideoEncodeRateControlModeFlagsKHR::VBR { (kbps * 1500).min(most) } else { avg }, fps.max(1), mode);
         // The fastest quality level at high rates (as NVENC's presets).
-        let quality = if width as u64 * height as u64 * fps as u64 > 1920 * 1080 * 144 { 0 } else { caps.quality_levels.saturating_sub(1) / 2 };
+        let quality = if export {
+            caps.quality_levels.saturating_sub(2)
+        } else if width as u64 * height as u64 * fps as u64 > 1920 * 1080 * 144 {
+            0
+        } else {
+            caps.quality_levels.saturating_sub(1) / 2
+        };
 
         // SAFETY: the device is Vulkan.
         let hal = unsafe { gpu.device.as_hal::<Vulkan>() }.context("not a Vulkan device")?;
@@ -606,7 +613,7 @@ impl VkEncoder {
     /// Encode frame `n`, made on the card by `picture` (its picture number
     /// `version`). False if it's skipped: every slot is busy, or encoding
     /// stopped working.
-    pub(crate) fn encode_gpu(&self, picture: &GpuPicture, version: u64, n: i64) -> bool {
+    pub(crate) fn encode_gpu(&self, picture: &dyn Nv12Source, version: u64, n: i64) -> bool {
         if self.broken.load(Ordering::Relaxed) {
             return false;
         }
@@ -616,6 +623,11 @@ impl VkEncoder {
             slot.holds = Some(version);
         }
         self.frames.as_ref().is_some_and(|f| f.send((slot, n)).is_ok())
+    }
+
+    /// Whether encoding stopped working.
+    pub(crate) fn failed(&self) -> bool {
+        self.broken.load(Ordering::Relaxed)
     }
 
     /// Encode what's handed in and wait for the last frame.
@@ -1010,7 +1022,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::super::gpu;
-    use super::super::gpu_frame::nv12_len;
+    use super::super::gpu_frame::{GpuPicture, nv12_len};
     use super::super::screen::{Frame, Order};
     use super::*;
 
@@ -1064,7 +1076,7 @@ mod tests {
         let (w, h, fps, n) = (640u32, 360u32, 30u32, 70u32);
         let mut pic = GpuPicture::new(card.clone(), w, h, place);
         let (tx, rx) = mpsc::channel();
-        let enc = VkEncoder::start(w, h, fps, 20_000, tx, &pic).unwrap().expect("an encoder");
+        let enc = VkEncoder::start(w, h, fps, 20_000, tx, &pic, false).unwrap().expect("an encoder");
         let mut wanted = Vec::new();
         for i in 0..n {
             assert!(pic.draw(&picture(w, h, i), i as u64 + 1));
@@ -1161,7 +1173,7 @@ mod tests {
                 .collect();
             let mut pic = GpuPicture::new(card.clone(), w, h, place);
             let (tx, rx) = mpsc::channel();
-            let enc = VkEncoder::start(w, h, 540, 50_000, tx, &pic).unwrap().expect("an encoder");
+            let enc = VkEncoder::start(w, h, 540, 50_000, tx, &pic, false).unwrap().expect("an encoder");
             let frames = 1620u32;
             let (t0, c0) = (Instant::now(), cpu_time());
             let mut waited = 0u32;

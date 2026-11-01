@@ -37,6 +37,7 @@ pub mod audio;
 mod blend;
 mod camera;
 pub mod decode;
+pub(crate) mod export;
 mod ext_windows;
 pub mod ffmpeg;
 mod image;
@@ -647,7 +648,7 @@ impl Session {
         let (titles, comment, has_rest) = track_layout(&s.sources);
         let tracks = titles.len();
         let layout = Layout {
-            spec: Spec { width, height, fps: s.fps, audio_titles: titles, audio_bitrate: AUDIO_BITRATE, comment, mov },
+            spec: Spec { width, height, fps: s.fps, audio_titles: titles, audio_bitrate: AUDIO_BITRATE, comment, mov, reorder: 0 },
         };
         let writer = match target {
             Target::Record(file) => Writer::record(file, layout, s.fps),
@@ -920,14 +921,14 @@ impl VideoEncoder {
         let only = std::env::var("HASTECLIP_ENCODER").ok();
         let wanted = |name: &str| only.as_deref().is_none_or(|o| o == name);
         if s.use_hardware && wanted("nvenc") {
-            match nvenc::Nvenc::start(width, height, s.fps, s.video_bitrate_kbps, out.clone(), picture) {
+            match nvenc::Nvenc::start(width, height, s.fps, s.video_bitrate_kbps, out.clone(), picture.map(|p| p as &dyn gpu_frame::Nv12Source), false) {
                 Ok(Some(e)) => return Ok(Self::Nvenc(e)),
                 Ok(None) => {}
                 Err(e) => eprintln!("NVIDIA's video encoder didn't start: {e:#}"),
             }
         }
         if let (true, true, Some(p)) = (s.use_hardware, wanted("vulkan"), picture) {
-            match vkenc::VkEncoder::start(width, height, s.fps, s.video_bitrate_kbps, out.clone(), p) {
+            match vkenc::VkEncoder::start(width, height, s.fps, s.video_bitrate_kbps, out.clone(), p, false) {
                 Ok(Some(e)) => return Ok(Self::Vulkan(e)),
                 Ok(None) => {}
                 Err(e) => eprintln!("the card's video encoder (Vulkan Video) didn't start: {e:#}"),

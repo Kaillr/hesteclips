@@ -262,6 +262,11 @@ impl Decoder {
         self.source
     }
 
+    /// Whether its colours are BT.601's (else BT.709's).
+    pub fn bt601(&self) -> bool {
+        self.bt601
+    }
+
     /// The keyframes' numbers, ascending.
     pub fn keyframes(&self) -> Vec<u64> {
         let mut k: Vec<u64> = self.keys.iter().map(|&i| self.index_of(self.pts_sec(i))).collect();

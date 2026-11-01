@@ -419,7 +419,24 @@ pub(crate) struct GpuPicture {
     preview: Option<PreviewTarget>,
 }
 
-/// Where an encoder takes frames from on the card ([`GpuPicture::nv12_target`]).
+/// What an encoder takes its frames from on the card, as NV12: the
+/// recording's picture ([`GpuPicture`]), or an export's decoded frames
+/// scaled as they are (`export`).
+pub(crate) trait Nv12Source {
+    /// The card it's on.
+    fn gpu(&self) -> &Arc<Gpu>;
+
+    /// A place an encoder takes frames from (`super::nvenc`,
+    /// `super::vkenc`): `buffer`, NV12 with rows `pitch` bytes apart, made by
+    /// [`Self::nv12_to`] at `size` (the frame's, or more: black past it),
+    /// and then copied into `picture` (NV12 of that size) if there is one.
+    fn nv12_target(&self, buffer: wgpu::Buffer, pitch: u32, size: (u32, u32), picture: Option<wgpu::Texture>) -> Nv12Target;
+
+    /// The frame as NV12 into `target`, on the card: done when this returns.
+    fn nv12_to(&self, target: &Nv12Target);
+}
+
+/// Where an encoder takes frames from on the card ([`Nv12Source::nv12_target`]).
 pub(crate) struct Nv12Target {
     buffer: wgpu::Buffer,
     bind: wgpu::BindGroup,
@@ -427,6 +444,41 @@ pub(crate) struct Nv12Target {
     size: (u32, u32),
     /// The encoder's picture, copied into.
     picture: Option<wgpu::Texture>,
+}
+
+impl Nv12Target {
+    /// `buffer` and the rest as given to `nv12_target`, `bind` the source's
+    /// bindings for writing into it.
+    pub(crate) fn new(buffer: wgpu::Buffer, bind: wgpu::BindGroup, pitch: u32, size: (u32, u32), picture: Option<wgpu::Texture>) -> Self {
+        Self { buffer, bind, pitch, size, picture }
+    }
+
+    /// Fill it by `pipeline` (four bytes a thread, as `to_nv12`) and copy
+    /// that into the encoder's picture: done when this returns.
+    pub(crate) fn fill(&self, gpu: &Gpu, pipeline: &wgpu::ComputePipeline) {
+        let device = &gpu.device;
+        let groups = ((self.buffer.size() / 4) as u32).div_ceil(64);
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("nv12 out") });
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &self.bind, &[]);
+            pass.dispatch_workgroups(groups.min(65535), groups.div_ceil(65535), 1);
+        }
+        if let Some(picture) = &self.picture {
+            // Luma, then the U, V pairs at half the size each way.
+            let (w, h) = self.size;
+            for (plane, offset, size) in [(wgpu::TextureAspect::Plane0, 0, (w, h)), (wgpu::TextureAspect::Plane1, self.pitch as u64 * h as u64, (w / 2, h / 2))] {
+                enc.copy_buffer_to_texture(
+                    wgpu::TexelCopyBufferInfo { buffer: &self.buffer, layout: wgpu::TexelCopyBufferLayout { offset, bytes_per_row: Some(self.pitch), rows_per_image: Some(size.1) } },
+                    wgpu::TexelCopyTextureInfo { texture: picture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: plane },
+                    wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 },
+                );
+            }
+        }
+        let index = gpu.queue.submit([enc.finish()]);
+        let _ = device.poll(wgpu::PollType::Wait { submission_index: Some(index), timeout: None });
+    }
 }
 
 /// A small copy of the frame for the preview, kept for its size.
@@ -820,59 +872,6 @@ impl GpuPicture {
         self.readback.unmap();
     }
 
-    /// A place an encoder takes frames from on the card (`super::nvenc`,
-    /// `super::vkenc`): `buffer`, NV12 with rows `pitch` bytes apart, made by
-    /// [`Self::nv12_to`] at `size` (the frame's, or more: black past it),
-    /// and then copied into `picture` (NV12 of that size) if there is one.
-    pub(crate) fn nv12_target(&self, buffer: wgpu::Buffer, pitch: u32, size: (u32, u32), picture: Option<wgpu::Texture>) -> Nv12Target {
-        let device = &self.gpu.device;
-        let sizes = device.create_buffer(&wgpu::BufferDescriptor { label: Some("size"), size: 16, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-        let bytes: Vec<u8> = [size.0, size.1, pitch, 0].iter().flat_map(|v| v.to_le_bytes()).collect();
-        self.gpu.queue.write_buffer(&sizes, 0, &bytes);
-        let frame_view = self.frame.create_view(&Default::default());
-        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("nv12 out"),
-            layout: &self.nv12.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&frame_view) },
-                wgpu::BindGroupEntry { binding: 1, resource: buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: sizes.as_entire_binding() },
-            ],
-        });
-        Nv12Target { buffer, bind, pitch, size, picture }
-    }
-
-    /// The frame as NV12 into `target`, on the card: done when this returns.
-    pub(crate) fn nv12_to(&self, target: &Nv12Target) {
-        let device = &self.gpu.device;
-        let groups = ((target.buffer.size() / 4) as u32).div_ceil(64);
-        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("nv12 out") });
-        {
-            let mut pass = enc.begin_compute_pass(&Default::default());
-            pass.set_pipeline(&self.nv12);
-            pass.set_bind_group(0, &target.bind, &[]);
-            pass.dispatch_workgroups(groups.min(65535), groups.div_ceil(65535), 1);
-        }
-        if let Some(picture) = &target.picture {
-            // Luma, then the U, V pairs at half the size each way.
-            let (w, h) = target.size;
-            for (plane, offset, size) in [(wgpu::TextureAspect::Plane0, 0, (w, h)), (wgpu::TextureAspect::Plane1, target.pitch as u64 * h as u64, (w / 2, h / 2))] {
-                enc.copy_buffer_to_texture(
-                    wgpu::TexelCopyBufferInfo { buffer: &target.buffer, layout: wgpu::TexelCopyBufferLayout { offset, bytes_per_row: Some(target.pitch), rows_per_image: Some(size.1) } },
-                    wgpu::TexelCopyTextureInfo { texture: picture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: plane },
-                    wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 },
-                );
-            }
-        }
-        let index = self.gpu.queue.submit([enc.finish()]);
-        let _ = device.poll(wgpu::PollType::Wait { submission_index: Some(index), timeout: None });
-    }
-
-    /// The card it's made on.
-    pub(crate) fn gpu(&self) -> &Arc<Gpu> {
-        &self.gpu
-    }
-
     /// The frame shrunk to fit `max`, as R, G, B, A, for the preview. Its
     /// size. Shrunk on the card (as the frame is made) and only that read
     /// back: reading the whole frame back and shrinking it on the CPU took
@@ -982,6 +981,34 @@ impl GpuPicture {
         );
         self.uploaded = Some((t.clone(), seq));
         Some(t)
+    }
+}
+
+impl Nv12Source for GpuPicture {
+    fn gpu(&self) -> &Arc<Gpu> {
+        &self.gpu
+    }
+
+    fn nv12_target(&self, buffer: wgpu::Buffer, pitch: u32, size: (u32, u32), picture: Option<wgpu::Texture>) -> Nv12Target {
+        let device = &self.gpu.device;
+        let sizes = device.create_buffer(&wgpu::BufferDescriptor { label: Some("size"), size: 16, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let bytes: Vec<u8> = [size.0, size.1, pitch, 0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        self.gpu.queue.write_buffer(&sizes, 0, &bytes);
+        let frame_view = self.frame.create_view(&Default::default());
+        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("nv12 out"),
+            layout: &self.nv12.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&frame_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: sizes.as_entire_binding() },
+            ],
+        });
+        Nv12Target::new(buffer, bind, pitch, size, picture)
+    }
+
+    fn nv12_to(&self, target: &Nv12Target) {
+        target.fill(&self.gpu, &self.nv12);
     }
 }
 

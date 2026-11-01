@@ -25,7 +25,7 @@ use std::thread::{self, JoinHandle};
 
 use anyhow::{Result, bail};
 
-use super::gpu_frame::{GpuPicture, Nv12Target, nv12_len};
+use super::gpu_frame::{Nv12Source, Nv12Target, nv12_len};
 use crate::mp4file::{EncodedFrame, VideoFrame};
 use crate::mp4mux::{AvcConfig, annexb_to_avcc};
 use crate::writer::{Command as WriterCommand, Media};
@@ -41,6 +41,8 @@ unsafe extern "C" {
         buf_kbits: c_int,
         gop: c_int,
         preset: c_int,
+        quality: c_int,
+        bframes: *mut c_int,
         code: *mut c_int,
         err: *mut c_char,
         errlen: c_int,
@@ -49,8 +51,9 @@ unsafe extern "C" {
     fn hcnv_add_own(e: *mut c_void, pitch: c_int, err: *mut c_char, errlen: c_int) -> c_int;
     fn hcnv_upload(e: *mut c_void, slot: c_int, nv12: *const u8, err: *mut c_char, errlen: c_int) -> c_int;
     fn hcnv_encode(e: *mut c_void, slot: c_int, pts: i64, err: *mut c_char, errlen: c_int) -> c_int;
-    fn hcnv_lock(e: *mut c_void, slot: c_int, data: *mut *const u8, len: *mut u32, key: *mut c_int, err: *mut c_char, errlen: c_int) -> c_int;
+    fn hcnv_lock(e: *mut c_void, slot: c_int, data: *mut *const u8, len: *mut u32, pts: *mut i64, key: *mut c_int, err: *mut c_char, errlen: c_int) -> c_int;
     fn hcnv_unlock(e: *mut c_void, slot: c_int, locked: c_int);
+    fn hcnv_release(e: *mut c_void, slot: c_int);
     fn hcnv_end(e: *mut c_void);
     fn hcnv_close(e: *mut c_void);
 }
@@ -149,10 +152,14 @@ pub(crate) struct Nvenc {
 impl Nvenc {
     /// Start encoding `width`×`height` frames at `fps` and `kbps` into
     /// `out`: made on the card by `picture`, or (`None`) handed in from the
-    /// CPU. `Ok(None)` where there's no NVIDIA driver.
-    pub(crate) fn start(width: u32, height: u32, fps: u32, kbps: u32, out: Sender<WriterCommand>, picture: Option<&GpuPicture>) -> Result<Option<Self>> {
-        let preset = preset(width, height, fps);
-        let started = Self::open(width, height, fps, kbps, preset, out, picture);
+    /// CPU. For an `export` (not live: frames can take longer) two presets
+    /// slower and tuned for quality, with B-frames (frames then reach `out`
+    /// in decode order, up to 3 before the frames shown first: see
+    /// `Spec::reorder`), for a better picture in as many bits. `Ok(None)`
+    /// where there's no NVIDIA driver.
+    pub(crate) fn start(width: u32, height: u32, fps: u32, kbps: u32, out: Sender<WriterCommand>, picture: Option<&dyn Nv12Source>, export: bool) -> Result<Option<Self>> {
+        let preset = if export { (preset(width, height, fps) + 2).min(7) } else { preset(width, height, fps) };
+        let started = Self::open(width, height, fps, kbps, preset, export, out, picture);
         if let Ok(Some(_)) = &started {
             let from = if picture.is_some() { "made in the card's memory" } else { "copied up from ours" };
             eprintln!("video encoder: NVIDIA NVENC ({width}x{height} at {fps} fps, preset P{preset}, frames {from})");
@@ -160,11 +167,14 @@ impl Nvenc {
         started
     }
 
-    fn open(width: u32, height: u32, fps: u32, kbps: u32, preset: c_int, out: Sender<WriterCommand>, picture: Option<&GpuPicture>) -> Result<Option<Self>> {
+    #[allow(clippy::too_many_arguments)]
+    fn open(width: u32, height: u32, fps: u32, kbps: u32, preset: c_int, export: bool, out: Sender<WriterCommand>, picture: Option<&dyn Nv12Source>) -> Result<Option<Self>> {
         let kbps = kbps.max(100);
-        let gop = crate::keyframe_every(fps);
+        // A file to watch, not to cut clips from: keyframes every few
+        // seconds (as x264's), the bitrate free to follow the picture.
+        let (gop, max_kbps, buf_kbits) = if export { ((fps * 4).min(600), kbps * 3, kbps * 6) } else { (crate::keyframe_every(fps), kbps * 3 / 2, kbps * 2) };
         let uuid = picture.map(|p| p.gpu().uuid);
-        let (mut why, mut code) = (Why::new(), 0);
+        let (mut why, mut code, mut bframes) = (Why::new(), 0, 0);
         // SAFETY: valid arguments, and room for the error.
         let raw = unsafe {
             hcnv_open(
@@ -173,10 +183,12 @@ impl Nvenc {
                 height as c_int,
                 fps as c_int,
                 kbps as c_int,
-                (kbps * 3 / 2) as c_int,
-                (kbps * 2) as c_int,
+                max_kbps as c_int,
+                buf_kbits as c_int,
                 gop as c_int,
                 preset,
+                c_int::from(export),
+                &mut bframes,
                 &mut code,
                 why.buf(),
                 why.room(),
@@ -190,7 +202,9 @@ impl Nvenc {
         }
         let session = Arc::new(Session(raw));
         let (free_tx, free) = mpsc::channel();
-        let count = slots(fps);
+        // B-frames wait on the card for the frame after them, and their
+        // bitstreams come out in another order: more frames are out at once.
+        let count = slots(fps).max(IN_FLIGHT + 2 * bframes as usize + 2);
         let (frames, frames_rx) = mpsc::sync_channel(count);
         // Made now, so that dropping it on the way out frees everything in order.
         let mut enc = Self {
@@ -232,7 +246,7 @@ impl Nvenc {
     /// Encode frame `n`, made on the card by `picture` (its picture number
     /// `version`). False if it's skipped: every slot is busy, or encoding
     /// stopped working.
-    pub(crate) fn encode_gpu(&self, picture: &GpuPicture, version: u64, n: i64) -> bool {
+    pub(crate) fn encode_gpu(&self, picture: &dyn Nv12Source, version: u64, n: i64) -> bool {
         let Some(mut slot) = self.slot() else { return false };
         if slot.holds != Some(version) {
             if let Some(target) = &slot.target {
@@ -284,6 +298,11 @@ impl Nvenc {
         }
     }
 
+    /// Whether encoding stopped working.
+    pub(crate) fn failed(&self) -> bool {
+        self.broken.load(Ordering::Relaxed)
+    }
+
     /// Encode what's handed in and wait for the last frame.
     pub(crate) fn finish(mut self) {
         drop(self.frames.take());
@@ -318,23 +337,42 @@ fn stop(broken: &AtomicBool, why: &Why) {
     }
 }
 
-/// Hand each frame to the card as it comes, and take each one's bitstream
-/// out when it's done, in order: the oldest when [`IN_FLIGHT`] are on the
-/// card, or when no new one is waiting. Each is passed to the writer as
-/// frame `n`, and its slot freed.
+/// A frame handed to the card: its slot, its number, whether its slot's
+/// bitstream has been taken out (the next one out when it went in, in the
+/// order frames are decoded: with B-frames, maybe another frame's), and
+/// whether its own frame has (then its picture is no longer needed).
+struct Flying {
+    slot: Slot,
+    n: i64,
+    taken: bool,
+    encoded: bool,
+}
+
+/// Hand each frame to the card as it comes, and take the bitstreams out
+/// when they're done, in order: the oldest when [`IN_FLIGHT`] are being
+/// encoded, or when no new frame is waiting. B-frames wait for the frame
+/// after them before any of them is encoded. Each frame is passed to the
+/// writer as the frame number it went in with, and slots are freed once
+/// their bitstream and their frame are both out.
 fn encode_frames(session: &Session, frames: Receiver<(Slot, i64)>, free: Sender<Slot>, broken: &AtomicBool, fps: u32, out: Sender<WriterCommand>) {
-    let mut flight: VecDeque<(Slot, i64)> = VecDeque::new();
+    let mut flight: VecDeque<Flying> = VecDeque::new();
+    // In `flight`: the next bitstream to take out, and the end of those
+    // being encoded (the ones after wait for more frames).
+    let (mut next_out, mut encoding) = (0usize, 0usize);
     let mut config: Option<AvcConfig> = None;
     let mut writer_gone = false;
-    let mut ended = false;
+    let (mut ended, mut flushed) = (false, false);
     loop {
-        let next = if flight.is_empty() {
+        let next = if ended {
+            None
+        } else if next_out == encoding {
             match frames.recv() {
                 Ok(f) => Some(f),
-                Err(_) => break,
+                Err(_) => {
+                    ended = true;
+                    None
+                }
             }
-        } else if ended {
-            None
         } else {
             match frames.try_recv() {
                 Ok(f) => Some(f),
@@ -352,27 +390,58 @@ fn encode_frames(session: &Session, frames: Receiver<(Slot, i64)>, free: Sender<
             }
             let mut why = Why::new();
             // SAFETY: a slot with a frame in it, not on the card.
-            if unsafe { hcnv_encode(session.0, slot.index, n, why.buf(), why.room()) } != 0 {
-                stop(broken, &why);
-                let _ = free.send(slot);
-                continue;
+            match unsafe { hcnv_encode(session.0, slot.index, n, why.buf(), why.room()) } {
+                0 => {
+                    flight.push_back(Flying { slot, n, taken: false, encoded: false });
+                    encoding = flight.len();
+                }
+                1 => flight.push_back(Flying { slot, n, taken: false, encoded: false }),
+                _ => {
+                    stop(broken, &why);
+                    let _ = free.send(slot);
+                    continue;
+                }
             }
-            flight.push_back((slot, n));
-            if flight.len() < IN_FLIGHT {
+            if encoding - next_out < IN_FLIGHT {
                 continue;
             }
         }
-        // Take out the oldest.
-        let Some((slot, n)) = flight.pop_front() else { continue };
-        let (mut data, mut len, mut key) = (std::ptr::null(), 0u32, 0);
+        if ended && !flushed {
+            // SAFETY: the session is open; frames waiting get encoded.
+            unsafe { hcnv_end(session.0) };
+            flushed = true;
+            encoding = flight.len();
+        }
+        if next_out == encoding {
+            if ended {
+                break;
+            }
+            continue;
+        }
+        // Take out the oldest bitstream.
+        let index = flight[next_out].slot.index;
+        next_out += 1;
+        let (mut data, mut len, mut pts, mut key) = (std::ptr::null(), 0u32, 0i64, 0);
         let mut why = Why::new();
-        // SAFETY: the oldest frame on the card.
-        let locked = unsafe { hcnv_lock(session.0, slot.index, &mut data, &mut len, &mut key, why.buf(), why.room()) } == 0;
+        // SAFETY: the oldest bitstream, being encoded.
+        let locked = unsafe { hcnv_lock(session.0, index, &mut data, &mut len, &mut pts, &mut key, why.buf(), why.room()) } == 0;
         // SAFETY: locked, the bitstream is `len` bytes at `data` until unlocked.
         let frame = locked.then(|| annexb_to_avcc(unsafe { std::slice::from_raw_parts(data, len as usize) }));
         // SAFETY: as above; the bitstream isn't read after this.
-        unsafe { hcnv_unlock(session.0, slot.index, c_int::from(locked)) };
-        let _ = free.send(slot);
+        unsafe { hcnv_unlock(session.0, index, c_int::from(locked)) };
+        flight[next_out - 1].taken = true;
+        // The frame in it is encoded: its picture can go. (Failed: the one
+        // that went in with it, so every slot still comes back.)
+        let done = if locked { flight.iter().position(|f| f.n == pts && !f.encoded) } else { None }.unwrap_or(next_out - 1);
+        // SAFETY: that frame is no longer on the card.
+        unsafe { hcnv_release(session.0, flight[done].slot.index) };
+        flight[done].encoded = true;
+        while flight.front().is_some_and(|f| f.taken && f.encoded) {
+            let f = flight.pop_front().expect("a frame");
+            let _ = free.send(f.slot);
+            next_out -= 1;
+            encoding -= 1;
+        }
         let Some(frame) = frame else {
             stop(broken, &why);
             continue;
@@ -386,13 +455,19 @@ fn encode_frames(session: &Session, frames: Receiver<(Slot, i64)>, free: Sender<
         let key = frame.idr;
         let media = Media::Video {
             frame: VideoFrame(Arc::new(EncodedFrame { data: Arc::from(frame.data), config: if key { config.clone() } else { None } })),
-            pts: n as f64 / fps as f64,
+            pts: pts as f64 / fps as f64,
             key,
         };
         writer_gone = out.send(WriterCommand::Media(media)).is_err();
     }
-    // SAFETY: the session is open, and every frame has been taken out.
-    unsafe { hcnv_end(session.0) };
+    // Anything left (encoding failed on the way): its picture goes too.
+    for f in flight {
+        if !f.encoded {
+            // SAFETY: the session is open; nothing more is encoded.
+            unsafe { hcnv_release(session.0, f.slot.index) };
+        }
+        let _ = free.send(f.slot);
+    }
 }
 
 #[cfg(test)]
@@ -400,6 +475,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::super::gpu;
+    use super::super::gpu_frame::GpuPicture;
     use super::super::image::Canvas;
     use super::super::screen::{Frame, Order};
     use super::*;
@@ -462,7 +538,7 @@ mod tests {
         for on_card in [true, false] {
             let mut pic = GpuPicture::new(card.clone(), W, H, place);
             let (tx, rx) = mpsc::channel();
-            let Some(enc) = Nvenc::start(W, H, 60, 20_000, tx, on_card.then_some(&pic)).unwrap() else {
+            let Some(enc) = Nvenc::start(W, H, 60, 20_000, tx, on_card.then_some(&pic), false).unwrap() else {
                 eprintln!("no NVIDIA driver: nothing to test");
                 return;
             };
@@ -556,7 +632,7 @@ mod tests {
             for preset in [1, 2, 3, 4] {
                 let mut pic = GpuPicture::new(card.clone(), w, h, place);
                 let (tx, rx) = mpsc::channel();
-                let Some(enc) = Nvenc::open(w, h, 540, 50_000, preset, tx, Some(&pic)).unwrap() else {
+                let Some(enc) = Nvenc::open(w, h, 540, 50_000, preset, false, tx, Some(&pic)).unwrap() else {
                     eprintln!("no NVIDIA driver");
                     return;
                 };

@@ -32,6 +32,7 @@ pub mod preview;
 pub mod webcam;
 pub mod sources;
 mod shutter;
+pub mod export;
 mod steady;
 pub mod stores;
 

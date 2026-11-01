@@ -63,7 +63,7 @@ impl Shutter {
     }
 
     /// The first look that counts toward frame `k`.
-    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub(crate) fn first_look(&self, k: i64) -> i64 {
         self.start(if self.soft { k - 1 } else { k })
     }

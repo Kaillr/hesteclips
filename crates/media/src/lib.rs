@@ -1415,9 +1415,37 @@ fn render_video(source: &Path, info: &ClipInfo, edit: &Edit, pieces: &[Piece], w
         run_progress(&mut cmd, parts.iter().map(|(a, b)| b - a).sum(), progress)
     };
 
-    // All of it encoded again (a piece for each part): in one go.
+    // All of it encoded again (a piece for each part): in one go, on the
+    // graphics card where it can be (much faster), else by ffmpeg.
     let encoded: Option<Vec<(f64, f64)>> = pieces.iter().map(|p| if let Piece::Encode(a, b) = *p { Some((a, b)) } else { None }).collect();
     if let Some(parts) = encoded {
+        let rate = edit.output.frame_rate(info);
+        let whole_rate = (rate - rate.round()).abs() < 1e-6 && rate >= 1.0;
+        if whole_rate && std::env::var_os("HASTECLIP_EXPORT_FFMPEG").is_none() {
+            let out_fps = rate.round() as u32;
+            let job = capture::export::Job {
+                source,
+                fps: info.fps,
+                parts: &parts,
+                crop: output.crop.map(|c| [c.x, c.y, c.w, c.h]),
+                size: edit.output.size(info),
+                out_fps,
+                blend: output.blend_fps.map(|b| {
+                    let shape = match output.blend_shape {
+                        BlendShape::Even => capture::BlendShape::Even,
+                        BlendShape::Soft => capture::BlendShape::Soft,
+                    };
+                    (b, shape)
+                }),
+                kbps: kbps as u32,
+                fit: output.max_mb.is_some(),
+            };
+            match capture::export::render_video(&job, out, progress) {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(e) => eprintln!("export: the graphics card couldn't make it ({e:#}); ffmpeg does"),
+            }
+        }
         return encode(&parts, out, progress);
     }
 
@@ -2212,5 +2240,161 @@ mod jpeg_tests {
                 err[2] as f64 / n.max(1) as f64
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod export_bench {
+    use super::*;
+
+    /// A video's frames as their luma planes, averaged down in blocks to
+    /// about `w` wide (straight from the decoder, so no scaler or colour
+    /// conversion of ffmpeg's can differ between files), and its streams'
+    /// lengths (video, then each audio).
+    fn frames_of(file: &Path, w: u32) -> (Vec<Vec<u8>>, Vec<f64>) {
+        let info = probe(file).unwrap();
+        let (width, height) = (info.width as usize, info.height as usize);
+        let out = ffmpeg()
+            .args(["-hide_banner", "-loglevel", "error", "-i"])
+            .arg(file)
+            .args(["-f", "rawvideo", "-pix_fmt", "yuv420p", "-"])
+            .output()
+            .unwrap();
+        let block = (width / w as usize).max(1);
+        let (bw, bh) = (width / block, height / block);
+        let frames = out
+            .stdout
+            .chunks(width * height * 3 / 2)
+            .map(|f| {
+                let mut small = Vec::with_capacity(bw * bh);
+                for by in 0..bh {
+                    for bx in 0..bw {
+                        let mut sum = 0u32;
+                        for y in by * block..(by + 1) * block {
+                            sum += f[y * width + bx * block..y * width + (bx + 1) * block].iter().map(|&v| v as u32).sum::<u32>();
+                        }
+                        small.push((sum / (block * block) as u32) as u8);
+                    }
+                }
+                small
+            })
+            .collect();
+        let lengths = ffprobe()
+            .args(["-v", "error", "-show_entries", "stream=duration", "-of", "csv=p=0"])
+            .arg(file)
+            .output()
+            .unwrap();
+        let lengths = String::from_utf8_lossy(&lengths.stdout).lines().filter_map(|l| l.trim().parse().ok()).collect();
+        (frames, lengths)
+    }
+
+    /// The same edits made on the graphics card and by ffmpeg come out the
+    /// same: as many frames, each showing the same moment (the pictures
+    /// differ only by scaling and encoding: under a level in 8×8 blocks),
+    /// the sound as long as the picture. HC_SRC: a 60 fps clip with sound;
+    /// HC_FAST: a 540 fps one. HASTECLIP_ENCODER picks the card's encoder.
+    #[test]
+    #[ignore = "needs clips and a graphics card"]
+    fn card_exports_match_ffmpegs() {
+        let dir = std::env::temp_dir().join(format!("hc-export-match-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = PathBuf::from(std::env::var("HC_SRC").unwrap());
+        let fast = std::env::var("HC_FAST").ok().map(PathBuf::from);
+        type MakeEdit = Box<dyn Fn(&ClipInfo) -> Edit>;
+        let mut cases: Vec<(&str, PathBuf, MakeEdit)> = vec![
+            ("cuts at 720p", src.clone(), Box::new(|i: &ClipInfo| {
+                let mut e = Edit { start: 3.0, end: 40.0, cuts: vec![Cut { from: 10.0, to: 17.5 }, Cut { from: 25.25, to: 31.0 }], ..Edit::new(i) };
+                e.output.height = Some(720);
+                e
+            })),
+            ("crop at 30 fps", src.clone(), Box::new(|i: &ClipInfo| {
+                let mut e = Edit { start: 5.0, end: 20.0, ..Edit::new(i) };
+                e.output.crop = Some(Crop { x: 320, y: 180, w: 1920, h: 1080 });
+                e.output.fps = Some(30);
+                e
+            })),
+        ];
+        if let Some(fast) = &fast {
+            for shape in [BlendShape::Even, BlendShape::Soft] {
+                cases.push((if shape == BlendShape::Even { "blend even" } else { "blend soft" }, fast.clone(), Box::new(move |i: &ClipInfo| {
+                    let mut e = Edit { start: 2.0, end: 12.0, ..Edit::new(i) };
+                    e.output.fps = Some(60);
+                    e.output.blend_fps = Some(540);
+                    e.output.blend_shape = shape;
+                    e
+                })));
+            }
+        }
+        for (name, source, make) in &cases {
+            let info = probe(source).unwrap();
+            let edit = make(&info);
+            let card = dir.join("card.mp4");
+            let theirs = dir.join("ffmpeg.mp4");
+            let t = std::time::Instant::now();
+            render_to(source, &info, &edit, &card, None).unwrap();
+            let card_s = t.elapsed().as_secs_f64();
+            // SAFETY: the tests here run one at a time (--test-threads=1).
+            unsafe { std::env::set_var("HASTECLIP_EXPORT_FFMPEG", "1") };
+            let t = std::time::Instant::now();
+            render_to(source, &info, &edit, &theirs, None).unwrap();
+            let ffmpeg_s = t.elapsed().as_secs_f64();
+            unsafe { std::env::remove_var("HASTECLIP_EXPORT_FFMPEG") };
+            let (a, a_len) = frames_of(&card, 160);
+            let (b, b_len) = frames_of(&theirs, 160);
+            let diffs: Vec<f64> = a.iter().zip(&b).map(|(x, y)| x.iter().zip(y).map(|(p, q)| p.abs_diff(*q) as f64).sum::<f64>() / x.len() as f64).collect();
+            let worst = diffs.iter().copied().fold(0.0, f64::max);
+            let mean = diffs.iter().sum::<f64>() / diffs.len().max(1) as f64;
+            eprintln!("{name}: {:.1} s on the card, {:.1} s by ffmpeg; {} frames against {}; off by {mean:.2} on average, {worst:.2} at worst; lengths {a_len:?} against {b_len:?}", card_s, ffmpeg_s, a.len(), b.len());
+            assert_eq!(a.len(), b.len(), "{name}: frames");
+            assert!(worst < 1.0, "{name}: a frame off by {worst:.2}");
+            for (x, y) in a_len.iter().zip(&b_len) {
+                assert!((x - y).abs() < 0.03, "{name}: a stream {x} s long against {y}");
+            }
+            if a_len.len() > 1 {
+                assert!((a_len[0] - a_len[1]).abs() < 0.05, "{name}: picture {} s, sound {} s", a_len[0], a_len[1]);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// How long exports take (HC_SRC: a 60 fps clip with sound; HC_FAST: a
+    /// 540 fps recording).
+    #[test]
+    #[ignore = "benchmark"]
+    fn export_times() {
+        let dir = std::env::temp_dir().join(format!("hc-export-bench-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = |name: &str, src: &Path, edit: &dyn Fn(&ClipInfo) -> Edit| {
+            let info = probe(src).unwrap();
+            let e = edit(&info);
+            let out = dir.join(format!("{}.mp4", name.replace(' ', "-")));
+            let t = std::time::Instant::now();
+            render_to(src, &info, &e, &out, None).unwrap();
+            let secs = t.elapsed().as_secs_f64();
+            let o = probe(&out).unwrap();
+            eprintln!("{name}: {secs:.1} s for {:.1} s of video ({}x{} at {:.0} fps, {:.1} MB)", e.duration(), o.width, o.height, o.fps, std::fs::metadata(&out).unwrap().len() as f64 / 1048576.0);
+        };
+        let src = PathBuf::from(std::env::var("HC_SRC").unwrap());
+        run("trim", &src, &|i| Edit { start: 10.0, end: 40.0, ..Edit::new(i) });
+        run("1080p", &src, &|i| {
+            let mut e = Edit::new(i);
+            e.output.height = Some(1080);
+            e
+        });
+        run("discord", &src, &|i| {
+            let mut e = Edit::new(i);
+            e.output.mix_only = true;
+            e.output.max_mb = Some(10);
+            e
+        });
+        if let Ok(fast) = std::env::var("HC_FAST") {
+            run("blend 540 to 60", Path::new(&fast), &|i| {
+                let mut e = Edit::new(i);
+                e.output.fps = Some(60);
+                e.output.blend_fps = Some(540);
+                e
+            });
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
