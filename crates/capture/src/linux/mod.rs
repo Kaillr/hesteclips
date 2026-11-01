@@ -1,6 +1,6 @@
 //! Native Linux capture backend: the screen from the X server on X11, from
 //! the compositor on wlroots-style Wayland desktops, KDE Plasma and GNOME,
-//! else through the ScreenCast desktop portal + PipeWire, encoded by ffmpeg.
+//! else through the ScreenCast desktop portal + PipeWire.
 //! Works on every X11 desktop, Sway, Hyprland and their kin, KDE Plasma,
 //! GNOME, and other Wayland desktops that have a portal.
 //!
@@ -13,8 +13,10 @@
 //!   it to the output size, draws the webcam over it and converts it to NV12,
 //!   so the output is constant frame rate even when the screen is still and
 //!   nothing new arrives. Where the compositor hands pictures over on the
-//!   graphics card (DMA-BUF, `gpu`), that's done there (`gpu_frame`) and only
-//!   the NV12 frame comes down; else on the CPU (`image`). ffmpeg encodes it (`ffmpeg`): NVENC or
+//!   graphics card (DMA-BUF, `gpu`), that's done there (`gpu_frame`); else on
+//!   the CPU (`image`). On NVIDIA cards their encoder takes the frame where
+//!   it's made, on the card (`nvenc`), and nothing comes down to the CPU but
+//!   the encoded frame. Elsewhere ffmpeg encodes the NV12 frame (`ffmpeg`):
 //!   VA-API on the GPU where it can, x264 or OpenH264 otherwise.
 //! - **Audio**: everything through PipeWire (`audio`): mics, the desktop
 //!   (every app but us), and single apps. **Mixing** happens in Rust
@@ -35,6 +37,8 @@ pub mod audio;
 mod blend;
 mod camera;
 pub mod decode;
+mod dmabuf;
+pub(crate) mod export;
 mod ext_windows;
 pub mod ffmpeg;
 mod image;
@@ -46,8 +50,10 @@ mod kwin;
 mod kwin_windows;
 pub mod monitor;
 mod mutter;
+mod nvenc;
 mod portal;
 mod screen;
+mod vkenc;
 mod wlr;
 mod wlr_windows;
 mod x11;
@@ -643,7 +649,7 @@ impl Session {
         let (titles, comment, has_rest) = track_layout(&s.sources);
         let tracks = titles.len();
         let layout = Layout {
-            spec: Spec { width, height, fps: s.fps, audio_titles: titles, audio_bitrate: AUDIO_BITRATE, comment, mov },
+            spec: Spec { width, height, fps: s.fps, audio_titles: titles, audio_bitrate: AUDIO_BITRATE, comment, mov, reorder: 0 },
         };
         let writer = match target {
             Target::Record(file) => Writer::record(file, layout, s.fps),
@@ -680,8 +686,8 @@ impl Session {
             let mixer = mixer::spawn_mixer(inputs, mix_track, rest_track, live.clone(), clock.clone(), host_now, MIX_LATENCY, stop.clone());
             session.mixer = Some((stop, mixer));
 
-            let encoder = ffmpeg::H264::start(width, height, s, session.writer_tx.clone())?;
             let picture = Picture::new(feed.clone(), width, height, s.screen.clone(), s.webcam.as_ref());
+            let encoder = VideoEncoder::start(width, height, s, session.writer_tx.clone(), picture.gpu.as_ref())?;
             // Frame blending is done on the graphics card.
             session.pacer = Some(if s.blend_samples > 1 && picture.gpu.is_some() {
                 blend::spawn_blend_pacer(s.fps, s.blend_samples, crate::shutter::Shutter::new(s.blend_samples, s.blend_shape), picture, encoder, clock)
@@ -741,10 +747,12 @@ struct Picture {
     screen: crate::SharedScreen,
     camera: Option<(camera::CameraLayer, SharedPlacement)>,
     /// What the canvas shows: the screen picture's number and where it went,
-    /// the camera picture and where it was placed.
-    shows: Option<(u64, crate::ScreenPlacement, Option<usize>, Option<Placement>)>,
-    /// The webcam picture and where it was placed, as the card's layer has it.
-    camera_shown: Option<(Option<usize>, Option<Placement>)>,
+    /// the camera picture's number (`CameraPicture::seq`) and where it was
+    /// placed.
+    shows: Option<(u64, crate::ScreenPlacement, Option<u64>, Option<Placement>)>,
+    /// The webcam picture's number and where it was placed, as the card's
+    /// layer has it.
+    camera_shown: Option<(Option<u64>, Option<Placement>)>,
     /// The canvas as NV12, made when it changes.
     nv12: Vec<u8>,
     /// Counts the canvas's changes, so the preview is only sent new ones.
@@ -783,7 +791,7 @@ impl Picture {
             }
             None => (None, None),
         };
-        let now = (cam.as_ref().map(|c| Arc::as_ptr(c) as usize), place);
+        let now = (cam.as_ref().map(|c| c.seq), place);
         if let Some(g) = &mut self.gpu
             && self.camera_shown != Some(now)
         {
@@ -799,7 +807,7 @@ impl Picture {
         self.feed.want();
         let Some((frame, seq)) = self.feed.get() else { return false };
         let (placed, cam, place) = self.layers();
-        let now = (seq, placed, cam.as_ref().map(|c| Arc::as_ptr(c) as usize), place);
+        let now = (seq, placed, cam.as_ref().map(|c| c.seq), place);
         if self.shows.as_ref() != Some(&now) {
             match &mut self.gpu {
                 Some(g) => {
@@ -899,11 +907,96 @@ fn skipped(dropped: &mut u64, n: u64) {
     }
 }
 
+/// The recording's video encoder: NVIDIA's, driven directly (`nvenc`); else
+/// the card's through Vulkan Video (`vkenc`: AMD's, Intel's), where the
+/// frame is made on the card; else ffmpeg's (`ffmpeg`: VA-API, x264 or
+/// OpenH264).
+pub(super) enum VideoEncoder {
+    Nvenc(nvenc::Nvenc),
+    Vulkan(vkenc::VkEncoder),
+    Ffmpeg(ffmpeg::H264),
+}
+
+impl VideoEncoder {
+    fn start(width: u32, height: u32, s: &EncodeSettings, out: Sender<writer::Command>, picture: Option<&gpu_frame::GpuPicture>) -> Result<Self> {
+        // HASTECLIP_ENCODER=nvenc, vulkan or ffmpeg: only that one (or
+        // ffmpeg's), even where another would start, to compare.
+        let only = std::env::var("HASTECLIP_ENCODER").ok();
+        let wanted = |name: &str| only.as_deref().is_none_or(|o| o == name);
+        if s.use_hardware && wanted("nvenc") {
+            match nvenc::Nvenc::start(width, height, s.fps, s.video_bitrate_kbps, out.clone(), picture.map(|p| p as &dyn gpu_frame::Nv12Source), false) {
+                Ok(Some(e)) => return Ok(Self::Nvenc(e)),
+                Ok(None) => {}
+                Err(e) => eprintln!("NVIDIA's video encoder didn't start: {e:#}"),
+            }
+        }
+        if let (true, true, Some(p)) = (s.use_hardware, wanted("vulkan"), picture) {
+            match vkenc::VkEncoder::start(width, height, s.fps, s.video_bitrate_kbps, out.clone(), p, false) {
+                Ok(Some(e)) => return Ok(Self::Vulkan(e)),
+                Ok(None) => {}
+                Err(e) => eprintln!("the card's video encoder (Vulkan Video) didn't start: {e:#}"),
+            }
+        }
+        Ok(Self::Ffmpeg(ffmpeg::H264::start(width, height, s, out)?))
+    }
+
+    /// Whether it takes the picture as NV12 in our memory (`Picture::nv12`),
+    /// rather than from the graphics card.
+    fn wants_cpu_nv12(&self, picture: &Picture) -> bool {
+        match self {
+            Self::Nvenc(_) => picture.gpu.is_none(),
+            Self::Vulkan(_) => false,
+            Self::Ffmpeg(_) => true,
+        }
+    }
+
+    /// Encode the picture as frame `n`. False if it's skipped: the encoder
+    /// is behind.
+    fn encode(&self, picture: &Picture, n: i64) -> bool {
+        match self {
+            Self::Ffmpeg(f) => {
+                let mut frame = f.buffer();
+                frame.clear();
+                frame.extend_from_slice(&picture.nv12);
+                f.encode(frame, n)
+            }
+            Self::Nvenc(e) => match &picture.gpu {
+                Some(g) => e.encode_gpu(g, picture.version, n),
+                None => e.encode_cpu(&picture.nv12, picture.version, n),
+            },
+            Self::Vulkan(e) => picture.gpu.as_ref().is_some_and(|g| e.encode_gpu(g, picture.version, n)),
+        }
+    }
+
+    /// Encode the frame `g` has made (blended: `blend`) as frame `n`, its
+    /// picture number `version`.
+    fn encode_made(&self, g: &gpu_frame::GpuPicture, version: u64, n: i64) -> bool {
+        match self {
+            Self::Ffmpeg(f) => {
+                let mut frame = f.buffer();
+                g.nv12(&mut frame);
+                f.encode(frame, n)
+            }
+            Self::Nvenc(e) => e.encode_gpu(g, version, n),
+            Self::Vulkan(e) => e.encode_gpu(g, version, n),
+        }
+    }
+
+    /// Encode what's queued and wait for the last frame.
+    fn finish(self) {
+        match self {
+            Self::Ffmpeg(f) => f.finish(),
+            Self::Nvenc(e) => e.finish(),
+            Self::Vulkan(e) => e.finish(),
+        }
+    }
+}
+
 /// Encode the newest picture every 1/fps on the host clock. The screen only
 /// sends pictures when something changes; repeating the last one keeps the
 /// output constant frame rate. Frame N is stamped N/fps seconds after t0, the
 /// same clock the audio uses.
-fn spawn_pacer(fps: u32, mut picture: Picture, encoder: ffmpeg::H264, clock: Arc<Clock>) -> (Arc<AtomicBool>, JoinHandle<()>) {
+fn spawn_pacer(fps: u32, mut picture: Picture, encoder: VideoEncoder, clock: Arc<Clock>) -> (Arc<AtomicBool>, JoinHandle<()>) {
     let stop = Arc::new(AtomicBool::new(false));
     let stop2 = stop.clone();
     let handle = thread::Builder::new()
@@ -921,13 +1014,11 @@ fn spawn_pacer(fps: u32, mut picture: Picture, encoder: ffmpeg::H264, clock: Arc
                 // After a stall, catch up gradually rather than in one huge burst.
                 let mut burst = 0;
                 while next <= due && burst < fps * 2 {
-                    if picture.update(true) {
-                        let mut frame = encoder.buffer();
-                        frame.clear();
-                        frame.extend_from_slice(&picture.nv12);
+                    let cpu_nv12 = encoder.wants_cpu_nv12(&picture);
+                    if picture.update(cpu_nv12) {
                         // The encoder can't keep up: skip this frame (the file
                         // shows the previous one a little longer).
-                        if encoder.encode(frame, next) {
+                        if encoder.encode(&picture, next) {
                             encoded();
                         } else {
                             skipped(&mut dropped, 1);

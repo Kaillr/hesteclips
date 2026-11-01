@@ -32,6 +32,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
@@ -66,6 +67,11 @@ pub(crate) struct Blender {
     /// yet: added in one pass when another comes up or the frame is done (a
     /// screen slower than the blend rate is seen several times in a row).
     pending: [f32; 2],
+    /// Waits for the GPU at each step (live: a picture goes back to the
+    /// stream at once), else (exports) never: see [`Self::queued`].
+    waits: bool,
+    /// What the GPU was last given, not waiting for it.
+    last: Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
 }
 
 // Metal devices, queues, pipelines and textures are thread-safe; the buffers
@@ -77,6 +83,31 @@ impl Blender {
     pub(crate) fn new(width: usize, height: usize, open: usize) -> Result<Self> {
         let device = MTLCreateSystemDefaultDevice().context("no Metal device")?;
         let queue = device.newCommandQueue().context("no Metal command queue")?;
+        Self::on(device, queue, width, height, open, true)
+    }
+
+    /// For exports: on `queue`, where the pictures it's given are made (so
+    /// they're made before it reads them), never waiting for the GPU: each
+    /// picture is kept until the GPU is done with it, and a frame finished
+    /// is made once [`Self::last_work`] is done.
+    pub(crate) fn queued(
+        device: Retained<ProtocolObject<dyn MTLDevice>>,
+        queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
+        width: usize,
+        height: usize,
+        open: usize,
+    ) -> Result<Self> {
+        Self::on(device, queue, width, height, open, false)
+    }
+
+    fn on(
+        device: Retained<ProtocolObject<dyn MTLDevice>>,
+        queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
+        width: usize,
+        height: usize,
+        open: usize,
+        waits: bool,
+    ) -> Result<Self> {
         let mut k = kernels(&device, KERNELS, &["add_look", "light_to_luma", "light_to_chroma"])?.into_iter();
         let light = (0..open.clamp(1, 2))
             .map(|_| unsafe {
@@ -95,9 +126,17 @@ impl Blender {
             held: None,
             weight: [0.0; 2],
             pending: [0.0; 2],
+            waits,
+            last: None,
             device,
             queue,
         })
+    }
+
+    /// The GPU work given last (not waiting for it): once it's done, so is
+    /// the frame last finished.
+    pub(crate) fn last_work(&self) -> Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
+        self.last.clone()
     }
 
     /// `picture` is the one that's up now.
@@ -120,17 +159,18 @@ impl Blender {
     }
 
     /// Mix the looks at the picture that's up into the averages, at once.
-    /// Waits for the GPU, so the picture's buffer can go back to the stream.
+    /// Waits for the GPU, so the picture's buffer can go back to the stream
+    /// (exports keep it instead: [`Self::queued`]).
     fn flush(&mut self) {
         let pending = std::mem::take(&mut self.pending);
-        let Some(held) = self.held.as_ref().filter(|_| pending.iter().any(|w| *w > 0.0)) else { return };
+        let Some(held) = self.held.clone().filter(|_| pending.iter().any(|w| *w > 0.0)) else { return };
         // Mixing in by its share of the total so far keeps it the average.
         let mut mixes = Vec::new();
         for (i, weight) in pending.into_iter().enumerate().filter(|(_, w)| *w > 0.0) {
             self.weight[i] += weight;
             mixes.push((i, weight / self.weight[i]));
         }
-        if let Err(e) = self.run(|enc, this| {
+        if let Err(e) = self.run(Some(held.clone()), |enc, this| {
             let luma = plane_texture(&this.device, &held.0, 0, false)?;
             let chroma = plane_texture(&this.device, &held.0, 1, false)?;
             enc.setComputePipelineState(&this.add_pass);
@@ -159,7 +199,7 @@ impl Blender {
             return None;
         }
         let made = self.pool.take().and_then(|out| {
-            self.run(|enc, this| {
+            self.run(None, |enc, this| {
                 for (plane, pass) in [(0, &this.luma_pass), (1, &this.chroma_pass)] {
                     let dst = plane_texture(&this.device, &out, plane, true)?;
                     enc.setComputePipelineState(pass);
@@ -182,14 +222,27 @@ impl Blender {
         }
     }
 
-    /// Encode one compute pass with `f`, run it and wait for it.
-    fn run(&self, f: impl FnOnce(&ProtocolObject<dyn MTLComputeCommandEncoder>, &Self) -> Result<()>) -> Result<()> {
+    /// Encode one compute pass with `f`, run it and wait for it; or, not
+    /// waiting (exports), keep `reads` until the GPU is done with it.
+    fn run(&mut self, reads: Option<Arc<Buffer>>, f: impl FnOnce(&ProtocolObject<dyn MTLComputeCommandEncoder>, &Self) -> Result<()>) -> Result<()> {
         let cmd = self.queue.commandBuffer().context("no command buffer")?;
         let enc = cmd.computeCommandEncoder().context("no compute encoder")?;
         let result = f(&enc, self);
         enc.endEncoding();
-        cmd.commit();
-        cmd.waitUntilCompleted();
+        if self.waits {
+            cmd.commit();
+            cmd.waitUntilCompleted();
+        } else {
+            if let Some(reads) = reads {
+                // Kept until the GPU, done, lets go of the block.
+                let keep = RcBlock::new(move |_: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+                    let _ = &reads;
+                });
+                unsafe { cmd.addCompletedHandler(RcBlock::as_ptr(&keep)) };
+            }
+            cmd.commit();
+            self.last = Some(cmd);
+        }
         result
     }
 }

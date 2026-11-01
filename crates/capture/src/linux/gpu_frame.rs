@@ -7,13 +7,15 @@
 //! screen's pictures are on the card.
 //!
 //! A picture that arrives in our memory (the away screen, X11) is uploaded
-//! first. The webcam is drawn by the CPU's code (`Canvas::draw_camera`, only
-//! its box, only when it changes) into a layer laid over the frame here.
+//! first. The webcam's picture is uploaded as it comes and drawn into its
+//! box here too, into a layer laid over the frame, when it or its box
+//! changes (as `Canvas::draw_camera` on the CPU, which took 12-46% of a
+//! core at 30 fps for a quarter- to half-wide box).
 
 use std::sync::Arc;
 
 use super::gpu::Gpu;
-use super::image::{CameraPicture, Canvas};
+use super::image::CameraPicture;
 use super::screen::{Frame, Order};
 use crate::webcam::Placement;
 
@@ -259,11 +261,81 @@ fn resolve(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
+const CAMERA_SHADER: &str = r#"
+struct Cam {
+    // The frame's size, and the camera picture's (as it comes, unturned).
+    size: vec2<u32>,
+    camera: vec2<u32>,
+    // The box (x, y, w, h, in the frame's pixels), and the part of the
+    // turned picture shown (u0, u1, v0, v1, in its pixels).
+    box_: vec4<f32>,
+    part: vec4<f32>,
+    // Turned a quarter this many times; flipped (1 across, 2 upside down);
+    // whether it's shown.
+    turns: u32,
+    flips: u32,
+    on: u32,
+    _pad: u32,
+}
+
+@group(0) @binding(0) var camera: texture_2d<f32>;
+@group(0) @binding(1) var layer: texture_storage_2d<rgba8unorm, write>;
+@group(0) @binding(2) var<uniform> c: Cam;
+
+// A point of the turned picture in the camera's own (`Placement::unturn`).
+fn unturn(p: vec2<f32>, size: vec2<f32>, turns: u32) -> vec2<f32> {
+    switch turns {
+        case 1u: { return vec2<f32>(p.y, size.y - p.x); }
+        case 2u: { return vec2<f32>(size.x - p.x, size.y - p.y); }
+        case 3u: { return vec2<f32>(size.x - p.y, p.x); }
+        default: { return p; }
+    }
+}
+
+// The camera's colour at a point (pixel centres at whole numbers), blended
+// between the four nearest pixels in 256ths (`CameraPicture::sample`).
+fn sample(p0: vec2<f32>) -> vec3<f32> {
+    let last = vec2<f32>(c.camera) - 1.0;
+    let p = clamp(p0, vec2<f32>(0.0), last);
+    let a = vec2<i32>(p);
+    let b = min(a + 1, vec2<i32>(c.camera) - 1);
+    let f = floor((p - vec2<f32>(a)) * 256.0) / 256.0;
+    let top = mix(textureLoad(camera, a, 0).rgb, textureLoad(camera, vec2<i32>(b.x, a.y), 0).rgb, f.x);
+    let bottom = mix(textureLoad(camera, vec2<i32>(a.x, b.y), 0).rgb, textureLoad(camera, b, 0).rgb, f.x);
+    return mix(top, bottom, f.y);
+}
+
+// Each pixel of the layer: the camera's picture in its box, clear
+// elsewhere (`Canvas::draw_camera`).
+@compute @workgroup_size(8, 8)
+fn draw_camera(@builtin(global_invocation_id) id: vec3<u32>) {
+    if (id.x >= c.size.x || id.y >= c.size.y) {
+        return;
+    }
+    var out = vec4<f32>(0.0);
+    var f = (vec2<f32>(id.xy) + 0.5 - c.box_.xy) / c.box_.zw;
+    if (c.on != 0u && all(f >= vec2<f32>(0.0)) && all(f < vec2<f32>(1.0))) {
+        if ((c.flips & 1u) != 0u) {
+            f.x = 1.0 - f.x;
+        }
+        if ((c.flips & 2u) != 0u) {
+            f.y = 1.0 - f.y;
+        }
+        let uv = vec2<f32>(c.part.x + f.x * (c.part.y - c.part.x), c.part.z + f.y * (c.part.w - c.part.z));
+        out = vec4<f32>(sample(unturn(uv, vec2<f32>(c.camera), c.turns) - 0.5), 1.0);
+    }
+    textureStore(layer, vec2<i32>(id.xy), out);
+}
+"#;
+
 const NV12_SHADER: &str = r#"
 struct Size {
     width: u32,
     height: u32,
-    _pad: vec2<u32>,
+    // Bytes from one row to the next: the width, or more (an encoder's
+    // aligned rows).
+    pitch: u32,
+    _pad: u32,
 }
 
 @group(0) @binding(0) var image: texture_2d<f32>;
@@ -274,25 +346,32 @@ fn rgb8(x: u32, y: u32) -> vec3<i32> {
     return vec3<i32>(round(textureLoad(image, vec2<i32>(i32(x), i32(y)), 0).rgb * 255.0));
 }
 
-// One byte of NV12 (BT.709, studio range): as `nv12_pair` on the CPU.
+// One byte of NV12 (BT.709, studio range): as `nv12_pair` on the CPU. A
+// row's padding past the width is 0.
 fn byte_at(b: u32) -> u32 {
     let w = n.width;
     let h = n.height;
-    if (b < w * h) {
-        let c = rgb8(b % w, b / w);
+    let p = n.pitch;
+    if (b < p * h) {
+        let x = b % p;
+        if (x >= w) {
+            return 0u;
+        }
+        let c = rgb8(x, b / p);
         return u32(((47 * c.r + 157 * c.g + 16 * c.b + 128) >> 8u) + 16);
     }
-    let k = b - w * h;
-    if (k >= w * h / 2u) {
+    let k = b - p * h;
+    let x = k % p;
+    if (k >= p * h / 2u || x >= w) {
         return 0u;
     }
-    let cy = k / w;
-    let cx = (k % w) / 2u;
+    let cy = k / p;
+    let cx = x / 2u;
     let y0 = cy * 2u;
     let y1 = min(y0 + 1u, h - 1u);
     let sum = rgb8(cx * 2u, y0) + rgb8(cx * 2u + 1u, y0) + rgb8(cx * 2u, y1) + rgb8(cx * 2u + 1u, y1);
     var v: i32;
-    if (k % 2u == 0u) {
+    if (x % 2u == 0u) {
         v = 128 + ((-26 * sum.r - 86 * sum.g + 112 * sum.b + 512) >> 10u);
     } else {
         v = 128 + ((112 * sum.r - 102 * sum.g - 10 * sum.b + 512) >> 10u);
@@ -340,6 +419,68 @@ pub(crate) struct GpuPicture {
     preview: Option<PreviewTarget>,
 }
 
+/// What an encoder takes its frames from on the card, as NV12: the
+/// recording's picture ([`GpuPicture`]), or an export's decoded frames
+/// scaled as they are (`export`).
+pub(crate) trait Nv12Source {
+    /// The card it's on.
+    fn gpu(&self) -> &Arc<Gpu>;
+
+    /// A place an encoder takes frames from (`super::nvenc`,
+    /// `super::vkenc`): `buffer`, NV12 with rows `pitch` bytes apart, made by
+    /// [`Self::nv12_to`] at `size` (the frame's, or more: black past it),
+    /// and then copied into `picture` (NV12 of that size) if there is one.
+    fn nv12_target(&self, buffer: wgpu::Buffer, pitch: u32, size: (u32, u32), picture: Option<wgpu::Texture>) -> Nv12Target;
+
+    /// The frame as NV12 into `target`, on the card: done when this returns.
+    fn nv12_to(&self, target: &Nv12Target);
+}
+
+/// Where an encoder takes frames from on the card ([`Nv12Source::nv12_target`]).
+pub(crate) struct Nv12Target {
+    buffer: wgpu::Buffer,
+    bind: wgpu::BindGroup,
+    pitch: u32,
+    size: (u32, u32),
+    /// The encoder's picture, copied into.
+    picture: Option<wgpu::Texture>,
+}
+
+impl Nv12Target {
+    /// `buffer` and the rest as given to `nv12_target`, `bind` the source's
+    /// bindings for writing into it.
+    pub(crate) fn new(buffer: wgpu::Buffer, bind: wgpu::BindGroup, pitch: u32, size: (u32, u32), picture: Option<wgpu::Texture>) -> Self {
+        Self { buffer, bind, pitch, size, picture }
+    }
+
+    /// Fill it by `pipeline` (four bytes a thread, as `to_nv12`) and copy
+    /// that into the encoder's picture: done when this returns.
+    pub(crate) fn fill(&self, gpu: &Gpu, pipeline: &wgpu::ComputePipeline) {
+        let device = &gpu.device;
+        let groups = ((self.buffer.size() / 4) as u32).div_ceil(64);
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("nv12 out") });
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &self.bind, &[]);
+            pass.dispatch_workgroups(groups.min(65535), groups.div_ceil(65535), 1);
+        }
+        if let Some(picture) = &self.picture {
+            // Luma, then the U, V pairs at half the size each way.
+            let (w, h) = self.size;
+            for (plane, offset, size) in [(wgpu::TextureAspect::Plane0, 0, (w, h)), (wgpu::TextureAspect::Plane1, self.pitch as u64 * h as u64, (w / 2, h / 2))] {
+                enc.copy_buffer_to_texture(
+                    wgpu::TexelCopyBufferInfo { buffer: &self.buffer, layout: wgpu::TexelCopyBufferLayout { offset, bytes_per_row: Some(self.pitch), rows_per_image: Some(size.1) } },
+                    wgpu::TexelCopyTextureInfo { texture: picture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: plane },
+                    wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 },
+                );
+            }
+        }
+        let index = gpu.queue.submit([enc.finish()]);
+        let _ = device.poll(wgpu::PollType::Wait { submission_index: Some(index), timeout: None });
+    }
+}
+
 /// A small copy of the frame for the preview, kept for its size.
 struct PreviewTarget {
     texture: wgpu::Texture,
@@ -372,13 +513,15 @@ struct Slot {
     pending: f32,
 }
 
-/// The webcam over the frame: drawn into a frame-size canvas of ours (clear
-/// where it isn't), uploaded where it changed.
+/// The webcam over the frame: its picture drawn into its box on the card,
+/// clear where it isn't.
 struct Layer {
-    canvas: Canvas,
     texture: wgpu::Texture,
-    /// The rows last drawn on, to clear and upload.
-    rows: Option<(usize, usize)>,
+    draw: wgpu::ComputePipeline,
+    uniforms: wgpu::Buffer,
+    /// The camera's picture on the card, and which picture it is
+    /// (`CameraPicture::seq`).
+    picture: Option<(wgpu::Texture, u64)>,
     /// Whether anything is drawn.
     on: bool,
 }
@@ -404,16 +547,7 @@ impl GpuPicture {
             })
         };
         let frame = texture("frame", wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC);
-        let overlay = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("webcam layer"),
-            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Bgra8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
+        let overlay = texture("webcam layer", wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC);
         let uniform = |label| device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size: 64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let (uniforms, sizes) = (uniform("scale"), uniform("size"));
         let bytes = nv12_len(width, height).div_ceil(4) as u64 * 4;
@@ -429,9 +563,9 @@ impl GpuPicture {
                 wgpu::BindGroupEntry { binding: 2, resource: sizes.as_entire_binding() },
             ],
         });
-        let size_bytes: Vec<u8> = [width, height, 0, 0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let size_bytes: Vec<u8> = [width, height, width, 0].iter().flat_map(|v| v.to_le_bytes()).collect();
         gpu.queue.write_buffer(&sizes, 0, &size_bytes);
-        let layer = Layer { canvas: Canvas::new(width, height), texture: overlay, rows: None, on: false };
+        let layer = Layer { texture: overlay, draw: pipeline(CAMERA_SHADER, "draw_camera"), uniforms: uniform("camera"), picture: None, on: false };
         Self { gpu, width, height, screen, scale, nv12, frame, uniforms, nv12_buf, readback, layer, uploaded: None, nv12_bind, blend: None, preview: None }
     }
 
@@ -440,37 +574,78 @@ impl GpuPicture {
         self.screen = screen;
     }
 
-    /// Draw the webcam's layer: `cam` placed at `place`, or none.
+    /// Draw the webcam's layer: `cam` placed at `place`, or none. A new
+    /// picture is uploaded first (one copy, its own size).
     pub(crate) fn set_camera(&mut self, cam: Option<(&CameraPicture, &Placement)>) {
+        let shown = cam.filter(|(c, p)| !p.is_hidden() && c.width > 0 && c.height > 0);
+        let (device, queue) = (&self.gpu.device, &self.gpu.queue);
         let l = &mut self.layer;
-        let w = l.canvas.width as usize;
-        let row = w * 4;
-        // Clear what was drawn before.
-        if let Some((top, bottom)) = l.rows {
-            l.canvas.bgra[top * row..bottom * row].fill(0);
+        if let Some((c, _)) = shown {
+            let id = c.seq;
+            let size = wgpu::Extent3d { width: c.width, height: c.height, depth_or_array_layers: 1 };
+            if l.picture.as_ref().is_none_or(|(t, _)| t.size() != size) {
+                let t = device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("webcam picture"),
+                    size,
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Bgra8Unorm,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                });
+                l.picture = Some((t, 0));
+            }
+            if let Some((t, uploaded)) = &mut l.picture
+                && *uploaded != id
+            {
+                queue.write_texture(t.as_image_copy(), &c.bgra, wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(c.width * 4), rows_per_image: Some(c.height) }, size);
+                *uploaded = id;
+            }
         }
-        let drawn = cam.filter(|(_, p)| !p.is_hidden()).and_then(|(c, p)| {
-            l.canvas.draw_camera(c, p);
-            let (fh, ph) = (l.canvas.height as f32, p.h * l.canvas.height as f32);
-            let top = (p.y * fh).max(0.0).floor() as usize;
-            let bottom = ((p.y * fh + ph).min(fh).ceil() as usize).min(l.canvas.height as usize);
-            (top < bottom).then_some((top, bottom))
+        l.on = shown.is_some();
+        // Nothing to draw and nothing drawn: no work.
+        let Some((picture, _)) = &l.picture else { return };
+        let (fw, fh) = (self.width as f32, self.height as f32);
+        let mut floats = [0f32; 8];
+        let mut flags = [0u32; 4];
+        let mut camera = [0u32; 2];
+        if let Some((c, p)) = shown {
+            // As `Canvas::draw_camera` places it.
+            let (tw, th) = p.turned((c.width, c.height));
+            let crop = p.fill_crop((tw, th), (self.width, self.height));
+            let (cw, ch) = (tw as f32, th as f32);
+            floats = [p.x * fw, p.y * fh, p.w * fw, p.h * fh, crop[0] * cw, (1.0 - crop[2]) * cw, crop[1] * ch, (1.0 - crop[3]) * ch];
+            flags = [u32::from(p.turns % 4), u32::from(p.flip_h) | u32::from(p.flip_v) << 1, 1, 0];
+            camera = [c.width, c.height];
+        }
+        let bytes: Vec<u8> = [self.width, self.height]
+            .iter()
+            .chain(&camera)
+            .flat_map(|v| v.to_le_bytes())
+            .chain(floats.iter().flat_map(|v| v.to_le_bytes()))
+            .chain(flags.iter().flat_map(|v| v.to_le_bytes()))
+            .collect();
+        queue.write_buffer(&l.uniforms, 0, &bytes);
+        let picture_view = picture.create_view(&Default::default());
+        let layer_view = l.texture.create_view(&Default::default());
+        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("webcam"),
+            layout: &l.draw.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&picture_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&layer_view) },
+                wgpu::BindGroupEntry { binding: 2, resource: l.uniforms.as_entire_binding() },
+            ],
         });
-        // Upload the rows drawn now and before (cleared).
-        let span = match (l.rows, drawn) {
-            (Some(a), Some(b)) => Some((a.0.min(b.0), a.1.max(b.1))),
-            (a, b) => a.or(b),
-        };
-        if let Some((top, bottom)) = span {
-            self.gpu.queue.write_texture(
-                wgpu::TexelCopyTextureInfo { texture: &l.texture, mip_level: 0, origin: wgpu::Origin3d { x: 0, y: top as u32, z: 0 }, aspect: wgpu::TextureAspect::All },
-                &l.canvas.bgra[top * row..bottom * row],
-                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row as u32), rows_per_image: Some((bottom - top) as u32) },
-                wgpu::Extent3d { width: w as u32, height: (bottom - top) as u32, depth_or_array_layers: 1 },
-            );
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("webcam") });
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&l.draw);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups(self.width.div_ceil(8), self.height.div_ceil(8), 1);
         }
-        l.rows = drawn;
-        l.on = drawn.is_some();
+        queue.submit([enc.finish()]);
     }
 
     /// Make the frame from `src` (picture number `seq`) on the card. Returns
@@ -810,13 +985,42 @@ impl GpuPicture {
     }
 }
 
+impl Nv12Source for GpuPicture {
+    fn gpu(&self) -> &Arc<Gpu> {
+        &self.gpu
+    }
+
+    fn nv12_target(&self, buffer: wgpu::Buffer, pitch: u32, size: (u32, u32), picture: Option<wgpu::Texture>) -> Nv12Target {
+        let device = &self.gpu.device;
+        let sizes = device.create_buffer(&wgpu::BufferDescriptor { label: Some("size"), size: 16, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let bytes: Vec<u8> = [size.0, size.1, pitch, 0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        self.gpu.queue.write_buffer(&sizes, 0, &bytes);
+        let frame_view = self.frame.create_view(&Default::default());
+        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("nv12 out"),
+            layout: &self.nv12.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&frame_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: sizes.as_entire_binding() },
+            ],
+        });
+        Nv12Target::new(buffer, bind, pitch, size, picture)
+    }
+
+    fn nv12_to(&self, target: &Nv12Target) {
+        target.fill(&self.gpu, &self.nv12);
+    }
+}
+
 /// NV12's size: a full-size luma plane, then a half-size plane of U, V pairs.
-fn nv12_len(width: u32, height: u32) -> usize {
+pub(crate) fn nv12_len(width: u32, height: u32) -> usize {
     width as usize * height as usize * 3 / 2
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::image::Canvas;
     use super::*;
 
     /// The screen in a box of its own in front of the webcam covers it there
@@ -827,7 +1031,7 @@ mod tests {
     fn in_front_or_behind() {
         let gpu = super::super::gpu::gpu().expect("a graphics card");
         let white = Frame { width: 64, height: 36, stride: 256, order: Order::Bgr, data: [255u8, 255, 255, 255].repeat(64 * 36), texture: None };
-        let cam = CameraPicture { width: 16, height: 9, bgra: [40u8, 40, 40, 255].repeat(16 * 9) };
+        let cam = CameraPicture { width: 16, height: 9, bgra: [40u8, 40, 40, 255].repeat(16 * 9), seq: 1 };
         let all = Placement { x: 0.0, y: 0.0, w: 1.0, h: 1.0, crop: [0.0; 4], flip_h: false, flip_v: false, turns: 0, stretch: 1.0 };
         let left = crate::ScreenPlacement { rect: [0.0, 0.0, 0.5, 1.0], ..crate::ScreenPlacement::whole(crate::Framing::Fill) };
         // Luma of white, and of the camera's grey.
@@ -849,6 +1053,70 @@ mod tests {
                 let (l, r) = (out[18 * 64 + 10], out[18 * 64 + 50]);
                 assert_eq!((l, r), (want_left, camera), "in front {in_front}, blended {blended}");
             }
+        }
+    }
+
+    /// The webcam drawn on the card is the CPU's (`Canvas::draw_camera`), give
+    /// or take a step of rounding: boxed, turned, mirrored, cropped, partly
+    /// off the frame.
+    #[test]
+    #[ignore = "uses the graphics card: cargo test -p capture webcam_layer -- --ignored"]
+    fn webcam_layer_matches_the_cpu() {
+        let gpu = super::super::gpu::gpu().expect("a graphics card");
+        let (w, h) = (320u32, 180u32);
+        let cam = CameraPicture { width: 160, height: 120, bgra: (0..160 * 120 * 4).map(|i| if i % 4 == 3 { 255 } else { ((i * 7919) % 251) as u8 }).collect(), seq: 1 };
+        let base = Placement { x: 0.55, y: 0.5, w: 0.4, h: 0.45, crop: [0.0; 4], flip_h: false, flip_v: false, turns: 0, stretch: 1.0 };
+        let cases = [
+            ("boxed", base),
+            ("turned", Placement { turns: 1, ..base }),
+            ("turned twice, mirrored", Placement { turns: 2, flip_h: true, ..base }),
+            ("upside down, cropped", Placement { flip_v: true, crop: [0.1, 0.05, 0.2, 0.0], ..base }),
+            ("off the edge", Placement { x: 0.8, y: -0.2, ..base }),
+            ("the whole frame", Placement { x: 0.0, y: 0.0, w: 1.0, h: 1.0, ..base }),
+        ];
+        for (name, place) in cases {
+            let mut canvas = Canvas::new(w, h);
+            canvas.draw_camera(&cam, &place);
+            let mut pic = GpuPicture::new(gpu.clone(), w, h, crate::ScreenPlacement::whole(crate::Framing::Fit));
+            pic.set_camera(Some((&cam, &place)));
+            let got = gpu.read(&pic.layer.texture);
+            // The CPU's layer is B, G, R, A; the card's R, G, B, A.
+            let mut worst = 0;
+            for (c, g) in canvas.bgra.chunks_exact(4).zip(got.chunks_exact(4)) {
+                assert_eq!(c[3] > 127, g[3] > 127, "{name}: drawn in different places");
+                if c[3] > 127 {
+                    worst = worst.max(c[0].abs_diff(g[2])).max(c[1].abs_diff(g[1])).max(c[2].abs_diff(g[0]));
+                }
+            }
+            eprintln!("{name}: off by at most {worst}");
+            assert!(worst <= 1, "{name}: off by {worst}");
+        }
+    }
+
+    /// What a new webcam picture costs the CPU (uploading it, drawing its box
+    /// on the card), against `Canvas::draw_camera`'s 4-60 ms.
+    #[test]
+    #[ignore = "uses the graphics card: cargo test --release -p capture webcam_layer_time -- --ignored --nocapture"]
+    fn webcam_layer_time() {
+        let gpu = super::super::gpu::gpu().expect("a graphics card");
+        let cpu = || {
+            // SAFETY: a valid rusage to fill.
+            let mut u = unsafe { std::mem::zeroed::<libc::rusage>() };
+            unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut u) };
+            (u.ru_utime.tv_sec + u.ru_stime.tv_sec) as f64 + (u.ru_utime.tv_usec + u.ru_stime.tv_usec) as f64 / 1e6
+        };
+        let mut pic = GpuPicture::new(gpu.clone(), 1920, 1080, crate::ScreenPlacement::whole(crate::Framing::Fit));
+        let pictures: Vec<Arc<CameraPicture>> = (0..2).map(|k| Arc::new(CameraPicture { width: 1920, height: 1080, bgra: vec![40 + k as u8; 1920 * 1080 * 4], seq: k as u64 + 1 })).collect();
+        for w in [0.25f32, 0.5, 1.0] {
+            let place = Placement { x: 1.0 - w, y: 1.0 - w, w, h: w, crop: [0.0; 4], flip_h: false, flip_v: false, turns: 0, stretch: 1.0 };
+            let n = 60;
+            let c0 = cpu();
+            for i in 0..n {
+                pic.set_camera(Some((&pictures[i % 2], &place)));
+            }
+            let _ = gpu.device.poll(wgpu::PollType::wait_indefinitely());
+            let c = (cpu() - c0) * 1000.0 / n as f64;
+            eprintln!("a {:.0}%-wide box: {c:.2} ms CPU a picture ({:.0}% of a core at 30 fps)", w * 100.0, c * 3.0);
         }
     }
 

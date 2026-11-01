@@ -855,6 +855,8 @@ dependencies = [
  "windows 0.62.2",
  "windows-core 0.62.2",
  "x11rb",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -3064,9 +3066,12 @@ name = "media"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "capture",
  "jpeg-encoder",
+ "libc",
  "serde",
  "serde_json",
+ "windows 0.62.2",
 ]
 
 [[package]]

@@ -6,7 +6,7 @@
 //! shows (only the sides are trimmed, by at most a fifth).
 //!
 //! The pictures are exact frames from the in-process decoder (the GPU's on
-//! Windows and macOS, libavcodec on Linux), in
+//! Windows and macOS, libavcodec on Linux: on the card there), in
 //! stretches of a fixed number of frames laid end to end from the clip's
 //! start (the last one to its end), as many frames as fit a thumbnail at
 //! this zoom: they stay put while panning. A picture shows only its own frame:
@@ -136,6 +136,70 @@ mod exact {
     /// Thumbnails kept, at ~90 KB each.
     const CACHE: usize = 800;
 
+    /// The filmstrip's decoders: on Linux on the card where it can
+    /// (the pictures made small there: no CPU), but on the CPU while
+    /// playback is short of the card's video decoder (a 1440p 540 fps clip
+    /// needs nearly all of it: sharing it, playback showed 400 frames a
+    /// second, not 540), as it always was elsewhere: the platform's own.
+    struct Decoders {
+        path: PathBuf,
+        width: u32,
+        fps: f64,
+        card: Option<Decoder>,
+        cpu: Option<Decoder>,
+        /// The CPU's couldn't open: the card's does it all.
+        cpu_failed: bool,
+    }
+
+    impl Decoders {
+        fn open(path: &Path, width: u32, fps: f64) -> anyhow::Result<Self> {
+            let mut d = Self { path: path.to_path_buf(), width, fps, card: None, cpu: None, cpu_failed: false };
+            #[cfg(target_os = "linux")]
+            if std::env::var_os("HASTECLIP_CPU_DECODE").is_none()
+                && let Some(card) = capture::decode::Card::background()
+            {
+                match Decoder::open_rgba_card(path, width, &card) {
+                    Ok(mut dec) => {
+                        dec.set_fps(fps);
+                        d.card = Some(dec);
+                    }
+                    Err(e) => eprintln!("filmstrip: decoding on the CPU ({e:#})"),
+                }
+            }
+            if d.card.is_none() {
+                d.cpu = Some(d.open_cpu()?);
+            }
+            Ok(d)
+        }
+
+        fn open_cpu(&self) -> anyhow::Result<Decoder> {
+            let mut dec = Decoder::open_rgba(&self.path, self.width)?;
+            dec.set_fps(self.fps);
+            Ok(dec)
+        }
+
+        /// Frame `i`'s picture, from the card's decoder unless playback is
+        /// short of it.
+        fn frame(&mut self, i: u64) -> anyhow::Result<Option<Picture>> {
+            let short = capture::playback_short();
+            if short && self.card.is_some() && self.cpu.is_none() && !self.cpu_failed {
+                match self.open_cpu() {
+                    Ok(dec) => self.cpu = Some(dec),
+                    Err(e) => {
+                        eprintln!("filmstrip: can't decode on the CPU meanwhile ({e:#})");
+                        self.cpu_failed = true;
+                    }
+                }
+            }
+            match (&mut self.card, &mut self.cpu) {
+                (Some(_), Some(cpu)) if short => cpu.frame(i),
+                (Some(card), _) => card.frame(i),
+                (None, Some(cpu)) => cpu.frame(i),
+                (None, None) => anyhow::bail!("no decoder"),
+            }
+        }
+    }
+
     pub struct Exact {
         pub source: std::path::PathBuf,
         /// The decoder couldn't open the clip.
@@ -168,7 +232,7 @@ mod exact {
                 // The filmstrip's decoding yields to everything else.
                 crate::video::lower_priority();
                 // Opened here, not on the UI thread: it takes a few hundred ms.
-                let mut dec = match Decoder::open_rgba(&path, width) {
+                let mut dec = match Decoders::open(&path, width, fps) {
                     Ok(d) => d,
                     Err(e) => {
                         eprintln!("filmstrip: hardware decoder unavailable, using keyframes: {e:#}");
@@ -177,7 +241,6 @@ mod exact {
                         return;
                     }
                 };
-                dec.set_fps(fps);
                 // Wait for a list; work through it, switching to a newer one
                 // the moment it arrives.
                 let Ok(mut list) = want_rx.recv() else { return };

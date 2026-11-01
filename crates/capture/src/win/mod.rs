@@ -26,6 +26,7 @@ mod changes;
 mod cursor;
 mod d3d;
 mod dupl;
+pub(crate) mod export;
 pub mod decode;
 pub(crate) mod direct;
 pub mod gpu;
@@ -257,7 +258,7 @@ impl Session {
         let (titles, comment, has_rest) = track_layout(&s.sources);
         let aac: Vec<AacEncoder> = titles.iter().map(|_| AacEncoder::new(AUDIO_BITRATE)).collect::<Result<_>>()?;
         let layout = Layout {
-            spec: Spec { width, height, fps: s.fps, audio_titles: titles, audio_bitrate: AUDIO_BITRATE, comment, mov },
+            spec: Spec { width, height, fps: s.fps, audio_titles: titles, audio_bitrate: AUDIO_BITRATE, comment, mov, reorder: 0 },
         };
         let writer = match target {
             Target::Record(file) => Writer::record(file, layout, s.fps),

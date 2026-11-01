@@ -4,6 +4,10 @@
 //! textures, in turns, so each new frame is one the stage's light hasn't
 //! taken in yet. Uploads and draws reach the GPU in the order they're made:
 //! a set isn't written again before the frame in it has been drawn.
+//!
+//! Linux, on the card: frames decoded there, into buffers of the
+//! renderer's ([`card`]), are copied into those textures by the card itself:
+//! nothing passes through the CPU.
 
 use eframe::wgpu;
 
@@ -32,6 +36,26 @@ impl Uploads {
         if nv12.len() < media::nv12_len(width, height) {
             return None;
         }
+        let (slot, y, cbcr) = self.next_set(rs, width, height);
+        write(&rs.queue, (&y, &cbcr), width, height, nv12);
+        Some(Shown { key: (self.pool, slot), planes: Planes::Nv12 { y, cbcr, bt601 } })
+    }
+
+    /// A frame on the card (`width`×`height`), copied into the next set by
+    /// the card, ready to draw. The frame must stay held until that copy has
+    /// run: a few passes (as the player keeps a frame it took off screen).
+    #[cfg(target_os = "linux")]
+    pub fn show_card(&mut self, width: u32, height: u32, f: &capture::decode::CardFrame, bt601: bool) -> Option<Shown> {
+        let rs = RENDER.get()?;
+        let (slot, y, cbcr) = self.next_set(rs, width, height);
+        let mut encoder = rs.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame from the card") });
+        copy_card_frame(&mut encoder, f, (&y, &cbcr));
+        rs.queue.submit([encoder.finish()]);
+        Some(Shown { key: (self.pool, slot), planes: Planes::Nv12 { y, cbcr, bt601 } })
+    }
+
+    /// The set to put the next frame in, made for `width`×`height`.
+    fn next_set(&mut self, rs: &eframe::egui_wgpu::RenderState, width: u32, height: u32) -> (usize, wgpu::TextureView, wgpu::TextureView) {
         if self.pool == 0 {
             self.pool = next_pool();
         }
@@ -42,9 +66,35 @@ impl Uploads {
         let slot = self.next;
         self.next = (slot + 1) % self.sets.len();
         let (y, cbcr) = self.sets[slot].clone();
-        write(&rs.queue, (&y, &cbcr), width, height, nv12);
-        Some(Shown { key: (self.pool, slot), planes: Planes::Nv12 { y, cbcr, bt601 } })
+        (slot, y, cbcr)
     }
+}
+
+/// Copy a frame on the card into a texture set (the card's copy, in order
+/// with what's submitted around it).
+#[cfg(target_os = "linux")]
+fn copy_card_frame(encoder: &mut wgpu::CommandEncoder, f: &capture::decode::CardFrame, (y, cbcr): (&wgpu::TextureView, &wgpu::TextureView)) {
+    let layout = |offset: u64| wgpu::TexelCopyBufferLayout { offset, bytes_per_row: Some(f.pitch()), rows_per_image: None };
+    encoder.copy_buffer_to_texture(wgpu::TexelCopyBufferInfo { buffer: f.buffer(), layout: layout(0) }, y.texture().as_image_copy(), y.texture().size());
+    encoder.copy_buffer_to_texture(wgpu::TexelCopyBufferInfo { buffer: f.buffer(), layout: layout(f.chroma_at()) }, cbcr.texture().as_image_copy(), cbcr.texture().size());
+}
+
+/// Decoding on the card, into the renderer's memory: made the first time
+/// it's asked for, if the renderer is on Vulkan on a card that decodes
+/// (NVIDIA's through CUDA, AMD's and Intel's through VA-API: see
+/// `capture::decode::Card`). `HASTECLIP_CPU_DECODE=1` decodes on the CPU
+/// anyway, to compare.
+#[cfg(target_os = "linux")]
+pub fn card() -> Option<std::sync::Arc<capture::decode::Card>> {
+    static CARD: std::sync::OnceLock<Option<std::sync::Arc<capture::decode::Card>>> = std::sync::OnceLock::new();
+    CARD.get_or_init(|| {
+        if std::env::var_os("HASTECLIP_CPU_DECODE").is_some() {
+            return None;
+        }
+        let rs = RENDER.get()?;
+        capture::decode::Card::new(&rs.device, &rs.queue).inspect_err(|e| eprintln!("video: decoding on the CPU ({e:#})")).ok()
+    })
+    .clone()
 }
 
 impl Drop for Uploads {
@@ -80,6 +130,9 @@ pub struct Ring {
     width: u32,
     height: u32,
     staging: std::sync::Mutex<Staging>,
+    /// Frames on the card for slots ([`Ring::fill_card`]): the card copies
+    /// them in at the next flush.
+    cards: std::sync::Mutex<Vec<(usize, capture::decode::CardFrame)>>,
 }
 
 /// The buffers a frame goes through on its way to a slot: each is mapped
@@ -141,6 +194,7 @@ impl Ring {
                 state: vec![State::Free; STAGING],
                 mapped: (0..STAGING).map(|_| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true))).collect(),
             }),
+            cards: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -200,13 +254,21 @@ impl Ring {
         written
     }
 
+    /// The uploader: frame `f` (on the card, the ring's size) for `slot`,
+    /// copied in by the card at the next flush.
+    pub fn fill_card(&self, slot: usize, f: capture::decode::CardFrame) -> bool {
+        self.cards.lock().unwrap().push((slot, f));
+        true
+    }
+
     /// The UI thread: have the GPU copy every written buffer into its
     /// slot (in order before the UI's next frame), and map them again.
     /// The slots now holding their frames.
     pub fn flush(&self) -> Vec<usize> {
+        let cards = std::mem::take(&mut *self.cards.lock().unwrap());
         let mut staging = self.staging.lock().unwrap();
         let filled: Vec<(usize, usize)> = (0..STAGING).filter_map(|k| match staging.state[k] { State::Filled(slot) => Some((k, slot)), _ => None }).collect();
-        if filled.is_empty() {
+        if filled.is_empty() && cards.is_empty() {
             return Vec::new();
         }
         let Some(rs) = RENDER.get() else { return Vec::new() };
@@ -221,7 +283,17 @@ impl Ring {
             encoder.copy_buffer_to_texture(wgpu::TexelCopyBufferInfo { buffer, layout: layout(0, row_y) }, y.texture().as_image_copy(), y.texture().size());
             encoder.copy_buffer_to_texture(wgpu::TexelCopyBufferInfo { buffer, layout: layout(chroma_at, row_c) }, cbcr.texture().as_image_copy(), cbcr.texture().size());
         }
+        for (slot, f) in &cards {
+            let (y, cbcr) = &self.sets[*slot];
+            copy_card_frame(&mut encoder, f, (y, cbcr));
+        }
         rs.queue.submit([encoder.finish()]);
+        // The frames' buffers go back to their decoder once the card has
+        // copied them.
+        let card_slots: Vec<usize> = cards.iter().map(|(slot, _)| *slot).collect();
+        if !cards.is_empty() {
+            rs.queue.on_submitted_work_done(move || drop(cards));
+        }
         for &(k, _) in &filled {
             // Mapped again once that copy is done (the UI's submits see to
             // the callback).
@@ -234,7 +306,7 @@ impl Ring {
                 }
             });
         }
-        filled.into_iter().map(|(_, slot)| slot).collect()
+        filled.into_iter().map(|(_, slot)| slot).chain(card_slots).collect()
     }
 
     /// A buffer is mapped and free for the uploader to write.
@@ -300,16 +372,29 @@ pub(super) fn upload_for_test(device: &wgpu::Device, queue: &wgpu::Queue, width:
     set
 }
 
+/// A frame on the card copied into textures, as the player does.
+#[cfg(all(test, target_os = "linux"))]
+pub(super) fn card_for_test(device: &wgpu::Device, queue: &wgpu::Queue, width: u32, height: u32, f: &capture::decode::CardFrame) -> (wgpu::TextureView, wgpu::TextureView) {
+    let set = planes(device, width, height);
+    let mut encoder = device.create_command_encoder(&Default::default());
+    copy_card_frame(&mut encoder, f, (&set.0, &set.1));
+    queue.submit([encoder.finish()]);
+    set
+}
+
 /// The in-process decoder's frames (`capture::decode`: on Linux, NV12 in
-/// memory), uploaded to draw.
+/// memory, or on the card), put in textures to draw.
 #[cfg(target_os = "linux")]
 #[derive(Default)]
 pub struct Frames(Uploads);
 
 #[cfg(target_os = "linux")]
 impl Frames {
-    /// `s`, uploaded and ready to draw.
+    /// `s`, uploaded (or copied on the card) and ready to draw.
     pub fn show(&mut self, s: &capture::decode::Surface, width: u32, height: u32) -> Option<Shown> {
-        self.0.show(width, height, &s.nv12, s.bt601)
+        match &s.nv12 {
+            capture::decode::Nv12::Memory(nv12) => self.0.show(width, height, nv12, s.bt601),
+            capture::decode::Nv12::Card(f) => self.0.show_card(width, height, f, s.bt601),
+        }
     }
 }

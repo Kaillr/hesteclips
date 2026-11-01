@@ -10,10 +10,10 @@
 //! come in our memory and are worked on the CPU (`super::image`).
 
 use std::ffi::CStr;
-use std::os::fd::{AsRawFd, BorrowedFd, IntoRawFd};
-use std::sync::{Arc, OnceLock};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
+use std::sync::{Arc, Mutex, OnceLock};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use ash::vk;
 use wgpu::hal::api::Vulkan;
 
@@ -24,6 +24,9 @@ const EXTENSIONS: [&CStr; 4] = [
     ash::ext::image_drm_format_modifier::NAME,
     ash::ext::queue_family_foreign::NAME,
 ];
+
+/// What encoding H.264 through Vulkan Video takes (`super::vkenc`).
+const VIDEO_EXTENSIONS: [&CStr; 3] = [ash::khr::video_queue::NAME, ash::khr::video_encode_queue::NAME, ash::khr::video_encode_h264::NAME];
 
 /// The DRM fourcc codes of the formats asked for, as PipeWire's video formats.
 pub(crate) const DRM_XRGB8888: u32 = u32::from_le_bytes(*b"XR24");
@@ -38,7 +41,18 @@ pub(crate) struct Gpu {
     /// The layouts (DRM format modifiers) a 4-byte BGRA/RGBA picture can be
     /// imported in: what we offer the compositor.
     pub modifiers: Vec<u64>,
+    /// The card's UUID, which CUDA knows it by too (`super::nvenc`).
+    pub uuid: [u8; 16],
+    /// Where the card encodes H.264 through Vulkan Video (`super::vkenc`).
+    pub video: Option<VideoQueue>,
     external_fd: ash::khr::external_memory_fd::Device,
+}
+
+/// The card's video encoding queue: ours alone (wgpu has its own queue).
+pub(crate) struct VideoQueue {
+    pub family: u32,
+    /// Taken while submitting to it.
+    pub queue: Mutex<vk::Queue>,
 }
 
 /// The card, if pictures can be taken from it.
@@ -65,47 +79,98 @@ impl Gpu {
             ..Default::default()
         }))
         .context("no Vulkan graphics card")?;
-        let (open, modifiers) = {
+        let (open, modifiers, uuid, video) = {
             // SAFETY: the adapter is Vulkan (the only backend asked for).
             let hal = unsafe { adapter.as_hal::<Vulkan>() }.context("not a Vulkan adapter")?;
             let caps = hal.physical_device_capabilities();
             if let Some(missing) = EXTENSIONS.iter().find(|e| !caps.supports_extension(e)) {
                 bail!("the driver can't import DMA-BUFs ({} missing)", missing.to_string_lossy());
             }
-            let modifiers = importable_modifiers(hal.shared_instance().raw_instance(), hal.raw_physical_device());
+            let (instance, physical) = (hal.shared_instance().raw_instance(), hal.raw_physical_device());
+            let modifiers = importable_modifiers(instance, physical);
+            let uuid = {
+                let mut id = vk::PhysicalDeviceIDProperties::default();
+                let mut props = vk::PhysicalDeviceProperties2::default().push_next(&mut id);
+                // SAFETY: a valid physical device and output structs.
+                unsafe { instance.get_physical_device_properties2(physical, &mut props) };
+                id.device_uuid
+            };
             if modifiers.is_empty() {
                 bail!("the driver can't import a BGRA picture in any layout");
             }
+            // A queue that encodes H.264, where Vulkan Video can, and wgpu
+            // copies into the encoder's NV12 pictures (`super::vkenc`).
+            let video = (VIDEO_EXTENSIONS.iter().all(|e| caps.supports_extension(e))
+                && adapter.features().contains(wgpu::Features::TEXTURE_FORMAT_NV12)
+                && has_synchronization2(instance, physical))
+            .then(|| h264_encode_family(instance, physical))
+            .flatten();
             let limits = adapter.limits();
-            // SAFETY: only extensions the device has are added.
-            let open = unsafe {
-                hal.open_with_callback(
-                    wgpu::Features::empty(),
-                    &limits,
-                    &wgpu::MemoryHints::Performance,
-                    Some(Box::new(|args: wgpu::hal::vulkan::CreateDeviceCallbackArgs| {
-                        for e in EXTENSIONS {
-                            if !args.extensions.contains(&e) {
-                                args.extensions.push(e);
+            let open = |video: Option<u32>| {
+                let features = if video.is_some() { wgpu::Features::TEXTURE_FORMAT_NV12 } else { wgpu::Features::empty() };
+                // SAFETY: only extensions and queues the device has are added.
+                unsafe {
+                    hal.open_with_callback(
+                        features,
+                        &limits,
+                        &wgpu::MemoryHints::Performance,
+                        Some(Box::new(move |args: wgpu::hal::vulkan::CreateDeviceCallbackArgs| {
+                            let video_extensions: &[&CStr] = if video.is_some() { &VIDEO_EXTENSIONS } else { &[] };
+                            for &e in EXTENSIONS.iter().chain(video_extensions) {
+                                if !args.extensions.contains(&e) {
+                                    args.extensions.push(e);
+                                }
                             }
-                        }
-                    })),
-                )
-            }
-            .map_err(|e| anyhow!("can't open the graphics card: {e}"))?;
-            (open, modifiers)
+                            if let Some(family) = video {
+                                static PRIORITY: [f32; 1] = [1.0];
+                                args.queue_create_infos.push(vk::DeviceQueueCreateInfo::default().queue_family_index(family).queue_priorities(&PRIORITY));
+                                // The encoder's pictures are shared by wgpu's queue
+                                // and the video queue, and wgpu's barriers on them
+                                // name its own family: allowed with this. Made
+                                // once, for the device's life.
+                                let sync2 = Box::leak(Box::new(vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true)));
+                                *args.create_info = args.create_info.push_next(sync2);
+                            }
+                        })),
+                    )
+                }
+                .map(|o| (o, features))
+            };
+            let (open, video) = match video.map(|f| (open(Some(f)), f)) {
+                Some((Ok(o), f)) => (o, Some(f)),
+                Some((Err(e), _)) => {
+                    eprintln!("graphics card: can't open it with its video encoder ({e}); without it");
+                    (open(None).map_err(|e| anyhow!("can't open the graphics card: {e}"))?, None)
+                }
+                None => (open(None).map_err(|e| anyhow!("can't open the graphics card: {e}"))?, None),
+            };
+            (open, modifiers, uuid, video)
         };
-        // SAFETY: `open` was made from this adapter.
+        let (open, features) = open;
+        // SAFETY: `open` was made from this adapter, with these features.
         let (device, queue) = unsafe {
-            adapter.create_device_from_hal(open, &wgpu::DeviceDescriptor { label: Some("hasteclip capture"), required_limits: adapter.limits(), ..Default::default() })
+            adapter.create_device_from_hal(
+                open,
+                &wgpu::DeviceDescriptor { label: Some("hasteclip capture"), required_features: features, required_limits: adapter.limits(), ..Default::default() },
+            )
         }
         .context("can't use the graphics card")?;
-        let external_fd = {
+        let (external_fd, video) = {
             // SAFETY: the device is Vulkan.
             let hal = unsafe { device.as_hal::<Vulkan>() }.context("not a Vulkan device")?;
-            ash::khr::external_memory_fd::Device::new(hal.shared_instance().raw_instance(), hal.raw_device())
+            let external_fd = ash::khr::external_memory_fd::Device::new(hal.shared_instance().raw_instance(), hal.raw_device());
+            // SAFETY: the device was made with one queue in this family.
+            let video = video.map(|family| VideoQueue { family, queue: Mutex::new(unsafe { hal.raw_device().get_device_queue(family, 0) }) });
+            (external_fd, video)
         };
-        Ok(Self { device, queue, modifiers, external_fd })
+        Ok(Self { device, queue, modifiers, uuid, video, external_fd })
+    }
+
+    /// A storage buffer of `size` bytes whose memory CUDA can take in too
+    /// (NVIDIA's encoder reads the frames made in it, `super::nvenc`): see
+    /// [`shared_buffer`].
+    pub(crate) fn shared_buffer(&self, size: u64) -> Result<(wgpu::Buffer, OwnedFd, u64)> {
+        shared_buffer(&self.device, size)
     }
 
     /// Take in a DMA-BUF picture (one plane; `fd` is borrowed, and dup'ed for
@@ -222,6 +287,113 @@ impl Gpu {
         }
         out
     }
+}
+
+/// A buffer of `size` bytes on `device` (ours, or the app's renderer's)
+/// whose memory CUDA can take in too: NVIDIA's encoder reads the frames made
+/// in it (`super::nvenc`), its decoder's frames are copied into it
+/// (`super::decode`). Its memory as an opaque fd, and the size of that
+/// memory, which CUDA is told (it can be more than `size`).
+pub(crate) fn shared_buffer(device: &wgpu::Device, size: u64) -> Result<(wgpu::Buffer, OwnedFd, u64)> {
+    // SAFETY: the device is Vulkan.
+    let hal = unsafe { device.as_hal::<Vulkan>() }.context("not a Vulkan device")?;
+    ensure!(hal.enabled_device_extensions().contains(&ash::khr::external_memory_fd::NAME), "the graphics card's memory can't be shared");
+    let raw = hal.raw_device();
+    let external_fd = ash::khr::external_memory_fd::Device::new(hal.shared_instance().raw_instance(), raw);
+    let opaque = vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD;
+    let mut external = vk::ExternalMemoryBufferCreateInfo::default().handle_types(opaque);
+    let info = vk::BufferCreateInfo::default()
+        .size(size)
+        .usage(vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .push_next(&mut external);
+    // SAFETY: a valid create info.
+    let buffer = unsafe { raw.create_buffer(&info, None) }.context("Vulkan won't make a buffer to share")?;
+    let memory = (|| -> Result<vk::DeviceMemory> {
+        // SAFETY: a buffer of ours.
+        let req = unsafe { raw.get_buffer_memory_requirements(buffer) };
+        // SAFETY: a valid physical device.
+        let props = unsafe { hal.shared_instance().raw_instance().get_physical_device_memory_properties(hal.raw_physical_device()) };
+        let type_index = (0..props.memory_type_count)
+            .find(|&i| req.memory_type_bits & (1 << i) != 0 && props.memory_types[i as usize].property_flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL))
+            .context("no memory on the card for a shared buffer")?;
+        let mut export = vk::ExportMemoryAllocateInfo::default().handle_types(opaque);
+        let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().buffer(buffer);
+        let alloc = vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(type_index).push_next(&mut export).push_next(&mut dedicated);
+        // SAFETY: a valid allocate info.
+        let memory = unsafe { raw.allocate_memory(&alloc, None) }.context("Vulkan won't allocate memory to share")?;
+        // SAFETY: fresh memory for this buffer.
+        if let Err(e) = unsafe { raw.bind_buffer_memory(buffer, memory, 0) } {
+            // SAFETY: unused memory of ours.
+            unsafe { raw.free_memory(memory, None) };
+            bail!("Vulkan won't bind memory to share: {e}");
+        }
+        Ok(memory)
+    })();
+    let memory = match memory {
+        Ok(m) => m,
+        Err(e) => {
+            // SAFETY: a buffer of ours, unused.
+            unsafe { raw.destroy_buffer(buffer, None) };
+            return Err(e);
+        }
+    };
+    // SAFETY: a buffer of ours.
+    let allocated = unsafe { raw.get_buffer_memory_requirements(buffer) }.size;
+    // SAFETY: the buffer and memory are ours, and handed to wgpu, which
+    // destroys them when the buffer is dropped.
+    let hal_buffer = unsafe { wgpu::hal::vulkan::Buffer::from_raw_managed(buffer, memory, 0, size) };
+    let fd = {
+        let info = vk::MemoryGetFdInfoKHR::default().memory(memory).handle_type(opaque);
+        // SAFETY: memory made exportable as an opaque fd.
+        unsafe { external_fd.get_memory_fd(&info) }
+    };
+    drop(hal);
+    let desc = wgpu::BufferDescriptor { label: Some("shared"), size, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false };
+    // SAFETY: made on this device, as `desc` says, and bound to memory.
+    let shared = unsafe { device.create_buffer_from_hal::<Vulkan>(hal_buffer, &desc) };
+    let fd = fd.map_err(|e| anyhow!("Vulkan won't share the memory: {e}"))?;
+    // SAFETY: a new fd, ours.
+    Ok((shared, unsafe { OwnedFd::from_raw_fd(fd) }, allocated))
+}
+
+/// The Vulkan UUID of `device`'s card (CUDA knows it by it too).
+pub(crate) fn uuid_of(device: &wgpu::Device) -> Option<[u8; 16]> {
+    // SAFETY: only read from.
+    let hal = unsafe { device.as_hal::<Vulkan>() }?;
+    let (instance, physical) = (hal.shared_instance().raw_instance(), hal.raw_physical_device());
+    let mut id = vk::PhysicalDeviceIDProperties::default();
+    let mut props = vk::PhysicalDeviceProperties2::default().push_next(&mut id);
+    // SAFETY: a valid physical device and output structs.
+    unsafe { instance.get_physical_device_properties2(physical, &mut props) };
+    Some(id.device_uuid)
+}
+
+/// Whether the card has synchronization2 (Vulkan 1.3's), which sharing the
+/// encoder's pictures with wgpu takes.
+fn has_synchronization2(instance: &ash::Instance, physical: vk::PhysicalDevice) -> bool {
+    let mut sync2 = vk::PhysicalDeviceSynchronization2Features::default();
+    let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut sync2);
+    // SAFETY: a valid physical device and output structs.
+    unsafe { instance.get_physical_device_features2(physical, &mut features) };
+    sync2.synchronization2 == vk::TRUE
+}
+
+/// A queue family that encodes H.264 through Vulkan Video, other than wgpu's
+/// (the first).
+fn h264_encode_family(instance: &ash::Instance, physical: vk::PhysicalDevice) -> Option<u32> {
+    // SAFETY: a valid physical device.
+    let count = unsafe { instance.get_physical_device_queue_family_properties2_len(physical) };
+    let mut video = vec![vk::QueueFamilyVideoPropertiesKHR::default(); count];
+    let flags: Vec<vk::QueueFlags> = {
+        let mut props: Vec<vk::QueueFamilyProperties2> = video.iter_mut().map(|v| vk::QueueFamilyProperties2::default().push_next(v)).collect();
+        // SAFETY: as many output structs as families.
+        unsafe { instance.get_physical_device_queue_family_properties2(physical, &mut props) };
+        props.iter().map(|p| p.queue_family_properties.queue_flags).collect()
+    };
+    (1..count)
+        .find(|&i| flags[i].contains(vk::QueueFlags::VIDEO_ENCODE_KHR) && video[i].video_codec_operations.contains(vk::VideoCodecOperationFlagsKHR::ENCODE_H264))
+        .map(|i| i as u32)
 }
 
 /// The DRM format modifiers a B8G8R8A8 picture can be imported in, sampled

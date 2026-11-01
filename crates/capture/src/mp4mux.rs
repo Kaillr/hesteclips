@@ -13,6 +13,11 @@
 //!
 //! Track names (`hdlr`) and the mix tag (`©cmt`, read by ffprobe as `comment`)
 //! are written directly.
+//!
+//! On macOS only exports' pictures are written here (`mac::export`; the
+//! recordings by AVAssetWriter): the sound and the encoders' Annex B go unused.
+
+#![cfg_attr(target_os = "macos", allow(dead_code))]
 
 use std::fs::File;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
@@ -45,6 +50,11 @@ pub(crate) struct Spec {
     pub comment: String,
     /// QuickTime brand instead of MP4.
     pub mov: bool,
+    /// Video frames that may come before ones shown earlier (an encoder's
+    /// B-frames: frames come in the order they're decoded): each is then
+    /// one frame long, decoded this many frames before it's shown at the
+    /// latest, and an edit takes that back out. 0: frames come as shown.
+    pub reorder: u32,
 }
 
 /// H.264 parameter sets, from the first keyframe.
@@ -52,6 +62,27 @@ pub(crate) struct Spec {
 pub(crate) struct AvcConfig {
     pub sps: Vec<u8>,
     pub pps: Vec<u8>,
+}
+
+impl AvcConfig {
+    /// As an `avcC` box holds them (the box's content): what a decoder is
+    /// set up from, for frames with 4-byte NAL lengths.
+    pub(crate) fn record(&self) -> Vec<u8> {
+        let (sps, pps) = (&self.sps, &self.pps);
+        let mut avcc = vec![1, sps.get(1).copied().unwrap_or(100), sps.get(2).copied().unwrap_or(0), sps.get(3).copied().unwrap_or(40)];
+        avcc.push(0xFF); // 4-byte NAL lengths
+        avcc.push(0xE1);
+        avcc.put_u16(sps.len() as u16);
+        avcc.extend_from_slice(sps);
+        avcc.push(1);
+        avcc.put_u16(pps.len() as u16);
+        avcc.extend_from_slice(pps);
+        if matches!(sps.get(1), Some(100 | 110 | 122 | 144)) {
+            // 4:2:0, 8-bit, no SPS extensions.
+            avcc.extend_from_slice(&[0xFD, 0xF8, 0xF8, 0]);
+        }
+        avcc
+    }
 }
 
 struct Track {
@@ -63,13 +94,17 @@ struct Track {
     durations: Vec<u32>,
     /// 1-based numbers of sync samples (video only).
     syncs: Vec<u32>,
+    /// How long after its decoding each sample is shown, where frames are
+    /// reordered (else none).
+    shown_after: Vec<u32>,
     /// (file offset, sample count) per chunk.
     chunks: Vec<(u64, u32)>,
     /// Where the track's media starts on the file's timeline, in its timescale
     /// (written as an empty edit).
     offset: u64,
-    /// Fragmented: samples not yet written, and the decode time of the first.
-    pending: Vec<(Data, u32, bool)>,
+    /// Fragmented: samples not yet written (data, duration, sync, shown
+    /// after), and the decode time of the first.
+    pending: Vec<(Data, u32, bool, u32)>,
     decode_time: u64,
 }
 
@@ -103,6 +138,8 @@ pub(crate) struct Muxer {
     mode: Mode,
     /// The newest video frame, held until the next one gives its duration.
     held: Option<(Data, i64, bool)>,
+    /// Video frames so far, where frames are reordered.
+    frames: i64,
     /// Next expected frame per audio track (None until its first packet).
     audio_next: Vec<Option<i64>>,
 }
@@ -129,6 +166,7 @@ impl Muxer {
             tracks,
             mode,
             held: None,
+            frames: 0,
         };
         if fragmented {
             let ftyp = mux.ftyp();
@@ -147,12 +185,25 @@ impl Muxer {
     /// A video frame (AVCC, 4-byte lengths) presented at `t` seconds into the file.
     pub(crate) fn video(&mut self, data: Data, t: f64, sync: bool) -> Result<()> {
         let tick = (t * self.tracks[0].timescale as f64).round() as i64;
+        if self.spec.reorder > 0 {
+            // In decode order: frame `frames` is decoded at that many frames
+            // in and shown at `tick`, `reorder` frames later than it is.
+            let frame = self.frame_ticks() as i64;
+            let shown_after = tick + self.spec.reorder as i64 * frame - self.frames * frame;
+            self.frames += 1;
+            return self.push(0, data, frame as u32, sync, shown_after.max(0) as u32);
+        }
         if let Some((prev, prev_tick, prev_sync)) = self.held.take() {
             let dur = (tick - prev_tick).max(1) as u32;
-            self.push(0, prev, dur, prev_sync)?;
+            self.push(0, prev, dur, prev_sync, 0)?;
         }
         self.held = Some((data, tick, sync));
         Ok(())
+    }
+
+    /// A video frame's length, in its track's timescale.
+    fn frame_ticks(&self) -> u32 {
+        (self.tracks[0].timescale / self.spec.fps.max(1)).max(1)
     }
 
     /// An AAC packet starting at 48 kHz frame `frame` of the file (≥ 0).
@@ -165,10 +216,11 @@ impl Muxer {
             _ => {}
         }
         *next = Some(frame.max(next.unwrap_or(0)) + AAC_FRAMES as i64);
-        self.push(track + 1, data, AAC_FRAMES, true)
+        self.push(track + 1, data, AAC_FRAMES, true, 0)
     }
 
-    fn push(&mut self, track: usize, data: Data, dur: u32, sync: bool) -> Result<()> {
+    fn push(&mut self, track: usize, data: Data, dur: u32, sync: bool, shown_after: u32) -> Result<()> {
+        let reordered = track == 0 && self.spec.reorder > 0;
         match &mut self.mode {
             Mode::Plain { samples } => {
                 let t = &mut self.tracks[track];
@@ -177,13 +229,16 @@ impl Muxer {
                 if t.video && sync {
                     t.syncs.push(t.sizes.len() as u32);
                 }
+                if reordered {
+                    t.shown_after.push(shown_after);
+                }
                 samples.push((track, data));
             }
             Mode::Fragmented { .. } => {
                 if track == 0 && sync && self.tracks[0].pending_duration() >= (FRAGMENT_SECS * self.tracks[0].timescale) as u64 {
                     self.flush_fragment()?;
                 }
-                self.tracks[track].pending.push((data, dur, sync));
+                self.tracks[track].pending.push((data, dur, sync, shown_after));
                 // Never let a fragment grow past a few seconds, keyframes or not.
                 if track == 0 && self.tracks[0].pending_duration() >= (4 * FRAGMENT_SECS * self.tracks[0].timescale) as u64 {
                     self.flush_fragment()?;
@@ -206,11 +261,12 @@ impl Muxer {
 
         // The moof's size doesn't depend on the data offsets, so build it once to
         // measure, then for real.
+        let reorder = self.spec.reorder > 0;
         let build = |tracks: &[Track], data_start: u64| -> Vec<u8> {
             let mut trafs = Vec::new();
             let mut off = data_start;
             for t in tracks.iter().filter(|t| !t.pending.is_empty()) {
-                trafs.extend(traf(t, off as i32));
+                trafs.extend(traf(t, off as i32, t.video && reorder));
                 off += t.pending.iter().map(|p| p.0.len() as u64).sum::<u64>();
             }
             let mut body = full_box(b"mfhd", 0, 0, &seq.to_be_bytes());
@@ -229,12 +285,15 @@ impl Muxer {
             }
             let t = &mut self.tracks[i];
             t.chunks.push((self.pos, pending.len() as u32));
-            for (data, dur, sync) in &pending {
+            for (data, dur, sync, shown_after) in &pending {
                 t.sizes.push(data.len() as u32);
                 t.durations.push(*dur);
                 t.decode_time += *dur as u64;
                 if t.video && *sync {
                     t.syncs.push(t.sizes.len() as u32);
+                }
+                if t.video && self.spec.reorder > 0 {
+                    t.shown_after.push(*shown_after);
                 }
             }
             for (data, ..) in &pending {
@@ -248,8 +307,8 @@ impl Muxer {
 
     pub(crate) fn finish(mut self) -> Result<()> {
         if let Some((data, _, sync)) = self.held.take() {
-            let dur = (self.tracks[0].timescale / self.spec.fps.max(1)).max(1);
-            self.push(0, data, dur, sync)?;
+            let dur = self.frame_ticks();
+            self.push(0, data, dur, sync, 0)?;
         }
         match std::mem::replace(&mut self.mode, Mode::Plain { samples: Vec::new() }) {
             Mode::Fragmented { sequence, moov_at, moofs } => {
@@ -419,6 +478,16 @@ impl Muxer {
             elst.put_u32(0x0001_0000);
             trak.extend(make_box(b"edts", &full_box(b"elst", 0, 0, &elst)));
         }
+        // Reordered video is shown `reorder` frames after it's decoded: the
+        // file starts there.
+        if t.video && self.spec.reorder > 0 {
+            let mut elst = Vec::new();
+            elst.put_u32(1);
+            elst.put_u32(movie_dur as u32);
+            elst.put_u32(self.spec.reorder * self.frame_ticks());
+            elst.put_u32(0x0001_0000);
+            trak.extend(make_box(b"edts", &full_box(b"elst", 0, 0, &elst)));
+        }
 
         let mut mdhd = Vec::new();
         mdhd.put_u32(0);
@@ -466,6 +535,23 @@ impl Muxer {
             stts.put_u32(d);
         }
         stbl.extend(full_box(b"stts", 0, 0, &stts));
+
+        if !t.shown_after.is_empty() {
+            let mut runs: Vec<(u32, u32)> = Vec::new();
+            for &d in &t.shown_after {
+                match runs.last_mut() {
+                    Some((n, after)) if *after == d => *n += 1,
+                    _ => runs.push((1, d)),
+                }
+            }
+            let mut ctts = Vec::new();
+            ctts.put_u32(runs.len() as u32);
+            for (n, d) in runs {
+                ctts.put_u32(n);
+                ctts.put_u32(d);
+            }
+            stbl.extend(full_box(b"ctts", 0, 0, &ctts));
+        }
 
         if t.video {
             let mut stss = Vec::new();
@@ -523,20 +609,7 @@ impl Muxer {
         b.put_u16(0x18);
         b.put_u16(0xFFFF);
 
-        let (sps, pps) = (&self.avc.sps, &self.avc.pps);
-        let mut avcc = vec![1, sps.get(1).copied().unwrap_or(100), sps.get(2).copied().unwrap_or(0), sps.get(3).copied().unwrap_or(40)];
-        avcc.push(0xFF); // 4-byte NAL lengths
-        avcc.push(0xE1);
-        avcc.put_u16(sps.len() as u16);
-        avcc.extend_from_slice(sps);
-        avcc.push(1);
-        avcc.put_u16(pps.len() as u16);
-        avcc.extend_from_slice(pps);
-        if matches!(sps.get(1), Some(100 | 110 | 122 | 144)) {
-            // 4:2:0, 8-bit, no SPS extensions.
-            avcc.extend_from_slice(&[0xFD, 0xF8, 0xF8, 0]);
-        }
-        b.extend(make_box(b"avcC", &avcc));
+        b.extend(make_box(b"avcC", &self.avc.record()));
         // BT.709, limited range — what the encoder is given.
         let mut colr = b"nclx".to_vec();
         colr.put_u16(1);
@@ -588,6 +661,7 @@ impl Track {
             sizes: Vec::new(),
             durations: Vec::new(),
             syncs: Vec::new(),
+            shown_after: Vec::new(),
             chunks: Vec::new(),
             offset: 0,
             pending: Vec::new(),
@@ -607,23 +681,27 @@ fn mdat_header_len(data_len: u64) -> u64 {
 
 /// A track fragment for `t`'s pending samples, whose data starts `data_offset`
 /// bytes after the start of the `moof`.
-fn traf(t: &Track, data_offset: i32) -> Vec<u8> {
+fn traf(t: &Track, data_offset: i32, reordered: bool) -> Vec<u8> {
     let mut tfhd = Vec::new();
     tfhd.put_u32(t.id);
     let mut b = full_box(b"tfhd", 0, 0x02_0000, &tfhd); // default-base-is-moof
     let mut tfdt = Vec::new();
     tfdt.put_u64(t.decode_time);
     b.extend(full_box(b"tfdt", 1, 0, &tfdt));
-    // data offset, durations, sizes, and per-sample flags for video
-    let flags = 0x001 | 0x100 | 0x200 | if t.video { 0x400 } else { 0 };
+    // data offset, durations, sizes, and per-sample flags for video (and
+    // how long after its decoding each is shown, where reordered)
+    let flags = 0x001 | 0x100 | 0x200 | if t.video { 0x400 } else { 0 } | if reordered { 0x800 } else { 0 };
     let mut trun = Vec::new();
     trun.put_u32(t.pending.len() as u32);
     trun.put_u32(data_offset as u32);
-    for (data, dur, sync) in &t.pending {
+    for (data, dur, sync, shown_after) in &t.pending {
         trun.put_u32(*dur);
         trun.put_u32(data.len() as u32);
         if t.video {
             trun.put_u32(if *sync { 0x0200_0000 } else { 0x0101_0000 });
+        }
+        if reordered {
+            trun.put_u32(*shown_after);
         }
     }
     b.extend(full_box(b"trun", 0, flags, &trun));
@@ -795,6 +873,7 @@ mod tests {
             audio_bitrate: 192_000,
             comment: "hasteclip:mix=1".into(),
             mov,
+            reorder: 0,
         }
     }
 
@@ -942,6 +1021,39 @@ mod tests {
         assert!(text.contains("Video\0") && text.contains("Mix\0") && text.contains("Mic\0"));
         assert!(text.contains("hasteclip:mix=1"));
         assert!(text.contains("elst"), "audio starting late gets an empty edit");
+    }
+
+    /// B-frames, in the order they're decoded (each anchor before the
+    /// B-frames shown before it, the middle one decoded first): every frame
+    /// is shown at its own time, from 0, both ways of writing.
+    #[test]
+    fn reordered_frames_are_shown_at_their_times() {
+        let order = [0, 4, 2, 1, 3, 8, 6, 5, 7, 11, 9, 10];
+        for fragmented in [false, true] {
+            let path = std::env::temp_dir().join(format!("hc-mux-reorder-{fragmented}-{}.mp4", std::process::id()));
+            let spec = Spec { audio_titles: Vec::new(), reorder: 3, ..spec(false) };
+            let mut m = Muxer::create(&path, &spec, avc(), fragmented).unwrap();
+            for &n in &order {
+                m.video(Arc::from(vec![n as u8; 10]), n as f64 / 60.0, n == 0).unwrap();
+            }
+            m.finish().unwrap();
+            let bytes = std::fs::read(&path).unwrap();
+            let _ = std::fs::remove_file(&path);
+            let moov = top_level(&bytes).into_iter().find(|b| &b.0 == b"moov").unwrap();
+            let moov = &bytes[moov.1 + 8..moov.1 + moov.2];
+            let stbl = find(moov, &[b"trak", b"mdia", b"minf", b"stbl"]).unwrap();
+            let (stts, ctts) = (find(stbl, &[b"stts"]).unwrap(), find(stbl, &[b"ctts"]).expect("offsets"));
+            let elst = find(moov, &[b"trak", b"edts", b"elst"]).expect("an edit");
+            let frame = 90_000 / 60;
+            assert_eq!((be32(stts, 4), be32(stts, 8), be32(stts, 12)), (1, 12, frame), "one frame each, decoded in turn");
+            let mut after = Vec::new();
+            for e in 0..be32(ctts, 4) as usize {
+                after.extend(std::iter::repeat_n(be32(ctts, 12 + e * 8), be32(ctts, 8 + e * 8) as usize));
+            }
+            let start = be32(elst, 12);
+            let shown: Vec<u32> = after.iter().enumerate().map(|(k, a)| (k as u32 * frame + a - start) / frame).collect();
+            assert_eq!(shown, order, "fragmented: {fragmented}");
+        }
     }
 
     #[test]

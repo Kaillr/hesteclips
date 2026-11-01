@@ -6,6 +6,7 @@
 //!
 //! Backed by the `ffmpeg`/`ffprobe` binaries ([`ffmpeg`], [`ffprobe`]).
 
+mod mp4;
 pub mod pcm;
 
 use std::io::Read;
@@ -157,7 +158,50 @@ impl AudioStream {
     }
 }
 
+/// What's in a clip: MP4 and MOV (ours, and most others) read here from
+/// their index, anything else by ffprobe. HASTECLIP_FFPROBE=1 asks ffprobe
+/// every time, to compare.
 pub fn probe(source: &Path) -> Result<ClipInfo> {
+    if std::env::var_os("HASTECLIP_FFPROBE").is_none()
+        && let Ok(info) = probe_mp4(source)
+    {
+        return Ok(info);
+    }
+    probe_ffprobe(source)
+}
+
+/// [`probe`] from an MP4's or MOV's index, the same facts ffprobe gives.
+fn probe_mp4(source: &Path) -> Result<ClipInfo> {
+    let movie = mp4::read(source)?;
+    let video = movie.tracks.iter().find(|t| t.kind == mp4::Kind::Video).context("no video stream")?;
+    let tag = movie.comment.as_deref().map(parse_clip_tag).unwrap_or_default();
+    let audio = movie
+        .tracks
+        .iter()
+        .filter(|t| t.kind == mp4::Kind::Audio)
+        .enumerate()
+        .map(|(index, t)| AudioStream {
+            index,
+            title: t.name.clone().filter(|n| n != "SoundHandler" && n != "AudioHandler"),
+            in_mix: tag.mix.as_ref().is_none_or(|m| m.contains(&index)),
+        })
+        .collect();
+    Ok(ClipInfo {
+        duration: movie.seconds,
+        fps: if video.samples > 0 && video.seconds > 0.0 { video.samples as f64 / video.seconds } else { 60.0 },
+        width: video.width,
+        height: video.height,
+        video_kbps: (video.seconds > 0.0).then(|| (video.bytes as f64 * 8.0 / video.seconds / 1000.0) as u32).filter(|&k| k > 0),
+        audio,
+        id: tag.id,
+        // As the file says, else as players take its size: the rule the
+        // decoders go by (`capture::colours`).
+        bt601: capture::colours::bt601(video.matrix.map(u16::from), video.width, video.height),
+    })
+}
+
+/// [`probe`] by ffprobe.
+fn probe_ffprobe(source: &Path) -> Result<ClipInfo> {
     let out = ffprobe()
         .args(["-v", "error", "-show_entries"])
         .arg("format=duration:format_tags=comment:stream=index,codec_type,width,height,avg_frame_rate,r_frame_rate,bit_rate,color_space:stream_tags=title,handler_name,name")
@@ -244,10 +288,10 @@ pub fn probe(source: &Path) -> Result<ClipInfo> {
         video_kbps: video.bit_rate.as_deref().and_then(|b| b.parse::<u64>().ok()).map(|b| (b / 1000) as u32).filter(|&k| k > 0),
         audio,
         id: tag.id,
-        // Untagged: as players guess, by its size.
+        // Not said: as players take its size (`capture::colours`).
         bt601: match video.color_space.as_deref() {
             Some("bt470bg" | "smpte170m") => true,
-            Some("unknown") | None => video.height.is_some_and(|h| h < 720),
+            Some("unknown") | None => matches!((video.width, video.height), (Some(w), Some(h)) if capture::colours::bt601(None, w, h)),
             Some(_) => false,
         },
     })
@@ -1290,13 +1334,16 @@ fn render_video(source: &Path, info: &ClipInfo, edit: &Edit, pieces: &[Piece], w
             // ones in its slot (or around it, softly: `blend_graph`). Mixed
             // as light (what a screen gives off), not as pixel values, which
             // are gamma-encoded: a fifth of a bright ghost's value is about
-            // 3% of its light, not 20%. Recordings are BT.709, limited. 16
+            // 3% of its light, not 20%. Recordings are BT.709, limited; a
+            // clip's colours are read by its own matrix (BT.601's read as
+            // BT.709's came out 8.5 levels off in RGB), and saved BT.709. 16
             // bits keep the faintest ghosts (72 dB from float) with half the
             // memory to move.
             Some(b) => {
                 let light = has_filter("zscale");
                 if light {
-                    filters.push("setparams=range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709".to_owned());
+                    let matrix = if info.bt601 { "smpte170m" } else { "bt709" };
+                    filters.push(format!("setparams=range=tv:color_primaries=bt709:color_trc=bt709:colorspace={matrix}"));
                     filters.push("zscale=tin=iec61966-2-1:t=linear,format=gbrp16le".to_owned());
                 }
                 if (b as f64) < info.fps - 0.5 {
@@ -1367,9 +1414,39 @@ fn render_video(source: &Path, info: &ClipInfo, edit: &Edit, pieces: &[Piece], w
         run_progress(&mut cmd, parts.iter().map(|(a, b)| b - a).sum(), progress)
     };
 
-    // All of it encoded again (a piece for each part): in one go.
+    // All of it encoded again (a piece for each part): in one go, on the
+    // graphics card where it can be (much faster), else by ffmpeg.
     let encoded: Option<Vec<(f64, f64)>> = pieces.iter().map(|p| if let Piece::Encode(a, b) = *p { Some((a, b)) } else { None }).collect();
     if let Some(parts) = encoded {
+        let rate = edit.output.frame_rate(info);
+        let whole_rate = (rate - rate.round()).abs() < 1e-6 && rate >= 1.0;
+        // A video to be shown turned (a phone's) ffmpeg turns as it renders
+        // it; the card's frames are as stored, so it's left to ffmpeg.
+        if whole_rate && std::env::var_os("HASTECLIP_EXPORT_FFMPEG").is_none() && !mp4::turned(source) {
+            let out_fps = rate.round() as u32;
+            let job = capture::export::Job {
+                source,
+                fps: info.fps,
+                parts: &parts,
+                crop: output.crop.map(|c| [c.x, c.y, c.w, c.h]),
+                size: edit.output.size(info),
+                out_fps,
+                blend: output.blend_fps.map(|b| {
+                    let shape = match output.blend_shape {
+                        BlendShape::Even => capture::BlendShape::Even,
+                        BlendShape::Soft => capture::BlendShape::Soft,
+                    };
+                    (b, shape)
+                }),
+                kbps: kbps as u32,
+                fit: output.max_mb.is_some(),
+            };
+            match capture::export::render_video(&job, out, progress) {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(e) => eprintln!("export: the graphics card couldn't make it ({e:#}); ffmpeg does"),
+            }
+        }
         return encode(&parts, out, progress);
     }
 
@@ -1418,13 +1495,20 @@ fn mux_audio(source: &Path, info: &ClipInfo, edit: &Edit, id: Option<&str>, vide
     // The sound is read from a second before the first part: a seek lands on
     // the sound's own frames, up to one (21 ms) after where it was asked, so
     // asking early and cutting the parts out by time keeps all of them, in
-    // time with the picture (a part cut from a seek's start came out short,
-    // and the picture lost its last frame to `-shortest`).
+    // time with the picture (a part cut from a seek's start came out short).
     let from = (edit.start - 1.0).max(0.0);
     // The parts, in seconds from there, and how far each join's crossfade
     // reaches either side.
     let kept: Vec<(f64, f64)> = edit.kept().iter().map(|(a, b)| (a - from, b - from)).collect();
     let fades = join_fades(&kept);
+    // Every sound exactly as long as the parts: padded with silence where a
+    // track runs short, trimmed where a crossfade's rounding runs over. The
+    // picture is never cut to the sound: ended by its shortest stream
+    // (`-shortest`), a file whose sound came out a few milliseconds short
+    // (a muted mix, silence made in whole AAC frames) lost the picture's
+    // last frame, or four with NVIDIA's B-frames.
+    let len = edit.duration();
+    let exact = format!("apad=whole_dur={len:.6},atrim=end={len:.6}");
 
     for (i, t) in edit.tracks.iter().enumerate() {
         // eval=frame re-evaluates per audio frame so keyframed volume ramps; `t`
@@ -1432,7 +1516,7 @@ fn mux_audio(source: &Path, info: &ClipInfo, edit: &Edit, id: Option<&str>, vide
         // set before the parts are cut out, on the recording's own time).
         let level = format!("[1:a:{}]volume='{}':eval=frame", t.index, t.volume_expr(from));
         if let [(a, b)] = kept[..] {
-            graph.push(format!("{level},atrim=start={a:.6}:end={b:.6},asetpts=PTS-STARTPTS,asplit=2[m{i}][s{i}]"));
+            graph.push(format!("{level},atrim=start={a:.6}:end={b:.6},asetpts=PTS-STARTPTS,{exact},asplit=2[m{i}][s{i}]"));
         } else {
             // Each part, running on into what's cut out either side of a
             // join by as much as that join crossfades over, then joined: the
@@ -1450,7 +1534,7 @@ fn mux_audio(source: &Path, info: &ClipInfo, edit: &Edit, id: Option<&str>, vide
                 graph.push(format!("{joined}[q{i}_{k}]acrossfade=d={:.6}:c1=tri:c2=tri{to}", 2.0 * fades[k - 1]));
                 joined = to;
             }
-            graph.push(format!("{joined}asplit=2[m{i}][s{i}]"));
+            graph.push(format!("{joined}{exact},asplit=2[m{i}][s{i}]"));
         }
         if t.muted {
             graph.push(format!("[m{i}]anullsink"));
@@ -1470,7 +1554,7 @@ fn mux_audio(source: &Path, info: &ClipInfo, edit: &Edit, id: Option<&str>, vide
     if has_audio {
         if mix_inputs.is_empty() {
             // Everything muted: keep a silent mix so the layout stays the same.
-            graph.push("anullsrc=r=48000:cl=stereo[mix]".into());
+            graph.push(format!("anullsrc=r=48000:cl=stereo,atrim=end={len:.6}[mix]"));
         } else {
             graph.push(format!(
                 "{}amix=inputs={}:normalize=0:duration=longest[mix]",
@@ -1501,7 +1585,7 @@ fn mux_audio(source: &Path, info: &ClipInfo, edit: &Edit, id: Option<&str>, vide
         for m in &maps {
             cmd.args(["-map", m]);
         }
-        cmd.args(["-c:a", "aac", "-b:a", &format!("{RENDER_AUDIO_KBPS}k"), "-shortest"]);
+        cmd.args(["-c:a", "aac", "-b:a", &format!("{RENDER_AUDIO_KBPS}k")]);
         let all_titles = std::iter::once("Mix".to_owned()).chain(titles);
         for (i, t) in all_titles.enumerate() {
             cmd.args([format!("-metadata:s:a:{i}"), format!("title={t}")]);
@@ -1752,6 +1836,83 @@ pub fn from_db(db: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Reading an MP4's or MOV's index here gives what ffprobe gives, for
+    /// files like ours (named tracks, our tag) and others: B-frames, colour
+    /// tagged or not and guessed by size, QuickTime's own comment, no sound,
+    /// a film's frame rate, a copy starting on a keyframe; a fragmented
+    /// one is left to ffprobe.
+    #[test]
+    fn probing_mp4_matches_ffprobe() {
+        let dir = std::env::temp_dir().join(format!("hc-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let make = |name: &str, args: &[&str]| -> Option<PathBuf> {
+            let out = dir.join(name);
+            let ok = ffmpeg()
+                .args(["-hide_banner", "-loglevel", "error", "-y"])
+                .args(args)
+                .arg(&out)
+                .stdin(Stdio::null())
+                .status()
+                .ok()?
+                .success();
+            ok.then_some(out)
+        };
+        let tone = |f: u32| format!("sine=f={f}:d=2");
+        let cases: Vec<(&str, Vec<String>)> = vec![
+            ("ours.mp4", vec![
+                "-f", "lavfi", "-i", "testsrc2=s=1280x720:r=60:d=2", "-f", "lavfi", "-i", &tone(440), "-f", "lavfi", "-i", &tone(660), "-f", "lavfi", "-i", &tone(880),
+                "-map", "0", "-map", "1", "-map", "2", "-map", "3", "-c:v", "libx264", "-bf", "0", "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-c:a", "aac",
+                "-metadata", "comment=hasteclip:mix=1,2 id=0123456789abcdef",
+                "-metadata:s:a:0", "title=Mix", "-metadata:s:a:0", "handler_name=Mix",
+                "-metadata:s:a:1", "title=Desktop", "-metadata:s:a:1", "handler_name=Desktop",
+                "-metadata:s:a:2", "handler_name=Microphone",
+            ].into_iter().map(String::from).collect()),
+            ("bframes.mp4", ["-f", "lavfi", "-i", "testsrc2=s=640x360:r=30:d=2", "-f", "lavfi", "-i", "sine=d=2", "-c:v", "libx264", "-bf", "3", "-c:a", "aac"].iter().map(|s| s.to_string()).collect()),
+            ("small709.mp4", ["-f", "lavfi", "-i", "testsrc2=s=640x360:r=30:d=1", "-c:v", "libx264", "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"].iter().map(|s| s.to_string()).collect()),
+            ("big601.mp4", ["-f", "lavfi", "-i", "testsrc2=s=1280x720:r=30:d=1", "-c:v", "libx264", "-colorspace", "smpte170m", "-color_primaries", "smpte170m", "-color_trc", "smpte170m"].iter().map(|s| s.to_string()).collect()),
+            ("colr.mp4", ["-f", "lavfi", "-i", "testsrc2=s=1280x720:r=30:d=1", "-c:v", "libx264", "-colorspace", "bt470bg", "-movflags", "+write_colr"].iter().map(|s| s.to_string()).collect()),
+            ("quicktime.mov", ["-f", "lavfi", "-i", "testsrc2=s=1920x1080:r=30:d=1", "-f", "lavfi", "-i", "sine=d=1", "-c:v", "libx264", "-c:a", "aac", "-metadata", "comment=hasteclip:mix=1", "-metadata:s:a:0", "title=Game"].iter().map(|s| s.to_string()).collect()),
+            ("film.mp4", ["-f", "lavfi", "-i", "testsrc2=s=1280x720:r=24000/1001:d=2", "-c:v", "libx264"].iter().map(|s| s.to_string()).collect()),
+            // Copied from a keyframe (as freeing up space trims): the
+            // picture edited to start late, its movie length longer than
+            // its streams'.
+            ("copied.mp4", ["-ss", "0.4", "-to", "1.7", "-i", &dir.join("bframes.mp4").to_string_lossy(), "-map", "0", "-c", "copy", "-avoid_negative_ts", "make_zero"].iter().map(|s| s.to_string()).collect()),
+        ];
+        let mut checked = 0;
+        for (name, args) in &cases {
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let Some(file) = make(name, &args) else {
+                eprintln!("{name}: ffmpeg couldn't make it (no ffmpeg or x264?): not checked");
+                continue;
+            };
+            let (ours, theirs) = (probe_mp4(&file).unwrap(), probe_ffprobe(&file).unwrap());
+            eprintln!("{name}: {ours:?}");
+            assert!((ours.duration - theirs.duration).abs() < 0.002, "{name}: duration {} against {}", ours.duration, theirs.duration);
+            assert!((ours.fps - theirs.fps).abs() < 0.01, "{name}: fps {} against {}", ours.fps, theirs.fps);
+            assert_eq!((ours.width, ours.height), (theirs.width, theirs.height), "{name}: size");
+            let (a, b) = (ours.video_kbps.unwrap_or(0) as f64, theirs.video_kbps.unwrap_or(0) as f64);
+            assert!((a - b).abs() <= b * 0.02 + 1.0, "{name}: {a} kbps against {b}");
+            let tracks = |i: &ClipInfo| i.audio.iter().map(|a| (a.index, a.title.clone(), a.in_mix)).collect::<Vec<_>>();
+            assert_eq!(tracks(&ours), tracks(&theirs), "{name}: audio tracks");
+            assert_eq!(ours.id, theirs.id, "{name}: id");
+            assert_eq!(ours.bt601, theirs.bt601, "{name}: BT.601");
+            checked += 1;
+        }
+        // Turned to be shown upright (a phone's): known, so exports leave it
+        // to ffmpeg, which turns it.
+        if let Some(upright) = make("upright.mp4", &["-display_rotation", "90", "-i", &dir.join("small709.mp4").to_string_lossy(), "-c", "copy"]) {
+            assert!(mp4::turned(&upright), "turned");
+            assert!(!mp4::turned(&dir.join("small709.mp4")), "not turned");
+        }
+        // Fragmented (a recording a crash cut off): ffprobe reads it.
+        if let Some(file) = make("fragmented.mp4", &["-f", "lavfi", "-i", "testsrc2=s=640x360:r=30:d=2", "-c:v", "libx264", "-movflags", "frag_keyframe+empty_moov"]) {
+            assert!(probe_mp4(&file).is_err(), "fragments aren't read here");
+            assert!((probe(&file).unwrap().duration - 2.0).abs() < 0.05, "a fragmented file's length");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!("{checked} of {} files checked", cases.len());
+    }
 
     #[test]
     fn fader_law() {
@@ -2048,6 +2209,20 @@ mod cut_render_tests {
         assert_eq!(String::from_utf8_lossy(&frames.stdout).trim(), "30");
         let sound = decode_audio(&out, 1).unwrap();
         assert!((sound.len() as f64 / 2.0 / PREVIEW_RATE as f64 - 1.0).abs() < 0.002, "the sound lasts {} s", sound.len() as f64 / 2.0 / PREVIEW_RATE as f64);
+
+        // Every track muted, the mix made of silence: still every frame, and
+        // every sound as long as the picture. (Ended by the shortest stream,
+        // the silence, made in whole AAC frames, ran short of the parts and
+        // took the picture's last frames with it.)
+        edit.set_parts(&[(0.5, 2.0), (3.0, 4.6)]);
+        edit.tracks.iter_mut().for_each(|t| t.muted = true);
+        render_to(&src, &info, &edit, &out, None).unwrap();
+        let frames = ffprobe().args(["-v", "error", "-count_frames", "-select_streams", "v:0", "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0"]).arg(&out).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&frames.stdout).trim(), "93", "every frame, every track muted");
+        for stream in 0..2 {
+            let secs = decode_audio(&out, stream).unwrap().len() as f64 / 2.0 / PREVIEW_RATE as f64;
+            assert!((secs - 3.1).abs() < 0.002, "sound {stream} lasts {secs} s, every track muted");
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
@@ -2099,5 +2274,196 @@ mod jpeg_tests {
                 err[2] as f64 / n.max(1) as f64
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod export_bench {
+    use super::*;
+
+    /// A video's frames as their luma planes, averaged down in blocks to
+    /// about `w` wide (straight from the decoder, so no scaler or colour
+    /// conversion of ffmpeg's can differ between files), and its streams'
+    /// lengths (video, then each audio).
+    fn frames_of(file: &Path, w: u32) -> (Vec<Vec<u8>>, Vec<f64>) {
+        let info = probe(file).unwrap();
+        let (width, height) = (info.width as usize, info.height as usize);
+        let out = ffmpeg()
+            .args(["-hide_banner", "-loglevel", "error", "-i"])
+            .arg(file)
+            .args(["-f", "rawvideo", "-pix_fmt", "yuv420p", "-"])
+            .output()
+            .unwrap();
+        let block = (width / w as usize).max(1);
+        let (bw, bh) = (width / block, height / block);
+        let frames = out
+            .stdout
+            .chunks(width * height * 3 / 2)
+            .map(|f| {
+                let mut small = Vec::with_capacity(bw * bh);
+                for by in 0..bh {
+                    for bx in 0..bw {
+                        let mut sum = 0u32;
+                        for y in by * block..(by + 1) * block {
+                            sum += f[y * width + bx * block..y * width + (bx + 1) * block].iter().map(|&v| v as u32).sum::<u32>();
+                        }
+                        small.push((sum / (block * block) as u32) as u8);
+                    }
+                }
+                small
+            })
+            .collect();
+        let lengths = ffprobe()
+            .args(["-v", "error", "-show_entries", "stream=duration", "-of", "csv=p=0"])
+            .arg(file)
+            .output()
+            .unwrap();
+        let lengths = String::from_utf8_lossy(&lengths.stdout).lines().filter_map(|l| l.trim().parse().ok()).collect();
+        (frames, lengths)
+    }
+
+    /// The same edits made on the graphics card and by ffmpeg come out the
+    /// same: as many frames, each showing the same moment (the pictures
+    /// differ only by scaling and encoding: under a level in 8×8 blocks),
+    /// the sound as long as the picture. HC_SRC: a 60 fps clip with sound;
+    /// HC_FAST: a 540 fps one. HASTECLIP_ENCODER picks the card's encoder.
+    #[test]
+    #[ignore = "needs clips and a graphics card"]
+    fn card_exports_match_ffmpegs() {
+        let dir = std::env::temp_dir().join(format!("hc-export-match-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = PathBuf::from(std::env::var("HC_SRC").unwrap());
+        let fast = std::env::var("HC_FAST").ok().map(PathBuf::from);
+        type MakeEdit = Box<dyn Fn(&ClipInfo) -> Edit>;
+        let mut cases: Vec<(&str, PathBuf, MakeEdit)> = vec![
+            ("cuts at 720p", src.clone(), Box::new(|i: &ClipInfo| {
+                let mut e = Edit { start: 3.0, end: 40.0, cuts: vec![Cut { from: 10.0, to: 17.5 }, Cut { from: 25.25, to: 31.0 }], ..Edit::new(i) };
+                e.output.height = Some(720);
+                e
+            })),
+            ("crop at 30 fps", src.clone(), Box::new(|i: &ClipInfo| {
+                let mut e = Edit { start: 5.0, end: 20.0, ..Edit::new(i) };
+                e.output.crop = Some(Crop { x: 320, y: 180, w: 1920, h: 1080 });
+                e.output.fps = Some(30);
+                e
+            })),
+        ];
+        if let Some(fast) = &fast {
+            for shape in [BlendShape::Even, BlendShape::Soft] {
+                cases.push((if shape == BlendShape::Even { "blend even" } else { "blend soft" }, fast.clone(), Box::new(move |i: &ClipInfo| {
+                    let mut e = Edit { start: 2.0, end: 12.0, ..Edit::new(i) };
+                    e.output.fps = Some(60);
+                    e.output.blend_fps = Some(540);
+                    e.output.blend_shape = shape;
+                    e
+                })));
+            }
+        }
+        for (name, source, make) in &cases {
+            let info = probe(source).unwrap();
+            let edit = make(&info);
+            let card = dir.join("card.mp4");
+            let theirs = dir.join("ffmpeg.mp4");
+            let t = std::time::Instant::now();
+            render_to(source, &info, &edit, &card, None).unwrap();
+            let card_s = t.elapsed().as_secs_f64();
+            // SAFETY: the tests here run one at a time (--test-threads=1).
+            unsafe { std::env::set_var("HASTECLIP_EXPORT_FFMPEG", "1") };
+            let t = std::time::Instant::now();
+            render_to(source, &info, &edit, &theirs, None).unwrap();
+            let ffmpeg_s = t.elapsed().as_secs_f64();
+            unsafe { std::env::remove_var("HASTECLIP_EXPORT_FFMPEG") };
+            let (a, a_len) = frames_of(&card, 160);
+            let (b, b_len) = frames_of(&theirs, 160);
+            let diffs: Vec<f64> = a.iter().zip(&b).map(|(x, y)| x.iter().zip(y).map(|(p, q)| p.abs_diff(*q) as f64).sum::<f64>() / x.len() as f64).collect();
+            let worst = diffs.iter().copied().fold(0.0, f64::max);
+            let mean = diffs.iter().sum::<f64>() / diffs.len().max(1) as f64;
+            eprintln!("{name}: {:.1} s on the card, {:.1} s by ffmpeg; {} frames against {}; off by {mean:.2} on average, {worst:.2} at worst; lengths {a_len:?} against {b_len:?}", card_s, ffmpeg_s, a.len(), b.len());
+            assert_eq!(a.len(), b.len(), "{name}: frames");
+            assert!(worst < 1.0, "{name}: a frame off by {worst:.2}");
+            for (x, y) in a_len.iter().zip(&b_len) {
+                assert!((x - y).abs() < 0.03, "{name}: a stream {x} s long against {y}");
+            }
+            if a_len.len() > 1 {
+                assert!((a_len[0] - a_len[1]).abs() < 0.05, "{name}: picture {} s, sound {} s", a_len[0], a_len[1]);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// How long exports take (HC_SRC: a 60 fps clip with sound; HC_FAST: a
+    /// 540 fps recording).
+    #[test]
+    #[ignore = "benchmark"]
+    fn export_times() {
+        let dir = std::env::temp_dir().join(format!("hc-export-bench-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // CPU seconds this process and the ffmpegs it waited for have used.
+        #[cfg(not(any(target_os = "macos", windows)))]
+        let cpu = || {
+            let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+            let fields: Vec<f64> = stat.rsplit(')').next().unwrap_or_default().split_whitespace().filter_map(|f| f.parse().ok()).collect();
+            // utime, stime, cutime, cstime: fields 14-17; here from ppid
+            // (field 4) on, the state (a letter) left out.
+            fields.get(10..14).map_or(0.0, |t| t.iter().sum::<f64>() / 100.0)
+        };
+        #[cfg(target_os = "macos")]
+        let cpu = || {
+            let used = |who| {
+                // SAFETY: getrusage only writes the struct it's given.
+                let mut u: libc::rusage = unsafe { std::mem::zeroed() };
+                unsafe { libc::getrusage(who, &mut u) };
+                let secs = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+                secs(u.ru_utime) + secs(u.ru_stime)
+            };
+            used(libc::RUSAGE_SELF) + used(libc::RUSAGE_CHILDREN)
+        };
+        // Windows counts no child's time to its parent: a job does, for
+        // this process and every one it starts from now on, ended or not.
+        #[cfg(windows)]
+        let cpu = {
+            use windows::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JobObjectBasicAccountingInformation, QueryInformationJobObject};
+            let job = unsafe { CreateJobObjectW(None, None) }.unwrap();
+            unsafe { AssignProcessToJobObject(job, windows::Win32::System::Threading::GetCurrentProcess()) }.unwrap();
+            move || {
+                let mut info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+                let size = std::mem::size_of_val(&info) as u32;
+                unsafe { QueryInformationJobObject(Some(job), JobObjectBasicAccountingInformation, (&raw mut info).cast(), size, None) }.unwrap();
+                // In 100 ns.
+                (info.TotalUserTime + info.TotalKernelTime) as f64 / 1e7
+            }
+        };
+        let run = |name: &str, src: &Path, edit: &dyn Fn(&ClipInfo) -> Edit| {
+            let info = probe(src).unwrap();
+            let e = edit(&info);
+            let out = dir.join(format!("{}.mp4", name.replace(' ', "-")));
+            let (t, used) = (std::time::Instant::now(), cpu());
+            render_to(src, &info, &e, &out, None).unwrap();
+            let (secs, used) = (t.elapsed().as_secs_f64(), cpu() - used);
+            let o = probe(&out).unwrap();
+            eprintln!("{name}: {secs:.1} s for {:.1} s of video ({}x{} at {:.0} fps, {:.1} MB), {:.0}% of a core", e.duration(), o.width, o.height, o.fps, std::fs::metadata(&out).unwrap().len() as f64 / 1048576.0, used / secs * 100.0);
+        };
+        let src = PathBuf::from(std::env::var("HC_SRC").unwrap());
+        run("trim", &src, &|i| Edit { start: 10.0, end: 40.0, ..Edit::new(i) });
+        run("1080p", &src, &|i| {
+            let mut e = Edit::new(i);
+            e.output.height = Some(1080);
+            e
+        });
+        run("discord", &src, &|i| {
+            let mut e = Edit::new(i);
+            e.output.mix_only = true;
+            e.output.max_mb = Some(10);
+            e
+        });
+        if let Ok(fast) = std::env::var("HC_FAST") {
+            run("blend 540 to 60", Path::new(&fast), &|i| {
+                let mut e = Edit::new(i);
+                e.output.fps = Some(60);
+                e.output.blend_fps = Some(540);
+                e
+            });
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

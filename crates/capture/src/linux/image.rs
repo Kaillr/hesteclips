@@ -190,6 +190,9 @@ pub(crate) struct CameraPicture {
     pub width: u32,
     pub height: u32,
     pub bgra: Vec<u8>,
+    /// Which picture it is, a new number each (pictures' memory is used
+    /// again, so where one is says nothing).
+    pub seq: u64,
 }
 
 impl CameraPicture {
@@ -453,7 +456,7 @@ mod tests {
         let mut c = Canvas::new(16, 8);
         c.draw_screen(&white, &left, false);
         assert_eq!((px(&c, 2, 4), px(&c, 12, 4)), (vec![255, 255, 255], vec![0, 0, 0]));
-        let grey = CameraPicture { width: 4, height: 2, bgra: [40, 40, 40, 255].repeat(8) };
+        let grey = CameraPicture { width: 4, height: 2, bgra: [40, 40, 40, 255].repeat(8), seq: 1 };
         let all = Placement { x: 0.0, y: 0.0, w: 1.0, h: 1.0, crop: [0.0; 4], flip_h: false, flip_v: false, turns: 0, stretch: 1.0 };
         c.clear();
         c.draw_camera(&grey, &all);
@@ -546,7 +549,7 @@ mod tests {
     fn camera_fills_its_box() {
         let mut c = Canvas::new(100, 50);
         c.clear();
-        let cam = CameraPicture { width: 16, height: 9, bgra: [200, 100, 50, 255].repeat(16 * 9) };
+        let cam = CameraPicture { width: 16, height: 9, bgra: [200, 100, 50, 255].repeat(16 * 9), seq: 1 };
         let place = Placement { x: 0.5, y: 0.5, w: 0.5, h: 0.5, crop: [0.0; 4], flip_h: true, flip_v: false, turns: 0, stretch: 1.0 };
         c.draw_camera(&cam, &place);
         let at = |x: usize, y: usize| &c.bgra[(y * 100 + x) * 4..(y * 100 + x) * 4 + 4];

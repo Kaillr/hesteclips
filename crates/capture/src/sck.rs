@@ -900,7 +900,7 @@ pub(crate) fn probe_video_format(
     rx.recv_timeout(Duration::from_secs(5)).context("the H.264 encoder produced nothing")
 }
 
-fn is_keyframe(sample: &CMSampleBuffer) -> bool {
+pub(crate) fn is_keyframe(sample: &CMSampleBuffer) -> bool {
     unsafe {
         let Some(attachments) = sample.sample_attachments_array(false) else { return true };
         if attachments.count() == 0 {
