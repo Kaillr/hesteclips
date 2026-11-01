@@ -83,7 +83,8 @@ time. At the same bitrate the picture's a little better (35.5 dB against
 - Shared, in `crates/capture/src/export.rs`: which source frames make up an
   export (`Timeline`) and the Lanczos weights exports scale by (`lanczos`).
   The colour matrix a clip states, for the decoders and `media`'s probe:
-  its MP4's `colr` box, else its H.264 stream's own (`capture::h264`).
+  its MP4's `colr` box, else its H.264 stream's own (`capture::h264`); and
+  what's taken where it states none (`capture::colours`).
 - Linux's decoding on the card and its check: `crates/capture/src/linux/decode.rs`
   (and `dmabuf.rs`); its encoder check: `linux/vkenc.rs` (`check`).
 - What Windows has that may help: `capture::win::decode` and `direct` (D3D11
@@ -172,6 +173,13 @@ ffmpeg), `HASTECLIP_ENCODER`, `HASTECLIP_DECODE`, `HASTECLIP_CPU_DECODE=1`,
 - ffmpeg's blending stamped every clip BT.709 before reading it into
   light: a BT.601 clip came out 8.5 levels off in RGB. It's read by its own
   matrix now.
+- A clip that doesn't say its colours was BT.709 to the decoders and, below
+  720 lines, BT.601 to the probe: a standard-definition one showed two ways
+  in the app, and its export kept its values but said BT.709, 9.2 levels off
+  in RGB in other players (which take it as BT.601). One rule now, players'
+  (mpv's and libplacebo's): under 1280 wide and at most 576 high, BT.601,
+  else BT.709, for the decoders, the probe and so the exports (within 1.0
+  of how players showed it).
 
 ## Working on macOS and Windows at once
 
@@ -199,7 +207,3 @@ maintainer says so.
   thumbnail check (`first_frame_is_ffmpegs`) is 2.27 off ffmpeg's there
   against a bar of 2.0: VideoToolbox interpolates the colours, ffmpeg's
   default scaling doesn't (against its `full_chroma_int+accurate_rnd`, 1.44).
-- A clip that doesn't say its colours: `media`'s probe guesses BT.601 below
-  720 lines (as players do), the decoders take BT.709, and so do the exports
-  made in the app (labelled so); ffmpeg's left them unlabelled. One rule for
-  all would be better.
