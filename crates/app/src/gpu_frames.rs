@@ -32,8 +32,8 @@
 //! graphics card; otherwise frames come back as RGBA as before.
 //!
 //! - **Linux** (and wherever ffmpeg decodes instead): ffmpeg's NV12 frames,
-//!   at the video's own size, uploaded into textures (`upload`); on NVIDIA's
-//!   card decoded there, into buffers of the renderer's, which the card
+//!   at the video's own size, uploaded into textures (`upload`); decoded on
+//!   the card where it can, into buffers of the renderer's, which the card
 //!   copies into those textures.
 
 use std::collections::HashMap;
@@ -1217,14 +1217,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A frame decoded on NVIDIA's card into the renderer's memory, copied
+    /// A frame decoded on the card into the renderer's memory, copied
     /// into textures as the player does and drawn by the real filter,
     /// matches ffmpeg's own conversion of it: at 1:1 and shrunk (Lanczos
     /// both). A height that isn't a whole number of macroblocks (1080).
     /// `cargo test -p hasteclip card_frame -- --ignored --nocapture`
     #[cfg(target_os = "linux")]
     #[test]
-    #[ignore = "needs NVIDIA's driver"]
+    #[ignore = "needs a card that decodes (HASTECLIP_DECODE=vaapi for VA-API)"]
     fn card_frame_matches_ffmpeg() {
         let dir = std::env::temp_dir().join(format!("hc-card-frame-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

@@ -8,10 +8,11 @@
 //! Frames come out one of two ways ([`Output`]):
 //! - **For the screen**: NV12 at the video's own size (`Picture::gpu`), which
 //!   the app uploads and draws with its own filter: nothing scaled or
-//!   compressed on the way. On NVIDIA's card ([`Decoder::open_card`]) they're
-//!   decoded there (NVDEC), into buffers of the app's renderer ([`Card`]),
+//!   compressed on the way. On the graphics card ([`Decoder::open_card`])
+//!   they're decoded there, into buffers of the app's renderer ([`Card`]),
 //!   and never come to the CPU: a tenth of the CPU time (a 1440p frame took
-//!   11.5 ms of it, 6 cores at 540 fps).
+//!   11.5 ms of it, 6 cores at 540 fps). NVIDIA's decoder through CUDA, or
+//!   AMD's and Intel's through VA-API (`super::dmabuf`).
 //! - **As pixels** (thumbnails): RGBA at the size asked for, shrunk here.
 //!
 //! Decoding runs on a few threads at once (frame threading): a frame comes
@@ -26,17 +27,24 @@ use std::collections::{BTreeMap, HashSet};
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
+use std::os::fd::FromRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result, bail, ensure};
 
+use super::dmabuf::{Importer, Imports, Plane};
 use crate::mp4read::Index;
 
 unsafe extern "C" {
     fn hcav_load(dir: *const c_char, err: *mut c_char, errlen: c_int) -> c_int;
-    fn hcav_open(avcc: *const u8, avcc_len: c_int, threads: c_int, cuda: *mut c_void, err: *mut c_char, errlen: c_int) -> *mut c_void;
+    fn hcav_open(avcc: *const u8, avcc_len: c_int, threads: c_int, kind: c_int, hw: *mut c_void, err: *mut c_char, errlen: c_int) -> *mut c_void;
+    fn hcav_vaapi_open(node: *const c_char, err: *mut c_char, errlen: c_int) -> *mut c_void;
+    fn hcav_vaapi_close(device: *mut c_void);
+    fn hcav_vaapi_vendor(device: *mut c_void, out: *mut c_char, len: c_int);
+    fn hcav_frame_dmabuf(d: *mut c_void, planes: *mut Plane) -> c_int;
+    fn hcav_unmap(d: *mut c_void);
     fn hcav_send(d: *mut c_void, data: *const u8, size: c_int, pts: i64, key: c_int, code: *mut c_int) -> c_int;
     fn hcav_receive(d: *mut c_void, pts: *mut i64, code: *mut c_int) -> c_int;
     fn hcav_take_nv12(d: *mut c_void, out: *mut u8, width: c_int, height: c_int) -> c_int;
@@ -58,6 +66,11 @@ const FRAME: c_int = 1;
 const AGAIN: c_int = 0;
 const END: c_int = -1;
 const SENT: c_int = 2;
+
+/// Where `hcav_open` decodes.
+const ON_CPU: c_int = 0;
+const ON_CUDA: c_int = 1;
+const ON_VAAPI: c_int = 2;
 
 /// Bytes read from the file at a time (frames are stored one after another):
 /// one read per few dozen frames, not per frame.
@@ -116,17 +129,67 @@ impl Nv12 {
     }
 }
 
-/// Decoding on NVIDIA's card into the memory of a wgpu device of the app's:
-/// the renderer's (frames drawn), or ours ([`Card::background`]: exports,
-/// the filmstrip). The card's CUDA context (`cuda.c`), shared by every one
-/// on it, and the device and its queue; each decoder has its buffers
-/// ([`Pool`]).
+/// Decoding on the graphics card into the memory of a wgpu device of the
+/// app's: the renderer's (frames drawn), or ours ([`Card::background`]:
+/// exports, the filmstrip). The device and its queue, and the card's
+/// decoder ([`Way`]); each decoder has its buffers ([`Pool`]).
 pub struct Card {
     device: wgpu::Device,
     queue: wgpu::Queue,
-    cuda: Arc<Cuda>,
+    way: Way,
     /// Frames made small on the card (`Output::Rgba`), made when first asked.
     shrink: OnceLock<wgpu::ComputePipeline>,
+}
+
+/// How a card decodes.
+enum Way {
+    /// NVIDIA's decoder (NVDEC), through the card's CUDA context (shared by
+    /// every [`Card`] on it): frames copied by CUDA into buffers it shares.
+    Nvidia(Arc<Cuda>),
+    /// VA-API's (AMD's, Intel's): libavutil's device on the card (shared
+    /// too), and Vulkan copying each frame's planes into our buffers.
+    Vaapi(Arc<VaDevice>, Arc<Importer>),
+}
+
+/// libavutil's VA-API device on a card's render node (`hcav_vaapi_open`):
+/// one per card, for the app's life. And its driver's name for itself.
+struct VaDevice {
+    raw: *mut c_void,
+    vendor: String,
+}
+
+// SAFETY: libavcodec's decoders on any thread share it (each takes a
+// reference); it's let go of once.
+unsafe impl Send for VaDevice {}
+unsafe impl Sync for VaDevice {}
+
+impl VaDevice {
+    /// The device on render node `node`, opened the first time.
+    fn on(node: &Path) -> Result<Arc<Self>> {
+        static ALL: Mutex<Vec<(std::path::PathBuf, Arc<VaDevice>)>> = Mutex::new(Vec::new());
+        let mut all = ALL.lock().unwrap();
+        if let Some((_, d)) = all.iter().find(|(n, _)| n == node) {
+            return Ok(d.clone());
+        }
+        let path = CString::new(node.as_os_str().as_bytes())?;
+        let mut err = [0 as c_char; 512];
+        // SAFETY: a valid path and error buffer.
+        let raw = unsafe { hcav_vaapi_open(path.as_ptr(), err.as_mut_ptr(), err.len() as c_int) };
+        ensure!(!raw.is_null(), "{}", text(&err));
+        let mut vendor = [0 as c_char; 256];
+        // SAFETY: an open device and a buffer.
+        unsafe { hcav_vaapi_vendor(raw, vendor.as_mut_ptr(), vendor.len() as c_int) };
+        let d = Arc::new(Self { raw, vendor: text(&vendor) });
+        all.push((node.to_path_buf(), d.clone()));
+        Ok(d)
+    }
+}
+
+impl Drop for VaDevice {
+    fn drop(&mut self) {
+        // SAFETY: ours, let go of once (decoders hold their own references).
+        unsafe { hcav_vaapi_close(self.raw) };
+    }
 }
 
 /// A CUDA context on a card (`cuda.c`): one per card, for the app's life.
@@ -157,19 +220,147 @@ impl Cuda {
 
 impl Card {
     /// For frames on `device` (submitted to by `queue`), on Vulkan: where
-    /// it's an NVIDIA card whose memory CUDA can share.
+    /// it's an NVIDIA card whose memory CUDA can share, else where VA-API
+    /// decodes on it and Vulkan takes in its frames; either way, where a
+    /// clip decoded on it comes out as on the CPU ([`Self::check`]).
+    /// `HASTECLIP_DECODE=nvidia` (or `vaapi`) tries only that way.
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<Arc<Self>> {
         load()?;
+        type Open = fn(&wgpu::Device, &wgpu::Queue) -> Result<Arc<Card>>;
+        let only = std::env::var("HASTECLIP_DECODE").unwrap_or_default();
+        let mut why = Vec::new();
+        for (key, name, open) in [("nvidia", "NVIDIA's", Self::nvidia as Open), ("vaapi", "VA-API", Self::vaapi)] {
+            if !only.is_empty() && only != key {
+                continue;
+            }
+            match open(device, queue).and_then(|card| card.check().map(|()| card)) {
+                Ok(card) => {
+                    match &card.way {
+                        Way::Nvidia(_) => eprintln!("decoding: on the card, NVIDIA's decoder"),
+                        Way::Vaapi(va, _) => eprintln!("decoding: on the card, through VA-API ({})", if va.vendor.is_empty() { "a driver that doesn't say" } else { &va.vendor }),
+                    }
+                    return Ok(card);
+                }
+                Err(e) => why.push(format!("{name}: {e:#}")),
+            }
+        }
+        if why.is_empty() {
+            bail!("HASTECLIP_DECODE={only} isn't a way (nvidia, vaapi)");
+        }
+        bail!("{}", why.join("; "))
+    }
+
+    /// Through NVIDIA's decoder, where the card is NVIDIA's.
+    fn nvidia(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<Arc<Self>> {
         let uuid = super::gpu::uuid_of(device).context("not on Vulkan")?;
-        let card = Arc::new(Self { device: device.clone(), queue: queue.clone(), cuda: Cuda::on(uuid)?, shrink: OnceLock::new() });
+        let card = Arc::new(Self { device: device.clone(), queue: queue.clone(), way: Way::Nvidia(Cuda::on(uuid)?), shrink: OnceLock::new() });
         // A buffer shared and taken in once, to know it works.
         Slot::new(&card, 1 << 16).context("the card's memory can't be shared with CUDA")?;
         Ok(card)
     }
 
+    /// Through VA-API, on the card's own render node. Not NVIDIA's VA-API
+    /// driver (NVIDIA's cards decode through CUDA) unless asked for, to
+    /// try this way on one ([`NVIDIA_VA_SETTLE`]).
+    fn vaapi(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<Arc<Self>> {
+        let importer = Arc::new(Importer::new(device, queue)?);
+        let va = VaDevice::on(&super::dmabuf::render_node(device)?)?;
+        if nvidia_va(&va) && std::env::var("HASTECLIP_DECODE").as_deref() != Ok("vaapi") {
+            bail!("NVIDIA's VA-API driver hands frames over before they're finished ({})", va.vendor);
+        }
+        Ok(Arc::new(Self { device: device.clone(), queue: queue.clone(), way: Way::Vaapi(va, importer), shrink: OnceLock::new() }))
+    }
+
+    /// A short clip (1080p, B-frames, two keyframes) decoded on the card and
+    /// on the CPU (meanwhile, on a thread of its own): every frame on the
+    /// card, and the same to the byte (H.264 decodes exactly), row by row
+    /// ([`row_sums`]: the card sums its frames' rows, which is all that
+    /// comes back). A driver that gets it wrong, or frames that don't come
+    /// through, and the card isn't used.
+    fn check(self: &Arc<Self>) -> Result<()> {
+        const CLIP: &[u8] = include_bytes!("check.mp4");
+        const FRAMES: usize = 12;
+        // In memory, opened by its path (`/proc/self/fd/…`).
+        // SAFETY: a name; the fd is ours.
+        let fd = unsafe { libc::memfd_create(c"hasteclip-check".as_ptr(), libc::MFD_CLOEXEC) };
+        ensure!(fd >= 0, "no memory file for the check: {}", std::io::Error::last_os_error());
+        // SAFETY: a new fd, ours.
+        let mut file = File::from(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
+        std::io::Write::write_all(&mut file, CLIP)?;
+        let path = std::path::PathBuf::from(format!("/proc/self/fd/{fd}"));
+        std::thread::scope(|s| {
+            let on_cpu = s.spawn(|| -> Result<Vec<Vec<u32>>> {
+                let mut dec = Decoder::open(&path, Output::Screen)?;
+                let mut sums = Vec::new();
+                while let Some(p) = dec.next()? {
+                    sums.push(row_sums(p.gpu.as_ref().and_then(|s| s.nv12.memory()).context("a frame from the CPU")?, (p.width, p.height)));
+                }
+                Ok(sums)
+            });
+            let mut dec = Decoder::open_with(&path, Output::Screen, 1, Some((self, FRAMES)))?;
+            let mut frames = Vec::new();
+            while let Some(p) = dec.next()? {
+                let Some(Surface { nv12: Nv12::Card(f), .. }) = p.gpu else { bail!("frame {} didn't stay on the card", frames.len()) };
+                frames.push(f);
+            }
+            let on_card = self.row_sums(&frames, dec.source_size())?;
+            let on_cpu = on_cpu.join().map_err(|_| anyhow::anyhow!("decoding on the CPU failed"))??;
+            ensure!(on_card.len() == FRAMES && on_cpu.len() == FRAMES, "{} frames of {FRAMES} came out ({} on the CPU)", on_card.len(), on_cpu.len());
+            if let Some(n) = (0..FRAMES).find(|&n| on_card[n] != on_cpu[n]) {
+                bail!("frame {n} comes out different on the card");
+            }
+            Ok(())
+        })
+    }
+
+    /// [`row_sums`] of frames on the card (`size`), summed there.
+    fn row_sums(&self, frames: &[CardFrame], (w, h): (u32, u32)) -> Result<Vec<Vec<u32>>> {
+        let device = &self.device;
+        let rows = h + h.div_ceil(2);
+        // Each frame's sums where a storage binding can start.
+        let each = (rows as u64 * 4).next_multiple_of(device.limits().min_storage_buffer_offset_alignment as u64);
+        let bytes = (each * frames.len() as u64).max(4);
+        let buffer = |label, usage| device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size: bytes, usage, mapped_at_creation: false });
+        let (sums, read) = (buffer("row sums", wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC), buffer("row sums read", wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST));
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("row sums"), source: wgpu::ShaderSource::Wgsl(ROW_SUMS_SHADER.into()) });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some("row sums"), layout: None, module: &module, entry_point: Some("row_sums"), compilation_options: Default::default(), cache: None });
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("row sums") });
+        for (i, f) in frames.iter().enumerate() {
+            let values = [w, h, f.pitch(), f.chroma_at() as u32];
+            let uniforms = device.create_buffer(&wgpu::BufferDescriptor { label: Some("row sums"), size: 16, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+            self.queue.write_buffer(&uniforms, 0, &values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+            let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("row sums"),
+                layout: &pipeline.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: f.buffer().as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: &sums, offset: i as u64 * each, size: std::num::NonZeroU64::new(rows as u64 * 4) }) },
+                    wgpu::BindGroupEntry { binding: 2, resource: uniforms.as_entire_binding() },
+                ],
+            });
+            {
+                let mut pass = enc.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&pipeline);
+                pass.set_bind_group(0, &bind, &[]);
+                pass.dispatch_workgroups(rows.div_ceil(64), 1, 1);
+            }
+        }
+        enc.copy_buffer_to_buffer(&sums, 0, &read, 0, bytes);
+        let index = self.queue.submit([enc.finish()]);
+        read.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        device
+            .poll(wgpu::PollType::Wait { submission_index: Some(index), timeout: Some(std::time::Duration::from_secs(5)) })
+            .map_err(|e| anyhow::anyhow!("the card stopped: {e}"))?;
+        let data = read.slice(..).get_mapped_range().map_err(|e| anyhow::anyhow!("the sums didn't come back: {e}"))?;
+        Ok((0..frames.len())
+            .map(|i| data[i * each as usize..][..rows as usize * 4].as_chunks::<4>().0.iter().map(|b| u32::from_le_bytes(*b)).collect())
+            .collect())
+    }
+
     /// Ours, on the card captures are made on (`super::gpu`), for work whose
     /// frames aren't drawn: exports, the filmstrip (its pictures come back
-    /// small). Made the first time it's asked for; none without NVIDIA's.
+    /// small). Made the first time it's asked for; none where the card can't
+    /// decode ([`Self::new`]).
     pub fn background() -> Option<Arc<Self>> {
         static CARD: OnceLock<Option<Arc<Card>>> = OnceLock::new();
         CARD.get_or_init(|| {
@@ -179,8 +370,12 @@ impl Card {
         .clone()
     }
 
+    /// The card's CUDA context (NVIDIA's way), else null.
     fn cuda(&self) -> *mut c_void {
-        self.cuda.0
+        match &self.way {
+            Way::Nvidia(c) => c.0,
+            Way::Vaapi(..) => std::ptr::null_mut(),
+        }
     }
 
     /// Frame `f` (`source` big) made `size` small on the card and read back
@@ -316,13 +511,13 @@ impl Drop for Cuda {
     }
 }
 
-/// A frame buffer: the renderer's memory, which CUDA writes into.
+/// A frame buffer: the renderer's memory, which CUDA writes into (NVIDIA's
+/// way) or Vulkan copies into (VA-API's).
 struct Slot {
     card: Arc<Card>,
     buffer: wgpu::Buffer,
-    /// Where CUDA has it, and its hold on it.
-    at: u64,
-    mem: *mut c_void,
+    /// Where CUDA has it, and its hold on it (NVIDIA's way).
+    cuda: Option<(u64, *mut c_void)>,
 }
 
 // SAFETY: as `Card`; the memory handle is only let go of on drop.
@@ -331,20 +526,32 @@ unsafe impl Sync for Slot {}
 
 impl Slot {
     fn new(card: &Arc<Card>, bytes: u64) -> Result<Self> {
-        let (buffer, fd, allocated) = super::gpu::shared_buffer(&card.device, bytes)?;
-        let (mut at, mut mem, mut err) = (0u64, std::ptr::null_mut(), [0 as c_char; 512]);
-        // SAFETY: the fd is handed over; valid out-parameters and buffer.
-        let r = unsafe { hccu_import(card.cuda(), std::os::fd::IntoRawFd::into_raw_fd(fd), allocated, bytes, &mut at, &mut mem, err.as_mut_ptr(), err.len() as c_int) };
-        ensure!(r == 0, "{}", text(&err));
-        Ok(Self { card: card.clone(), buffer, at, mem })
+        if let Way::Nvidia(cuda) = &card.way {
+            let (buffer, fd, allocated) = super::gpu::shared_buffer(&card.device, bytes)?;
+            let (mut at, mut mem, mut err) = (0u64, std::ptr::null_mut(), [0 as c_char; 512]);
+            // SAFETY: the fd is handed over; valid out-parameters and buffer.
+            let r = unsafe { hccu_import(cuda.0, std::os::fd::IntoRawFd::into_raw_fd(fd), allocated, bytes, &mut at, &mut mem, err.as_mut_ptr(), err.len() as c_int) };
+            ensure!(r == 0, "{}", text(&err));
+            return Ok(Self { card: card.clone(), buffer, cuda: Some((at, mem)) });
+        }
+        let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
+        let buffer = card.device.create_buffer(&wgpu::BufferDescriptor { label: Some("decoded frame"), size: bytes, usage, mapped_at_creation: false });
+        // Cleared once, so wgpu counts it as written: it doesn't see
+        // Vulkan's copies into it, and would clear it over the first frame.
+        let mut enc = card.device.create_command_encoder(&Default::default());
+        enc.clear_buffer(&buffer, 0, None);
+        card.queue.submit([enc.finish()]);
+        Ok(Self { card: card.clone(), buffer, cuda: None })
     }
 }
 
 impl Drop for Slot {
     fn drop(&mut self) {
-        // SAFETY: what `hccu_import` took in, let go of once; the buffer
-        // (and its memory) goes after.
-        unsafe { hccu_release(self.card.cuda(), self.at, self.mem) };
+        if let Some((at, mem)) = self.cuda {
+            // SAFETY: what `hccu_import` took in, let go of once; the
+            // buffer (and its memory) goes after.
+            unsafe { hccu_release(self.card.cuda(), at, mem) };
+        }
     }
 }
 
@@ -441,6 +648,20 @@ impl CardFrame {
     }
 }
 
+/// Whether a VA-API device is NVIDIA's driver (nvidia-vaapi-driver): it says
+/// a frame is finished while its copy into the buffer it hands over may
+/// still be running (CUDA's device-to-device copies don't wait), so a frame
+/// read at once can be the one before it in that buffer. AMD's and Intel's
+/// drivers finish first.
+fn nvidia_va(va: &VaDevice) -> bool {
+    va.vendor.contains("NVDEC")
+}
+
+/// How long NVIDIA's VA-API driver gets to finish a frame it said was
+/// finished, decoding that way to try it (`HASTECLIP_DECODE=vaapi`): 1 ms
+/// was always enough on an RTX 4060 Ti, none wasn't.
+const NVIDIA_VA_SETTLE: std::time::Duration = std::time::Duration::from_millis(2);
+
 /// Open libavcodec, once: from `lib/` beside the app (the release ships it
 /// there), else the system's.
 fn load() -> Result<()> {
@@ -492,6 +713,10 @@ pub struct Decoder {
     /// whether it's said once that a frame came to our memory instead.
     pool: Option<Arc<Pool>>,
     said_off_card: bool,
+    /// VA-API's planes taken into Vulkan (made with the first frame), or
+    /// why they can't be (then frames come to our memory).
+    imports: Option<Imports>,
+    no_imports: bool,
     /// The video's own size.
     source: (u32, u32),
     /// The next sample (decode order) to hand the decoder.
@@ -554,7 +779,7 @@ impl Decoder {
         Self::open_with(path, output, threads, None)
     }
 
-    /// Frames for the screen decoded on NVIDIA's card and kept there, in
+    /// Frames for the screen decoded on the card and kept there, in
     /// buffers of `card`'s renderer ([`Nv12::Card`]). (A frame the card's
     /// decoder can't take, or with no buffer free, comes to our memory.)
     pub fn open_card(path: &Path, card: &Arc<Card>) -> Result<Self> {
@@ -593,10 +818,15 @@ impl Decoder {
         // BT.601 only when the file says so, as other players do.
         let bt601 = matches!(index.matrix, Some(5 | 6));
         let mut err = [0 as c_char; 512];
-        // SAFETY: the setup bytes and the error buffer are valid for the call.
-        // SAFETY: an open card's context.
-        let cuda = card.map_or(std::ptr::null_mut(), |(c, _)| unsafe { hccu_context(c.cuda()) });
-        let dec = unsafe { hcav_open(index.avcc.as_ptr(), index.avcc.len() as c_int, threads, cuda, err.as_mut_ptr(), err.len() as c_int) };
+        let (kind, hw) = match card.map(|(c, _)| &c.way) {
+            None => (ON_CPU, std::ptr::null_mut()),
+            // SAFETY: an open card's context.
+            Some(Way::Nvidia(cuda)) => (ON_CUDA, unsafe { hccu_context(cuda.0) }),
+            Some(Way::Vaapi(va, _)) => (ON_VAAPI, va.raw),
+        };
+        // SAFETY: the setup bytes and the error buffer are valid for the
+        // call; the card's device outlives the decoder (its pool holds it).
+        let dec = unsafe { hcav_open(index.avcc.as_ptr(), index.avcc.len() as c_int, threads, kind, hw, err.as_mut_ptr(), err.len() as c_int) };
         ensure!(!dec.is_null(), "{}", text(&err));
         // Frames span about one interval; the caller usually knows the rate better.
         let fps = {
@@ -619,6 +849,8 @@ impl Decoder {
             bt601,
             pool: card.map(|(c, most)| Arc::new(Pool::new(c, source, most))),
             said_off_card: false,
+            imports: None,
+            no_imports: false,
             source,
             next_feed: 0,
             draining: false,
@@ -651,7 +883,7 @@ impl Decoder {
         Self::open(path, Output::Rgba(width))
     }
 
-    /// [`Self::open_rgba`] decoded on NVIDIA's card and made small there
+    /// [`Self::open_rgba`] decoded on the card and made small there
     /// (the filmstrip): only the small pictures come to the CPU. On one
     /// thread, as frames are asked for here and there.
     pub fn open_rgba_card(path: &Path, width: u32, card: &Arc<Card>) -> Result<Self> {
@@ -718,7 +950,11 @@ impl Decoder {
 
     /// How frames are decoded, for the log.
     pub fn way(&self) -> &'static str {
-        if self.pool.is_some() { "libavcodec on NVIDIA's card" } else { "libavcodec" }
+        match self.pool.as_ref().map(|p| &p.card.way) {
+            None => "libavcodec",
+            Some(Way::Nvidia(_)) => "libavcodec on NVIDIA's card",
+            Some(Way::Vaapi(..)) => "libavcodec on the card, through VA-API",
+        }
     }
 
     /// The frame showing at `index`: the last one at or before it, so a
@@ -848,6 +1084,10 @@ impl Decoder {
     /// the renderer's: `None` if it isn't there as NV12, or no buffer is free.
     fn on_card(&mut self) -> Result<Option<CardFrame>> {
         let Some(pool) = &self.pool else { return Ok(None) };
+        if let Way::Vaapi(_, importer) = &pool.card.way {
+            let importer = importer.clone();
+            return self.on_card_vaapi(importer);
+        }
         let (mut y, mut y_pitch, mut uv, mut uv_pitch) = (0u64, 0, 0u64, 0);
         // SAFETY: the decoder is open, holding the frame; valid out-parameters.
         if unsafe { hcav_frame_cuda(self.dec, &mut y, &mut y_pitch, &mut uv, &mut uv_pitch) } != 0 {
@@ -868,9 +1108,56 @@ impl Decoder {
         let mut err = [0 as c_char; 512];
         // SAFETY: the frame stays put while it's held; the buffer is a whole
         // frame at its pitch, and no one reads it until this returns.
-        let r = unsafe { hccu_copy_nv12(pool.card.cuda(), y, y_pitch, uv, uv_pitch, frame.0.slot.at, pool.pitch as c_int, w as c_int, h as c_int, err.as_mut_ptr(), err.len() as c_int) };
+        let at = frame.0.slot.cuda.context("a frame buffer CUDA doesn't have")?.0;
+        let r = unsafe { hccu_copy_nv12(pool.card.cuda(), y, y_pitch, uv, uv_pitch, at, pool.pitch as c_int, w as c_int, h as c_int, err.as_mut_ptr(), err.len() as c_int) };
         ensure!(r == 0, "{}", text(&err));
         Ok(Some(frame))
+    }
+
+    /// [`Self::on_card`] for a frame decoded through VA-API: its planes
+    /// copied by Vulkan. A frame Vulkan can't take in comes to our memory,
+    /// and the ones after it.
+    fn on_card_vaapi(&mut self, importer: Arc<Importer>) -> Result<Option<CardFrame>> {
+        let pool = self.pool.clone().context("no frame buffers")?;
+        let mut planes = [Plane::default(); 2];
+        // SAFETY: the decoder is open, holding the frame; room for two planes.
+        if self.no_imports || unsafe { hcav_frame_dmabuf(self.dec, planes.as_mut_ptr()) } != 0 {
+            if !self.said_off_card {
+                self.said_off_card = true;
+                eprintln!("decoding: a frame the card's decoder didn't make (or not as 8-bit NV12): it comes to our memory");
+            }
+            return Ok(None);
+        }
+        if let Way::Vaapi(va, _) = &pool.card.way
+            && nvidia_va(va)
+        {
+            std::thread::sleep(NVIDIA_VA_SETTLE);
+        }
+        let copied = match pool.take() {
+            Some(frame) => {
+                let imports = self.imports.get_or_insert_with(|| Imports::new(importer));
+                imports.copy(&planes, pool.size, frame.buffer(), pool.pitch, frame.chroma_at()).map(|()| Some(frame))
+            }
+            None => Ok(None),
+        };
+        // SAFETY: the planes are let go of (Vulkan has its own hold).
+        unsafe { hcav_unmap(self.dec) };
+        match copied {
+            Ok(Some(frame)) => Ok(Some(frame)),
+            Ok(None) => {
+                if !self.said_off_card {
+                    self.said_off_card = true;
+                    eprintln!("decoding: all {} frame buffers on the card are held: frames come to our memory", pool.most);
+                }
+                Ok(None)
+            }
+            Err(e) => {
+                eprintln!("decoding: VA-API's frames can't be copied on the card ({e:#}): they come to our memory");
+                self.no_imports = true;
+                self.said_off_card = true;
+                Ok(None)
+            }
+        }
     }
 
     /// The frame just out, in our memory (copied down from the card if it's
@@ -959,6 +1246,53 @@ fn even_height(width: u32, source: (u32, u32)) -> u32 {
     (((width as f64) * source.1 as f64 / source.0.max(1) as f64 / 2.0).round() as u32 * 2).max(2)
 }
 
+/// A sum for each row of a tight NV12 frame (`size`): its luma's rows, then
+/// its U, V pairs' rows, byte `x` of a row weighted `x + 1` (wrapping): any
+/// one byte different changes its row's sum (by a multiple of 2³² only in
+/// a row of 16 million). As the card sums frames ([`ROW_SUMS_SHADER`]).
+fn row_sums(nv12: &[u8], (w, h): (u32, u32)) -> Vec<u32> {
+    let (w, h) = (w as usize, h as usize);
+    let (luma, chroma) = nv12.split_at(w * h);
+    let sum = |row: &[u8]| row.iter().zip(1u32..).fold(0u32, |s, (&b, weight)| s.wrapping_add(b as u32 * weight));
+    luma.chunks_exact(w).map(sum).chain(chroma.chunks_exact(w.div_ceil(2) * 2).map(sum)).collect()
+}
+
+/// [`row_sums`] on the card, of a frame on it (rows `pitch` bytes apart,
+/// the U, V pairs' rows from `chroma_at`): one row an invocation.
+const ROW_SUMS_SHADER: &str = r#"
+struct Frame {
+    size: vec2<u32>,
+    pitch: u32,
+    chroma_at: u32,
+}
+
+@group(0) @binding(0) var<storage, read> frame: array<u32>;
+@group(0) @binding(1) var<storage, read_write> sums: array<u32>;
+@group(0) @binding(2) var<uniform> f: Frame;
+
+@compute @workgroup_size(64)
+fn row_sums(@builtin(global_invocation_id) id: vec3<u32>) {
+    let pair_rows = (f.size.y + 1u) / 2u;
+    let row = id.x;
+    if (row >= f.size.y + pair_rows) {
+        return;
+    }
+    var start = row * f.pitch;
+    var n = f.size.x;
+    if (row >= f.size.y) {
+        start = f.chroma_at + (row - f.size.y) * f.pitch;
+        n = (f.size.x + 1u) / 2u * 2u;
+    }
+    var sum = 0u;
+    for (var x = 0u; x < n; x += 1u) {
+        let i = start + x;
+        let b = (frame[i / 4u] >> ((i % 4u) * 8u)) & 0xFFu;
+        sum += b * (x + 1u);
+    }
+    sums[row] = sum;
+}
+"#;
+
 /// A studio-range NV12 frame of `source` size as opaque RGBA at `size`:
 /// each pixel the average of the ones it covers.
 fn nv12_to_rgba(nv12: &[u8], (sw, sh): (u32, u32), (w, h): (u32, u32), bt601: bool) -> Vec<u8> {
@@ -1038,7 +1372,7 @@ mod tests {
         let mut dec = Decoder::open(&clip, Output::Screen).unwrap();
         dec.set_fps(30.0);
         assert_eq!(dec.keyframes(), vec![0, 30, 60]);
-        let mut check = |p: Option<Picture>, n: u64| {
+        let check = |p: Option<Picture>, n: u64| {
             let p = p.unwrap_or_else(|| panic!("no frame {n}"));
             assert_eq!(p.index, n);
             assert!(p.gpu.as_ref().unwrap().nv12.memory() == Some(ffmpeg_frame(n).as_slice()), "frame {n} differs");
@@ -1081,12 +1415,12 @@ mod tests {
         out
     }
 
-    /// Frames decoded on NVIDIA's card, into the renderer's buffers, are
-    /// the CPU decoder's to the byte (H.264 decodes exactly), wherever
-    /// they're asked for: reading on, jumps back and ahead, the last. A
-    /// clip with B-frames, its height not a whole number of macroblocks.
+    /// Frames decoded on the card, into the renderer's buffers, are the CPU
+    /// decoder's to the byte (H.264 decodes exactly), wherever they're
+    /// asked for: reading on, jumps back and ahead, the last. A clip with
+    /// B-frames, its height not a whole number of macroblocks.
     #[test]
-    #[ignore = "needs NVIDIA's driver: cargo test -p capture card_frames -- --ignored"]
+    #[ignore = "needs a card that decodes: cargo test -p capture card_frames -- --ignored (HASTECLIP_DECODE=vaapi for VA-API)"]
     fn card_frames_match_the_cpus() {
         if let Err(e) = load() {
             eprintln!("skipped: {e:#}");
@@ -1114,6 +1448,7 @@ mod tests {
         assert!(made.success());
         let mut on_card = Decoder::open_card(&clip, &card).unwrap();
         let mut on_cpu = Decoder::open(&clip, Output::Screen).unwrap();
+        eprintln!("decoding with {}", on_card.way());
         on_card.set_fps(30.0);
         on_cpu.set_fps(30.0);
         let size = (640, 360);
@@ -1121,7 +1456,9 @@ mod tests {
             let (a, b) = (a.unwrap_or_else(|| panic!("no frame {n} on the card")), b.unwrap_or_else(|| panic!("no frame {n}")));
             assert_eq!((a.index, b.index), (n, n));
             let Nv12::Card(f) = &a.gpu.as_ref().unwrap().nv12 else { panic!("frame {n} isn't on the card") };
-            assert!(read_back(&device, &queue, f, size) == b.gpu.as_ref().unwrap().nv12.memory().unwrap(), "frame {n} differs");
+            let (got, want) = (read_back(&device, &queue, f, size), b.gpu.as_ref().unwrap().nv12.memory().unwrap().to_vec());
+            let off = got.iter().zip(&want).filter(|(a, b)| a != b).count();
+            assert!(off == 0, "frame {n}: {off} bytes differ");
         };
         for n in [45, 46, 47, 10, 75, 89, 0] {
             let (a, b) = if n == 46 || n == 47 { (on_card.next().unwrap(), on_cpu.next().unwrap()) } else { (on_card.frame(n).unwrap(), on_cpu.frame(n).unwrap()) };
@@ -1135,7 +1472,7 @@ mod tests {
     /// filmstrip's) are the CPU's ([`Decoder::open_rgba`]), within a level
     /// (the card's arithmetic may round a hair differently).
     #[test]
-    #[ignore = "needs NVIDIA's driver: cargo test -p capture small_card -- --ignored"]
+    #[ignore = "needs a card that decodes: cargo test -p capture small_card -- --ignored (HASTECLIP_DECODE=vaapi for VA-API)"]
     fn small_card_pictures_match_the_cpus() {
         if let Err(e) = load() {
             eprintln!("skipped: {e:#}");
@@ -1178,6 +1515,55 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A whole clip decoded on the card is the CPU's, frame by frame (to try
+    /// a card and driver: HASTECLIP_DECODE=vaapi, say). HC_CLIP: the clip;
+    /// HC_FRAMES: how many frames (600).
+    #[test]
+    #[ignore = "needs a card that decodes and a clip: HC_CLIP=<mp4> cargo test --release -p capture card_through_a_clip -- --ignored --nocapture"]
+    fn card_through_a_clip() {
+        let clip = std::path::PathBuf::from(std::env::var("HC_CLIP").expect("HC_CLIP"));
+        let most: usize = std::env::var("HC_FRAMES").ok().and_then(|n| n.parse().ok()).unwrap_or(600);
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor { backends: wgpu::Backends::VULKAN, ..wgpu::InstanceDescriptor::new_without_display_handle() });
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).expect("a Vulkan card");
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).expect("a device");
+        let card = Card::new(&device, &queue).expect("a card that decodes");
+        let (mut on_card, mut on_cpu) = (Decoder::open_card(&clip, &card).unwrap(), Decoder::open(&clip, Output::Screen).unwrap());
+        eprintln!("{}", on_card.way());
+        let size = on_card.source_size();
+        let mut n = 0;
+        while let (Some(a), Some(b)) = (on_card.next().unwrap(), on_cpu.next().unwrap()) {
+            let Nv12::Card(f) = &a.gpu.as_ref().unwrap().nv12 else { panic!("frame {} isn't on the card", a.index) };
+            assert_eq!(a.index, b.index);
+            assert!(read_back(&device, &queue, f, size) == b.gpu.as_ref().unwrap().nv12.memory().unwrap(), "frame {} differs", a.index);
+            n += 1;
+            if n == most {
+                break;
+            }
+        }
+        eprintln!("{n} frames the same");
+    }
+
+    /// Any one byte different changes its row's sum, the check's
+    /// (`Card::check`): every value at every place, in a row as wide as 4K.
+    #[test]
+    fn row_sums_see_any_byte() {
+        let (w, h) = (3840u32, 2u32);
+        let frame: Vec<u8> = (0..(w * h + w * h.div_ceil(2)) as usize).map(|i| (i * 7 % 251) as u8).collect();
+        let sums = row_sums(&frame, (w, h));
+        assert_eq!(sums.len(), 3);
+        let mut changed = frame.clone();
+        for at in [0, 1, 1919, 3839, 3840, 3840 * 2 + 5] {
+            for v in 0..=255u8 {
+                if v == frame[at] {
+                    continue;
+                }
+                changed[at] = v;
+                assert_ne!(row_sums(&changed, (w, h)), sums, "byte {at} as {v}");
+            }
+            changed[at] = frame[at];
+        }
+    }
+
     /// The CPU time this process has used, in seconds.
     fn cpu_seconds() -> f64 {
         // SAFETY: an output struct for the call.
@@ -1189,7 +1575,7 @@ mod tests {
     }
 
     /// How fast frames come out, and the CPU time each takes, decoding on
-    /// NVIDIA's card against on the CPU (as playback does, 6 threads).
+    /// the card against on the CPU (as playback does, 6 threads).
     /// HC_CLIP: a clip.
     #[test]
     #[ignore = "benchmark: HC_CLIP=<mp4> cargo test --release -p capture card_decoding_speed -- --ignored --nocapture"]
@@ -1198,9 +1584,10 @@ mod tests {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor { backends: wgpu::Backends::VULKAN, ..wgpu::InstanceDescriptor::new_without_display_handle() });
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).expect("a Vulkan card");
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).expect("a device");
-        let card = Card::new(&device, &queue).expect("NVIDIA's card");
+        let card = Card::new(&device, &queue).expect("a card that decodes");
         for on_card in [true, false] {
             let mut dec = if on_card { Decoder::open_card(&clip, &card).unwrap() } else { Decoder::open(&clip, Output::Screen).unwrap() };
+            eprintln!("{}:", dec.way());
             let (t, cpu) = (std::time::Instant::now(), cpu_seconds());
             let mut n = 0u64;
             while let Some(p) = dec.next().unwrap() {

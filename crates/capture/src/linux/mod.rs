@@ -37,6 +37,7 @@ pub mod audio;
 mod blend;
 mod camera;
 pub mod decode;
+mod dmabuf;
 pub(crate) mod export;
 mod ext_windows;
 pub mod ffmpeg;

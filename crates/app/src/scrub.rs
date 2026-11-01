@@ -34,9 +34,10 @@
 //!   memory. The frames the next few redraws will show are uploaded to the
 //!   GPU ahead of them by a thread of their own ([`Uploader`]): uploading
 //!   one on the UI thread cost it more than drawing everything else did.
-//!   On NVIDIA's card, libavcodec decodes there (NVDEC) into buffers of the
-//!   renderer's, a pool for each decoder as on Windows, and the card copies
-//!   the frames the next redraws show into their textures.
+//!   On the card (NVIDIA's NVDEC, AMD's and Intel's through VA-API),
+//!   libavcodec decodes there into buffers of the renderer's, a pool for
+//!   each decoder as on Windows, and the card copies the frames the next
+//!   redraws show into their textures.
 //! - **macOS**: VideoToolbox (the media engine), frames in IOSurfaces the
 //!   renderer draws from where they are.
 //! - **Windows**: Media Foundation on the graphics card, frames in
@@ -66,7 +67,7 @@ fn budget(gpu: &Gpu) -> u64 {
 /// Linux: frames in memory. An eighth of the machine's, or a quarter of
 /// what's free when the clip opens if that's less (a game may hold the
 /// rest), from 128 MB to 3 GB (a 1440p frame is 5.5 MB: up to 550 of
-/// them, 9 s of 60 fps). On NVIDIA's card, as on Windows: a sixth of the
+/// them, 9 s of 60 fps). Decoded on the card, as on Windows: a sixth of the
 /// card's own memory, from 512 MB to 1.5 GB (games want the rest).
 #[cfg(target_os = "linux")]
 fn platform_budget(gpu: &Gpu) -> u64 {
@@ -118,7 +119,7 @@ fn decoders(gpu: &Gpu) -> usize {
 /// decoded no more frames in all, and each one so much slower (25 ms a
 /// frame instead of 6, on 6 cores) that none could keep up with the
 /// playhead at 1×, while the UI, sharing a core with one, drew half as
-/// often. On NVIDIA's card, 3, as elsewhere.
+/// often. Decoding on the card, 3, as elsewhere.
 #[cfg(target_os = "linux")]
 fn platform_decoders(gpu: &Gpu) -> usize {
     if gpu.card.is_some() {
@@ -138,8 +139,8 @@ fn platform_decoders(_: &Gpu) -> usize {
 
 /// Where decoded frames go: on Windows, the graphics card the renderer
 /// draws with (frames are shared with it); on Linux, the renderer's memory
-/// on NVIDIA's card where it decodes there; elsewhere, wherever the decoder
-/// puts them.
+/// on the card where it decodes there; elsewhere, wherever the decoder puts
+/// them.
 #[derive(Clone)]
 struct Gpu {
     #[cfg(windows)]
@@ -174,7 +175,7 @@ struct Source {
 impl Source {
     /// Open `path`, frames numbered at `fps`. `bytes`: the memory for its
     /// frames, where a decoder sets that aside as it opens (Windows; Linux
-    /// on NVIDIA's card, its pool of buffers there).
+    /// on the card, its pool of buffers there).
     /// Linux: on one thread (each decoder has a core).
     #[cfg(target_os = "linux")]
     fn open(path: &Path, fps: f64, gpu: &Gpu, bytes: u64) -> anyhow::Result<Self> {

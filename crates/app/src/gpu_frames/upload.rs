@@ -5,7 +5,7 @@
 //! taken in yet. Uploads and draws reach the GPU in the order they're made:
 //! a set isn't written again before the frame in it has been drawn.
 //!
-//! Linux, on NVIDIA's card: frames decoded there, into buffers of the
+//! Linux, on the card: frames decoded there, into buffers of the
 //! renderer's ([`card`]), are copied into those textures by the card itself:
 //! nothing passes through the CPU.
 
@@ -79,10 +79,11 @@ fn copy_card_frame(encoder: &mut wgpu::CommandEncoder, f: &capture::decode::Card
     encoder.copy_buffer_to_texture(wgpu::TexelCopyBufferInfo { buffer: f.buffer(), layout: layout(f.chroma_at()) }, cbcr.texture().as_image_copy(), cbcr.texture().size());
 }
 
-/// Decoding on NVIDIA's card, into the renderer's memory: made the first
-/// time it's asked for, if the renderer is on Vulkan on an NVIDIA card
-/// whose memory CUDA can share. `HASTECLIP_CPU_DECODE=1` decodes on the
-/// CPU anyway, to compare.
+/// Decoding on the card, into the renderer's memory: made the first time
+/// it's asked for, if the renderer is on Vulkan on a card that decodes
+/// (NVIDIA's through CUDA, AMD's and Intel's through VA-API: see
+/// `capture::decode::Card`). `HASTECLIP_CPU_DECODE=1` decodes on the CPU
+/// anyway, to compare.
 #[cfg(target_os = "linux")]
 pub fn card() -> Option<std::sync::Arc<capture::decode::Card>> {
     static CARD: std::sync::OnceLock<Option<std::sync::Arc<capture::decode::Card>>> = std::sync::OnceLock::new();
@@ -382,7 +383,7 @@ pub(super) fn card_for_test(device: &wgpu::Device, queue: &wgpu::Queue, width: u
 }
 
 /// The in-process decoder's frames (`capture::decode`: on Linux, NV12 in
-/// memory, or on NVIDIA's card), put in textures to draw.
+/// memory, or on the card), put in textures to draw.
 #[cfg(target_os = "linux")]
 #[derive(Default)]
 pub struct Frames(Uploads);

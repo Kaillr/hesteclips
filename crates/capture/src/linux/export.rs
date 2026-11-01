@@ -1,7 +1,7 @@
 //! Saving an edited clip's picture with the graphics card, for `media`'s
 //! export where the picture is made again (a new size, rate, bitrate or
 //! crop, or frame blending). The frames are decoded in the app (`decode`:
-//! on NVIDIA's card, there, into our device's memory; else on the CPU, and
+//! on the card, there, into our device's memory; else on the CPU, and
 //! put up on the card), there cropped and scaled as they are, in YUV
 //! (`Nv12Scaler`); or, to blend them, turned into RGB and blended by the
 //! recording's own frame code (`gpu_frame`: blended just as live). Then
@@ -44,7 +44,7 @@ pub(crate) fn render_video(job: &Job, dest: &Path, progress: &dyn Fn(f32)) -> Re
     if job.out_fps == 0 || job.size.0 < 2 || job.size.1 < 2 || job.parts.is_empty() || job.fps <= 0.0 {
         return Ok(false);
     }
-    // On NVIDIA's card where it can (the CPU free: ~11 ms a 1440p frame
+    // On the card where it can (the CPU free: ~11 ms a 1440p frame
     // there, every core busy), into our device's memory, which the frames
     // are read from where they are.
     let on_card = Card::background().filter(|_| std::env::var_os("HASTECLIP_CPU_DECODE").is_none()).and_then(|c| Decoder::open_card(job.source, &c).ok());

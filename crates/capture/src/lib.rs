@@ -645,9 +645,10 @@ pub fn screen_capture_auto_duplicates() -> bool {
 
 /// Until when playback's decoder was last behind, in ms on [`clock_ms`]:
 /// background decoding (the filmstrip, exports) keeps off the decoder
-/// playback uses meanwhile. NVIDIA's card has one, and a 1440p 540 fps clip
-/// needs nearly all of it: the filmstrip decoding there too held playback
-/// to 400 frames a second.
+/// playback uses meanwhile. A card has one (NVIDIA's RTX 4060 Ti decodes
+/// ~600 1440p frames a second), and a 1440p 540 fps clip needs nearly all
+/// of it: the filmstrip decoding there too held playback to 400 frames a
+/// second.
 static PLAYBACK_BEHIND_UNTIL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Milliseconds since the first time this was asked.

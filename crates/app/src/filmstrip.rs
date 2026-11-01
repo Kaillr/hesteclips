@@ -6,7 +6,7 @@
 //! shows (only the sides are trimmed, by at most a fifth).
 //!
 //! The pictures are exact frames from the in-process decoder (the GPU's on
-//! Windows and macOS, libavcodec on Linux: on NVIDIA's card there), in
+//! Windows and macOS, libavcodec on Linux: on the card there), in
 //! stretches of a fixed number of frames laid end to end from the clip's
 //! start (the last one to its end), as many frames as fit a thumbnail at
 //! this zoom: they stay put while panning. A picture shows only its own frame:
@@ -136,7 +136,7 @@ mod exact {
     /// Thumbnails kept, at ~90 KB each.
     const CACHE: usize = 800;
 
-    /// The filmstrip's decoders: on Linux on NVIDIA's card where it can
+    /// The filmstrip's decoders: on Linux on the card where it can
     /// (the pictures made small there: no CPU), but on the CPU while
     /// playback is short of the card's video decoder (a 1440p 540 fps clip
     /// needs nearly all of it: sharing it, playback showed 400 frames a
