@@ -101,7 +101,8 @@ impl Encoder {
                 }
             };
             let _ = ready_tx.send(Ok(name));
-            let mut run = Run { gpu: gpu2, pool: pool2, fps: setup.fps, out, config: None, width, height, staging: None };
+            let last_out = setup.export.then_some(None);
+            let mut run = Run { gpu: gpu2, pool: pool2, fps: setup.fps, out, config: None, width, height, staging: None, last_out };
             if let Err(e) = run.run(mft, rx) {
                 eprintln!("video encoder stopped: {e:#}");
                 failed2.store(true, Ordering::Relaxed);
@@ -378,6 +379,9 @@ struct Run {
     height: u32,
     /// Software path: CPU-readable copy of a frame.
     staging: Option<ID3D11Texture2D>,
+    /// An export's last frame out: frames must come out in order (see
+    /// `process_output`).
+    last_out: Option<Option<i64>>,
 }
 
 impl Run {
@@ -557,6 +561,16 @@ impl Run {
             }
             let Some(sample) = sample else { return Ok(true) };
             let n = ((sample.GetSampleTime().unwrap_or(0) as f64) * self.fps as f64 / 1e7).round() as i64;
+            // An export's writer takes frames in the order they're shown.
+            // One asked for none but making B-frames anyway (in the order
+            // they're decoded) would play out of order: it stops, and ffmpeg
+            // makes the export.
+            if let Some(last) = &mut self.last_out {
+                if last.is_some_and(|l| n <= l) {
+                    bail!("the encoder gave frame {n} after frame {}: B-frames, though asked for none", last.unwrap_or(0));
+                }
+                *last = Some(n);
+            }
             let clean = sample.GetUINT32(&MFSampleExtension_CleanPoint).unwrap_or(0) != 0;
             let buffer = sample.ConvertToContiguousBuffer()?;
             let mut ptr = std::ptr::null_mut();
