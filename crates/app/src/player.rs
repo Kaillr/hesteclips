@@ -353,6 +353,12 @@ pub struct Player {
     /// by several decoders, read on every redraw.
     #[cfg(hw_decode)]
     scrub: Option<crate::scrub::Engine>,
+    /// The engine while it opens, on a thread of its own: it waits for the
+    /// graphics card's decoder, which the first clip of a run starts
+    /// (~150 ms: the UI was held that long). Until it's there, scrubbing
+    /// goes through the playback decoder.
+    #[cfg(hw_decode)]
+    scrub_opening: Option<Receiver<Option<crate::scrub::Engine>>>,
     /// The playhead's motion while scrubbing.
     #[cfg(hw_decode)]
     motion: Option<Motion>,
@@ -501,10 +507,20 @@ impl Player {
         // `HASTECLIP_SCRUB_ENGINE=0`: scrub through the playback decoder
         // instead, to compare (as it does where the engine can't start).
         #[cfg(hw_decode)]
-        let scrub = video
-            .as_ref()
-            .filter(|_| scrubs && std::env::var_os("HASTECLIP_SCRUB_ENGINE").is_none_or(|v| v != "0"))
-            .and_then(|_| crate::scrub::Engine::open(ctx, source, info.fps, total_frames(&info) as u64));
+        let scrub_opening = video.as_ref().filter(|_| scrubs && std::env::var_os("HASTECLIP_SCRUB_ENGINE").is_none_or(|v| v != "0")).map(|_| {
+            let (tx, rx) = mpsc::channel();
+            let (ctx, source, fps, total) = (ctx.clone(), source.to_path_buf(), info.fps, total_frames(&info) as u64);
+            let opened = std::thread::Builder::new().name("scrub engine".into()).spawn(move || {
+                // Gone already (the clip closed): the engine stops as it drops.
+                if tx.send(crate::scrub::Engine::open(&ctx, &source, fps, total)).is_ok() {
+                    ctx.request_repaint();
+                }
+            });
+            if let Err(e) = opened {
+                eprintln!("scrubbing through the playback decoder: no thread for the scrub engine ({e})");
+            }
+            rx
+        });
         #[cfg(not(hw_decode))]
         let _ = scrubs;
         Self {
@@ -533,7 +549,9 @@ impl Player {
             stand_in: None,
             video,
             #[cfg(hw_decode)]
-            scrub,
+            scrub: None,
+            #[cfg(hw_decode)]
+            scrub_opening,
             #[cfg(hw_decode)]
             motion: None,
             #[cfg(hw_decode)]
@@ -843,6 +861,7 @@ impl Player {
                     self.uploader = None;
                 }
                 self.scrub = None;
+                self.scrub_opening = None;
             }
         }
         if let Some(proxy) = &self.proxy {
@@ -1024,6 +1043,17 @@ impl Player {
         let want = self.info.frame_index(self.time());
         #[cfg(hw_decode)]
         {
+            // The engine, once it's open.
+            if let Some(rx) = &self.scrub_opening {
+                match rx.try_recv() {
+                    Ok(engine) => {
+                        self.scrub = engine;
+                        self.scrub_opening = None;
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => self.scrub_opening = None,
+                    Err(mpsc::TryRecvError::Empty) => {}
+                }
+            }
             // Its decoders gone: its frames and textures go too (scrubbing
             // carries on through the playback decoder).
             if self.scrub.as_ref().is_some_and(|e| e.failed()) {
