@@ -125,7 +125,7 @@ default: {:?}", d.inputs.iter().map(|i| &i.name).collect::<Vec<_>>(), d.default_
                 Some(capture::Crop { w: w.parse().ok()?, h: h.parse().ok()?, at: None })
             });
             let framing = if rect.is_some() { capture::Framing::Fill } else { size.framing() };
-            capture::ScreenPlacement { rect: rect.unwrap_or([0.0, 0.0, 1.0, 1.0]), framing, in_front: env("SCREEN_FRONT").is_some(), crop, ..capture::ScreenPlacement::whole(framing) }
+            capture::ScreenPlacement { rect: rect.unwrap_or([0.0, 0.0, 1.0, 1.0]), framing, in_front: env("SCREEN_FRONT").is_some(), hidden: env("SCREEN_OFF").is_some(), crop, ..capture::ScreenPlacement::whole(framing) }
         })),
         sources: sources.clone(),
     })?;

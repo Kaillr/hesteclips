@@ -869,26 +869,17 @@ impl Layer {
         }
     }
 
-    /// Fill `target` of target `slot` with black (the stream off: only the
-    /// background is drawn).
+    /// Fill `target` of target `slot` with black: the picture drawn fully
+    /// transparent over the black background. (A stream that's off in the
+    /// Blt crashes some drivers, NVIDIA's, when nothing was ever drawn.)
     fn clear(&self, video: &ID3D11VideoContext, slot: usize, target: RECT) -> windows::core::Result<()> {
-        unsafe { video.VideoProcessorSetOutputTargetRect(&self.processor, true, Some(&target)) };
-        let stream = D3D11_VIDEO_PROCESSOR_STREAM {
-            Enable: false.into(),
-            OutputIndex: 0,
-            InputFrameOrField: 0,
-            PastFrames: 0,
-            FutureFrames: 0,
-            ppPastSurfaces: std::ptr::null_mut(),
-            pInputSurface: std::mem::ManuallyDrop::new(Some(self.input.clone())),
-            ppFutureSurfaces: std::ptr::null_mut(),
-            ppPastSurfacesRight: std::ptr::null_mut(),
-            pInputSurfaceRight: std::mem::ManuallyDrop::new(None),
-            ppFutureSurfacesRight: std::ptr::null_mut(),
-        };
-        let mut streams = [stream];
-        let result = unsafe { video.VideoProcessorBlt(&self.processor, &self.outputs[slot], 0, &streams) };
-        unsafe { std::mem::ManuallyDrop::drop(&mut streams[0].pInputSurface) };
+        unsafe {
+            video.VideoProcessorSetStreamAlpha(&self.processor, 0, true, 0.0);
+        }
+        let (w, h) = self.source.content();
+        let whole = RECT { left: 0, top: 0, right: w.max(2) as i32, bottom: h.max(2) as i32 };
+        let result = self.draw(video, slot, whole, target, target, 0, (false, false));
+        unsafe { video.VideoProcessorSetStreamAlpha(&self.processor, 0, false, 1.0) };
         result
     }
 
