@@ -128,6 +128,12 @@ for picture and sound, and `scripts/frame-numbers.py make clip.mp4` for one
 whose frames carry their numbers (`scripts/frame-numbers.py read
 export.mp4` says which frames an export kept).
 
+`scripts/check-native-media.sh` does all of it on the machine it runs on
+(Linux, macOS, or Git Bash on Windows): makes the clips, runs the tests
+below against ffmpeg's exports (and Linux's `card_` tests there), checks a
+144 fps export at 60 and a BT.601 clip's colours, times the exports, and
+says what passed. Its log's `export:` lines say which way each export went.
+
 | Test | What it checks |
 |---|---|
 | `media` `card_exports_match_ffmpegs` | Exports made in the app against ffmpeg's: frames, each frame, stream lengths (`HC_SRC`: a 60 fps clip with sound, `HC_FAST`: 540 fps; `--ignored`) |
@@ -224,6 +230,11 @@ ffmpeg), `HASTECLIP_ENCODER`, `HASTECLIP_DECODE`, `HASTECLIP_CPU_DECODE=1`,
   default. At a very low bitrate (500 kbit/s at 720p60) its first few frames
   are softer than x264's (a level and a bit, in 8×8 blocks), as its rate
   control starts carefully.
+- Exports ask every encoder for no B-frames (the writer takes frames in
+  the order they're shown), but that's a request: AMD's or Intel's could
+  make them anyway, out of order. One that does stops the export and ffmpeg
+  makes it (tried by making NVIDIA's look so at frame 100: the export came
+  out by ffmpeg, every frame right).
 - A decoder's own textures (`Decoder::open_nv12`) aren't shared and need no
   fence: what reads a frame on the same device is queued after its copy, so
   a frame goes back to the pool as soon as its draw is queued.
