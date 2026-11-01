@@ -181,6 +181,12 @@ ffmpeg), `HASTECLIP_ENCODER`, `HASTECLIP_DECODE`, `HASTECLIP_CPU_DECODE=1`,
 - A driver can report work done before it is (NVIDIA's VA-API driver did);
   the checks above catch that kind of thing.
 - Clips at fractional rates (59.94) are still exported by ffmpeg.
+- A dev build compiles the decoder shim against the system's libavcodec
+  headers and asks for that major version at run time. A system update
+  (ffmpeg 8 to 9: libavcodec 62 to 63) left a build asking for a library
+  that was gone, and every clip quietly played through ffmpeg processes
+  ("hardware decoder unavailable" in the log); the build now reruns when
+  those headers change. Releases ship their libavcodec, so aren't affected.
 
 ## Lessons from macOS
 
@@ -189,7 +195,8 @@ ffmpeg), `HASTECLIP_ENCODER`, `HASTECLIP_DECODE`, `HASTECLIP_CPU_DECODE=1`,
   frame to start before its middle, not the one at its start. The two agree
   only at half the rate (60 to 30), which the checks had used; 144 to 60,
   120 to 30 and 540 to 60 showed other frames until the shared `Timeline`
-  took the middle. That changed Linux's export too, which hasn't run since.
+  took the middle. That changed Linux's export too; it passes the same
+  checks there (`scripts/check-native-media.sh`, 144 to 60 included).
 - A GPU waited on frame by frame sits idle: each frame took 1.5–2 ms for a
   fraction of that in work. The frames go in without waiting, and the
   encoder takes each a few behind (`AHEAD`), once it's made.
@@ -266,13 +273,17 @@ maintainer says so.
 
 - AMD's and Intel's cards on Linux (VA-API decoding, Vulkan Video encoding):
   both check themselves before use and fall back, but have only run on
-  NVIDIA's.
+  NVIDIA's. Everything else on Linux was checked again after the macOS and
+  Windows work (2026-11-02, RTX 4060 Ti): the check script passes all six;
+  the release app plays and scrubs 60, 144 and 540 fps clips and a BT.601
+  one on the card, makes thumbnails (within 1.6 of ffmpeg's), exports at
+  1080p, to a Discord size, cropped and blended 540 to 60 on the card,
+  records 1080p60 through NVENC; the package builds and runs on its own
+  libavcodec. 540 fps playback is as before (522–534 shown a second against
+  524–534 on the Linux-only branch, interleaved).
 - Sound decoded in the app (waveforms and playback still start ffmpeg once a
   track: `media::pcm`), and other apps' videos (MKV, WebM, HEVC, AV1). Shared
   work, for whichever machine gets to it.
-- Linux since `Timeline` and `lanczos` moved and `Timeline` took ffmpeg's
-  frames: not built or run there yet (`card_exports_match_ffmpegs`, and
-  `frame-numbers.py` on a 144 fps export at 60).
 - On macOS, anything not H.264 in an MP4 is still made by ffmpeg. The
   thumbnail check (`first_frame_is_ffmpegs`) is 2.27 off ffmpeg's there
   against a bar of 2.0: VideoToolbox interpolates the colours, ffmpeg's
