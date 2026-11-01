@@ -1804,7 +1804,7 @@ mod tests {
     /// Reading an MP4's or MOV's index here gives what ffprobe gives, for
     /// files like ours (named tracks, our tag) and others: B-frames, colour
     /// tagged or not and guessed by size, QuickTime's own comment, no sound,
-    /// a film's frame rate.
+    /// a film's frame rate, a copy starting on a keyframe.
     #[test]
     fn probing_mp4_matches_ffprobe() {
         let dir = std::env::temp_dir().join(format!("hc-probe-{}", std::process::id()));
@@ -1837,6 +1837,10 @@ mod tests {
             ("colr.mp4", ["-f", "lavfi", "-i", "testsrc2=s=1280x720:r=30:d=1", "-c:v", "libx264", "-colorspace", "bt470bg", "-movflags", "+write_colr"].iter().map(|s| s.to_string()).collect()),
             ("quicktime.mov", ["-f", "lavfi", "-i", "testsrc2=s=1920x1080:r=30:d=1", "-f", "lavfi", "-i", "sine=d=1", "-c:v", "libx264", "-c:a", "aac", "-metadata", "comment=hasteclip:mix=1", "-metadata:s:a:0", "title=Game"].iter().map(|s| s.to_string()).collect()),
             ("film.mp4", ["-f", "lavfi", "-i", "testsrc2=s=1280x720:r=24000/1001:d=2", "-c:v", "libx264"].iter().map(|s| s.to_string()).collect()),
+            // Copied from a keyframe (as freeing up space trims): the
+            // picture edited to start late, its movie length longer than
+            // its streams'.
+            ("copied.mp4", ["-ss", "0.4", "-to", "1.7", "-i", &dir.join("bframes.mp4").to_string_lossy(), "-map", "0", "-c", "copy", "-avoid_negative_ts", "make_zero"].iter().map(|s| s.to_string()).collect()),
         ];
         let mut checked = 0;
         for (name, args) in &cases {

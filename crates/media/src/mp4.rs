@@ -26,6 +26,11 @@ pub(crate) struct Track {
     pub samples: u64,
     pub bytes: u64,
     pub seconds: f64,
+    /// When it starts and ends on the file's timeline, in seconds, as
+    /// ffprobe has a stream: where its edit list starts it, and then its
+    /// media's length (at most what the edits show of it).
+    pub start: f64,
+    pub end: f64,
     /// A video track's size (as coded, from its sample entry).
     pub width: u32,
     pub height: u32,
@@ -51,12 +56,42 @@ pub(crate) fn read(path: &Path) -> Result<Movie> {
     let (timescale, duration) = times(mvhd).context("a short mvhd")?;
     let mut tracks = Vec::new();
     for trak in children(&moov, b"trak") {
-        tracks.push(track(trak)?);
+        tracks.push(track(trak, timescale)?);
     }
-    Ok(Movie { seconds: if timescale > 0 { duration as f64 / timescale as f64 } else { 0.0 }, tracks, comment: comment(&moov) })
+    // From the first stream's start to the last one's end, as ffprobe's
+    // length: the movie's own length can run past it (ffmpeg's copies
+    // starting on a keyframe edit their streams' starts in, and keep the
+    // whole length after them: 3.24 s where the streams end by 3.14).
+    let end = tracks.iter().map(|t| t.end).fold(0.0, f64::max);
+    let start = tracks.iter().map(|t| t.start).fold(f64::INFINITY, f64::min);
+    let seconds = if end > 0.0 { end - start.min(end) } else if timescale > 0 { duration as f64 / timescale as f64 } else { 0.0 };
+    Ok(Movie { seconds, tracks, comment: comment(&moov) })
 }
 
-fn track(trak: &[u8]) -> Result<Track> {
+/// A track's edit list, in seconds: where it starts the media on the
+/// file's timeline (after its empty edits), and how long the edits after
+/// that show (`None`: all of it). `timescale`: the movie's.
+fn edits(trak: &[u8], timescale: u32) -> (f64, Option<f64>) {
+    let Some(elst) = child(trak, b"edts").and_then(|e| child(e, b"elst")) else { return (0.0, None) };
+    let wide = elst.first() == Some(&1);
+    let (size, time) = if wide { (20, 8) } else { (12, 4) };
+    let (mut empty, mut shown) = (0u64, 0u64);
+    for i in 0..be32(elst.get(4..)).unwrap_or(0) as usize {
+        let at = 8 + i * size;
+        let (Some(segment), Some(media)) = (elst.get(at..at + time), elst.get(at + time..at + 2 * time)) else { break };
+        let segment = if wide { be64(Some(segment)).unwrap_or(0) } else { be32(Some(segment)).unwrap_or(0) as u64 };
+        match media.iter().all(|&b| b == 0xFF) {
+            true if shown == 0 => empty += segment,
+            true => {}
+            false => shown += segment,
+        }
+    }
+    let seconds = |t: u64| if timescale > 0 { t as f64 / timescale as f64 } else { 0.0 };
+    // A fragmented file's edits may give no length (0): all of it.
+    (seconds(empty), (shown > 0).then(|| seconds(shown)))
+}
+
+fn track(trak: &[u8], movie_timescale: u32) -> Result<Track> {
     let mdia = child(trak, b"mdia").context("no mdia")?;
     let hdlr = child(mdia, b"hdlr").context("no hdlr")?;
     let kind = match hdlr.get(8..12) {
@@ -88,6 +123,9 @@ fn track(trak: &[u8]) -> Result<Track> {
         (0..be32(s.get(4..)).unwrap_or(0) as usize).map(|i| be32(s.get(8 + 8 * i..)).unwrap_or(0) as u64 * be32(s.get(12 + 8 * i..)).unwrap_or(0) as u64).sum()
     });
     let seconds = if timescale > 0 { (if ticks > 0 { ticks } else { duration }) as f64 / timescale as f64 } else { 0.0 };
+    let (start, shown) = edits(trak, movie_timescale);
+    let media = if timescale > 0 { duration as f64 / timescale as f64 } else { 0.0 };
+    let end = start + shown.map_or(media, |s| media.min(s));
 
     let (mut width, mut height, mut matrix) = (0, 0, None);
     if kind == Kind::Video
@@ -105,7 +143,7 @@ fn track(trak: &[u8]) -> Result<Track> {
             matrix = child(boxes, b"avcC").and_then(avcc_matrix);
         }
     }
-    Ok(Track { kind, name, samples: count, bytes, seconds, width, height, matrix })
+    Ok(Track { kind, name, samples: count, bytes, seconds, start, end, width, height, matrix })
 }
 
 /// The file comment: `udta/meta/ilst/©cmt` (MP4) or `udta/©cmt` (QuickTime).
