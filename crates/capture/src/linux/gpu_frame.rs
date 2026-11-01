@@ -519,8 +519,9 @@ struct Layer {
     texture: wgpu::Texture,
     draw: wgpu::ComputePipeline,
     uniforms: wgpu::Buffer,
-    /// The camera's picture on the card, and which picture it is.
-    picture: Option<(wgpu::Texture, usize)>,
+    /// The camera's picture on the card, and which picture it is
+    /// (`CameraPicture::seq`).
+    picture: Option<(wgpu::Texture, u64)>,
     /// Whether anything is drawn.
     on: bool,
 }
@@ -580,7 +581,7 @@ impl GpuPicture {
         let (device, queue) = (&self.gpu.device, &self.gpu.queue);
         let l = &mut self.layer;
         if let Some((c, _)) = shown {
-            let id = c as *const CameraPicture as usize;
+            let id = c.seq;
             let size = wgpu::Extent3d { width: c.width, height: c.height, depth_or_array_layers: 1 };
             if l.picture.as_ref().is_none_or(|(t, _)| t.size() != size) {
                 let t = device.create_texture(&wgpu::TextureDescriptor {
@@ -1030,7 +1031,7 @@ mod tests {
     fn in_front_or_behind() {
         let gpu = super::super::gpu::gpu().expect("a graphics card");
         let white = Frame { width: 64, height: 36, stride: 256, order: Order::Bgr, data: [255u8, 255, 255, 255].repeat(64 * 36), texture: None };
-        let cam = CameraPicture { width: 16, height: 9, bgra: [40u8, 40, 40, 255].repeat(16 * 9) };
+        let cam = CameraPicture { width: 16, height: 9, bgra: [40u8, 40, 40, 255].repeat(16 * 9), seq: 1 };
         let all = Placement { x: 0.0, y: 0.0, w: 1.0, h: 1.0, crop: [0.0; 4], flip_h: false, flip_v: false, turns: 0, stretch: 1.0 };
         let left = crate::ScreenPlacement { rect: [0.0, 0.0, 0.5, 1.0], ..crate::ScreenPlacement::whole(crate::Framing::Fill) };
         // Luma of white, and of the camera's grey.
@@ -1063,7 +1064,7 @@ mod tests {
     fn webcam_layer_matches_the_cpu() {
         let gpu = super::super::gpu::gpu().expect("a graphics card");
         let (w, h) = (320u32, 180u32);
-        let cam = CameraPicture { width: 160, height: 120, bgra: (0..160 * 120 * 4).map(|i| if i % 4 == 3 { 255 } else { ((i * 7919) % 251) as u8 }).collect() };
+        let cam = CameraPicture { width: 160, height: 120, bgra: (0..160 * 120 * 4).map(|i| if i % 4 == 3 { 255 } else { ((i * 7919) % 251) as u8 }).collect(), seq: 1 };
         let base = Placement { x: 0.55, y: 0.5, w: 0.4, h: 0.45, crop: [0.0; 4], flip_h: false, flip_v: false, turns: 0, stretch: 1.0 };
         let cases = [
             ("boxed", base),
@@ -1105,7 +1106,7 @@ mod tests {
             (u.ru_utime.tv_sec + u.ru_stime.tv_sec) as f64 + (u.ru_utime.tv_usec + u.ru_stime.tv_usec) as f64 / 1e6
         };
         let mut pic = GpuPicture::new(gpu.clone(), 1920, 1080, crate::ScreenPlacement::whole(crate::Framing::Fit));
-        let pictures: Vec<Arc<CameraPicture>> = (0..2).map(|k| Arc::new(CameraPicture { width: 1920, height: 1080, bgra: vec![40 + k as u8; 1920 * 1080 * 4] })).collect();
+        let pictures: Vec<Arc<CameraPicture>> = (0..2).map(|k| Arc::new(CameraPicture { width: 1920, height: 1080, bgra: vec![40 + k as u8; 1920 * 1080 * 4], seq: k as u64 + 1 })).collect();
         for w in [0.25f32, 0.5, 1.0] {
             let place = Placement { x: 1.0 - w, y: 1.0 - w, w, h: w, crop: [0.0; 4], flip_h: false, flip_v: false, turns: 0, stretch: 1.0 };
             let n = 60;

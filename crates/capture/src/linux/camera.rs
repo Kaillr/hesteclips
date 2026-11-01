@@ -163,7 +163,10 @@ fn stream(feed: &CameraFeed) -> Result<()> {
     };
     if std::env::var_os("HASTECLIP_WEBCAM_FFMPEG").is_none() {
         match Stream::open(&path, format, pixel) {
-            Ok(s) => return stream_direct(feed, s),
+            Ok(s) => match stream_direct(feed, s)? {
+                Direct::Done => return Ok(()),
+                Direct::Unreadable => eprintln!("webcam: its pictures can't be read here; through ffmpeg"),
+            },
             Err(Opening::Busy) => bail!("in use by another app"),
             Err(Opening::Failed(e)) => eprintln!("webcam: can't stream it directly ({e:#}); through ffmpeg"),
         }
@@ -197,8 +200,9 @@ impl Delivery {
             NEW_PICTURES.fetch_add(1, Ordering::Relaxed);
             self.last_print = Some(print);
         }
-        let old = feed.frame.lock().unwrap().replace(Arc::new(CameraPicture { width: w, height: h, bgra: buf }));
-        feed.seq.store(PICTURES.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Release);
+        let seq = PICTURES.fetch_add(1, Ordering::Relaxed) + 1;
+        let old = feed.frame.lock().unwrap().replace(Arc::new(CameraPicture { width: w, height: h, bgra: buf, seq }));
+        feed.seq.store(seq, Ordering::Release);
         self.spare = old.and_then(|a| Arc::try_unwrap(a).ok()).map(|p| p.bgra);
         if !self.live {
             // Open: what was set for this camera before goes back on (it
@@ -214,8 +218,20 @@ impl Delivery {
 /// stopped (a dark room's long exposures are well under).
 const SILENT: Duration = Duration::from_secs(5);
 
+/// How reading straight from the camera ended.
+enum Direct {
+    /// Told to stop.
+    Done,
+    /// Not one of its first pictures could be decoded here (a JPEG of a
+    /// kind ours don't read): ffmpeg reads it then, as it did before.
+    Unreadable,
+}
+
+/// Pictures that can't be decoded before giving up on decoding here.
+const UNREADABLE: u32 = 30;
+
 /// Read pictures straight from the camera, decoding them here.
-fn stream_direct(feed: &CameraFeed, mut s: Stream) -> Result<()> {
+fn stream_direct(feed: &CameraFeed, mut s: Stream) -> Result<Direct> {
     let (w, h) = (s.width, s.height);
     let mut decoder = Decoder::new(s.pixel, w, h, s.bytes_per_line);
     let mut delivery = Delivery::new();
@@ -239,6 +255,9 @@ fn stream_direct(feed: &CameraFeed, mut s: Stream) -> Result<()> {
                 if bad.is_power_of_two() {
                     eprintln!("webcam: {bad} pictures it sent couldn't be read: {e:#}");
                 }
+                if !delivery.live && bad >= UNREADABLE {
+                    return Ok(Direct::Unreadable);
+                }
                 delivery.spare = Some(buf);
             }
             Some(Ok(())) => {
@@ -247,7 +266,7 @@ fn stream_direct(feed: &CameraFeed, mut s: Stream) -> Result<()> {
             }
         }
     }
-    Ok(())
+    Ok(Direct::Done)
 }
 
 /// Read pictures through ffmpeg, which decodes them to BGRA.
@@ -367,8 +386,11 @@ impl Stream {
             return Err(if std::io::Error::last_os_error().raw_os_error() == Some(libc::EBUSY) { Opening::Busy } else { failed("its picture format") });
         }
         // A camera that says it does the format, then picks another (MJPG
-        // asked, JPEG given) is read as what it gives.
+        // asked, JPEG given) is read as what it gives, if that's read here.
         let pixel = f.pix.pixelformat;
+        if !matches!(&pixel.to_le_bytes(), b"MJPG" | b"JPEG" | b"YUYV" | b"UYVY" | b"NV12" | b"YU12") {
+            return Err(Opening::Failed(anyhow!("it gives {} instead", String::from_utf8_lossy(&pixel.to_le_bytes()))));
+        }
         let mut s = Self { fd, buffers: Vec::new(), width: f.pix.width, height: f.pix.height, pixel, bytes_per_line: f.pix.bytesperline };
         // The rate: seconds a frame, the inverse of frames a second.
         // SAFETY: as above.

@@ -746,10 +746,12 @@ struct Picture {
     screen: crate::SharedScreen,
     camera: Option<(camera::CameraLayer, SharedPlacement)>,
     /// What the canvas shows: the screen picture's number and where it went,
-    /// the camera picture and where it was placed.
-    shows: Option<(u64, crate::ScreenPlacement, Option<usize>, Option<Placement>)>,
-    /// The webcam picture and where it was placed, as the card's layer has it.
-    camera_shown: Option<(Option<usize>, Option<Placement>)>,
+    /// the camera picture's number (`CameraPicture::seq`) and where it was
+    /// placed.
+    shows: Option<(u64, crate::ScreenPlacement, Option<u64>, Option<Placement>)>,
+    /// The webcam picture's number and where it was placed, as the card's
+    /// layer has it.
+    camera_shown: Option<(Option<u64>, Option<Placement>)>,
     /// The canvas as NV12, made when it changes.
     nv12: Vec<u8>,
     /// Counts the canvas's changes, so the preview is only sent new ones.
@@ -788,7 +790,7 @@ impl Picture {
             }
             None => (None, None),
         };
-        let now = (cam.as_ref().map(|c| Arc::as_ptr(c) as usize), place);
+        let now = (cam.as_ref().map(|c| c.seq), place);
         if let Some(g) = &mut self.gpu
             && self.camera_shown != Some(now)
         {
@@ -804,7 +806,7 @@ impl Picture {
         self.feed.want();
         let Some((frame, seq)) = self.feed.get() else { return false };
         let (placed, cam, place) = self.layers();
-        let now = (seq, placed, cam.as_ref().map(|c| Arc::as_ptr(c) as usize), place);
+        let now = (seq, placed, cam.as_ref().map(|c| c.seq), place);
         if self.shows.as_ref() != Some(&now) {
             match &mut self.gpu {
                 Some(g) => {
