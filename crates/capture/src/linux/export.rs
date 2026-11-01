@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 
-use super::decode::{Decoder, Output};
+use super::decode::{Decoder, Nv12, Output};
 use super::gpu::{self, Gpu};
 use super::gpu_frame::{GpuPicture, Nv12Source, Nv12Target, nv12_len};
 use super::nvenc::Nvenc;
@@ -86,7 +86,10 @@ pub(crate) fn render_video(job: &Job, dest: &Path, progress: &dyn Fn(f32)) -> Re
                 let got = decoder.frame(i).and_then(|p| {
                     let p = p.context("a frame the decoder doesn't have")?;
                     let s = p.gpu.context("a frame not in NV12")?;
-                    Ok((i, s.nv12, s.bt601))
+                    match s.nv12 {
+                        Nv12::Memory(nv12) => Ok((i, nv12, s.bt601)),
+                        Nv12::Card(_) => bail!("a frame on the renderer's card"),
+                    }
                 });
                 let failed = got.is_err();
                 if tx.send(got).is_err() || failed {

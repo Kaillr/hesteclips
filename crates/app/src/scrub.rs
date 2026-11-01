@@ -34,6 +34,9 @@
 //!   memory. The frames the next few redraws will show are uploaded to the
 //!   GPU ahead of them by a thread of their own ([`Uploader`]): uploading
 //!   one on the UI thread cost it more than drawing everything else did.
+//!   On NVIDIA's card, libavcodec decodes there (NVDEC) into buffers of the
+//!   renderer's, a pool for each decoder as on Windows, and the card copies
+//!   the frames the next redraws show into their textures.
 //! - **macOS**: VideoToolbox (the media engine), frames in IOSurfaces the
 //!   renderer draws from where they are.
 //! - **Windows**: Media Foundation on the graphics card, frames in
@@ -63,9 +66,13 @@ fn budget(gpu: &Gpu) -> u64 {
 /// Linux: frames in memory. An eighth of the machine's, or a quarter of
 /// what's free when the clip opens if that's less (a game may hold the
 /// rest), from 128 MB to 3 GB (a 1440p frame is 5.5 MB: up to 550 of
-/// them, 9 s of 60 fps).
+/// them, 9 s of 60 fps). On NVIDIA's card, as on Windows: a sixth of the
+/// card's own memory, from 512 MB to 1.5 GB (games want the rest).
 #[cfg(target_os = "linux")]
-fn platform_budget(_: &Gpu) -> u64 {
+fn platform_budget(gpu: &Gpu) -> u64 {
+    if let Some(card) = &gpu.card {
+        return card.memory().map_or(512 << 20, |m| m / 6).clamp(512 << 20, 3 << 29);
+    }
     let share = capture::total_memory().map_or(1 << 30, |m| m / 8);
     let free = meminfo("MemAvailable").map_or(u64::MAX, |m| m / 4);
     share.min(free).clamp(128 << 20, 3 << 30)
@@ -100,20 +107,23 @@ fn meminfo(key: &str) -> Option<u64> {
 
 /// How many decoders ([`platform_decoders`]). `HASTECLIP_SCRUB_DECODERS`
 /// overrides it.
-fn decoders() -> usize {
+fn decoders(gpu: &Gpu) -> usize {
     if let Some(n) = std::env::var("HASTECLIP_SCRUB_DECODERS").ok().and_then(|s| s.parse::<usize>().ok()) {
         return n.clamp(1, 32);
     }
-    platform_decoders()
+    platform_decoders(gpu)
 }
 
 /// Linux: one per physical core, 2 to 12. More (one per hardware thread)
 /// decoded no more frames in all, and each one so much slower (25 ms a
 /// frame instead of 6, on 6 cores) that none could keep up with the
 /// playhead at 1×, while the UI, sharing a core with one, drew half as
-/// often.
+/// often. On NVIDIA's card, 3, as elsewhere.
 #[cfg(target_os = "linux")]
-fn platform_decoders() -> usize {
+fn platform_decoders(gpu: &Gpu) -> usize {
+    if gpu.card.is_some() {
+        return 3;
+    }
     let logical = std::thread::available_parallelism().map_or(4, |n| n.get());
     physical_cores().unwrap_or(logical / 2).clamp(2, 12)
 }
@@ -122,17 +132,20 @@ fn platform_decoders() -> usize {
 /// decodes for all of them. A few at once keep it busy and work in as many
 /// places ahead of the playhead; more would only hold more of its memory.
 #[cfg(not(target_os = "linux"))]
-fn platform_decoders() -> usize {
+fn platform_decoders(_: &Gpu) -> usize {
     3
 }
 
 /// Where decoded frames go: on Windows, the graphics card the renderer
-/// draws with (frames are shared with it); elsewhere, wherever the decoder
+/// draws with (frames are shared with it); on Linux, the renderer's memory
+/// on NVIDIA's card where it decodes there; elsewhere, wherever the decoder
 /// puts them.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Gpu {
     #[cfg(windows)]
     luid: u64,
+    #[cfg(target_os = "linux")]
+    card: Option<Arc<capture::decode::Card>>,
 }
 
 impl Gpu {
@@ -149,7 +162,7 @@ impl Gpu {
 
     #[cfg(target_os = "linux")]
     fn find() -> Option<Self> {
-        Some(Self {})
+        Some(Self { card: crate::gpu_frames::card() })
     }
 }
 
@@ -160,11 +173,18 @@ struct Source {
 
 impl Source {
     /// Open `path`, frames numbered at `fps`. `bytes`: the memory for its
-    /// frames, where a decoder sets that aside as it opens (Windows).
+    /// frames, where a decoder sets that aside as it opens (Windows; Linux
+    /// on NVIDIA's card, its pool of buffers there).
     /// Linux: on one thread (each decoder has a core).
     #[cfg(target_os = "linux")]
-    fn open(path: &Path, fps: f64, _: &Gpu, _: u64) -> anyhow::Result<Self> {
-        let mut dec = Decoder::open_threads(path, Output::Screen, 1)?;
+    fn open(path: &Path, fps: f64, gpu: &Gpu, bytes: u64) -> anyhow::Result<Self> {
+        let on_card = gpu.card.as_ref().and_then(|card| {
+            Decoder::open_card_pooled(path, card, bytes).inspect_err(|e| eprintln!("scrubbing: decoding on the CPU ({e:#})")).ok()
+        });
+        let mut dec = match on_card {
+            Some(d) => d,
+            None => Decoder::open_threads(path, Output::Screen, 1)?,
+        };
         dec.set_fps(fps);
         Ok(Self { dec })
     }
@@ -395,7 +415,9 @@ impl Shared {
         for p in pics {
             if spare.len() >= SPARE {
                 extra.push(p);
-            } else if let Some(buf) = p.gpu.and_then(|s| Arc::try_unwrap(s.nv12).ok()) {
+            } else if let Some(capture::decode::Nv12::Memory(nv12)) = p.gpu.map(|s| s.nv12)
+                && let Ok(buf) = Arc::try_unwrap(nv12)
+            {
                 spare.push(buf);
             }
         }
@@ -837,7 +859,8 @@ impl Engine {
     /// none if the renderer can't draw decoded frames where they are.
     pub fn open(ctx: &egui::Context, path: &Path, fps: f64, total: u64) -> Option<Self> {
         let gpu = Gpu::find()?;
-        let n = decoders();
+        let n = decoders(&gpu);
+        let budget = budget(&gpu);
         let shared = Arc::new(Shared {
             inner: Mutex::new(Inner {
                 keys: Vec::new(),
@@ -869,7 +892,7 @@ impl Engine {
             ctx: ctx.clone(),
             fps,
             total,
-            budget: budget(&gpu),
+            budget,
         });
         for w in 0..n {
             let (shared, path) = (shared.clone(), path.to_path_buf());
@@ -947,6 +970,12 @@ impl Engine {
     /// may have been skipped.)
     pub fn offer(&self, pic: Picture) {
         if !KEEPS_PLAYBACK {
+            return;
+        }
+        // Linux, decoded on the card: in a buffer of playback's own few
+        // dozen, which it would run short of (as on Windows).
+        #[cfg(target_os = "linux")]
+        if pic.gpu.as_ref().is_some_and(|g| matches!(g.nv12, capture::decode::Nv12::Card(_))) {
             return;
         }
         let mut s = self.shared.inner.lock().unwrap();
@@ -1254,7 +1283,11 @@ fn upload_work(shared: Arc<UpShared>, engine: Arc<Shared>) {
         };
         match job {
             Some((k, p)) => {
-                let written = p.gpu.as_ref().is_some_and(|g| shared.ring.fill(k, &g.nv12));
+                let written = match p.gpu.as_ref().map(|g| &g.nv12) {
+                    Some(capture::decode::Nv12::Memory(nv12)) => shared.ring.fill(k, nv12),
+                    Some(capture::decode::Nv12::Card(f)) => shared.ring.fill_card(k, f.clone()),
+                    None => false,
+                };
                 let mut s = shared.inner.lock().unwrap();
                 if written {
                     // Ready once the UI has had it copied in (`Uploader::flush`).

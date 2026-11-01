@@ -829,7 +829,14 @@ fn open_decoder(path: &Path) -> anyhow::Result<Decoder> {
     #[cfg(target_os = "linux")]
     {
         anyhow::ensure!(crate::gpu_frames::can_upload(), "the renderer can't draw decoded frames");
-        Decoder::open(path, capture::decode::Output::Screen)
+        // On NVIDIA's card where it can: a tenth of the CPU.
+        let on_card = crate::gpu_frames::card().and_then(|card| {
+            Decoder::open_card(path, &card).inspect_err(|e| eprintln!("video: this clip is decoded on the CPU ({e:#})")).ok()
+        });
+        match on_card {
+            Some(d) => Ok(d),
+            None => Decoder::open(path, capture::decode::Output::Screen),
+        }
     }
 }
 

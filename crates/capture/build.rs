@@ -4,7 +4,8 @@
 //! else pkg-config's, else the system's. Without them it's built to say so,
 //! and playback uses ffmpeg processes instead.
 //!
-//! And the NVENC shim for recording (`src/linux/nvenc.c`), against NVIDIA's
+//! And the NVENC shim for recording (`src/linux/nvenc.c`) and the CUDA one
+//! for decoding on NVIDIA's card (`src/linux/cuda.c`), against NVIDIA's
 //! headers in `src/linux/ffnvcodec/`: nothing to install.
 
 use std::path::{Path, PathBuf};
@@ -14,8 +15,10 @@ fn main() {
         return;
     }
     println!("cargo:rerun-if-changed=src/linux/nvenc.c");
+    println!("cargo:rerun-if-changed=src/linux/cuda.c");
     println!("cargo:rerun-if-changed=src/linux/ffnvcodec");
     cc::Build::new().file("src/linux/nvenc.c").compile("hcnvenc");
+    cc::Build::new().file("src/linux/cuda.c").compile("hccuda");
 
     println!("cargo:rerun-if-changed=src/linux/avdec.c");
     println!("cargo:rerun-if-env-changed=HASTECLIP_FFMPEG_INCLUDE");
