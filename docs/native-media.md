@@ -5,12 +5,13 @@ natively, what the bundled ffmpeg did, wherever that's faster. Performance
 is the reason; dropping the bundled ffmpeg (most of the Linux download) is a
 goal once nothing needs it, not a reason on its own.
 
-Linux is done and measured. macOS and Windows already decoded playback on
-the GPU in the app (VideoToolbox; D3D11) and recorded with their own
-encoders, so most of Linux's gains they had. What they don't have yet:
+Linux is done and measured. macOS's exports are made in the app too, on
+`mac-native-media` (off this branch, not merged), measured below. Windows
+already decoded playback on the GPU in the app (D3D11) and recorded with its
+own encoders, so most of Linux's gains it had; what it doesn't have yet is
 exports made in the app (ffmpeg still makes the picture there), and the
-shared changes on this branch haven't run on them. This note is what's known
-so far; how to do it there is open.
+shared changes on this branch haven't run on it. This note is what's known
+so far.
 
 ## The bar: what Linux gained
 
@@ -30,6 +31,32 @@ clips. CPU in % of one core.
 
 The last two are shared code and run on every platform; the rest is Linux's.
 
+## What macOS gained
+
+Measured on a MacBook Pro with an M4 Pro (14 cores), 1440p clips made by ffmpeg
+(`testsrc2`), release builds, against the ffmpeg the app ships (9.0.2).
+CPU in % of one core.
+
+| | ffmpeg | Now |
+|---|---|---|
+| Export: 23.75 s cut from 1440p60, saved at 720p | 3.5 s | 3.6 s |
+| Export: a minute of 1440p60 saved at 1080p | 16.6 s, 197% CPU | 16.9 s, 42% |
+| Export: a minute made to fit Discord (10 MB) | 3.9 s, 606% | 3.9 s, 66% |
+| Export: 14 s of 540 fps blended to 60 | 14.8 s, 980% | 6.6 s, 53% |
+| Export: 10 s of 540 fps blended to 60, soft | 15.0 s | 4.8 s |
+| Reading a clip's length, size, tracks | ffprobe: 17–35 ms | 0.03–0.2 ms |
+| A clip's thumbnail | 40 ms | 10 ms (the first of a run, 80) |
+
+On the Mac ffmpeg already encoded on the media engine (`h264_videotoolbox`),
+and that encoder is the limit: 440 to 500 megapixels a second here (136 fps
+at 1440p, 236 at 1080p, 476 at 720p), however it's set (real time or not,
+speed over quality, keyframes) and however many sessions share it (the M4
+Pro has one encode engine). So an export that only scales, crops or drops
+frames takes as long as ffmpeg's, within 3%, with a fifth to a tenth of the
+CPU; blending, which ffmpeg did on the CPU, takes a third to a half of the
+time. At the same bitrate the picture's a little better (35.5 dB against
+35.2 at 4 Mbit/s): ffmpeg's encoder put a keyframe every 12 frames.
+
 ## What has to hold, however it's done
 
 - **Exports are ffmpeg's, frame for frame.** The same source frame in each
@@ -47,20 +74,20 @@ The last two are shared code and run on every platform; the rest is Linux's.
 
 ## Where things are
 
-- Linux's export: `crates/capture/src/linux/export.rs`, reached through
-  `capture::export::render_video` (which returns `Ok(false)` elsewhere, so
-  `media` has ffmpeg make the picture). The sound is added by `media`
-  (`mux_audio`), on every platform.
-- Which source frames make up an export (`Timeline`, in the Linux export)
-  has nothing Linux in it: worth sharing rather than copying.
+- Linux's export: `crates/capture/src/linux/export.rs`; macOS's:
+  `crates/capture/src/mac/export.rs` (VideoToolbox decoding and encoding,
+  Metal scaling, the recording's blending, our MP4 writer). Both reached
+  through `capture::export::render_video` (which returns `Ok(false)` on
+  Windows, so `media` has ffmpeg make the picture). The sound is added by
+  `media` (`mux_audio`), on every platform.
+- Shared, in `crates/capture/src/export.rs`: which source frames make up an
+  export (`Timeline`) and the Lanczos weights exports scale by (`lanczos`).
 - Linux's decoding on the card and its check: `crates/capture/src/linux/decode.rs`
   (and `dmabuf.rs`); its encoder check: `linux/vkenc.rs` (`check`).
-- What macOS has that may help: `capture::mac::decode` (VideoToolbox),
-  `mac::gpu` (the Metal compositor), `mac::blend`, the recording's
-  VideoToolbox encoder (`sck.rs`), `avwriter.rs`. Windows: `capture::win::decode`
-  and `direct` (D3D11 decoding), `win::d3d` (the video processor),
-  `win::h264` (Media Foundation's encoders), the blend pacer in `win/mod.rs`,
-  and the MP4 writer Linux uses too (`mp4file`).
+- What Windows has that may help: `capture::win::decode` and `direct` (D3D11
+  decoding), `win::d3d` (the video processor), `win::h264` (Media
+  Foundation's encoders), the blend pacer in `win/mod.rs`, and the MP4 writer
+  Linux uses too (`mp4file`).
 
 ## Checking it
 
@@ -76,6 +103,14 @@ export.mp4` says which frames an export kept).
 | `media` `export_times` | Time and CPU of exports (same clips) |
 | `media` `cut_out_of_the_middle`, `probing_mp4_matches_ffprobe` | Cuts, muted tracks; the in-app probe against ffprobe |
 | `capture` `card_frames_match_the_cpus` and the other `card_` tests | Linux: decoding on the card is the CPU's, byte for byte |
+| `capture` `frames_shown_are_ffmpegs`, `looks_are_ffmpegs`, `a_join_at_a_frames_middle` | Which source frames an export shows: ffmpeg's, as read from its exports |
+| `capture` `scaled_as_linux_scales`, `frames_not_waited_for_are_each_their_own` | macOS: Metal's scaling is Linux's, sample for sample |
+
+On macOS, compare with the ffmpeg the app ships: Homebrew's has no `zscale`,
+so its blends mix pixel values, not light. A release build leaves it in
+`target/release-package/dmg/HasteClip.app/Contents/MacOS`; put that first on
+`PATH`. And time release builds: in a debug build VideoToolbox's first
+decoder takes ~0.6 s to start (60 ms in release, 3 ms after).
 
 Switches for comparing paths: `HASTECLIP_EXPORT_FFMPEG=1` (exports by
 ffmpeg), `HASTECLIP_ENCODER`, `HASTECLIP_DECODE`, `HASTECLIP_CPU_DECODE=1`,
@@ -105,14 +140,35 @@ ffmpeg), `HASTECLIP_ENCODER`, `HASTECLIP_DECODE`, `HASTECLIP_CPU_DECODE=1`,
   the checks above catch that kind of thing.
 - Clips at fractional rates (59.94) are still exported by ffmpeg.
 
+## Lessons from macOS
+
+- ffmpeg's `fps` filter rounds each source frame's time to the nearest new
+  frame's and keeps the last of each: a new frame shows the last source
+  frame to start before its middle, not the one at its start. The two agree
+  only at half the rate (60 to 30), which the checks had used; 144 to 60,
+  120 to 30 and 540 to 60 showed other frames until the shared `Timeline`
+  took the middle. That changed Linux's export too, which hasn't run since.
+- A GPU waited on frame by frame sits idle: each frame took 1.5–2 ms for a
+  fraction of that in work. The frames go in without waiting, and the
+  encoder takes each a few behind (`AHEAD`), once it's made.
+- ffmpeg's soft blend gets its very last frame wrong: the looks past the
+  clip's end should see its last frame (as `blend_graph` says), but `mix`
+  holds each branch's frame from a whole frame before. The app does as the
+  comment says, so that one frame differs.
+- The media engine decodes and encodes: decoding there may cost the
+  encoder a little (exports only scaled were up to 3% slower than ffmpeg's,
+  which decodes on the CPU; its first decoder of a run takes 60 ms too).
+
 ## Working on macOS and Windows at once
 
 One branch each, off `linux-native-nvenc`, merged back when done. Most of the
 work is in each platform's own modules; the places both may want to change
 are the shared export entry (`crates/capture/src/export.rs`), the `media`
 export, and this note: keep changes there small and in their own commits,
-and settle who moves shared code (like `Timeline`) before both do. Nothing
-goes into main or out as a release until the maintainer says so.
+and settle who moves shared code before both do. `Timeline` and `lanczos`
+were moved there on `mac-native-media`: Windows starts from that, or takes
+those changes. Nothing goes into main or out as a release until the
+maintainer says so.
 
 ## Not tried yet
 
@@ -122,3 +178,10 @@ goes into main or out as a release until the maintainer says so.
 - Sound decoded in the app (waveforms and playback still start ffmpeg once a
   track: `media::pcm`), and other apps' videos (MKV, WebM, HEVC, AV1). Shared
   work, for whichever machine gets to it.
+- Linux since `Timeline` and `lanczos` moved and `Timeline` took ffmpeg's
+  frames: not built or run there yet (`card_exports_match_ffmpegs`, and
+  `frame-numbers.py` on a 144 fps export at 60).
+- On macOS, BT.601 clips and anything not H.264 in an MP4 are still made by
+  ffmpeg. The thumbnail check (`first_frame_is_ffmpegs`) is 2.27 off ffmpeg's
+  there against a bar of 2.0: VideoToolbox interpolates the colours, ffmpeg's
+  default scaling doesn't (against its `full_chroma_int+accurate_rnd`, 1.44).
