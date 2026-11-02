@@ -307,12 +307,12 @@ impl App {
                 // Original: each clip as it is, for several; for one, what it is.
                 let original = |what: String| if many { Choice::new("Original").note("each clip's own") } else { Choice::new("Original").shown(format!("Original ({what})")).note(what) };
                 row(ui, "Resolution, at most", &mut |ui| {
-                    if let Some(h) = export_ui::height_choice(ui, "free_up_height", s.height, top_h, s.height.unwrap_or(top_h), original(format!("{top_h}p")), "any height") {
+                    if let Some(h) = export_ui::height_choice(ui, "free_up_height", s.height, top_h, s.height.unwrap_or(top_h), (None, original(format!("{top_h}p"))), "any height") {
                         s.height = h;
                     }
                 });
                 row(ui, "Frame rate, at most", &mut |ui| {
-                    if let Some(f) = export_ui::fps_choice(ui, "free_up_fps", s.fps, top_fps, s.fps.unwrap_or(top_fps), original(format!("{top_fps} fps")), "any frame rate") {
+                    if let Some(f) = export_ui::fps_choice(ui, "free_up_fps", s.fps, top_fps, s.fps.unwrap_or(top_fps), (None, original(format!("{top_fps} fps"))), "any frame rate") {
                         s.fps = f;
                     }
                 });

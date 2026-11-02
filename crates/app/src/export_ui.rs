@@ -67,6 +67,80 @@ pub fn summary(info: &ClipInfo, edit: &Edit) -> String {
 /// set when the crop is to be chosen on the picture (the crop tool).
 pub fn ui(ui: &mut egui::Ui, info: &ClipInfo, edit: &mut Edit, crop_on_picture: &mut bool) -> bool {
     use crate::theme::{self, W};
+    let pal = theme::pal(ui);
+    let before = edit.output;
+    ui.set_width(340.0);
+    ui.label(theme::text("Export", 14.5, W::Semibold).color(pal.text));
+    ui.add_space(2.0);
+    ui.label(theme::text("How the saved clip is made. Smaller files send and upload faster.", 12.5, W::Regular).color(pal.text3));
+    ui.add_space(10.0);
+    rows(ui, info, edit, Form { id: "export", crop: Some(crop_on_picture), more: true, size_hint: "The most the saved clip can take", cap_mb: None, size_note: None });
+
+    // What it comes to.
+    ui.add_space(8.0);
+    let (r, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
+    ui.painter().hline(r.x_range(), r.center().y, egui::Stroke::new(1.0, pal.line));
+    ui.add_space(10.0);
+    let o = edit.output;
+    ui.horizontal(|ui| {
+        match o.estimate_bytes(info, edit) {
+            Some(b) => {
+                ui.label(theme::text(format!("About {}", human_bytes(b)), 13.0, W::Semibold).color(pal.text));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(theme::text(picture_words(info, edit), 13.0, W::Regular).color(pal.text3));
+                });
+            }
+            None => {
+                ui.label(theme::text("Size unknown", 13.0, W::Regular).color(pal.text3));
+            }
+        }
+    });
+    if o.changes_video(info) {
+        ui.add_space(4.0);
+        ui_kit::hint(ui, "Every frame is encoded again, so saving takes longer.");
+    }
+    if o != Output::default() {
+        ui.add_space(6.0);
+        if ui_kit::Btn::ghost("Reset to original").small().show(ui).clicked() {
+            edit.output = Output::default();
+        }
+    }
+    edit.output != before
+}
+
+/// What an edit comes out as: "1920×1080 · 60 fps · 15 Mbps".
+pub(crate) fn picture_words(info: &ClipInfo, edit: &Edit) -> String {
+    let o = edit.output;
+    let (w, h) = o.size(info);
+    let kbps = o.video_kbps_for(info, edit).map_or(String::new(), |k| format!(" · {}", mbps(k)));
+    format!("{w}×{h} · {:.0} fps{kbps}", o.frame_rate(info))
+}
+
+/// Which of the settings a form shows: the editor's Export shows them all,
+/// the Share with a link dialog what an upload can change.
+pub(crate) struct Form<'a> {
+    /// Its fields' ids begin with this: each form keeps its own (a number
+    /// of your own typed in one isn't another's).
+    pub id: &'a str,
+    /// The crop, and where choosing it on the picture is asked for (the
+    /// editor's crop tool). `None`: no crop.
+    pub crop: Option<&'a mut bool>,
+    /// Frame blending and the sound tracks too.
+    pub more: bool,
+    /// What a size to fit under is, on its hover.
+    pub size_hint: &'a str,
+    /// The most it can take, in MB: then it always fits a size, up to
+    /// this (an upload), and there's no Aim for. `None`: any.
+    pub cap_mb: Option<u32>,
+    /// A common size to fit under that's worth a note in its menu, and the
+    /// note.
+    pub size_note: Option<(u32, &'a str)>,
+}
+
+/// The settings' rows, each its name on the left and its control on the
+/// right: what `edit`'s output is made as.
+pub(crate) fn rows(ui: &mut egui::Ui, info: &ClipInfo, edit: &mut Edit, form: Form) {
+    use crate::theme::{self, W};
     use crate::ui_kit::Item;
     let pal = theme::pal(ui);
     let before = edit.output;
@@ -74,12 +148,11 @@ pub fn ui(ui: &mut egui::Ui, info: &ClipInfo, edit: &mut Edit, crop_on_picture: 
     let mut dims = edit.clone();
     let tracks = edit.tracks.len();
     let o = &mut edit.output;
-    ui.set_width(340.0);
-    ui.label(theme::text("Export", 14.5, W::Semibold).color(pal.text));
-    ui.add_space(2.0);
-    ui.label(theme::text("How the saved clip is made. Type any value, or pick one under ∨.", 12.5, W::Regular).color(pal.text3));
-    ui.add_space(10.0);
-    // A row: its name on the left, its control on the right.
+    // Capped: always a size, and never more than the cap.
+    if let Some(cap) = form.cap_mb {
+        o.max_mb = Some(o.max_mb.map_or(cap, |mb| mb.min(cap)));
+    }
+    let id = |what: &str| format!("{}_{what}", form.id);
     let row = |ui: &mut egui::Ui, label: &str, add: &mut dyn FnMut(&mut egui::Ui)| {
         ui.horizontal(|ui| {
             ui.set_min_height(36.0);
@@ -88,35 +161,37 @@ pub fn ui(ui: &mut egui::Ui, info: &ClipInfo, edit: &mut Edit, crop_on_picture: 
         });
     };
 
-    row(ui, "Crop", &mut |ui| {
-        let crop = o.crop.and_then(|c| c.within(info.width, info.height));
-        let shown = match crop {
-            None => "None".to_owned(),
-            Some(c) => match common_ratio(c.w, c.h) {
-                Some(i) => format!("{}:{} ({}×{})", RATIOS[i].0, RATIOS[i].1, c.w, c.h),
-                None => format!("{}×{}", c.w, c.h),
-            },
-        };
-        let r = ui_kit::select(ui, &shown, FIELD_W);
-        ui_kit::menu_popup(&r, false, 240.0, |ui| {
-            if Item::new("None").check(crop.is_none()).tip("The whole picture").show(ui).clicked() {
-                o.crop = None;
-            }
-            // Each shape the biggest it can be, where the crop is (else in
-            // the middle); not one the picture already is.
-            let centre = crop.map_or((info.width as f64 / 2.0, info.height as f64 / 2.0), |c| c.centre());
-            for (i, &(w, h, note)) in RATIOS.iter().enumerate() {
-                let Some(c) = Crop::largest(info.width, info.height, w, h, centre).within(info.width, info.height) else { continue };
-                if Item::new(format!("{w}:{h}")).check(crop.and_then(|c| common_ratio(c.w, c.h)) == Some(i)).value(note).show(ui).clicked() {
-                    o.crop = Some(c);
+    if let Some(crop_on_picture) = form.crop {
+        row(ui, "Crop", &mut |ui| {
+            let crop = o.crop.and_then(|c| c.within(info.width, info.height));
+            let shown = match crop {
+                None => "None".to_owned(),
+                Some(c) => match common_ratio(c.w, c.h) {
+                    Some(i) => format!("{}:{} ({}×{})", RATIOS[i].0, RATIOS[i].1, c.w, c.h),
+                    None => format!("{}×{}", c.w, c.h),
+                },
+            };
+            let r = ui_kit::select(ui, &shown, FIELD_W);
+            ui_kit::menu_popup(&r, false, 240.0, |ui| {
+                if Item::new("None").check(crop.is_none()).tip("The whole picture").show(ui).clicked() {
+                    o.crop = None;
                 }
-            }
-            ui_kit::menu_sep(ui);
-            if Item::new("Adjust on the picture…").icon(egui_phosphor::regular::CROP).keys(Some(vec!["C".into()])).tip("Drag its corners and move it over the picture").show(ui).clicked() {
-                *crop_on_picture = true;
-            }
+                // Each shape the biggest it can be, where the crop is (else in
+                // the middle); not one the picture already is.
+                let centre = crop.map_or((info.width as f64 / 2.0, info.height as f64 / 2.0), |c| c.centre());
+                for (i, &(w, h, note)) in RATIOS.iter().enumerate() {
+                    let Some(c) = Crop::largest(info.width, info.height, w, h, centre).within(info.width, info.height) else { continue };
+                    if Item::new(format!("{w}:{h}")).check(crop.and_then(|c| common_ratio(c.w, c.h)) == Some(i)).value(note).show(ui).clicked() {
+                        o.crop = Some(c);
+                    }
+                }
+                ui_kit::menu_sep(ui);
+                if Item::new("Adjust on the picture…").icon(egui_phosphor::regular::CROP).keys(Some(vec!["C".into()])).tip("Drag its corners and move it over the picture").show(ui).clicked() {
+                    *crop_on_picture = true;
+                }
+            });
         });
-    });
+    }
 
     // The quality level chosen, if it's one: it follows the picture's size
     // and rate as they change (Balanced at 720p is less than at 1440p).
@@ -126,36 +201,30 @@ pub fn ui(ui: &mut egui::Ui, info: &ClipInfo, edit: &mut Edit, crop_on_picture: 
         o.video_kbps.and_then(|k| LEVELS.iter().position(|l| level_kbps(w, h, fps, l.1) == k))
     };
     let level = level_of(o);
-    // What a size to fit under picked, shown where it decides for you.
-    let auto = o.max_mb.map(|_| (o.size(info).1, o.frame_rate(info)));
+    // While a size decides, Auto picks the resolution and rate (each with
+    // the other as it's set), and Original keeps the clip's own.
+    let sized = o.max_mb.is_some();
     let ph = o.picture(info).1;
+    let src = info.fps.round() as u32;
+    let original = |what: String| Choice::new("Original").shown(format!("Original ({what})")).note(if sized { format!("{what}, as it is") } else { what });
+    let auto = |what: String, lower: bool| Choice::new("Auto").shown(format!("Auto ({what})")).note(if lower { format!("{what}, to fit the size") } else { what });
     row(ui, "Resolution", &mut |ui| {
-        // What it comes out at with none chosen: the picture's, or what a
-        // size to fit under picks.
-        let (first, at) = match auto {
-            Some((h, _)) if h < ph => (Choice::new("Auto").shown(format!("Auto ({h}p)")).note(format!("{h}p, to fit the size")), h),
-            Some(_) => (Choice::new("Auto").shown(format!("Auto ({ph}p)")).note(format!("{ph}p")), ph),
-            None => (Choice::new("Original").shown(format!("Original ({ph}p)")).note(format!("{ph}p")), ph),
-        };
-        if let Some(h) = height_choice(ui, "export_height", o.height, ph, at, first, "any height") {
+        let auto_h = Output { height: None, ..*o }.size(info).1;
+        let firsts = (sized.then(|| auto(format!("{auto_h}p"), auto_h < ph)), original(format!("{ph}p")));
+        if let Some(h) = height_choice(ui, &id("height"), o.height, ph, o.size(info).1, firsts, "any height") {
             o.height = h;
         }
     });
-
-    let src = info.fps.round() as u32;
     row(ui, "Frame rate", &mut |ui| {
-        let (first, at) = match auto {
-            Some((_, f)) if f < info.fps - 0.5 => (Choice::new("Auto").shown(format!("Auto ({f:.0} fps)")).note(format!("{f:.0} fps, to fit the size")), f.round() as u32),
-            Some(_) => (Choice::new("Auto").shown(format!("Auto ({src} fps)")).note(format!("{src} fps")), src),
-            None => (Choice::new("Original").shown(format!("Original ({src} fps)")).note(format!("{src} fps")), src),
-        };
-        if let Some(f) = fps_choice(ui, "export_fps", o.fps, src, at, first, "any frame rate") {
+        let auto_f = Output { fps: None, ..*o }.frame_rate(info).round() as u32;
+        let firsts = (sized.then(|| auto(format!("{auto_f} fps"), auto_f < src)), original(format!("{src} fps")));
+        if let Some(f) = fps_choice(ui, &id("fps"), o.fps, src, o.frame_rate(info).round() as u32, firsts, "any frame rate") {
             o.fps = f;
         }
     });
 
-    let out = auto.map_or(o.fps.filter(|&f| (f as f64) < info.fps - 0.5), |(_, f)| Some(f.round() as u32).filter(|&f| (f as f64) < info.fps - 0.5).or(o.fps)).unwrap_or(src);
-    let rates = if out < src { media::blend_rates(out, info.fps) } else { Vec::new() };
+    let out = o.frame_rate(info).round() as u32;
+    let rates = if out < src && form.more { media::blend_rates(out, info.fps) } else { Vec::new() };
     if !rates.is_empty() {
         row(ui, "Frame blending", &mut |ui| {
             let shown = match o.blend_fps.filter(|b| rates.contains(b)) {
@@ -179,7 +248,7 @@ pub fn ui(ui: &mut egui::Ui, info: &ClipInfo, edit: &mut Edit, crop_on_picture: 
                 use crate::settings_ui::{BLEND_EVEN_TIP, BLEND_SOFT_TIP};
                 let opts = [ui_kit::Seg { icon: None, label: "Even", tip: Some(BLEND_EVEN_TIP) }, ui_kit::Seg { icon: None, label: "Soft", tip: Some(BLEND_SOFT_TIP) }];
                 let chosen = usize::from(o.blend_shape == BlendShape::Soft);
-                if let Some(i) = ui_kit::segmented_opts(ui, "export_blend_shape", &opts, chosen, None, true) {
+                if let Some(i) = ui_kit::segmented_opts(ui, id("blend_shape"), &opts, chosen, None, true) {
                     o.blend_shape = if i == 0 { BlendShape::Even } else { BlendShape::Soft };
                 }
             });
@@ -193,38 +262,44 @@ pub fn ui(ui: &mut egui::Ui, info: &ClipInfo, edit: &mut Edit, crop_on_picture: 
 
     // Either the quality decides how big it comes out, or a size does (and
     // then the quality, and the resolution and rate left on Auto, follow).
-    row(ui, "Aim for", &mut |ui| {
-        let opts = [
-            ui_kit::Seg { icon: None, label: "Quality", tip: Some("Choose how good it looks: the size follows") },
-            ui_kit::Seg { icon: None, label: "File size", tip: Some("Choose the most it can take, to send or upload it where there's a limit: the quality follows") },
-        ];
-        if let Some(i) = ui_kit::segmented_opts(ui, "export_aim", &opts, usize::from(o.max_mb.is_some()), None, true) {
-            o.max_mb = if i == 1 {
-                // A common size under what it would be now.
-                dims.output = *o;
-                let now = o.estimate_bytes(info, &dims).map(|b| (b / 1024 / 1024) as u32);
-                Some(match now {
-                    Some(mb) => SIZES.iter().rev().copied().find(|&s| s < mb).unwrap_or((mb / 2).max(1)),
-                    None => 25,
-                })
-            } else {
-                None
-            };
-        }
-    });
+    // Capped, it's always a size.
+    if form.cap_mb.is_none() {
+        row(ui, "Aim for", &mut |ui| {
+            let opts = [
+                ui_kit::Seg { icon: None, label: "Quality", tip: Some("Choose how good it looks: the size follows") },
+                ui_kit::Seg { icon: None, label: "File size", tip: Some("Choose the most it can take, for where there's a limit: the quality follows") },
+            ];
+            if let Some(i) = ui_kit::segmented_opts(ui, id("aim"), &opts, usize::from(o.max_mb.is_some()), None, true) {
+                o.max_mb = if i == 1 {
+                    // A common size under what it would come to now.
+                    dims.output = *o;
+                    let now = o.estimate_bytes(info, &dims).map(|b| (b / 1024 / 1024) as u32);
+                    Some(match now {
+                        Some(mb) => SIZES.iter().rev().copied().find(|&s| s < mb).unwrap_or((mb / 2).max(1)),
+                        None => 25,
+                    })
+                } else {
+                    None
+                };
+            }
+        });
+    }
+    let most = form.cap_mb.unwrap_or(MAX_MB);
     match o.max_mb {
         // Always a number: typed straight in, the common sizes under its ∨.
         Some(mb) => row(ui, "Fit under", &mut |ui| {
-            let field = ValueField {
-                id: egui::Id::new("export_size"),
-                value: mb as f64,
-                decimals: 0,
-                range: 1.0..=MAX_MB as f64,
-                unit: "MB",
-                width: FIELD_W,
-                hint: "The most the saved clip can take, in MB",
-                presets: SIZES.iter().map(|&s| Preset::new(format!("{s} MB"), s as f64)).collect(),
-            };
+            let presets = SIZES
+                .iter()
+                .filter(|&&s| s <= most)
+                .map(|&s| {
+                    let p = Preset::new(format!("{s} MB"), s as f64);
+                    match form.size_note {
+                        Some((at, note)) if at == s => p.note(note),
+                        _ => p,
+                    }
+                })
+                .collect();
+            let field = ValueField { id: egui::Id::new(id("size")), value: mb as f64, decimals: 0, range: 1.0..=most as f64, unit: "MB", width: FIELD_W, hint: form.size_hint, presets };
             if let Some(v) = field.show(ui) {
                 o.max_mb = Some(v as u32);
             }
@@ -237,89 +312,57 @@ pub fn ui(ui: &mut egui::Ui, info: &ClipInfo, edit: &mut Edit, crop_on_picture: 
             let own = o.video_kbps_for(info, &dims).or(info.video_kbps);
             // Only levels below what it has.
             let levels: Vec<(&str, u32)> = LEVELS.iter().map(|&(n, share, _)| (n, level_kbps(w, h, fps, share))).filter(|&(_, k)| own.is_none_or(|s| k < s)).collect();
-            if let Some(k) = quality_choice(ui, "export_kbps", o.video_kbps, own, &levels) {
+            if let Some(k) = quality_choice(ui, &id("kbps"), o.video_kbps, own, &levels) {
                 o.video_kbps = k;
             }
         }),
     }
 
-    if tracks > 1 {
+    if tracks > 1 && form.more {
         row(ui, "Sound", &mut |ui| {
             let opts = [
                 ui_kit::Seg { icon: None, label: "All tracks", tip: Some("The mix, then each source on its own track, to rebalance later") },
                 ui_kit::Seg { icon: None, label: "Mix only", tip: Some("Just what you hear: smaller, and some apps only play one track anyway") },
             ];
-            if let Some(i) = ui_kit::segmented_opts(ui, "export_audio", &opts, usize::from(o.mix_only), None, true) {
+            if let Some(i) = ui_kit::segmented_opts(ui, id("audio"), &opts, usize::from(o.mix_only), None, true) {
                 o.mix_only = i == 1;
             }
         });
     }
-
-    // What it comes to.
-    ui.add_space(8.0);
-    let (r, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
-    ui.painter().hline(r.x_range(), r.center().y, egui::Stroke::new(1.0, pal.line));
-    ui.add_space(10.0);
-    let o = edit.output;
-    ui.horizontal(|ui| {
-        match o.estimate_bytes(info, edit) {
-            Some(b) => {
-                ui.label(theme::text(format!("About {}", human_bytes(b)), 13.0, W::Semibold).color(pal.text));
-                let (w, h) = o.size(info);
-                let kbps = o.video_kbps_for(info, edit).map_or(String::new(), |k| format!(" · {}", mbps(k)));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(theme::text(format!("{w}×{h} · {:.0} fps{kbps}", o.frame_rate(info)), 13.0, W::Regular).color(pal.text3));
-                });
-            }
-            None => {
-                ui.label(theme::text("Size unknown", 13.0, W::Regular).color(pal.text3));
-            }
-        }
-    });
-    if o.changes_video(info) {
-        ui.add_space(4.0);
-        ui_kit::hint(ui, "Every frame is encoded again, so saving takes longer.");
-    }
-    if o != Output::default() {
-        ui.add_space(6.0);
-        if ui_kit::Btn::ghost("Reset to original").small().show(ui).clicked() {
-            edit.output = Output::default();
-        }
-    }
-    edit.output != before
 }
 
-/// How wide the fields are.
+// How wide the fields are.
 pub(crate) const FIELD_W: f32 = 156.0;
 /// The most a size to fit under can be, in MB.
 const MAX_MB: u32 = 9999;
 
-/// A resolution: `first` (Original, or Auto while a size to fit under
-/// picks it), a common height below the picture's `picture_h`, or any
-/// height of your own (Custom…, `custom` saying what it takes). `at`: the
-/// height it comes out at now, where the box starts. The new height when it
-/// changes (`None`: `first`).
-pub(crate) fn height_choice(ui: &mut egui::Ui, id: &str, now: Option<u32>, picture_h: u32, at: u32, first: Choice, custom: &str) -> Option<Option<u32>> {
+/// A resolution: Auto (`auto`: while a size to fit under picks it, saying
+/// what it picks), Original (the picture's `picture_h`: kept as it is, even
+/// when a size would lower it), a common height below it, or any height of
+/// your own (Custom…, `custom` saying what it takes). `at`: the height it
+/// comes out at now, where the box starts. The new height when it changes
+/// (`None`: Auto, or Original when there's no Auto).
+pub(crate) fn height_choice(ui: &mut egui::Ui, id: &str, now: Option<u32>, picture_h: u32, at: u32, (auto, original): (Option<Choice>, Choice), custom: &str) -> Option<Option<u32>> {
     let heights: Vec<u32> = HEIGHTS.into_iter().filter(|&h| h < picture_h).collect();
-    let now = now.filter(|&h| h < picture_h);
-    let mut choices = vec![first];
+    let has_auto = auto.is_some();
+    let mut choices: Vec<Choice> = auto.into_iter().chain([original]).collect();
     choices.extend(heights.iter().map(|h| Choice::new(format!("{h}p"))));
     let low = MIN_HEIGHT.min(picture_h);
     let field = ChoiceField { id, choices, custom: Some(Custom { unit: "p", range: low..=picture_h, note: custom }), width: FIELD_W };
-    let chosen = field.show(ui, choice_of(now, &heights), now.unwrap_or(at))?;
+    let chosen = field.show(ui, choice_of(now, &heights, picture_h, has_auto), now.filter(|&h| h < picture_h).unwrap_or(at))?;
     // Video sides are even.
-    Some(picked(chosen, &heights, picture_h, |h| h / 2 * 2))
+    Some(picked(chosen, &heights, picture_h, has_auto, |h| h / 2 * 2))
 }
 
-/// A frame rate, as [`height_choice`] a resolution: below the clip's `src`.
-pub(crate) fn fps_choice(ui: &mut egui::Ui, id: &str, now: Option<u32>, src: u32, at: u32, first: Choice, custom: &str) -> Option<Option<u32>> {
+/// A frame rate, as [`height_choice`] a resolution: the clip's own is `src`.
+pub(crate) fn fps_choice(ui: &mut egui::Ui, id: &str, now: Option<u32>, src: u32, at: u32, (auto, original): (Option<Choice>, Choice), custom: &str) -> Option<Option<u32>> {
     let rates: Vec<u32> = RATES.into_iter().filter(|&f| f < src).collect();
-    let now = now.filter(|&f| f < src);
-    let mut choices = vec![first];
+    let has_auto = auto.is_some();
+    let mut choices: Vec<Choice> = auto.into_iter().chain([original]).collect();
     choices.extend(rates.iter().map(|f| Choice::new(format!("{f} fps"))));
     let field = ChoiceField { id, choices, custom: Some(Custom { unit: "fps", range: 1..=src.max(1), note: custom }), width: FIELD_W };
-    let chosen = field.show(ui, choice_of(now, &rates), now.unwrap_or(at))?;
-    Some(picked(chosen, &rates, src, |f| f))
+    let chosen = field.show(ui, choice_of(now, &rates, src, has_auto), now.filter(|&f| f < src).unwrap_or(at))?;
+    Some(picked(chosen, &rates, src, has_auto, |f| f))
 }
 
 /// The quality: Original (the recording's, `own` kbps), one of `levels`
@@ -331,31 +374,36 @@ fn quality_choice(ui: &mut egui::Ui, id: &str, now: Option<u32>, own: Option<u32
     let kbps: Vec<u32> = levels.iter().map(|l| l.1).collect();
     let field = ChoiceField { id, choices, custom: Some(Custom { unit: "Mbps", range: 1..=300, note: "any bitrate" }), width: FIELD_W };
     let at = now.or(own).map_or(8, |k| ((k as f64 / 1000.0).round() as u32).max(1));
-    match field.show(ui, choice_of(now, &kbps), at)? {
+    match field.show(ui, choice_of(now, &kbps, u32::MAX, false), at)? {
         Chosen::Choice(0) => Some(None),
         Chosen::Choice(i) => Some(kbps.get(i - 1).copied()),
         Chosen::Number(m) => Some(Some(m * 1000)),
     }
 }
 
-/// Which of a [`ChoiceField`]'s choices `now` is: none is the first
-/// (Original, Auto), then each of `common`; `None` when it's a number of
-/// your own.
-fn choice_of(now: Option<u32>, common: &[u32]) -> Option<usize> {
+/// Which of a [`ChoiceField`]'s choices `now` is: none is the first (Auto,
+/// or Original with no Auto); the clip's own (`top` or more) is Original;
+/// then each of `common`. `None` when it's a number of your own.
+fn choice_of(now: Option<u32>, common: &[u32], top: u32, auto: bool) -> Option<usize> {
     match now {
         None => Some(0),
-        Some(v) => common.iter().position(|&c| c == v).map(|i| i + 1),
+        Some(v) if v >= top => Some(usize::from(auto)),
+        Some(v) => common.iter().position(|&c| c == v).map(|i| i + 1 + usize::from(auto)),
     }
 }
 
-/// What's chosen, as a value: the first choice is none; a number of your
-/// own at or above `top` is none too (the clip's own), else it's made to
-/// fit (`fit`).
-fn picked(chosen: Chosen, common: &[u32], top: u32, fit: impl Fn(u32) -> u32) -> Option<u32> {
+/// What's chosen, as a value: the first choice is none (Auto, or Original
+/// with no Auto). With Auto, Original (or a number of your own at `top` or
+/// more) is `top`: the clip's own, kept; with none, it's none. Else a
+/// common one, or a number of your own made to fit (`fit`).
+fn picked(chosen: Chosen, common: &[u32], top: u32, auto: bool, fit: impl Fn(u32) -> u32) -> Option<u32> {
+    let original = auto.then_some(top);
     match chosen {
         Chosen::Choice(0) => None,
-        Chosen::Choice(i) => common.get(i - 1).copied(),
-        Chosen::Number(v) => (v < top).then(|| fit(v)),
+        Chosen::Choice(1) if auto => original,
+        Chosen::Choice(i) => common.get(i - 1 - usize::from(auto)).copied(),
+        Chosen::Number(v) if v >= top => original,
+        Chosen::Number(v) => Some(fit(v)),
     }
 }
 
@@ -383,15 +431,24 @@ mod tests {
     #[test]
     fn choices_and_numbers() {
         let heights = [1080, 720, 480];
-        assert_eq!(choice_of(None, &heights), Some(0));
-        assert_eq!(choice_of(Some(720), &heights), Some(2));
-        assert_eq!(choice_of(Some(900), &heights), None, "a height of your own");
         let even = |h: u32| h / 2 * 2;
-        assert_eq!(picked(Chosen::Choice(0), &heights, 1440, even), None);
-        assert_eq!(picked(Chosen::Choice(1), &heights, 1440, even), Some(1080));
-        assert_eq!(picked(Chosen::Number(901), &heights, 1440, even), Some(900), "made even");
-        assert_eq!(picked(Chosen::Number(1440), &heights, 1440, even), None, "the picture's own is Original");
-        assert_eq!(picked(Chosen::Number(2000), &heights, 1440, even), None);
+        // No size: Original, then the common ones.
+        assert_eq!(choice_of(None, &heights, 1440, false), Some(0));
+        assert_eq!(choice_of(Some(1440), &heights, 1440, false), Some(0), "the picture's own is Original");
+        assert_eq!(choice_of(Some(720), &heights, 1440, false), Some(2));
+        assert_eq!(choice_of(Some(900), &heights, 1440, false), None, "a height of your own");
+        assert_eq!(picked(Chosen::Choice(0), &heights, 1440, false, even), None);
+        assert_eq!(picked(Chosen::Choice(1), &heights, 1440, false, even), Some(1080));
+        assert_eq!(picked(Chosen::Number(901), &heights, 1440, false, even), Some(900), "made even");
+        assert_eq!(picked(Chosen::Number(2000), &heights, 1440, false, even), None);
+        // A size decides: Auto first, then Original, which is kept.
+        assert_eq!(choice_of(None, &heights, 1440, true), Some(0), "Auto");
+        assert_eq!(choice_of(Some(1440), &heights, 1440, true), Some(1), "Original");
+        assert_eq!(choice_of(Some(720), &heights, 1440, true), Some(3));
+        assert_eq!(picked(Chosen::Choice(0), &heights, 1440, true, even), None, "Auto");
+        assert_eq!(picked(Chosen::Choice(1), &heights, 1440, true, even), Some(1440), "Original, kept");
+        assert_eq!(picked(Chosen::Choice(2), &heights, 1440, true, even), Some(1080));
+        assert_eq!(picked(Chosen::Number(2000), &heights, 1440, true, even), Some(1440), "the picture's own, kept");
     }
 
     #[test]

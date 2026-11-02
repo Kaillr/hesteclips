@@ -615,12 +615,21 @@ pub fn blend_rates(out: u32, src_fps: f64) -> Vec<u32> {
     (2..).map(|k| out * k).take_while(|&r| out > 0 && r as f64 <= src_fps + 0.5).collect()
 }
 
+/// The fastest frame rate a size to fit under picks by itself: what most
+/// screens show. Faster spends the size on frames few people see, taking it
+/// from the picture's detail; the clip's own faster rate can still be
+/// chosen, and is kept then.
+pub const AUTO_MAX_FPS: u32 = 60;
+
 impl Output {
     /// The settings that actually change something for `info` (a height or
     /// rate at or above the source's is the source's, a crop of the whole
     /// picture none).
     pub fn effective(&self, info: &ClipInfo) -> Self {
         let (_, ph) = self.picture(info);
+        // At or above the source's: the source's, which a size to fit
+        // under then doesn't lower either.
+        let keep = (self.height.is_some_and(|h| h >= ph), self.fps.is_some_and(|f| f as f64 >= info.fps - 0.5));
         let mut e = Self {
             height: self.height.filter(|&h| h < ph),
             fps: self.fps.filter(|&f| (f as f64) < info.fps - 0.5),
@@ -631,7 +640,7 @@ impl Output {
             blend_shape: BlendShape::Even,
             crop: self.crop.and_then(|c| c.within(info.width, info.height)),
         };
-        e.fit_picture(info);
+        e.fit_picture(info, keep);
         let out = e.fps.map_or(info.fps, f64::from).round() as u32;
         e.blend_fps = self.blend_fps.filter(|b| e.fps.is_some() && blend_rates(out, info.fps).contains(b));
         if e.blend_fps.is_some() {
@@ -640,13 +649,14 @@ impl Output {
         e
     }
 
-    /// With a size to fit under and the resolution or rate left as they
-    /// are: the biggest picture the bitrate can carry (about 0.05 bits per
-    /// pixel), as an encoder can't make a big picture small enough: a
-    /// minute of 3600×2338 asked for 10 MB came out at 14.
-    fn fit_picture(&mut self, info: &ClipInfo) {
+    /// With a size to fit under and the resolution or rate left to it
+    /// (neither chosen nor kept as the source's, `keep`): the biggest
+    /// picture the bitrate can carry (about 0.05 bits per pixel), at up to
+    /// [`AUTO_MAX_FPS`], as an encoder can't make a big picture small
+    /// enough: a minute of 3600×2338 asked for 10 MB came out at 14.
+    fn fit_picture(&mut self, info: &ClipInfo, (keep_height, keep_rate): (bool, bool)) {
         let Some(mb) = self.max_mb else { return };
-        if self.height.is_some() && self.fps.is_some() {
+        if (self.height.is_some() || keep_height) && (self.fps.is_some() || keep_rate) {
             return;
         }
         let audio = if self.mix_only { RENDER_AUDIO_KBPS } else { RENDER_AUDIO_KBPS * (info.source_tracks().len() as u32 + 1) };
@@ -655,21 +665,21 @@ impl Output {
         let (pw, ph) = self.picture(info);
         let aspect = pw as f64 / ph.max(1) as f64;
         let src_fps = info.fps.round() as u32;
-        // Best first: full rate down to 30, then smaller.
+        // Best first: full rate (up to 60) down to 30, then smaller.
         let heights = [2160, 1440, 1080, 720, 540, 480, 360];
-        let rates: Vec<u32> = [src_fps, 30].into_iter().filter(|&f| f <= src_fps).collect();
-        for h in heights.into_iter().filter(|&h| h <= ph) {
-            for &f in &rates {
-                let (h, f) = (self.height.unwrap_or(h), self.fps.unwrap_or(f));
-                if kbps / (h as f64 * h as f64 * aspect * f as f64) >= 0.05 {
-                    self.height = self.height.or(Some(h).filter(|&h| h < ph));
-                    self.fps = self.fps.or(Some(f).filter(|&f| (f as f64) < info.fps - 0.5));
-                    return;
-                }
-            }
+        let rates: Vec<u32> = [src_fps.min(AUTO_MAX_FPS), 30].into_iter().filter(|&f| f <= src_fps).collect();
+        // What's chosen or kept stays; the rest is picked.
+        let height = |h: u32| if keep_height { ph } else { self.height.unwrap_or(h) };
+        let rate = |f: u32| if keep_rate { src_fps } else { self.fps.unwrap_or(f) };
+        let fits = heights.into_iter().filter(|&h| h <= ph).find_map(|h| rates.iter().map(|&f| (height(h), rate(f))).find(|&(h, f)| kbps / (h as f64 * h as f64 * aspect * f as f64) >= 0.05));
+        // Nothing carries it: the smallest.
+        let (h, f) = fits.unwrap_or((height(360), rate(30)));
+        if !keep_height {
+            self.height = self.height.or(Some(h).filter(|&h| h < ph));
         }
-        self.height = self.height.or(Some(360).filter(|&h| h < ph));
-        self.fps = self.fps.or(Some(30).filter(|&f| (f as f64) < info.fps - 0.5));
+        if !keep_rate {
+            self.fps = self.fps.or(Some(f).filter(|&f| (f as f64) < info.fps - 0.5));
+        }
     }
 
     /// Whether the video must be re-encoded whole (else it can be copied).
@@ -716,19 +726,25 @@ impl Output {
     /// target's, else the one chosen, else the source's (`None` if unknown).
     pub fn video_kbps_for(&self, info: &ClipInfo, edit: &Edit) -> Option<u32> {
         let e = self.effective(info);
-        if let Some(mb) = e.max_mb {
-            return Some(fit_kbps(mb, edit.duration(), self.audio_tracks(edit) * RENDER_AUDIO_KBPS));
+        // What the picture needs: the bitrate chosen, else (smaller or fewer
+        // frames) the source's, scaled down with the pixels a second (to the
+        // ¾ power: smaller pictures need a bit more per pixel to look as
+        // good).
+        let needs = e.video_kbps.or_else(|| {
+            let src = info.video_kbps?;
+            let (w, h) = self.size(info);
+            let ratio = (w as f64 * h as f64 * self.frame_rate(info)) / (info.width as f64 * info.height as f64 * info.fps).max(1.0);
+            Some(((src as f64 * ratio.min(1.0).powf(0.75)) as u32).max(500))
+        });
+        // A size to fit under is the most it takes: a copy is never made
+        // bigger than its picture needs to fill it.
+        match e.max_mb {
+            Some(mb) => {
+                let fit = fit_kbps(mb, edit.duration(), self.audio_tracks(edit) * RENDER_AUDIO_KBPS);
+                Some(needs.map_or(fit, |n| n.min(fit)))
+            }
+            None => needs,
         }
-        if let Some(k) = e.video_kbps {
-            return Some(k);
-        }
-        // Smaller or fewer frames and no bitrate chosen: the source's, scaled
-        // down with the pixels a second (to the ¾ power: smaller pictures need
-        // a bit more per pixel to look as good).
-        let src = info.video_kbps?;
-        let (w, h) = self.size(info);
-        let ratio = (w as f64 * h as f64 * self.frame_rate(info)) / (info.width as f64 * info.height as f64 * info.fps).max(1.0);
-        Some(((src as f64 * ratio.min(1.0).powf(0.75)) as u32).max(500))
     }
 
     /// Roughly how big a render of `edit` comes out, in bytes.
@@ -1974,6 +1990,41 @@ mod tests {
         assert!(bytes < 10 * 1024 * 1024, "{bytes}");
         // ...in a picture that bitrate can carry.
         assert_eq!((fit.size(&info).1, fit.frame_rate(&info)), (720, 30.0));
+    }
+
+    /// A size to fit under picks at most 60 fps by itself; the clip's own
+    /// faster rate, or its own picture size, chosen, is kept, and the rest
+    /// gives way.
+    #[test]
+    fn a_size_picks_up_to_60_fps_unless_more_is_kept() {
+        let info = ClipInfo { duration: 30.0, fps: 144.0, width: 2560, height: 1440, video_kbps: Some(60_000), audio: Vec::new(), id: None, bt601: false };
+        let fit = Output { max_mb: Some(100), ..Default::default() };
+        assert_eq!(fit.frame_rate(&info), 60.0, "Auto: 60 at most");
+        let kept = Output { fps: Some(144), ..fit };
+        assert_eq!(kept.frame_rate(&info), 144.0, "the clip's own, kept");
+        assert!(kept.size(&info).1 <= fit.size(&info).1, "the picture gives way instead");
+        let tall = Output { height: Some(1440), ..fit };
+        assert_eq!(tall.size(&info).1, 1440, "its own size, kept");
+        assert!(tall.frame_rate(&info) <= 60.0);
+        // Without a size, the source's is just the source's.
+        assert!(!Output { fps: Some(144), height: Some(1440), ..Default::default() }.changes_video(&info));
+    }
+
+    /// A size to fit under is the most it takes, not what it's made to
+    /// take: a short clip made smaller under a big size comes out as big as
+    /// its picture needs, not as big as the size.
+    #[test]
+    fn a_size_is_a_ceiling() {
+        let info = ClipInfo { duration: 10.0, fps: 60.0, width: 1920, height: 1080, video_kbps: Some(15_000), audio: Vec::new(), id: None, bt601: false };
+        let edit = |output| Edit { start: 0.0, end: 10.0, cuts: Vec::new(), tracks: Vec::new(), output };
+        let o = Output { height: Some(720), max_mb: Some(100), ..Default::default() };
+        let k = o.video_kbps_for(&info, &edit(o)).unwrap();
+        assert!(k < 15_000, "a 720p copy needs less than the 1080p clip: {k}");
+        let bytes = o.estimate_bytes(&info, &edit(o)).unwrap();
+        assert!(bytes < 15 * 1024 * 1024, "nowhere near 100 MB: {bytes}");
+        // Tight, the size is what decides.
+        let tight = Output { max_mb: Some(5), ..o };
+        assert!(tight.video_kbps_for(&info, &edit(tight)).unwrap() < k);
     }
 
     #[test]
