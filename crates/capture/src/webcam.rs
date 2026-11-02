@@ -306,10 +306,39 @@ pub(crate) fn set_formats(device: &str, formats: Vec<Format>) {
 pub const HAS_SETTINGS: bool = cfg!(target_os = "windows");
 
 /// Whether the app shows a camera's controls itself ([`camera_controls`]):
-/// on Linux, where there's no settings window of the driver's to open.
-pub const HAS_CONTROLS: bool = cfg!(target_os = "linux");
+/// on Linux, where there's no settings window of the driver's to open, and
+/// on Windows (the driver's window is still there, for what only it has).
+pub const HAS_CONTROLS: bool = cfg!(any(target_os = "linux", target_os = "windows"));
 
-/// A setting a camera offers (Linux): its V4L2 control.
+/// Control ids, as V4L2 numbers them; Windows' own settings take the same
+/// ids, so a setting is the same one everywhere (each camera's are saved).
+pub mod cid {
+    pub const BRIGHTNESS: u32 = 0x980900;
+    pub const CONTRAST: u32 = 0x980901;
+    pub const SATURATION: u32 = 0x980902;
+    pub const HUE: u32 = 0x980903;
+    pub const AUTO_WHITE_BALANCE: u32 = 0x98090c;
+    pub const GAMMA: u32 = 0x980910;
+    pub const GAIN: u32 = 0x980913;
+    pub const POWER_LINE: u32 = 0x980918;
+    pub const WHITE_BALANCE: u32 = 0x98091a;
+    pub const SHARPNESS: u32 = 0x98091b;
+    pub const BACKLIGHT: u32 = 0x98091c;
+    pub const AUTO_EXPOSURE: u32 = 0x9a0901;
+    pub const EXPOSURE: u32 = 0x9a0902;
+    pub const EXPOSURE_DYNAMIC_FPS: u32 = 0x9a0903;
+    pub const PAN: u32 = 0x9a0908;
+    pub const TILT: u32 = 0x9a0909;
+    pub const FOCUS: u32 = 0x9a090a;
+    pub const AUTO_FOCUS: u32 = 0x9a090c;
+    pub const ZOOM: u32 = 0x9a090d;
+    pub const IRIS: u32 = 0x9a0911;
+    /// `V4L2_EXPOSURE_MANUAL`, among the automatic exposure menu's items.
+    pub const EXPOSURE_MANUAL: i64 = 1;
+}
+
+/// A setting a camera offers: a V4L2 control (Linux), or one of DirectShow's
+/// camera and picture settings (Windows), by [`cid`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct CameraControl {
     pub id: u32,
@@ -330,22 +359,27 @@ pub enum ControlKind {
     Menu(Vec<(i64, String)>),
 }
 
-/// The settings camera `device` offers, with their values now (Linux; none
-/// elsewhere). Reads the camera: call it off the UI thread, or seldom.
+/// The settings camera `device` offers, with their values now (Linux; on
+/// Windows, once the camera's open; none elsewhere). Reads the camera: call
+/// it off the UI thread, or seldom.
 pub fn camera_controls(device: &str) -> Vec<CameraControl> {
     #[cfg(target_os = "linux")]
     {
         crate::linux::camera_controls(device)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
+    {
+        crate::win::camera_controls(device)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
         let _ = device;
         Vec::new()
     }
 }
 
-/// The open camera's own picture, for showing it alone (its crop, and on
-/// Linux its settings): R, G, B, A rows.
+/// The open camera's own picture, for showing it alone (its crop, and its
+/// settings): R, G, B, A rows.
 pub struct CameraPreview {
     pub width: u32,
     pub height: u32,
@@ -389,21 +423,56 @@ pub fn remember_controls(device: &str, values: Vec<(u32, i64)>) {
     REMEMBERED.lock().unwrap().get_or_insert_with(Default::default).insert(device.to_owned(), values);
 }
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
 pub(crate) fn remembered_controls(device: &str) -> Vec<(u32, i64)> {
     REMEMBERED.lock().unwrap().as_ref().and_then(|m| m.get(device).cloned()).unwrap_or_default()
 }
 
-/// Set a camera setting; it applies at once, in every app (Linux).
+/// Put back the settings remembered for camera `device`, as it opens:
+/// switches and menus first (a manual exposure time is only taken once
+/// automatic exposure is off), then the rest.
+#[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
+pub(crate) fn apply_remembered(device: &str) {
+    let saved = remembered_controls(device);
+    if saved.is_empty() {
+        return;
+    }
+    let all = camera_controls(device);
+    let kind_first = |id: u32| all.iter().find(|c| c.id == id).is_some_and(|c| !matches!(c.kind, ControlKind::Int { .. }));
+    let (first, rest): (Vec<_>, Vec<_>) = saved.into_iter().partition(|(id, _)| kind_first(*id));
+    for (id, value) in first {
+        if let Err(e) = set_camera_control(device, id, value) {
+            eprintln!("camera setting {id:#x}: {e:#}");
+        }
+    }
+    // The rest, unless the switches just set leave them doing nothing (a
+    // white balance temperature while white balance is automatic): the camera
+    // refuses those.
+    let now = camera_controls(device);
+    for (id, value) in rest {
+        if now.iter().any(|c| c.id == id && c.inactive) {
+            continue;
+        }
+        if let Err(e) = set_camera_control(device, id, value) {
+            eprintln!("camera setting {id:#x}: {e:#}");
+        }
+    }
+}
+
+/// Set a camera setting; it applies at once, in every app (Linux, Windows).
 pub fn set_camera_control(device: &str, id: u32, value: i64) -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
     {
         crate::linux::set_camera_control(device, id, value)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
+    {
+        crate::win::set_camera_control(device, id, value)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
         let _ = (device, id, value);
-        anyhow::bail!("camera settings are the driver's own here")
+        anyhow::bail!("this camera's settings can't be changed here")
     }
 }
 

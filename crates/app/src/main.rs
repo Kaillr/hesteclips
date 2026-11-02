@@ -1486,8 +1486,10 @@ impl App {
         // Keep the webcam open whenever one is set up and on, previewed or
         // recorded or not: closing a camera can reset its own settings. Off,
         // it's closed (its light goes out), but while its crop's set (its
-        // picture's cropped on); a capture takes it up again.
-        let on = self.settings.webcam.as_ref().is_some_and(|w| w.enabled) || self.webcam_view.crop.is_some();
+        // picture's cropped on) or its Camera page is open (its picture, and
+        // on Windows its settings, are the open camera's); a capture takes
+        // it up again.
+        let on = self.settings.webcam.as_ref().is_some_and(|w| w.enabled) || self.webcam_view.crop.is_some() || self.camera_panel.is_some();
         let camera = self.webcam_source().filter(|_| on).map(|w| (w.device, w.format));
         if camera != self.kept_camera {
             // Its settings go back on as it opens.

@@ -515,22 +515,13 @@ impl App {
                 self.webcam_view.ask_fit();
             }
         }
-        // Its own settings: a page of them (Linux), else the driver's window.
-        if capture::webcam::HAS_SETTINGS || capture::webcam::HAS_CONTROLS {
+        // Its own settings: a page of them (Linux, Windows).
+        if capture::webcam::HAS_CONTROLS {
             crate::ui_kit::divider(ui, 0.0);
             row(ui, "Camera settings", &mut |ui| {
                 let tip = "The camera's own settings: exposure, focus, white balance. They apply right away, in every app.";
-                let open = if capture::webcam::HAS_CONTROLS {
-                    Btn::normal("Adjust").trail(icon::CARET_RIGHT).small().tip(tip).show(ui).clicked()
-                } else {
-                    Btn::normal("Open…").small().tip(tip).show(ui).clicked()
-                };
-                if open {
-                    if capture::webcam::HAS_CONTROLS {
-                        self.camera_panel = Some(CameraPanel::open(&cam.id));
-                    } else {
-                        capture::webcam::open_settings(&cam.id, &cam.name);
-                    }
+                if Btn::normal("Adjust").trail(icon::CARET_RIGHT).small().tip(tip).show(ui).clicked() {
+                    self.camera_panel = Some(CameraPanel::open(&cam.id));
                 }
             });
         }
@@ -758,7 +749,7 @@ mod tests {
 }
 
 // ---------------------------------------------------------------------------
-// Camera page (Linux), and the webcam's crop page
+// Camera page (Linux, Windows), and the webcam's crop page
 // ---------------------------------------------------------------------------
 
 /// The Camera page's state (or the crop page's): the camera's settings as
@@ -773,6 +764,9 @@ pub(crate) struct CameraPanel {
     new_pictures: u64,
     counted: Option<(std::time::Instant, u64)>,
     fps: Option<f32>,
+    /// Whether the camera was live when last looked: its settings are read
+    /// again as it opens (on Windows they're only there while it's open).
+    live: bool,
     /// Cropping on the picture: the whole of it shown, its edges dragged.
     cropping: bool,
     /// The crop's corner or edge (or all of it) being dragged, the crop as
@@ -792,34 +786,13 @@ impl CameraPanel {
     }
 
     fn picture_of(device: &str) -> Self {
-        Self { device: device.to_owned(), controls: Vec::new(), picture: None, seq: 0, new_pictures: 0, counted: None, fps: None, cropping: false, crop_drag: None }
+        let live = matches!(capture::webcam::status(), Status::Live { .. });
+        Self { device: device.to_owned(), controls: Vec::new(), picture: None, seq: 0, new_pictures: 0, counted: None, fps: None, live, cropping: false, crop_drag: None }
     }
 }
 
-/// V4L2's control ids, for the ones grouped and named here.
-mod v4l2 {
-    pub const BRIGHTNESS: u32 = 0x980900;
-    pub const CONTRAST: u32 = 0x980901;
-    pub const SATURATION: u32 = 0x980902;
-    pub const HUE: u32 = 0x980903;
-    pub const AUTO_WHITE_BALANCE: u32 = 0x98090c;
-    pub const GAMMA: u32 = 0x980910;
-    pub const GAIN: u32 = 0x980913;
-    pub const POWER_LINE: u32 = 0x980918;
-    pub const WHITE_BALANCE: u32 = 0x98091a;
-    pub const SHARPNESS: u32 = 0x98091b;
-    pub const BACKLIGHT: u32 = 0x98091c;
-    pub const AUTO_EXPOSURE: u32 = 0x9a0901;
-    pub const EXPOSURE: u32 = 0x9a0902;
-    pub const EXPOSURE_DYNAMIC_FPS: u32 = 0x9a0903;
-    pub const PAN: u32 = 0x9a0908;
-    pub const TILT: u32 = 0x9a0909;
-    pub const FOCUS: u32 = 0x9a090a;
-    pub const AUTO_FOCUS: u32 = 0x9a090c;
-    pub const ZOOM: u32 = 0x9a090d;
-    /// `V4L2_EXPOSURE_MANUAL`, among the automatic exposure menu's items.
-    pub const EXPOSURE_MANUAL: i64 = 1;
-}
+/// The control ids grouped and named here (V4L2's; Windows' take the same).
+use capture::webcam::cid;
 
 /// One row of the panel.
 #[derive(Debug, PartialEq)]
@@ -836,7 +809,7 @@ const OTHER: &str = "Other";
 /// people, each automatic mode with the setting it takes over, and the
 /// camera's own under Other.
 fn panel_groups(controls: &[CameraControl]) -> Vec<(&'static str, Vec<PanelRow<'_>>)> {
-    use v4l2::*;
+    use cid::*;
     let find = |id: u32| controls.iter().find(|c| c.id == id);
     let named = |id: u32, label: &str| find(id).map(|control| PanelRow::Control { label: label.to_owned(), control });
     let auto = |auto: u32, label: &'static str, manual: u32, manual_label: &'static str| {
@@ -892,7 +865,7 @@ fn control_widget(ui: &mut egui::Ui, c: &CameraControl, set: &mut Vec<(u32, i64)
         }
         ControlKind::Int { min, max, step } => {
             // Right to left: the value, then the slider.
-            let shown = if c.id == v4l2::WHITE_BALANCE { format!("{} K", c.value) } else { c.value.to_string() };
+            let shown = if c.id == cid::WHITE_BALANCE { format!("{} K", c.value) } else { c.value.to_string() };
             ui.add_sized([46.0, 20.0], egui::Label::new(theme::text(&shown, 12.5, W::Regular).color(pal.text3)));
             let span = (max - min).max(1) as f32;
             let mut v = (c.value - min) as f32 / span;
@@ -933,7 +906,7 @@ fn control_widget(ui: &mut egui::Ui, c: &CameraControl, set: &mut Vec<(u32, i64)
 fn auto_on(c: &CameraControl) -> bool {
     match c.kind {
         // Automatic exposure is a menu: anything but manual.
-        ControlKind::Menu(_) => c.value != v4l2::EXPOSURE_MANUAL,
+        ControlKind::Menu(_) => c.value != cid::EXPOSURE_MANUAL,
         _ => c.value != 0,
     }
 }
@@ -941,13 +914,13 @@ fn auto_on(c: &CameraControl) -> bool {
 fn auto_value(c: &CameraControl, on: bool) -> i64 {
     match &c.kind {
         ControlKind::Menu(items) if on => {
-            if c.default != v4l2::EXPOSURE_MANUAL {
+            if c.default != cid::EXPOSURE_MANUAL {
                 c.default
             } else {
-                items.iter().map(|(v, _)| *v).find(|v| *v != v4l2::EXPOSURE_MANUAL).unwrap_or(c.default)
+                items.iter().map(|(v, _)| *v).find(|v| *v != cid::EXPOSURE_MANUAL).unwrap_or(c.default)
             }
         }
-        ControlKind::Menu(_) => v4l2::EXPOSURE_MANUAL,
+        ControlKind::Menu(_) => cid::EXPOSURE_MANUAL,
         _ => i64::from(on),
     }
 }
@@ -989,6 +962,11 @@ impl App {
         // The frame rate the camera runs at: as picked, or Automatic's pick.
         let fps = current.or_else(|| self.camera_panel.as_ref().and_then(|p| capture::webcam::formats(&p.device).into_iter().max_by_key(|f| f.auto_rank()))).map(|f| f.fps());
         let Some(panel) = self.camera_panel.as_mut() else { return };
+        let live = matches!(capture::webcam::status(), Status::Live { .. });
+        if live && !panel.live {
+            panel.controls = capture::webcam::camera_controls(&panel.device);
+        }
+        panel.live = live;
         let mut set: Vec<(u32, i64)> = Vec::new();
         let mut reset = false;
         ui.add_space(4.0);
@@ -1290,7 +1268,7 @@ fn crop_numbers(ui: &mut egui::Ui, orient: Orientation, crop: [f32; 4], size: Op
             }
         });
     });
-    // Where the camera zooms itself (Linux's Camera page), that's sharper.
+    // Where the camera zooms itself (its Camera page), that's sharper.
     if capture::webcam::HAS_CONTROLS {
         ui.add_space(6.0);
         ui.add(egui::Label::new(theme::text("The camera's own Zoom, in Camera settings, crops inside the camera instead, from its sensor, which can be sharper.", 12.0, W::Regular).color(pal.text3)).wrap());
@@ -1402,20 +1380,29 @@ fn picture_side(ui: &mut egui::Ui, panel: &mut CameraPanel, name: &str, fps: Opt
         (capture::webcam::Status::Live { width, height }, None) => format!("{name} · {width}×{height}"),
         _ => name.to_owned(),
     };
-    ui.horizontal(|ui| {
-        ui.label(theme::text(&status, 13.0, W::Regular).color(pal.text2));
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if !panel.controls.is_empty() && crate::ui_kit::Btn::ghost("Reset to defaults").small().tip("Back to the camera's own defaults").show(ui).clicked() {
-                *reset = true;
-            }
-        });
-    });
+    // Which camera, on a line of its own: a long name wraps, not under the buttons.
+    ui.add(egui::Label::new(theme::text(&status, 13.0, W::Regular).color(pal.text2)).wrap());
     // Slower than its format: said, with what can cause it (the camera
     // doesn't say which).
     if let Some(why) = slowdown(panel.fps, fps) {
         ui.add(egui::Label::new(theme::text(why, 12.5, W::Regular).color(pal.warn)).wrap());
     }
     ui.add(egui::Label::new(theme::text("Changes apply right away, in every app, and are put back each time HasteClip opens this camera.", 12.0, W::Regular).color(pal.text3)).wrap());
+    // What's done to all of them, under what's said about them.
+    let resettable = !panel.controls.is_empty();
+    if resettable || capture::webcam::HAS_SETTINGS {
+        ui.add_space(8.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
+            if resettable && crate::ui_kit::Btn::normal("Reset to defaults").small().tip("Back to the camera's own defaults").show(ui).clicked() {
+                *reset = true;
+            }
+            // What only its driver has, in the driver's own window.
+            if capture::webcam::HAS_SETTINGS && crate::ui_kit::Btn::normal("Driver settings…").small().tip("The camera driver's own settings window, for anything not here").show(ui).clicked() {
+                capture::webcam::open_settings(&panel.device, name);
+            }
+        });
+    }
 }
 
 /// When the camera sends clearly fewer new pictures (`measured` a second)
@@ -1736,11 +1723,17 @@ fn controls_view(ui: &mut egui::Ui, panel: &CameraPanel, fps: Option<f32>, set: 
                         // The setting it takes over, while it's off.
                         if let Some((label, m)) = manual {
                             l.well(("camera_manual", auto.id), !on, |l| {
-                                if m.id == v4l2::EXPOSURE {
+                                if m.id == cid::EXPOSURE {
                                     let tip = fps.map(|fps| {
                                         let (half, whole) = exposure_guides(fps);
+                                        // A list of times (Windows has them in doublings), or a slider.
+                                        let lamps = if matches!(m.kind, ControlKind::Menu(_)) {
+                                            "Under lamps, pick the time where no bands roll through the picture, or set Flicker to your mains frequency."
+                                        } else {
+                                            "Under lamps, step it with − and + (or ← and →) to where no bands roll through the picture."
+                                        };
                                         format!(
-                                            "How long each picture takes in light. Film's rule of thumb is half a frame, a 180° shutter: {:.1} ms at {fps:.0} fps, for motion blur that looks natural. About a whole frame ({:.1} ms) or longer, a camera can't keep its frame rate; where exactly is the camera's own, as is how much light it wants (watch the pictures a second under the picture). Under lamps, step it with − and + (or ← and →) to where no bands roll through the picture.",
+                                            "How long each picture takes in light. Film's rule of thumb is half a frame, a 180° shutter: {:.1} ms at {fps:.0} fps, for motion blur that looks natural. About a whole frame ({:.1} ms) or longer, a camera can't keep its frame rate; where exactly is the camera's own, as is how much light it wants (watch the pictures a second under the picture). {lamps}",
                                             half as f64 / 10.0,
                                             whole as f64 / 10.0
                                         )
@@ -1824,7 +1817,7 @@ mod panel_tests {
 
     #[test]
     fn groups_a_webcams_controls() {
-        use v4l2::*;
+        use cid::*;
         let int = ControlKind::Int { min: 0, max: 255, step: 1 };
         let menu = |items: &[(i64, &str)]| ControlKind::Menu(items.iter().map(|(v, n)| (*v, n.to_string())).collect());
         let controls = vec![
@@ -1846,7 +1839,7 @@ mod panel_tests {
         // Aperture priority is automatic; turning it off picks manual, on picks the default.
         let ae = &controls[4];
         assert!(auto_on(ae));
-        assert_eq!(auto_value(ae, false), v4l2::EXPOSURE_MANUAL);
+        assert_eq!(auto_value(ae, false), cid::EXPOSURE_MANUAL);
         assert_eq!(auto_value(ae, true), 3);
     }
 }

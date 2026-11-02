@@ -207,7 +207,7 @@ impl Delivery {
         if !self.live {
             // Open: what was set for this camera before goes back on (it
             // forgets when it's unplugged).
-            apply_remembered(&feed.device);
+            crate::webcam::apply_remembered(&feed.device);
             set_status(Status::Live { width: w, height: h });
             self.live = true;
         }
@@ -918,36 +918,6 @@ pub(crate) fn controls(device: &str) -> Vec<crate::webcam::CameraControl> {
         });
     }
     out
-}
-
-/// Put back the settings remembered for camera `device`: switches and menus
-/// first (a manual exposure time is only taken once automatic exposure is
-/// off), then the rest.
-fn apply_remembered(device: &str) {
-    let saved = crate::webcam::remembered_controls(device);
-    if saved.is_empty() {
-        return;
-    }
-    let all = controls(device);
-    let kind_first = |id: u32| all.iter().find(|c| c.id == id).is_some_and(|c| !matches!(c.kind, crate::webcam::ControlKind::Int { .. }));
-    let (first, rest): (Vec<_>, Vec<_>) = saved.into_iter().partition(|(id, _)| kind_first(*id));
-    for (id, value) in first {
-        if let Err(e) = set_control(device, id, value) {
-            eprintln!("camera setting {id:#x}: {e:#}");
-        }
-    }
-    // The rest, unless the switches just set leave them doing nothing (a
-    // white balance temperature while white balance is automatic): the camera
-    // refuses those.
-    let now = controls(device);
-    for (id, value) in rest {
-        if now.iter().any(|c| c.id == id && c.inactive) {
-            continue;
-        }
-        if let Err(e) = set_control(device, id, value) {
-            eprintln!("camera setting {id:#x}: {e:#}");
-        }
-    }
 }
 
 /// The open camera's newest picture, shrunk to at most `max_width` wide, as

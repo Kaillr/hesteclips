@@ -853,9 +853,9 @@ pub struct RecordSettings {
     pub webcam: Option<WebcamCfg>,
     /// The screen as a source in the video: in front or behind, its box.
     pub screen: ScreenCfg,
-    /// Each camera's settings changed from its defaults (Linux: V4L2 control
-    /// id to value), by camera id: put back each time it's opened, as
-    /// cameras forget them when unplugged.
+    /// Each camera's settings changed from its defaults (control id, as
+    /// V4L2 numbers them, to value), by camera id: put back each time it's
+    /// opened, as cameras forget them when unplugged.
     pub camera_controls: std::collections::BTreeMap<String, std::collections::BTreeMap<u32, i64>>,
     /// The chosen display's id (`capture::Device::id`), so the choice stays
     /// with that display when others are plugged in or listed in another

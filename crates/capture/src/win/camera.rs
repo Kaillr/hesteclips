@@ -8,6 +8,11 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
+use windows::Win32::Media::DirectShow::{IAMCameraControl, IAMVideoProcAmp};
+use windows::Win32::Media::KernelStreaming::{
+    IKsControl, KSIDENTIFIER, KSIDENTIFIER_0_0, KSPROPERTY_DESCRIPTION, KSPROPERTY_MEMBERSHEADER, KSPROPERTY_TYPE_BASICSUPPORT, KSPROPERTY_TYPE_DEFAULTVALUES, KSPROPERTY_TYPE_GET, KSPROPERTY_TYPE_SET, KSPROPERTY_VIDEOPROCAMP_POWERLINE_FREQUENCY,
+    KSPROPERTY_VIDEOPROCAMP_S, PROPSETID_VIDCAP_VIDEOPROCAMP,
+};
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::core::Interface;
@@ -74,6 +79,8 @@ pub(crate) struct CameraFeed {
     pub device: String,
     pub format: Option<crate::webcam::Format>,
     frame: Mutex<Option<Arc<Frame>>>,
+    /// Its settings, while it's open.
+    settings: Mutex<Option<Arc<Settings>>>,
     stop: AtomicBool,
 }
 
@@ -110,7 +117,7 @@ pub fn keep_open(want: Option<(String, Option<crate::webcam::Format>)>) {
         set_status(Status::Off);
         return;
     };
-    let feed = Arc::new(CameraFeed { device, format, frame: Mutex::new(None), stop: AtomicBool::new(false) });
+    let feed = Arc::new(CameraFeed { device, format, frame: Mutex::new(None), settings: Mutex::new(None), stop: AtomicBool::new(false) });
     *current = Some(feed.clone());
     thread::spawn(move || run(feed));
 }
@@ -148,7 +155,7 @@ fn run(feed: Arc<CameraFeed>) {
     let mut seq = 0u64;
     while !feed.stop.load(Ordering::Relaxed) {
         set_status(Status::Opening);
-        let (reader, width, height) = match open_reader(&feed.device, feed.format) {
+        let (reader, source, width, height) = match open_reader(&feed.device, feed.format) {
             Ok(r) => r,
             Err(e) => {
                 set_status(Status::Unavailable(format!("{e:#}")));
@@ -156,6 +163,11 @@ fn run(feed: Arc<CameraFeed>) {
                 continue;
             }
         };
+        // Its settings, and what was set for it before put back on (it
+        // forgets when it's unplugged).
+        *feed.settings.lock().unwrap() = Some(Arc::new(Settings { amp: source.cast().ok(), cam: source.cast().ok(), ks: source.cast().ok() }));
+        drop(source);
+        crate::webcam::apply_remembered(&feed.device);
         set_status(Status::Live { width, height });
         let mut rows = Vec::new();
         while !feed.stop.load(Ordering::Relaxed) {
@@ -180,6 +192,7 @@ fn run(feed: Arc<CameraFeed>) {
                 Err(e) => eprintln!("webcam frame: {e:#}"),
             }
         }
+        *feed.settings.lock().unwrap() = None;
         drop(reader);
         if !feed.stop.load(Ordering::Relaxed) {
             wait_or_stop(&feed, Duration::from_secs(3));
@@ -286,7 +299,7 @@ mod tests {
 
 /// A source reader for `device` delivering BGRA, in `format` if the camera
 /// offers it, else the best one. Also publishes the formats it offers.
-fn open_reader(device: &str, format: Option<crate::webcam::Format>) -> Result<(IMFSourceReader, u32, u32)> {
+fn open_reader(device: &str, format: Option<crate::webcam::Format>) -> Result<(IMFSourceReader, IMFMediaSource, u32, u32)> {
     com_init();
     super::system::mf_startup()?;
     let activate = devices()
@@ -343,7 +356,7 @@ fn open_reader(device: &str, format: Option<crate::webcam::Format>) -> Result<(I
         reader.SetCurrentMediaType(STREAM, None, &out).map_err(|e| anyhow!("the camera's pictures can't be converted ({})", e.message()))?;
         reader.SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS.0 as u32, false)?;
         reader.SetStreamSelection(STREAM, true)?;
-        Ok((reader, width, height))
+        Ok((reader, source, width, height))
     }
 }
 
@@ -380,6 +393,242 @@ fn read_frame(sample: &IMFSample, width: u32, height: u32, out: &mut Vec<u8>) ->
         }
     }
     Ok(())
+}
+
+/// An open camera's settings: DirectShow's picture settings (brightness,
+/// white balance…) and camera settings (exposure, focus, zoom…), which Media
+/// Foundation's camera source also has, and the driver's own properties for
+/// what those don't list. Changes apply to the camera, in every app, as its
+/// driver's own window does them.
+struct Settings {
+    amp: Option<IAMVideoProcAmp>,
+    cam: Option<IAMCameraControl>,
+    ks: Option<IKsControl>,
+}
+
+// SAFETY: Media Foundation's camera source is free-threaded, and it's only
+// used from threads in the multithreaded apartment (see `in_mta`).
+unsafe impl Send for Settings {}
+unsafe impl Sync for Settings {}
+
+/// Which a setting is in.
+#[derive(Clone, Copy)]
+enum Of {
+    Amp,
+    Cam,
+    /// A picture setting DirectShow's list stops short of, asked of the
+    /// driver itself (`PROPSETID_VIDCAP_VIDEOPROCAMP`).
+    Ks,
+}
+
+/// A setting, by its id (as V4L2 numbers it, see `webcam::cid`), with its
+/// automatic mode's switch, if the app offers one.
+struct Setting {
+    id: u32,
+    of: Of,
+    /// Its `VideoProcAmpProperty`, `CameraControlProperty`, or
+    /// `KSPROPERTY_VIDCAP_VIDEOPROCAMP`.
+    prop: i32,
+    name: &'static str,
+    auto: Option<(u32, &'static str)>,
+}
+
+/// Ids for settings V4L2 has none of.
+const COLOUR: u32 = 0x0800_0006;
+const ROLL: u32 = 0x0800_0102;
+
+const SETTINGS: &[Setting] = {
+    use crate::webcam::cid::*;
+    const fn amp(id: u32, prop: i32, name: &'static str) -> Setting {
+        Setting { id, of: Of::Amp, prop, name, auto: None }
+    }
+    const fn cam(id: u32, prop: i32, name: &'static str) -> Setting {
+        Setting { id, of: Of::Cam, prop, name, auto: None }
+    }
+    &[
+        amp(BRIGHTNESS, 0, "Brightness"),
+        amp(CONTRAST, 1, "Contrast"),
+        amp(HUE, 2, "Hue"),
+        amp(SATURATION, 3, "Saturation"),
+        amp(SHARPNESS, 4, "Sharpness"),
+        amp(GAMMA, 5, "Gamma"),
+        amp(COLOUR, 6, "Colour"),
+        Setting { auto: Some((AUTO_WHITE_BALANCE, "White balance, automatic")), ..amp(WHITE_BALANCE, 7, "White balance") },
+        amp(BACKLIGHT, 8, "Backlight compensation"),
+        amp(GAIN, 9, "Gain"),
+        Setting { of: Of::Ks, ..amp(POWER_LINE, KSPROPERTY_VIDEOPROCAMP_POWERLINE_FREQUENCY.0, "Power line frequency") },
+        cam(PAN, 0, "Pan"),
+        cam(TILT, 1, "Tilt"),
+        cam(ROLL, 2, "Roll"),
+        cam(ZOOM, 3, "Zoom"),
+        Setting { auto: Some((AUTO_EXPOSURE, "Exposure, automatic")), ..cam(EXPOSURE, 4, "Exposure") },
+        cam(IRIS, 5, "Iris"),
+        Setting { auto: Some((AUTO_FOCUS, "Focus, automatic")), ..cam(FOCUS, 6, "Focus") },
+    ]
+};
+
+/// `VideoProcAmp_Flags_Auto` and `_Manual` (the camera's the same).
+const AUTO: i32 = 1;
+const MANUAL: i32 = 2;
+
+impl Settings {
+    /// min, max, step, default, and whether it can be automatic or set.
+    fn range(&self, s: &Setting) -> Option<(i32, i32, i32, i32, i32)> {
+        let (mut min, mut max, mut step, mut default, mut caps) = (0, 0, 0, 0, 0);
+        unsafe {
+            match s.of {
+                Of::Amp => self.amp.as_ref()?.GetRange(s.prop, &mut min, &mut max, &mut step, &mut default, &mut caps),
+                Of::Cam => self.cam.as_ref()?.GetRange(s.prop, &mut min, &mut max, &mut step, &mut default, &mut caps),
+                Of::Ks => return self.ks_range(s.prop),
+            }
+        }
+        .ok()?;
+        (max >= min).then_some((min, max, step, default, caps))
+    }
+
+    /// Its value, and whether it's automatic now.
+    fn get(&self, s: &Setting) -> Option<(i32, bool)> {
+        let (mut value, mut flags) = (0, 0);
+        unsafe {
+            match s.of {
+                Of::Amp => self.amp.as_ref()?.Get(s.prop, &mut value, &mut flags),
+                Of::Cam => self.cam.as_ref()?.Get(s.prop, &mut value, &mut flags),
+                Of::Ks => {
+                    let got = self.ks_property(s.prop, KSPROPERTY_TYPE_GET, 0)?;
+                    (value, flags) = (got.Value, got.Flags as i32);
+                    Ok(())
+                }
+            }
+        }
+        .ok()?;
+        Some((value, flags & AUTO != 0))
+    }
+
+    fn set(&self, s: &Setting, value: i32, flags: i32) -> Result<()> {
+        unsafe {
+            match s.of {
+                Of::Amp => self.amp.as_ref().context("the camera has no picture settings")?.Set(s.prop, value, flags),
+                Of::Cam => self.cam.as_ref().context("the camera has no camera settings")?.Set(s.prop, value, flags),
+                Of::Ks => {
+                    self.ks_property(s.prop, KSPROPERTY_TYPE_SET, value).context("the camera didn't take it")?;
+                    Ok(())
+                }
+            }
+        }
+        .map_err(|e| anyhow!("the camera didn't take it ({})", e.message()))
+    }
+
+    /// Get (`KSPROPERTY_TYPE_GET`) or set picture setting `prop` of the
+    /// driver's own.
+    fn ks_property(&self, prop: i32, kind: u32, value: i32) -> Option<KSPROPERTY_VIDEOPROCAMP_S> {
+        let ks = self.ks.as_ref()?;
+        let mut p = KSPROPERTY_VIDEOPROCAMP_S { Value: value, Flags: MANUAL as u32, ..Default::default() };
+        p.Property.Anonymous.Anonymous = KSIDENTIFIER_0_0 { Set: PROPSETID_VIDCAP_VIDEOPROCAMP, Id: prop as u32, Flags: kind };
+        let mut out = p;
+        let size = std::mem::size_of::<KSPROPERTY_VIDEOPROCAMP_S>() as u32;
+        let mut got = 0;
+        unsafe { ks.KsProperty(&p.Property, size, (&raw mut out).cast(), size, &mut got) }.ok()?;
+        Some(out)
+    }
+
+    /// The range and default of picture setting `prop` of the driver's own,
+    /// as `range` has them: its basic support (a description, a members
+    /// header, then the stepping) and its default (the same, then the value).
+    fn ks_range(&self, prop: i32) -> Option<(i32, i32, i32, i32, i32)> {
+        let ks = self.ks.as_ref()?;
+        let ask = |kind: u32| -> Option<Vec<u8>> {
+            let mut p = KSIDENTIFIER::default();
+            p.Anonymous.Anonymous = KSIDENTIFIER_0_0 { Set: PROPSETID_VIDCAP_VIDEOPROCAMP, Id: prop as u32, Flags: kind };
+            let mut buf = vec![0u8; 256];
+            let mut got = 0;
+            unsafe { ks.KsProperty(&p, std::mem::size_of::<KSPROPERTY_VIDEOPROCAMP_S>() as u32, buf.as_mut_ptr().cast(), buf.len() as u32, &mut got) }.ok()?;
+            buf.truncate(got as usize);
+            Some(buf)
+        };
+        let head = std::mem::size_of::<KSPROPERTY_DESCRIPTION>() + std::mem::size_of::<KSPROPERTY_MEMBERSHEADER>();
+        let read = |b: &[u8], at: usize| Some(i32::from_le_bytes(b.get(at..at + 4)?.try_into().ok()?));
+        let support = ask(KSPROPERTY_TYPE_BASICSUPPORT)?;
+        // KSPROPERTY_STEPPING_LONG: the step, a reserved word, then the bounds.
+        let (step, min, max) = (read(&support, head)?, read(&support, head + 8)?, read(&support, head + 12)?);
+        let default = ask(KSPROPERTY_TYPE_DEFAULTVALUES).and_then(|d| read(&d, head)).unwrap_or(min);
+        (max >= min).then_some((min, max, step, default, MANUAL))
+    }
+}
+
+/// Run `f` on a thread of the multithreaded apartment, where the camera was
+/// opened (the UI's thread is single-threaded).
+fn in_mta<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+    thread::scope(|s| {
+        s.spawn(|| {
+            com_init();
+            f()
+        })
+        .join()
+        .unwrap()
+    })
+}
+
+/// The settings of camera `device`, if it's the one open.
+fn settings_of(device: &str) -> Option<Arc<Settings>> {
+    let feed = CURRENT.lock().unwrap().clone().filter(|f| f.device == device && !f.stop.load(Ordering::Relaxed))?;
+    feed.settings.lock().unwrap().clone()
+}
+
+/// An exposure time as DirectShow has it, in powers of two of a second.
+fn exposure_label(log2: i32) -> String {
+    let secs = 2f64.powi(log2);
+    if secs >= 1.0 { format!("{secs} s") } else { format!("{:.1} ms", secs * 1000.0) }
+}
+
+/// The settings camera `device` offers, with their values now: none until
+/// it's open. Automatic modes are switches of their own, before what they
+/// take over.
+pub(crate) fn controls(device: &str) -> Vec<crate::webcam::CameraControl> {
+    use crate::webcam::{CameraControl, ControlKind, cid};
+    let Some(settings) = settings_of(device) else { return Vec::new() };
+    in_mta(|| {
+        let mut out = Vec::new();
+        for s in SETTINGS {
+            let Some((min, max, step, default, caps)) = settings.range(s) else { continue };
+            if caps & MANUAL == 0 {
+                continue;
+            }
+            let (value, auto) = settings.get(s).unwrap_or((default, false));
+            let switch = s.auto.filter(|_| caps & AUTO != 0);
+            if let Some((id, name)) = switch {
+                // Cameras start out automatic.
+                out.push(CameraControl { id, name: name.to_owned(), kind: ControlKind::Bool, value: i64::from(auto), default: 1, inactive: false });
+            }
+            let kind = match s.id {
+                cid::EXPOSURE => ControlKind::Menu((min..=max).map(|v| (i64::from(v), exposure_label(v))).collect()),
+                cid::POWER_LINE => {
+                    let names = ["Off", "50 Hz", "60 Hz", "Automatic"];
+                    ControlKind::Menu((min..=max).filter_map(|v| Some((i64::from(v), names.get(usize::try_from(v).ok()?)?.to_string()))).collect())
+                }
+                _ => ControlKind::Int { min: min.into(), max: max.into(), step: step.max(1).into() },
+            };
+            out.push(CameraControl { id: s.id, name: s.name.to_owned(), kind, value: value.into(), default: default.into(), inactive: switch.is_some() && auto });
+        }
+        out
+    })
+}
+
+/// Set camera `device`'s setting `id` (or an automatic mode's switch) to
+/// `value`; it applies at once, in every app. One its automatic mode has
+/// taken over is refused (as V4L2 does).
+pub(crate) fn set_control(device: &str, id: u32, value: i64) -> Result<()> {
+    let settings = settings_of(device).context("the camera isn't open")?;
+    let s = SETTINGS.iter().find(|s| s.id == id || s.auto.is_some_and(|(a, _)| a == id)).context("the camera has no such setting")?;
+    in_mta(|| {
+        let (now, auto) = settings.get(s).context("the camera's setting can't be read")?;
+        if s.id != id {
+            return settings.set(s, now, if value != 0 { AUTO } else { MANUAL });
+        }
+        if s.auto.is_some() && auto {
+            bail!("it's automatic now");
+        }
+        settings.set(s, i32::try_from(value).context("out of range")?, MANUAL)
+    })
 }
 
 /// The camera's own settings window, through its DirectShow filter's property
