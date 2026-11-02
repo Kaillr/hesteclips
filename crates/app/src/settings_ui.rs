@@ -1,7 +1,9 @@
 //! The Settings page: a panel of panes on the left, as Clips has its games,
 //! and the chosen pane's settings beside it. Panes are grouped by what you're
-//! trying to do rather than by codec jargon, and each is short enough to take
-//! in at once. Changes apply (and save) immediately; there's no Save button.
+//! trying to do rather than by codec jargon, and a pane's settings come in
+//! groups under headings, each short enough to take in at once (Video's:
+//! the picture's size, its motion, the file, and how it's captured).
+//! Changes apply (and save) immediately; there's no Save button.
 //!
 //! Each setting is a row: what it is (and a line on why you'd change it) on the
 //! left, the control on the right. In a narrow window the control moves under
@@ -73,7 +75,7 @@ impl Pane {
     fn groups(self) -> &'static [&'static str] {
         match self {
             Pane::Clipping => &["Clipping", "Saved sound", "Voice"],
-            Pane::Video => &["Video"],
+            Pane::Video => &["Video", "Motion", "File", "Capture"],
             Pane::Clips => &["Clips", "Screenshots"],
             Pane::Shortcuts => &["Shortcuts"],
             #[cfg(target_os = "macos")]
@@ -100,7 +102,10 @@ impl Filter {
 fn group_matches(name: &str, f: &Filter) -> bool {
     match name {
         "Clipping" => f.shows(&["clip length", "replay buffer duration", "start clipping when hasteclip opens", "auto start", "memory"]),
-        "Video" => VIDEO_WORDS.iter().any(|w| f.shows(w)) || SCREEN_CAPTURE && f.shows(SCREEN_CAPTURE_WORDS),
+        "Video" => f.shows(RESOLUTION_WORDS) || f.shows(SHAPE_WORDS),
+        "Motion" => f.shows(FPS_WORDS) || capture::frame_blending() && f.shows(BLEND_WORDS),
+        "File" => f.shows(QUALITY_WORDS) || f.shows(ENCODER_WORDS) || f.shows(FORMAT_WORDS),
+        "Capture" => capture::game_hook_available() && f.shows(GAME_CAPTURE_WORDS) || SCREEN_CAPTURE && f.shows(SCREEN_CAPTURE_WORDS),
         "Clips" => f.shows(&["clips folder", "location", "directory", "folder per game", "name clips after what happened", "game events", "osu", "names", "delete", "trash", "permanently", "output", "titles", "recycle"]),
         "Screenshots" => capture::SCREENSHOTS && f.shows(&["screenshots", "take a screenshot", "shortcut", "hotkey", "format", "png", "jpg", "jpeg", "copy", "clipboard", "paste", "keyboard"]),
         "Saved sound" => f.shows(&["play a sound when a clip is saved", "sound", "volume", "record the sound", "in clip", "add your own"]),
@@ -188,9 +193,9 @@ impl App {
     }
 
     /// The heading beside the panel: the pane's name (Video's says it's
-    /// locked while capturing, with the button to stop), Clip names with the
-    /// way back, or Results while searching. Narrow, the panes are in a menu
-    /// on it, beside the search.
+    /// locked while capturing), Clip names with the way back, or Results
+    /// while searching. Narrow, the panes are in a menu on it, beside the
+    /// search.
     fn settings_head(&mut self, ui: &mut egui::Ui, wide: bool, searching: bool) {
         let mut back = false;
         self.page_head_folding(ui, "", |app, ui, tight| {
@@ -246,8 +251,10 @@ impl App {
                 ui.set_width(width);
                 if searching {
                     let found: Vec<&str> = Pane::ALL.iter().flat_map(|p| p.groups().iter().copied()).filter(|g| group_matches(g, f)).collect();
+                    // Video's lock by the first of its groups found, as on its pane's heading.
+                    let locked_at = found.iter().position(|g| Pane::Video.groups().contains(g));
                     for (i, name) in found.iter().enumerate() {
-                        self.group_head(ui, name, i == 0);
+                        self.group_head(ui, name, i == 0, locked_at == Some(i));
                         self.settings_group(ui, name, f);
                     }
                     if found.is_empty() {
@@ -263,7 +270,7 @@ impl App {
                     ui_kit::gap(ui, 4.0);
                     for (i, name) in self.settings_pane.groups().iter().filter(|g| group_matches(g, f)).enumerate() {
                         if i > 0 {
-                            self.group_head(ui, name, false);
+                            self.group_head(ui, name, false, false);
                         }
                         self.settings_group(ui, name, f);
                     }
@@ -278,6 +285,9 @@ impl App {
         match name {
             "Clipping" => self.clipping_group(ui, f),
             "Video" => self.video_group(ui, f),
+            "Motion" => self.motion_group(ui, f),
+            "File" => self.file_group(ui, f),
+            "Capture" => self.capture_group(ui, f),
             "Clips" => self.clips_group(ui, f),
             "Screenshots" => self.screenshots_group(ui, f),
             "Saved sound" => self.sound_group(ui, f),
@@ -291,19 +301,20 @@ impl App {
         }
     }
 
-    /// A group's heading (a pane's first group has the pane's own).
-    fn group_head(&mut self, ui: &mut egui::Ui, name: &str, first: bool) {
+    /// A group's heading (a pane's first group has the pane's own). `lock`:
+    /// Video's lock beside it, saying why.
+    fn group_head(&mut self, ui: &mut egui::Ui, name: &str, first: bool, lock: bool) {
         ui_kit::section_head(ui, name, first, |ui| {
-            if name == "Video" {
+            if lock {
                 self.video_lock(ui, false);
             }
         });
     }
 
     /// Video's settings are fixed when capture starts: while capturing, by
-    /// its name, the lock and the button to stop (`tight`: the lock without
-    /// its words).
-    fn video_lock(&mut self, ui: &mut egui::Ui, tight: bool) {
+    /// its name, the lock and why (`tight`: the lock, why on hover). Stopping
+    /// is the clipping bar's, not here too.
+    fn video_lock(&self, ui: &mut egui::Ui, tight: bool) {
         let Some(why) = self.locked_while() else { return };
         let p = theme::pal(ui);
         ui.add_space(4.0);
@@ -311,10 +322,6 @@ impl App {
             ui.label(theme::ic(icon::LOCK_SIMPLE, 13.0).color(p.text3)).on_hover_text(why);
         } else {
             ui.label(theme::text(format!("{}  {why}", icon::LOCK_SIMPLE), 12.5, W::Regular).color(p.text3));
-        }
-        let stop = if self.rec_state == RecState::Recording { "Stop recording" } else { "Stop clipping" };
-        if Btn::ghost(stop).small().show(ui).clicked() {
-            self.stop();
         }
     }
 
@@ -354,9 +361,9 @@ impl App {
         });
     }
 
+    /// Video's first group: the picture's size and shape.
     fn video_group(&mut self, ui: &mut egui::Ui, f: &Filter) {
         let lock = self.lock();
-        let mut said = false;
         let size = self.recorded_size();
         let native = capture::frame_size(&self.video_source(), capture::VideoSize { shape: self.settings.capture_shape(), ..Default::default() });
         let screen = capture::frame_size(&self.video_source(), Default::default());
@@ -367,21 +374,6 @@ impl App {
             (Some((w, h)), _) => format!("Records at {w}×{h}"),
             _ => String::new(),
         };
-        let max_blend = capture::max_blend_rate(&self.video_source());
-        let blends = settings::blend_choices(self.settings.fps, max_blend);
-        let samples = self.settings.blend_samples();
-        let blend_note = if samples > 1 {
-            format!("Captured at {} fps, blended down to {}", self.settings.fps * samples, self.settings.fps)
-        } else if blends.is_empty() {
-            max_blend.map_or(String::new(), |hz| format!("Your display shows {hz} pictures a second: blending needs {} fps or less", hz / 2))
-        } else {
-            String::new()
-        };
-        let fps_note = max_blend.filter(|hz| self.settings.fps > *hz).map_or(String::new(), |hz| format!("More than your display shows ({hz} Hz). Fine for games running faster."));
-        let per_min = human_bytes(self.estimated_bytes(60.0));
-        let rec = self.recommended_mbps();
-        let preset = rec.and_then(|r| [("Smaller", round_mbps(r as f64 * 0.5)), ("Balanced", r), ("High", round_mbps(r as f64 * 2.0))].into_iter().position(|(_, m)| m == self.settings.video_bitrate_mbps));
-        let quality_note = format!("{}about {per_min} per minute", if preset.is_some() { "" } else { "Your own bitrate, " });
         let mut locked_click = false;
         ui_kit::list(ui, "video", |l| {
             if f.shows(RESOLUTION_WORDS) {
@@ -412,12 +404,29 @@ impl App {
                     self.show_screen_card();
                 }
             }
+        });
+        self.say_locked(locked_click, lock);
+    }
+
+    /// Video's motion: the frame rate, and frame blending's motion blur
+    /// made from faster captures than it.
+    fn motion_group(&mut self, ui: &mut egui::Ui, f: &Filter) {
+        let lock = self.lock();
+        let max_blend = capture::max_blend_rate(&self.video_source());
+        let blends = settings::blend_choices(self.settings.fps, max_blend);
+        let samples = self.settings.blend_samples();
+        let blend_note = if samples > 1 {
+            format!("Captured at {} fps, blended down to {}", self.settings.fps * samples, self.settings.fps)
+        } else if blends.is_empty() {
+            max_blend.map_or(String::new(), |hz| format!("Your display shows {hz} pictures a second: blending needs {} fps or less", hz / 2))
+        } else {
+            String::new()
+        };
+        let fps_note = max_blend.filter(|hz| self.settings.fps > *hz).map_or(String::new(), |hz| format!("More than your display shows ({hz} Hz). Fine for games running faster."));
+        let mut locked_click = false;
+        ui_kit::list(ui, "video_motion", |l| {
             if f.shows(FPS_WORDS) {
                 let (_, c) = l.row(Row::new("Frame rate").note(fps_note.clone()).locked(lock.clone()), |ui| self.fps_field(ui));
-                locked_click |= c;
-            }
-            if f.shows(QUALITY_WORDS) {
-                let (_, c) = l.row(Row::new("Quality").tip("Quality", "How much detail each second gets. Fast motion needs more, and files grow with it. Balanced looks good in fast motion at this size and frame rate.").note(quality_note.clone()).locked(lock.clone()), |ui| self.quality_field(ui, rec, preset));
                 locked_click |= c;
             }
             if capture::frame_blending() && f.shows(BLEND_WORDS) {
@@ -432,6 +441,24 @@ impl App {
                     });
                     locked_click |= c;
                 });
+            }
+        });
+        self.say_locked(locked_click, lock);
+    }
+
+    /// Video's file: how much detail it keeps (and so how big it is), what
+    /// encodes it, and its format.
+    fn file_group(&mut self, ui: &mut egui::Ui, f: &Filter) {
+        let lock = self.lock();
+        let per_min = human_bytes(self.estimated_bytes(60.0));
+        let rec = self.recommended_mbps();
+        let preset = rec.and_then(|r| [("Smaller", round_mbps(r as f64 * 0.5)), ("Balanced", r), ("High", round_mbps(r as f64 * 2.0))].into_iter().position(|(_, m)| m == self.settings.video_bitrate_mbps));
+        let quality_note = format!("{}about {per_min} per minute", if preset.is_some() { "" } else { "Your own bitrate, " });
+        let mut locked_click = false;
+        ui_kit::list(ui, "video_file", |l| {
+            if f.shows(QUALITY_WORDS) {
+                let (_, c) = l.row(Row::new("Quality").tip("Quality", "How much detail each second gets. Fast motion needs more, and files grow with it. Balanced looks good in fast motion at this size and frame rate.").note(quality_note.clone()).locked(lock.clone()), |ui| self.quality_field(ui, rec, preset));
+                locked_click |= c;
             }
             if f.shows(ENCODER_WORDS) {
                 let (_, c) = l.row(Row::new("Encoder").tip("Encoder", "Hardware encoding barely affects your game's frame rate. Software is slower and uses the CPU.").locked(lock.clone()), |ui| {
@@ -455,6 +482,16 @@ impl App {
                 });
                 locked_click |= c;
             }
+        });
+        self.say_locked(locked_click, lock);
+    }
+
+    /// How the picture's captured (Windows): game capture, for games
+    /// Windows' own capture can't record properly, and the screen's way.
+    fn capture_group(&mut self, ui: &mut egui::Ui, f: &Filter) {
+        let lock = self.lock();
+        let mut locked_click = false;
+        ui_kit::list(ui, "video_capture", |l| {
             if capture::game_hook_available() && f.shows(GAME_CAPTURE_WORDS) {
                 let (_, c) = l.row(Row::new("Game capture").tip("Game capture", "For games Windows can't record properly, like exclusive fullscreen games that record frozen, or that lose their cursor. Uses OBS Studio's game capture, only where it's needed.").note("For games that record frozen or without a cursor").locked(lock.clone()), |ui| ui_kit::switch(ui, &mut self.settings.game_capture));
                 locked_click |= c;
@@ -480,11 +517,14 @@ impl App {
                 locked_click |= c;
             }
         });
-        if locked_click && !said {
-            said = true;
-            self.toast_icon(icon::LOCK_SIMPLE, lock.clone().unwrap_or_default());
+        self.say_locked(locked_click, lock);
+    }
+
+    /// A locked row's control was clicked: why it's locked, in a toast.
+    fn say_locked(&mut self, clicked: bool, why: Option<String>) {
+        if clicked && let Some(why) = why {
+            self.toast_icon(icon::LOCK_SIMPLE, why);
         }
-        let _ = said;
     }
 
     fn clips_group(&mut self, ui: &mut egui::Ui, f: &Filter) {
@@ -1513,9 +1553,6 @@ const ENCODER_WORDS: &[&str] = &["encoder", "hardware", "software", "gpu"];
 const FORMAT_WORDS: &[&str] = &["file format", "mp4", "mov", "container"];
 /// What finds Game capture in the search.
 const GAME_CAPTURE_WORDS: &[&str] = &["game capture", "anti-cheat", "anticheat", "obs", "fullscreen"];
-/// Every Video row's words (but the screen capture's, Windows only): the
-/// group shows when any of its rows does.
-const VIDEO_WORDS: [&[&str]; 8] = [RESOLUTION_WORDS, SHAPE_WORDS, FPS_WORDS, QUALITY_WORDS, BLEND_WORDS, ENCODER_WORDS, FORMAT_WORDS, GAME_CAPTURE_WORDS];
 
 /// The screen capture setting shows: Windows, where there's a choice.
 const SCREEN_CAPTURE: bool = cfg!(target_os = "windows");
@@ -1655,10 +1692,31 @@ mod search_tests {
     fn searching_finds_the_aspect_ratio() {
         for q in ["aspect", "4:3", "stretched", "stretch res", "black bars"] {
             let f = Filter { q: q.to_owned() };
-            assert!(f.shows(SHAPE_WORDS) && VIDEO_WORDS.iter().any(|w| f.shows(w)), "{q}");
+            assert!(f.shows(SHAPE_WORDS) && group_matches("Video", &f), "{q}");
         }
         // Nothing of Video's finds it.
-        assert!(!VIDEO_WORDS.iter().any(|w| Filter { q: "discord".to_owned() }.shows(w)));
+        let f = Filter { q: "discord".to_owned() };
+        assert!(!Pane::Video.groups().iter().any(|g| group_matches(g, &f)));
+    }
+
+    /// Video's settings are found in the group they're in on its pane.
+    #[test]
+    fn video_rows_are_found_in_their_groups() {
+        let found = |q: &str| -> Vec<&str> {
+            let f = Filter { q: q.to_owned() };
+            Pane::Video.groups().iter().copied().filter(|g| group_matches(g, &f)).collect()
+        };
+        assert_eq!(found("resolution"), ["Video"]);
+        assert_eq!(found("fps"), ["Motion"]);
+        assert_eq!(found("bitrate"), ["File"]);
+        assert_eq!(found("hardware"), ["File"]);
+        assert_eq!(found("mp4"), ["File"]);
+        if capture::frame_blending() {
+            assert_eq!(found("motion blur"), ["Motion"]);
+        }
+        if SCREEN_CAPTURE {
+            assert_eq!(found("yellow border"), ["Capture"]);
+        }
     }
 
     /// Every group is on one pane, and the search finds what moved in with
