@@ -384,11 +384,6 @@ pub struct Player {
     /// anyway (longer while the decoder is catching up: it decodes from
     /// the keyframe before).
     pending_wait: std::time::Duration,
-    /// While the playhead itself is scrubbed (a drag of it, the wheel), how
-    /// near the playhead (seconds) a picture held still on stays, and where
-    /// letting go lands ([`Self::land`]); `None` for other drags (a trim's
-    /// edge: the picture is fetched for where the edge is).
-    landing: Option<f64>,
     /// Play was pressed; the sound starts with the first frame (or after
     /// [`START_WAIT`], [`FFMPEG_START_WAIT`] for ffmpeg's), so picture and
     /// sound start together.
@@ -563,7 +558,6 @@ impl Player {
             #[cfg(hw_decode)]
             catching_up: false,
             pending_wait: START_WAIT,
-            landing: None,
             pending_start: None,
             video_playing: false,
             played_at: None,
@@ -603,7 +597,6 @@ impl Player {
         }
         self.shared.speed.store(1.0f32.to_bits(), Ordering::Relaxed);
         self.shared.scrubbing.store(false, Ordering::Relaxed);
-        self.landing = None;
         self.stepping = false;
         self.set_cuts(&[]);
         // Hushed for a curtain and handed straight back (a quick switch
@@ -1235,11 +1228,11 @@ impl Player {
     /// (each frame decoded on the way to it showed as it came, nearer and
     /// nearer: stopped, the picture played on a few frames).
     ///
-    /// Held still, the engine decodes around it. Scrubbing the playhead
-    /// itself, a picture near it stays put (letting go lands on it,
-    /// [`Self::land`]); otherwise its own frame comes in one step, the
-    /// engine's or the playback decoder's (all its threads on the one
-    /// frame: soonest).
+    /// Held still, the engine decodes around it, and its own frame comes in
+    /// one step, the engine's or the playback decoder's (all its threads on
+    /// the one frame: soonest). (A picture near it used to stay put while
+    /// held, letting go moving the playhead to it: up to half a second off
+    /// where it was put, and the playhead not where it was let go.)
     #[cfg(hw_decode)]
     fn scrub_engine(&mut self, ctx: &egui::Context, want: u64) {
         let m = self.motion_at(want);
@@ -1263,11 +1256,6 @@ impl Player {
             ctx.request_repaint_after(HELD.saturating_sub(m.moved.elapsed()) + std::time::Duration::from_millis(2));
         }
         if self.shown_frame == Some(want) {
-            return;
-        }
-        let fps = self.info.fps;
-        let keep = held && !m.jumped && self.landing.zip(self.screen_index).is_some_and(|(reach, i)| i.abs_diff(want) as f64 <= reach * fps);
-        if keep {
             return;
         }
         match found {
@@ -1381,43 +1369,6 @@ impl Player {
         };
         self.motion = Some(m);
         m
-    }
-
-    /// While the playhead itself is scrubbed (`Some`), how near the
-    /// playhead (seconds) the picture it's held still on may be to stay,
-    /// and where letting go lands ([`Self::land`]). Set every frame, before
-    /// [`Self::update`].
-    pub fn set_landing(&mut self, reach: Option<f64>) {
-        self.landing = reach;
-    }
-
-    /// A scrub of the playhead (a drag of it, the wheel) ended: when the
-    /// picture on screen is a frame near the playhead (within the reach
-    /// [`Self::set_landing`] gave) but not the playhead's own, the playhead
-    /// goes to it. Letting go lands on the frame you see, rather than the
-    /// picture jumping to the one under the pointer once it's decoded. Not
-    /// after a jump (a click): that picture is only a stand-in for where it
-    /// went. Nor into a stretch cut out of the clip.
-    pub fn land(&mut self) {
-        #[cfg(hw_decode)]
-        {
-            let (Some(reach), Some(on_screen)) = (self.landing, self.screen_index) else { return };
-            if self.scrub.as_ref().is_none_or(|e| e.failed()) || self.motion.is_none_or(|m| m.jumped) {
-                return;
-            }
-            let want = self.info.frame_index(self.time());
-            if self.shown_frame == Some(want) || on_screen == want || on_screen.abs_diff(want) as f64 > reach * self.info.fps {
-                return;
-            }
-            let t = self.info.snap(on_screen as f64 / self.info.fps + 1e-9) + 1e-6;
-            let cut = self.shared.skips.lock().is_ok_and(|s| s.iter().any(|k| (k.from..k.to).contains(&to_samples(t))));
-            if cut || t > self.info.duration {
-                return;
-            }
-            trace!("scrub lands on the frame shown, {on_screen} (the playhead was at {want})");
-            self.seek(t);
-            self.shown_frame = Some(on_screen);
-        }
     }
 
     #[cfg_attr(not(windows), allow(dead_code))]

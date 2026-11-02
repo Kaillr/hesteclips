@@ -25,7 +25,10 @@ use crate::viewer::Resume;
 /// Timeline geometry, in points.
 const RULER_H: f32 = crate::transport::RULER_H;
 const VIDEO_H: f32 = 56.0;
+/// A sound lane, and the tallest one grows when the divider gives the
+/// timeline more room than its lanes need.
 const AUDIO_H: f32 = 52.0;
+const AUDIO_MAX_H: f32 = AUDIO_H * 3.0;
 /// The line under the lanes that says how long the kept part is.
 const LENGTH_H: f32 = 28.0;
 const DIVIDER_H: f32 = 9.0;
@@ -113,6 +116,12 @@ struct Ready {
     /// picture and timeline (whatever the guess of the other parts' height
     /// missed).
     lanes_short: f32,
+    /// How tall the sound lanes are: [`AUDIO_H`], or taller (up to
+    /// [`AUDIO_MAX_H`]) with the divider dragged up past what they need.
+    lane_h: f32,
+    /// The split leaves the sound lanes short of room on purpose (they
+    /// scroll): how short they come isn't a miss for `lanes_short` to make up.
+    lanes_cut: bool,
     /// The kept length being typed (click the length under the timeline).
     typing_length: Option<String>,
     /// The mix's meter on the right of the timeline (as on Sources).
@@ -148,6 +157,8 @@ struct Ready {
     save_as: Option<(String, Option<String>)>,
     /// F2 was pressed.
     rename_requested: bool,
+    /// Esc was pressed: back, as the back button.
+    back_requested: bool,
     /// The export settings were opened by the dev hook.
     export_shown: bool,
     /// The export settings popup is open.
@@ -253,8 +264,9 @@ impl Meter {
 pub struct Editor {
     target: EditTarget,
     state: State,
-    /// How much of the height the preview gets; the timeline has the rest.
-    preview_share: f32,
+    /// How much of the height the preview gets, as dragged (the timeline has
+    /// the rest); none: fitted (see [`Ready::ui`]).
+    preview_share: Option<f32>,
     /// Snapping, as the app keeps it (settings), until the clip has loaded.
     snap: bool,
     /// Where the player was when the editor was opened from it (the clip
@@ -269,7 +281,7 @@ impl Editor {
     /// Edit the clip at `clip`. An edited clip is decoded from its original, so
     /// every earlier decision can still be changed. Opened from the player:
     /// `from` where it was, with what it handed over.
-    pub fn open(ctx: &egui::Context, clip: &Path, preview_share: f32, snap: bool, from: Option<Resume>, mut handoff: Handoff) -> Self {
+    pub fn open(ctx: &egui::Context, clip: &Path, preview_share: Option<f32>, snap: bool, from: Option<Resume>, mut handoff: Handoff) -> Self {
         let target = EditTarget::of(clip);
         let state = if handoff.kept.info(&target.source).is_some() {
             match load(&target.source, &mut handoff.kept) {
@@ -337,8 +349,9 @@ impl Editor {
         &self.target.clip
     }
 
-    /// The preview's share of the height, as last dragged (to remember it).
-    pub fn preview_share(&self) -> f32 {
+    /// The preview's share of the height, as last dragged (to remember it);
+    /// none: fitted.
+    pub fn preview_share(&self) -> Option<f32> {
         self.preview_share
     }
 
@@ -446,6 +459,8 @@ impl Ready {
             mix_meter: Default::default(),
             typing_length: None,
             lanes_short: 0.0,
+            lane_h: AUDIO_H,
+            lanes_cut: false,
             dragging: None,
             resume: false,
             grab_offset: 0.0,
@@ -461,6 +476,7 @@ impl Ready {
             confirm_delete_original: false,
             save_as: None,
             rename_requested: false,
+            back_requested: false,
             export_shown: false,
             export_open: false,
             undo: Vec::new(),
@@ -486,7 +502,7 @@ impl Ready {
         }
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, target: &EditTarget, preview_share: &mut f32, delete_permanently: bool) -> EditorOutcome {
+    fn ui(&mut self, ui: &mut egui::Ui, target: &EditTarget, preview_share: &mut Option<f32>, delete_permanently: bool) -> EditorOutcome {
         // The clip as named in the library; decoding uses `target.source`.
         let source = target.clip.as_path();
         let ctx = ui.ctx().clone();
@@ -679,7 +695,7 @@ impl Ready {
         if rename {
             outcome = EditorOutcome::Rename;
         }
-        if back || cancel {
+        if back || cancel || std::mem::take(&mut self.back_requested) {
             if dirty {
                 self.confirm_discard = true;
             } else {
@@ -721,24 +737,11 @@ impl Ready {
         }
 
         // --- Picture: what's left over after the transport and timeline ---
-        // The divider under it sets the split; the timeline always keeps room
-        // for the ruler, the video lane and one sound lane (the rest scroll).
         let total = ui.available_height();
-        let below_min = DIVIDER_H + crate::transport::BAR_H + RULER_H + VIDEO_H + 4.0 + AUDIO_H + LENGTH_H + 10.0;
-        // Never more timeline than its lanes need: the picture gets the rest.
-        // (The same sum the timeline makes: its ruler, video lane, the gap
-        // above the sound lanes, each lane and the gap after it, the length.)
-        let below_max = DIVIDER_H + crate::transport::BAR_H + RULER_H + VIDEO_H + 4.0 + 4.0 + self.edit.tracks.len() as f32 * (AUDIO_H + 4.0) + LENGTH_H + 10.0 + self.lanes_short;
-        // The divider's share, except that every sound lane shows (no
-        // scrolling) whenever the picture can still have a third of the room.
-        let preview_h = (total * *preview_share).min((total - below_max).max(total / 3.0)).max(total - below_max).min(total - below_min).max(MIN_PREVIEW_H);
+        let split = split(total, self.edit.tracks.len(), self.lanes_short, *preview_share);
+        let preview_h = split.picture;
+        (self.lane_h, self.lanes_cut) = (split.lane, split.cut);
         let (preview_rect, preview_resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), preview_h), Sense::click());
-        // Dragging the playhead: held still, the picture stays, and letting
-        // go lands on it, within a dozen pixels of the timeline. (A trim's
-        // edge instead gets its frame: the edge is where it's put.)
-        let reach = (12.0 / self.px_per_s.max(1e-9)).min(0.5);
-        let free = matches!(self.dragging, Some(Drag::Playhead)) && !self.playhead_snapped;
-        self.player.set_landing(free.then_some(reach));
         let size = self.player.update(&ctx, self.dragging.is_some());
         if size.is_some() {
             self.curtain = None;
@@ -789,7 +792,7 @@ impl Ready {
                 self.toggle_play();
             }
         }
-        divider(ui, preview_h, total, preview_share);
+        divider(ui, preview_h, split.heights, total, preview_share);
 
         // --- Transport ---
         let bar = Rect::from_min_size(ui.cursor().min, Vec2::new(ui.available_width(), crate::transport::BAR_H));
@@ -1319,16 +1322,22 @@ impl Ready {
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::F2)) {
             self.rename_requested = true;
         }
-        let (crop, done) = ctx.input_mut(|i| {
+        let (crop, done, back) = ctx.input_mut(|i| {
             let crop = i.consume_key(egui::Modifiers::NONE, Key::C);
             let done = self.crop_tool.is_some() && (i.consume_key(egui::Modifiers::NONE, Key::Enter) || i.consume_key(egui::Modifiers::NONE, Key::Escape));
-            (crop, done)
+            // Esc otherwise: back, as the back button does (asking first
+            // when there are changes).
+            let back = self.crop_tool.is_none() && i.consume_key(egui::Modifiers::NONE, Key::Escape);
+            (crop, done, back)
         });
         if crop {
             self.toggle_crop();
         }
         if done {
             self.crop_tool = None;
+        }
+        if back {
+            self.back_requested = true;
         }
         let (redo, undo, snap, mute) = ctx.input_mut(|i| {
             (
@@ -1713,16 +1722,16 @@ impl Ready {
                 // the clip's ends), and keep it a frame long.
                 let lo = |k: usize, parts: &[(f64, f64)]| if k > 0 { parts[k - 1].1 } else { 0.0 };
                 let hi = |k: usize, parts: &[(f64, f64)]| parts.get(k + 1).map_or(self.info.duration, |p| p.0);
+                let edge = |this: &Self| trim_edge(pos.x, lanes, l.view, dur, || this.snapped(t_of(pos.x) - this.grab_offset, px_per_s, Some(d)));
                 match d {
                     Drag::Start(k) if k < parts.len() => {
-                        let t = self.info.snap(self.snapped(t_of(pos.x) - self.grab_offset, px_per_s, Some(d)));
+                        let t = self.info.snap(edge(self));
                         parts[k].0 = t.min(parts[k].1 - fd).max(lo(k, &parts));
                         self.edit.set_parts(&parts);
                         self.player.seek(parts[k].0);
                     }
                     Drag::End(k) if k < parts.len() => {
-                        let t = self.snapped(t_of(pos.x) - self.grab_offset, px_per_s, Some(d));
-                        parts[k].1 = self.info.snap(t).clamp(parts[k].0 + fd, hi(k, &parts).max(parts[k].0 + fd));
+                        parts[k].1 = trimmed_end(&self.info, edge(self)).clamp(parts[k].0 + fd, hi(k, &parts).max(parts[k].0 + fd));
                         self.edit.set_parts(&parts);
                         self.player.seek(parts[k].1 - fd);
                     }
@@ -1747,7 +1756,8 @@ impl Ready {
                     Drag::Line(i) => {
                         // The whole curve, up or down by how far it's been
                         // dragged (along the fader, so it follows the pointer).
-                        // Level, it snaps to 0 dB as it passes (Ctrl: it doesn't).
+                        // Level, it snaps to 0 dB or silence within a pixel of
+                        // it (Ctrl: it doesn't).
                         let lane = lane_rects[i];
                         let travel = lane.height() - 8.0;
                         let was = self.before_drag.as_ref().and_then(|e| e.tracks.get(i)).cloned();
@@ -1758,7 +1768,7 @@ impl Ready {
                             if was.points.is_empty() {
                                 let mut db = media::fader_db(media::fader_pos(media::to_db(was.gain)) + d);
                                 // Unchanged, or silent at the bottom.
-                                if let Some(to) = [0.0, media::SILENT_DB].into_iter().find(|&to| !no_snap && (y_of_db(lane, db) - y_of_db(lane, to)).abs() < SNAP_PX) {
+                                if let Some(to) = [0.0, media::SILENT_DB].into_iter().find(|&to| !no_snap && (y_of_db(lane, db) - y_of_db(lane, to)).abs() < SNAP_PX * fine) {
                                     db = to;
                                     guide = Some((i, to));
                                 }
@@ -1775,7 +1785,8 @@ impl Ready {
                         // From where it was by how far it's been dragged (taken
                         // hold of off its middle, it doesn't jump to the
                         // pointer), between its neighbours. Its level snaps to
-                        // 0 dB and to theirs as it passes (Ctrl: it doesn't).
+                        // 0 dB, silence or theirs within a pixel of it (Ctrl:
+                        // it doesn't).
                         let lane = lane_rects[i];
                         let from = self.before_drag.as_ref().and_then(|e| e.tracks.get(i)).and_then(|t| t.points.get(k)).map(|p| (p.t, p.db));
                         let mut guide = None;
@@ -1792,7 +1803,7 @@ impl Ready {
                                     .into_iter()
                                     .flatten()
                                     .map(|to| (to, (y_of_db(lane, db) - y_of_db(lane, to)).abs()))
-                                    .filter(|(_, off)| *off < SNAP_PX)
+                                    .filter(|(_, off)| *off < SNAP_PX * fine)
                                     .min_by(|a, b| a.1.total_cmp(&b.1));
                                 if let Some((to, _)) = nearest {
                                     db = to;
@@ -1817,10 +1828,6 @@ impl Ready {
             {
                 self.push_undo(was);
             }
-            // The playhead on the frame you see, not one decoded after.
-            if self.dragging == Some(Drag::Playhead) {
-                self.player.land();
-            }
             self.dragging = None;
             self.playhead_snapped = false;
             if std::mem::take(&mut self.resume) && self.player.time() < self.edit.end - fd {
@@ -1832,7 +1839,6 @@ impl Ready {
         // from where it went.
         if self.dragging.is_none() && self.resume && !ui.input(|i| i.pointer.primary_down()) {
             self.resume = false;
-            self.player.land();
             if self.player.time() < self.edit.end - fd {
                 self.player.play(self.edit.end);
             }
@@ -1898,7 +1904,7 @@ impl Ready {
     /// scroll and the edit are now (see [`Layout`]).
     fn layout(&self, outer: Rect) -> Layout {
         let n_audio = self.edit.tracks.len();
-        let lane_step = AUDIO_H + 4.0;
+        let lane_step = self.lane_h + 4.0;
         // Under the lanes, the line saying how long the parts are.
         let body_bottom = outer.bottom() - LENGTH_H;
         let audio_view = Rect::from_x_y_ranges(outer.x_range(), outer.top() + RULER_H + VIDEO_H..=body_bottom);
@@ -1913,7 +1919,7 @@ impl Ready {
         let video = Rect::from_min_size(Pos2::new(lanes.left(), ruler.bottom()), Vec2::new(lanes.width(), VIDEO_H));
         // The sound lanes, as far as they're scrolled.
         let top = audio_view.top() - self.lane_scroll + 4.0;
-        let lane_rects = (0..n_audio).map(|i| Rect::from_min_size(Pos2::new(lanes.left(), top + i as f32 * lane_step), Vec2::new(lanes.width(), AUDIO_H))).collect();
+        let lane_rects = (0..n_audio).map(|i| Rect::from_min_size(Pos2::new(lanes.left(), top + i as f32 * lane_step), Vec2::new(lanes.width(), self.lane_h))).collect();
         let body = Rect::from_x_y_ranges(lanes_x, video.top()..=(top + n_audio as f32 * lane_step - 4.0).min(audio_view.bottom()));
         let hit_area = Rect::from_x_y_ranges(lanes.left() - HANDLE_W - 4.0..=lanes.right() + HANDLE_W + 4.0, ruler.top()..=body_bottom + LENGTH_H);
         let dur = self.info.duration.max(1e-6);
@@ -1961,7 +1967,7 @@ impl Ready {
     fn timeline(&mut self, ui: &mut egui::Ui, resp: Option<egui::Response>) {
         let pal = crate::theme::pal(ui);
         let n_audio = self.edit.tracks.len();
-        let lane_step = AUDIO_H + 4.0;
+        let lane_step = self.lane_h + 4.0;
         let lanes_h = n_audio as f32 * lane_step;
         // As tall as it needs, up to what's left; the sound lanes scroll in
         // whatever height that leaves them.
@@ -1980,11 +1986,16 @@ impl Ready {
         let over = 4.0 + lanes_h - audio_view.height();
         let max_scroll = if over > 2.0 { over } else { 0.0 };
         // Short with the picture already as small as the divider lets it be
-        // (it gives the lanes their room first): next frame asks for this much more.
-        if over > 0.5 {
-            self.lanes_short = (self.lanes_short + over).min(200.0);
-        } else if over < -0.5 {
-            self.lanes_short = (self.lanes_short + over).max(0.0);
+        // (it gives the lanes their room first): next frame asks for this much
+        // more. (Not while they're left short on purpose: it climbed to its
+        // most, and dragged back up, the divider's range was that far off till
+        // it had come down again.)
+        if !self.lanes_cut {
+            if over > 0.5 {
+                self.lanes_short = (self.lanes_short + over).min(200.0);
+            } else if over < -0.5 {
+                self.lanes_short = (self.lanes_short + over).max(0.0);
+            }
         }
         let p = ui.painter_at(outer);
 
@@ -2742,15 +2753,75 @@ impl Layout {
     }
 }
 
+/// How the editor's height splits between the picture and, under the
+/// divider, the transport and the timeline.
+struct Split {
+    /// The picture's height.
+    picture: f32,
+    /// Each sound lane's.
+    lane: f32,
+    /// Where the divider can take the picture's height.
+    heights: std::ops::RangeInclusive<f32>,
+    /// The sound lanes are left short of room (they scroll), the picture
+    /// being taller than fits them.
+    cut: bool,
+}
+
+/// `total` split, with `n_audio` sound lanes, the picture's share as the
+/// divider was left (none: fitted). `short`: how far short the lanes came
+/// last frame ([`Ready::lanes_short`]).
+///
+/// Fitted (till the divider's dragged, and after a double-click on it), the
+/// timeline's as tall as its lanes need and the picture has the rest, unless
+/// that's under a third of the room: then the sound lanes scroll. Dragged,
+/// the picture's as tall as it was left: down, the sound lanes scroll, the
+/// timeline keeping room for the ruler, the video lane and one sound lane;
+/// up, they grow taller into the room (up to [`AUDIO_MAX_H`]), the timeline
+/// never taller than its lanes. (Fitted was all there was: with a sound
+/// lane or two, the divider couldn't move.)
+fn split(total: f32, n_audio: usize, short: f32, share: Option<f32>) -> Split {
+    let n = n_audio as f32;
+    let below_min = DIVIDER_H + crate::transport::BAR_H + RULER_H + VIDEO_H + 4.0 + AUDIO_H + LENGTH_H + 10.0;
+    // Every lane showing, as tall as it starts. (The same sum the timeline
+    // makes: its ruler, video lane, the gap above the sound lanes, each lane
+    // and the gap after it, the length.)
+    let below_fit = DIVIDER_H + crate::transport::BAR_H + RULER_H + VIDEO_H + 4.0 + 4.0 + n * (AUDIO_H + 4.0) + LENGTH_H + 10.0 + short;
+    let shortest = (total - below_fit - n * (AUDIO_MAX_H - AUDIO_H)).max(MIN_PREVIEW_H);
+    let tallest = (total - below_min).max(shortest);
+    let fitted = (total - below_fit).max(total / 3.0);
+    let picture = share.map_or(fitted, |s| total * s).clamp(shortest, tallest);
+    // The room the timeline has beyond its lanes' need, shared out among them.
+    let lane = if n_audio > 0 { (AUDIO_H + (total - picture - below_fit).max(0.0) / n).min(AUDIO_MAX_H) } else { AUDIO_H };
+    Split { picture, lane, heights: shortest..=tallest, cut: picture > total - below_fit + 0.5 }
+}
+
 /// The bar between the picture and the timeline: drag it to give either more
-/// room. `share` is the picture's fraction of `total`.
-fn divider(ui: &mut egui::Ui, preview_h: f32, total: f32, share: &mut f32) {
+/// room, the picture (`preview_h` tall now) kept within `heights`; or
+/// double-click it for the fitted split again. `share`: the picture's
+/// fraction of `total` as dragged (none: fitted).
+fn divider(ui: &mut egui::Ui, preview_h: f32, heights: std::ops::RangeInclusive<f32>, total: f32, share: &mut Option<f32>) {
     let pal = crate::theme::pal(ui);
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), DIVIDER_H), Sense::drag());
-    let resp = resp.on_hover_cursor(egui::CursorIcon::ResizeVertical).on_hover_text("Drag to resize the picture and the timeline");
-    if resp.dragged() {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), DIVIDER_H), Sense::click_and_drag());
+    let resp = resp.on_hover_cursor(egui::CursorIcon::ResizeVertical).on_hover_text("Drag to resize the picture and the timeline. Double-click to fit the timeline to its lanes again.");
+    // How far down the bar it was taken hold of: it stays that far above the
+    // pointer, and waits at either end of its range till the pointer's back
+    // (moved by the pointer's moves instead, it fell behind it at an end).
+    let held = resp.id.with("held");
+    if resp.drag_started()
+        && let Some(origin) = ui.input(|i| i.pointer.press_origin())
+    {
+        ui.data_mut(|d| d.insert_temp(held, origin.y - rect.top()));
+    }
+    if resp.double_clicked() {
+        *share = None;
+    } else if resp.dragged()
+        && let Some(pointer) = resp.interact_pointer_pos()
+    {
         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
-        *share = ((preview_h + resp.drag_delta().y) / total.max(1.0)).clamp(0.1, 0.95);
+        let held = ui.data(|d| d.get_temp::<f32>(held)).unwrap_or(DIVIDER_H / 2.0);
+        // The picture as tall as puts the bar there.
+        let h = preview_h + (pointer.y - held - rect.top());
+        *share = Some(h.clamp(*heights.start(), *heights.end()) / total.max(1.0));
     }
     let active = theme_fade(ui.ctx(), "ed_divider", resp.hovered() || resp.dragged());
     let grip = Rect::from_center_size(rect.center(), Vec2::new(36.0 + 8.0 * active, 3.0));
@@ -2800,6 +2871,30 @@ fn same_edit(a: &Edit, b: &Edit) -> bool {
 /// The kept part (`start`..`end`) made `secs` long around its middle; where
 /// that runs past an end of the clip, it shifts back in (as long as the clip
 /// allows). On frames, at least one long.
+/// Where a trimmed edge goes, the pointer at `x`: past either end of the
+/// `lanes`, to that end of what's shown (`view`: its start and length, in a
+/// clip `dur` long); within them, with the pointer, as it was taken hold of
+/// (`with_pointer`). A handle sits outside its edge, so it's taken hold of a
+/// handle's width from it, and the pointer's time stops at the lanes' ends:
+/// without this, an edge could never be brought all the way to the clip's
+/// start or end.
+fn trim_edge(x: f32, lanes: Rect, (v0, span): (f64, f64), dur: f64, with_pointer: impl FnOnce() -> f64) -> f64 {
+    if x <= lanes.left() {
+        v0
+    } else if x >= lanes.right() {
+        (v0 + span).min(dur)
+    } else {
+        with_pointer()
+    }
+}
+
+/// A part's end at `t`, on a frame, but at the clip's end its own end
+/// (within half a frame of it): a clip's length isn't always a whole number
+/// of frames, and short of it, it would count as trimmed.
+fn trimmed_end(info: &media::ClipInfo, t: f64) -> f64 {
+    if t >= info.duration - info.frame_duration() / 2.0 { info.duration } else { info.snap(t) }
+}
+
 fn trim_to_length(info: &media::ClipInfo, start: f64, end: f64, secs: f64) -> (f64, f64) {
     let fd = info.frame_duration();
     let secs = secs.clamp(fd, info.duration);
@@ -2887,12 +2982,12 @@ fn put_back(parts: &[(f64, f64)], spot: Spot, duration: f64) -> Option<(Vec<(f64
     Some((parts, back))
 }
 
-/// The volume line, striped (so it reads as a control over the waveform, not
-/// part of it): faint where it's unchanged, bright with its points as
-/// diamonds where it's been changed.
-/// How a volume drag that comes this close (points) to a level it snaps to
-/// lands on it.
-const SNAP_PX: f32 = 5.0;
+/// How close a volume drag has to come to a level it snaps to (0 dB,
+/// silence, a neighbouring point's) to land on it: a pixel of the
+/// pointer's, so it only catches when it's right there. Shift's fine steps
+/// move the line a fifth as far, so on screen it's a fifth of a pixel then
+/// (they go past it, as the Sources fader's do).
+const SNAP_PX: f32 = 1.0;
 
 /// How a lane's volume line looks this frame: how much it's pointed at (0 to
 /// 1), the point pointed at or held, whether that point is held, and a level
@@ -2905,6 +3000,9 @@ struct Look {
     guide: Option<f32>,
 }
 
+/// The volume line, striped (so it reads as a control over the waveform, not
+/// part of it): faint where it's unchanged, bright with its points as
+/// diamonds where it's been changed.
 fn draw_envelope(p: &egui::Painter, pal: &crate::theme::Pal, lane: Rect, track: &media::TrackEdit, dur: f64, x_of: impl Fn(f64) -> f32, look: Look) {
     let flat = track.points.is_empty() && (track.gain - 1.0).abs() < 0.005;
     // Amber: apart from the waveform's blue-grey and the edit's white.
@@ -2978,6 +3076,33 @@ mod length_tests {
         assert_eq!(trim_to_length(&info(), 0.0, 4.0, 10.0), (0.0, 10.0));
         // Longer than the whole clip: all of it.
         assert_eq!(trim_to_length(&info(), 5.0, 10.0, 90.0), (0.0, 60.0));
+    }
+
+    /// A trimmed edge reaches the clip's very start and end: past either end
+    /// of the lanes it goes there, however far from its handle's middle it
+    /// was taken hold of; within them it follows the pointer.
+    #[test]
+    fn trimming_reaches_the_ends() {
+        let lanes = Rect::from_min_max(Pos2::new(100.0, 0.0), Pos2::new(700.0, 100.0));
+        let whole = (0.0, 60.0);
+        let pointer = || 12.5;
+        assert_eq!(trim_edge(99.0, lanes, whole, 60.0, pointer), 0.0, "past the start");
+        assert_eq!(trim_edge(100.0, lanes, whole, 60.0, pointer), 0.0);
+        assert_eq!(trim_edge(701.0, lanes, whole, 60.0, pointer), 60.0, "past the end");
+        assert_eq!(trim_edge(400.0, lanes, whole, 60.0, pointer), 12.5, "with the pointer");
+        // Zoomed in: the ends of what's shown (the view then scrolls on).
+        assert_eq!(trim_edge(50.0, lanes, (20.0, 10.0), 60.0, pointer), 20.0);
+        assert_eq!(trim_edge(750.0, lanes, (55.0, 10.0), 60.0, pointer), 60.0);
+    }
+
+    /// At the clip's end, an end is the clip's own, even when its length
+    /// isn't a whole number of frames; elsewhere, on a frame.
+    #[test]
+    fn an_end_at_the_clips_end_is_its_own() {
+        let info = media::ClipInfo { duration: 59.52, ..info() };
+        assert_eq!(trimmed_end(&info, 59.52), 59.52);
+        assert_eq!(trimmed_end(&info, 59.515), 59.52, "within half a frame");
+        assert_eq!(trimmed_end(&info, 30.01), 30.0, "on a frame");
     }
 }
 
@@ -3070,5 +3195,51 @@ mod part_tests {
         assert_eq!(put_back(&[(0.0, 5.0), (5.0, 10.0)], Spot::Split(0), 10.0), Some((vec![(0.0, 10.0)], (5.0, 5.0))));
         // Nothing trimmed off: nothing to put back.
         assert_eq!(put_back(&[(0.0, 10.0)], Spot::Before, 10.0), None);
+    }
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::*;
+
+    /// The divider moves the picture. (It used to be pinned where the
+    /// timeline fitted its lanes, whatever the divider said, with a sound
+    /// lane or two.) Down, the picture's taller and the lanes as they were
+    /// (they scroll); up, it's shorter and the lanes share what it gave up.
+    #[test]
+    fn the_divider_moves_the_picture() {
+        let (total, n, short) = (900.0, 2, 12.0);
+        let fitted = split(total, n, short, None);
+        assert_eq!((fitted.lane, fitted.cut), (AUDIO_H, false), "fitted, every lane as it starts");
+        let down = split(total, n, short, Some((fitted.picture + 40.0) / total));
+        assert!((down.picture - (fitted.picture + 40.0)).abs() < 0.01, "{} for {}", down.picture, fitted.picture + 40.0);
+        assert_eq!((down.lane, down.cut), (AUDIO_H, true), "down, the lanes short of room");
+        let up = split(total, n, short, Some((fitted.picture - 60.0) / total));
+        assert!((up.picture - (fitted.picture - 60.0)).abs() < 0.01, "{} for {}", up.picture, fitted.picture - 60.0);
+        assert!((up.lane - (AUDIO_H + 30.0)).abs() < 0.01 && !up.cut, "{}", up.lane);
+    }
+
+    /// Its ends: up, where the lanes are as tall as they grow (the timeline
+    /// never taller than its lanes); down, where the timeline has one sound
+    /// lane's room. A small window keeps the picture's least height.
+    #[test]
+    fn the_divider_stops_at_its_ends() {
+        let (total, n, short) = (900.0, 2, 12.0);
+        let top = split(total, n, short, Some(0.0));
+        assert_eq!((top.picture, top.lane), (*top.heights.start(), AUDIO_MAX_H));
+        let bottom = split(total, n, short, Some(1.0));
+        assert_eq!((bottom.picture, bottom.lane), (*bottom.heights.end(), AUDIO_H));
+        assert!(split(300.0, 4, short, Some(0.9)).picture >= MIN_PREVIEW_H);
+        // No sound lanes: nothing to grow.
+        assert_eq!(split(total, 0, short, Some(0.0)).lane, AUDIO_H);
+    }
+
+    /// Fitted with more sound lanes than fit, the picture keeps a third and
+    /// the lanes scroll.
+    #[test]
+    fn fitted_keeps_a_third_for_the_picture() {
+        let s = split(900.0, 8, 12.0, None);
+        assert!((s.picture - 300.0).abs() < 0.01, "{}", s.picture);
+        assert_eq!((s.lane, s.cut), (AUDIO_H, true));
     }
 }

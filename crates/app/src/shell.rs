@@ -643,6 +643,7 @@ impl App {
                 ("Cmd S", "Save"),
                 ("Shift Cmd S", "Save as a new clip"),
                 ("F2", "Rename"),
+                ("Esc", "Back, asking first if there are changes"),
             ],
         };
         let mut close = false;

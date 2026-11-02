@@ -170,6 +170,9 @@ struct Ready {
     wave: Arc<crate::waveform::Live>,
     /// Dragging on the timeline, and whether it was playing when the drag began.
     dragging: Option<bool>,
+    /// The drag is `HASTECLIP_DEV_DRAG`'s: no button is down, and that
+    /// doesn't end it.
+    dev_dragging: bool,
     /// Last scroll-scrub, and whether it was playing before scrolling began.
     scrolled: Option<(Instant, bool)>,
     /// `,` held down (repeating): stepping back goes as a scrub does, with
@@ -593,6 +596,7 @@ impl Ready {
             curtain,
             wave,
             dragging: None,
+            dev_dragging: false,
             scrolled: None,
             stepping_back: false,
             glide: Default::default(),
@@ -664,7 +668,6 @@ impl Ready {
         // A scroll-scrub has settled: sharpen, and carry on playing if it was.
         if let Some((at, was_playing)) = self.scrolled {
             if at.elapsed() >= SCROLL_SETTLE {
-                self.player.land();
                 self.scrolled = None;
                 self.scroll_to = None;
                 if was_playing {
@@ -674,17 +677,18 @@ impl Ready {
                 ctx.request_repaint_after(SCROLL_SETTLE);
             }
         }
-        match dev_drag() {
+        match dev_drag(&ctx) {
             Some(Some(t)) => {
                 if self.dragging.is_none() {
                     self.dragging = Some(self.player.is_playing());
                     self.player.pause();
                 }
+                self.dev_dragging = true;
                 self.seek(t);
                 ctx.request_repaint();
             }
             Some(None) => {
-                self.player.land();
+                self.dev_dragging = false;
                 if self.dragging.take() == Some(true) {
                     self.play();
                 }
@@ -717,11 +721,6 @@ impl Ready {
         let scrubbing = self.dragging.is_some() || self.scrolled.is_some();
 
         self.player.set_stepping(self.stepping_back);
-        // Scrubbing the playhead: held still, the picture stays, and letting
-        // go lands on it, if it's within a dozen pixels of the timeline (the
-        // width of the picture, near enough).
-        let reach = (12.0 * self.info.duration / preview.width().max(1.0) as f64).min(0.5);
-        self.player.set_landing(scrubbing.then_some(reach));
         let size = self.player.update(&ctx, scrubbing);
         if size.is_some() {
             self.curtain = None;
@@ -929,12 +928,8 @@ impl Ready {
         {
             self.seek(t_of(pos.x));
         }
-        if self.dragging.is_some() && !ui.input(|i| i.pointer.primary_down()) {
-            // On the frame you see, not one decoded after.
-            self.player.land();
-            if self.dragging.take() == Some(true) {
-                self.play();
-            }
+        if self.dragging.is_some() && !self.dev_dragging && !ui.input(|i| i.pointer.primary_down()) && self.dragging.take() == Some(true) {
+            self.play();
         }
     }
 
@@ -1204,8 +1199,9 @@ fn dev_wheel() -> f32 {
 /// from 10 s to 20 s of the clip between 4 and 6 s after start, then from
 /// 30 s back to 25 s, as the mouse would, to reproduce drag scrubbing
 /// without touching the mouse. `Some(Some(t))`: dragging to `t` now;
-/// `Some(None)`: a drag just ended.
-fn dev_drag() -> Option<Option<f64>> {
+/// `Some(None)`: a drag just ended. Wakes the UI for the next drag (paused,
+/// nothing else may redraw it).
+fn dev_drag(ctx: &egui::Context) -> Option<Option<f64>> {
     type Plan = (Vec<[f64; 4]>, bool);
     static PLAN: std::sync::OnceLock<std::sync::Mutex<Plan>> = std::sync::OnceLock::new();
     let plan = PLAN.get_or_init(|| {
@@ -1229,6 +1225,9 @@ fn dev_drag() -> Option<Option<f64>> {
         return None;
     }
     let now = crate::player::uptime();
+    if let Some(next) = plan.0.iter().map(|s| s[0]).filter(|&t0| t0 > now).reduce(f64::min) {
+        ctx.request_repaint_after(std::time::Duration::from_secs_f64(next - now));
+    }
     if let Some(&[t0, t1, a, b]) = plan.0.iter().find(|s| s[0] <= now && now < s[1]) {
         plan.1 = true;
         return Some(Some(a + (b - a) * (now - t0) / (t1 - t0).max(1e-3)));

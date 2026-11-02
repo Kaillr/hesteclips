@@ -1865,7 +1865,7 @@ impl App {
             return;
         }
         self.listen_as_set();
-        self.editor = Some(editor::Editor::open(&self.ctx(), &clip, self.settings.editor_preview_share, self.settings.editor_snap, from, handoff));
+        self.editor = Some(editor::Editor::open(&self.ctx(), &clip, self.settings.editor_picture_share, self.settings.editor_snap, from, handoff));
         self.page = Page::Edit;
     }
 
@@ -2010,7 +2010,7 @@ impl App {
             return;
         };
         let outcome = ed.ui(ui, self.settings.delete_permanently);
-        self.settings.editor_preview_share = ed.preview_share();
+        self.settings.editor_picture_share = ed.preview_share();
         self.settings.editor_snap = ed.snap();
         if let Some((volume, muted)) = viewer::volume(ui.ctx()) {
             (self.settings.player_volume, self.settings.player_muted) = (volume, muted);

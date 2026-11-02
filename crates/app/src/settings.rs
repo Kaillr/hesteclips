@@ -982,8 +982,10 @@ pub struct RecordSettings {
     /// The sound played when a clip (or a screenshot) is saved.
     pub save_sound: SaveSound,
     /// The editor's preview height, as a share of the window (the timeline
-    /// gets the rest), as last dragged.
-    pub editor_preview_share: f32,
+    /// gets the rest), as last dragged; none: fitted, the timeline as tall
+    /// as its lanes need. (It was `editor_preview_share`, from a divider
+    /// that barely moved: what that says isn't anyone's choice.)
+    pub editor_picture_share: Option<f32>,
     /// The editor's snapping (the magnet, N): trim edges and the playhead
     /// snap to each other, the clip's ends and its moments. Off unless you
     /// turn it on (it caught on kills while trimming), then kept as you left it.
@@ -1053,7 +1055,7 @@ impl Default for RecordSettings {
             copy_screenshots: true,
             shortcuts: Shortcuts::default(),
             save_sound: SaveSound::default(),
-            editor_preview_share: 0.5,
+            editor_picture_share: None,
             editor_snap: false,
             player_volume: 1.0,
             player_muted: false,
