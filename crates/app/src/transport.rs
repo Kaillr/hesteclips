@@ -469,12 +469,23 @@ pub fn muted_note(ui: &mut egui::Ui, picture: Rect) {
 
 /// A slim slider: a track filled to `value` (0..=1) and a round knob.
 pub fn slider(ui: &mut egui::Ui, value: &mut f32, width: f32) -> egui::Response {
+    stepped_slider(ui, value, width, 0)
+}
+
+/// Most stops a slider shows as marks on its track: more are too close.
+const MARKED_STOPS: u32 = 24;
+
+/// [`slider`] that snaps to `stops` even steps (0 for none): the knob
+/// jumps from one to the next as it's dragged, and up to a couple of dozen
+/// show as marks on the track.
+pub fn stepped_slider(ui: &mut egui::Ui, value: &mut f32, width: f32, stops: u32) -> egui::Response {
     let p = theme::pal(ui);
+    let snap = |v: f32| if stops == 0 { v } else { (v * stops as f32).round() / stops as f32 };
     let (rect, mut resp) = ui.allocate_exact_size(vec2(width, 20.0), Sense::click_and_drag());
     if let Some(pos) = resp.interact_pointer_pos()
         && (resp.dragged() || resp.clicked() || resp.drag_started())
     {
-        let v = ((pos.x - rect.left() - 7.0) / (rect.width() - 14.0)).clamp(0.0, 1.0);
+        let v = snap(((pos.x - rect.left() - 7.0) / (rect.width() - 14.0)).clamp(0.0, 1.0));
         if v != *value {
             *value = v;
             resp.mark_changed();
@@ -485,6 +496,15 @@ pub fn slider(ui: &mut egui::Ui, value: &mut f32, width: f32) -> egui::Response 
     ui.painter().rect_filled(track, 2, p.control_h);
     let x = track.left() + track.width() * value.clamp(0.0, 1.0);
     ui.painter().rect_filled(Rect::from_min_max(track.min, Pos2::new(x, track.bottom())), 2, theme::mix(p.text2, p.text, hv));
+    // Where it can stop, past the knob's end of the fill (where it shows).
+    if (1..=MARKED_STOPS).contains(&stops) {
+        for i in 0..=stops {
+            let at = track.left() + track.width() * i as f32 / stops as f32;
+            if at > x + 1.0 {
+                ui.painter().circle_filled(Pos2::new(at, track.center().y), 1.5, p.text3);
+            }
+        }
+    }
     let k = 7.0 + hv;
     ui.painter().circle_filled(Pos2::new(x, rect.center().y + 1.0), k, Color32::from_black_alpha(60));
     ui.painter().circle_filled(Pos2::new(x, rect.center().y), k, Color32::WHITE);

@@ -869,7 +869,9 @@ fn control_widget(ui: &mut egui::Ui, c: &CameraControl, set: &mut Vec<(u32, i64)
             ui.add_sized([46.0, 20.0], egui::Label::new(theme::text(&shown, 12.5, W::Regular).color(pal.text3)));
             let span = (max - min).max(1) as f32;
             let mut v = (c.value - min) as f32 / span;
-            let slider = crate::transport::slider(ui, &mut v, 150.0);
+            // On the camera's own steps (focus goes by 5 on a C922).
+            let stops = u32::try_from((max - min) / step.max(&1)).unwrap_or(0);
+            let slider = crate::transport::stepped_slider(ui, &mut v, 150.0, stops);
             if slider.changed() {
                 let raw = *min as f32 + v * span;
                 let stepped = (min + ((raw - *min as f32) / *step as f32).round() as i64 * step).clamp(*min, *max);
@@ -1316,6 +1318,9 @@ fn exposure_guides(fps: f32) -> (i64, i64) {
 /// where lights' flicker leaves no bands, found by eye; the slider; its time in ms.
 fn exposure_widget(ui: &mut egui::Ui, c: &CameraControl, set: &mut Vec<(u32, i64)>) {
     use crate::theme::{self, W};
+    if let ControlKind::Menu(times) = &c.kind {
+        return exposure_steps(ui, c, times, set);
+    }
     let ControlKind::Int { min, max, step } = c.kind else { return control_widget(ui, c, set) };
     let pal = theme::pal(ui);
     // Right to left: the time, +, the slider, −.
@@ -1348,6 +1353,41 @@ fn exposure_widget(ui: &mut egui::Ui, c: &CameraControl, set: &mut Vec<(u32, i64
     {
         set.push((c.id, v));
     }
+}
+
+/// The exposure time as a slider over the few times a camera has (Windows:
+/// every doubling, as its driver offers them; no finer time can be set),
+/// as the slider over a continuous one looks: the time, +, the slider, −.
+fn exposure_steps(ui: &mut egui::Ui, c: &CameraControl, times: &[(i64, String)], set: &mut Vec<(u32, i64)>) {
+    use crate::theme::{self, W};
+    let pal = theme::pal(ui);
+    let last = times.len().saturating_sub(1);
+    let at = times.iter().position(|(v, _)| *v == c.value);
+    let label = at.map_or_else(|| c.value.to_string(), |i| times[i].1.clone());
+    ui.add_sized([56.0, 20.0], egui::Label::new(theme::text(&label, 12.5, W::Regular).color(pal.text3)));
+    let mut go = |i: usize| {
+        if Some(i) != at
+            && let Some((v, _)) = times.get(i)
+        {
+            set.push((c.id, *v));
+        }
+    };
+    let i = at.unwrap_or(0);
+    if crate::ui_kit::Btn::icon(crate::ui_kit::Kind::Ghost, egui_phosphor::regular::PLUS).small().enabled(i < last).tip("Longer").show(ui).clicked() {
+        go((i + 1).min(last));
+    }
+    let mut v = if last == 0 { 0.0 } else { i as f32 / last as f32 };
+    let slider = crate::transport::stepped_slider(ui, &mut v, 130.0, last as u32);
+    if slider.changed() {
+        go((v * last as f32).round() as usize);
+    }
+    if let Some(d) = arrow_steps(ui, &slider) {
+        go((i as i64 + d).clamp(0, last as i64) as usize);
+    }
+    if crate::ui_kit::Btn::icon(crate::ui_kit::Kind::Ghost, egui_phosphor::regular::MINUS).small().enabled(i > 0).tip("Shorter").show(ui).clicked() {
+        go(i.saturating_sub(1));
+    }
+    slider.on_hover_text("Each step doubles the time");
 }
 
 /// How steep the exposure slider's curve is: near linear at the bottom (the
@@ -1726,9 +1766,9 @@ fn controls_view(ui: &mut egui::Ui, panel: &CameraPanel, fps: Option<f32>, set: 
                                 if m.id == cid::EXPOSURE {
                                     let tip = fps.map(|fps| {
                                         let (half, whole) = exposure_guides(fps);
-                                        // A list of times (Windows has them in doublings), or a slider.
+                                        // Windows has only the doublings: Flicker does the rest.
                                         let lamps = if matches!(m.kind, ControlKind::Menu(_)) {
-                                            "Under lamps, pick the time where no bands roll through the picture, or set Flicker to your mains frequency."
+                                            "Under lamps, step it with − and + (or ← and →) to where no bands roll through the picture; Windows only has every doubling of the time, so setting Flicker to your mains frequency may be what does it."
                                         } else {
                                             "Under lamps, step it with − and + (or ← and →) to where no bands roll through the picture."
                                         };
