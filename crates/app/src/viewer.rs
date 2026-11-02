@@ -79,9 +79,6 @@ pub struct Nav {
     pub delete_label: String,
     /// The clip's edit being saved, 0..=1.
     pub saving: Option<f32>,
-    /// What's kept beside the clip, in bytes: an edited clip's original
-    /// (0: none, so nothing to free up).
-    pub kept: u64,
     /// The clip has a share link.
     pub linked: bool,
     /// How its link is, for the header: icon, words and what they mean.
@@ -509,15 +506,7 @@ impl Viewer {
                     if Item::new(if image { "Open in another app" } else { "Open in another player" }).icon(icon::ARROW_SQUARE_OUT).show(ui).clicked() {
                         out = ViewerOutcome::OpenExternal;
                     }
-                    // An edited clip keeps its original beside it.
-                    if nav.kept > 0
-                        && Item::new("Free up space…")
-                            .icon(icon::HARD_DRIVE)
-                            .enabled(ready)
-                            .tip(format!("Its original recording takes {}: trim it to what the edit uses, or delete it", crate::export_ui::human_bytes(nav.kept)))
-                            .show(ui)
-                            .clicked()
-                    {
+                    if !image && Item::new("Free up space…").icon(icon::HARD_DRIVE).enabled(ready).tip(crate::library_view::FREE_UP_TIP).show(ui).clicked() {
                         out = ViewerOutcome::FreeUp;
                     }
                     crate::ui_kit::menu_sep(ui);

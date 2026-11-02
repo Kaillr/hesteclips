@@ -15,7 +15,7 @@ use egui::{Align2, Color32, FontId, Pos2, Rect, vec2};
 
 use crate::settings::{self, Container, Encoder, OutputResolution, ShortcutAction};
 use crate::theme::{self, W, icon};
-use crate::ui_kit::{self, Btn, Item, Kind, Row, Seg, Typed, ValueField};
+use crate::ui_kit::{self, Btn, Choice, ChoiceField, Chosen, Item, Kind, Preset, Row, Seg, ValueField};
 use crate::{App, Page, RecState, reveal_label, shortcuts};
 
 /// Replay lengths offered as one-click choices (seconds).
@@ -873,16 +873,18 @@ impl App {
     /// The clip length: type any length (digits fill the clock: "230" is 2:30)
     /// or pick one.
     fn length_field(&mut self, ui: &mut egui::Ui) {
-        let secs = self.settings.replay_seconds;
-        let presets: Vec<(String, String, String)> = REPLAY_CHOICES.iter().map(|&s| (length_words(s), clock_label(s), String::new())).collect();
-        let current = REPLAY_CHOICES.iter().position(|&s| s == secs);
-        let field = ValueField { id: egui::Id::new("vf_length"), text: clock_label(secs), unit: "", width: 116.0, hint: "Type the digits: 230 is 2:30. ↑ ↓ change the part chosen", presets, current, range: "5 s – 1 h" };
-        match field.show_time(ui, f64::from(secs), 5.0, 3600.0) {
-            Typed::Preset(i) => self.settings.replay_seconds = REPLAY_CHOICES[i],
-            Typed::Secs(v) if (5.0..=3600.0).contains(&v.round()) => self.settings.replay_seconds = v.round() as u32,
-            Typed::Secs(v) => self.toast_error(format!("{} isn't a length from 5 seconds to an hour", length_words(v.round() as u32))),
-            Typed::Text(t) => self.toast_error(format!("“{}” isn't a length from 5 seconds to an hour", t.trim())),
-            Typed::None => {}
+        let field = ValueField {
+            id: egui::Id::new("vf_length"),
+            value: f64::from(self.settings.replay_seconds),
+            decimals: 0,
+            range: 5.0..=3600.0,
+            unit: "",
+            width: 116.0,
+            hint: "Type the digits: 230 is 2:30. ↑ ↓ change the part chosen",
+            presets: REPLAY_CHOICES.iter().map(|&s| Preset::new(length_words(s), f64::from(s))).collect(),
+        };
+        if let Some(v) = field.show_time(ui) {
+            self.settings.replay_seconds = v.round() as u32;
         }
     }
 
@@ -947,22 +949,20 @@ impl App {
         let fps = self.settings.fps;
         let hz = capture::display_refresh(&self.video_source());
         let choices = settings::fps_choices(hz);
-        let presets: Vec<(String, String, String)> = choices
-            .iter()
-            .map(|&f| (format!("{f} fps"), f.to_string(), hz.filter(|hz| f > *hz).map_or(String::new(), |hz| format!("above {hz} Hz"))))
-            .collect();
-        let current = choices.iter().position(|&f| f == fps);
         let max = settings::MAX_FPS;
-        let hint = format!("Type any frame rate from 10 to {max}");
-        let range = format!("10–{max}");
-        let field = ValueField { id: egui::Id::new("vf_fps"), text: fps.to_string(), unit: "fps", width: 104.0, hint: &hint, presets, current, range: &range };
-        match field.show(ui) {
-            Typed::Preset(i) => self.settings.fps = choices[i],
-            Typed::Text(t) => match t.trim().trim_end_matches("fps").trim().parse::<u32>() {
-                Ok(v) if (10..=max).contains(&v) => self.settings.fps = v,
-                _ => self.toast_error(format!("“{}” isn't a frame rate from 10 to {max}", t.trim())),
-            },
-            Typed::None | Typed::Secs(_) => {}
+        let hint = format!("Any frame rate from 10 to {max}");
+        let field = ValueField {
+            id: egui::Id::new("vf_fps"),
+            value: f64::from(fps),
+            decimals: 0,
+            range: 10.0..=f64::from(max),
+            unit: "fps",
+            width: 104.0,
+            hint: &hint,
+            presets: choices.iter().map(|&f| Preset::new(format!("{f} fps"), f64::from(f)).note(hz.filter(|hz| f > *hz).map_or(String::new(), |hz| format!("above {hz} Hz")))).collect(),
+        };
+        if let Some(v) = field.show(ui) {
+            self.settings.fps = v as u32;
         }
     }
 
@@ -973,21 +973,16 @@ impl App {
         let presets: Vec<(&str, u32)> = rec.map_or(Vec::new(), |r| vec![("Smaller", round_mbps(r as f64 * 0.5)), ("Balanced", r), ("High", round_mbps(r as f64 * 2.0))]);
         let field = ValueField {
             id: egui::Id::new("vf_mbps"),
-            text: mbps.to_string(),
+            value: f64::from(mbps),
+            decimals: 0,
+            range: 1.0..=300.0,
             unit: "Mbps",
             width: 104.0,
-            hint: "Type any bitrate from 1 to 300 Mbps",
-            presets: presets.iter().map(|(n, m)| (n.to_string(), m.to_string(), format!("{m} Mbps"))).collect(),
-            current: preset,
-            range: "1–300",
+            hint: "Any bitrate from 1 to 300 Mbps",
+            presets: presets.iter().map(|&(n, m)| Preset::new(n, f64::from(m)).note(format!("{m} Mbps"))).collect(),
         };
-        match field.show(ui) {
-            Typed::Preset(i) => self.settings.video_bitrate_mbps = presets[i].1,
-            Typed::Text(t) => match t.trim().trim_end_matches("Mbps").trim().parse::<f64>() {
-                Ok(v) if (1.0..=300.0).contains(&v) => self.settings.video_bitrate_mbps = v.round() as u32,
-                _ => self.toast_error(format!("“{}” isn't a bitrate from 1 to 300 Mbps", t.trim())),
-            },
-            Typed::None | Typed::Secs(_) => {}
+        if let Some(v) = field.show(ui) {
+            self.settings.video_bitrate_mbps = v as u32;
         }
         if !presets.is_empty() {
             let opts: Vec<Seg> = presets.iter().map(|(n, _)| Seg { icon: None, label: n, tip: None }).collect();
@@ -997,6 +992,9 @@ impl App {
         }
     }
 
+    /// Frame blending: Off, or one of the rates it can capture at, picked.
+    /// They're whole multiples of the frame rate, so there's nothing of your
+    /// own to type.
     fn blend_field(&mut self, ui: &mut egui::Ui, choices: &[u32]) {
         let fps = self.settings.fps;
         let samples = self.settings.blend_samples();
@@ -1005,37 +1003,14 @@ impl App {
             self.settings.blend_fps = fps * samples;
         }
         let used = choices.iter().copied().filter(|&r| r <= fps * samples).max().filter(|_| samples > 1);
-        let mut presets = vec![("Off".to_owned(), "Off".to_owned(), String::new())];
-        presets.extend(choices.iter().map(|r| (format!("From {r} fps"), r.to_string(), String::new())));
-        let current = match used {
-            None => Some(0),
-            Some(r) => choices.iter().position(|c| *c == r).map(|i| i + 1),
-        };
-        let text = used.map_or("Off".to_owned(), |r| r.to_string());
-        let unit = if used.is_some() { "fps" } else { "" };
-        let field = ValueField { id: egui::Id::new("vf_blend"), text, unit, width: 104.0, hint: "Type a capture rate (a multiple of the frame rate), or Off", presets, current, range: "" };
-        match field.show(ui) {
-            Typed::Preset(0) => self.settings.blend_fps = 0,
-            Typed::Preset(i) => self.settings.blend_fps = choices[i - 1],
-            Typed::Text(t) => {
-                let t = t.trim().trim_end_matches("fps").trim();
-                if t.to_lowercase().starts_with('o') || t == "0" {
-                    self.settings.blend_fps = 0;
-                } else {
-                    match t.parse::<u32>() {
-                        Ok(v) if choices.contains(&v) => self.settings.blend_fps = v,
-                        Ok(v) => match choices.iter().copied().min_by_key(|c| c.abs_diff(v)) {
-                            Some(c) => {
-                                self.settings.blend_fps = c;
-                                self.toast_icon(icon::INFO, format!("Blending goes in steps of the frame rate: {c} fps"));
-                            }
-                            None => self.toast_error("Blending needs a lower frame rate on this display"),
-                        },
-                        Err(_) => self.toast_error(format!("“{t}” isn't a capture rate")),
-                    }
-                }
-            }
-            Typed::None | Typed::Secs(_) => {}
+        let mut list = vec![Choice::new("Off")];
+        list.extend(choices.iter().map(|r| Choice::new(format!("From {r} fps"))));
+        let now = used.and_then(|r| choices.iter().position(|c| *c == r)).map_or(0, |i| i + 1);
+        let field = ChoiceField { id: "vf_blend", choices: list, custom: None, width: 150.0 };
+        match field.show(ui, Some(now), 0) {
+            Some(Chosen::Choice(0)) => self.settings.blend_fps = 0,
+            Some(Chosen::Choice(i)) => self.settings.blend_fps = choices[i - 1],
+            _ => {}
         }
     }
 
@@ -1646,13 +1621,8 @@ pub(crate) fn length_words(secs: u32) -> String {
     if parts.is_empty() { "0 seconds".into() } else { parts.join(" ") }
 }
 
-/// A length as minutes and seconds ("2:30"), for the typed-in value.
-fn clock_label(secs: u32) -> String {
-    format!("{}:{:02}", secs / 60, secs % 60)
-}
-
 /// A bitrate rounded to something readable: whole Mbps under 20, else to 5.
-fn round_mbps(mbps: f64) -> u32 {
+pub(crate) fn round_mbps(mbps: f64) -> u32 {
     if mbps < 20.0 { (mbps.round() as u32).max(2) } else { ((mbps / 5.0).round() * 5.0) as u32 }
 }
 
@@ -1662,9 +1632,6 @@ mod length_tests {
 
     #[test]
     fn typed_lengths() {
-        assert_eq!(clock_label(30), "0:30");
-        assert_eq!(clock_label(1200), "20:00");
-        assert_eq!(clock_label(75), "1:15");
         assert_eq!(length_words(150), "2 minutes 30 seconds");
         assert_eq!(length_words(3600), "1 hour");
         assert_eq!(length_words(1), "1 second");

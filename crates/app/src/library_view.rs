@@ -32,6 +32,8 @@ use crate::library_grid::{DAY_H, GridItem};
 /// The window is too narrow for the panel below this page width: its list
 /// moves into a menu on the title (Settings' too).
 pub(crate) const PANEL_FROM: f32 = 700.0;
+/// What Free up space does, on its button and menu items.
+pub(crate) const FREE_UP_TIP: &str = "Trim or delete original recordings kept for edits, or make clips smaller by encoding them again";
 /// How long a freshly saved clip has its dot.
 const NEW_FOR: Duration = Duration::from_secs(60 * 30);
 
@@ -1070,7 +1072,7 @@ impl App {
         let when = clip.captured_at().format("Saved %-d %B at %H:%M").to_string();
         let size_tip = if clip.kept_bytes > 0 {
             format!(
-                "{when}\n{} in all: {} for the clip, and {} for its original recording, kept so the edit can be changed or undone. Right-click → Free up space trims or deletes it.",
+                "{when}\n{} in all: {} for the clip, and {} for its original recording, kept so the edit can be changed or undone. Right-click → Free up space to trim or delete it.",
                 clips::human_bytes(clip.size_bytes + clip.kept_bytes),
                 clip.human_size(),
                 clips::human_bytes(clip.kept_bytes),
@@ -1134,9 +1136,8 @@ impl App {
             {
                 action = Some(Action::Export(paths.clone()));
             }
-            let kept: u64 = self.clips.iter().filter(|c| self.selection.paths.contains(&c.path)).map(|c| c.kept_bytes).sum();
-            if kept > 0
-                && Item::new("Free up space…").icon(icon::HARD_DRIVE).tip(format!("Their original recordings take {}: trim them to what the edits use, or delete them", clips::human_bytes(kept))).show(ui).clicked()
+            if !paths.iter().all(|p| clips::is_image(p))
+                && Item::new("Free up space…").icon(icon::HARD_DRIVE).tip(FREE_UP_TIP).show(ui).clicked()
             {
                 action = Some(Action::FreeUp(paths.clone()));
             }
@@ -1193,10 +1194,7 @@ impl App {
         if Item::new(if selected { "Deselect" } else { "Select" }).icon(icon::CHECK_CIRCLE).show(ui).clicked() {
             action = Some(Action::Select { path: clip.path.clone(), range: false });
         }
-        // An edited clip keeps its original beside it.
-        if clip.kept_bytes > 0
-            && Item::new("Free up space…").icon(icon::HARD_DRIVE).tip(format!("Its original recording takes {}: trim it to what the edit uses, or delete it", clips::human_bytes(clip.kept_bytes))).show(ui).clicked()
-        {
+        if !image && Item::new("Free up space…").icon(icon::HARD_DRIVE).tip(FREE_UP_TIP).show(ui).clicked() {
             action = Some(Action::FreeUp(vec![clip.path.clone()]));
         }
         ui_kit::menu_sep(ui);
@@ -1322,17 +1320,8 @@ impl App {
                                     }
                                 });
                             }
-                            // Edited clips among them keep their originals.
-                            let (kept, with) = self.clips.iter().filter(|c| self.selection.paths.contains(&c.path) && c.kept_bytes > 0).fold((0, 0), |(b, n), c| (b + c.kept_bytes, n + 1));
-                            if with > 0 {
-                                let tip = match (n, with) {
-                                    (1, _) => format!("Its original recording takes {}: trim it to what the edit uses, or delete it", clips::human_bytes(kept)),
-                                    (_, 1) => format!("One of them keeps its original recording ({}): trim it to what the edit uses, or delete it", clips::human_bytes(kept)),
-                                    _ => format!("{with} of them keep their original recordings ({}): trim them to what the edits use, or delete them", clips::human_bytes(kept)),
-                                };
-                                if Btn::ghost("Free up space").with_icon(icon::HARD_DRIVE).small().tip(tip).show(ui).clicked() {
-                                    action = Some(Action::FreeUp(selected.clone()));
-                                }
+                            if !selected.iter().all(|p| clips::is_image(p)) && Btn::ghost("Free up space").with_icon(icon::HARD_DRIVE).small().tip(FREE_UP_TIP).show(ui).clicked() {
+                                action = Some(Action::FreeUp(selected.clone()));
                             }
                             let label = if self.settings.delete_permanently { format!("Delete {n}") } else { format!("Move {n} to {}", crate::store::bin_name()) };
                             if Btn::new(Kind::DangerText, label).with_icon(icon::TRASH).small().show(ui).clicked() {
@@ -1439,6 +1428,8 @@ pub fn search_field(ui: &mut egui::Ui, id: &str, text: &mut String, hint: &str) 
     let right_w = if text.is_empty() { ui_kit::key_hint_width(ui, &crate::shortcuts::command("F"), 11.0) + 6.0 } else { 26.0 };
     let field = Rect::from_min_max(Pos2::new(rect.left() + 28.0, rect.top()), Pos2::new(rect.right() - right_w - 4.0, rect.bottom()));
     let mut fui = ui.new_child(egui::UiBuilder::new().max_rect(field).layout(egui::Layout::left_to_right(egui::Align::Center)));
+    // Free text: a search.
+    #[allow(clippy::disallowed_methods)]
     let out = egui::TextEdit::singleline(text)
         .id(id)
         .frame(egui::Frame::NONE)

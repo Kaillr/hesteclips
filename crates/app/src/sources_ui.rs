@@ -1702,6 +1702,8 @@ fn name_field(ui: &mut egui::Ui, id: egui::Id, name: &mut String, font: egui::Fo
     if opening {
         ui.data_mut(|d| d.insert_temp(was_id, name.clone()));
     }
+    // Free text: a name.
+    #[allow(clippy::disallowed_methods)]
     let r = ui.add(egui::TextEdit::singleline(name).id(id).font(font).desired_width(width));
     if opening {
         r.request_focus();
@@ -2034,6 +2036,9 @@ fn volume_value(ui: &mut egui::Ui, db: &mut f32, start: bool, id: &str) {
             let unit = ui.painter().layout_no_wrap("dB".to_owned(), font.clone(), pal.text3);
             let field = egui::Rect::from_min_max(r.left_top() + egui::vec2(5.0, 0.0), egui::pos2(r.right() - 6.0 - unit.size().x - 4.0, r.bottom()));
             let mut fui = ui.new_child(egui::UiBuilder::new().max_rect(field).layout(egui::Layout::right_to_left(egui::Align::Center)));
+            // A volume as it's said: "-7.5", "+3", "4,5 dB", and "−∞" or
+            // "-inf" for silence (read by `parse_db`, #26).
+            #[allow(clippy::disallowed_methods)]
             let out = egui::TextEdit::singleline(text)
                 .id(edit_id)
                 .frame(egui::Frame::NONE)

@@ -6,6 +6,9 @@
 //! Settings is a separate page you rarely visit, reached from the gear.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // no console window on release Windows
+// egui's own inputs, turned away by clippy.toml: values are entered with
+// ui_kit's controls ("Inputs guide" in ui_kit.rs).
+#![deny(clippy::disallowed_methods, clippy::disallowed_types)]
 
 mod app_icons;
 mod archive;
@@ -1931,7 +1934,6 @@ impl App {
             collections,
             delete_label,
             saving,
-            kept: self.clips.iter().find(|c| c.path == v.clip()).map_or(0, |c| c.kept_bytes),
             linked: self.links.get(v.clip()).is_some(),
             link,
         };
@@ -2046,7 +2048,7 @@ impl App {
                 // Closed first: the editor reads the original (about to
                 // change, so nothing of it is handed on).
                 self.close_editor(false);
-                self.start_free_up(vec![target], how);
+                self.free_up_original(target, how);
             }
         }
     }
@@ -2078,29 +2080,21 @@ impl App {
     }
 
     /// Render an edit in the background. `new_name`: save as a separate clip with
-    /// that name instead of updating this clip's edit.
+    /// that name instead of updating this clip's edit. `then`: once it's
+    /// saved, free up the space the original takes this way.
     fn start_render(&mut self, target: store::EditTarget, info: media::ClipInfo, edit: media::Edit, new_name: Option<String>, then: Option<store::FreeUp>) {
         let ext = target.clip.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or("mp4".into());
-        // In place: render into the clip's asset folder, then swap it in (see
-        // `store::commit_render`). As new: straight to the new file, no history.
-        let (dest, clip_id) = match &new_name {
-            None => {
-                let clip_id = target.id.clone().unwrap_or_else(store::new_id);
-                let staged = store::staging_path(target.library(), &clip_id, &ext);
-                if let Err(e) = store::create_assets_dir(target.library(), &clip_id) {
-                    self.toast_error(format!("Couldn't save the edit: {e}"));
-                    return;
-                }
-                (staged, Some(clip_id))
-            }
-            // Next to the clip, in the same game's folder.
+        // As new: straight to the new file, no history, next to the clip in
+        // the same game's folder. In place: see `render_in_place`.
+        let new_dest = match &new_name {
+            None => None,
             Some(name) => match clips::path_for_name(target.clip.parent().unwrap_or(target.library()), name, &ext, None) {
                 // Another render that isn't done yet may be making it.
                 Ok(p) if self.renders.iter().any(|j| j.dest == p) => {
                     self.toast_error("A clip with that name is already being saved.");
                     return;
                 }
-                Ok(p) => (p, None),
+                Ok(p) => Some(p),
                 Err(e) => {
                     self.toast_error(e);
                     return;
@@ -2113,41 +2107,30 @@ impl App {
         self.renders.push(RenderJob {
             id,
             source: target.clip.clone(),
-            dest: if new_name.is_some() { dest.clone() } else { target.clip.clone() },
-            as_new: new_name.is_some(),
+            dest: new_dest.clone().unwrap_or_else(|| target.clip.clone()),
+            as_new: new_dest.is_some(),
             progress: progress.clone(),
         });
         let tx = self.render_tx.clone();
         let ctx = self.ctx();
-        // When the clip was made: the saved edit (or new clip) keeps it, so it
-        // stays on its day in the library instead of jumping to today.
-        let made = std::fs::metadata(&target.clip).and_then(|m| m.modified()).ok();
         let permanently = self.settings.delete_permanently;
         std::thread::spawn(move || {
             let report = |f: f32| {
                 progress.store(f.to_bits(), std::sync::atomic::Ordering::Relaxed);
                 ctx.request_repaint();
             };
-            let rendered = media::render_with_progress(&target.source, &info, &edit, &dest, clip_id.as_deref(), report).map_err(|e| e.to_string());
-            let result = match &clip_id {
-                None => rendered.map(|()| {
-                    // A new clip of part of this one: the moments in that part.
-                    moments::rebase(&target.clip, &dest, info.duration, &edit.kept());
-                    dest
-                }),
-                Some(clip_id) => {
-                    let committed = rendered.and_then(|()| store::commit_render(&target, &dest, clip_id, &edit).map_err(|e| e.to_string()));
-                    if committed.is_err() {
-                        store::abandon_render(target.library(), clip_id, &dest);
-                    }
-                    committed.map(|()| target.clip.clone())
+            let result = match &new_dest {
+                None => render_in_place(&target, &info, &edit, report),
+                Some(dest) => {
+                    let made = std::fs::metadata(&target.clip).and_then(|m| m.modified()).ok();
+                    media::render_with_progress(&target.source, &info, &edit, dest, None, report).map_err(|e| e.to_string()).map(|()| {
+                        // A new clip of part of this one: the moments in that part.
+                        moments::rebase(&target.clip, dest, info.duration, &edit.kept());
+                        keep_date(dest, made);
+                        dest.clone()
+                    })
                 }
             };
-            if let (Ok(path), Some(made)) = (&result, made) {
-                if let Err(e) = std::fs::File::options().write(true).open(path).and_then(|f| f.set_modified(made)) {
-                    eprintln!("couldn't keep the clip's date on {}: {e}", path.display());
-                }
-            }
             // Saved: now the original it keeps can be trimmed or deleted.
             let freed = match (&result, then) {
                 (Ok(_), Some(how)) => Some((how, store::free_up(&store::EditTarget::of(&target.clip), how, permanently))),
@@ -2233,6 +2216,36 @@ pub(crate) struct RenderJob {
 impl RenderJob {
     pub fn progress(&self) -> f32 {
         f32::from_bits(self.progress.load(std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+/// Render `edit` of `target` over the clip: into its asset folder, then
+/// swapped in, the recording kept beside it as its original (see
+/// `store::commit_render`); a failed render leaves the clip as it was. The
+/// clip keeps its date, so it stays on its day in the library. The clip,
+/// once it's done.
+pub(crate) fn render_in_place(target: &store::EditTarget, info: &media::ClipInfo, edit: &media::Edit, report: impl Fn(f32)) -> Result<PathBuf, String> {
+    let ext = target.clip.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or("mp4".into());
+    let clip_id = target.id.clone().unwrap_or_else(store::new_id);
+    store::create_assets_dir(target.library(), &clip_id).map_err(|e| e.to_string())?;
+    let staged = store::staging_path(target.library(), &clip_id, &ext);
+    let made = std::fs::metadata(&target.clip).and_then(|m| m.modified()).ok();
+    let rendered = media::render_with_progress(&target.source, info, edit, &staged, Some(&clip_id), report).map_err(|e| e.to_string());
+    let committed = rendered.and_then(|()| store::commit_render(target, &staged, &clip_id, edit).map_err(|e| e.to_string()));
+    if committed.is_err() {
+        store::abandon_render(target.library(), &clip_id, &staged);
+    }
+    committed?;
+    keep_date(&target.clip, made);
+    Ok(target.clip.clone())
+}
+
+/// Give `path` back the modified time `made` (when the clip was made).
+fn keep_date(path: &std::path::Path, made: Option<std::time::SystemTime>) {
+    if let Some(made) = made
+        && let Err(e) = std::fs::File::options().write(true).open(path).and_then(|f| f.set_modified(made))
+    {
+        eprintln!("couldn't keep the clip's date on {}: {e}", path.display());
     }
 }
 

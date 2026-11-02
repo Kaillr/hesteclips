@@ -1198,6 +1198,9 @@ impl Ready {
             }
             Some(text) => {
                 ui.painter().rect_filled(rect, 5, pal.control);
+                // A number of frames: only digits go in.
+                crate::ui_kit::keep_to_number(ui, id.with("edit"), false, false);
+                #[allow(clippy::disallowed_methods)]
                 let out = egui::TextEdit::singleline(text)
                     .id(id.with("edit"))
                     .frame(egui::Frame::NONE)

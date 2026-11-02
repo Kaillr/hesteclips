@@ -6,6 +6,28 @@
 //! - **One control per kind of choice**: a switch for on and off, a segmented
 //!   control for two to four short choices, a menu for longer lists, ⓘ for
 //!   the why behind a setting.
+//! - **Inputs guide**: what kind of value it is decides its input, so the
+//!   common values are offered and nothing that makes no sense can be
+//!   typed. Copy how Settings does the same kind of value.
+//!   - *Picked, or partly words* ("Original", "Auto", "Off", "1080p"): a
+//!     menu, a [`ChoiceField`] (or [`select`] with [`menu_popup`]); a
+//!     segmented control when it's two to four short ones. A word is only
+//!     ever picked: it's never in a box that can be clicked into and typed
+//!     over.
+//!   - *Picked, or a number of your own*: a [`ChoiceField`] with its
+//!     [`Custom`]: Custom… at the end of the menu puts a box for the number
+//!     beside it, its unit after it (Settings' Resolution and Aspect ratio).
+//!   - *Always a number* (a frame rate, a bitrate, a size in MB): a
+//!     [`ValueField`]: typed straight in, its unit after it, the common
+//!     values under its ∨; a length is [`ValueField::show_time`], a clock.
+//!     Two numbers that go together (a size, a ratio) are a [`number_box`]
+//!     each ([`size_field`], [`ratio_field`]).
+//!   - *Free text* (a name, a search): [`text_field`]. The only box where
+//!     letters go in.
+//!   - Numbers only take digits (and a point where they take decimals), and
+//!     one beyond its range is kept to it, so typing can't go wrong: no
+//!     error to read afterwards. Never egui's own `DragValue` or `Slider`,
+//!     or a bare `TextEdit` for a value: `clippy.toml` turns them away.
 //! - **Buttons**: main (one per screen, the brightest), normal, quiet
 //!   (ghost), destructive. 30 px tall, corners of 6.
 //! - **Can't be used now**: a control with nothing to do (an empty undo, a
@@ -1376,6 +1398,9 @@ pub fn menu_db_field(ui: &mut egui::Ui, label: &str, shown: &str) -> Option<f32>
     let unit = ui.painter().layout_no_wrap("dB".to_owned(), font.clone(), p.text3);
     let inner = Rect::from_min_max(Pos2::new(fbox.left() + 8.0, fbox.top()), Pos2::new(fbox.right() - 12.0 - unit.size().x, fbox.bottom()));
     let mut fui = ui.new_child(egui::UiBuilder::new().max_rect(inner).layout(egui::Layout::left_to_right(egui::Align::Center)));
+    // A volume as it's said: "-7.5", "+3", "4,5 dB", and "−∞" or "-inf"
+    // for silence (read by `parse_db`, #26).
+    #[allow(clippy::disallowed_methods)]
     let out = egui::TextEdit::singleline(&mut text)
         .id(edit_id)
         .frame(egui::Frame::NONE)
@@ -1939,7 +1964,10 @@ impl<T> Dismissed for egui::ModalResponse<T> {
     }
 }
 
-/// A text field in the app's look: filled, outlined when focused.
+/// A text field in the app's look: filled, outlined when focused. Only for
+/// free text (a name, a search): a number is a [`ValueField`], a choice a
+/// [`ChoiceField`] (see "Inputs guide" above).
+#[allow(clippy::disallowed_methods)] // the free-text box itself
 pub fn text_field(ui: &mut egui::Ui, text: &mut String, hint: &str) -> egui::text_edit::TextEditOutput {
     let p = theme::pal(ui);
     let id = ui.next_auto_id();
@@ -1965,55 +1993,85 @@ pub fn text_field(ui: &mut egui::Ui, text: &mut String, hint: &str) -> egui::tex
     out
 }
 
-// --- Value fields ---
+// --- Inputs ---
+//
+// Which input a value gets is decided by what kind of value it is: see
+// "Inputs" in this module's notes. [`ValueField`] is for one that's always
+// a number; [`ChoiceField`] for one picked from a list (a number of your
+// own beside it, where it can be one); [`number_box`] for each number of a
+// pair (a size, a ratio); [`text_field`] only for free text.
 
-/// A number you type in place ("90", "2:30", "1080", "Native"), with
-/// its unit after it and the common values under its ∨. Clicking it chooses
-/// all of it, so typing replaces it, and a word's first letters are enough
-/// ("n" is Native). Enter or clicking away applies; Esc puts it back; arrow
-/// keys step through the common values. A value that isn't one of them just
-/// shows as itself.
-pub struct ValueField<'a> {
-    pub id: egui::Id,
-    /// What it shows now.
-    pub text: String,
-    pub unit: &'a str,
-    pub width: f32,
-    pub hint: &'a str,
-    /// The common values: (label, its value as text, a note).
-    pub presets: Vec<(String, String, String)>,
-    /// What the field's text currently is, among the presets, if any.
-    pub current: Option<usize>,
-    /// What "Type your own…" says about the range.
-    pub range: &'a str,
+/// A common value of a [`ValueField`]: what it's called in its menu, the
+/// number, and a note on the right.
+pub struct Preset {
+    pub label: String,
+    pub value: f64,
+    pub note: String,
 }
 
-/// What happened to a [`ValueField`] this frame.
-pub enum Typed {
-    None,
-    /// Typed and applied: parse it.
-    Text(String),
-    /// A common value was picked (or stepped to with the arrows).
-    Preset(usize),
-    /// A length typed or stepped in a time field ([`ValueField::show_time`]).
-    Secs(f64),
+impl Preset {
+    pub fn new(label: impl Into<String>, value: f64) -> Self {
+        Self { label: label.into(), value, note: String::new() }
+    }
+
+    pub fn note(mut self, note: impl Into<String>) -> Self {
+        self.note = note.into();
+        self
+    }
+}
+
+/// A value that's always a number ("60", "15", "2:30"), typed in place,
+/// with its unit after it and the common values under its ∨. It only ever
+/// shows a number, and only digits go in (and a point, where it takes
+/// decimals): a value that can be a word ("Original", "Auto", "Off") is a
+/// [`ChoiceField`] instead. Clicking it chooses all of it, so typing
+/// replaces it; Enter, Tab or clicking away applies; Esc puts it back; ↑ ↓
+/// step through the common values. A number beyond its range is kept to it.
+pub struct ValueField<'a> {
+    pub id: egui::Id,
+    /// The number now.
+    pub value: f64,
+    /// Places after the point (0: whole numbers).
+    pub decimals: usize,
+    /// The least and most it can be.
+    pub range: std::ops::RangeInclusive<f64>,
+    pub unit: &'a str,
+    pub width: f32,
+    /// What to type, on hover.
+    pub hint: &'a str,
+    /// The common values, in the order ↑ ↓ step through them.
+    pub presets: Vec<Preset>,
 }
 
 impl ValueField<'_> {
-    pub fn show(self, ui: &mut egui::Ui) -> Typed {
-        self.show_inner(ui, None)
+    /// The new number, once it's typed or picked.
+    pub fn show(self, ui: &mut egui::Ui) -> Option<f64> {
+        self.show_inner(ui, false)
     }
 
-    /// A length: the box takes it as a clock ([`crate::time_field`]), now
-    /// `secs`, with ↑ ↓ stepping it between `min` and `max`. Words that
-    /// aren't a length come back as [`Typed::Text`].
-    pub fn show_time(self, ui: &mut egui::Ui, secs: f64, min: f64, max: f64) -> Typed {
-        self.show_inner(ui, Some((secs, min, max)))
+    /// A length, in seconds: the box is a clock ([`crate::time_field`]),
+    /// ↑ ↓ stepping the part chosen.
+    pub fn show_time(self, ui: &mut egui::Ui) -> Option<f64> {
+        self.show_inner(ui, true)
     }
 
-    fn show_inner(self, ui: &mut egui::Ui, time: Option<(f64, f64, f64)>) -> Typed {
+    /// Which of the common values it is, if one.
+    fn current(&self) -> Option<usize> {
+        let near = 0.5 * 10f64.powi(-(self.decimals as i32));
+        self.presets.iter().position(|p| (p.value - self.value).abs() < near)
+    }
+
+    /// `v` as it can be: to its places, within its range.
+    fn kept(&self, v: f64) -> f64 {
+        let scale = 10f64.powi(self.decimals as i32);
+        ((v * scale).round() / scale).clamp(*self.range.start(), *self.range.end())
+    }
+
+    fn show_inner(self, ui: &mut egui::Ui, time: bool) -> Option<f64> {
         let p = theme::pal(ui);
-        let mut out = Typed::None;
+        let mut out = None;
+        let current = self.current();
+        let shown = number_text(self.value, self.decimals);
         let edit_id = self.id.with("text");
         let editing_key = self.id.with("editing");
         let mut editing: Option<String> = ui.data(|d| d.get_temp(editing_key));
@@ -2029,89 +2087,80 @@ impl ValueField<'_> {
         }
         let dd = Rect::from_min_max(Pos2::new(rect.right() - 26.0, rect.top()), rect.max);
         let field = Rect::from_min_max(Pos2::new(rect.left() + 10.0, rect.top()), Pos2::new(dd.left(), rect.bottom()));
-        if let Some((secs, min, max)) = time {
+        if time {
             let font = theme::font(13.0, W::Medium);
-            let tf = crate::time_field::TimeField { id: edit_id, secs, min, max, decimals: 0, font, align: egui::Align::Min, hint: self.hint };
-            out = match tf.show(ui, field) {
-                crate::time_field::Timed::None => Typed::None,
-                crate::time_field::Timed::Stepped(v) | crate::time_field::Timed::Typed(v) => Typed::Secs(v),
-                crate::time_field::Timed::Unreadable(t) => Typed::Text(t),
-            };
-        } else {
-        let mut text = editing.clone().unwrap_or_else(|| self.text.clone());
-        let font = theme::font(13.0, W::Medium);
-        let tw = ui.painter().layout_no_wrap(if text.is_empty() { " ".into() } else { text.clone() }, font.clone(), p.text).size().x;
-        let unit_w = if self.unit.is_empty() { 0.0 } else { ui.painter().layout_no_wrap(self.unit.to_owned(), font.clone(), p.text3).size().x + 4.0 };
-        let input_w = (tw + 1.0).min(field.width() - unit_w).max(14.0);
-        let mut fui = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_size(field.min, vec2(input_w, field.height()))).layout(egui::Layout::left_to_right(egui::Align::Center)));
-        let edited = egui::TextEdit::singleline(&mut text)
-            .id(edit_id)
-            .frame(egui::Frame::NONE)
-            .font(font.clone())
-            .text_color(p.text)
-            .desired_width(input_w)
-            .margin(Margin::ZERO)
-            .show(&mut fui);
-        let resp = edited.response.response.clone().on_hover_text(self.hint).on_hover_cursor(egui::CursorIcon::Text);
-        // A word typed: the common value it's the start of, finished with
-        // Enter ("n" is Native).
-        let completes = |t: &str| {
-            let t = t.trim().to_lowercase();
-            (t.chars().any(char::is_alphabetic)).then(|| self.presets.iter().position(|(_, v, _)| v.to_lowercase().starts_with(&t))).flatten()
-        };
-        if let Some(i) = completes(&text).filter(|_| resp.has_focus()) {
-            // The rest of it, dim, after what's typed.
-            let rest: String = self.presets[i].1.chars().skip(text.trim().chars().count()).collect();
-            ui.painter().text(Pos2::new(field.left() + tw, rect.center().y), Align2::LEFT_CENTER, rest, font.clone(), p.text3);
-        } else if !self.unit.is_empty() {
-            ui.painter().text(Pos2::new(field.left() + input_w + 2.0, rect.center().y), Align2::LEFT_CENTER, self.unit, font, p.text3);
-        }
-        // Clicking anywhere in the box (not just on the digits) types.
-        let box_resp = ui.interact(field, self.id.with("box"), Sense::click());
-        if box_resp.clicked() {
-            resp.request_focus();
-        }
-        if resp.gained_focus() {
-            editing = Some(self.text.clone());
-            // All of it chosen: what's typed replaces it.
-            let mut state = edited.state.clone();
-            state.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(self.text.chars().count()))));
-            state.store(ui.ctx(), edit_id);
-        }
-        if resp.has_focus() {
-            editing = Some(text.clone());
-            let (up, down, esc) = ui.input_mut(|i| (i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp), i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown), i.key_pressed(egui::Key::Escape)));
-            if esc {
-                editing = None;
-                resp.surrender_focus();
-            } else if (up || down) && !self.presets.is_empty() {
-                // Up goes to the next bigger one: presets are listed biggest
-                // first or smallest first, so step by their order.
-                let n = self.presets.len();
-                let at = self.current.unwrap_or(0);
-                let next = if up { at.saturating_sub(1) } else { (at + 1).min(n - 1) };
-                out = Typed::Preset(next);
-                editing = Some(self.presets[next].1.clone());
+            let tf = crate::time_field::TimeField { id: edit_id, secs: self.value, min: *self.range.start(), max: *self.range.end(), decimals: 0, font, align: egui::Align::Min, hint: self.hint };
+            match tf.show(ui, field) {
+                crate::time_field::Timed::Stepped(v) | crate::time_field::Timed::Typed(v) => out = Some(self.kept(v)),
+                // Not a length: it shows what it was.
+                crate::time_field::Timed::None | crate::time_field::Timed::Unreadable => {}
             }
-        }
-        if resp.lost_focus() {
-            if let Some(t) = editing.take() {
-                if t.trim() != self.text.trim() {
-                    out = match completes(&t) {
-                        Some(i) => Typed::Preset(i),
-                        None => Typed::Text(t),
-                    };
+        } else {
+            let (point, minus) = (self.decimals > 0, *self.range.start() < 0.0);
+            keep_to_number(ui, edit_id, point, minus);
+            let mut text = editing.clone().unwrap_or_else(|| shown.clone());
+            let font = theme::font(13.0, W::Medium);
+            let tw = ui.painter().layout_no_wrap(if text.is_empty() { " ".into() } else { text.clone() }, font.clone(), p.text).size().x;
+            let unit_w = if self.unit.is_empty() { 0.0 } else { ui.painter().layout_no_wrap(self.unit.to_owned(), font.clone(), p.text3).size().x + 4.0 };
+            let input_w = (tw + 1.0).min(field.width() - unit_w).max(14.0);
+            let mut fui = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_size(field.min, vec2(input_w, field.height()))).layout(egui::Layout::left_to_right(egui::Align::Center)));
+            // The box itself: what goes in is kept to a number, above and below.
+            #[allow(clippy::disallowed_methods)]
+            let edited = egui::TextEdit::singleline(&mut text)
+                .id(edit_id)
+                .frame(egui::Frame::NONE)
+                .font(font.clone())
+                .text_color(p.text)
+                .desired_width(input_w)
+                .margin(Margin::ZERO)
+                .show(&mut fui);
+            text = number_typing(&text, point, minus);
+            let resp = edited.response.response.clone().on_hover_text(self.hint).on_hover_cursor(egui::CursorIcon::Text);
+            if !self.unit.is_empty() {
+                ui.painter().text(Pos2::new(field.left() + input_w + 2.0, rect.center().y), Align2::LEFT_CENTER, self.unit, font, p.text3);
+            }
+            // Clicking anywhere in the box (not just on the digits) types.
+            let box_resp = ui.interact(field, self.id.with("box"), Sense::click());
+            if box_resp.clicked() {
+                resp.request_focus();
+            }
+            if resp.gained_focus() {
+                editing = Some(shown.clone());
+                // All of it chosen: what's typed replaces it.
+                let mut state = edited.state.clone();
+                state.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(shown.chars().count()))));
+                state.store(ui.ctx(), edit_id);
+            }
+            if resp.has_focus() {
+                editing = Some(text.clone());
+                let (up, down, esc) = ui.input_mut(|i| (i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp), i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown), i.key_pressed(egui::Key::Escape)));
+                if esc {
+                    editing = None;
+                    resp.surrender_focus();
+                } else if (up || down) && !self.presets.is_empty() {
+                    // Up goes to the one before in the list: they're listed
+                    // biggest first or smallest first, so step by their order.
+                    let n = self.presets.len();
+                    let at = current.unwrap_or(0);
+                    let next = if up { at.saturating_sub(1) } else { (at + 1).min(n - 1) };
+                    out = Some(self.presets[next].value);
+                    editing = Some(number_text(self.presets[next].value, self.decimals));
                 }
             }
-        }
-        ui.data_mut(|d| match &editing {
-            Some(t) => {
-                d.insert_temp(editing_key, t.clone());
+            if resp.lost_focus()
+                && let Some(t) = editing.take()
+                && let Ok(v) = t.parse::<f64>()
+            {
+                out = Some(self.kept(v));
             }
-            None => d.remove::<String>(editing_key),
-        });
+            ui.data_mut(|d| match &editing {
+                Some(t) => {
+                    d.insert_temp(editing_key, t.clone());
+                }
+                None => d.remove::<String>(editing_key),
+            });
         }
-        // The ∨: common values, and "Type your own…".
+        // The ∨: the common values, and "Type your own…".
         let ddr = ui.interact(dd, self.id.with("dd"), Sense::click());
         let dhv = theme::toggle(ui.ctx(), ddr.id.with("hv"), ddr.hovered() || menu_open, theme::FAST);
         if dhv > 0.0 {
@@ -2121,29 +2170,228 @@ impl ValueField<'_> {
         chevron(ui.painter(), dd.center(), 3.5, turn, theme::mix(p.text3, p.text, dhv));
         let ddr = ddr.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Common values");
         let mut focus = false;
+        let (lo, hi) = (*self.range.start(), *self.range.end());
+        let range = if time {
+            format!("{} – {}", length_short(lo), length_short(hi))
+        } else {
+            format!("{}–{} {}", number_text(lo, self.decimals), number_text(hi, self.decimals), self.unit).trim_end().to_owned()
+        };
         // As wide as the field (wider when a value's note needs it).
         menu_popup(&ddr, false, self.width, |ui| {
-            for (i, (label, _, note)) in self.presets.iter().enumerate() {
-                let mut item = Item::new(label.clone()).check(self.current == Some(i));
-                if !note.is_empty() {
-                    item = item.value(note.clone());
+            for (i, preset) in self.presets.iter().enumerate() {
+                let mut item = Item::new(preset.label.clone()).check(current == Some(i));
+                if !preset.note.is_empty() {
+                    item = item.value(preset.note.clone());
                 }
                 if item.show(ui).clicked() {
-                    out = Typed::Preset(i);
+                    out = Some(preset.value);
                 }
             }
-            if self.current.is_none() {
+            if current.is_none() && !time {
                 menu_sep(ui);
-                Item::new(format!("{}{}{}", self.text, if self.unit.is_empty() { "" } else { " " }, self.unit)).check(true).value("yours").show(ui);
+                Item::new(format!("{shown}{}{}", if self.unit.is_empty() { "" } else { " " }, self.unit)).check(true).value("yours").show(ui);
             }
             menu_sep(ui);
-            if Item::new("Type your own…").icon(icon::TEXT_T).value(self.range.to_owned()).show(ui).clicked() {
+            if Item::new("Type your own…").icon(icon::TEXT_T).value(range).show(ui).clicked() {
                 focus = true;
             }
         });
         if focus {
             ui.memory_mut(|m| m.request_focus(edit_id));
         }
+        out.filter(|v| (v - self.value).abs() > 1e-9)
+    }
+}
+
+/// A number as a field shows it: to `decimals` places, without the zeros
+/// that end them ("8", "8.5").
+pub fn number_text(v: f64, decimals: usize) -> String {
+    let s = format!("{v:.decimals$}");
+    if s.contains('.') { s.trim_end_matches('0').trim_end_matches('.').to_owned() } else { s }
+}
+
+/// While the box `id` has the keyboard, only what a number has goes into
+/// it: digits, a point where it takes decimals (`point`; a comma is one),
+/// and a minus where it can go below zero (`minus`). Letters typed or
+/// pasted are left out as they come. [`ValueField`] does this itself; a box
+/// of a page's own that takes a number calls it before its `TextEdit`.
+pub fn keep_to_number(ui: &egui::Ui, id: egui::Id, point: bool, minus: bool) {
+    if !ui.memory(|m| m.has_focus(id)) {
+        return;
+    }
+    ui.input_mut(|i| {
+        i.events.retain_mut(|e| match e {
+            egui::Event::Text(t) | egui::Event::Paste(t) => {
+                *t = t.chars().map(|c| if c == ',' { '.' } else { c }).filter(|&c| c.is_ascii_digit() || (point && c == '.') || (minus && c == '-')).collect();
+                // Nothing left: no typing at all (an empty one would
+                // still replace what's chosen in the box).
+                !t.is_empty()
+            }
+            _ => true,
+        });
+    });
+}
+
+/// What's typed in a number's box, kept to what a number can be: digits,
+/// one point (`point`), a minus first (`minus`).
+fn number_typing(t: &str, point: bool, minus: bool) -> String {
+    let mut seen_point = false;
+    t.chars()
+        .enumerate()
+        .filter(|&(i, c)| c.is_ascii_digit() || (point && c == '.' && !std::mem::replace(&mut seen_point, true)) || (minus && c == '-' && i == 0))
+        .map(|(_, c)| c)
+        .collect()
+}
+
+/// A length in short words, for a range: "5 s", "10 min", "1 h".
+fn length_short(secs: f64) -> String {
+    let s = secs.round() as u64;
+    if s < 60 {
+        format!("{s} s")
+    } else if s < 3600 {
+        format!("{} min", s / 60)
+    } else {
+        format!("{} h", s / 3600)
+    }
+}
+
+/// One of a [`ChoiceField`]'s choices.
+pub struct Choice {
+    /// Its name in the menu.
+    pub label: String,
+    /// What the field shows while it's chosen, when that's more than its
+    /// name ("Original (1440p)").
+    pub shown: Option<String>,
+    /// On its right in the menu.
+    pub note: String,
+}
+
+impl Choice {
+    pub fn new(label: impl Into<String>) -> Self {
+        Self { label: label.into(), shown: None, note: String::new() }
+    }
+
+    pub fn shown(mut self, shown: impl Into<String>) -> Self {
+        self.shown = Some(shown.into());
+        self
+    }
+
+    pub fn note(mut self, note: impl Into<String>) -> Self {
+        self.note = note.into();
+        self
+    }
+}
+
+/// A [`ChoiceField`]'s number of your own: Custom… at the end of its menu,
+/// then a box for it beside the menu.
+pub struct Custom<'a> {
+    /// After the box: "p", "fps", "Mbps".
+    pub unit: &'a str,
+    /// The least and most it can be: a number typed beyond is kept to it.
+    pub range: std::ops::RangeInclusive<u32>,
+    /// On Custom…'s right in the menu: "any height".
+    pub note: &'a str,
+}
+
+/// What a [`ChoiceField`] was set to.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Chosen {
+    /// One of its choices, picked from the menu.
+    Choice(usize),
+    /// A number of your own, typed in its box.
+    Number(u32),
+}
+
+/// The width of a [`ChoiceField`]'s box for a number of your own, and of its
+/// menu while the box is beside it (saying Custom), as Settings' custom
+/// size has them.
+const CHOICE_BOX_W: f32 = 58.0;
+const CHOICE_CUSTOM_W: f32 = 110.0;
+
+/// A value picked from a menu of choices, and, with [`Custom`], a number of
+/// your own: Custom… at the end of the menu puts a box beside it (on its
+/// left: the menu stays where it was), its unit after it and the number
+/// chosen, ready to type over, as Settings' Resolution does with a custom
+/// size. For a value that's a word or a number ("Original", "Auto", "Off",
+/// "1080p", or 900): the words are only ever picked, and the box only takes
+/// digits. Picking a choice puts the menu back on its own.
+pub struct ChoiceField<'a> {
+    pub id: &'a str,
+    pub choices: Vec<Choice>,
+    pub custom: Option<Custom<'a>>,
+    /// The menu's width (narrower, saying Custom, while the box is beside it).
+    pub width: f32,
+}
+
+impl ChoiceField<'_> {
+    /// Shown as `now` (the choice it is, if it's one) and `number` (what it
+    /// is as a number: what the box shows, and starts from). What it was
+    /// set to, when that changes.
+    pub fn show(self, ui: &mut egui::Ui, now: Option<usize>, number: u32) -> Option<Chosen> {
+        let p = theme::pal(ui);
+        let typed_key = egui::Id::new((self.id, "custom"));
+        let box_id = egui::Id::new((self.id, "box"));
+        let type_in = egui::Id::new((self.id, "type_in"));
+        // Custom… just picked: typing goes into the box.
+        if ui.data(|d| d.get_temp::<bool>(type_in)).is_some() && !ui.input(|i| i.pointer.any_click()) {
+            ui.data_mut(|d| d.remove::<bool>(type_in));
+            ui.memory_mut(|m| m.request_focus(box_id));
+        }
+        // The number given last in the box: while it's still the value, the
+        // box stays, even when that's one of the choices (a value changed
+        // elsewhere puts the menu back on its own).
+        let typed: Option<u32> = ui.data(|d| d.get_temp(typed_key));
+        let custom = self.custom.as_ref().filter(|_| now.is_none() || typed == Some(number));
+        let unit = custom.map(|c| ui.painter().layout_no_wrap(c.unit.to_owned(), theme::font(12.5, W::Regular), p.text3));
+        let menu_w = if custom.is_some() { CHOICE_CUSTOM_W } else { self.width };
+        let width = menu_w + unit.as_ref().map_or(0.0, |g| CHOICE_BOX_W + g.size().x + 6.0 * 2.0);
+        let label = match (custom, now.and_then(|i| self.choices.get(i))) {
+            (Some(_), _) => "Custom".to_owned(),
+            (None, Some(c)) => c.shown.clone().unwrap_or_else(|| c.label.clone()),
+            (None, None) => String::new(),
+        };
+        let mut out = None;
+        let mut to_custom = false;
+        ui.allocate_ui_with_layout(vec2(width, CONTROL_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            if let (Some(c), Some(unit)) = (custom, unit) {
+                if let Some(v) = number_box(ui, box_id, number, c.range.clone(), CHOICE_BOX_W) {
+                    out = Some(Chosen::Number(v));
+                }
+                let (r, _) = ui.allocate_exact_size(unit.size(), Sense::hover());
+                ui.painter().galley(r.min, unit, p.text3);
+            }
+            let r = select(ui, &label, menu_w);
+            menu_popup(&r, false, self.width.max(200.0), |ui| {
+                for (i, c) in self.choices.iter().enumerate() {
+                    let mut item = Item::new(c.label.clone()).check(custom.is_none() && now == Some(i));
+                    if !c.note.is_empty() {
+                        item = item.value(c.note.clone());
+                    }
+                    if item.show(ui).clicked() {
+                        out = Some(Chosen::Choice(i));
+                    }
+                }
+                if let Some(c) = &self.custom {
+                    menu_sep(ui);
+                    if Item::new("Custom…").check(custom.is_some()).value(c.note).show(ui).clicked() {
+                        to_custom = true;
+                    }
+                }
+            });
+        });
+        ui.data_mut(|d| match out {
+            Some(Chosen::Choice(_)) => d.remove::<u32>(typed_key),
+            Some(Chosen::Number(v)) => {
+                d.insert_temp(typed_key, v);
+            }
+            // The box from the next frame, its number ready to type over.
+            None if to_custom => {
+                d.insert_temp(typed_key, number);
+                d.insert_temp(type_in, true);
+            }
+            None => {}
+        });
         out
     }
 }
@@ -2768,28 +3016,43 @@ mod tests {
         assert_eq!(clicks, 1, "once");
     }
 
-    /// A value field, clicked and typed into as a person would: what each
-    /// frame gave back.
-    fn type_into(text: &str, frames: Vec<Vec<egui::Event>>) -> Vec<String> {
+    /// Frames of a ui with just `show` in it, at (10, 10), 150 wide: run
+    /// with each frame's events as a person's input.
+    fn run_frames(frames: Vec<Vec<egui::Event>>, mut show: impl FnMut(&mut egui::Ui)) {
         let ctx = egui::Context::default();
         theme::install_fonts(&ctx);
-        let presets = vec![("Native".to_owned(), "Native".to_owned(), String::new()), ("1080p".to_owned(), "1080".to_owned(), String::new())];
-        let mut got = Vec::new();
         for events in frames {
             let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(400.0, 300.0))), events, ..Default::default() };
             let mut out = ctx.run_ui(raw, |ui| {
-                let mut at = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_size(Pos2::new(10.0, 10.0), vec2(150.0, CONTROL_H))));
-                let field = ValueField { id: egui::Id::new("vf"), text: text.to_owned(), unit: "", width: 150.0, hint: "", presets: presets.clone(), current: None, range: "" };
-                got.push(match field.show(&mut at) {
-                    Typed::None => String::new(),
-                    Typed::Text(t) => format!("text {t}"),
-                    Typed::Preset(i) => format!("preset {i}"),
-                    Typed::Secs(s) => format!("secs {s}"),
-                });
+                let mut at = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_size(Pos2::new(10.0, 10.0), vec2(300.0, CONTROL_H))).layout(egui::Layout::left_to_right(egui::Align::Center)));
+                show(&mut at);
             });
             out.textures_delta.clear();
         }
-        got.into_iter().filter(|g| !g.is_empty()).collect()
+    }
+
+    /// A height's value field (1440 now, 144 to 2160, to `decimals`
+    /// places), clicked and typed into as a person would: what it gave back.
+    fn type_into(decimals: usize, frames: Vec<Vec<egui::Event>>) -> Vec<f64> {
+        let mut got = Vec::new();
+        run_frames(frames, |ui| {
+            let presets = vec![Preset::new("1080p", 1080.0), Preset::new("720p", 720.0)];
+            let field = ValueField { id: egui::Id::new("vf"), value: 1440.0, decimals, range: 144.0..=2160.0, unit: "p", width: 150.0, hint: "", presets };
+            got.extend(field.show(ui));
+        });
+        got
+    }
+
+    /// A resolution's choice field, now `now` (Original, or 1080p) or a
+    /// height of its own (`None`, 900), clicked and typed into as a person
+    /// would: what it was set to.
+    fn choose(now: Option<usize>, frames: Vec<Vec<egui::Event>>) -> Vec<Chosen> {
+        let mut got = Vec::new();
+        run_frames(frames, |ui| {
+            let field = ChoiceField { id: "cf", choices: vec![Choice::new("Original"), Choice::new("1080p")], custom: Some(Custom { unit: "p", range: 144..=2160, note: "" }), width: 150.0 };
+            got.extend(field.show(ui, now, if now == Some(1) { 1080 } else { 900 }));
+        });
+        got
     }
 
     /// Clicked, typed into, Enter.
@@ -2800,12 +3063,28 @@ mod tests {
         vec![vec![egui::Event::PointerMoved(at)], vec![button(true)], vec![button(false)], vec![], vec![egui::Event::Text(text.to_owned())], vec![key(egui::Key::Enter)], vec![]]
     }
 
-    /// Clicked, typing replaces what was there, and a word's first letter is
-    /// enough.
+    /// Clicked, typing replaces what was there; only a number goes in, and
+    /// one beyond its range is kept to it.
     #[test]
-    fn a_value_field_types_over_its_value() {
-        assert_eq!(type_into("Native", click_type_enter("1440")), ["text 1440"]);
-        assert_eq!(type_into("1440", click_type_enter("n")), ["preset 0"]);
+    fn a_value_field_only_takes_a_number() {
+        assert_eq!(type_into(0, click_type_enter("1080")), [1080.0]);
+        assert_eq!(type_into(0, click_type_enter("9a0b0p")), [900.0], "the letters don't go in");
+        assert!(type_into(0, click_type_enter("Native")).is_empty(), "a word isn't typing: it stays as it was");
+        assert_eq!(type_into(0, click_type_enter("99999")), [2160.0], "kept to its most");
+        assert_eq!(type_into(0, click_type_enter("5")), [144.0], "kept to its least");
+        assert_eq!(type_into(1, click_type_enter("900,5")), [900.5], "a comma is a point");
+        assert_eq!(type_into(0, click_type_enter("900,5")), [2160.0], "no point without decimals: 9005, kept to 2160");
+    }
+
+    /// A choice field's words are only ever picked: clicked where they show,
+    /// it opens its menu, and typing changes nothing. A number of its own is
+    /// in a box beside the menu, where only digits go in.
+    #[test]
+    fn a_choice_field_types_only_numbers() {
+        assert!(choose(Some(0), click_type_enter("1080")).is_empty(), "Original can't be typed over");
+        assert!(choose(Some(1), click_type_enter("900")).is_empty(), "nor 1080p");
+        assert_eq!(choose(None, click_type_enter("720")), [Chosen::Number(720)]);
+        assert!(choose(None, click_type_enter("abc")).is_empty(), "letters don't go in its box");
     }
 
     /// Two number boxes, clicked and typed into as a person would: each
