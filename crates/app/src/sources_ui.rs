@@ -1850,14 +1850,8 @@ fn source_card(
             // Muted: what the source delivers, dimmed, so you see the mic is
             // live without it being recorded. Otherwise what goes into the clip.
             let state = if source.muted { &meters.input } else { &meters.output };
-            fader(ui, &mut source.volume_db, state, source.muted, w.max(80.0), &source.id);
-            let (r, resp) = ui.allocate_exact_size(egui::vec2(66.0, 22.0), Sense::click());
-            let hv = theme::toggle(ui.ctx(), resp.id.with("hv"), resp.hovered(), theme::FAST);
-            ui.painter().rect_filled(r, 4, theme::fade(pal.sel, hv));
-            ui.painter().text(r.right_center() - egui::vec2(6.0, 0.0), egui::Align2::RIGHT_CENTER, db_text(source.volume_db), theme::font(12.5, W::Medium), theme::mix(pal.text2, pal.text, hv));
-            if resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Click for 0 dB").clicked() {
-                source.volume_db = 0.0;
-            }
+            let fresp = fader(ui, &mut source.volume_db, state, source.muted, w.max(80.0), &source.id);
+            volume_value(ui, &mut source.volume_db, fresp.secondary_clicked(), &source.id);
             let (r, resp) = ui.allocate_exact_size(egui::vec2(26.0, 24.0), Sense::click());
             let hv = theme::toggle(ui.ctx(), resp.id.with("hv"), resp.hovered(), theme::FAST);
             let on = theme::toggle(ui.ctx(), resp.id.with("on"), source.muted, theme::FAST);
@@ -1966,8 +1960,9 @@ fn labelled_switch(ui: &mut egui::Ui, on: &mut bool, label: &str, tip: &str) -> 
 
 /// A source's volume and level as one control: the meter runs along the
 /// track (green, yellow from −18, red from −6), the knob sits at the volume,
-/// and a tick marks 0 dB. Drag the knob, or anywhere on the track; double-click
-/// for 0 dB.
+/// and a tick marks 0 dB. Drag the knob, or anywhere on the track (Shift:
+/// finer); double-click for 0 dB. A right-click on it types one (see
+/// [`volume_value`]).
 fn fader(ui: &mut egui::Ui, db: &mut f32, state: &MeterState, dimmed: bool, width: f32, id: &str) -> egui::Response {
     let pal = crate::theme::pal(ui);
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 22.0), Sense::click_and_drag());
@@ -1978,13 +1973,24 @@ fn fader(ui: &mut egui::Ui, db: &mut f32, state: &MeterState, dimmed: bool, widt
     // 0 dB.
     let zero = track.left() + track.width() * pos(0.0);
     ui.painter().vline(zero, rect.top() + 4.0..=rect.bottom() - 4.0, egui::Stroke::new(1.0, crate::theme::fade(pal.text3, 0.5)));
-    if let Some(p) = resp.interact_pointer_pos()
-        && (resp.dragged() || resp.drag_started())
-    {
-        let f = ((p.x - track.left()) / track.width()).clamp(0.0, 1.0);
-        let mut v = FADER_MIN_DB + f * (FADER_MAX_DB - FADER_MIN_DB);
-        // A small detent at 0 dB.
-        if (v.abs()) < 0.6 {
+    // Taken hold of, the knob goes to the pointer; then it follows it, a
+    // fifth as far with Shift held, for fine steps. `raw`: where it's been
+    // dragged to, past the ends too (so it comes back with the pointer).
+    let raw_key = egui::Id::new(("fader_raw", id));
+    let fine = ui.input(|i| i.modifiers.shift);
+    let raw = if resp.drag_started() {
+        resp.interact_pointer_pos().map(|p| FADER_MIN_DB + ((p.x - track.left()) / track.width()).clamp(0.0, 1.0) * (FADER_MAX_DB - FADER_MIN_DB))
+    } else if resp.dragged() {
+        let was = ui.data(|d| d.get_temp::<f32>(raw_key)).unwrap_or(*db);
+        Some(was + resp.drag_delta().x / track.width() * (FADER_MAX_DB - FADER_MIN_DB) * if fine { 0.2 } else { 1.0 })
+    } else {
+        None
+    };
+    if let Some(raw) = raw {
+        ui.data_mut(|d| d.insert_temp(raw_key, raw));
+        let mut v = raw.clamp(FADER_MIN_DB, FADER_MAX_DB);
+        // A small detent at 0 dB (not in fine steps, which go past it).
+        if !fine && v.abs() < 0.6 {
             v = 0.0;
         }
         *db = (v * 10.0).round() / 10.0;
@@ -1998,7 +2004,69 @@ fn fader(ui: &mut egui::Ui, db: &mut f32, state: &MeterState, dimmed: bool, widt
     let shadow = egui::Shadow { offset: [0, 1], blur: 4, spread: 0, color: Color32::from_black_alpha(110) };
     ui.painter().add(shadow.as_shape(knob, 3));
     ui.painter().rect_filled(knob, 3, Color32::WHITE);
-    resp.on_hover_cursor(egui::CursorIcon::ResizeHorizontal).on_hover_text("Volume: drag the knob. Double-click for 0 dB")
+    resp.on_hover_cursor(egui::CursorIcon::ResizeHorizontal).on_hover_text("Volume: drag the knob (Shift: finer). Double-click for 0 dB, right-click to type one")
+}
+
+/// A source's volume, shown, and typed over on a click (or a right-click,
+/// or `start`: one on its fader). Enter or clicking away sets it, Esc
+/// leaves it as it was.
+fn volume_value(ui: &mut egui::Ui, db: &mut f32, start: bool, id: &str) {
+    use crate::theme::{self, W};
+    let pal = theme::pal(ui);
+    let key = egui::Id::new(("volume_typing", id));
+    let edit_id = key.with("edit");
+    let mut typing: Option<String> = ui.data(|d| d.get_temp(key));
+    let (r, resp) = ui.allocate_exact_size(egui::vec2(66.0, 22.0), Sense::click());
+    let started = typing.is_none() && (start || resp.clicked() || resp.secondary_clicked());
+    if started {
+        typing = Some(crate::ui_kit::db_edit_text(*db, FADER_MIN_DB));
+    }
+    match typing.as_mut() {
+        None => {
+            let hv = theme::toggle(ui.ctx(), resp.id.with("hv"), resp.hovered(), theme::FAST);
+            ui.painter().rect_filled(r, 4, theme::fade(pal.sel, hv));
+            ui.painter().text(r.right_center() - egui::vec2(6.0, 0.0), egui::Align2::RIGHT_CENTER, db_text(*db), theme::font(12.5, W::Medium), theme::mix(pal.text2, pal.text, hv));
+            resp.on_hover_cursor(egui::CursorIcon::Text).on_hover_text("Click to type a volume");
+        }
+        Some(text) => {
+            ui.painter().rect_filled(r, 4, pal.control);
+            let font = theme::font(12.5, W::Medium);
+            let unit = ui.painter().layout_no_wrap("dB".to_owned(), font.clone(), pal.text3);
+            let field = egui::Rect::from_min_max(r.left_top() + egui::vec2(5.0, 0.0), egui::pos2(r.right() - 6.0 - unit.size().x - 4.0, r.bottom()));
+            let mut fui = ui.new_child(egui::UiBuilder::new().max_rect(field).layout(egui::Layout::right_to_left(egui::Align::Center)));
+            let out = egui::TextEdit::singleline(text)
+                .id(edit_id)
+                .frame(egui::Frame::NONE)
+                .font(font)
+                .text_color(pal.text)
+                .horizontal_align(egui::Align::Max)
+                .desired_width(field.width())
+                .margin(egui::Margin::ZERO)
+                .show(&mut fui);
+            ui.painter().galley(egui::pos2(r.right() - 6.0 - unit.size().x, r.center().y - unit.size().y / 2.0), unit, pal.text3);
+            ui.painter().rect_stroke(r, 4, egui::Stroke::new(1.5, pal.text2), egui::StrokeKind::Inside);
+            if started {
+                // All of it chosen: what's typed replaces it.
+                out.response.request_focus();
+                let mut state = out.state.clone();
+                state.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(text.chars().count()))));
+                state.store(ui.ctx(), edit_id);
+            } else if !out.response.has_focus() {
+                if !ui.input(|i| i.key_pressed(egui::Key::Escape))
+                    && let Some(v) = crate::ui_kit::parse_db(text)
+                {
+                    *db = (v.clamp(FADER_MIN_DB, FADER_MAX_DB) * 10.0).round() / 10.0;
+                }
+                typing = None;
+            }
+        }
+    }
+    ui.data_mut(|d| match typing {
+        Some(t) => {
+            d.insert_temp(key, t);
+        }
+        None => d.remove::<String>(key),
+    });
 }
 
 fn db_text(db: f32) -> String {

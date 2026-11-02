@@ -1299,6 +1299,107 @@ pub fn context_menu<R>(resp: &Response, width: f32, content: impl FnOnce(&mut eg
         .map(|r| r.inner)
 }
 
+/// A right-click menu, as [`context_menu`], that a click inside doesn't
+/// close (only its items do): for one with a field to type into.
+pub fn context_menu_typed<R>(resp: &Response, width: f32, content: impl FnOnce(&mut egui::Ui) -> R) -> Option<R> {
+    let frame = menu_frame_ctx(&resp.ctx);
+    egui::Popup::context_menu(resp)
+        .frame(frame)
+        .style(menu_style)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .show(|ui| menu_body(ui, menu_floor(width), content))
+        .map(|r| r.inner)
+}
+
+/// A volume as typed: "-6", "−6", "+3.5", "4,5 dB", "-inf", "−∞". Unclamped;
+/// silence is `f32::NEG_INFINITY`. None when it isn't one.
+pub fn parse_db(s: &str) -> Option<f32> {
+    let s = s.trim().replace('−', "-").replace(',', ".").to_lowercase();
+    let s = s.strip_suffix("db").unwrap_or(&s).trim();
+    if matches!(s, "-∞" | "-inf" | "-infinity") {
+        return Some(f32::NEG_INFINITY);
+    }
+    s.parse::<f32>().ok().filter(|v| v.is_finite())
+}
+
+/// A volume for typing over: "+3.0", "−12.5", "0.0", and "−∞" at or below
+/// `silent`.
+pub fn db_edit_text(db: f32, silent: f32) -> String {
+    if db <= silent + 0.05 {
+        "−∞".to_owned()
+    } else if db.abs() < 0.05 {
+        "0.0".to_owned()
+    } else {
+        format!("{}{:.1}", if db > 0.0 { "+" } else { "−" }, db.abs())
+    }
+}
+
+/// A row in a menu ([`context_menu_typed`]) to type a volume into: its name,
+/// then a box with `shown` in it, chosen all through and ready to type over
+/// as the menu opens. Enter sets it and closes the menu; Esc closes it.
+/// Returns the dB typed, unclamped (see [`parse_db`]).
+pub fn menu_db_field(ui: &mut egui::Ui, label: &str, shown: &str) -> Option<f32> {
+    let p = theme::pal(ui);
+    const BOX_W: f32 = 86.0;
+    let g = ui.painter().layout_no_wrap(label.to_owned(), theme::font(13.5, W::Regular), p.text);
+    let natural = 9.0 + g.size().x + 16.0 + BOX_W + 4.0;
+    menu_saw(ui, natural);
+    let w = natural.max(menu_min_width(ui));
+    let (rect, _) = ui.allocate_exact_size(vec2(w, 32.0), Sense::hover());
+    ui.painter().galley(Pos2::new(rect.left() + 9.0, rect.center().y - g.size().y / 2.0), g, p.text);
+    let id = ui.id().with(("menu_db_field", label));
+    let edit_id = id.with("edit");
+    // What's typed, and the pass it was last shown in: a menu opened
+    // again starts from `shown`.
+    let key = id.with("typed");
+    let now = ui.ctx().cumulative_pass_nr();
+    let kept = ui.data(|d| d.get_temp::<(u64, String)>(key)).filter(|(seen, _)| seen + 1 >= now);
+    let fresh = kept.is_none();
+    let mut text = kept.map_or_else(|| shown.to_owned(), |(_, t)| t);
+    let fbox = Rect::from_min_size(Pos2::new(rect.right() - 4.0 - BOX_W, rect.center().y - 12.0), vec2(BOX_W, 24.0));
+    let focused = ui.memory(|m| m.has_focus(edit_id));
+    ui.painter().rect_filled(fbox, RADIUS, p.control);
+    let font = theme::font(13.0, W::Medium);
+    let unit = ui.painter().layout_no_wrap("dB".to_owned(), font.clone(), p.text3);
+    let inner = Rect::from_min_max(Pos2::new(fbox.left() + 8.0, fbox.top()), Pos2::new(fbox.right() - 12.0 - unit.size().x, fbox.bottom()));
+    let mut fui = ui.new_child(egui::UiBuilder::new().max_rect(inner).layout(egui::Layout::left_to_right(egui::Align::Center)));
+    let out = egui::TextEdit::singleline(&mut text)
+        .id(edit_id)
+        .frame(egui::Frame::NONE)
+        .font(font)
+        .text_color(p.text)
+        .desired_width(inner.width())
+        .margin(Margin::ZERO)
+        .show(&mut fui);
+    ui.painter().galley(Pos2::new(fbox.right() - 8.0 - unit.size().x, fbox.center().y - unit.size().y / 2.0), unit, p.text3);
+    if focused {
+        ui.painter().rect_stroke(fbox, RADIUS, Stroke::new(1.5, p.text2), StrokeKind::Inside);
+    }
+    // Clicking anywhere in the box (the unit too) types.
+    if ui.interact(fbox, id.with("box"), Sense::click()).on_hover_cursor(egui::CursorIcon::Text).clicked() {
+        out.response.request_focus();
+    }
+    if fresh {
+        out.response.request_focus();
+        let mut state = out.state.clone();
+        state.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(text.chars().count()))));
+        state.store(ui.ctx(), edit_id);
+    }
+    let mut typed = None;
+    if out.response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+        match parse_db(&text) {
+            Some(db) => {
+                typed = Some(db);
+                ui.close();
+            }
+            // Not a volume: still there to fix.
+            None => out.response.request_focus(),
+        }
+    }
+    ui.data_mut(|d| d.insert_temp(key, (now, text)));
+    typed
+}
+
 /// How narrow a menu may be: it's as wide as its widest row, so `asked`
 /// only keeps a short one from looking cramped (up to a point: a list of
 /// short values stays small).
@@ -2464,6 +2565,29 @@ pub fn replay_click(ctx: &egui::Context, raw: &mut egui::RawInput) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A volume is read however it's typed: either minus sign, a comma for
+    /// the point, with or without "dB"; silence as −∞ or -inf.
+    #[test]
+    fn volumes_typed() {
+        assert_eq!(parse_db("-6"), Some(-6.0));
+        assert_eq!(parse_db("−6"), Some(-6.0));
+        assert_eq!(parse_db("+3.5"), Some(3.5));
+        assert_eq!(parse_db(" 4,5 dB "), Some(4.5));
+        assert_eq!(parse_db("−12.5dB"), Some(-12.5));
+        assert_eq!(parse_db("0"), Some(0.0));
+        assert_eq!(parse_db("−∞"), Some(f32::NEG_INFINITY));
+        assert_eq!(parse_db("-inf"), Some(f32::NEG_INFINITY));
+        assert_eq!(parse_db("inf"), None);
+        assert_eq!(parse_db("nan"), None);
+        assert_eq!(parse_db("loud"), None);
+        assert_eq!(parse_db(""), None);
+        // What's shown to type over reads back as itself.
+        for db in [-96.0, -12.5, 0.0, 3.0] {
+            let back = parse_db(&db_edit_text(db, -96.0)).unwrap();
+            assert!(back == db || (db <= -96.0 && back == f32::NEG_INFINITY));
+        }
+    }
 
     /// A size's sides are even: typed, rounded the way they were changed;
     /// following the other (its shape kept), the nearest; within range.

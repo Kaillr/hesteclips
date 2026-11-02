@@ -1121,6 +1121,29 @@ impl Ready {
         }
     }
 
+    /// Track `i`'s volume typed in, as it is at `t`: a flat one is set to
+    /// it; a curve goes up or down as a whole until it's there (as dragging
+    /// its line does).
+    fn set_level_at(&mut self, i: usize, t: f64, db: f32) {
+        if i >= self.edit.tracks.len() {
+            return;
+        }
+        let db = (db.clamp(media::SILENT_DB, media::FADER_MAX_DB) * 10.0).round() / 10.0;
+        let was = self.edit.clone();
+        let track = &mut self.edit.tracks[i];
+        if track.points.is_empty() {
+            track.gain = media::from_db(db);
+        } else {
+            let d = media::fader_pos(db) - media::fader_pos(track.db_at(t));
+            for pt in &mut track.points {
+                pt.db = media::fader_db(media::fader_pos(pt.db) + d);
+            }
+        }
+        if !same_edit(&self.edit, &was) {
+            self.push_undo(was);
+        }
+    }
+
     /// The kept length under the timeline: shown, and on a click typed over
     /// (digits fill the clock, "1250" is 12:50 and "12.5" 12.5 seconds; or
     /// frames when times show as frames). Enter, or ↑ ↓, makes the kept part
@@ -2299,14 +2322,20 @@ impl Ready {
                     self.solo = if solo_before == Some(i) { None } else { Some(i) };
                 }
             }
-            // Right-click: mute, solo, reset the volume.
+            // Right-click: the volume (where the playhead is) to type, mute,
+            // solo, reset the volume.
             let track = &self.edit.tracks[i];
             let (muted, flat) = (track.muted, track.points.is_empty() && (track.gain - 1.0).abs() < 0.005);
             let has_points = !track.points.is_empty();
+            let now_t = self.player.time();
+            let shown = crate::ui_kit::db_edit_text(track.db_at(now_t), media::SILENT_DB);
             let mut pick = None;
-            crate::ui_kit::context_menu(&hresp, 220.0, |ui| {
+            let mut typed = None;
+            crate::ui_kit::context_menu_typed(&hresp, 220.0, |ui| {
                 use crate::ui_kit::Item;
                 use egui_phosphor::regular as icon;
+                typed = crate::ui_kit::menu_db_field(ui, "Volume", &shown);
+                crate::ui_kit::menu_sep(ui);
                 if Item::new(if muted { "Unmute" } else { "Mute" }).icon(icon::SPEAKER_X).show(ui).clicked() {
                     pick = Some(0);
                 }
@@ -2321,6 +2350,9 @@ impl Ready {
                     pick = Some(3);
                 }
             });
+            if let Some(db) = typed {
+                self.set_level_at(i, now_t, db);
+            }
             match pick {
                 Some(0) => {
                     self.push_undo(self.edit.clone());
@@ -2414,11 +2446,16 @@ impl Ready {
                 Mute(usize),
                 RemovePoint(usize, usize),
                 PointLevel(usize, usize, f32),
+                Typed(usize, f32),
             }
             let can_split = self.split_at(t).is_some();
             let at_playhead = self.part_at(self.player.time());
+            let vol_t = self.info.snap(t);
             let mut act = None;
-            let open = crate::ui_kit::context_menu(resp, 220.0, |ui| {
+            // A volume menu has a field to type it into, which a click
+            // into mustn't close.
+            let typing = matches!(spot, Spot::Volume(_) | Spot::Point(..));
+            let body = |ui: &mut egui::Ui| {
                 use crate::ui_kit::Item;
                 use egui_phosphor::regular as icon;
                 match spot {
@@ -2446,6 +2483,12 @@ impl Ready {
                     Spot::Volume(i) => {
                         let Some(track) = self.edit.tracks.get(i) else { return };
                         let flat = track.points.is_empty() && (track.gain - 1.0).abs() < 0.005;
+                        // Here, on a curve: it all goes up or down to it.
+                        let shown = crate::ui_kit::db_edit_text(track.db_at(vol_t), media::SILENT_DB);
+                        if let Some(db) = crate::ui_kit::menu_db_field(ui, if track.points.is_empty() { "Volume" } else { "Volume here" }, &shown) {
+                            act = Some(Act::Typed(i, db));
+                        }
+                        crate::ui_kit::menu_sep(ui);
                         if Item::new("Add a point here").icon(icon::PLUS).keys(Some(vec!["Double-click".into()])).show(ui).clicked() {
                             act = Some(Act::AddPoint(i));
                         }
@@ -2461,6 +2504,13 @@ impl Ready {
                         }
                     }
                     Spot::Point(i, k) => {
+                        if let Some(pt) = self.edit.tracks.get(i).and_then(|t| t.points.get(k)) {
+                            let shown = crate::ui_kit::db_edit_text(pt.db, media::SILENT_DB);
+                            if let Some(db) = crate::ui_kit::menu_db_field(ui, "Volume", &shown) {
+                                act = Some(Act::PointLevel(i, k, (db.clamp(media::SILENT_DB, media::FADER_MAX_DB) * 10.0).round() / 10.0));
+                            }
+                            crate::ui_kit::menu_sep(ui);
+                        }
                         if Item::new("Set to 0 dB").icon(icon::ARROW_COUNTER_CLOCKWISE).show(ui).clicked() {
                             act = Some(Act::PointLevel(i, k, 0.0));
                         }
@@ -2469,7 +2519,8 @@ impl Ready {
                         }
                     }
                 }
-            });
+            };
+            let open = if typing { crate::ui_kit::context_menu_typed(resp, 220.0, body) } else { crate::ui_kit::context_menu(resp, 220.0, body) };
             // Closed (picked from, or clicked away): its part isn't lit anymore.
             if open.is_none() {
                 self.menu_at = None;
@@ -2498,6 +2549,7 @@ impl Ready {
                     self.edit.tracks[i].muted = !self.edit.tracks[i].muted;
                 }
                 Some(Act::RemovePoint(i, k)) => self.remove_point(i, k),
+                Some(Act::Typed(i, db)) => self.set_level_at(i, vol_t, db),
                 Some(Act::PointLevel(i, k, db)) => {
                     if let Some(pt) = self.edit.tracks.get(i).and_then(|t| t.points.get(k)).copied() {
                         self.push_undo(self.edit.clone());
