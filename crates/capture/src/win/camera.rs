@@ -2,7 +2,7 @@
 //! camera sends (MJPEG, YUY2, NV12) into BGRA, which is uploaded to the GPU
 //! for the compositor (`d3d::Converter`).
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -87,6 +87,15 @@ pub(crate) struct CameraFeed {
 /// The one open camera.
 static CURRENT: Mutex<Option<Arc<CameraFeed>>> = Mutex::new(None);
 
+/// Pictures from any camera so far, numbering them: going on from camera to
+/// camera and format to format, so a reader waiting for one newer than the
+/// last it had (the Camera page) gets the next camera's at once.
+static PICTURES: AtomicU64 = AtomicU64::new(0);
+
+/// How many of them were new, not repeats of the one before (as a camera
+/// sends while its exposure is longer than a frame): its real frame rate.
+static NEW_PICTURES: AtomicU64 = AtomicU64::new(0);
+
 impl CameraFeed {
     pub(crate) fn latest(&self) -> Option<Arc<Frame>> {
         self.frame.lock().unwrap().clone()
@@ -144,15 +153,13 @@ pub(crate) fn picture(max_width: u32, newer_than: u64) -> Option<crate::webcam::
             (to[0], to[1], to[2]) = (from[2], from[1], from[0]);
         }
     }
-    // Each picture the camera sends is a new one (it doesn't say otherwise).
-    Some(crate::webcam::CameraPreview { width: w as u32, height: h as u32, rgba, seq: f.seq, new_pictures: f.seq })
+    Some(crate::webcam::CameraPreview { width: w as u32, height: h as u32, rgba, seq: f.seq, new_pictures: NEW_PICTURES.load(Ordering::Relaxed) })
 }
 
 /// Open the camera and keep reading it until told to stop. If it can't be
 /// opened (unplugged, in use) or stops, try again every few seconds.
 fn run(feed: Arc<CameraFeed>) {
     com_init();
-    let mut seq = 0u64;
     while !feed.stop.load(Ordering::Relaxed) {
         set_status(Status::Opening);
         let (reader, source, width, height) = match open_reader(&feed.device, feed.format) {
@@ -170,6 +177,7 @@ fn run(feed: Arc<CameraFeed>) {
         crate::webcam::apply_remembered(&feed.device);
         set_status(Status::Live { width, height });
         let mut rows = Vec::new();
+        let mut last_print = None;
         while !feed.stop.load(Ordering::Relaxed) {
             let mut flags = 0u32;
             let mut sample = None;
@@ -185,7 +193,12 @@ fn run(feed: Arc<CameraFeed>) {
             let Some(sample) = sample else { continue };
             match read_frame(&sample, width, height, &mut rows) {
                 Ok(()) => {
-                    seq += 1;
+                    let seq = PICTURES.fetch_add(1, Ordering::Relaxed) + 1;
+                    let print = crate::webcam::fingerprint(&rows);
+                    if last_print != Some(print) {
+                        NEW_PICTURES.fetch_add(1, Ordering::Relaxed);
+                        last_print = Some(print);
+                    }
                     let bgra = std::mem::take(&mut rows);
                     *feed.frame.lock().unwrap() = Some(Arc::new(Frame { seq, width, height, bgra }));
                 }

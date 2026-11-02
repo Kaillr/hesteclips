@@ -413,6 +413,16 @@ pub fn camera_picture(max_width: u32, newer_than: u64) -> Option<CameraPreview> 
     }
 }
 
+/// A quick fingerprint of a camera's picture: a few thousand of its bytes,
+/// spread over it. A repeated picture has the same; a new one (sensor noise
+/// alone) a different one. Cameras repeat pictures when their exposure is
+/// longer than a frame: counting only new ones gives their real frame rate.
+#[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
+pub(crate) fn fingerprint(bytes: &[u8]) -> u64 {
+    let step = (bytes.len() / 4096).max(1);
+    bytes.iter().step_by(step).fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ *b as u64).wrapping_mul(0x100_0000_01b3))
+}
+
 /// Settings set for each camera, by device: put back each time it's opened.
 static REMEMBERED: Mutex<Option<std::collections::HashMap<String, Vec<(u32, i64)>>>> = Mutex::new(None);
 

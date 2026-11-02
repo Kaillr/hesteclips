@@ -50,14 +50,6 @@ static PICTURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 /// them (the very same bytes): this counts what's new, its real rate.
 static NEW_PICTURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// A quick fingerprint of a picture: a few thousand of its bytes, spread
-/// over it. A repeated picture has the same; a new one (sensor noise alone)
-/// a different one.
-fn fingerprint(bytes: &[u8]) -> u64 {
-    let step = (bytes.len() / 4096).max(1);
-    bytes.iter().step_by(step).fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ *b as u64).wrapping_mul(0x100_0000_01b3))
-}
-
 impl CameraFeed {
     fn latest(&self) -> Option<Arc<CameraPicture>> {
         self.frame.lock().unwrap().clone()
@@ -195,7 +187,7 @@ impl Delivery {
     }
 
     fn deliver(&mut self, feed: &CameraFeed, w: u32, h: u32, buf: Vec<u8>) {
-        let print = fingerprint(&buf);
+        let print = crate::webcam::fingerprint(&buf);
         if self.last_print != Some(print) {
             NEW_PICTURES.fetch_add(1, Ordering::Relaxed);
             self.last_print = Some(print);

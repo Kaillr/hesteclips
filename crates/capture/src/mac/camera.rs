@@ -53,6 +53,11 @@ pub(crate) struct CameraFeed {
 
 static CURRENT: Mutex<Option<Arc<CameraFeed>>> = Mutex::new(None);
 
+/// Pictures from any camera so far, numbering them: going on from camera to
+/// camera and format to format, so a reader waiting for one newer than the
+/// last it had (the crop page) gets the next camera's at once.
+static PICTURES: AtomicU64 = AtomicU64::new(0);
+
 impl CameraFeed {
     /// The newest picture.
     pub(crate) fn latest(&self) -> Option<Arc<Frame>> {
@@ -262,7 +267,8 @@ define_class!(
         fn did_output(&self, _output: &AVCaptureOutput, sample: &CMSampleBuffer, _connection: &AVCaptureConnection) {
             let feed = self.ivars();
             if let Some(buffer) = unsafe { sample.image_buffer() } {
-                let seq = feed.seq.fetch_add(1, Ordering::Relaxed) + 1;
+                feed.seq.fetch_add(1, Ordering::Relaxed);
+                let seq = PICTURES.fetch_add(1, Ordering::Relaxed) + 1;
                 *feed.frame.lock().unwrap() = Some(Arc::new(Frame { seq, buffer }));
             }
         }
