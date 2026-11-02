@@ -515,16 +515,18 @@ impl Viewer {
                 if let Some(c) = crate::ui_kit::menu_popup(&share, false, 250.0, |ui| crate::library::share_menu(ui, share.rect.left_bottom(), nav.linked, image)).flatten() {
                     out = ViewerOutcome::Share(c);
                 }
-                // Shared: says so beside Share, and opens its link.
+                let edit = if narrow { Btn::icon(Kind::Normal, icon::SCISSORS) } else { Btn::normal("Edit").with_icon(icon::SCISSORS) };
+                if !image && edit.enabled(ready).tip(if ready { "Trim it, adjust its sound, or save it smaller" } else { wait }).show(ui).clicked() {
+                    out = ViewerOutcome::Edit;
+                }
+                // Shared: says so left of the buttons (laid out right to left),
+                // so Share and Edit stay put whether the clip's shared or not.
+                // It opens its link.
                 if let Some((glyph, words, tip)) = &nav.link {
                     let b = if narrow { Btn::icon(Kind::Ghost, glyph) } else { Btn::ghost(words.clone()).with_icon(glyph) };
                     if b.tip(*tip).show(ui).clicked() {
                         out = ViewerOutcome::Share(crate::library::ShareChoice::Link);
                     }
-                }
-                let edit = if narrow { Btn::icon(Kind::Normal, icon::SCISSORS) } else { Btn::normal("Edit").with_icon(icon::SCISSORS) };
-                if !image && edit.enabled(ready).tip(if ready { "Trim it, adjust its sound, or save it smaller" } else { wait }).show(ui).clicked() {
-                    out = ViewerOutcome::Edit;
                 }
             }
             crate::transport::Part::Left => {}
