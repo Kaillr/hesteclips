@@ -1577,13 +1577,16 @@ impl Ready {
         let vol_at = |pos: Pos2, this: &Self| l.vol_at(pos, &this.edit.tracks);
         let hit = |pos: Pos2, this: &Self| l.hit(pos, &this.edit.tracks);
 
-        // The playhead goes where the button goes down, at once, not when
-        // it's let go or a drag gets going (a drag on a part or its edge
-        // then moves it on). Not on the volume, where a drag only shapes it.
+        // The playhead goes where the button goes down, at once, and playing
+        // pauses until it's let go, a click as a drag (a drag on a part or
+        // its edge then moves it on). Not on the volume, where a drag only
+        // shapes it and never interrupts playback.
         if resp.is_pointer_button_down_on()
             && let Some(pos) = ui.input(|i| i.pointer.primary_pressed().then(|| i.pointer.press_origin()).flatten())
             && !matches!(hit(pos, self), Some(Drag::Line(_) | Drag::Point(..)))
         {
+            self.resume = self.player.is_playing();
+            self.player.pause();
             let t = self.snapped(t_of(pos.x), px_per_s, Some(Drag::Playhead));
             self.player.seek(self.info.snap(t) + 1e-6);
         }
@@ -1621,7 +1624,8 @@ impl Ready {
                 // Moving the playhead or a trim pauses while you drag and carries on
                 // after; shaping the volume never interrupts playback.
                 if matches!(d, Drag::Start(_) | Drag::End(_) | Drag::Range(_) | Drag::Playhead) {
-                    self.resume = self.player.is_playing();
+                    // (Already paused by the press, which noted if it played.)
+                    self.resume |= self.player.is_playing();
                     self.player.pause();
                 }
             }
@@ -1768,6 +1772,15 @@ impl Ready {
             }
         }
 
+        // Let go of a press that didn't become a drag: playing carries on
+        // from where it went.
+        if self.dragging.is_none() && self.resume && !ui.input(|i| i.pointer.primary_down()) {
+            self.resume = false;
+            self.player.land();
+            if self.player.time() < self.edit.end - fd {
+                self.player.play(self.edit.end);
+            }
+        }
         if resp.double_clicked() {
             if let Some(pos) = resp.interact_pointer_pos() {
                 if let Some(Drag::Point(i, k)) = vol_at(pos, self) {
@@ -1791,8 +1804,8 @@ impl Ready {
                 }
             }
         } else if resp.clicked() {
-            // Jump there; playing carries on from the new spot.
-            if let Some(pos) = resp.interact_pointer_pos() {
+            // On the volume, jump there (elsewhere, the press already did).
+            if let Some(pos) = resp.interact_pointer_pos().filter(|&pos| matches!(hit(pos, self), Some(Drag::Line(_) | Drag::Point(..)))) {
                 let t = self.snapped(t_of(pos.x), px_per_s, Some(Drag::Playhead));
                 self.player.seek(self.info.snap(t) + 1e-6);
             }
