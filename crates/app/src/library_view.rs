@@ -1070,7 +1070,7 @@ impl App {
         let when = clip.captured_at().format("Saved %-d %B at %H:%M").to_string();
         let size_tip = if clip.kept_bytes > 0 {
             format!(
-                "{when}\n{} in all: {} for the clip, and {} for its original recording, kept so the edit can be changed or undone. In the editor, ⋯ → Free up space trims or deletes it.",
+                "{when}\n{} in all: {} for the clip, and {} for its original recording, kept so the edit can be changed or undone. Right-click → Free up space trims or deletes it.",
                 clips::human_bytes(clip.size_bytes + clip.kept_bytes),
                 clip.human_size(),
                 clips::human_bytes(clip.kept_bytes),
@@ -1134,6 +1134,12 @@ impl App {
             {
                 action = Some(Action::Export(paths.clone()));
             }
+            let kept: u64 = self.clips.iter().filter(|c| self.selection.paths.contains(&c.path)).map(|c| c.kept_bytes).sum();
+            if kept > 0
+                && Item::new("Free up space…").icon(icon::HARD_DRIVE).tip(format!("Their original recordings take {}: trim them to what the edits use, or delete them", clips::human_bytes(kept))).show(ui).clicked()
+            {
+                action = Some(Action::FreeUp(paths.clone()));
+            }
             ui_kit::menu_sep(ui);
             if Item::new("Deselect all").icon(icon::X_CIRCLE).show(ui).clicked() {
                 action = Some(Action::Deselect);
@@ -1186,6 +1192,12 @@ impl App {
         let selected = self.selection.paths.contains(&clip.path);
         if Item::new(if selected { "Deselect" } else { "Select" }).icon(icon::CHECK_CIRCLE).show(ui).clicked() {
             action = Some(Action::Select { path: clip.path.clone(), range: false });
+        }
+        // An edited clip keeps its original beside it.
+        if clip.kept_bytes > 0
+            && Item::new("Free up space…").icon(icon::HARD_DRIVE).tip(format!("Its original recording takes {}: trim it to what the edit uses, or delete it", clips::human_bytes(clip.kept_bytes))).show(ui).clicked()
+        {
+            action = Some(Action::FreeUp(vec![clip.path.clone()]));
         }
         ui_kit::menu_sep(ui);
         let del_key = Some(vec![if cfg!(target_os = "macos") { icon::BACKSPACE.to_owned() } else { "Del".to_owned() }]);
@@ -1310,6 +1322,18 @@ impl App {
                                     }
                                 });
                             }
+                            // Edited clips among them keep their originals.
+                            let (kept, with) = self.clips.iter().filter(|c| self.selection.paths.contains(&c.path) && c.kept_bytes > 0).fold((0, 0), |(b, n), c| (b + c.kept_bytes, n + 1));
+                            if with > 0 {
+                                let tip = match (n, with) {
+                                    (1, _) => format!("Its original recording takes {}: trim it to what the edit uses, or delete it", clips::human_bytes(kept)),
+                                    (_, 1) => format!("One of them keeps its original recording ({}): trim it to what the edit uses, or delete it", clips::human_bytes(kept)),
+                                    _ => format!("{with} of them keep their original recordings ({}): trim them to what the edits use, or delete them", clips::human_bytes(kept)),
+                                };
+                                if Btn::ghost("Free up space").with_icon(icon::HARD_DRIVE).small().tip(tip).show(ui).clicked() {
+                                    action = Some(Action::FreeUp(selected.clone()));
+                                }
+                            }
                             let label = if self.settings.delete_permanently { format!("Delete {n}") } else { format!("Move {n} to {}", crate::store::bin_name()) };
                             if Btn::new(Kind::DangerText, label).with_icon(icon::TRASH).small().show(ui).clicked() {
                                 action = Some(Action::TrashSelected);
@@ -1391,6 +1415,7 @@ impl App {
             }
             Action::Export(paths) => self.export_clips(&paths),
             Action::Import => self.import_clips_dialog(),
+            Action::FreeUp(paths) => self.ask_free_up(&paths),
         }
     }
 }

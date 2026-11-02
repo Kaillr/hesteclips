@@ -21,6 +21,7 @@ mod discord;
 mod editor;
 mod export_ui;
 mod filmstrip;
+mod free_up;
 mod logfile;
 mod game_events;
 mod games;
@@ -560,6 +561,10 @@ struct App {
     pub(crate) card_drag: Option<library::CardDrag>,
     /// Clips waiting for "Delete permanently?" to be answered.
     pub(crate) confirm_delete: Option<Vec<PathBuf>>,
+    /// The library's Free up space dialog, and originals being freed (see
+    /// `free_up.rs`).
+    pub(crate) free_up: Option<free_up::Ask>,
+    pub(crate) free_up_batches: Vec<free_up::Batch>,
     /// The editor was opened from the player on this clip: closing it goes
     /// back there, not to the library (so cleaning up clips flows on).
     edit_return: Option<PathBuf>,
@@ -772,6 +777,8 @@ impl App {
             collection_dialog: None,
             card_drag: None,
             confirm_delete: None,
+            free_up: None,
+            free_up_batches: Vec::new(),
             last_view: None,
             tray,
             quitting: false,
@@ -844,6 +851,12 @@ impl App {
         // unless the dialog is answered).
         if let Some(clip) = std::env::var_os("HASTECLIP_DEMO_DELETE").map(PathBuf::from) {
             app.confirm_delete = Some(vec![clip]);
+        }
+        // `HASTECLIP_DEMO_FREE_UP=<clips>` (separated as in PATH) asks how to free up their
+        // originals' space (nothing changes unless the dialog is answered).
+        if let Some(clips) = std::env::var_os("HASTECLIP_DEMO_FREE_UP") {
+            let paths: Vec<PathBuf> = std::env::split_paths(&clips).collect();
+            app.ask_free_up(&paths);
         }
         if let Some(clip) = std::env::var_os("HASTECLIP_DEMO_RENAME").map(PathBuf::from) {
             app.rename_clip(clip);
@@ -1172,6 +1185,7 @@ impl eframe::App for App {
         let overlay = self.rename.is_some()
             || self.collection_dialog.is_some()
             || self.confirm_delete.is_some()
+            || self.free_up.is_some()
             || self.link_dialog.is_some()
             || self.confirm_reset
             || self.close_dialog
@@ -1225,6 +1239,7 @@ impl eframe::App for App {
         self.rename_dialog(&ctx);
         self.collection_dialog(&ctx);
         self.delete_dialog(&ctx);
+        self.free_up_dialog(&ctx);
         self.link_dialog(&ctx);
         self.close_dialog(&ctx);
         self.keys_dialog(&ctx);
@@ -1914,6 +1929,7 @@ impl App {
             collections,
             delete_label,
             saving,
+            kept: self.clips.iter().find(|c| c.path == v.clip()).map_or(0, |c| c.kept_bytes),
             linked: self.links.get(v.clip()).is_some(),
             link,
         };
@@ -1957,6 +1973,10 @@ impl App {
                 let clip = v.clip().to_path_buf();
                 self.delete_clips(&[clip]);
             }
+            viewer::ViewerOutcome::FreeUp => {
+                let clip = v.clip().to_path_buf();
+                self.ask_free_up(&[clip]);
+            }
             viewer::ViewerOutcome::Rename => {
                 let clip = v.clip().to_path_buf();
                 self.rename_clip(clip);
@@ -1985,7 +2005,7 @@ impl App {
             self.page = Page::Clips;
             return;
         };
-        let outcome = ed.ui(ui);
+        let outcome = ed.ui(ui, self.settings.delete_permanently);
         self.settings.editor_preview_share = ed.preview_share();
         self.settings.editor_snap = ed.snap();
         if let Some((volume, muted)) = viewer::volume(ui.ctx()) {
@@ -2024,7 +2044,7 @@ impl App {
                 // Closed first: the editor reads the original (about to
                 // change, so nothing of it is handed on).
                 self.close_editor(false);
-                self.start_free_up(target, how);
+                self.start_free_up(vec![target], how);
             }
         }
     }
@@ -2137,47 +2157,25 @@ impl App {
         self.refresh_clips();
     }
 
-    /// Trim or delete an edited clip's original, in the background. The clip
-    /// shows as saving meanwhile.
-    fn start_free_up(&mut self, target: store::EditTarget, how: store::FreeUp) {
-        let id = self.next_render_id;
-        self.next_render_id += 1;
-        self.renders.push(RenderJob {
-            id,
-            source: target.clip.clone(),
-            dest: target.clip.clone(),
-            as_new: false,
-            progress: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
-        });
-        let tx = self.render_tx.clone();
-        let ctx = self.ctx();
-        let permanently = self.settings.delete_permanently;
-        std::thread::spawn(move || {
-            let freed = store::free_up(&target, how, permanently);
-            let _ = tx.send(RenderDone { id, result: Ok(target.clip.clone()), freed: Some((how, freed)) });
-            ctx.request_repaint();
-        });
-    }
-
     fn pump_renders(&mut self) {
         while let Ok(RenderDone { id, result, freed }) = self.render_rx.try_recv() {
             let Some(i) = self.renders.iter().position(|j| j.id == id) else { continue };
-            match freed {
-                Some((how, Ok(bytes))) => {
-                    let what = if how == store::FreeUp::Trim { "Trimmed the original" } else { "Deleted the original" };
-                    let bin = if how == store::FreeUp::Delete && !self.settings.delete_permanently {
-                        format!(" (empty the {} to get the space back)", store::bin_name())
-                    } else {
-                        String::new()
-                    };
-                    if bytes == 0 && how == store::FreeUp::Trim {
-                        self.toast("The original is already as short as this edit");
-                    } else {
-                        self.toast(format!("{what}: freed {}{bin}", export_ui::human_bytes(bytes)));
-                    }
+            // The player showing it (Free up space from its ⋯) reads where
+            // it sits in the recording again.
+            if freed.is_some()
+                && let Some(v) = &mut self.viewer
+            {
+                v.original_changed(&self.renders[i].source);
+            }
+            // Freed with others: their batch's toast says how it went, once
+            // they're all done. After saving an edit: this one's.
+            if let Some((how, freed)) = freed
+                && !self.freed_in_batch(id, &freed)
+            {
+                match freed {
+                    Ok(bytes) => self.freed_toast(how, 1, bytes, usize::from(bytes == 0 && how == store::FreeUp::Trim), &[]),
+                    Err(e) => self.freed_toast(how, 1, 0, 0, &[e]),
                 }
-                Some((_, Err(e))) => self.toast_error(format!("Couldn't free up the space: {e}")),
-                None => {}
             }
             let job = self.renders.remove(i);
             match result {

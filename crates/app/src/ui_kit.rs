@@ -473,6 +473,8 @@ pub struct Btn<'a> {
     /// Held back by what the app's doing, and why.
     locked: Option<String>,
     corners: CornerRadius,
+    /// Drawn this wide, whatever's in it.
+    exact_w: Option<f32>,
     id: Option<egui::Id>,
     progress: Option<f32>,
 }
@@ -492,9 +494,21 @@ impl<'a> Btn<'a> {
             enabled: true,
             locked: None,
             corners: CornerRadius::same(RADIUS),
+            exact_w: None,
             id: None,
             progress: None,
         }
+    }
+    /// Its corners, to join it to a button beside it (a split button: Save
+    /// and its ▾).
+    pub fn corners(mut self, c: CornerRadius) -> Self {
+        self.corners = c;
+        self
+    }
+    /// Drawn this wide (a split button's narrow ▾).
+    pub fn exact_width(mut self, w: f32) -> Self {
+        self.exact_w = Some(w);
+        self
     }
     pub fn primary(label: impl Into<String>) -> Self {
         Self::new(Kind::Primary, label)
@@ -588,6 +602,9 @@ impl<'a> Btn<'a> {
         let trail_w = self.trail.map(|i| text_w(i, FontId::proportional(icon_size - 1.5)));
         let keys_w = self.keys.as_ref().map(|k| key_hint_width(ui, k, 11.0));
         let only_icon = label_w.is_none() && trail_w.is_none() && keys_w.is_none();
+        if let Some(w) = self.exact_w {
+            return w;
+        }
         if only_icon {
             return h;
         }
@@ -619,7 +636,7 @@ impl<'a> Btn<'a> {
             parts += 1;
         }
         content += gap * (parts.max(1) - 1) as f32;
-        let target_w = if only_icon { h } else { (pad_l + content + pad_r).max(self.min_w) };
+        let target_w = self.exact_w.unwrap_or(if only_icon { h } else { (pad_l + content + pad_r).max(self.min_w) });
         let id = self.id.unwrap_or_else(|| ui.next_auto_id());
         let w = theme::value(ui.ctx(), id.with("w"), target_w, theme::NORMAL);
         let usable = self.enabled && self.locked.is_none();

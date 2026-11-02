@@ -279,6 +279,8 @@ pub(crate) enum Action {
     Deselect,
     /// Delete the selected clips.
     TrashSelected,
+    /// Ask how to free up the space these edited clips' originals take.
+    FreeUp(Vec<PathBuf>),
 }
 
 impl App {

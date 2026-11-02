@@ -55,6 +55,8 @@ pub enum ViewerOutcome {
     NewCollection,
     /// Delete the clip (to the Recycle Bin, or for good after asking).
     Delete,
+    /// Ask how to free up the space its original takes.
+    FreeUp,
     /// The picture was dragged: hand the clip to the OS to drop into an app.
     DragOut,
     /// Play it in the OS default video player instead.
@@ -77,6 +79,9 @@ pub struct Nav {
     pub delete_label: String,
     /// The clip's edit being saved, 0..=1.
     pub saving: Option<f32>,
+    /// What's kept beside the clip, in bytes: an edited clip's original
+    /// (0: none, so nothing to free up).
+    pub kept: u64,
     /// The clip has a share link.
     pub linked: bool,
     /// How its link is, for the header: icon, words and what they mean.
@@ -299,6 +304,20 @@ impl Viewer {
         }
     }
 
+    /// `clip`'s original was trimmed or deleted to free up space: the file
+    /// plays on as it is, but where it sits in the recording and the
+    /// moments (kept in the recording's time) are read again.
+    pub fn original_changed(&mut self, clip: &Path) {
+        if self.clip != clip {
+            return;
+        }
+        self.handoff.kept.keep_only(clip);
+        if let State::Ready(r) = &mut self.state {
+            r.span = recording_span(clip, r.info.duration, &self.handoff.kept);
+            r.moments = crate::moments::of(clip);
+        }
+    }
+
     pub fn ui(&mut self, ui: &mut egui::Ui, nav: &Nav) -> ViewerOutcome {
         if let State::Loading(rx) = &self.state {
             if let Ok((result, kept)) = rx.try_recv() {
@@ -489,6 +508,17 @@ impl Viewer {
                     }
                     if Item::new(if image { "Open in another app" } else { "Open in another player" }).icon(icon::ARROW_SQUARE_OUT).show(ui).clicked() {
                         out = ViewerOutcome::OpenExternal;
+                    }
+                    // An edited clip keeps its original beside it.
+                    if nav.kept > 0
+                        && Item::new("Free up space…")
+                            .icon(icon::HARD_DRIVE)
+                            .enabled(ready)
+                            .tip(format!("Its original recording takes {}: trim it to what the edit uses, or delete it", crate::export_ui::human_bytes(nav.kept)))
+                            .show(ui)
+                            .clicked()
+                    {
+                        out = ViewerOutcome::FreeUp;
                     }
                     crate::ui_kit::menu_sep(ui);
                     if !image {
