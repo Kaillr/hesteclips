@@ -473,31 +473,34 @@ fn run(dir: &Path, gpu: &Gpu, window: HWND, latest: &Arc<Latest>, fps: u32, stop
         if let Some(s) = source.as_ref().filter(|_| !super::system::window_hidden(window)) {
             // Into a slot of its own: whether it's new is known a few
             // milliseconds on (`Changes`), and the picture is kept till then.
-            let (i, picture, slot_target) = changes.slot();
-            let mut at = windows::Win32::Foundation::POINT::default();
-            let _ = unsafe { windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut at) };
-            match &s.signature_view {
-                // Copied only if it changed.
-                Some(view) => {
-                    let mut failed = None;
-                    changes.read(gpu, &quad, i, view, (s.cx, s.cy), (at.x, at.y), &mut || {
-                        s.copy(gpu, &quad, &slot_target, &picture, &mutexes).unwrap_or_else(|e| {
-                            failed = Some(e);
-                            None
-                        })
-                    });
-                    if let Some(e) = failed {
-                        eprintln!("game hook: {e:#}");
+            // None: every slot is still waiting on a comparison (the graphics
+            // card is behind), so this look is skipped, not its pictures.
+            if let Some((i, picture, slot_target)) = changes.slot(gpu) {
+                let mut at = windows::Win32::Foundation::POINT::default();
+                let _ = unsafe { windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut at) };
+                match &s.signature_view {
+                    // Copied only if it changed.
+                    Some(view) => {
+                        let mut failed = None;
+                        changes.read(gpu, &quad, i, view, (s.cx, s.cy), (at.x, at.y), &mut || {
+                            s.copy(gpu, &quad, &slot_target, &picture, &mutexes).unwrap_or_else(|e| {
+                                failed = Some(e);
+                                None
+                            })
+                        });
+                        if let Some(e) = failed {
+                            eprintln!("game hook: {e:#}");
+                        }
                     }
+                    None => match s.copy(gpu, &quad, &slot_target, &picture, &mutexes) {
+                        Ok(Some(size)) => {
+                            changes.submit(gpu, &quad, i, size, (at.x, at.y));
+                            unsafe { gpu.context.Flush() };
+                        }
+                        Ok(None) => {}
+                        Err(e) => eprintln!("game hook: {e:#}"),
+                    },
                 }
-                None => match s.copy(gpu, &quad, &slot_target, &picture, &mutexes) {
-                    Ok(Some(size)) => {
-                        changes.submit(gpu, &quad, i, size, (at.x, at.y));
-                        unsafe { gpu.context.Flush() };
-                    }
-                    Ok(None) => {}
-                    Err(e) => eprintln!("game hook: {e:#}"),
-                },
             }
         }
         // What's new goes up, with the cursor drawn on it.
