@@ -2011,8 +2011,14 @@ impl App {
                 }
             }
             editor::EditorOutcome::Saved { target, info, edit, new_name, then } => {
+                // As new: the editor stays open, on this clip, for the next
+                // one (cutting several out of one recording).
+                let as_new = new_name.as_ref().map(|n| n.trim().to_owned());
                 self.start_render(target, info, edit, new_name, then);
-                self.close_editor(true);
+                match as_new {
+                    Some(name) => self.toast(format!("Saving “{name}” as a new clip")),
+                    None => self.close_editor(true),
+                }
             }
             editor::EditorOutcome::FreeUp(target, how) => {
                 // Closed first: the editor reads the original (about to
@@ -2067,6 +2073,11 @@ impl App {
             }
             // Next to the clip, in the same game's folder.
             Some(name) => match clips::path_for_name(target.clip.parent().unwrap_or(target.library()), name, &ext, None) {
+                // Another render that isn't done yet may be making it.
+                Ok(p) if self.renders.iter().any(|j| j.dest == p) => {
+                    self.toast_error("A clip with that name is already being saved.");
+                    return;
+                }
                 Ok(p) => (p, None),
                 Err(e) => {
                     self.toast_error(e);

@@ -641,6 +641,7 @@ impl App {
                 ("Double-click it", "Add a volume point"),
                 ("Right-click a point", "Remove it"),
                 ("Cmd S", "Save"),
+                ("Shift Cmd S", "Save as a new clip"),
                 ("F2", "Rename"),
             ],
         };

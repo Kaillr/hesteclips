@@ -9,7 +9,7 @@
 //! renders the edited file in the background; the original is never touched.
 
 use crate::ui_kit::Dismissed as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
 
@@ -175,6 +175,10 @@ struct Ready {
     confirm_revert: bool,
     /// The Save as new name was selected for typing over.
     save_as_focused: bool,
+    /// The edit last saved as a new clip (the editor stays open after).
+    saved_new: Option<Edit>,
+    /// The clips saved as new from here, which may not be there yet.
+    new_clips: Vec<PathBuf>,
     /// The clip's kills and your markers, as pins (the editor shows the
     /// whole recording, which they're kept for).
     moments: Vec<crate::transport::Moment>,
@@ -467,6 +471,8 @@ impl Ready {
             was_playing: false,
             confirm_revert: false,
             save_as_focused: false,
+            saved_new: None,
+            new_clips: Vec::new(),
             moments: crate::moments::of(&target.clip).pins(full),
             crop_tool: None,
             menu_at: None,
@@ -536,7 +542,8 @@ impl Ready {
         // --- Header: back and the name; export, ⋯, Cancel, Save ---
         let stem = source.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
         let title = crate::clips::title_for_stem(&stem);
-        let dirty = self.dirty();
+        // Unsaved: not this clip's edit, nor a clip just saved as new.
+        let dirty = self.unsaved();
         let changed = !self.edit.is_identity(&self.info);
         let has_saved_edit = target.source != target.clip;
         let mut cancel = false;
@@ -554,25 +561,20 @@ impl Ready {
             // Narrower windows: the export button shows just its icon, and
             // Cancel goes (back and Esc cancel too).
             let narrow = ui.ctx().content_rect().width() < 820.0;
-            // Save, with Save as new in its menu.
-            let corners_l = egui::CornerRadius { nw: 6, sw: 6, ne: 0, se: 0 };
-            let corners_r = egui::CornerRadius { nw: 0, sw: 0, ne: 6, se: 6 };
-            ui.spacing_mut().item_spacing.x = 1.0;
-            let more = Btn::icon(Kind::Primary, icon::CARET_DOWN).corners(corners_r).tip("More ways to save").show(ui);
-            crate::ui_kit::menu_popup(&more, false, 240.0, |ui| {
-                if Item::new("Save").icon(icon::CHECK).keys(Some(crate::shortcuts::command("S"))).show(ui).clicked() {
-                    save = true;
-                }
-                let item = Item::new("Save as new clip…").icon(icon::COPY).enabled(changed);
-                let item = if changed { item.tip("Keep this clip as it is and save the edit as a separate clip") } else { item.tip("Trim, change the sound or the export settings first") };
-                if item.show(ui).clicked() {
-                    save_new = true;
-                }
-            });
-            if Btn::primary("Save").corners(corners_l).min_width(64.0).tip("Save the edit to this clip. The original recording is kept, so you can change it later.").show(ui).clicked() {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            // Save, and Save as new beside it: cutting several clips out of
+            // one recording is Save as new each time, so it's not in a menu.
+            if Btn::primary("Save").min_width(64.0).tip("Save the edit to this clip. The original recording is kept, so you can change it later.").show(ui).clicked() {
                 save = true;
             }
-            ui.spacing_mut().item_spacing.x = 6.0;
+            let tip = if changed {
+                format!("Keep this clip as it is and save the edit as a separate clip  (Shift {} S). The editor stays open for the next one.", crate::shortcuts::cmd_name())
+            } else {
+                "Trim, change the sound or the export settings first".to_owned()
+            };
+            if Btn::normal("Save as new").enabled(changed).tip(tip).show(ui).clicked() {
+                save_new = true;
+            }
             ui.add_space(4.0);
             if !narrow && Btn::ghost("Cancel").show(ui).clicked() {
                 cancel = true;
@@ -647,15 +649,22 @@ impl Ready {
                 outcome = EditorOutcome::Close;
             }
         }
-        if save || (ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::S)) && !crate::ui_kit::overlay_open(&ctx)) {
+        // Shift Cmd S first: Cmd S alone would take it too (egui's shortcuts
+        // don't mind an extra Shift).
+        let (key_save_new, key_save) = if crate::ui_kit::overlay_open(&ctx) {
+            (false, false)
+        } else {
+            ctx.input_mut(|i| (i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, Key::S), i.consume_key(egui::Modifiers::COMMAND, Key::S)))
+        };
+        if save || key_save {
             self.player.pause();
             outcome = self.save(target, None);
         }
-        if save_new {
+        if save_new || key_save_new && changed {
             self.player.pause();
-            let base = source.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-            let suggested = crate::clips::sanitize_name(&format!("{} (edit)", crate::clips::title_for_stem(&base)));
-            self.save_as = Some((suggested, None));
+            let ext = source.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or("mp4".into());
+            let dir = source.parent().unwrap_or(Path::new("."));
+            self.save_as = Some((suggest_new_name(&title, dir, &ext, &self.new_clips), None));
         }
         if revert {
             self.player.pause();
@@ -774,7 +783,7 @@ impl Ready {
             let mut submit = false;
             let modal = crate::ui_kit::dialog(&ctx, "save_as_new", 400.0, |ui| {
                 crate::ui_kit::dialog_title(ui, "Save as new clip");
-                crate::ui_kit::dialog_text(ui, "This clip stays as it is. Your edit is saved as a separate clip:");
+                crate::ui_kit::dialog_text(ui, "This clip stays as it is. Your edit is saved as a separate clip, and the editor stays open for the next one:");
                 ui.add_space(4.0);
                 let out = crate::ui_kit::text_field(ui, name, "");
                 // Open with the name selected and ready to type over.
@@ -802,11 +811,13 @@ impl Ready {
             if submit {
                 let ext = source.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or("mp4".into());
                 let dir = source.parent().unwrap_or(Path::new("."));
-                match crate::clips::path_for_name(dir, name, &ext, None) {
-                    Ok(_) => {
+                // One saved as new a moment ago may not be there yet.
+                match crate::clips::path_for_name(dir, name, &ext, None).and_then(|p| if self.new_clips.contains(&p) { Err("A clip with that name is already being saved.".into()) } else { Ok(p) }) {
+                    Ok(path) => {
                         let name = name.trim().to_owned();
                         self.save_as = None;
                         self.save_as_focused = false;
+                        self.new_clips.push(path);
                         outcome = self.save(target, Some(name));
                     }
                     Err(e) => *err = Some(e),
@@ -1256,8 +1267,15 @@ impl Ready {
         targets.into_iter().filter(|x| (x - t).abs() < reach).min_by(|a, b| (a - t).abs().total_cmp(&(b - t).abs()))
     }
 
+    /// The edit isn't this clip's.
     fn dirty(&self) -> bool {
         !same_edit(&self.edit, &self.saved)
+    }
+
+    /// The edit is saved nowhere: not as this clip's, nor as the clip last
+    /// saved as new (leaving then asks nothing).
+    fn unsaved(&self) -> bool {
+        self.dirty() && !self.saved_new.as_ref().is_some_and(|s| same_edit(&self.edit, s))
     }
 
     fn save(&mut self, target: &EditTarget, new_name: Option<String>) -> EditorOutcome {
@@ -1274,7 +1292,13 @@ impl Ready {
                 EditorOutcome::Close
             };
         }
-        self.saved = self.edit.clone();
+        // As new, this clip stays as it was: it's still what the edit's
+        // compared with.
+        if new_name.is_some() {
+            self.saved_new = Some(self.edit.clone());
+        } else {
+            self.saved = self.edit.clone();
+        }
         EditorOutcome::Saved { target: target.clone(), info: self.info.clone(), edit: self.edit.clone(), new_name, then: None }
     }
 
@@ -2741,6 +2765,17 @@ fn db_label(db: f32) -> String {
     }
 }
 
+/// A name for a clip saved as new from the clip titled `title`: "… (edit)",
+/// or "… (edit 2)" and on when that's taken, by a clip in `dir` or one
+/// still being saved (`pending`).
+fn suggest_new_name(title: &str, dir: &Path, ext: &str, pending: &[PathBuf]) -> String {
+    let name = |n: u32| crate::clips::sanitize_name(&if n == 1 { format!("{title} (edit)") } else { format!("{title} (edit {n})") });
+    (1..1000)
+        .map(name)
+        .find(|name| crate::clips::path_for_name(dir, name, ext, None).is_ok_and(|p| !pending.contains(&p)))
+        .unwrap_or_else(|| name(1))
+}
+
 fn same_edit(a: &Edit, b: &Edit) -> bool {
     a.output == b.output
         && (a.start - b.start).abs() < 1e-6
@@ -2934,6 +2969,26 @@ mod length_tests {
         assert_eq!(trim_to_length(&info(), 0.0, 4.0, 10.0), (0.0, 10.0));
         // Longer than the whole clip: all of it.
         assert_eq!(trim_to_length(&info(), 5.0, 10.0, 90.0), (0.0, 60.0));
+    }
+}
+
+#[cfg(test)]
+mod new_name_tests {
+    use super::*;
+
+    #[test]
+    fn skips_names_taken_on_disk_or_still_saving() {
+        let dir = std::env::temp_dir().join(format!("hc-new-name-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(suggest_new_name("Kill", &dir, "mp4", &[]), "Kill (edit)");
+        std::fs::write(dir.join("Kill (edit).mp4"), b"").unwrap();
+        assert_eq!(suggest_new_name("Kill", &dir, "mp4", &[]), "Kill (edit 2)");
+        // Saved as new a moment ago, not written yet.
+        assert_eq!(suggest_new_name("Kill", &dir, "mp4", &[dir.join("Kill (edit 2).mp4")]), "Kill (edit 3)");
+        // A title a file can't have, made safe.
+        assert_eq!(suggest_new_name("14:51:01", &dir, "mp4", &[]), "14.51.01 (edit)");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

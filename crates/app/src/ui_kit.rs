@@ -552,10 +552,6 @@ impl<'a> Btn<'a> {
         self.locked = why;
         self
     }
-    pub fn corners(mut self, c: CornerRadius) -> Self {
-        self.corners = c;
-        self
-    }
     /// A stable id, so the width animates across frames even when the
     /// button's place in the layout changes.
     pub fn id(mut self, id: impl std::hash::Hash + std::fmt::Debug) -> Self {
