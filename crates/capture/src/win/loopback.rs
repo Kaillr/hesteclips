@@ -244,6 +244,11 @@ struct Tap {
     /// that failed to start once (or to start again after its stream died)
     /// stayed silent until the capture restarted.
     failed: HashMap<Target, (Retry, String)>,
+    /// Failed targets being started again, off the rescan's thread: the feed
+    /// each fills, and what its start comes back with. An activation that
+    /// hangs takes 5 s to give up, and every other source's rescan, and
+    /// stopping the capture, waited for it each time it was tried again.
+    retrying: HashMap<Target, (Arc<SourceFeed>, mpsc::Receiver<Result<Stream>>)>,
     /// What the log last said about this source, to log only changes.
     logged: String,
 }
@@ -260,11 +265,19 @@ impl SystemAudio {
             com_init();
             let mut taps: Vec<Tap> = sources
                 .into_iter()
-                .map(|(source, feed, channel)| Tap { source, feed, channel, streams: HashMap::new(), failed: HashMap::new(), logged: String::new() })
+                .map(|(source, feed, channel)| Tap {
+                    source,
+                    feed,
+                    channel,
+                    streams: HashMap::new(),
+                    failed: HashMap::new(),
+                    retrying: HashMap::new(),
+                    logged: String::new(),
+                })
                 .collect();
             let mut first = true;
             while !stop2.load(Ordering::Relaxed) {
-                sync_taps(&mut taps);
+                sync_taps(&mut taps, Stream::start);
                 if std::mem::take(&mut first) {
                     let _ = ready_tx.send(());
                 }
@@ -275,6 +288,9 @@ impl SystemAudio {
             }
             for tap in &mut taps {
                 tap.streams.clear();
+                // A start under way isn't waited for: a stream it starts is
+                // let go of on its thread.
+                tap.retrying.clear();
                 tap.channel.set_status(SourceStatus::Off);
             }
         });
@@ -291,8 +307,9 @@ impl SystemAudio {
     }
 }
 
-/// Bring every tap's streams in line with the processes running right now.
-fn sync_taps(taps: &mut [Tap]) {
+/// Bring every tap's streams in line with the processes running right now,
+/// starting a target's stream with `start` (`Stream::start`).
+fn sync_taps(taps: &mut [Tap], start: fn(Target, Arc<SourceFeed>) -> Result<Stream>) {
     let tree = ProcessTree::snapshot();
     let own = std::process::id();
     let own_app = crate::sources::own_app_id();
@@ -317,6 +334,9 @@ fn sync_taps(taps: &mut [Tap]) {
                 if roots.is_empty() && !own_source {
                     // Nothing to listen to until the app opens.
                     for (_, (_, child)) in tap.streams.drain() {
+                        tap.feed.remove_child(&child);
+                    }
+                    for (_, (child, _)) in tap.retrying.drain() {
                         tap.feed.remove_child(&child);
                     }
                     tap.failed.clear();
@@ -355,26 +375,45 @@ fn sync_taps(taps: &mut [Tap]) {
             keep
         });
         tap.failed.retain(|t, _| wanted.contains(t));
+        tap.retrying.retain(|t, (child, _)| {
+            let keep = wanted.contains(t);
+            if !keep {
+                feed.remove_child(child);
+            }
+            keep
+        });
         for target in wanted {
-            if tap.streams.contains_key(&target) || tap.failed.get(&target).is_some_and(|(retry, _)| !retry.due(Instant::now())) {
+            if tap.streams.contains_key(&target) {
+                continue;
+            }
+            // Started again off this thread: how it went, once it has.
+            if let Some((_, outcome)) = tap.retrying.get(&target) {
+                let outcome = match outcome.try_recv() {
+                    Err(mpsc::TryRecvError::Empty) => continue,
+                    Ok(outcome) => outcome,
+                    Err(mpsc::TryRecvError::Disconnected) => Err(anyhow!("its start ended without an answer")),
+                };
+                let (child, _) = tap.retrying.remove(&target).unwrap();
+                started(tap, target, child, outcome);
+                continue;
+            }
+            let retry = tap.failed.get(&target).map(|(retry, _)| retry.due(Instant::now()));
+            if retry == Some(false) {
                 continue;
             }
             let child = tap.feed.add_child(RATE);
-            match Stream::start(target, child.clone()) {
-                Ok(stream) => {
-                    tap.streams.insert(target, (stream, child));
-                    tap.failed.remove(&target);
-                }
-                Err(e) => {
-                    tap.feed.remove_child(&child);
-                    // Each error once, not at every try.
-                    let error = format!("{e:#}");
-                    let last = tap.failed.remove(&target);
-                    if last.as_ref().is_none_or(|(_, said)| *said != error) {
-                        eprintln!("audio source \"{}\": {error}", tap.source.name);
-                    }
-                    tap.failed.insert(target, (Retry::after(last.map(|(retry, _)| retry), Instant::now()), error));
-                }
+            if retry.is_some() {
+                let (tx, rx) = mpsc::channel();
+                let fills = child.clone();
+                thread::spawn(move || {
+                    let _ = tx.send(start(target, fills));
+                });
+                tap.retrying.insert(target, (child, rx));
+            } else {
+                // Its first try, here: the first rescan's are waited for, so
+                // a capture starts with its sound running.
+                let outcome = start(target, child.clone());
+                started(tap, target, child, outcome);
             }
         }
         let live = !tap.streams.is_empty()
@@ -389,6 +428,26 @@ fn sync_taps(taps: &mut [Tap]) {
             other => format!("{other:?}"),
         };
         log_change(tap, format!("{} ({what}): capturing {capturing:?}, failed {failed:?}", if live { "live" } else { "unavailable" }));
+    }
+}
+
+/// How starting `target`'s stream, into `child`, went.
+fn started(tap: &mut Tap, target: Target, child: Arc<SourceFeed>, outcome: Result<Stream>) {
+    match outcome {
+        Ok(stream) => {
+            tap.streams.insert(target, (stream, child));
+            tap.failed.remove(&target);
+        }
+        Err(e) => {
+            tap.feed.remove_child(&child);
+            // Each error once, not at every try.
+            let error = format!("{e:#}");
+            let last = tap.failed.remove(&target);
+            if last.as_ref().is_none_or(|(_, said)| *said != error) {
+                eprintln!("audio source \"{}\": {error}", tap.source.name);
+            }
+            tap.failed.insert(target, (Retry::after(last.map(|(retry, _)| retry), Instant::now()), error));
+        }
     }
 }
 
@@ -426,6 +485,53 @@ fn desktop_without(tree: &ProcessTree, sessions: &[u32], excluded: &dyn Fn(u32) 
 mod tests {
     use super::*;
     use crate::mixer::Clock;
+
+    /// A desktop stream that failed to start is started again off the
+    /// rescan: a start that hangs (an activation can take 5 s) holds up
+    /// neither the other sources' rescans nor stopping. The source is
+    /// Unavailable until it has started, Live then. (Nothing is captured:
+    /// the starts here fail, or wait and hand back a stream with no thread.)
+    #[test]
+    fn a_retry_doesnt_hold_up_the_rescan() {
+        static TRIES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        fn start(_: Target, _: Arc<SourceFeed>) -> Result<Stream> {
+            if TRIES.fetch_add(1, Ordering::SeqCst) == 0 {
+                anyhow::bail!("the first try fails at once");
+            }
+            thread::sleep(Duration::from_millis(600));
+            Ok(Stream { stop: Arc::new(AtomicBool::new(false)), alive: Arc::new(AtomicBool::new(true)), thread: None })
+        }
+        let live = crate::mixer::LiveAudio::new();
+        let source = AudioSource {
+            id: "desktop".into(),
+            name: "Desktop".into(),
+            kind: SourceKind::Desktop { exclude_app_sources: false },
+            in_mix: true,
+            own_track: false,
+        };
+        let mut taps = vec![Tap {
+            source,
+            feed: SourceFeed::new(RATE, Arc::new(Clock::default())),
+            channel: live.channel("desktop"),
+            streams: HashMap::new(),
+            failed: HashMap::new(),
+            retrying: HashMap::new(),
+            logged: String::new(),
+        }];
+        sync_taps(&mut taps, start);
+        assert_eq!(taps[0].channel.status(), SourceStatus::Unavailable);
+        // Its retry is due a second later.
+        thread::sleep(Duration::from_millis(1050));
+        let t = Instant::now();
+        sync_taps(&mut taps, start);
+        assert!(t.elapsed() < Duration::from_millis(200), "the rescan waited {:?} for the retry", t.elapsed());
+        assert_eq!(taps[0].channel.status(), SourceStatus::Unavailable, "still starting");
+        thread::sleep(Duration::from_millis(800));
+        sync_taps(&mut taps, start);
+        assert_eq!(taps[0].channel.status(), SourceStatus::Live);
+        assert!(taps[0].failed.is_empty() && taps[0].retrying.is_empty() && taps[0].streams.len() == 1);
+        assert_eq!(TRIES.load(Ordering::SeqCst), 2);
+    }
 
     #[test]
     #[ignore = "captures real system audio; run with --ignored"]
