@@ -122,7 +122,7 @@ struct OpenMic {
     /// The feed it fills.
     child: Arc<SourceFeed>,
     health: Arc<MicHealth>,
-    /// Host time it was opened at.
+    /// Host time its stream was open and started at.
     opened: f64,
 }
 
@@ -475,9 +475,10 @@ fn open_mic(name: &str, feed: &SourceFeed, channel: &crate::mixer::Channel) -> R
     child.mono_with(channel.mono_flag());
     child.denoise_with(channel.denoise_mode());
     let health = Arc::new(MicHealth::default());
-    let opened = host_now();
     match start_mic(name, &device, config, child.clone(), health.clone()) {
-        Ok(stream) => Ok(OpenMic { stream, child, health, opened }),
+        // Its first sound is given its time from when it's open: an open
+        // that takes seconds (a Bluetooth headset) used most of it up.
+        Ok(stream) => Ok(OpenMic { stream, child, health, opened: host_now() }),
         Err(e) => {
             feed.remove_child(&child);
             Err(e)
