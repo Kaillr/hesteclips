@@ -986,14 +986,10 @@ pub struct Devices {
     pub apps: Vec<Device>,
 }
 
-/// How the running capture keeps up, second by second: kept this many
-/// seconds back (an hour: the longest a clip reaches).
-const HEALTH_SECONDS: usize = 3600;
-
 /// One second of the running capture: frames handed to the video encoder
-/// and frames skipped, and (frame blending) the screen's pictures blended and
+/// and frames skipped, and (frame blending) the screen's new pictures and
 /// those that missed their frame.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 struct Second {
     encoded: u32,
     skipped: u32,
@@ -1001,38 +997,39 @@ struct Second {
     missed: u32,
 }
 
-/// The running capture's seconds, from its start.
+impl Second {
+    const NONE: Self = Self { encoded: 0, skipped: 0, pictures: 0, missed: 0 };
+}
+
+/// The running capture's second under way and the whole one before it, as
+/// a frame rate counter would count them: from the capture's start, or its
+/// pacer's once that says so ([`blending`]).
 struct History {
     started: Option<std::time::Instant>,
-    /// Frame blending: looks at the screen a second, and per frame (none: it
-    /// doesn't blend).
-    rate: u32,
+    /// Frames a second, and looks at the screen each blends (one: it doesn't
+    /// blend; none before the pacer begins).
+    fps: u32,
     looks: u32,
-    /// Second `first` (counted from the start) onward, the newest last.
-    first: u64,
-    seconds: std::collections::VecDeque<Second>,
+    /// The second under way (counted from the start) and its counts.
+    at: u64,
+    now: Second,
+    /// The whole second before it (none until one has gone by).
+    last: Option<Second>,
 }
 
 impl History {
-    const NONE: Self = Self { started: None, rate: 0, looks: 0, first: 0, seconds: std::collections::VecDeque::new() };
+    const NONE: Self = Self { started: None, fps: 0, looks: 0, at: 0, now: Second::NONE, last: None };
 
-    /// The second under way (those that went by with nothing counted are
-    /// added, empty); none between captures.
+    /// The second under way: once another begins, the one before is whole
+    /// (a quiet one when seconds went by with nothing counted). None between
+    /// captures.
     fn now(&mut self) -> Option<&mut Second> {
         let at = self.started?.elapsed().as_secs();
-        let end = self.first + self.seconds.len() as u64;
-        if at >= end + HEALTH_SECONDS as u64 {
-            self.seconds.clear();
-            self.first = at;
+        if at > self.at {
+            self.last = Some(if at == self.at + 1 { self.now } else { Second::NONE });
+            (self.at, self.now) = (at, Second::NONE);
         }
-        while self.first + (self.seconds.len() as u64) <= at {
-            self.seconds.push_back(Second::default());
-            if self.seconds.len() > HEALTH_SECONDS {
-                self.seconds.pop_front();
-                self.first += 1;
-            }
-        }
-        self.seconds.back_mut()
+        Some(&mut self.now)
     }
 }
 
@@ -1051,11 +1048,12 @@ pub(crate) fn capture_started() {
     *HISTORY.lock().unwrap() = History { started: Some(std::time::Instant::now()), ..History::NONE };
 }
 
-/// The capture blends `looks` looks at the screen into each frame, `fps` frames a second.
+/// The capture's pacer begins: `fps` frames a second, each blending `looks`
+/// looks at the screen (one doesn't blend: Windows times its frames so
+/// without blending). Its seconds are counted from here, so the first whole
+/// one is all the pacer's.
 pub(crate) fn blending(fps: u32, looks: u32) {
-    let mut h = HISTORY.lock().unwrap();
-    h.rate = fps.saturating_mul(looks);
-    h.looks = looks;
+    *HISTORY.lock().unwrap() = History { started: Some(std::time::Instant::now()), fps, looks, ..History::NONE };
 }
 
 /// A frame handed to the video encoder.
@@ -1098,39 +1096,60 @@ pub struct LastSecond {
     /// before a skipped frame longer.
     pub encoded: u32,
     pub skipped: u32,
-    /// Frame blending's pictures that missed their frame (came too late for
-    /// it, or were let go of waiting): those frames reused the picture before.
-    pub missed: u32,
 }
 
-/// How frame blending kept up ([`CaptureHealth::blend`]).
+/// How frame blending keeps up ([`CaptureHealth::blend`]).
 #[derive(Debug, Clone, Copy)]
 pub struct BlendHealth {
     /// Looks at the screen a second, and per frame.
     pub rate: u32,
     pub looks: u32,
-    /// The screen's new pictures in the busiest whole second of the span
-    /// (none until one has gone by): the screen only sends one when
-    /// something changes.
-    pub busiest: Option<u32>,
+    /// Its last whole second (none until one has gone by).
+    pub last_second: Option<BlendSecond>,
 }
 
-/// How the running capture keeps up: its last whole second, and frame
-/// blending's busiest whole second in its last `span`, counted each second
-/// from its start. None before a capture starts.
-pub fn health(span: std::time::Duration) -> Option<CaptureHealth> {
-    HISTORY.lock().unwrap().summary(span)
+/// One whole second of frame blending ([`BlendHealth::last_second`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BlendSecond {
+    /// Looks blended into the frames that went to the video: every look,
+    /// whether or not the screen had changed for it, but a skipped frame's.
+    pub blended: u32,
+    /// The screen's new pictures: it only shows one when something on it
+    /// changes (as often as the game draws, or the display refreshes), and
+    /// each look takes the newest one up.
+    pub pictures: u32,
+    /// Pictures that missed their frame (came too late for it, or were let go
+    /// of waiting): those frames reused the picture before.
+    pub missed: u32,
+}
+
+/// How the running capture keeps up: its last whole second, counted each
+/// second from its start, as a frame rate counter would. None before a
+/// capture starts.
+pub fn health() -> Option<CaptureHealth> {
+    HISTORY.lock().unwrap().summary()
 }
 
 impl History {
     /// [`health`] of this history.
-    fn summary(&mut self, span: std::time::Duration) -> Option<CaptureHealth> {
+    fn summary(&mut self) -> Option<CaptureHealth> {
         self.now()?;
-        // The second under way is the last: those before it are whole.
-        let whole = || self.seconds.iter().rev().skip(1);
-        let last_second = whole().next().map(|s| LastSecond { encoded: s.encoded, skipped: s.skipped, missed: s.missed });
-        let busiest = whole().take(span.as_secs().max(1) as usize).map(|s| s.pictures).max();
-        let blend = (self.rate > 0).then_some(BlendHealth { rate: self.rate, looks: self.looks, busiest });
+        let last_second = self.last.map(|s| LastSecond { encoded: s.encoded, skipped: s.skipped });
+        let (fps, looks) = (self.fps, self.looks);
+        let blend = (looks > 1).then(|| BlendHealth {
+            rate: fps.saturating_mul(looks),
+            looks,
+            last_second: self.last.map(|s| BlendSecond {
+                // Every frame made blends all its looks; a skipped one's go
+                // with it. Told by the frames skipped, not those made: the
+                // pacer makes exactly `fps` a second on its own clock, but a
+                // second here can catch one more or one fewer of them as
+                // they're finished. None made or skipped: it was held up.
+                blended: if s.encoded + s.skipped == 0 { 0 } else { fps.saturating_sub(s.skipped).saturating_mul(looks) },
+                pictures: s.pictures,
+                missed: s.missed,
+            }),
+        });
         Some(CaptureHealth { last_second, blend })
     }
 }
@@ -1140,55 +1159,66 @@ mod health_tests {
     use super::*;
     use std::time::{Duration, Instant};
 
-    /// A capture that started `secs` seconds ago.
-    fn started(secs: u64) -> History {
-        History { started: Some(Instant::now() - Duration::from_secs(secs)), ..History::NONE }
+    /// A capture whose pacer began `ms` milliseconds ago, blending 9 looks
+    /// into each of 60 frames a second.
+    fn began(ms: u64) -> History {
+        History { started: Some(Instant::now() - Duration::from_millis(ms)), fps: 60, looks: 9, ..History::NONE }
     }
 
-    /// Counts go to the second they happened in: the last whole second is
-    /// as it was, and the busiest second a whole one of the span.
+    /// Counts go to the second they happened in: the last whole second's are
+    /// as they were, not the one under way's.
     #[test]
     fn the_last_whole_second() {
-        let mut h = started(0);
-        assert!(h.summary(Duration::from_secs(60)).is_some_and(|s| s.blend.is_none() && s.last_second.is_none()), "not blending, no whole second yet");
-        h.rate = 540;
-        h.looks = 9;
-        // Three seconds in: 500 pictures in second 0, 530 in second 1, 40 so far in second 2.
-        h.started = Some(Instant::now() - Duration::from_millis(2500));
-        h.seconds = [500u32, 530, 40].iter().map(|&p| Second { encoded: 60, skipped: 0, pictures: p, missed: 0 }).collect();
-        h.seconds[0].skipped = 7;
-        h.seconds[1].skipped = 3;
-        h.seconds[2].missed = 2;
-        let s = h.summary(Duration::from_secs(60)).unwrap();
-        assert_eq!(s.last_second, Some(LastSecond { encoded: 60, skipped: 3, missed: 0 }), "the second under way isn't whole yet");
-        let b = s.blend.unwrap();
-        assert_eq!((b.rate, b.looks, b.busiest), (540, 9, Some(530)), "the second under way isn't the busiest");
-        // A one-second span: the busiest is the last whole second's.
-        h.seconds[0].pictures = 539;
-        assert_eq!(h.summary(Duration::from_secs(1)).unwrap().blend.unwrap().busiest, Some(530));
+        let mut h = began(0);
+        let s = h.summary().unwrap();
+        assert_eq!((s.last_second, s.blend.map(|b| (b.rate, b.looks, b.last_second))), (None, Some((540, 9, None))), "no whole second yet");
+        // Second 0: 57 frames made and 3 skipped, 500 new pictures, 2 of them too late.
+        *h.now().unwrap() = Second { encoded: 57, skipped: 3, pictures: 500, missed: 2 };
+        // Half a second into second 1: 40 pictures so far.
+        h.started = Some(Instant::now() - Duration::from_millis(1500));
+        h.now().unwrap().pictures = 40;
+        let s = h.summary().unwrap();
+        assert_eq!(s.last_second, Some(LastSecond { encoded: 57, skipped: 3 }));
+        assert_eq!(s.blend.unwrap().last_second, Some(BlendSecond { blended: 57 * 9, pictures: 500, missed: 2 }), "a skipped frame's looks aren't blended");
     }
 
-    /// Seconds with nothing counted still go by: a span reaches only as far
-    /// back as it says, and the last whole second is a quiet one.
+    /// Every look of a frame made is blended, whether or not the screen
+    /// showed a new picture for it: a still screen is blended at the full
+    /// rate. A second that skips more frames than it has (catching up)
+    /// blended none.
+    #[test]
+    fn every_look_counts() {
+        let mut h = began(1500);
+        (h.at, h.last) = (1, Some(Second { encoded: 60, ..Second::NONE }));
+        assert_eq!(h.summary().unwrap().blend.unwrap().last_second, Some(BlendSecond { blended: 540, pictures: 0, missed: 0 }));
+        // Catching up after falling behind: more than a second's frames skipped at once.
+        h.last = Some(Second { skipped: 75, ..Second::NONE });
+        assert_eq!(h.summary().unwrap().blend.unwrap().last_second.map(|b| b.blended), Some(0));
+    }
+
+    /// Seconds with nothing counted still go by: the last whole second is a
+    /// quiet one, not the last one anything was counted in.
     #[test]
     fn quiet_seconds_go_by() {
-        let mut h = started(0);
-        h.rate = 540;
-        h.looks = 9;
-        h.now().unwrap().missed = 5;
-        h.now().unwrap().pictures = 500;
-        assert_eq!(h.summary(Duration::from_secs(60)).unwrap().blend.unwrap().busiest, None, "no whole second yet");
-        // Ten seconds later, nothing more counted.
+        let mut h = began(0);
+        *h.now().unwrap() = Second { encoded: 60, skipped: 0, pictures: 500, missed: 5 };
+        // Ten seconds later, nothing more counted: the pacer was held up.
         h.started = Some(Instant::now() - Duration::from_secs(10));
-        let s = h.summary(Duration::from_secs(5)).unwrap();
-        assert_eq!((s.last_second, s.blend.unwrap().busiest), (Some(LastSecond::default()), Some(0)));
-        assert_eq!(h.summary(Duration::from_secs(60)).unwrap().blend.unwrap().busiest, Some(500));
-        // Over an hour later: only the last hour is kept (and nothing of it
-        // was counted: no whole second known yet).
-        h.started = Some(Instant::now() - Duration::from_secs(5000));
-        let s = h.summary(Duration::from_secs(4000)).unwrap();
-        assert!(h.seconds.len() <= HEALTH_SECONDS + 1);
-        assert_eq!((s.last_second, s.blend.unwrap().busiest), (None, None));
+        let s = h.summary().unwrap();
+        assert_eq!(s.last_second, Some(LastSecond::default()));
+        assert_eq!(s.blend.unwrap().last_second, Some(BlendSecond::default()), "nothing made, nothing blended");
+    }
+
+    /// One look a frame isn't blending (Windows times its frames so without
+    /// it), and a capture whose pacer hasn't begun isn't blending yet.
+    #[test]
+    fn not_blending() {
+        let mut h = History { looks: 1, ..began(0) };
+        assert!(h.summary().is_some_and(|s| s.blend.is_none()));
+        let mut h = History { started: Some(Instant::now()), ..History::NONE };
+        assert!(h.summary().is_some_and(|s| s.blend.is_none()));
+        let mut none = History::NONE;
+        assert!(none.summary().is_none(), "no capture");
     }
 }
 

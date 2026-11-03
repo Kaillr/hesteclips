@@ -1609,8 +1609,8 @@ impl App {
 
 // --- Capture status beside the recorder ---
 impl App {
-    /// How the capture kept up over what a clip saved now holds, for the
-    /// status by the recorder: looked up a few times a second while capturing.
+    /// How the capture kept up in its last whole second, for the status by
+    /// the recorder: looked up a few times a second while capturing.
     fn track_health(&mut self) {
         if self.rec_state == RecState::Idle {
             (self.health, self.health_at) = (None, None);
@@ -1619,24 +1619,8 @@ impl App {
         if self.health_at.is_some_and(|t| t.elapsed() < Duration::from_millis(200)) {
             return;
         }
-        self.health = capture::health(Duration::from_secs(self.health_span() as u64));
+        self.health = capture::health();
         self.health_at = Some(Instant::now());
-    }
-
-    /// How far back frame blending's busiest second is looked for (seconds):
-    /// what a clip saved now holds; recording, the last minute.
-    fn health_span(&self) -> u32 {
-        match self.rec_state {
-            RecState::Buffering => self.settings.replay_seconds.max(1),
-            _ => 60,
-        }
-    }
-
-    /// [`Self::health_span`] in words ("the last minute").
-    fn health_words(&self) -> String {
-        let words = crate::settings_ui::length_words(self.health_span());
-        let words = words.strip_prefix("1 ").filter(|w| !w.contains(' ')).map_or(words.clone(), str::to_owned);
-        format!("the last {words}")
     }
 
     /// Shown while frames are being skipped, as a frame rate counter would
@@ -1675,20 +1659,21 @@ impl App {
         }
     }
 
-    /// Frame blending, while the capture blends: how many of the screen's
-    /// pictures a second it blends ("Blending 540 fps", or "Blending 412 of
-    /// 540 fps" when the screen showed no more, at its busiest moment of
-    /// what a clip saved now holds), and a warning instead while pictures
-    /// miss their frame (blending fell behind: those frames reused the
-    /// picture before), as many as the last whole second's, which a click
-    /// takes to Settings. `compact`: a narrow window, only the warning, as a
-    /// count. Laid out right to left, before the recorder.
+    /// Frame blending, while the capture blends, as a frame rate counter
+    /// would say it: how many looks at the screen the last whole second's
+    /// frames blended, every look whether or not the screen had changed
+    /// ("Blending 540 fps", or "Blending 495 of 540 fps" when frames were
+    /// skipped, their looks with them), and on hover how many new pictures
+    /// the screen showed in it. A warning instead while pictures miss their
+    /// frame (blending fell behind: those frames reused the picture before),
+    /// which a click takes to Settings. `compact`: a narrow window, only the
+    /// warning, as a count. Laid out right to left, before the recorder.
     pub(crate) fn blend_status(&mut self, ui: &mut egui::Ui, compact: bool) {
-        let Some(b) = self.health.and_then(|h| h.blend) else { return };
+        // A whole second has to go by to say.
+        let Some((b, s)) = self.health.and_then(|h| h.blend).and_then(|b| b.last_second.map(|s| (b, s))) else { return };
         let p = theme::pal(ui);
         let fps = b.rate / b.looks.max(1);
-        let span = self.health_words();
-        let missed = self.health.and_then(|h| h.last_second).map_or(0, |s| s.missed.min(b.rate));
+        let missed = s.missed.min(b.rate);
         if missed > 0 {
             let text = format!("Blending missed {missed} of {} fps", b.rate);
             let tip = format!(
@@ -1706,30 +1691,32 @@ impl App {
             }
             return;
         }
-        // A whole second has to go by to say.
-        let (Some(busiest), false) = (b.busiest, compact) else { return };
-        let every = busiest as f64 >= b.rate as f64 * 0.95;
-        let (text, tip) = if every {
-            (
-                format!("Blending {} fps", b.rate),
-                format!(
-                    "Each {fps} fps frame blends {} looks at the screen, {} a second. In {span} the screen showed up to {busiest} new pictures a second: every look had a picture of its own.",
-                    b.looks, b.rate
-                ),
-            )
+        if compact {
+            return;
+        }
+        let (text, blended) = if s.blended < b.rate {
+            (format!("Blending {} of {} fps", s.blended, b.rate), format!("{} of {}, as skipped frames take their looks with them", s.blended, b.rate))
         } else {
-            (
-                format!("Blending {busiest} of {} fps", b.rate),
-                format!(
-                    "Each {fps} fps frame blends {} looks at the screen, {} a second. In {span} the screen showed at most {busiest} new pictures a second, so looks shared them: about {} different ones in a frame.\n\n\
-                     None were lost: the game drew no more frames than that, or nothing moved. A game frame limit of {} fps or more gives every look a picture of its own.",
-                    b.looks,
-                    b.rate,
-                    (busiest as f64 / fps.max(1) as f64).round() as u32,
-                    b.rate
-                ),
+            (format!("Blending {} fps", b.rate), format!("all {}", b.rate))
+        };
+        let pictures = match s.pictures {
+            0 => "no new pictures".to_owned(),
+            1 => "1 new picture".to_owned(),
+            n => format!("{n} new pictures"),
+        };
+        let each = if s.pictures as f64 >= b.rate as f64 * 0.95 {
+            "every look had one of its own.".to_owned()
+        } else {
+            format!(
+                "it only shows one when something changes, at most as often as the game draws or the display refreshes, and each look takes the newest one up.\n\n\
+                 Where things move, a game frame limit of {} fps or more gives every look a picture of its own.",
+                b.rate
             )
         };
+        let tip = format!(
+            "Each {fps} fps frame blends {} looks at the screen, whether or not anything on it changed: in the last second, {blended}. The screen showed {pictures} in it: {each}",
+            b.looks
+        );
         ui.add_space(6.0);
         ui.add(egui::Label::new(theme::text(text, 13.0, theme::W::Medium).color(p.text3)).sense(egui::Sense::hover())).on_hover_text(tip);
     }
