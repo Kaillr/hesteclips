@@ -358,6 +358,9 @@ struct FeedState {
     /// Output frames still to discard: resampler delay, or audio that arrived
     /// after the mixer had already moved past it.
     skip_out: i64,
+    /// Input frames still to throw away: sound that came twice (an overlap
+    /// put right at once), from the packets that bring it.
+    skip_in: i64,
     /// Keeps its sound on its timestamps while its clock runs a little fast
     /// or slow.
     steer: Steer,
@@ -372,8 +375,9 @@ struct FeedState {
 }
 
 impl SourceFeed {
-    /// Timing off by more than this is put right at once: a gap (a dropout)
-    /// filled with silence, or what came twice thrown away. Within it, a
+    /// Timing off by more than this, even for a packet, is put right at
+    /// once: a gap (a dropout) filled with silence, or what came twice thrown
+    /// away. Smaller sudden offsets are too, once they're kept up, and a
     /// clock that runs a little fast or slow is steered back (see [`Steer`]).
     const TOLERANCE: f64 = 0.04;
     /// A gap longer than this starts the feed over instead of being filled
@@ -395,6 +399,7 @@ impl SourceFeed {
                 out_base: 0,
                 heard: 0,
                 skip_out: 0,
+                skip_in: 0,
                 steer: Steer::default(),
                 mono: None,
                 denoise: None,
@@ -466,22 +471,38 @@ impl SourceFeed {
             st.out_base = (expected as f64 * RATE as f64 / rate).round() as i64;
             st.skip_out = st.resampler.as_ref().map_or(0, |r| r.output_delay() as i64)
                 + if st.denoise.is_some() { Denoise::DELAY as i64 } else { 0 };
+            st.skip_in = 0;
             st.steer = Steer::default();
         }
         let drift = expected - st.next_in.unwrap();
         let tolerance = (Self::TOLERANCE * rate) as i64;
-        let mut skip = 0usize;
         let mut slips = 0;
-        if drift > tolerance {
-            st.feed_silence(drift as usize);
-            st.steer = Steer::default();
-        } else if drift < -tolerance {
-            skip = ((-drift) as usize).min(frames);
-            // What's left over is steered off.
-            st.steer = Steer::at(drift + skip as i64);
+        // A big jump at once; a smaller sudden one once it's kept up; a
+        // clock's drift a frame at a time. Not while an overlap is still
+        // being thrown away.
+        let jump = if st.skip_in > 0 {
+            None
+        } else if drift.abs() > tolerance {
+            Some(drift)
         } else {
-            slips = st.steer.step(drift, frames, rate);
+            match st.steer.step(drift, frames, rate) {
+                Steering::Slip(n) => {
+                    slips = n;
+                    None
+                }
+                Steering::Jump(off) => Some(off),
+            }
+        };
+        if let Some(off) = jump {
+            if off > 0 {
+                st.feed_silence(off as usize);
+            } else {
+                st.skip_in = -off;
+            }
+            st.steer = Steer::default();
         }
+        let skip = (st.skip_in as usize).min(frames);
+        st.skip_in -= skip as i64;
         let (mut l, mut r): (Vec<f32>, Vec<f32>) = (skip..frames)
             .map(|i| {
                 let f = &samples[i * channels..];
@@ -637,9 +658,17 @@ impl FeedState {
 ///
 /// Now, from 2 ms off on, single frames are put in (slow) or taken out
 /// (fast) as it comes: as often as the drift needs, never more than one in
-/// 1000 frames (up to 1000 ppm is followed), each spread over a millisecond
-/// (see [`slip`]). At 100 ppm, a frame every 10,000 and the sound ~2.4 ms
-/// off its timestamps for good. Big jumps are still put right at once.
+/// 5000 frames (up to 200 ppm is followed: ~10 a second at 48 kHz), each
+/// spread over a millisecond (see [`slip`]). At 100 ppm, a frame every
+/// 10,000 and the sound ~3 ms off its timestamps for good.
+///
+/// Each frame slid moves the sound by a frame within a millisecond; many a
+/// second could make a long high note sound rough. So they're kept for
+/// gradual drift, and an offset that comes all at once (a dropout under
+/// [`SourceFeed::TOLERANCE`], timestamps that jump) is put right at once,
+/// silence in or the overlap thrown away, once it has been over
+/// [`Self::SUDDEN`] for [`Self::SURE`]: steered, 20 ms took 20 s of 48
+/// slips a second.
 #[derive(Debug, Default)]
 struct Steer {
     /// How far its sound is put from where its timestamps say, in input
@@ -648,29 +677,66 @@ struct Steer {
     drift: f64,
     /// Frames owed: one is put in (+) or taken out (-) each time it gets to 1.
     owed: f64,
+    /// The packets in a row that came over [`Self::SUDDEN`] off, one way.
+    run: Option<Run>,
+}
+
+/// Packets in a row that came a sudden offset off, one way.
+#[derive(Debug, Clone, Copy)]
+struct Run {
+    frames: usize,
+    packets: u32,
+    /// The least any of them was off (input frames, signed).
+    least: i64,
+}
+
+/// What [`Steer::step`] does with a packet.
+#[derive(Debug, PartialEq)]
+enum Steering {
+    /// Put this many frames into it (+) or take them out (-), one by one.
+    Slip(i64),
+    /// It's this far off (input frames; +: early), and has been for a
+    /// while: put right at once.
+    Jump(i64),
 }
 
 impl Steer {
     /// Off by less than this (seconds), it's left alone: that's the jitter.
     const FROM: f64 = 0.002;
     /// From this far off on, it's steered as hard as it gets.
-    const FULL: f64 = 0.006;
+    const FULL: f64 = 0.004;
     /// At most one frame in this many put in or taken out.
-    const EVERY: f64 = 1000.0;
+    const EVERY: f64 = 5000.0;
     /// How long its drift is averaged over (seconds).
     const SMOOTH: f64 = 1.0;
     /// How long a frame put in or taken out is spread over (seconds).
     const SLIP: f64 = 0.001;
-
-    /// `drift` frames off, as when it was just put right at once.
-    fn at(drift: i64) -> Self {
-        Self { drift: drift as f64, owed: 0.0 }
-    }
+    /// An offset over this (seconds) that came all at once is put right at
+    /// once, not steered off...
+    const SUDDEN: f64 = 0.01;
+    /// ...once it has held for this long (seconds), and three packets: a
+    /// packet whose timestamp is off alone isn't one.
+    const SURE: f64 = 0.05;
 
     /// A packet of `frames` frames (at `rate`) that came `drift` frames off
-    /// where counting puts it: how many frames to put into it (+) or take
-    /// out of it (-).
-    fn step(&mut self, drift: i64, frames: usize, rate: f64) -> i64 {
+    /// where counting puts it.
+    fn step(&mut self, drift: i64, frames: usize, rate: f64) -> Steering {
+        if drift.abs() as f64 > Self::SUDDEN * rate {
+            let run = self.run.filter(|r| r.least.signum() == drift.signum()).unwrap_or(Run { frames: 0, packets: 0, least: drift });
+            let run = Run {
+                frames: run.frames + frames,
+                packets: run.packets + 1,
+                least: if drift.abs() < run.least.abs() { drift } else { run.least },
+            };
+            if run.packets >= 3 && run.frames as f64 >= Self::SURE * rate {
+                *self = Self::default();
+                return Steering::Jump(run.least);
+            }
+            // Not steered meanwhile: it's about to be put right.
+            self.run = Some(run);
+            return Steering::Slip(0);
+        }
+        self.run = None;
         let weight = 1.0 - (-(frames as f64 / rate) / Self::SMOOTH).exp();
         self.drift += (drift as f64 - self.drift) * weight;
         let pull = ((self.drift.abs() / rate - Self::FROM) / (Self::FULL - Self::FROM)).clamp(0.0, 1.0);
@@ -681,7 +747,7 @@ impl Steer {
         self.owed += towards * frames as f64 / Self::EVERY;
         let now = self.owed.trunc();
         self.owed -= now;
-        now as i64
+        Steering::Slip(now as i64)
     }
 }
 
@@ -1250,9 +1316,9 @@ mod tests {
     /// A source whose clock runs 100 ppm fast or slow (a USB mic, an HDMI
     /// output) for 10 minutes, its timestamps jittering by up to a
     /// millisecond: it stays within a few ms of where they put it, without a
-    /// gap filled or a packet thrown away (that takes 40 ms off), steered
-    /// one frame at a time, all one way, never in two packets running. At
-    /// its right rate, the jitter alone steers nothing.
+    /// gap filled or a packet thrown away, steered one frame at a time, all
+    /// one way, at most one in 5000 frames. At its right rate, the jitter
+    /// alone steers nothing.
     #[test]
     fn drifting_clock_is_steered_a_frame_at_a_time() {
         for (rate, ppm) in [(RATE, 100.0), (RATE, -100.0), (RATE, 0.0), (44_100, 100.0), (44_100, -100.0)] {
@@ -1328,7 +1394,8 @@ mod tests {
             assert!(slips.iter().all(|s| s.1.signum() == drift.signum() as i64), "{what}: steered both ways");
             assert!(total as f64 / drift > 0.9 && total as f64 / drift < 1.0, "{what}: steered {total} of {drift:.0}");
             assert!(slips.iter().all(|s| s.1.abs() == 1), "{what}: more than a frame at once");
-            assert!(slips.windows(2).all(|w| w[1].0 - w[0].0 >= 2), "{what}: two packets running");
+            let closest = slips.windows(2).map(|w| (w[1].0 - w[0].0) * packet).min().unwrap();
+            assert!(closest >= 4_800, "{what}: two frames {closest} apart");
             if rate == RATE {
                 assert_eq!(silent, 0, "{what}: silence put in");
                 // Every click there, within 4 ms of where it was captured.
@@ -1340,6 +1407,58 @@ mod tests {
                     assert!(off < 0.004, "{what}: click {m} {:.2} ms off", off * 1e3);
                 }
             }
+        }
+    }
+
+    /// A dropout of 20 ms (under the 40 ms put right at once even for one
+    /// packet), or timestamps that jump 20 ms back: put right at once, 20 ms
+    /// of silence put in or 20 ms thrown away, not steered off a frame at a
+    /// time (that took 20 s). A single packet stamped 15 ms off isn't one.
+    #[test]
+    fn sudden_offset_is_put_right_at_once() {
+        for (jump, outlier) in [(0.02, false), (-0.02, false), (0.0, true)] {
+            let feed = SourceFeed::new(RATE, clock_at_zero());
+            let mut seed = 11u32;
+            let mut jitter = move || {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                ((seed >> 8) as f64 / (1u32 << 24) as f64 * 2.0 - 1.0) * 0.0005
+            };
+            // 20 s in 10 ms packets of a steady level; at 10 s, the jump.
+            let (mut slips, mut silent, mut taken) = (0i64, 0usize, 0i64);
+            let mut late = 0f64;
+            for k in 0..2_000 {
+                let mut captured = 1000.05 + k as f64 * 0.01;
+                if k >= 1_000 {
+                    captured += jump;
+                }
+                let stamped = captured + jitter() + if outlier && k == 1_000 { 0.015 } else { 0.0 };
+                let before = feed.st.lock().unwrap().next_in;
+                feed.push(stamped, &[0.25; 480], 1);
+                let after = feed.st.lock().unwrap().next_in.unwrap();
+                if let Some(before) = before {
+                    // A frame or two: slid (not the jump, which is hundreds).
+                    let moved = after - before - 480;
+                    if moved.abs() <= 2 {
+                        slips += moved.abs();
+                    }
+                    // From 0.1 s after the jump, within a couple of ms.
+                    if k >= 1_010 {
+                        late = late.max(((captured - 1000.0) * RATE as f64 - after as f64 + 480.0).abs() / RATE as f64);
+                    }
+                }
+                let upto = ((captured - 1000.1) * RATE as f64) as i64;
+                if upto > taken {
+                    silent += feed.take(taken, (upto - taken) as usize).iter().filter(|f| f[0] == 0.0).count();
+                    taken = upto;
+                }
+            }
+            let what = if outlier { "one packet 15 ms off".to_owned() } else { format!("a {:+} ms jump", jump * 1e3) };
+            eprintln!("{what}: {silent} frames of silence, {slips} frames slid, then up to {:.2} ms off", late * 1e3);
+            assert!(late < 0.002, "{what}: {:.2} ms off after it", late * 1e3);
+            assert_eq!(slips, 0, "{what}: steered off");
+            let expected = if jump > 0.0 { (jump * RATE as f64) as usize } else { 0 };
+            // The first 50 ms, before the source began, are silent too.
+            assert!(silent.abs_diff(2_400 + expected) < 50, "{what}: {silent} frames of silence");
         }
     }
 
