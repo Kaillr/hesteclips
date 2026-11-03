@@ -489,14 +489,27 @@ impl Muxer {
             trak.extend(make_box(b"edts", &full_box(b"elst", 0, 0, &elst)));
         }
 
+        // The track's length in its own timescale, in 64 bits (version 1)
+        // when it doesn't fit 32: the video's timescale is a multiple of its
+        // frame rate (540 000 at 540 fps), so a recording longer than 2.2
+        // hours at 540 fps (7.2 at 165, 13.25 at 60) said it was a fraction
+        // of its length.
+        let long = media_dur > u32::MAX as u64;
         let mut mdhd = Vec::new();
-        mdhd.put_u32(0);
-        mdhd.put_u32(0);
-        mdhd.put_u32(t.timescale);
-        mdhd.put_u32(media_dur as u32);
+        if long {
+            mdhd.put_u64(0);
+            mdhd.put_u64(0);
+            mdhd.put_u32(t.timescale);
+            mdhd.put_u64(media_dur);
+        } else {
+            mdhd.put_u32(0);
+            mdhd.put_u32(0);
+            mdhd.put_u32(t.timescale);
+            mdhd.put_u32(media_dur as u32);
+        }
         mdhd.put_u16(0x55C4); // "und"
         mdhd.put_u16(0);
-        let mut mdia = full_box(b"mdhd", 0, 0, &mdhd);
+        let mut mdia = full_box(b"mdhd", long as u8, 0, &mdhd);
         mdia.extend(hdlr(if t.video { b"vide" } else { b"soun" }, &t.name));
 
         let mut minf = if t.video {
@@ -1010,6 +1023,36 @@ mod tests {
         assert_eq!(kinds.iter().filter(|k| *k == b"moov").count(), 1);
         assert!(kinds.iter().filter(|k| *k == b"mdat").count() >= 3, "a fragment per second");
         check_tables(&bytes);
+    }
+
+    /// A recording too long for its track's timescale in 32 bits (at 540
+    /// fps, past 2.2 hours) says its whole length, in 64 bits; a short one
+    /// keeps the 32-bit box every player knows.
+    #[test]
+    fn a_long_recording_says_its_length() {
+        let mdhd = |frames: &[f64]| {
+            let path = std::env::temp_dir().join(format!("hc-mux-long-{}-{}.mp4", frames.len(), std::process::id()));
+            let mut m = Muxer::create(&path, &Spec { fps: 540, audio_titles: Vec::new(), ..spec(false) }, avc(), false).unwrap();
+            for (n, &t) in frames.iter().enumerate() {
+                m.video(Arc::from(vec![n as u8; 16]), t, n == 0).unwrap();
+            }
+            m.finish().unwrap();
+            let bytes = std::fs::read(&path).unwrap();
+            let _ = std::fs::remove_file(&path);
+            let moov = top_level(&bytes).into_iter().find(|b| &b.0 == b"moov").unwrap();
+            find(&bytes[moov.1..moov.1 + moov.2], &[b"moov", b"trak", b"mdia", b"mdhd"]).unwrap().to_vec()
+        };
+        // Three hours at 540 fps, a frame an hour (each frame's own length
+        // fits; the track's doesn't): 5.8 billion of its 540 000ths.
+        let long = mdhd(&[0.0, 3600.0, 7200.0, 10800.0]);
+        assert_eq!(long[0], 1, "version 1");
+        assert_eq!(u32::from_be_bytes(long[20..24].try_into().unwrap()), 540_000);
+        let ticks = u64::from_be_bytes(long[24..32].try_into().unwrap());
+        assert_eq!(ticks, 3 * 3600 * 540_000 + 1000, "three hours and a frame");
+        // A minute: version 0, as before.
+        let short = mdhd(&[0.0, 30.0, 60.0]);
+        assert_eq!(short[0], 0);
+        assert_eq!(u32::from_be_bytes(short[16..20].try_into().unwrap()), 60 * 540_000 + 1000);
     }
 
     #[test]
