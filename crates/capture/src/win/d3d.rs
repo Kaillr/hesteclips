@@ -369,7 +369,11 @@ impl Latest {
         pool.1 = (i + 1) % POOL;
         let (texture, view) = pool.0[i].clone();
         drop(pool);
-        unsafe { self.gpu.context.CopyResource(&texture, &self.texture) };
+        // Only the picture: the texture has room for a window on the
+        // biggest display (2560×1920 beside a portrait screen, for a
+        // 2560×1440 one), and nothing reads past the picture's size.
+        let region = D3D11_BOX { left: 0, top: 0, front: 0, right: size.0, bottom: size.1, back: 1 };
+        unsafe { self.gpu.context.CopySubresourceRegion(&texture, 0, 0, 0, 0, &self.texture, 0, Some(&region)) };
         let mut queue = self.queue.lock().unwrap();
         queue.push_back(Queued { texture, view, size, at });
         while queue.len() > QUEUE_MAX {
