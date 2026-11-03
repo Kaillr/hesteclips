@@ -847,7 +847,11 @@ impl App {
         }
         painter.text(Pos2::new(rect.left() + 2.0, thumb.bottom() + 9.0), Align2::LEFT_TOP, caption, theme::font(13.5, W::Medium), p.text);
         painter.text(Pos2::new(rect.left() + 2.0, thumb.bottom() + 29.0), Align2::LEFT_TOP, "In progress", theme::font(12.5, W::Regular), p.text3);
-        ui.ctx().request_repaint_after(Duration::from_millis(33));
+        // Nothing asked for here: the dot asks for its ring, the app's tick
+        // (every 100 ms while capturing) moves the recording's time on, and
+        // a render's progress asks as it comes. (33 ms asked here came after
+        // 16: a recording kept the library drawn 60 times a second, the
+        // window in use or not.)
     }
 
     fn new_render_card(&mut self, ui: &mut egui::Ui, i: usize, rect: Rect) {
