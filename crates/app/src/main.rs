@@ -597,8 +597,12 @@ struct App {
     /// Windows: it was maximized as it went to the tray, to be again.
     #[cfg(windows)]
     tray_maximized: bool,
-    /// Since when another window has had the focus (none: this one has).
-    unfocused_since: Option<Instant>,
+    /// Since when the window hasn't been used: another has had the focus,
+    /// and nothing's been scrolled or pressed over this one.
+    unused_since: Option<Instant>,
+    /// The frame it went to the tray in: a later one drawn while it's used
+    /// says it's out (see `ui`).
+    tray_frame: u64,
     /// Quitting for real (closing mustn't just hide the window then).
     quitting: bool,
     /// The first close: ask whether to keep running in the tray.
@@ -823,7 +827,8 @@ impl App {
             cloaked: background,
             #[cfg(windows)]
             tray_maximized: false,
-            unfocused_since: None,
+            unused_since: None,
+            tray_frame: 0,
             quitting: false,
             close_dialog: false,
             setup_open,
@@ -1142,6 +1147,20 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         let mut laps = Laps::start();
 
+        // Out of the tray, however it was shown (a dock; a desktop that
+        // minimized it instead, or wouldn't): drawn after the frame that sent
+        // it there, and used (the focus, or the pointer on it). On Windows
+        // it isn't drawn while it's there.
+        if self.in_tray
+            && ctx.cumulative_frame_nr() > self.tray_frame
+            && ctx.input(|i| {
+                i.viewport().focused == Some(true)
+                    || i.events.iter().any(|e| matches!(e, egui::Event::PointerMoved(_) | egui::Event::MouseWheel { .. } | egui::Event::PointerButton { .. }))
+            })
+        {
+            self.in_tray = false;
+        }
+
         self.navigate(&ctx);
         if let Some(action) = self.demo.as_mut().and_then(demo::Demo::take_action) {
             self.demo_action(action);
@@ -1418,11 +1437,11 @@ impl eframe::App for App {
     }
 }
 
-/// Other windows in front of this one this long (a game, say), the player
-/// and the editor let go of the scrub engine (`App::keep_open`): long enough
-/// that looking something up and coming back finds it open, and it's opened
-/// again in a moment anyway (scrubbing goes through the playback decoder
-/// meanwhile).
+/// Not used this long (another window has the focus, a game say, and
+/// nothing's scrolled or pressed over this one), the player and the editor
+/// let go of the scrub engine (`App::keep_open`): long enough that looking
+/// something up and coming back finds it open, and it's opened again in a
+/// moment anyway (scrubbing goes through the playback decoder meanwhile).
 const BEHIND_FOR: Duration = Duration::from_secs(10);
 
 // --- Running in the background: the tray, closing the window ---
@@ -1482,24 +1501,27 @@ impl App {
     }
 
     /// What the player and the editor keep open, by what the window is
-    /// doing (see `player::Window`): everything while it's in use; the scrub
-    /// engine goes once other windows have been in front of it for
-    /// [`BEHIND_FOR`] (a game); out of sight (minimized, in the tray) the
-    /// playback decoder too, and a card's preview in the library.
+    /// doing (see `player::Window`): everything while it's used; the scrub
+    /// engine goes once it hasn't been for [`BEHIND_FOR`] (a game in front);
+    /// out of sight (minimized, in the tray) the playback decoder too, and a
+    /// card's preview in the library.
     fn keep_open(&mut self, ctx: &egui::Context) {
-        let (minimized, focused) = ctx.input(|i| (i.viewport().minimized == Some(true), i.viewport().focused == Some(true)));
-        if focused {
-            // Back in front, however it was shown: out of the tray. (Not
-            // while it still has the focus it had as it went there.)
-            if self.unfocused_since.take().is_some() {
-                self.in_tray = false;
-            }
-        } else if self.unfocused_since.is_none() {
-            self.unfocused_since = Some(Instant::now());
+        let (minimized, used) = ctx.input(|i| {
+            // The focus, or the wheel or a button over it: Windows scrolls the
+            // window under the pointer, focused or not (a clip on another
+            // screen scrubbed with the wheel, a game in focus). A pointer
+            // only passing over it on its way elsewhere doesn't count.
+            let touched = i.events.iter().any(|e| matches!(e, egui::Event::MouseWheel { .. } | egui::Event::PointerButton { pressed: true, .. }));
+            (i.viewport().minimized == Some(true), i.viewport().focused == Some(true) || touched)
+        });
+        if used {
+            self.unused_since = None;
+        } else if self.unused_since.is_none() {
+            self.unused_since = Some(Instant::now());
         }
         // Not a development test instance's: its window is often behind the
         // terminal it was started from while it's measured.
-        let behind = self.persist_settings && self.unfocused_since.is_some_and(|t| t.elapsed() >= BEHIND_FOR);
+        let behind = self.persist_settings && self.unused_since.is_some_and(|t| t.elapsed() >= BEHIND_FOR);
         let window = if self.in_tray || minimized {
             player::Window::Hidden
         } else if behind {
@@ -1663,6 +1685,7 @@ impl App {
             self.page = Page::Clips;
         }
         self.in_tray = true;
+        self.tray_frame = ctx.cumulative_frame_nr();
         // Wayland can't hide a window: KWin is asked to; elsewhere on
         // Wayland it can only be minimized.
         #[cfg(target_os = "linux")]
