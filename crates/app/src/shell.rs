@@ -173,6 +173,25 @@ pub fn tint_title_bar(window: &impl raw_window_handle::HasWindowHandle, caption:
     DONE.store(now, Ordering::Relaxed);
 }
 
+/// Windows: the window cloaked (`on`), or not: the desktop's compositor
+/// keeps a cloaked window off the screen (and out of the taskbar) while it's
+/// shown and drawn. See `App::start_in_tray`.
+#[cfg(target_os = "windows")]
+pub fn cloak(window: &impl raw_window_handle::HasWindowHandle, on: bool) {
+    use raw_window_handle::RawWindowHandle;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Graphics::Dwm::{DWMWA_CLOAK, DwmSetWindowAttribute};
+    use windows::core::BOOL;
+    let Ok(handle) = window.window_handle() else { return };
+    let RawWindowHandle::Win32(h) = handle.as_raw() else { return };
+    let hwnd = HWND(h.hwnd.get() as *mut _);
+    let on = BOOL::from(on);
+    // SAFETY: `hwnd` is our live top-level window; the attribute takes a BOOL.
+    unsafe {
+        let _ = DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, &on as *const _ as *const _, size_of::<BOOL>() as u32);
+    }
+}
+
 /// Which screen's keyboard shortcuts to show.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Keys {

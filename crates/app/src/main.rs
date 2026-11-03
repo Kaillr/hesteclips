@@ -194,6 +194,9 @@ fn main() -> eframe::Result<()> {
         .unwrap_or([1040.0, 700.0]);
     let viewport = egui::ViewportBuilder::default()
         .with_visible(!background)
+        // Windows: started with the computer, it takes the focus from nothing
+        // as it's drawn on its way to the tray (`App::start_in_tray`).
+        .with_active(!(background && cfg!(windows)))
         .with_inner_size(size)
         .with_min_inner_size([560.0, 420.0])
         .with_title("HasteClip")
@@ -215,21 +218,19 @@ fn main() -> eframe::Result<()> {
         "HasteClip",
         options,
         Box::new(move |cc| {
-            // Started with the computer, the window stays in the tray. eframe
-            // opens it hidden whatever `with_visible` says, and shows it once
-            // its first frame is drawn; and it draws a hidden window as if it
-            // were shown, Windows never saying it's hidden. Minimized before
-            // that first frame, it's never drawn (only `logic` runs) until
-            // it's shown from the tray: as `hide_window` leaves it.
+            // Started with the computer, the window goes straight to the
+            // tray. eframe shows it once its first frame is drawn, whatever
+            // `with_visible` says: cloaked till it's there (Windows; see
+            // `App::start_in_tray`).
             #[cfg(windows)]
-            if background && let Some(window) = cc.winit_window() {
-                window.set_minimized(true);
+            if background {
+                shell::cloak(cc, true);
             }
             gpu_frames::init(cc.wgpu_render_state.as_ref(), &cc.egui_ctx);
             #[cfg(target_os = "macos")]
             shell::centre_window_buttons(cc);
             ui_kit::apply(&cc.egui_ctx);
-            Ok(Box::new(App::new(cc.egui_ctx.clone(), instance)))
+            Ok(Box::new(App::new(cc.egui_ctx.clone(), instance, background)))
         }),
     );
     // The window couldn't open because a system library is missing: say
@@ -587,6 +588,15 @@ struct App {
     tray: Option<tray::Tray>,
     /// The window's hidden in the tray, until it's shown again.
     in_tray: bool,
+    /// Windows, started with the computer: to go to the tray once its first
+    /// frame is drawn, and cloaked till it's there (see `start_in_tray`).
+    #[cfg(windows)]
+    to_tray: bool,
+    #[cfg(windows)]
+    cloaked: bool,
+    /// Windows: it was maximized as it went to the tray, to be again.
+    #[cfg(windows)]
+    tray_maximized: bool,
     /// Since when another window has had the focus (none: this one has).
     unfocused_since: Option<Instant>,
     /// Quitting for real (closing mustn't just hide the window then).
@@ -635,7 +645,8 @@ struct App {
 }
 
 impl App {
-    fn new(ctx: egui::Context, instance: Option<std::net::TcpListener>) -> Self {
+    /// `background`: started with the computer, for the tray.
+    fn new(ctx: egui::Context, instance: Option<std::net::TcpListener>, background: bool) -> Self {
         add_symbol_font(&ctx);
         let settings = RecordSettings::load();
         let screen_placement = std::sync::Arc::new(std::sync::Mutex::new(settings.screen_placement()));
@@ -691,6 +702,11 @@ impl App {
             tray::serve(listener, &ctx, tray_tx.clone());
         }
         let tray = tray::Tray::new(&ctx, tray_tx, tray_rx, quick_save.clone());
+        // No tray icon to open it from: it shows after all.
+        #[cfg(windows)]
+        let to_tray = background && tray.is_some();
+        #[cfg(not(windows))]
+        let _ = background;
         let mut app = Self {
             page: Page::Clips,
             rec_state: RecState::Idle,
@@ -801,6 +817,12 @@ impl App {
             last_view: None,
             tray,
             in_tray: false,
+            #[cfg(windows)]
+            to_tray,
+            #[cfg(windows)]
+            cloaked: background,
+            #[cfg(windows)]
+            tray_maximized: false,
             unfocused_since: None,
             quitting: false,
             close_dialog: false,
@@ -1378,6 +1400,8 @@ impl eframe::App for App {
         if self.page != Page::Sources {
             self.listening = None;
         }
+        #[cfg(windows)]
+        self.start_in_tray(ctx, _frame);
         self.background(ctx);
         self.pump_tray(ctx);
         self.handle_close(ctx);
@@ -1403,6 +1427,28 @@ const BEHIND_FOR: Duration = Duration::from_secs(10);
 
 // --- Running in the background: the tray, closing the window ---
 impl App {
+    /// Windows, started with the computer: the window opened cloaked (see
+    /// `main`), kept off the screen and out of the taskbar while eframe
+    /// draws its first frame and shows it (as it does whatever was asked);
+    /// it's hidden in the tray at the end of that frame, then uncloaked. Shown
+    /// from the tray, it comes up with that frame, not blank: minimized
+    /// before its first frame instead, it had never been drawn, and making a
+    /// hidden window minimized showed it a moment (a taskbar button at
+    /// login). Without a tray icon to open it from, it's uncloaked at once,
+    /// and shows.
+    #[cfg(windows)]
+    fn start_in_tray(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        if std::mem::take(&mut self.to_tray) {
+            self.hide_window(ctx);
+            return;
+        }
+        // In the tray now (minimized there), or not going there.
+        if self.cloaked && (!self.in_tray || ctx.input(|i| i.viewport().minimized == Some(true))) {
+            shell::cloak(frame, false);
+            self.cloaked = false;
+        }
+    }
+
     /// About once a second, shown or not (in the tray only `logic` runs):
     /// the library rescanned when its folders changed, the game being
     /// clipped and what Discord shows, and the settings saved.
@@ -1635,7 +1681,10 @@ impl App {
         // first: hidden first, winit would show a maximized window again
         // to minimize it.
         #[cfg(windows)]
-        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        {
+            self.tray_maximized = ctx.input(|i| i.viewport().maximized == Some(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
     }
 
@@ -1651,6 +1700,13 @@ impl App {
         // Restored too, where the tray minimizes it (`hide_window`).
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        // Maximized again if it was: opened started with the computer, it's
+        // shown without taking the focus (see `main`), which Windows does by
+        // restoring it to its normal size.
+        #[cfg(windows)]
+        if std::mem::take(&mut self.tray_maximized) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+        }
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
     }
 
