@@ -2470,6 +2470,7 @@ dependencies = [
  "windows-collections",
  "windows-core 0.62.2",
  "windows-future",
+ "winit",
  "winresource",
  "zbus",
  "zip 9.2.2",

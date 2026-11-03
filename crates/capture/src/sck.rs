@@ -2,9 +2,10 @@
 //! all in-process — no external tools.
 //!
 //! - **Video**: an `SCStream` delivers screen frames (already scaled to the output
-//!   size, NV12). A pacer thread feeds the newest frame to a VideoToolbox H.264
-//!   encoder at exactly `fps`, so the output is constant frame rate even when the
-//!   screen is static and SCK sends nothing.
+//!   size, NV12). A pacer thread (`crate::mac::blend`) makes a frame every 1/fps
+//!   of the picture that was up at its time, or a blend of several, for a
+//!   VideoToolbox H.264 encoder: constant frame rate even when the screen is
+//!   static and SCK sends nothing.
 //! - **Desktop and app audio**: one audio-only `SCStream` per source
 //!   ([`SystemAudio`]), filtered to that app (or to everything minus the apps
 //!   added separately). **Mics** use cpal.
@@ -20,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -48,7 +49,7 @@ use objc2_core_video::{
 use objc2_foundation::{NSArray, NSError, NSObject, NSObjectProtocol};
 use objc2_screen_capture_kit::{
     SCContentFilter, SCDisplay, SCRunningApplication, SCStream,
-    SCStreamConfiguration, SCStreamOutput, SCStreamOutputType,
+    SCStreamConfiguration, SCStreamDelegate, SCStreamOutput, SCStreamOutputType,
 };
 use objc2_video_toolbox::{
     VTCompressionSession, VTEncodeInfoFlags, VTSessionSetProperty,
@@ -65,10 +66,10 @@ use objc2_video_toolbox::{
 use crate::aac::AacEncoder;
 use crate::mixer::{self, Channel, Clock, LiveAudio, SourceFeed, SourceStatus};
 use crate::output::{in_progress, timestamp};
-use crate::sources::{AudioCapture, AudioSource, SourceKind, mix_inputs, track_layout};
+use crate::sources::{AudioCapture, AudioSource, Retry, SourceKind, mix_inputs, track_layout};
 use crate::avwriter::{SendFormat, SendSample};
 use crate::writer::{self, Layout, Media, Writer};
-use crate::mac::blend::{Blender, spawn_blend_pacer};
+use crate::mac::blend::{Blender, Mix, spawn_blend_pacer};
 use crate::mac::video::{self, Frames, Picture, pick_display, shareable_content};
 use crate::{EncodeSettings, Mode, Recorder};
 
@@ -289,13 +290,15 @@ impl Session {
             let frames = Frames::new(picture.latest.clone(), s.webcam.as_ref(), s.screen.clone(), Some(picture.ctl()), width, height, crate::preview::new_producer())?;
             let latest = picture.latest.clone();
             session.video = Some(picture);
-            session.pacer = Some(if looks > 1 {
-                let shutter = crate::shutter::Shutter::new(looks, s.blend_shape);
-                let blender = Blender::new(width, height, shutter.frames_open())?;
-                spawn_blend_pacer(s.fps, looks, shutter, latest, blender, frames, encoder, clock)
-            } else {
-                spawn_pacer(s.fps, frames, encoder, clock)
-            });
+            // Not blended too, a frame takes the picture that was up at its
+            // time, by when the screen showed it, its look kept halfway
+            // between the screen's pictures (as on Windows). Taken as the
+            // newest one when the frame was due, a game at the frame rate whose
+            // pictures came near those times had one in a frame twice and
+            // the next in none, by chance: measured, up to 1 frame in 5.
+            let shutter = crate::shutter::Shutter::new(looks, s.blend_shape);
+            let mix = if looks > 1 { Mix::Blend(Blender::new(width, height, shutter.frames_open())?) } else { Mix::one() };
+            session.pacer = Some(spawn_blend_pacer(s.fps, looks, shutter, latest, mix, frames, encoder, clock));
             Ok(())
         })();
         if let Err(e) = started {
@@ -370,11 +373,6 @@ pub(crate) fn host_now() -> f64 {
 // ---------------------------------------------------------------------------
 // ScreenCaptureKit
 // ---------------------------------------------------------------------------
-
-/// Wrapper to move ObjC/CF objects that are thread-safe in practice (retain counts
-/// are atomic; we never mutate them concurrently) across threads.
-struct SendBox<T>(T);
-unsafe impl<T> Send for SendBox<T> {}
 
 /// What an audio stream's callbacks feed: a source's audio.
 struct Shared {
@@ -458,13 +456,49 @@ fn interleaved_pcm(sample: &CMSampleBuffer) -> Option<(Vec<f32>, usize)> {
     }
 }
 
+/// Why the system stopped a stream, once it has (from its delegate).
+#[derive(Default)]
+struct Stopped(std::sync::Mutex<Option<String>>);
+
+impl Stopped {
+    fn take(&self) -> Option<String> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).take()
+    }
+}
+
+define_class!(
+    // SAFETY: NSObject has no subclassing requirements; no Drop impl.
+    #[unsafe(super(NSObject))]
+    #[ivars = Arc<Stopped>]
+    struct StreamWatch;
+
+    unsafe impl NSObjectProtocol for StreamWatch {}
+
+    unsafe impl SCStreamDelegate for StreamWatch {
+        #[unsafe(method(stream:didStopWithError:))]
+        fn did_stop(&self, _stream: &SCStream, error: &NSError) {
+            let why = format!("{} (error {})", error.localizedDescription(), error.code());
+            *self.ivars().0.lock().unwrap_or_else(PoisonError::into_inner) = Some(why);
+        }
+    }
+);
+
+impl StreamWatch {
+    fn new(stopped: Arc<Stopped>) -> Retained<Self> {
+        let this = Self::alloc().set_ivars(stopped);
+        unsafe { msg_send![super(this), init] }
+    }
+}
+
 /// An audio-only stream: everything the Mac plays (`include == false`, minus
-/// `apps`) or just `apps` (`include == true`).
+/// `apps`) or just `apps` (`include == true`). `watch` hears when the system
+/// stops it.
 fn make_audio_stream(
     display: &SCDisplay,
     apps: &[Retained<SCRunningApplication>],
     include: bool,
     output: &StreamOutput,
+    watch: &StreamWatch,
 ) -> Result<Retained<SCStream>> {
     unsafe {
         let filter = audio_filter(display, apps, include);
@@ -480,7 +514,7 @@ fn make_audio_stream(
         // Don't record our own clip previews. Note this excludes by *responsible*
         // app: under `cargo run`, sounds played from the same terminal are muted too.
         config.setExcludesCurrentProcessAudio(true);
-        let stream = SCStream::initWithFilter_configuration_delegate(SCStream::alloc(), &filter, &config, None);
+        let stream = SCStream::initWithFilter_configuration_delegate(SCStream::alloc(), &filter, &config, Some(ProtocolObject::from_ref(watch)));
         let queue = DispatchQueue::new("hasteclip.sck.audio", None);
         stream
             .addStreamOutput_type_sampleHandlerQueue_error(ProtocolObject::from_ref(output), SCStreamOutputType::Audio, Some(&queue))
@@ -547,9 +581,70 @@ struct Tap {
     source: AudioSource,
     feed: Arc<SourceFeed>,
     channel: Arc<Channel>,
-    stream: Option<(Retained<SCStream>, Retained<StreamOutput>)>,
+    stream: Option<Running>,
     /// Pids the current filter was built from, to notice changes.
     pids: Option<Vec<i32>>,
+    restart: Restart,
+}
+
+impl Tap {
+    fn say(&self, line: &str) {
+        eprintln!("{} audio source \"{}\": {line}", chrono::Local::now().format("%H:%M:%S"), self.source.name);
+    }
+}
+
+/// A tap's stream while it runs: what it feeds, and what hears when the
+/// system stops it (kept as long as the stream, which holds neither).
+struct Running {
+    stream: Retained<SCStream>,
+    _output: Retained<StreamOutput>,
+    _watch: Retained<StreamWatch>,
+    stopped: Arc<Stopped>,
+}
+
+/// When a tap's stream is started again, and what the log last said of it.
+/// A start that failed, or a stream the system stopped (the person stopping
+/// it from the menu bar, the display it's on going), is tried again a second
+/// later, then twice as long after each failure in a row, up to every 10 s
+/// (`sources::Retry`); one that had run a while starts over at a second.
+/// Each failure is said once. A start that failed was tried, and said, at
+/// every rescan (every second); a stream the system stopped went silent,
+/// Live all the same, until the capture restarted.
+#[derive(Debug, Default)]
+struct Restart {
+    retry: Option<Retry>,
+    /// When it last started.
+    started: Option<Instant>,
+    /// The failure the log last said.
+    said: String,
+}
+
+impl Restart {
+    /// A stream that ran this long without stopping had worked: a stop after
+    /// it is tried again a second later, not later than the one before.
+    const WORKED: Duration = Duration::from_secs(10);
+
+    /// Whether to try starting it at `now`.
+    fn due(&self, now: Instant) -> bool {
+        self.retry.is_none_or(|r| r.due(now))
+    }
+
+    /// Its start failed, or it stopped, at `now`, for `why`: what to log, if
+    /// it isn't what was said last.
+    fn failed(&mut self, why: String, now: Instant) -> Option<String> {
+        let worked = self.started.take().is_some_and(|t| now.duration_since(t) >= Self::WORKED);
+        self.retry = Some(Retry::after(self.retry.filter(|_| !worked), now));
+        (why != self.said).then(|| {
+            self.said.clone_from(&why);
+            why
+        })
+    }
+
+    /// It started at `now`: what to log, if a failure was said.
+    fn started(&mut self, now: Instant) -> Option<String> {
+        self.started = Some(now);
+        (!std::mem::take(&mut self.said).is_empty()).then(|| "started again".to_owned())
+    }
 }
 
 impl SystemAudio {
@@ -563,7 +658,7 @@ impl SystemAudio {
         let thread = thread::spawn(move || {
             let mut taps: Vec<Tap> = sources
                 .into_iter()
-                .map(|(source, feed, channel)| Tap { source, feed, channel, stream: None, pids: None })
+                .map(|(source, feed, channel)| Tap { source, feed, channel, stream: None, pids: None, restart: Restart::default() })
                 .collect();
             let mut first = true;
             while !stop2.load(Ordering::Relaxed) {
@@ -577,8 +672,8 @@ impl SystemAudio {
                 }
             }
             for tap in &taps {
-                if let Some((stream, _)) = &tap.stream {
-                    stop_capture(stream);
+                if let Some(running) = &tap.stream {
+                    stop_capture(&running.stream);
                 }
                 tap.channel.set_status(SourceStatus::Off);
             }
@@ -640,6 +735,15 @@ fn sync_taps(taps: &mut [Tap]) {
             .collect();
         let mut pids: Vec<i32> = apps.iter().map(|a| unsafe { a.processID() }).collect();
         pids.sort_unstable();
+        let now = Instant::now();
+        // Stopped by the system: let go of, and started again when it's due.
+        if let Some(why) = tap.stream.as_ref().and_then(|r| r.stopped.take()) {
+            tap.stream = None;
+            tap.pids = None;
+            if let Some(line) = tap.restart.failed(format!("stopped ({why}); starting it again"), now) {
+                tap.say(&line);
+            }
+        }
 
         if include && apps.is_empty() {
             // Nothing to listen to until the app opens. A stream left over from a
@@ -649,16 +753,29 @@ fn sync_taps(taps: &mut [Tap]) {
         }
         if tap.pids.as_ref() != Some(&pids) {
             match &tap.stream {
-                Some((stream, _)) => {
+                Some(running) => {
                     let filter = audio_filter(&display, &apps, include);
-                    let _ = await_completion(|h| unsafe { stream.updateContentFilter_completionHandler(&filter, Some(h)) });
+                    let _ = await_completion(|h| unsafe { running.stream.updateContentFilter_completionHandler(&filter, Some(h)) });
                 }
                 None => {
+                    if !tap.restart.due(now) {
+                        tap.channel.set_status(SourceStatus::Unavailable);
+                        continue;
+                    }
                     let output = StreamOutput::new(Arc::new(Shared { audio: Some(tap.feed.clone()) }));
-                    match make_audio_stream(&display, &apps, include, &output).and_then(|st| start_capture(&st).map(|_| st)) {
-                        Ok(stream) => tap.stream = Some((stream, output)),
+                    let stopped = Arc::new(Stopped::default());
+                    let watch = StreamWatch::new(stopped.clone());
+                    match make_audio_stream(&display, &apps, include, &output, &watch).and_then(|st| start_capture(&st).map(|_| st)) {
+                        Ok(stream) => {
+                            tap.stream = Some(Running { stream, _output: output, _watch: watch, stopped });
+                            if let Some(line) = tap.restart.started(Instant::now()) {
+                                tap.say(&line);
+                            }
+                        }
                         Err(e) => {
-                            eprintln!("audio source \"{}\": {e}", tap.source.name);
+                            if let Some(line) = tap.restart.failed(format!("{e:#}"), Instant::now()) {
+                                tap.say(&line);
+                            }
                             tap.channel.set_status(SourceStatus::Unavailable);
                             continue;
                         }
@@ -669,65 +786,6 @@ fn sync_taps(taps: &mut [Tap]) {
         }
         tap.channel.set_status(SourceStatus::Live);
     }
-}
-
-// ---------------------------------------------------------------------------
-// Pacer: constant frame rate
-// ---------------------------------------------------------------------------
-
-/// Encode the newest screen frame every 1/fps on the host clock. SCK only sends
-/// frames when the screen changes; repeating the last one keeps the output CFR.
-/// Frame N is stamped N/fps seconds after t0, the same clock the audio uses.
-///
-/// When the encoder can't keep up (a big frame at a high rate is more than
-/// the hardware does: ~60 fps at 3600×2338 on an M4 Pro), slots are skipped
-/// rather than queued: the pacer always encodes the slot that's due now, and
-/// a skipped slot shows the previous picture a little longer. Video never
-/// falls behind real time, so it stays in sync and nothing piles up.
-fn spawn_pacer(fps: u32, mut frames: Frames, encoder: Encoder, clock: Arc<Clock>) -> (Arc<AtomicBool>, JoinHandle<()>) {
-    let stop = Arc::new(AtomicBool::new(false));
-    let stop2 = stop.clone();
-    let encoder = SendBox(encoder);
-    let handle = thread::spawn(move || {
-        let encoder = encoder;
-        let fps_f = fps as f64;
-        let t0 = host_now();
-        clock.set(t0);
-        let mut next: i64 = 0;
-        let mut skipped = 0u64;
-        let mut note = |n: i64| {
-            let before = skipped;
-            skipped += n as u64;
-            crate::count_skipped(n as u64);
-            // Once per doubling, so a long session doesn't flood the log.
-            if before.checked_ilog2() != skipped.checked_ilog2() {
-                eprintln!("video encoder is behind: {skipped} frames skipped so far");
-            }
-        };
-        while !stop2.load(Ordering::Relaxed) {
-            let due = ((host_now() - t0) * fps_f) as i64;
-            if next <= due {
-                // Missed slots (the encoder or the system stalled) are skipped.
-                if due > next {
-                    note(due - next);
-                }
-                if let Some(frame) = frames.next() {
-                    if encoder.0.encode(&frame.0, due, fps) {
-                        crate::count_encoded();
-                    } else {
-                        note(1);
-                    }
-                }
-                next = due + 1;
-            }
-            let wait = t0 + next as f64 / fps_f - host_now();
-            if wait > 0.0 {
-                thread::sleep(Duration::from_secs_f64(wait));
-            }
-        }
-        encoder.0.finish();
-    });
-    (stop, handle)
 }
 
 // ---------------------------------------------------------------------------
@@ -752,11 +810,35 @@ pub(crate) struct EncodedSink {
     pub(crate) probe: Option<Sender<CFRetained<objc2_core_media::CMFormatDescription>>>,
     /// Frames handed to the encoder and not called back yet.
     in_flight: AtomicUsize,
+    /// When each frame in the encoder went in, oldest first (they come back
+    /// in order: no B-frames), and how long those back were held, for the
+    /// encode report (`crate::mac::blend`).
+    held: Mutex<Held>,
+}
+
+impl EncodedSink {
+    fn new(tx: Option<Sender<writer::Command>>, probe: Option<Sender<CFRetained<objc2_core_media::CMFormatDescription>>>) -> Self {
+        Self { tx, probe, in_flight: AtomicUsize::new(0), held: Mutex::default() }
+    }
+
+    fn held(&self) -> std::sync::MutexGuard<'_, Held> {
+        self.held.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// How long the encoder held frames: when each in it went in, and of those
+/// back since the report last asked, altogether, the most, and how many.
+#[derive(Default)]
+struct Held {
+    since: std::collections::VecDeque<Instant>,
+    total: Duration,
+    most: Duration,
+    count: u32,
 }
 
 impl Encoder {
     pub(crate) fn new(width: usize, height: usize, s: &EncodeSettings, tx: Sender<writer::Command>) -> Result<Self> {
-        Self::with_sink(width, height, s, EncodedSink { tx: Some(tx), probe: None, in_flight: AtomicUsize::new(0) })
+        Self::with_sink(width, height, s, EncodedSink::new(Some(tx), None))
     }
 
     fn with_sink(width: usize, height: usize, s: &EncodeSettings, sink: EncodedSink) -> Result<Self> {
@@ -812,6 +894,7 @@ impl Encoder {
             return false;
         }
         sink.in_flight.fetch_add(1, Ordering::Relaxed);
+        sink.held().since.push_back(Instant::now());
         unsafe {
             let status = self.session.encode_frame(
                 frame,
@@ -824,7 +907,8 @@ impl Encoder {
             if status != 0 {
                 // No callback comes for a frame refused outright.
                 sink.in_flight.fetch_sub(1, Ordering::Relaxed);
-                eprintln!("VideoToolbox encode error {status}");
+                sink.held().since.pop_back();
+                crate::eprintln_later!("VideoToolbox encode error {status}");
             }
         }
         true
@@ -834,6 +918,20 @@ impl Encoder {
     #[allow(dead_code)]
     pub(crate) fn in_flight(&self) -> usize {
         unsafe { &*self.ctx }.in_flight.load(Ordering::Relaxed)
+    }
+
+    /// Places free in the encoder's queue before a frame is skipped.
+    pub(crate) fn free(&self) -> usize {
+        QUEUE.saturating_sub(unsafe { &*self.ctx }.in_flight.load(Ordering::Relaxed))
+    }
+
+    /// How long the encoder held the frames it gave back since this was last
+    /// asked: altogether, the most, and how many.
+    pub(crate) fn held(&self) -> (Duration, Duration, u32) {
+        let mut held = unsafe { &*self.ctx }.held();
+        let out = (held.total, held.most, held.count);
+        (held.total, held.most, held.count) = (Duration::ZERO, Duration::ZERO, 0);
+        out
     }
 
     /// Flush pending frames, then release the sink.
@@ -858,6 +956,15 @@ unsafe extern "C-unwind" fn on_encoded(
     let Some(sink) = (unsafe { (ctx as *const EncodedSink).as_ref() }) else { return };
     // Called once per frame handed in, encoded or dropped.
     sink.in_flight.fetch_sub(1, Ordering::Relaxed);
+    {
+        let mut held = sink.held();
+        if let Some(at) = held.since.pop_front() {
+            let took = at.elapsed();
+            held.total += took;
+            held.most = held.most.max(took);
+            held.count += 1;
+        }
+    }
     let Some(sample) = (unsafe { sample.as_ref() }).filter(|_| status == 0) else { return };
     if let Some(probe) = &sink.probe {
         if let Some(fmt) = unsafe { sample.format_description() } {
@@ -881,7 +988,7 @@ pub(crate) fn probe_video_format(
     s: &EncodeSettings,
 ) -> Result<CFRetained<objc2_core_media::CMFormatDescription>> {
     let (tx, rx) = mpsc::channel();
-    let enc = Encoder::with_sink(width, height, s, EncodedSink { tx: None, probe: Some(tx), in_flight: AtomicUsize::new(0) })?;
+    let enc = Encoder::with_sink(width, height, s, EncodedSink::new(None, Some(tx)))?;
     let mut pb: *mut CVPixelBuffer = ptr::null_mut();
     let status = unsafe {
         objc2_core_video::CVPixelBufferCreate(
@@ -922,5 +1029,51 @@ pub(crate) fn probe_encoder(width: usize, height: usize) -> String {
     match probe_video_format(width, height, &s) {
         Ok(_) => "ok".into(),
         Err(e) => format!("{e:#}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A desktop or app sound stream that keeps failing to start is tried
+    /// again a second later, then later and later, up to every 10 s, and its
+    /// failure is said once.
+    #[test]
+    fn a_failing_start_is_tried_later_and_later_and_said_once() {
+        let t = Instant::now();
+        let at = |s: f64| t + Duration::from_secs_f64(s);
+        let mut restart = Restart::default();
+        assert!(restart.due(t), "the first try is at once");
+        assert_eq!(restart.failed("can't".into(), t).as_deref(), Some("can't"));
+        assert!(!restart.due(at(0.9)) && restart.due(at(1.0)));
+        let mut tries = Vec::new();
+        let mut now = 1.0;
+        for _ in 0..6 {
+            while !restart.due(at(now)) {
+                now += 0.25;
+            }
+            tries.push(now);
+            assert_eq!(restart.failed("can't".into(), at(now)), None, "said once");
+        }
+        let gaps: Vec<f64> = tries.windows(2).map(|w| w[1] - w[0]).collect();
+        assert_eq!(gaps, [2.0, 4.0, 8.0, 10.0, 10.0]);
+    }
+
+    /// A stream the system stops after it ran a while is started again a
+    /// second later; one stopped again soon after that waits longer.
+    #[test]
+    fn a_stream_that_ran_a_while_starts_over_at_a_second() {
+        let t = Instant::now();
+        let at = |s: f64| t + Duration::from_secs_f64(s);
+        let mut restart = Restart::default();
+        assert_eq!(restart.started(t), None, "nothing had been said");
+        assert!(restart.failed("stopped".into(), at(60.0)).is_some());
+        assert!(!restart.due(at(60.9)) && restart.due(at(61.0)), "a second after it stopped");
+        assert_eq!(restart.started(at(61.0)).as_deref(), Some("started again"));
+        // Stopped again 3 s in: said again (it had started since), and two
+        // seconds later this time.
+        assert!(restart.failed("stopped".into(), at(64.0)).is_some());
+        assert!(!restart.due(at(65.9)) && restart.due(at(66.0)));
     }
 }
