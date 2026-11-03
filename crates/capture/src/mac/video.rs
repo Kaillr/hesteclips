@@ -639,7 +639,16 @@ fn stream_config(width: usize, height: usize, fps: u32, framing: crate::Framing,
         let config = SCStreamConfiguration::new();
         config.setWidth(width);
         config.setHeight(height);
-        config.setMinimumFrameInterval(CMTime::new(1, fps as i32));
+        // At most a picture every 0.9 of a frame's time (`fps` is the looks'
+        // rate when blending). The screen's pictures come right at a frame's
+        // time from a game at the frame rate, and asked for at most one a
+        // frame's time, ScreenCaptureKit left out one that came a hair early:
+        // measured on a 120 Hz display changing at every refresh, 106-110 of
+        // 120 a second at 120 fps; at 60 fps 56-57 of 60, a 25 ms gap about
+        // six times a second; 81% of blended frames (60 fps, 2 looks) with
+        // both their pictures. At 0.9 it hands over each, and no more (at half
+        // a frame's time it handed over twice the pictures at 60 fps).
+        config.setMinimumFrameInterval(CMTime::new(9, fps as i32 * 10));
         config.setPixelFormat(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange);
         config.setColorMatrix(kCGDisplayStreamYCbCrMatrix_ITU_R_709_2);
         config.setShowsCursor(true);
