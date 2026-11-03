@@ -603,6 +603,9 @@ struct App {
     /// The frame it went to the tray in: a later one drawn while it's used
     /// says it's out (see `ui`).
     tray_frame: u64,
+    /// Until when the renderer's settled while out of sight, after the
+    /// player or the editor let go of decoders (see `keep_open`).
+    settle_until: Option<Instant>,
     /// Quitting for real (closing mustn't just hide the window then).
     quitting: bool,
     /// The first close: ask whether to keep running in the tray.
@@ -829,6 +832,7 @@ impl App {
             tray_maximized: false,
             unused_since: None,
             tray_frame: 0,
+            settle_until: None,
             quitting: false,
             close_dialog: false,
             setup_open,
@@ -1529,14 +1533,25 @@ impl App {
         } else {
             player::Window::InUse
         };
-        if window == player::Window::Hidden {
-            self.hover_play = None;
-        }
+        let mut let_go = window == player::Window::Hidden && self.hover_play.take().is_some();
         if let Some(v) = &mut self.viewer {
-            v.set_window(ctx, window);
+            let_go |= v.set_window(ctx, window);
         }
         if let Some(e) = &mut self.editor {
-            e.set_window(ctx, window);
+            let_go |= e.set_window(ctx, window);
+        }
+        // Out of sight nothing's drawn, so nothing has the renderer (or the
+        // driver) let go of what was let go of: settled for a few seconds,
+        // as the decoders close (each finishes the frame it's on first).
+        let now = Instant::now();
+        if let_go {
+            if player::debug() {
+                eprintln!("{:>8.3} app: decoders let go of, settling the renderer", player::uptime());
+            }
+            self.settle_until = Some(now + Duration::from_secs(3));
+        }
+        if window == player::Window::Hidden && self.settle_until.is_some_and(|t| now < t) {
+            gpu_frames::settle();
         }
     }
 

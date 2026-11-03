@@ -219,6 +219,17 @@ pub struct Video {
     state: Arc<Mutex<State>>,
 }
 
+/// Says (`HASTECLIP_DEBUG_VIDEO`) the playback decoder's thread is done.
+struct Closed;
+
+impl Drop for Closed {
+    fn drop(&mut self) {
+        if crate::player::debug() {
+            eprintln!("{:>8.3} video: playback decoder closed", crate::player::uptime());
+        }
+    }
+}
+
 impl Video {
     /// Start opening `path` in the background.
     /// Frames are decoded at the video's own resolution and numbered at
@@ -228,6 +239,9 @@ impl Video {
         let state = Arc::new(Mutex::new(State::default()));
         let (path, shared, ctx) = (path.to_path_buf(), state.clone(), ctx.clone());
         std::thread::spawn(move || {
+            // Logged as the thread ends, after the decoder's gone
+            // (`HASTECLIP_DEBUG_VIDEO`): a player that let go of it closed it.
+            let _closed = Closed;
             let opened = open_decoder(&path);
             let mut dec = match opened {
                 Ok(mut d) => {

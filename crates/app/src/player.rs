@@ -406,6 +406,9 @@ pub struct Player {
     /// while it's drawn, it's seen.
     #[cfg(hw_decode)]
     drawn_at: Option<std::time::Instant>,
+    /// What the window was doing, as last told ([`Self::set_window`]).
+    #[cfg(hw_decode)]
+    window: Window,
     /// The playhead's motion while scrubbing.
     #[cfg(hw_decode)]
     motion: Option<Motion>,
@@ -594,6 +597,8 @@ impl Player {
             #[cfg(hw_decode)]
             drawn_at: None,
             #[cfg(hw_decode)]
+            window: Window::InUse,
+            #[cfg(hw_decode)]
             motion: None,
             #[cfg(hw_decode)]
             redraw_secs: 1.0 / 240.0,
@@ -669,29 +674,45 @@ impl Player {
     /// in use the scrub engine is let go of, and out of sight the playback
     /// decoder too (paused, and not drawn for [`UNSEEN`]); each is opened
     /// again once it's back. The clip, the playhead, the sound and the
-    /// picture on screen stay as they are.
-    pub fn set_window(&mut self, ctx: &egui::Context, window: Window) {
+    /// picture on screen stay as they are. Whether it let go of either just
+    /// now.
+    pub fn set_window(&mut self, ctx: &egui::Context, window: Window) -> bool {
         #[cfg(hw_decode)]
-        match window {
-            // The playback decoder first: the engine opens only beside it.
-            Window::InUse => {
-                self.open_video_again(ctx);
-                self.open_engine_again(ctx);
+        {
+            if window != self.window {
+                trace!("window {}", match window {
+                    Window::InUse => "in use",
+                    Window::Behind => "not in use",
+                    Window::Hidden => "out of sight",
+                });
+                self.window = window;
             }
-            Window::Behind => {
-                self.let_go_of_engine();
-                self.open_video_again(ctx);
-            }
-            // The engine first: what it keeps can be on screen.
-            Window::Hidden => {
-                self.let_go_of_engine();
-                if !self.is_playing() && self.drawn_at.is_none_or(|t| t.elapsed() >= UNSEEN) {
-                    self.let_go_of_video();
+            let held = (self.engine_let_go, self.video_let_go);
+            match window {
+                // The playback decoder first: the engine opens only beside it.
+                Window::InUse => {
+                    self.open_video_again(ctx);
+                    self.open_engine_again(ctx);
+                }
+                Window::Behind => {
+                    self.let_go_of_engine();
+                    self.open_video_again(ctx);
+                }
+                // The engine first: what it keeps can be on screen.
+                Window::Hidden => {
+                    self.let_go_of_engine();
+                    if !self.is_playing() && self.drawn_at.is_none_or(|t| t.elapsed() >= UNSEEN) {
+                        self.let_go_of_video();
+                    }
                 }
             }
+            (!held.0 && self.engine_let_go) || (!held.1 && self.video_let_go)
         }
         #[cfg(not(hw_decode))]
-        let _ = (ctx, window);
+        {
+            let _ = (ctx, window);
+            false
+        }
     }
 
     /// Let go of the scrub engine: its decoders and their textures (on
@@ -767,6 +788,15 @@ impl Player {
         self.gpu_frames = Default::default();
         #[cfg(windows)]
         self.engine_pools.clear();
+        // Dev aid: `HASTECLIP_DEV_DROP_PICTURE=1` lets go of the picture on
+        // screen too (what draws it holds its texture; it comes back from the
+        // playback decoder as the window does), to see whether that's what
+        // keeps a clip's memory held.
+        if dev_flag("HASTECLIP_DEV_DROP_PICTURE") && matches!(self.display, Some(Display::Gpu(..))) {
+            self.display = None;
+            self.shown_frame = None;
+            self.screen_index = None;
+        }
     }
 
     /// The playback decoder again, after [`Self::let_go_of_video`], told

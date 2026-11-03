@@ -154,6 +154,18 @@ impl Shown {
     }
 }
 
+/// Out of sight nothing is drawn, so nothing submits work to the graphics
+/// card, and nothing has the renderer let go of what drawing was done with:
+/// what a decoder closed meanwhile held may wait for that to be freed (a
+/// paused clip let go of while minimized measured 2 GB still held). Done
+/// here as a frame would: an empty submission, waited for (at most 50 ms),
+/// and the renderer polled.
+pub fn settle() {
+    let Some(rs) = RENDER.get() else { return };
+    let index = rs.queue.submit(std::iter::empty());
+    let _ = rs.device.poll(wgpu::PollType::Wait { submission_index: Some(index), timeout: Some(std::time::Duration::from_millis(50)) });
+}
+
 /// Forget a player's bind groups (its frames' pools) so their textures are
 /// freed now, not when the next clip draws. Nothing is destroyed outright: a
 /// frame drawn this pass makes its own again if it still needs one.
