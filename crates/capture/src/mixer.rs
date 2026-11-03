@@ -3,7 +3,8 @@
 //! recorded tracks.
 //!
 //! Every source is aligned on one host clock: [`SourceFeed`] places each block of
-//! samples by its capture timestamp (gaps become silence, overlaps are dropped)
+//! samples by its capture timestamp (gaps become silence, overlaps are dropped,
+//! a clock that runs a little fast or slow is steered back a frame at a time)
 //! and converts it to 48 kHz stereo. The mixer then pulls exactly the same span
 //! from every feed a short moment behind real time, applies volume, meters it, and
 //! writes the mix and the separate tracks — so tracks can never drift apart.
@@ -357,6 +358,9 @@ struct FeedState {
     /// Output frames still to discard: resampler delay, or audio that arrived
     /// after the mixer had already moved past it.
     skip_out: i64,
+    /// Keeps its sound on its timestamps while its clock runs a little fast
+    /// or slow.
+    steer: Steer,
     /// Both sides made one, when this feed is a microphone's: before noise
     /// removal, which then cleans what's heard.
     mono: Option<Mono>,
@@ -365,7 +369,9 @@ struct FeedState {
 }
 
 impl SourceFeed {
-    /// Correct timing once it's off by more than this; smaller jitter is ignored.
+    /// Timing off by more than this is put right at once: a gap (a dropout)
+    /// filled with silence, or what came twice thrown away. Within it, a
+    /// clock that runs a little fast or slow is steered back (see [`Steer`]).
     const TOLERANCE: f64 = 0.04;
     /// A gap longer than this starts the feed over instead of being filled
     /// with silence (a guess: longer than any dropout worth keeping in step).
@@ -386,6 +392,7 @@ impl SourceFeed {
                 out_base: 0,
                 heard: 0,
                 skip_out: 0,
+                steer: Steer::default(),
                 mono: None,
                 denoise: None,
             }),
@@ -448,21 +455,33 @@ impl SourceFeed {
             st.out_base = (expected as f64 * RATE as f64 / rate).round() as i64;
             st.skip_out = st.resampler.as_ref().map_or(0, |r| r.output_delay() as i64)
                 + if st.denoise.is_some() { Denoise::DELAY as i64 } else { 0 };
+            st.steer = Steer::default();
         }
         let drift = expected - st.next_in.unwrap();
         let tolerance = (Self::TOLERANCE * rate) as i64;
         let mut skip = 0usize;
+        let mut slips = 0;
         if drift > tolerance {
             st.feed_silence(drift as usize);
+            st.steer = Steer::default();
         } else if drift < -tolerance {
             skip = ((-drift) as usize).min(frames);
+            // What's left over is steered off.
+            st.steer = Steer::at(drift + skip as i64);
+        } else {
+            slips = st.steer.step(drift, frames, rate);
         }
-        let (l, r): (Vec<f32>, Vec<f32>) = (skip..frames)
+        let (mut l, mut r): (Vec<f32>, Vec<f32>) = (skip..frames)
             .map(|i| {
                 let f = &samples[i * channels..];
                 (f[0], if channels > 1 { f[1] } else { f[0] })
             })
             .unzip();
+        if slips != 0 {
+            let over = (Steer::SLIP * rate).round() as usize;
+            slip(&mut l, slips, over);
+            slip(&mut r, slips, over);
+        }
         st.feed(&l, &r);
         st.heard = st.out_base + st.out.len() as i64;
     }
@@ -587,6 +606,93 @@ impl FeedState {
             } else {
                 self.out.push_back(f);
             }
+        }
+    }
+}
+
+/// Keeps a source on its timestamps while its clock runs a little fast or
+/// slow against the host's: a USB mic, or an HDMI or Bluetooth output, is
+/// often 10-100 ppm off. Sound is put where counting its frames says, so
+/// that error grew for as long as it played, and was put right only at
+/// [`SourceFeed::TOLERANCE`]: 40 ms of silence at once (a slow clock) or a
+/// packet thrown away (fast). At 50 ppm that's a gap every 13 minutes,
+/// with the sound up to 40 ms early or late in between.
+///
+/// Now, from 2 ms off on, single frames are put in (slow) or taken out
+/// (fast) as it comes: as often as the drift needs, never more than one in
+/// 1000 frames (up to 1000 ppm is followed), each spread over a millisecond
+/// (see [`slip`]). At 100 ppm, a frame every 10,000 and the sound ~2.4 ms
+/// off its timestamps for good. Big jumps are still put right at once.
+#[derive(Debug, Default)]
+struct Steer {
+    /// How far its sound is put from where its timestamps say, in input
+    /// frames (+: earlier, as a slow clock's is), averaged over about a
+    /// second: timestamps jitter by a millisecond or so.
+    drift: f64,
+    /// Frames owed: one is put in (+) or taken out (-) each time it gets to 1.
+    owed: f64,
+}
+
+impl Steer {
+    /// Off by less than this (seconds), it's left alone: that's the jitter.
+    const FROM: f64 = 0.002;
+    /// From this far off on, it's steered as hard as it gets.
+    const FULL: f64 = 0.006;
+    /// At most one frame in this many put in or taken out.
+    const EVERY: f64 = 1000.0;
+    /// How long its drift is averaged over (seconds).
+    const SMOOTH: f64 = 1.0;
+    /// How long a frame put in or taken out is spread over (seconds).
+    const SLIP: f64 = 0.001;
+
+    /// `drift` frames off, as when it was just put right at once.
+    fn at(drift: i64) -> Self {
+        Self { drift: drift as f64, owed: 0.0 }
+    }
+
+    /// A packet of `frames` frames (at `rate`) that came `drift` frames off
+    /// where counting puts it: how many frames to put into it (+) or take
+    /// out of it (-).
+    fn step(&mut self, drift: i64, frames: usize, rate: f64) -> i64 {
+        let weight = 1.0 - (-(frames as f64 / rate) / Self::SMOOTH).exp();
+        self.drift += (drift as f64 - self.drift) * weight;
+        let pull = ((self.drift.abs() / rate - Self::FROM) / (Self::FULL - Self::FROM)).clamp(0.0, 1.0);
+        let towards = self.drift.signum() * pull;
+        if towards == 0.0 || towards * self.owed < 0.0 {
+            self.owed = 0.0;
+        }
+        self.owed += towards * frames as f64 / Self::EVERY;
+        let now = self.owed.trunc();
+        self.owed -= now;
+        now as i64
+    }
+}
+
+/// Put `n` frames into `x` (or take `-n` out), spread evenly through it.
+/// A frame repeated or dropped outright jumps (a click, on a high note):
+/// instead the `over` frames around it are read a little slower (or
+/// faster), each taken between two neighbours, so the sound slides by one
+/// frame over them.
+fn slip(x: &mut Vec<f32>, n: i64, over: usize) {
+    let len = x.len();
+    if len < 3 {
+        return;
+    }
+    let w = over.clamp(1, len - 2);
+    let count = n.unsigned_abs() as usize;
+    let step = 1.0 / (w + 1) as f32;
+    // From the last to the first, so each leaves the places of those before it.
+    for k in (0..count).rev() {
+        let centre = (2 * k + 1) * len / (2 * count);
+        let at = centre.saturating_sub(w / 2).clamp(1, len - w - 1);
+        if n > 0 {
+            // Read back towards the frame before, one more frame out.
+            let slid: Vec<f32> = (0..w).map(|i| x[at + i] + (x[at + i - 1] - x[at + i]) * (i + 1) as f32 * step).collect();
+            x.splice(at..at + w - 1, slid);
+        } else {
+            // Read on towards the frame after, one frame less.
+            let slid: Vec<f32> = (0..w).map(|i| x[at + i] + (x[at + i + 1] - x[at + i]) * (i + 1) as f32 * step).collect();
+            x.splice(at..at + w + 1, slid);
         }
     }
 }
@@ -1122,6 +1228,131 @@ mod tests {
         assert!(feed.take(at - 4_800, 4_800).iter().all(|f| f[0] == 0.0), "nothing before its time");
         let out = feed.take(at, RATE as usize);
         assert!(out[4_000..44_000].iter().all(|f| (f[0] - 0.5).abs() < 0.01), "its level, in place");
+    }
+
+    /// A source whose clock runs 100 ppm fast or slow (a USB mic, an HDMI
+    /// output) for 10 minutes, its timestamps jittering by up to a
+    /// millisecond: it stays within a few ms of where they put it, without a
+    /// gap filled or a packet thrown away (that takes 40 ms off), steered
+    /// one frame at a time, all one way, never in two packets running. At
+    /// its right rate, the jitter alone steers nothing.
+    #[test]
+    fn drifting_clock_is_steered_a_frame_at_a_time() {
+        for (rate, ppm) in [(RATE, 100.0), (RATE, -100.0), (RATE, 0.0), (44_100, 100.0), (44_100, -100.0)] {
+            let feed = SourceFeed::new(rate, clock_at_zero());
+            let packet = rate as usize / 100;
+            let true_rate = rate as f64 * (1.0 + ppm * 1e-6);
+            let mut seed = 7u32;
+            let mut jitter = move || {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                ((seed >> 8) as f64 / (1u32 << 24) as f64 * 2.0 - 1.0) * 0.001
+            };
+            // A click every 100 ms of its own time, on a steady level.
+            let every = packet * 10;
+            let level = |frame: usize| if frame % every == every / 2 { 1.0f32 } else { 0.25 };
+            let packets = 10 * 60 * 100;
+            let mut worst = 0f64;
+            let mut slips: Vec<(usize, i64)> = Vec::new();
+            let (mut taken, mut silent) = (0i64, 0usize);
+            let mut clicks: Vec<(i64, f32)> = Vec::new();
+            for k in 0..packets {
+                let first = k * packet;
+                let captured = 1000.05 + first as f64 / true_rate;
+                let samples: Vec<f32> = (first..first + packet).map(level).collect();
+                let before = feed.st.lock().unwrap().next_in;
+                if let Some(next) = before {
+                    // Where it's put, against where it was captured.
+                    worst = worst.max(((captured - 1000.0) * rate as f64 - next as f64).abs() / rate as f64);
+                }
+                feed.push(captured + jitter(), &samples, 1);
+                let after = feed.st.lock().unwrap().next_in.unwrap();
+                if let Some(before) = before
+                    && after - before != packet as i64
+                {
+                    slips.push((k, after - before - packet as i64));
+                }
+                // The mixer, 100 ms behind. At 48 kHz, where each click lands.
+                let upto = ((captured - 1000.1) * RATE as f64) as i64;
+                if upto > taken {
+                    for (i, f) in feed.take(taken, (upto - taken) as usize).into_iter().enumerate() {
+                        let at = taken + i as i64;
+                        if rate != RATE {
+                            continue;
+                        }
+                        if at > (0.06 * RATE as f64) as i64 && f[0] < 0.2 {
+                            silent += 1;
+                        }
+                        // A click slid over is split between two frames.
+                        if f[0] > 0.6 {
+                            match clicks.last_mut() {
+                                Some(c) if at - c.0 <= 2 => {
+                                    if f[0] > c.1 {
+                                        *c = (at, f[0]);
+                                    }
+                                }
+                                _ => clicks.push((at, f[0])),
+                            }
+                        }
+                    }
+                    taken = upto;
+                }
+            }
+            let what = format!("{rate} Hz at {ppm:+} ppm");
+            assert!(worst < 0.004, "{what}: up to {:.2} ms off", worst * 1e3);
+            let total: i64 = slips.iter().map(|s| s.1).sum();
+            eprintln!("{what}: {} frames steered, up to {:.2} ms off", total, worst * 1e3);
+            if ppm == 0.0 {
+                assert!(slips.is_empty(), "{what}: steered by jitter: {slips:?}");
+                continue;
+            }
+            // Fast: frames taken out. All of the 10 minutes' drift (60 ms)
+            // but the couple of ms it's let be off.
+            let drift = -ppm * 1e-6 * 600.0 * rate as f64;
+            assert!(slips.iter().all(|s| s.1.signum() == drift.signum() as i64), "{what}: steered both ways");
+            assert!(total as f64 / drift > 0.9 && total as f64 / drift < 1.0, "{what}: steered {total} of {drift:.0}");
+            assert!(slips.iter().all(|s| s.1.abs() == 1), "{what}: more than a frame at once");
+            assert!(slips.windows(2).all(|w| w[1].0 - w[0].0 >= 2), "{what}: two packets running");
+            if rate == RATE {
+                assert_eq!(silent, 0, "{what}: silence put in");
+                // Every click there, within 4 ms of where it was captured.
+                let expected = (taken as f64 / RATE as f64 - 0.05) * true_rate / every as f64;
+                assert!((clicks.len() as f64 - expected).abs() < 2.0, "{what}: {} clicks of {expected:.0}", clicks.len());
+                for (m, (at, _)) in clicks.iter().enumerate() {
+                    let captured = 0.05 + (m * every + every / 2) as f64 / true_rate;
+                    let off = (*at as f64 / RATE as f64 - captured).abs();
+                    assert!(off < 0.004, "{what}: click {m} {:.2} ms off", off * 1e3);
+                }
+            }
+        }
+    }
+
+    /// A frame put in or taken out slides the sound by one frame over a
+    /// millisecond, read a little slower or faster there: no jump, and the
+    /// rest as it was.
+    #[test]
+    fn a_slip_slides_without_a_jump() {
+        let ramp: Vec<f32> = (0..480).map(|i| i as f32).collect();
+        for n in [1i64, -1] {
+            let mut x = ramp.clone();
+            slip(&mut x, n, 48);
+            assert_eq!(x.len() as i64, 480 + n);
+            let steps: Vec<f32> = x.windows(2).map(|w| w[1] - w[0]).collect();
+            // A ramp read at 48/49 or 50/49 of its speed there, else as it was.
+            assert!(steps.iter().all(|&s| (s - 1.0).abs() <= 1.0 / 49.0 + 1e-4), "{n}: {steps:?}");
+            assert_eq!(x[..200], ramp[..200]);
+            assert_eq!(x[x.len() - 200..], ramp[ramp.len() - 200..]);
+        }
+        // An 8 kHz note (at half scale) moves up to 0.433 from one frame to
+        // the next, and barely more slid; a frame dropped outright can jump
+        // 0.866.
+        let note: Vec<f32> = (0..480).map(|i| 0.5 * (std::f32::consts::TAU * 8000.0 * i as f32 / RATE as f32).sin()).collect();
+        let most = |x: &[f32]| x.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0, f32::max);
+        for n in [1i64, -1] {
+            let mut x = note.clone();
+            slip(&mut x, n, 48);
+            eprintln!("8 kHz note, {n:+} frame: moves up to {:.3} a frame ({:.3} as it came)", most(&x), most(&note));
+            assert!(most(&x) < most(&note) * 1.05, "{n}: {}", most(&x));
+        }
     }
 
     /// A short gap is still filled, so what follows stays in step.
