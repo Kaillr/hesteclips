@@ -230,7 +230,7 @@ impl Mics {
                 std::thread::Builder::new().name("mic watch".into()).spawn(move || {
                     while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = stopped.recv_timeout(Self::EVERY) {
                         let now = Instant::now();
-                        for mic in mics.lock().unwrap().iter_mut() {
+                        for mic in locked(&mics).iter_mut() {
                             mic.watch(now);
                         }
                     }
@@ -243,7 +243,7 @@ impl Mics {
     /// Switch the mic of the source `id` to `device`. False if there's no
     /// such mic.
     fn set(&self, id: &str, device: &str) -> bool {
-        let mut list = self.list.lock().unwrap();
+        let mut list = locked(&self.list);
         let Some(mic) = list.iter_mut().find(|m| m.id == id) else { return false };
         if mic.device != device {
             mic.device = device.to_owned();
@@ -258,8 +258,17 @@ impl Mics {
         if let Some(watch) = self.watch.take() {
             let _ = watch.join();
         }
-        self.list.lock().unwrap().clear();
+        locked(&self.list).clear();
     }
+}
+
+/// The mics, even after a thread panicked with them locked. Stopping a
+/// capture stops its audio before it finishes the file: a poisoned lock
+/// made that panic, and again in `Drop` while unwinding, which aborts, and
+/// the recording was never finished.
+#[cfg(not(target_os = "linux"))]
+fn locked(list: &Mutex<Vec<Mic>>) -> std::sync::MutexGuard<'_, Vec<Mic>> {
+    list.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -329,13 +338,13 @@ impl MicHealth {
     }
 
     fn end(&self, why: String) {
-        self.ended.lock().unwrap().get_or_insert(why);
+        self.ended.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert(why);
     }
 
     /// Why it has stopped, if it has, at host time `now`; it was opened at
     /// `opened`.
     fn stopped(&self, opened: f64, now: f64) -> Option<String> {
-        if let Some(why) = self.ended.lock().unwrap().clone() {
+        if let Some(why) = self.ended.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone() {
             return Some(why);
         }
         let heard = f64::from_bits(self.heard.load(Ordering::Relaxed));
@@ -812,6 +821,24 @@ mod tests {
     #[test]
     fn no_sources_no_tracks() {
         assert_eq!(track_layout(&[]).0.len(), 0);
+    }
+
+    /// A thread that panicked with the mics locked doesn't take stopping the
+    /// capture down with it (nor dropping them, while unwinding).
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn mics_stop_though_a_thread_panicked_holding_them() {
+        let mut mics = Mics::start(Vec::new());
+        let list = mics.list.clone();
+        let _ = std::thread::spawn(move || {
+            let _held = list.lock().unwrap();
+            panic!("a panic with the mics locked (this test's own)");
+        })
+        .join();
+        assert!(mics.list.is_poisoned());
+        assert!(!mics.set("a mic", "another"));
+        mics.stop();
+        drop(mics);
     }
 
     /// A mic that's gone is tried again a second later, then less and less
