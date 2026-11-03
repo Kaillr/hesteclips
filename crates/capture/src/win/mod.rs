@@ -1566,15 +1566,20 @@ struct BlendPacer {
 /// Where frames wait, logged for every 5 s in which frames were skipped
 /// (every 5 s with `HASTECLIP_ENCODE_LOG=1`), so a log from a PC that can't
 /// keep up says what it's short of: how late the pacer closed frames and how
-/// long closing took (CPU), how long the GPU took to finish a frame's work
-/// after it was submitted, how long the encoder held frames, the fewest free
-/// encoder frames, and why frames were skipped.
+/// long closing took (CPU), and which of its steps the slowest one's time
+/// went to, how long the GPU took to finish a frame's work after it was
+/// submitted, how long the encoder held frames, the fewest free encoder
+/// frames, and why frames were skipped. (A real session's log had the pacer
+/// held up 349 ms closing one frame, 20 frames skipped, and no way to tell
+/// where.)
 struct EncodeDiag {
     verbose: bool,
     since: Instant,
     frames: u32,
     late_max: f64,
     close_max: Duration,
+    /// Where the slowest closing's time went.
+    slowest: CloseSteps,
     /// Queries ending each frame's GPU work, oldest first, with when.
     pending: std::collections::VecDeque<(windows::Win32::Graphics::Direct3D11::ID3D11Query, Instant)>,
     spare: Vec<windows::Win32::Graphics::Direct3D11::ID3D11Query>,
@@ -1585,6 +1590,36 @@ struct EncodeDiag {
     caught_up: u32,
 }
 
+/// How long each step of closing a frame took (see `BlendPacer::close`).
+#[derive(Clone, Copy, Default)]
+struct CloseSteps {
+    /// The webcam's newest picture taken in.
+    webcam: Duration,
+    /// The frame's looks mixed and the average made.
+    blend: Duration,
+    /// Scaled and converted into the encoder's frame.
+    convert: Duration,
+    /// Handed to the encoder.
+    encode: Duration,
+    /// The preview's picture started.
+    preview: Duration,
+}
+
+impl std::fmt::Display for CloseSteps {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+        write!(
+            f,
+            "webcam {:.1}, blend {:.1}, convert {:.1}, encoder {:.1}, preview {:.1}",
+            ms(self.webcam),
+            ms(self.blend),
+            ms(self.convert),
+            ms(self.encode),
+            ms(self.preview)
+        )
+    }
+}
+
 impl EncodeDiag {
     fn new() -> Self {
         Self {
@@ -1593,6 +1628,7 @@ impl EncodeDiag {
             frames: 0,
             late_max: 0.0,
             close_max: Duration::ZERO,
+            slowest: CloseSteps::default(),
             pending: Default::default(),
             spare: Vec::new(),
             gpu_ms: Vec::new(),
@@ -1603,11 +1639,14 @@ impl EncodeDiag {
         }
     }
 
-    fn frame(&mut self, gpu: &d3d::Gpu, late: f64, close: Duration) {
+    fn frame(&mut self, gpu: &d3d::Gpu, late: f64, close: Duration, steps: CloseSteps) {
         use windows::Win32::Graphics::Direct3D11::{D3D11_ASYNC_GETDATA_DONOTFLUSH, D3D11_QUERY_DESC, D3D11_QUERY_EVENT};
         self.frames += 1;
         self.late_max = self.late_max.max(late);
-        self.close_max = self.close_max.max(close);
+        if close > self.close_max {
+            self.close_max = close;
+            self.slowest = steps;
+        }
         unsafe {
             while let Some((q, at)) = self.pending.front() {
                 let mut done = 0i32;
@@ -1641,10 +1680,11 @@ impl EncodeDiag {
             let pct = |p: f64| self.gpu_ms.get(((self.gpu_ms.len() as f64 - 1.0) * p).round() as usize).copied().unwrap_or(f64::NAN);
             // On the pacer: written by another thread.
             eprintln_later!(
-                "encode: {} frames; closed up to {:.1} ms late, closing took up to {:.1} ms; GPU done after {:.1}/{:.1}/{:.1} ms (median/99%/max), {} unfinished; encoder held frames {:.1} ms avg, {:.1} max; fewest free frames {}; skipped {} (no free frame) + {} (queue full) + {} (caught up)",
+                "encode: {} frames; closed up to {:.1} ms late, closing took up to {:.1} ms ({}); GPU done after {:.1}/{:.1}/{:.1} ms (median/99%/max), {} unfinished; encoder held frames {:.1} ms avg, {:.1} max; fewest free frames {}; skipped {} (no free frame) + {} (queue full) + {} (caught up)",
                 self.frames,
                 self.late_max * 1000.0,
                 self.close_max.as_secs_f64() * 1000.0,
+                self.slowest,
                 pct(0.5),
                 pct(0.99),
                 pct(1.0),
@@ -1749,14 +1789,26 @@ impl BlendPacer {
         if self.blend.is_empty(k) {
             return;
         }
+        let mut steps = CloseSteps::default();
+        let mut lap = Instant::now();
+        let mut took = || {
+            let now = Instant::now();
+            let d = now - lap;
+            lap = now;
+            d
+        };
         if let Some(c) = self.camera.as_mut() {
             c.pull();
         }
+        steps.webcam = took();
         self.diag.free_min = self.diag.free_min.min(self.encoder.pool.free_count());
         match self.encoder.pool.take() {
             Some(slot) => {
                 self.blend.finish(k);
-                match self.converter.convert(slot) {
+                steps.blend = took();
+                let converted = self.converter.convert(slot);
+                steps.convert = took();
+                match converted {
                     Ok(()) => {
                         if self.encoder.encode(slot, k) {
                             encoded();
@@ -1764,6 +1816,7 @@ impl BlendPacer {
                             skipped(&mut self.dropped, 1);
                             self.diag.queue_full += 1;
                         }
+                        steps.encode = took();
                     }
                     Err(e) => {
                         self.encoder.pool.give(slot);
@@ -1779,10 +1832,12 @@ impl BlendPacer {
                 self.diag.pool_empty += 1;
             }
         }
+        let _ = took();
         if let Err(e) = self.preview.submit() {
             eprintln_later!("preview: {e:#}");
         }
-        self.diag.frame(&self.blend.gpu, late, started.elapsed());
+        steps.preview = took();
+        self.diag.frame(&self.blend.gpu, late, started.elapsed(), steps);
     }
 
     /// A new picture came up at `at`: the looks before it saw the one before.
