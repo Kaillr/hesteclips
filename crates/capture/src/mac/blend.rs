@@ -14,9 +14,10 @@
 //! as fast as the blend rate, each look should get a different picture, but
 //! with looks right next to the pictures' times, chance would decide which
 //! picture a look gets, one twice and the next not at all. So the looks are
-//! kept halfway between the pictures (locked to their pace). When the screen
-//! changes faster, the looks pick evenly spaced ones of its pictures; slower,
-//! some picture is seen twice (as it was up that long).
+//! kept halfway between the pictures, locked to their pace as on Windows and
+//! Linux (`crate::shutter::follow_picture`). When the screen changes faster,
+//! the looks pick evenly spaced ones of its pictures; slower, some picture
+//! is seen twice (as it was up that long).
 //!
 //! The pictures are averaged as light, not as pixel values (which are
 //! gamma-encoded): a screen showing them in turn gives off the average of
@@ -313,11 +314,6 @@ kernel void light_to_chroma(texture2d<float, access::read> light [[texture(0)]],
 /// of a millisecond after the screen showed it (its time), and it must still
 /// get into its frame. A guess, with room for a busy system.
 const BLEND_LATE: f64 = 0.006;
-/// How much of the way the looks move toward halfway between the screen's
-/// pictures, on each picture. A guess: slow enough that the noise in
-/// pictures' times averages out (a few hundred milliseconds), quick enough to
-/// follow a screen that drifts. The same as on Windows.
-const PHASE_GAIN: f64 = 0.03;
 
 struct BlendPacer {
     t0: f64,
@@ -328,6 +324,8 @@ struct BlendPacer {
     /// Look `m` is at `t0 + phase + (m + 0.5) * step`; frame `k`'s own time
     /// is looks `k * looks` to `(k + 1) * looks - 1`.
     phase: f64,
+    /// A picture the stream timed has come up (it set `phase`).
+    timed: bool,
     /// Which frames each look counts toward.
     shutter: crate::shutter::Shutter,
     /// The next look to take.
@@ -412,23 +410,21 @@ impl BlendPacer {
     }
 
     /// A new picture came up at `at`: the looks before it saw the one before.
-    /// Then the looks move toward halfway between pictures.
-    fn arrive(&mut self, at: f64, picture: Arc<Buffer>, id: u64) {
+    /// Then the looks move toward halfway between pictures. `timed`: `at` is
+    /// when the stream says the screen showed it (else when it was noticed,
+    /// as the away screen is).
+    fn arrive(&mut self, at: f64, picture: Arc<Buffer>, id: u64, timed: bool) {
         crate::count_picture();
         if at < self.look_time(self.next - 1) {
             self.stats.late += 1;
             crate::count_missed(1);
         }
         self.look_until(at);
-        // Pictures belong on whole steps of the looks (halfway between two).
-        let steps = (at - self.t0 - self.phase) / self.step;
-        self.phase += (steps - steps.round()) * self.step * PHASE_GAIN;
-        // A whole step either way is the same lock, one look over.
-        if self.phase > self.step / 2.0 {
-            self.phase -= self.step;
-        } else if self.phase < -self.step / 2.0 {
-            self.phase += self.step;
-        }
+        // Pictures belong on whole steps of the looks (halfway between two);
+        // the first the stream timed puts them there.
+        let first = timed && !self.timed;
+        self.timed |= timed;
+        self.phase = crate::shutter::follow_picture(self.phase, self.step, at - self.t0, first);
         self.blender.hold(picture);
         self.held = Some(id);
         self.stats.pictures += 1;
@@ -501,6 +497,7 @@ pub(crate) fn spawn_blend_pacer(
             step: 1.0 / (fps.max(1) * looks.max(1)) as f64,
             looks: looks.max(1) as i64,
             phase: 0.0,
+            timed: false,
             shutter,
             next: 0,
             closed: -1,
@@ -526,7 +523,7 @@ pub(crate) fn spawn_blend_pacer(
             for a in latest.drain() {
                 if a.seq > seen {
                     seen = a.seq;
-                    p.arrive(a.at, a.buffer, a.seq);
+                    p.arrive(a.at, a.buffer, a.seq, true);
                 }
             }
             // Put up some other way (the away screen): take it from the capture.
@@ -534,7 +531,7 @@ pub(crate) fn spawn_blend_pacer(
             if now > seen {
                 seen = now;
                 if let Some(b) = latest.get() {
-                    p.arrive(host_now(), b, now);
+                    p.arrive(host_now(), b, now, false);
                 }
             }
             // Looks whose time is past (and late pictures' too) see what's up.

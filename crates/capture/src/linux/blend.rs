@@ -9,7 +9,8 @@
 //! it arrived (`Latest::queue_arrivals`); a look takes the picture that was
 //! up at its time. Looks right next to the pictures' times would get one
 //! picture twice and the next not at all by chance, so they're kept halfway
-//! between the pictures, locked to their pace.
+//! between the pictures, locked to their pace as on Windows and macOS
+//! (`crate::shutter::follow_picture`).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,10 +26,6 @@ use crate::shutter::Shutter;
 /// after the screen showed it, and must still get into its frame. A guess,
 /// with room for a busy system; as on macOS.
 const BLEND_LATE: f64 = 0.006;
-/// How much of the way the looks move toward halfway between the screen's
-/// pictures, on each picture: slow enough to average out the noise in their
-/// times, quick enough to follow a screen that drifts. As on macOS.
-const PHASE_GAIN: f64 = 0.03;
 
 struct BlendPacer {
     t0: f64,
@@ -37,6 +34,8 @@ struct BlendPacer {
     looks: i64,
     /// Look `m` is at `t0 + phase + (m + 0.5) * step`.
     phase: f64,
+    /// A picture the capture timed has come up (it set `phase`).
+    timed: bool,
     shutter: Shutter,
     /// The next look to take, and the last frame done.
     next: i64,
@@ -119,22 +118,20 @@ impl BlendPacer {
 
     /// A new picture came up at `at`: the looks before it saw the one
     /// before. Then the looks move toward halfway between pictures.
-    fn arrive(&mut self, at: f64, frame: &Frame, id: u64) {
+    /// `timed`: it came from the feed's queue with its time (else it was put
+    /// up some other way, and `at` is when it was noticed).
+    fn arrive(&mut self, at: f64, frame: &Frame, id: u64, timed: bool) {
         crate::count_picture();
         if at < self.look_time(self.next - 1) {
             self.stats.late += 1;
             crate::count_missed(1);
         }
         self.look_until(at);
-        // Pictures belong on whole steps of the looks (halfway between two).
-        let steps = (at - self.t0 - self.phase) / self.step;
-        self.phase += (steps - steps.round()) * self.step * PHASE_GAIN;
-        // A whole step either way is the same lock, one look over.
-        if self.phase > self.step / 2.0 {
-            self.phase -= self.step;
-        } else if self.phase < -self.step / 2.0 {
-            self.phase += self.step;
-        }
+        // Pictures belong on whole steps of the looks (halfway between two);
+        // the first the capture timed puts them there.
+        let first = timed && !self.timed;
+        self.timed |= timed;
+        self.phase = crate::shutter::follow_picture(self.phase, self.step, at - self.t0, first);
         if let Some(g) = &mut self.picture.gpu {
             g.hold(frame, id);
         }
@@ -204,6 +201,7 @@ pub(super) fn spawn_blend_pacer(fps: u32, looks: u32, shutter: Shutter, mut pict
                 step: 1.0 / (fps.max(1) * looks.max(1)) as f64,
                 looks: looks.max(1) as i64,
                 phase: 0.0,
+                timed: false,
                 shutter,
                 next: 0,
                 closed: -1,
@@ -217,7 +215,7 @@ pub(super) fn spawn_blend_pacer(fps: u32, looks: u32, shutter: Shutter, mut pict
             };
             let mut seen = 0;
             if let Some((f, s)) = p.picture.feed.get() {
-                p.arrive(t0, &f, s);
+                p.arrive(t0, &f, s, false);
                 seen = s;
             }
             let mut ended = false;
@@ -230,7 +228,7 @@ pub(super) fn spawn_blend_pacer(fps: u32, looks: u32, shutter: Shutter, mut pict
                 for a in p.picture.feed.drain() {
                     if a.seq > seen {
                         seen = a.seq;
-                        p.arrive(a.at, &a.frame, a.seq);
+                        p.arrive(a.at, &a.frame, a.seq, true);
                     }
                 }
                 // Put up some other way (the away screen, a new window): taken from the feed.
@@ -238,7 +236,7 @@ pub(super) fn spawn_blend_pacer(fps: u32, looks: u32, shutter: Shutter, mut pict
                     && now > seen
                 {
                     seen = now;
-                    p.arrive(host_now(), &f, now);
+                    p.arrive(host_now(), &f, now, false);
                 }
                 // Looks whose time is past (and late pictures' too) see what's up.
                 p.look_until(host_now() - BLEND_LATE);
