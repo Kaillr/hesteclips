@@ -597,6 +597,10 @@ struct App {
     /// Windows: it was maximized as it went to the tray, to be again.
     #[cfg(windows)]
     tray_maximized: bool,
+    /// Windows: shown from the tray, to be brought to the front once it's
+    /// back (see `come_to_front`).
+    #[cfg(windows)]
+    to_front: bool,
     /// Since when the window hasn't been used: another has had the focus,
     /// and nothing's been scrolled or pressed over this one.
     unused_since: Option<Instant>,
@@ -830,6 +834,8 @@ impl App {
             cloaked: background,
             #[cfg(windows)]
             tray_maximized: false,
+            #[cfg(windows)]
+            to_front: false,
             unused_since: None,
             tray_frame: 0,
             settle_until: None,
@@ -1425,6 +1431,8 @@ impl eframe::App for App {
         }
         #[cfg(windows)]
         self.start_in_tray(ctx, _frame);
+        #[cfg(windows)]
+        self.come_to_front(ctx, _frame);
         self.background(ctx);
         self.pump_tray(ctx);
         self.handle_close(ctx);
@@ -1721,6 +1729,7 @@ impl App {
         #[cfg(windows)]
         {
             self.tray_maximized = ctx.input(|i| i.viewport().maximized == Some(true));
+            self.to_front = false;
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
@@ -1746,6 +1755,24 @@ impl App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        // Windows: back from minimized, that leaves it behind the others; it's
+        // brought to the front in the next frame, once it's back.
+        #[cfg(windows)]
+        {
+            self.to_front = true;
+            ctx.request_repaint();
+        }
+    }
+
+    /// Windows: shown from the tray (`show_window`), brought to the front
+    /// once it's no longer minimized. It came back behind the other windows
+    /// otherwise, so it looked as if it hadn't opened.
+    #[cfg(windows)]
+    fn come_to_front(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        if self.to_front && ctx.input(|i| i.viewport().minimized != Some(true)) {
+            self.to_front = false;
+            shell::to_front(frame);
+        }
     }
 
     /// Quit for real. The window goes at once: stopping capture and finishing

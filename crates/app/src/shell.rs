@@ -192,6 +192,35 @@ pub fn cloak(window: &impl raw_window_handle::HasWindowHandle, on: bool) {
     }
 }
 
+/// Windows: the window to the front, with the focus. Shown from the tray it
+/// isn't: restored from minimized (`App::hide_window`), it's made active
+/// within the app only, while the taskbar, just clicked, keeps the front, and
+/// it stays at the back, where minimizing put it. egui's `Focus` does nothing
+/// then, as winit counts it as focused already. Where Windows won't let an
+/// app in the background take the front, a press of Alt first lets it, as
+/// winit does for `Focus`.
+#[cfg(target_os = "windows")]
+pub fn to_front(window: &impl raw_window_handle::HasWindowHandle) {
+    use raw_window_handle::RawWindowHandle;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC, MapVirtualKeyW, SendInput, VK_LMENU, VK_MENU};
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, SetForegroundWindow};
+    let Ok(handle) = window.window_handle() else { return };
+    let RawWindowHandle::Win32(h) = handle.as_raw() else { return };
+    let hwnd = HWND(h.hwnd.get() as *mut _);
+    // SAFETY: `hwnd` is our live top-level window; the inputs are whole
+    // keyboard INPUTs, their size given.
+    unsafe {
+        if GetForegroundWindow() == hwnd || SetForegroundWindow(hwnd).as_bool() {
+            return;
+        }
+        let scan = MapVirtualKeyW(u32::from(VK_MENU.0), MAPVK_VK_TO_VSC) as u16;
+        let alt = |flags| INPUT { r#type: INPUT_KEYBOARD, Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: VK_LMENU, wScan: scan, dwFlags: flags, time: 0, dwExtraInfo: 0 } } };
+        SendInput(&[alt(KEYEVENTF_EXTENDEDKEY), alt(KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP)], size_of::<INPUT>() as i32);
+        let _ = SetForegroundWindow(hwnd);
+    }
+}
+
 /// Which screen's keyboard shortcuts to show.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Keys {
