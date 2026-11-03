@@ -1477,6 +1477,44 @@ impl Lateness {
 /// pictures' times averages out (a few hundred milliseconds), quick enough to
 /// follow a game that drifts.
 const PHASE_GAIN: f64 = 0.03;
+/// How far the looks may move from where the frames' own times put them
+/// (in steps) before they go a whole step back the other way: as far is the
+/// same lock, one look over (a look repeated, or one passed over: a game a
+/// little off the blend rate gets a picture seen twice, or one missed, now
+/// and then, as it must). Past half a step each way, with some way to go
+/// before going back: a lock that sits
+/// right at half a step (a game at three pictures a frame, its pictures where
+/// they fell) went back and forth over it with every other picture, measured
+/// 144 times in under a second, each time a frame repeated or passed over.
+/// Now it has a quarter step either side of it before it goes back. The cost:
+/// a frame's picture may be up to three quarters of a step off its time
+/// instead of half (4 ms more at 60 fps).
+const PHASE_LIMIT: f64 = 0.75;
+
+/// Where the looks sit (`BlendPacer::phase`) once a game picture has come up
+/// `since` seconds after the looks' start, steps `step` seconds apart: moved
+/// a little of the way (`PHASE_GAIN`) toward having the pictures on whole
+/// steps, the looks halfway between two; the first picture puts them there
+/// at once (started anywhere, they could take seconds to get there, a frame
+/// repeated or passed over every few meanwhile: measured, a 240 fps game
+/// recorded at 240 did so for its first 4.5 s). A whole step back the other
+/// way past [`PHASE_LIMIT`].
+fn follow_picture(phase: f64, step: f64, since: f64, first: bool) -> f64 {
+    if first {
+        let off = since.rem_euclid(step);
+        return if off > step / 2.0 { off - step } else { off };
+    }
+    let steps = (since - phase) / step;
+    let phase = phase + (steps - steps.round()) * step * PHASE_GAIN;
+    if phase > step * PHASE_LIMIT {
+        phase - step
+    } else if phase < -step * PHASE_LIMIT {
+        phase + step
+    } else {
+        phase
+    }
+}
+
 /// How far behind its frames the pacer may fall (seconds) before it skips
 /// the ones it missed instead of making each. Made in a burst, they'd mostly
 /// be skipped anyway (more than the encoder takes at once) and mostly repeat
@@ -1497,6 +1535,8 @@ struct BlendPacer {
     /// Look `m` is at `t0 + phase + (m + 0.5) * step`; frame `k`'s own time
     /// is looks `k * looks` to `(k + 1) * looks - 1`.
     phase: f64,
+    /// A picture the capture timed has come up (it set `phase`).
+    timed: bool,
     /// Which frames each look counts toward.
     shutter: crate::shutter::Shutter,
     /// The next look to take.
@@ -1757,17 +1797,11 @@ impl BlendPacer {
             crate::count_missed(1);
         }
         self.look_until(at);
-        // Pictures belong on whole steps of the looks (halfway between two).
-        let steps = (at - self.t0 - self.phase) / self.step;
-        self.phase += (steps - steps.round()) * self.step * PHASE_GAIN;
-        // A whole step either way is the same lock, one look over: a game a
-        // little off the blend rate gets a picture seen twice, or one missed,
-        // now and then, as it must; every frame still has its looks.
-        if self.phase > self.step / 2.0 {
-            self.phase -= self.step;
-        } else if self.phase < -self.step / 2.0 {
-            self.phase += self.step;
-        }
+        // Pictures belong on whole steps of the looks (halfway between two);
+        // the first the capture timed puts them there.
+        let first = picture.is_some() && !self.timed;
+        self.timed |= picture.is_some();
+        self.phase = follow_picture(self.phase, self.step, at - self.t0, first);
         match picture {
             Some(q) => self.blend.hold_queued(q),
             None => self.blend.hold(latest),
@@ -1860,6 +1894,7 @@ fn spawn_blend_pacer(
             step: 1.0 / (fps.max(1) * looks.max(1)) as f64,
             looks: looks.max(1) as i64,
             phase: 0.0,
+            timed: false,
             shutter,
             next: 0,
             closed: -1,
@@ -1990,6 +2025,86 @@ mod tests {
             })
             .collect();
         assert_eq!(waits, [5, 10, 20, 40, 60, 60]);
+    }
+
+    /// Numbers from -1 to 1 that look random, the same each run.
+    fn jitter(seed: &mut u64) -> f64 {
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (*seed >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0
+    }
+
+    /// The looks' phase over a game's pictures, each `apart` seconds after the
+    /// one before plus up to `noise` either way, starting `offset` into the
+    /// first step, with looks `step` apart: how many times it went a whole
+    /// step back (a look repeated or passed over), and which way each went.
+    fn wraps(apart: f64, noise: f64, offset: f64, step: f64, pictures: usize, follow: impl Fn(f64, f64, f64, bool) -> f64) -> Vec<i32> {
+        let mut seed = 7;
+        let mut phase = 0.0;
+        let mut out = Vec::new();
+        for n in 0..pictures {
+            let since = offset + n as f64 * apart + noise * jitter(&mut seed);
+            let next = follow(phase, step, since, n == 0);
+            if n > 0 && (next - phase).abs() > step / 2.0 {
+                out.push(if next < phase { -1 } else { 1 });
+            }
+            phase = next;
+        }
+        out
+    }
+
+    /// A game at exactly three pictures a frame, its pictures falling where
+    /// the lock is half a step off (as one measured did): it holds, where
+    /// going back at half a step went back and forth all the time.
+    #[test]
+    fn a_lock_at_half_a_step_holds() {
+        let step = 1.0 / 60.0;
+        // Twenty seconds at 180 pictures a second, a third of a millisecond
+        // of noise in their times.
+        let (apart, noise, pictures) = (step / 3.0, 0.0003, 3600);
+        // The rule this replaced: back at half a step.
+        let old = |phase: f64, step: f64, since: f64, _first: bool| {
+            let steps = (since - phase) / step;
+            let phase = phase + (steps - steps.round()) * step * PHASE_GAIN;
+            if phase > step / 2.0 {
+                phase - step
+            } else if phase < -step / 2.0 {
+                phase + step
+            } else {
+                phase
+            }
+        };
+        // The first picture sets the lock exactly half a step off; the old
+        // rule is shown it there too.
+        let old_from_half = |phase: f64, step: f64, since: f64, first: bool| old(if first { step / 2.0 } else { phase }, step, since, first);
+        let before = wraps(apart, noise, step / 2.0, step, pictures, old_from_half);
+        assert!(before.len() > 20, "the old rule should go back and forth here: {}", before.len());
+        let now = wraps(apart, noise, step / 2.0, step, pictures, follow_picture);
+        assert!(now.is_empty(), "went back {} times", now.len());
+    }
+
+    /// A game a little off the frame rate (three pictures a frame, a tenth
+    /// of a percent faster): its pictures drift past the looks, a step every
+    /// 3000 pictures, and the looks go a step back once for each, the same
+    /// way every time, never back and forth.
+    #[test]
+    fn a_drifting_game_goes_back_once_a_step() {
+        let step = 1.0 / 60.0;
+        let apart = step / 3.0 * (1.0 - 1e-3);
+        let got = wraps(apart, 0.0003, 0.003, step, 12_000, follow_picture);
+        assert!((3..=5).contains(&got.len()), "{} times: {got:?}", got.len());
+        assert!(got.windows(2).all(|w| w[0] == w[1]), "both ways: {got:?}");
+    }
+
+    /// The first picture puts the looks halfway between pictures at once.
+    #[test]
+    fn the_first_picture_sets_the_lock() {
+        let step = 1.0 / 240.0;
+        for since in [0.0, 0.001, 0.0039, 12.3456, 600.0002] {
+            let phase = follow_picture(0.0, step, since, true);
+            let steps = (since - phase) / step;
+            assert!((steps - steps.round()).abs() < 1e-6, "{since}: off by {} steps", steps - steps.round());
+            assert!(phase.abs() <= step / 2.0 + 1e-12, "{since}: phase {phase}");
+        }
     }
 
     /// With nothing running, a screenshot of the main screen is taken by a
