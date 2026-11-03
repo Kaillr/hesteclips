@@ -986,6 +986,45 @@ pub struct Devices {
     pub apps: Vec<Device>,
 }
 
+/// Write `line` to stderr (the log) from a thread that can't wait for it: it's
+/// handed to a thread of its own that writes it. The frame pacer has a few
+/// milliseconds between the game's pictures, and a line written straight to
+/// stderr waits for wherever it goes: measured, the pacer's stats (written
+/// every 5 s) took 11-20 ms to reach a file, held the pacer up 43 ms, and the
+/// pictures that came up meanwhile were too late for their frames (one
+/// repeated, the next skipped). A terminal holds a writer for as long as text
+/// in it is selected.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) fn log_later(line: String) {
+    static WRITER: std::sync::OnceLock<Option<std::sync::mpsc::Sender<String>>> = std::sync::OnceLock::new();
+    let writer = WRITER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        let spawned = std::thread::Builder::new().name("log".into()).spawn(move || {
+            for line in rx {
+                eprintln!("{line}");
+            }
+        });
+        spawned.ok().map(|_| tx)
+    });
+    match writer {
+        Some(tx) => {
+            let _ = tx.send(line);
+        }
+        // No thread for it: written here after all.
+        None => eprintln!("{line}"),
+    }
+}
+
+/// `eprintln!` through [`log_later`].
+#[cfg_attr(not(target_os = "windows"), allow(unused_macros))]
+macro_rules! eprintln_later {
+    ($($arg:tt)*) => {
+        $crate::log_later(format!($($arg)*))
+    };
+}
+#[cfg_attr(not(target_os = "windows"), allow(unused_imports))]
+pub(crate) use eprintln_later;
+
 /// One second of the running capture: frames handed to the video encoder
 /// and frames skipped, and (frame blending) the screen's new pictures and
 /// those that missed their frame.

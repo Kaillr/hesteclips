@@ -14,9 +14,10 @@
 //! as fast as the blend rate, each look should get a different picture, but
 //! with looks right next to the pictures' times, chance would decide which
 //! picture a look gets, one twice and the next not at all. So the looks are
-//! kept halfway between the pictures (locked to their pace). When the screen
-//! changes faster, the looks pick evenly spaced ones of its pictures; slower,
-//! some picture is seen twice (as it was up that long).
+//! kept halfway between the pictures, locked to their pace as on Windows and
+//! Linux (`crate::shutter::follow_picture`). When the screen changes faster,
+//! the looks pick evenly spaced ones of its pictures; slower, some picture
+//! is seen twice (as it was up that long).
 //!
 //! The pictures are averaged as light, not as pixel values (which are
 //! gamma-encoded): a screen showing them in turn gives off the average of
@@ -36,7 +37,7 @@ use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
+    MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
     MTLPixelFormat, MTLSize, MTLStorageMode, MTLTexture, MTLTextureDescriptor, MTLTextureUsage,
 };
 
@@ -67,11 +68,37 @@ pub(crate) struct Blender {
     /// yet: added in one pass when another comes up or the frame is done (a
     /// screen slower than the blend rate is seen several times in a row).
     pending: [f32; 2],
-    /// Waits for the GPU at each step (live: a picture goes back to the
-    /// stream at once), else (exports) never: see [`Self::queued`].
-    waits: bool,
+    /// When it waits for the GPU.
+    waits: Waits,
+    /// Its GPU work given and not done yet, oldest first (live).
+    behind: std::collections::VecDeque<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
     /// What the GPU was last given, not waiting for it.
     last: Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
+}
+
+/// When a blender waits for the graphics card.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Waits {
+    /// Never (exports): each picture is kept until the GPU is done with it,
+    /// and a frame finished is made once [`Blender::last_work`] is done.
+    Never,
+    /// As exports do, but once this much of its work is waiting for the GPU,
+    /// for the oldest: each piece holds a picture of the stream's, which has
+    /// 8 for everything that holds them (live).
+    Behind(usize),
+}
+
+/// The most of a live blender's work that may wait for the GPU before it
+/// waits for some of it. Waiting at each step instead (a picture added, a
+/// frame made), the pacer was held up as long as the GPU was busy with a
+/// game: kept busy in 30 ms pieces, up to 23 ms a picture and 39 ms a frame,
+/// so pictures were late for their looks (33 in 5 s at 60 fps, 2 looks) and
+/// 40% of frames got both their pictures.
+const MOST_BEHIND: usize = 4;
+
+/// Whether the GPU is done with `work` (or gave up on it).
+pub(crate) fn gpu_done(work: &ProtocolObject<dyn MTLCommandBuffer>) -> bool {
+    matches!(work.status(), MTLCommandBufferStatus::Completed | MTLCommandBufferStatus::Error)
 }
 
 // Metal devices, queues, pipelines and textures are thread-safe; the buffers
@@ -79,11 +106,13 @@ pub(crate) struct Blender {
 unsafe impl Send for Blender {}
 
 impl Blender {
-    /// `open` frames made at once.
+    /// Live: `open` frames made at once. A frame finished is made once
+    /// [`Self::last_work`] is done; the GPU is waited for only when it's
+    /// [`MOST_BEHIND`] behind.
     pub(crate) fn new(width: usize, height: usize, open: usize) -> Result<Self> {
         let device = MTLCreateSystemDefaultDevice().context("no Metal device")?;
         let queue = device.newCommandQueue().context("no Metal command queue")?;
-        Self::on(device, queue, width, height, open, true)
+        Self::on(device, queue, width, height, open, Waits::Behind(MOST_BEHIND))
     }
 
     /// For exports: on `queue`, where the pictures it's given are made (so
@@ -97,7 +126,7 @@ impl Blender {
         height: usize,
         open: usize,
     ) -> Result<Self> {
-        Self::on(device, queue, width, height, open, false)
+        Self::on(device, queue, width, height, open, Waits::Never)
     }
 
     fn on(
@@ -106,7 +135,7 @@ impl Blender {
         width: usize,
         height: usize,
         open: usize,
-        waits: bool,
+        waits: Waits,
     ) -> Result<Self> {
         let mut k = kernels(&device, KERNELS, &["add_look", "light_to_luma", "light_to_chroma"])?.into_iter();
         let light = (0..open.clamp(1, 2))
@@ -127,6 +156,7 @@ impl Blender {
             weight: [0.0; 2],
             pending: [0.0; 2],
             waits,
+            behind: Default::default(),
             last: None,
             device,
             queue,
@@ -158,9 +188,8 @@ impl Blender {
         }
     }
 
-    /// Mix the looks at the picture that's up into the averages, at once.
-    /// Waits for the GPU, so the picture's buffer can go back to the stream
-    /// (exports keep it instead: [`Self::queued`]).
+    /// Mix the looks at the picture that's up into the averages, at once:
+    /// the picture is kept until the GPU is done with it.
     fn flush(&mut self) {
         let pending = std::mem::take(&mut self.pending);
         let Some(held) = self.held.clone().filter(|_| pending.iter().any(|w| *w > 0.0)) else { return };
@@ -185,7 +214,7 @@ impl Blender {
             }
             Ok(())
         }) {
-            eprintln!("frame blending: {e:#}");
+            crate::eprintln_later!("frame blending: {e:#}");
         }
     }
 
@@ -216,34 +245,100 @@ impl Blender {
         match made {
             Ok(out) => Some(Arc::new(Buffer(out))),
             Err(e) => {
-                eprintln!("frame blending: {e:#}");
+                crate::eprintln_later!("frame blending: {e:#}");
                 None
             }
         }
     }
 
-    /// Encode one compute pass with `f`, run it and wait for it; or, not
-    /// waiting (exports), keep `reads` until the GPU is done with it.
+    /// Encode one compute pass with `f` and give it to the GPU, keeping
+    /// `reads` until the GPU is done with it; live, once [`MOST_BEHIND`] of
+    /// its work is waiting for the GPU, wait for the oldest.
     fn run(&mut self, reads: Option<Arc<Buffer>>, f: impl FnOnce(&ProtocolObject<dyn MTLComputeCommandEncoder>, &Self) -> Result<()>) -> Result<()> {
         let cmd = self.queue.commandBuffer().context("no command buffer")?;
         let enc = cmd.computeCommandEncoder().context("no compute encoder")?;
         let result = f(&enc, self);
         enc.endEncoding();
-        if self.waits {
-            cmd.commit();
-            cmd.waitUntilCompleted();
-        } else {
-            if let Some(reads) = reads {
-                // Kept until the GPU, done, lets go of the block.
-                let keep = RcBlock::new(move |_: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
-                    let _ = &reads;
-                });
-                unsafe { cmd.addCompletedHandler(RcBlock::as_ptr(&keep)) };
-            }
-            cmd.commit();
-            self.last = Some(cmd);
+        if let Some(reads) = reads {
+            // Kept until the GPU, done, lets go of the block.
+            let keep = RcBlock::new(move |_: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+                let _ = &reads;
+            });
+            unsafe { cmd.addCompletedHandler(RcBlock::as_ptr(&keep)) };
         }
+        cmd.commit();
+        if let Waits::Behind(most) = self.waits {
+            // One queue: the GPU does its work in order.
+            while self.behind.front().is_some_and(|w| gpu_done(w)) {
+                self.behind.pop_front();
+            }
+            self.behind.push_back(cmd.clone());
+            while self.behind.len() > most {
+                if let Some(oldest) = self.behind.pop_front() {
+                    oldest.waitUntilCompleted();
+                }
+            }
+        }
+        self.last = Some(cmd);
         result
+    }
+}
+
+/// What a frame is made of: its looks blended on the graphics card, or (one
+/// look a frame) the picture its look took, as it is.
+pub(crate) enum Mix {
+    Blend(Blender),
+    /// Not blended: each frame is the picture that was up at its time,
+    /// taken by its one look, with no graphics card work.
+    One {
+        held: Option<Arc<Buffer>>,
+        /// The frame a look was for, and the picture it took.
+        took: Option<(i64, Arc<Buffer>)>,
+    },
+}
+
+impl Mix {
+    /// One look a frame.
+    pub(crate) fn one() -> Self {
+        Self::One { held: None, took: None }
+    }
+
+    /// `picture` is the one that's up now.
+    fn hold(&mut self, picture: Arc<Buffer>) {
+        match self {
+            Self::Blend(b) => b.hold(picture),
+            Self::One { held, .. } => *held = Some(picture),
+        }
+    }
+
+    /// A look at the picture that's up, for frame `k`, by `weight`.
+    fn add(&mut self, k: i64, weight: f32) {
+        match self {
+            Self::Blend(b) => b.add(k, weight),
+            Self::One { held, took } => {
+                if let Some(picture) = held {
+                    *took = Some((k, picture.clone()));
+                }
+            }
+        }
+    }
+
+    /// Frame `k` is done: what it's made of. None if nothing was added to
+    /// it (no picture yet).
+    fn finish(&mut self, k: i64) -> Option<Arc<Buffer>> {
+        match self {
+            Self::Blend(b) => b.finish(k),
+            Self::One { took, .. } => took.take().filter(|(frame, _)| *frame == k).map(|(_, picture)| picture),
+        }
+    }
+
+    /// The GPU work that makes the frame last finished, if it has some: the
+    /// frame is made once that's done.
+    fn work(&self) -> Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
+        match self {
+            Self::Blend(b) => b.last_work(),
+            Self::One { .. } => None,
+        }
     }
 }
 
@@ -313,11 +408,6 @@ kernel void light_to_chroma(texture2d<float, access::read> light [[texture(0)]],
 /// of a millisecond after the screen showed it (its time), and it must still
 /// get into its frame. A guess, with room for a busy system.
 const BLEND_LATE: f64 = 0.006;
-/// How much of the way the looks move toward halfway between the screen's
-/// pictures, on each picture. A guess: slow enough that the noise in
-/// pictures' times averages out (a few hundred milliseconds), quick enough to
-/// follow a screen that drifts. The same as on Windows.
-const PHASE_GAIN: f64 = 0.03;
 
 struct BlendPacer {
     t0: f64,
@@ -328,6 +418,8 @@ struct BlendPacer {
     /// Look `m` is at `t0 + phase + (m + 0.5) * step`; frame `k`'s own time
     /// is looks `k * looks` to `(k + 1) * looks - 1`.
     phase: f64,
+    /// A picture the stream timed has come up (it set `phase`).
+    timed: bool,
     /// Which frames each look counts toward.
     shutter: crate::shutter::Shutter,
     /// The next look to take.
@@ -339,11 +431,25 @@ struct BlendPacer {
     last_taken: Option<u64>,
     /// Different pictures in the frame's own time so far.
     different: u32,
-    blender: Blender,
+    mix: Mix,
     frames: Frames,
     encoder: SendEncoder,
     skipped: u64,
     stats: BlendStats,
+    report: EncodeReport,
+    /// Blended frames the GPU is still making, oldest first.
+    making: std::collections::VecDeque<Making>,
+}
+
+/// A blended frame the GPU is still making: encoded once it's made.
+struct Making {
+    k: i64,
+    made: Arc<Buffer>,
+    work: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+    /// How late it was closed, how long closing it took, and when.
+    late: f64,
+    mixed: Duration,
+    closed: Instant,
 }
 
 struct SendEncoder(Encoder);
@@ -373,7 +479,7 @@ impl BlendPacer {
         if let Some(id) = self.held {
             for (k, weight) in [(first, weights[0]), (first + 1, weights[1])] {
                 if k > self.closed && weight > 0.0 {
-                    self.blender.add(k, weight);
+                    self.mix.add(k, weight);
                 }
             }
             if self.last_taken != Some(id) {
@@ -395,41 +501,79 @@ impl BlendPacer {
         }
     }
 
-    /// Frame `k` is done: encode it (with the webcam over it).
+    /// Frame `k` is done: encoded (with the webcam over it) once the GPU has
+    /// made it, frames in order. The pacer doesn't wait for the GPU (see
+    /// `MOST_BEHIND`).
     fn close(&mut self, k: i64) {
         self.closed = k;
-        let Some(average) = self.blender.finish(k) else { return };
-        let frame = self.frames.make(average);
-        if self.encoder.0.encode(&frame.0, k, self.fps) {
+        let started = Instant::now();
+        // After its last look's time and the room a picture has to come in.
+        let late = host_now() - self.look_time(self.shutter.last_look(k)) - BLEND_LATE;
+        let Some(made) = self.mix.finish(k) else { return };
+        let mixed = started.elapsed();
+        match self.mix.work() {
+            Some(work) => self.making.push_back(Making { k, made, work, late, mixed, closed: started }),
+            None => self.encode(k, made, late, mixed, None),
+        }
+        self.encode_made(false);
+    }
+
+    /// Encode the blended frames the GPU has made, in order; `all`, those it
+    /// hasn't too, once it has (stopping).
+    fn encode_made(&mut self, all: bool) {
+        while let Some(m) = self.making.front() {
+            if !gpu_done(&m.work) {
+                if !all {
+                    break;
+                }
+                m.work.waitUntilCompleted();
+            }
+            let Some(m) = self.making.pop_front() else { break };
+            let gpu = m.closed.elapsed();
+            self.encode(m.k, m.made, m.late, m.mixed, Some(gpu));
+        }
+    }
+
+    /// Encode frame `k`, `made` (closed `late`, in `mixed`; made by the GPU
+    /// `gpu` after it was closed, when it's blended).
+    fn encode(&mut self, k: i64, made: Arc<Buffer>, late: f64, mixed: Duration, gpu: Option<Duration>) {
+        let started = Instant::now();
+        let frame = self.frames.make(made);
+        let composed = started.elapsed();
+        let free = self.encoder.0.free();
+        let encoded = self.encoder.0.encode(&frame.0, k, self.fps);
+        let steps = Steps { mix: mixed, make: composed, encode: started.elapsed() - composed };
+        if encoded {
             crate::count_encoded();
         } else {
             crate::count_skipped(1);
             self.skipped += 1;
             if self.skipped.is_power_of_two() {
-                eprintln!("video encoder is behind: {} frames skipped so far", self.skipped);
+                crate::eprintln_later!("video encoder is behind: {} frames skipped so far", self.skipped);
             }
         }
+        self.report.frame(late, steps, gpu, free, !encoded, &self.encoder.0);
     }
 
     /// A new picture came up at `at`: the looks before it saw the one before.
-    /// Then the looks move toward halfway between pictures.
-    fn arrive(&mut self, at: f64, picture: Arc<Buffer>, id: u64) {
+    /// Then the looks move toward halfway between pictures. `timed`: `at` is
+    /// when the stream says the screen showed it (else when it was noticed,
+    /// as the away screen is).
+    fn arrive(&mut self, at: f64, picture: Arc<Buffer>, id: u64, timed: bool) {
         crate::count_picture();
         if at < self.look_time(self.next - 1) {
             self.stats.late += 1;
             crate::count_missed(1);
         }
         self.look_until(at);
-        // Pictures belong on whole steps of the looks (halfway between two).
-        let steps = (at - self.t0 - self.phase) / self.step;
-        self.phase += (steps - steps.round()) * self.step * PHASE_GAIN;
-        // A whole step either way is the same lock, one look over.
-        if self.phase > self.step / 2.0 {
-            self.phase -= self.step;
-        } else if self.phase < -self.step / 2.0 {
-            self.phase += self.step;
-        }
-        self.blender.hold(picture);
+        // Pictures belong on whole steps of the looks (halfway between two);
+        // the first the stream timed puts them there.
+        let first = timed && !self.timed;
+        self.timed |= timed;
+        self.phase = crate::shutter::follow_picture(self.phase, self.step, at - self.t0, first);
+        let adding = Instant::now();
+        self.mix.hold(picture);
+        self.report.added(adding.elapsed());
         self.held = Some(id);
         self.stats.pictures += 1;
     }
@@ -438,7 +582,9 @@ impl BlendPacer {
 /// What the blending saw, printed every few seconds (to the log): how many
 /// pictures the screen showed, how many different ones each frame got (all
 /// its looks, when the screen changes at least at the blend rate), and how
-/// many came too late for their frame.
+/// many came too late for their frame. With one look a frame (not blended),
+/// a frame with none is a picture repeated. Written by another thread, as
+/// on Windows: the pacer has a few milliseconds between pictures.
 struct BlendStats {
     since: Instant,
     pictures: u32,
@@ -460,8 +606,9 @@ impl BlendStats {
         self.fewest = self.fewest.min(different);
         self.most = self.most.max(different);
         if self.since.elapsed() >= Duration::from_secs(5) {
-            eprintln!(
-                "frame blending: the screen showed {:.0} pictures/s; {looks} looks per frame, {}-{} different pictures in each, {:.0}% of frames with {looks}; {} pictures too late, over {} frames",
+            crate::eprintln_later!(
+                "{}: the screen showed {:.0} pictures/s; {looks} looks per frame, {}-{} different pictures in each, {:.0}% of frames with {looks}; {} pictures too late, over {} frames",
+                if looks == 1 { "frame timing" } else { "frame blending" },
                 self.pictures as f64 / self.since.elapsed().as_secs_f64(),
                 self.fewest,
                 self.most,
@@ -474,15 +621,116 @@ impl BlendStats {
     }
 }
 
-/// Like `sck::spawn_pacer`, for frame blending: `looks` looks at the screen
-/// per frame, averaged.
+/// How long each step of making a frame took (see `BlendPacer::close`).
+#[derive(Clone, Copy, Default)]
+struct Steps {
+    /// The looks' mixing given to the graphics card, or not blended, the
+    /// picture taken.
+    mix: Duration,
+    /// The webcam put over it, or the screen into its box (the graphics card
+    /// waited for), and the preview offered it.
+    make: Duration,
+    /// Handed to the encoder.
+    encode: Duration,
+}
+
+/// Where frames wait, logged for every 5 s in which frames were skipped
+/// (every 5 s with `HASTECLIP_ENCODE_LOG=1`), as on Windows, so a log from a
+/// Mac that can't keep up says what it's short of: how late frames were made
+/// and how long making one took, and which of its steps the slowest one's
+/// time went to; how long after a blended frame was closed the graphics card
+/// had made it, and the longest a picture took to be added to a blend (the
+/// graphics card is waited for when it's behind); how long the encoder held
+/// frames; the fewest free places in its queue; and how many frames were
+/// skipped.
+struct EncodeReport {
+    verbose: bool,
+    since: Instant,
+    frames: u32,
+    late_max: f64,
+    close_max: Duration,
+    slowest: Steps,
+    gpu_max: Duration,
+    add_max: Duration,
+    free_min: usize,
+    skipped: u32,
+}
+
+impl EncodeReport {
+    fn new() -> Self {
+        Self {
+            verbose: std::env::var_os("HASTECLIP_ENCODE_LOG").is_some(),
+            since: Instant::now(),
+            frames: 0,
+            late_max: 0.0,
+            close_max: Duration::ZERO,
+            slowest: Steps::default(),
+            gpu_max: Duration::ZERO,
+            add_max: Duration::ZERO,
+            free_min: usize::MAX,
+            skipped: 0,
+        }
+    }
+
+    /// A picture took `took` to be added to the frames it counts toward.
+    fn added(&mut self, took: Duration) {
+        self.add_max = self.add_max.max(took);
+    }
+
+    /// A frame closed `late` seconds after its time, made by the GPU `gpu`
+    /// after (blended), in `steps`, with `free` places in the encoder's
+    /// queue; `skipped` if the encoder couldn't take it.
+    fn frame(&mut self, late: f64, steps: Steps, gpu: Option<Duration>, free: usize, skipped: bool, encoder: &Encoder) {
+        self.frames += 1;
+        self.gpu_max = self.gpu_max.max(gpu.unwrap_or_default());
+        self.late_max = self.late_max.max(late);
+        let took = steps.mix + steps.make + steps.encode;
+        if took > self.close_max {
+            self.close_max = took;
+            self.slowest = steps;
+        }
+        self.free_min = self.free_min.min(free);
+        self.skipped += skipped as u32;
+        if self.since.elapsed() < Duration::from_secs(5) {
+            return;
+        }
+        let (held, held_most, held_count) = encoder.held();
+        if self.verbose || self.skipped > 0 {
+            let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+            crate::eprintln_later!(
+                "encode: {} frames; closed up to {:.1} ms late, making one took up to {:.1} ms (mixing {:.1}, compositor {:.1}, encoder {:.1}); blended frames made by the GPU up to {:.1} ms after closing, a picture took up to {:.1} ms to add; encoder held frames {:.1} ms avg, {:.1} max; fewest free places {}; skipped {}",
+                self.frames,
+                self.late_max * 1000.0,
+                ms(self.close_max),
+                ms(self.slowest.mix),
+                ms(self.slowest.make),
+                ms(self.slowest.encode),
+                ms(self.gpu_max),
+                ms(self.add_max),
+                ms(held) / held_count.max(1) as f64,
+                ms(held_most),
+                self.free_min,
+                self.skipped
+            );
+        }
+        *self = Self { verbose: self.verbose, ..Self::new() };
+    }
+}
+
+/// The pacer: `looks` looks at the screen per frame, each taking the picture
+/// that was up at its time (by when the screen showed it), kept halfway
+/// between the screen's pictures; the frame is made of them as `mix` says
+/// (blended, or one look's picture as it is). Frame `k` is stamped `k / fps`
+/// on the host clock, the audio's: a frame is made every 1/fps whether the
+/// screen changed or not (constant frame rate), and when the encoder can't
+/// take one it's skipped, not queued, so video never falls behind.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_blend_pacer(
     fps: u32,
     looks: u32,
     shutter: crate::shutter::Shutter,
     latest: Arc<Latest>,
-    blender: Blender,
+    mix: Mix,
     frames: Frames,
     encoder: Encoder,
     clock: Arc<Clock>,
@@ -501,21 +749,24 @@ pub(crate) fn spawn_blend_pacer(
             step: 1.0 / (fps.max(1) * looks.max(1)) as f64,
             looks: looks.max(1) as i64,
             phase: 0.0,
+            timed: false,
             shutter,
             next: 0,
             closed: -1,
             held: None,
             last_taken: None,
             different: 0,
-            blender,
+            mix,
             frames,
             encoder,
             skipped: 0,
             stats: BlendStats::new(),
+            report: EncodeReport::new(),
+            making: Default::default(),
         };
         let mut seen = latest.seq();
         if let Some(b) = latest.get() {
-            p.blender.hold(b);
+            p.mix.hold(b);
             p.held = Some(seen);
         }
         while !stop2.load(Ordering::Relaxed) {
@@ -526,7 +777,7 @@ pub(crate) fn spawn_blend_pacer(
             for a in latest.drain() {
                 if a.seq > seen {
                     seen = a.seq;
-                    p.arrive(a.at, a.buffer, a.seq);
+                    p.arrive(a.at, a.buffer, a.seq, true);
                 }
             }
             // Put up some other way (the away screen): take it from the capture.
@@ -534,12 +785,14 @@ pub(crate) fn spawn_blend_pacer(
             if now > seen {
                 seen = now;
                 if let Some(b) = latest.get() {
-                    p.arrive(host_now(), b, now);
+                    p.arrive(host_now(), b, now, false);
                 }
             }
             // Looks whose time is past (and late pictures' too) see what's up.
             p.look_until(host_now() - BLEND_LATE);
+            p.encode_made(false);
         }
+        p.encode_made(true);
         p.encoder.0.finish();
     });
     (stop, handle)
@@ -569,6 +822,16 @@ mod tests {
         Arc::new(Buffer(b))
     }
 
+    /// Frame `k` finished, once the GPU has made it (the blender doesn't
+    /// wait for it).
+    fn made(b: &mut Blender, k: i64) -> Option<Arc<Buffer>> {
+        let out = b.finish(k)?;
+        if let Some(work) = b.last_work() {
+            work.waitUntilCompleted();
+        }
+        Some(out)
+    }
+
     fn sample(b: &CVPixelBuffer) -> (u8, u8, u8) {
         unsafe {
             CVPixelBufferLockBaseAddress(b, CVPixelBufferLockFlags::ReadOnly);
@@ -587,7 +850,7 @@ mod tests {
         b.hold(filled(64, 32, 120, 100, 150));
         b.add(0, 1.0);
         b.add(0, 1.0);
-        let out = b.finish(0).unwrap();
+        let out = made(&mut b, 0).unwrap();
         let (y, cb, cr) = sample(&out.0);
         assert!(y.abs_diff(120) <= 1 && cb.abs_diff(100) <= 1 && cr.abs_diff(150) <= 1, "{y} {cb} {cr}");
         assert!(b.finish(1).is_none(), "the next frame starts empty");
@@ -604,7 +867,7 @@ mod tests {
         b.add(0, 1.0);
         b.add(0, 1.0);
         b.add(0, 1.0);
-        let (y, cb, cr) = sample(&b.finish(0).unwrap().0);
+        let (y, cb, cr) = sample(&made(&mut b, 0).unwrap().0);
         // sRGB of 0.25 light is 0.537: 16 + 219 * 0.537 = 134.
         assert!(y.abs_diff(134) <= 1, "{y}");
         assert_eq!((cb, cr), (128, 128));
@@ -621,8 +884,8 @@ mod tests {
         b.hold(filled(64, 32, 16, 128, 128));
         b.add(0, 0.75);
         b.add(1, 0.25);
-        let (y0, _, _) = sample(&b.finish(0).unwrap().0);
-        let (y1, _, _) = sample(&b.finish(1).unwrap().0);
+        let (y0, _, _) = sample(&made(&mut b, 0).unwrap().0);
+        let (y1, _, _) = sample(&made(&mut b, 1).unwrap().0);
         // sRGB of 0.75 light is 0.881: 16 + 219 * 0.881 = 209.
         assert!(y0.abs_diff(134) <= 1, "{y0}");
         assert!(y1.abs_diff(209) <= 1, "{y1}");

@@ -118,6 +118,20 @@ impl MeterState {
         (0..2).any(|c| self.clip_light(c) > 0.0)
     }
 
+    /// When a lit clip light next changes, to draw it then: as it starts to
+    /// fade, then about 30 times a second until it's out.
+    fn light_changes_in(&self) -> Option<Duration> {
+        self.clipped_at
+            .iter()
+            .flatten()
+            .filter_map(|at| match at.elapsed() {
+                since if since < CLIP_HOLD => Some(CLIP_HOLD - since),
+                since if since < CLIP_HOLD + CLIP_FADE => Some(Duration::from_millis(33)),
+                _ => None,
+            })
+            .min()
+    }
+
     /// The recent peak as text: "-12.4" / "-∞".
     pub fn readout(&self) -> String {
         if self.readout_db <= FLOOR_DB { "-∞".to_owned() } else { format!("{:.1}", self.readout_db) }
@@ -200,8 +214,17 @@ pub fn stereo(ui: &mut egui::Ui, id: egui::Id, state: &MeterState, style: &Style
         clip_light(&p, light, state.clip_light(c), crate::theme::of(v).meter_bg);
     }
     ui.interact(lights.expand(3.0), id.with("clip"), Sense::hover()).on_hover_text(clip_tip(state));
-    if state.clipped() {
-        ui.ctx().request_repaint_after(Duration::from_millis(16));
+    redraw_lights(ui.ctx(), state);
+}
+
+/// Draw the clip lights again when they change (see
+/// [`MeterState::light_changes_in`]). They used to ask for a frame in 16 ms
+/// the whole time one was lit, which egui takes a frame's time off: it came
+/// at once, and the page was drawn on every display refresh (up to 540
+/// times a second) for the light's 3.6 s.
+fn redraw_lights(ctx: &egui::Context, state: &MeterState) {
+    if let Some(next) = state.light_changes_in() {
+        crate::ui_kit::repaint_after(ctx, next);
     }
 }
 
@@ -238,9 +261,7 @@ pub fn stereo_vertical(ui: &mut egui::Ui, rect: Rect, id: egui::Id, state: &Mete
         clip_light(&p, light, state.clip_light(c), pal.meter_bg);
     }
     ui.interact(lights.expand(3.0), id.with("clip"), Sense::hover()).on_hover_text(clip_tip(state));
-    if state.clipped() {
-        ui.ctx().request_repaint_after(Duration::from_millis(16));
-    }
+    redraw_lights(ui.ctx(), state);
     if bars.height() < 20.0 {
         return;
     }
@@ -412,6 +433,22 @@ mod tests {
         m.clipped_at[0] = Some(now - CLIP_HOLD - CLIP_FADE);
         assert_eq!(m.clip_light(0), 0.0);
         assert!(!m.clipped());
+    }
+
+    /// A lit light is drawn again as it starts to fade, then ~30 times a
+    /// second until it's out; then not at all.
+    #[test]
+    fn a_clip_light_is_redrawn_only_as_it_fades() {
+        let mut m = MeterState::default();
+        assert_eq!(m.light_changes_in(), None, "never lit");
+        let now = Instant::now();
+        m.clipped_at[0] = Some(now - Duration::from_secs(1));
+        let wait = m.light_changes_in().expect("lit");
+        assert!(wait > Duration::from_millis(1900) && wait <= Duration::from_secs(2), "held: drawn again as it fades ({wait:?})");
+        m.clipped_at[1] = Some(now - CLIP_HOLD - CLIP_FADE / 2);
+        assert_eq!(m.light_changes_in(), Some(Duration::from_millis(33)), "the other one fading");
+        m.clipped_at = [Some(now - CLIP_HOLD - CLIP_FADE); 2];
+        assert_eq!(m.light_changes_in(), None, "both out");
     }
 
     #[test]

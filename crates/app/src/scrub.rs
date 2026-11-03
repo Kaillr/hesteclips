@@ -444,6 +444,19 @@ impl Shared {
     }
 }
 
+/// The last of the engine (it, its decoders' threads and its watcher) gone:
+/// its cache goes now, and with it the decoders' pools of textures, unless
+/// a frame is still held somewhere. Logged (`HASTECLIP_DEBUG_VIDEO`), to see
+/// that a clip let go of actually closed.
+impl Drop for Shared {
+    fn drop(&mut self) {
+        if crate::player::debug() {
+            let frames = self.inner.get_mut().map_or(0, |s| s.frames.len());
+            eprintln!("{:>8.3} scrub: engine closed, letting go of the {frames} frames it kept", crate::player::uptime());
+        }
+    }
+}
+
 impl Inner {
     /// Which way the playhead moves: 1 forward, -1 back, 0 standing still.
     fn dir(&self, fps: f64) -> i8 {

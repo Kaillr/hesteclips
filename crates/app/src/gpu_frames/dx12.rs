@@ -75,6 +75,18 @@ impl Frames {
         Some(Shown { key: s.key(), planes })
     }
 
+    /// Let go of these pools' textures (their decoders are closing): what
+    /// draws a frame of theirs already on screen keeps that one.
+    pub fn forget(&mut self, pools: &[usize]) {
+        if pools.is_empty() {
+            return;
+        }
+        self.pools.retain(|p| !pools.contains(p));
+        self.fences.retain(|p, _| !pools.contains(p));
+        self.opened.retain(|(p, _), _| !pools.contains(p));
+        super::forget_pools(pools);
+    }
+
     /// Keep the textures of the [`POOLS`] pools shown last, this one now
     /// (a pool shown before can still be on screen for a moment); free those
     /// of the one shown longest ago.

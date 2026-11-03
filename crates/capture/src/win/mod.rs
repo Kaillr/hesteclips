@@ -57,7 +57,7 @@ use crate::mp4mux::Spec;
 use crate::output::{in_progress, timestamp};
 use crate::sources::{AudioCapture, mix_inputs, track_layout};
 use crate::writer::{self, Media, Writer};
-use crate::{EncodeSettings, Mode, Recorder, VideoSource};
+use crate::{EncodeSettings, Mode, Recorder, VideoSource, eprintln_later};
 use aac::AacEncoder;
 use crate::mp4file::Layout;
 
@@ -174,7 +174,7 @@ impl Recorder for WinRecorder {
         }
         // Nothing running: a capture of its own, for one picture.
         system::com_init();
-        let gpu = d3d::Gpu::new()?;
+        let gpu = d3d::Gpu::for_capture()?;
         let (source, (w, h)) = PictureSource::plan(video)?;
         let picture = source.open(&gpu, w, h, 60, None)?;
         // A screen has its picture by now; games and apps take a moment to
@@ -250,7 +250,7 @@ impl Session {
         crate::capture_started();
         system::com_init();
         system::mf_startup()?;
-        let gpu = d3d::Gpu::new()?;
+        let gpu = d3d::Gpu::for_capture()?;
         let (picture_source, (canvas_w, canvas_h)) = PictureSource::plan(&s.video)?;
         let (width, height) = s.size.of(canvas_w, canvas_h);
         let clock = Arc::new(Clock::default());
@@ -574,7 +574,7 @@ impl PreviewCapture {
         thread::spawn(move || {
             system::com_init();
             let opened = (|| -> Result<(Picture, d3d::Previewer, Option<camera::CameraLayer>)> {
-                let gpu = d3d::Gpu::new()?;
+                let gpu = d3d::Gpu::for_capture()?;
                 let (mut source, (w, h)) = PictureSource::plan(&source)?;
                 if let (PictureSource::Apps(list), Some(shared)) = (&mut source, apps2) {
                     *list = shared; // so `update` reaches the running follower
@@ -1472,11 +1472,6 @@ impl Lateness {
         }
     }
 }
-/// How much of the way the looks move toward halfway between the game's
-/// pictures, on each picture. A guess: slow enough that the noise in
-/// pictures' times averages out (a few hundred milliseconds), quick enough to
-/// follow a game that drifts.
-const PHASE_GAIN: f64 = 0.03;
 /// How far behind its frames the pacer may fall (seconds) before it skips
 /// the ones it missed instead of making each. Made in a burst, they'd mostly
 /// be skipped anyway (more than the encoder takes at once) and mostly repeat
@@ -1497,6 +1492,8 @@ struct BlendPacer {
     /// Look `m` is at `t0 + phase + (m + 0.5) * step`; frame `k`'s own time
     /// is looks `k * looks` to `(k + 1) * looks - 1`.
     phase: f64,
+    /// A picture the capture timed has come up (it set `phase`).
+    timed: bool,
     /// Which frames each look counts toward.
     shutter: crate::shutter::Shutter,
     /// The next look to take.
@@ -1526,15 +1523,20 @@ struct BlendPacer {
 /// Where frames wait, logged for every 5 s in which frames were skipped
 /// (every 5 s with `HASTECLIP_ENCODE_LOG=1`), so a log from a PC that can't
 /// keep up says what it's short of: how late the pacer closed frames and how
-/// long closing took (CPU), how long the GPU took to finish a frame's work
-/// after it was submitted, how long the encoder held frames, the fewest free
-/// encoder frames, and why frames were skipped.
+/// long closing took (CPU), and which of its steps the slowest one's time
+/// went to, how long the GPU took to finish a frame's work after it was
+/// submitted, how long the encoder held frames, the fewest free encoder
+/// frames, and why frames were skipped. (A real session's log had the pacer
+/// held up 349 ms closing one frame, 20 frames skipped, and no way to tell
+/// where.)
 struct EncodeDiag {
     verbose: bool,
     since: Instant,
     frames: u32,
     late_max: f64,
     close_max: Duration,
+    /// Where the slowest closing's time went.
+    slowest: CloseSteps,
     /// Queries ending each frame's GPU work, oldest first, with when.
     pending: std::collections::VecDeque<(windows::Win32::Graphics::Direct3D11::ID3D11Query, Instant)>,
     spare: Vec<windows::Win32::Graphics::Direct3D11::ID3D11Query>,
@@ -1545,6 +1547,36 @@ struct EncodeDiag {
     caught_up: u32,
 }
 
+/// How long each step of closing a frame took (see `BlendPacer::close`).
+#[derive(Clone, Copy, Default)]
+struct CloseSteps {
+    /// The webcam's newest picture taken in.
+    webcam: Duration,
+    /// The frame's looks mixed and the average made.
+    blend: Duration,
+    /// Scaled and converted into the encoder's frame.
+    convert: Duration,
+    /// Handed to the encoder.
+    encode: Duration,
+    /// The preview's picture started.
+    preview: Duration,
+}
+
+impl std::fmt::Display for CloseSteps {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+        write!(
+            f,
+            "webcam {:.1}, blend {:.1}, convert {:.1}, encoder {:.1}, preview {:.1}",
+            ms(self.webcam),
+            ms(self.blend),
+            ms(self.convert),
+            ms(self.encode),
+            ms(self.preview)
+        )
+    }
+}
+
 impl EncodeDiag {
     fn new() -> Self {
         Self {
@@ -1553,6 +1585,7 @@ impl EncodeDiag {
             frames: 0,
             late_max: 0.0,
             close_max: Duration::ZERO,
+            slowest: CloseSteps::default(),
             pending: Default::default(),
             spare: Vec::new(),
             gpu_ms: Vec::new(),
@@ -1563,11 +1596,14 @@ impl EncodeDiag {
         }
     }
 
-    fn frame(&mut self, gpu: &d3d::Gpu, late: f64, close: Duration) {
+    fn frame(&mut self, gpu: &d3d::Gpu, late: f64, close: Duration, steps: CloseSteps) {
         use windows::Win32::Graphics::Direct3D11::{D3D11_ASYNC_GETDATA_DONOTFLUSH, D3D11_QUERY_DESC, D3D11_QUERY_EVENT};
         self.frames += 1;
         self.late_max = self.late_max.max(late);
-        self.close_max = self.close_max.max(close);
+        if close > self.close_max {
+            self.close_max = close;
+            self.slowest = steps;
+        }
         unsafe {
             while let Some((q, at)) = self.pending.front() {
                 let mut done = 0i32;
@@ -1599,11 +1635,13 @@ impl EncodeDiag {
         if self.verbose || self.pool_empty + self.queue_full + self.caught_up > 0 {
             self.gpu_ms.sort_by(f64::total_cmp);
             let pct = |p: f64| self.gpu_ms.get(((self.gpu_ms.len() as f64 - 1.0) * p).round() as usize).copied().unwrap_or(f64::NAN);
-            eprintln!(
-                "encode: {} frames; closed up to {:.1} ms late, closing took up to {:.1} ms; GPU done after {:.1}/{:.1}/{:.1} ms (median/99%/max), {} unfinished; encoder held frames {:.1} ms avg, {:.1} max; fewest free frames {}; skipped {} (no free frame) + {} (queue full) + {} (caught up)",
+            // On the pacer: written by another thread.
+            eprintln_later!(
+                "encode: {} frames; closed up to {:.1} ms late, closing took up to {:.1} ms ({}); GPU done after {:.1}/{:.1}/{:.1} ms (median/99%/max), {} unfinished; encoder held frames {:.1} ms avg, {:.1} max; fewest free frames {}; skipped {} (no free frame) + {} (queue full) + {} (caught up)",
                 self.frames,
                 self.late_max * 1000.0,
                 self.close_max.as_secs_f64() * 1000.0,
+                self.slowest,
                 pct(0.5),
                 pct(0.99),
                 pct(1.0),
@@ -1708,14 +1746,26 @@ impl BlendPacer {
         if self.blend.is_empty(k) {
             return;
         }
+        let mut steps = CloseSteps::default();
+        let mut lap = Instant::now();
+        let mut took = || {
+            let now = Instant::now();
+            let d = now - lap;
+            lap = now;
+            d
+        };
         if let Some(c) = self.camera.as_mut() {
             c.pull();
         }
+        steps.webcam = took();
         self.diag.free_min = self.diag.free_min.min(self.encoder.pool.free_count());
         match self.encoder.pool.take() {
             Some(slot) => {
                 self.blend.finish(k);
-                match self.converter.convert(slot) {
+                steps.blend = took();
+                let converted = self.converter.convert(slot);
+                steps.convert = took();
+                match converted {
                     Ok(()) => {
                         if self.encoder.encode(slot, k) {
                             encoded();
@@ -1723,10 +1773,11 @@ impl BlendPacer {
                             skipped(&mut self.dropped, 1);
                             self.diag.queue_full += 1;
                         }
+                        steps.encode = took();
                     }
                     Err(e) => {
                         self.encoder.pool.give(slot);
-                        eprintln!("{e:#}");
+                        eprintln_later!("{e:#}");
                     }
                 }
             }
@@ -1738,10 +1789,12 @@ impl BlendPacer {
                 self.diag.pool_empty += 1;
             }
         }
+        let _ = took();
         if let Err(e) = self.preview.submit() {
-            eprintln!("preview: {e:#}");
+            eprintln_later!("preview: {e:#}");
         }
-        self.diag.frame(&self.blend.gpu, late, started.elapsed());
+        steps.preview = took();
+        self.diag.frame(&self.blend.gpu, late, started.elapsed(), steps);
     }
 
     /// A new picture came up at `at`: the looks before it saw the one before.
@@ -1756,17 +1809,11 @@ impl BlendPacer {
             crate::count_missed(1);
         }
         self.look_until(at);
-        // Pictures belong on whole steps of the looks (halfway between two).
-        let steps = (at - self.t0 - self.phase) / self.step;
-        self.phase += (steps - steps.round()) * self.step * PHASE_GAIN;
-        // A whole step either way is the same lock, one look over: a game a
-        // little off the blend rate gets a picture seen twice, or one missed,
-        // now and then, as it must; every frame still has its looks.
-        if self.phase > self.step / 2.0 {
-            self.phase -= self.step;
-        } else if self.phase < -self.step / 2.0 {
-            self.phase += self.step;
-        }
+        // Pictures belong on whole steps of the looks (halfway between two);
+        // the first the capture timed puts them there.
+        let first = picture.is_some() && !self.timed;
+        self.timed |= picture.is_some();
+        self.phase = crate::shutter::follow_picture(self.phase, self.step, at - self.t0, first);
         match picture {
             Some(q) => self.blend.hold_queued(q),
             None => self.blend.hold(latest),
@@ -1812,7 +1859,8 @@ impl BlendStats {
         self.fewest = self.fewest.min(different);
         self.most = self.most.max(different);
         if self.since.elapsed() >= Duration::from_secs(5) {
-            eprintln!(
+            // On the pacer: written by another thread.
+            eprintln_later!(
                 "{}: the game showed {:.0} pictures/s; {looks} looks per frame, {}-{} different pictures in each, {:.0}% of frames with {looks}; {} pictures too late (waited up to {:.0} ms), over {} frames{}",
                 if looks == 1 { "frame timing" } else { "frame blending" },
                 self.pictures as f64 / self.since.elapsed().as_secs_f64(),
@@ -1858,6 +1906,7 @@ fn spawn_blend_pacer(
             step: 1.0 / (fps.max(1) * looks.max(1)) as f64,
             looks: looks.max(1) as i64,
             phase: 0.0,
+            timed: false,
             shutter,
             next: 0,
             closed: -1,
@@ -1918,7 +1967,7 @@ fn skipped(dropped: &mut u64, n: u64) {
     *dropped += n;
     crate::count_skipped(n);
     if n > 0 && (before == 0 || dropped.ilog2() > before.ilog2()) {
-        eprintln!("video is behind: {dropped} frames skipped");
+        eprintln_later!("video is behind: {dropped} frames skipped");
     }
 }
 

@@ -79,9 +79,19 @@ impl MicMonitor {
         let mut denoise = crate::mixer::Denoise::new(channel.denoise_mode());
         let mut frames = Vec::new();
         let mut mono = Vec::new();
+        // Both streams' threads are taken on by Windows' multimedia
+        // scheduler the first time through, as a recording mic's is (see
+        // `sources::start_mic`): with 5 ms buffers, they're the first to be
+        // late while a game keeps every core busy.
+        #[cfg(target_os = "windows")]
+        let mut scheduled = false;
         let in_stream = input.build_input_stream::<f32, _, _>(
             in_stream_config,
             move |data, _| {
+                #[cfg(target_os = "windows")]
+                if !std::mem::replace(&mut scheduled, true) {
+                    crate::win::system::multimedia_thread("Audio");
+                }
                 frames.clear();
                 frames.extend(data.chunks(in_channels).map(|f| [f[0], f[1.min(in_channels - 1)]]));
                 sides.process(&mut frames);
@@ -108,9 +118,15 @@ impl MicMonitor {
         // that moves by a whole millisecond.
         let mut smooth = 0.0f32;
         let (q, lat) = (queue, latency_us.clone());
+        #[cfg(target_os = "windows")]
+        let mut scheduled = false;
         let out_stream = output.build_output_stream::<f32, _, _>(
             out_stream_config,
             move |out: &mut [f32], info| {
+                #[cfg(target_os = "windows")]
+                if !std::mem::replace(&mut scheduled, true) {
+                    crate::win::system::multimedia_thread("Audio");
+                }
                 let gain = channel.gain();
                 let mut q = q.lock().unwrap();
                 let queued = q.len() as f32 / in_rate;
@@ -139,7 +155,7 @@ impl MicMonitor {
                     lat.store(((smooth * 1000.0).round() * 1000.0) as u32, Ordering::Relaxed);
                 }
             },
-            |e| eprintln!("mic monitor (output): {e}"),
+            |e| crate::eprintln_later!("mic monitor (output): {e}"),
             None,
         )?;
         in_stream.play()?;

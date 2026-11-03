@@ -1,7 +1,9 @@
 //! The clip library on disk: find finished clips (and screenshots) and hand
 //! them off to the OS file manager or default player.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::SystemTime;
 
 use chrono::{DateTime, Local, NaiveDate, NaiveDateTime};
@@ -104,12 +106,65 @@ pub fn human_bytes(bytes: u64) -> String {
 pub fn scan(lib: &Path) -> Vec<Clip> {
     // Only edited clips have ids; skip reading metadata when nothing's been edited.
     let any_edits = lib.join(crate::store::DIR).is_dir();
-    let mut clips = scan_dir(lib, lib, None, any_edits);
+    let mut ids = Ids::of(lib);
+    let mut clips = scan_dir(lib, lib, None, any_edits, &mut ids);
     for folder in folders(lib) {
-        clips.extend(scan_dir(lib, &lib.join(&folder), Some(&folder), any_edits));
+        clips.extend(scan_dir(lib, &lib.join(&folder), Some(&folder), any_edits, &mut ids));
     }
+    ids.keep();
     clips.sort_by(|a, b| b.captured_at().cmp(&a.captured_at()));
     clips
+}
+
+/// Ids read from the clips' files ([`crate::store::read_id`]), by path, with
+/// the file as it was then ([`Stamp`]), so a scan reads the id again only
+/// from a file that's new or changed since the last. Reading one opens the
+/// file's index (`moov`), or runs ffprobe on a file that isn't MP4; a scan
+/// read every clip's, and every clip saved rescans the library one to three
+/// times. (What's kept beside an edited clip, its original and its folder's
+/// size, is still looked up on every scan: that changes without the clip.)
+static IDS: Mutex<BTreeMap<PathBuf, (Stamp, Option<String>)>> = Mutex::new(BTreeMap::new());
+
+/// What tells a file from the one an id was read from: its size, and when
+/// it was modified and made, as the thumbnails' cache tells them apart. A
+/// saved edit is a new file renamed into the clip's place, which on NTFS
+/// keeps the made time (the name's, through tunneling) and is given the
+/// modified time back (`keep_date`): its size is what tells it apart, and an
+/// edit is encoded afresh, all but never the same size to the byte.
+type Stamp = (u64, Option<SystemTime>, Option<SystemTime>);
+
+/// The ids of one library's clips known from the last scan, and those seen
+/// in this one.
+struct Ids {
+    known: BTreeMap<PathBuf, (Stamp, Option<String>)>,
+    seen: BTreeMap<PathBuf, (Stamp, Option<String>)>,
+}
+
+impl Ids {
+    /// What's known of `lib`'s clips, taken out (another library's stay).
+    fn of(lib: &Path) -> Self {
+        let mut all = IDS.lock().unwrap();
+        let (known, rest): (BTreeMap<_, _>, BTreeMap<_, _>) = std::mem::take(&mut *all).into_iter().partition(|(path, _)| path.starts_with(lib));
+        *all = rest;
+        Self { known, seen: BTreeMap::new() }
+    }
+
+    /// The id of the clip at `path` (`meta`: its metadata): as read before
+    /// when it's the same file, else read now.
+    fn get(&mut self, path: &Path, meta: &std::fs::Metadata) -> Option<String> {
+        let stamp = (meta.len(), meta.modified().ok(), meta.created().ok());
+        let id = match self.known.remove(path) {
+            Some((was, id)) if was == stamp => id,
+            _ => crate::store::read_id(path),
+        };
+        self.seen.insert(path.to_path_buf(), (stamp, id.clone()));
+        id
+    }
+
+    /// Kept for the next scan: the clips seen in this one (not those gone).
+    fn keep(self) {
+        IDS.lock().unwrap().extend(self.seen);
+    }
 }
 
 /// The library's folders, by name. Hidden ones (`.hasteclip`, the edits)
@@ -134,7 +189,7 @@ pub fn stamp(lib: &Path) -> Vec<Option<SystemTime>> {
 }
 
 /// The clips directly in `dir`, which is `lib` or its `folder`.
-fn scan_dir(lib: &Path, dir: &Path, folder: Option<&str>, any_edits: bool) -> Vec<Clip> {
+fn scan_dir(lib: &Path, dir: &Path, folder: Option<&str>, any_edits: bool, ids: &mut Ids) -> Vec<Clip> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -161,7 +216,7 @@ fn scan_dir(lib: &Path, dir: &Path, folder: Option<&str>, any_edits: bool) -> Ve
                 return None;
             }
             // Only videos are edited.
-            let id = if any_edits && !image { crate::store::read_id(&path) } else { None };
+            let id = if any_edits && !image { ids.get(&path, &meta) } else { None };
             let original = id.as_deref().and_then(|id| crate::store::find_original(lib, id));
             let kept_bytes = id.as_deref().map_or(0, |id| dir_bytes(&crate::store::assets_dir(lib, id)));
             Some(Clip {
@@ -475,6 +530,36 @@ mod tests {
         assert_eq!(free_path(&lib, "new.mp4"), lib.join("new.mp4"));
         assert!(path_for_folder(&lib, "OSU!", &lib.join("osu!")).is_ok());
         assert!(path_for_folder(&lib, "osu!", &lib.join("Desktop")).is_err());
+        std::fs::remove_dir_all(&lib).unwrap();
+    }
+
+    /// An MP4 holding just its comment (QuickTime's way): `moov/udta/©cmt`.
+    fn mp4_with_comment(text: &str) -> Vec<u8> {
+        let boxed = |kind: &[u8; 4], body: &[u8]| [&((body.len() + 8) as u32).to_be_bytes()[..], kind, body].concat();
+        let cmt = [&(text.len() as u16).to_be_bytes()[..], &[0, 0], text.as_bytes()].concat();
+        boxed(b"moov", &boxed(b"udta", &boxed(b"\xa9cmt", &cmt)))
+    }
+
+    /// A clip's id is read from its file once: a scan reads it again only
+    /// when the file has changed (its size, or when it was modified or made).
+    #[test]
+    fn ids_are_read_again_only_from_changed_files() {
+        let lib = std::env::temp_dir().join(format!("hc-ids-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&lib);
+        std::fs::create_dir_all(lib.join(crate::store::DIR)).unwrap();
+        let clip = lib.join("clip_2026-10-01_14-51-01.mp4");
+        let id = || scan(&lib).into_iter().find(|c| c.path == clip).and_then(|c| c.id);
+        std::fs::write(&clip, mp4_with_comment("hasteclip: id=aaaaaaaa")).unwrap();
+        assert_eq!(id().as_deref(), Some("aaaaaaaa"));
+        // Written over with as many bytes, and its time put back: the same
+        // file as far as can be told, so not read.
+        let modified = std::fs::metadata(&clip).unwrap().modified().unwrap();
+        std::fs::write(&clip, mp4_with_comment("hasteclip: id=bbbbbbbb")).unwrap();
+        std::fs::File::options().write(true).open(&clip).unwrap().set_modified(modified).unwrap();
+        assert_eq!(id().as_deref(), Some("aaaaaaaa"), "read again");
+        // Another size: read.
+        std::fs::write(&clip, mp4_with_comment("hasteclip: id=cccccccccc")).unwrap();
+        assert_eq!(id().as_deref(), Some("cccccccccc"));
         std::fs::remove_dir_all(&lib).unwrap();
     }
 
