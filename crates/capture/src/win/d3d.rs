@@ -42,33 +42,68 @@ impl Drop for ContextLock {
     }
 }
 
-/// Our GPU work goes ahead of the game's. A game that keeps the GPU busy
-/// (CS2 at 100%) otherwise gets it first: measured, a frame's capture,
+/// A capture's GPU work goes ahead of the game's. A game that keeps the GPU
+/// busy (CS2 at 100%) otherwise gets it first: measured, a frame's capture,
 /// blending and conversion then finished 300-860 ms after it was submitted
 /// instead of within a frame, the encoder's frames all waited on it, and up to
 /// 190 frames in 5 s were skipped. What we ask for is a few percent of the
 /// GPU; the game gives that up either way, now without our frames waiting.
 /// OBS does the same. `HASTECLIP_NO_GPU_PRIORITY=1` leaves it as it was.
-fn raise_gpu_priority(device: &ID3D11Device) {
+///
+/// Only a capture's: the class is the whole process's, so it's raised while a
+/// capture's device lives and goes back to normal once the last one's gone
+/// (it was raised for good by the first device of any kind, a thumbnail's
+/// included); and only a capture's device is put first within it, not the
+/// ones decoding for the player, scrubbing, thumbnails and exports, which
+/// came first too.
+fn raise_gpu_priority(device: &ID3D11Device) -> Option<Arc<Raised>> {
     if std::env::var_os("HASTECLIP_NO_GPU_PRIORITY").is_some_and(|v| v != "0") {
-        return;
+        return None;
     }
+    {
+        let mut capturing = CAPTURING.lock().unwrap();
+        if *capturing == 0 {
+            set_gpu_priority_class(PRIORITY_HIGH);
+        }
+        *capturing += 1;
+    }
+    if let Ok(dxgi) = device.cast::<IDXGIDevice>()
+        && let Err(e) = unsafe { dxgi.SetGPUThreadPriority(7) }
+    {
+        eprintln!("couldn't raise the GPU thread priority: {e}");
+    }
+    Some(Arc::new(Raised))
+}
+
+/// Captures' devices alive, which keep the process's GPU priority raised.
+static CAPTURING: Mutex<usize> = Mutex::new(0);
+
+/// D3DKMT_SCHEDULINGPRIORITYCLASS_HIGH (REALTIME needs administrator), and
+/// NORMAL, every process's to begin with.
+const PRIORITY_HIGH: i32 = 4;
+const PRIORITY_NORMAL: i32 = 2;
+
+fn set_gpu_priority_class(class: i32) {
     #[link(name = "gdi32")]
     unsafe extern "system" {
         fn D3DKMTSetProcessSchedulingPriorityClass(process: windows::Win32::Foundation::HANDLE, class: i32) -> i32;
     }
-    /// D3DKMT_SCHEDULINGPRIORITYCLASS_HIGH (REALTIME needs administrator).
-    const HIGH: i32 = 4;
-    static PROCESS: std::sync::Once = std::sync::Once::new();
-    PROCESS.call_once(|| {
-        let status = unsafe { D3DKMTSetProcessSchedulingPriorityClass(windows::Win32::System::Threading::GetCurrentProcess(), HIGH) };
-        if status != 0 {
-            eprintln!("couldn't raise the GPU priority (status {status:#x})");
-        }
-    });
-    if let Ok(dxgi) = device.cast::<IDXGIDevice>() {
-        if let Err(e) = unsafe { dxgi.SetGPUThreadPriority(7) } {
-            eprintln!("couldn't raise the GPU thread priority: {e}");
+    let status = unsafe { D3DKMTSetProcessSchedulingPriorityClass(windows::Win32::System::Threading::GetCurrentProcess(), class) };
+    if status != 0 {
+        eprintln!("couldn't set the GPU priority to {class} (status {status:#x})");
+    }
+}
+
+/// A capture's raised priority, shared by its device's clones: the last of a
+/// process's to go puts its priority back to normal.
+pub(crate) struct Raised;
+
+impl Drop for Raised {
+    fn drop(&mut self) {
+        let mut capturing = CAPTURING.lock().unwrap();
+        *capturing = capturing.saturating_sub(1);
+        if *capturing == 0 {
+            set_gpu_priority_class(PRIORITY_NORMAL);
         }
     }
 }
@@ -79,13 +114,23 @@ pub(crate) struct Gpu {
     pub device: ID3D11Device,
     pub context: ID3D11DeviceContext,
     multithread: Option<ID3D11Multithread>,
+    /// A capture's: its work goes first (see [`raise_gpu_priority`]).
+    _raised: Option<Arc<Raised>>,
 }
 unsafe impl Send for Gpu {}
 unsafe impl Sync for Gpu {}
 
 impl Gpu {
+    /// A device at the GPU priority the process has (decoding, exports).
     pub(crate) fn new() -> Result<Self> {
         Self::create(None)
+    }
+
+    /// A device for a capture: its work goes ahead of the game's.
+    pub(crate) fn for_capture() -> Result<Self> {
+        let mut gpu = Self::create(None)?;
+        gpu._raised = raise_gpu_priority(&gpu.device);
+        Ok(gpu)
     }
 
     /// On the graphics card with this LUID (to share textures with another
@@ -129,8 +174,7 @@ impl Gpu {
                 let _ = mt.SetMultithreadProtected(true);
             }
         }
-        raise_gpu_priority(&device);
-        Ok(Self { device, context, multithread })
+        Ok(Self { device, context, multithread, _raised: None })
     }
 
     /// Hold the context for a run of calls: protection only makes each call
@@ -1188,6 +1232,48 @@ fn preview_size(width: u32, height: u32) -> (u32, u32) {
 }
 
 const PREVIEW_MAX_WIDTH: u32 = 1280;
+
+#[cfg(test)]
+mod priority_tests {
+    use super::*;
+
+    /// The process's GPU scheduling priority class.
+    fn class() -> i32 {
+        #[link(name = "gdi32")]
+        unsafe extern "system" {
+            fn D3DKMTGetProcessSchedulingPriorityClass(process: windows::Win32::Foundation::HANDLE, class: *mut i32) -> i32;
+        }
+        let mut class = -1;
+        let status = unsafe { D3DKMTGetProcessSchedulingPriorityClass(windows::Win32::System::Threading::GetCurrentProcess(), &mut class) };
+        assert_eq!(status, 0, "couldn't read the GPU priority");
+        class
+    }
+
+    /// A capture's device raises the process's GPU priority for as long as
+    /// it (or a clone) lives, another capture's too; once the last is gone
+    /// it's back to normal. A device for decoding never raises it.
+    #[test]
+    fn gpu_priority_follows_captures() {
+        if std::env::var_os("HASTECLIP_NO_GPU_PRIORITY").is_some() {
+            return;
+        }
+        let Ok(decoder) = Gpu::new() else {
+            eprintln!("no graphics card: skipped");
+            return;
+        };
+        assert_eq!(class(), PRIORITY_NORMAL, "a decoder's device raised it");
+        let first = Gpu::for_capture().unwrap();
+        assert_eq!(class(), PRIORITY_HIGH);
+        let second = Gpu::for_capture().unwrap();
+        let clone = first.clone();
+        drop(first);
+        drop(second);
+        assert_eq!(class(), PRIORITY_HIGH, "a clone still captures");
+        drop(clone);
+        assert_eq!(class(), PRIORITY_NORMAL);
+        drop(decoder);
+    }
+}
 
 #[cfg(test)]
 mod overlay_tests {

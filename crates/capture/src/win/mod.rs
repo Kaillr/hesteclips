@@ -174,7 +174,7 @@ impl Recorder for WinRecorder {
         }
         // Nothing running: a capture of its own, for one picture.
         system::com_init();
-        let gpu = d3d::Gpu::new()?;
+        let gpu = d3d::Gpu::for_capture()?;
         let (source, (w, h)) = PictureSource::plan(video)?;
         let picture = source.open(&gpu, w, h, 60, None)?;
         // A screen has its picture by now; games and apps take a moment to
@@ -250,7 +250,7 @@ impl Session {
         crate::capture_started();
         system::com_init();
         system::mf_startup()?;
-        let gpu = d3d::Gpu::new()?;
+        let gpu = d3d::Gpu::for_capture()?;
         let (picture_source, (canvas_w, canvas_h)) = PictureSource::plan(&s.video)?;
         let (width, height) = s.size.of(canvas_w, canvas_h);
         let clock = Arc::new(Clock::default());
@@ -574,7 +574,7 @@ impl PreviewCapture {
         thread::spawn(move || {
             system::com_init();
             let opened = (|| -> Result<(Picture, d3d::Previewer, Option<camera::CameraLayer>)> {
-                let gpu = d3d::Gpu::new()?;
+                let gpu = d3d::Gpu::for_capture()?;
                 let (mut source, (w, h)) = PictureSource::plan(&source)?;
                 if let (PictureSource::Apps(list), Some(shared)) = (&mut source, apps2) {
                     *list = shared; // so `update` reaches the running follower
