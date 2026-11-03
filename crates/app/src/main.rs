@@ -214,7 +214,17 @@ fn main() -> eframe::Result<()> {
     let result = eframe::run_native(
         "HasteClip",
         options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
+            // Started with the computer, the window stays in the tray. eframe
+            // opens it hidden whatever `with_visible` says, and shows it once
+            // its first frame is drawn; and it draws a hidden window as if it
+            // were shown, Windows never saying it's hidden. Minimized before
+            // that first frame, it's never drawn (only `logic` runs) until
+            // it's shown from the tray: as `hide_window` leaves it.
+            #[cfg(windows)]
+            if background && let Some(window) = cc.winit_window() {
+                window.set_minimized(true);
+            }
             gpu_frames::init(cc.wgpu_render_state.as_ref(), &cc.egui_ctx);
             #[cfg(target_os = "macos")]
             shell::centre_window_buttons(cc);
