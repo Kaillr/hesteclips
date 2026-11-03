@@ -2,9 +2,10 @@
 //! all in-process — no external tools.
 //!
 //! - **Video**: an `SCStream` delivers screen frames (already scaled to the output
-//!   size, NV12). A pacer thread feeds the newest frame to a VideoToolbox H.264
-//!   encoder at exactly `fps`, so the output is constant frame rate even when the
-//!   screen is static and SCK sends nothing.
+//!   size, NV12). A pacer thread (`crate::mac::blend`) makes a frame every 1/fps
+//!   of the picture that was up at its time, or a blend of several, for a
+//!   VideoToolbox H.264 encoder: constant frame rate even when the screen is
+//!   static and SCK sends nothing.
 //! - **Desktop and app audio**: one audio-only `SCStream` per source
 //!   ([`SystemAudio`]), filtered to that app (or to everything minus the apps
 //!   added separately). **Mics** use cpal.
@@ -68,7 +69,7 @@ use crate::output::{in_progress, timestamp};
 use crate::sources::{AudioCapture, AudioSource, SourceKind, mix_inputs, track_layout};
 use crate::avwriter::{SendFormat, SendSample};
 use crate::writer::{self, Layout, Media, Writer};
-use crate::mac::blend::{Blender, spawn_blend_pacer};
+use crate::mac::blend::{Blender, Mix, spawn_blend_pacer};
 use crate::mac::video::{self, Frames, Picture, pick_display, shareable_content};
 use crate::{EncodeSettings, Mode, Recorder};
 
@@ -289,13 +290,15 @@ impl Session {
             let frames = Frames::new(picture.latest.clone(), s.webcam.as_ref(), s.screen.clone(), Some(picture.ctl()), width, height, crate::preview::new_producer())?;
             let latest = picture.latest.clone();
             session.video = Some(picture);
-            session.pacer = Some(if looks > 1 {
-                let shutter = crate::shutter::Shutter::new(looks, s.blend_shape);
-                let blender = Blender::new(width, height, shutter.frames_open())?;
-                spawn_blend_pacer(s.fps, looks, shutter, latest, blender, frames, encoder, clock)
-            } else {
-                spawn_pacer(s.fps, frames, encoder, clock)
-            });
+            // Not blended too, a frame takes the picture that was up at its
+            // time, by when the screen showed it, its look kept halfway
+            // between the screen's pictures (as on Windows). Taken as the
+            // newest one when the frame was due, a game at the frame rate whose
+            // pictures came near those times had one in a frame twice and
+            // the next in none, by chance: measured, up to 1 frame in 5.
+            let shutter = crate::shutter::Shutter::new(looks, s.blend_shape);
+            let mix = if looks > 1 { Mix::Blend(Blender::new(width, height, shutter.frames_open())?) } else { Mix::one() };
+            session.pacer = Some(spawn_blend_pacer(s.fps, looks, shutter, latest, mix, frames, encoder, clock));
             Ok(())
         })();
         if let Err(e) = started {
@@ -370,11 +373,6 @@ pub(crate) fn host_now() -> f64 {
 // ---------------------------------------------------------------------------
 // ScreenCaptureKit
 // ---------------------------------------------------------------------------
-
-/// Wrapper to move ObjC/CF objects that are thread-safe in practice (retain counts
-/// are atomic; we never mutate them concurrently) across threads.
-struct SendBox<T>(T);
-unsafe impl<T> Send for SendBox<T> {}
 
 /// What an audio stream's callbacks feed: a source's audio.
 struct Shared {
@@ -669,65 +667,6 @@ fn sync_taps(taps: &mut [Tap]) {
         }
         tap.channel.set_status(SourceStatus::Live);
     }
-}
-
-// ---------------------------------------------------------------------------
-// Pacer: constant frame rate
-// ---------------------------------------------------------------------------
-
-/// Encode the newest screen frame every 1/fps on the host clock. SCK only sends
-/// frames when the screen changes; repeating the last one keeps the output CFR.
-/// Frame N is stamped N/fps seconds after t0, the same clock the audio uses.
-///
-/// When the encoder can't keep up (a big frame at a high rate is more than
-/// the hardware does: ~60 fps at 3600×2338 on an M4 Pro), slots are skipped
-/// rather than queued: the pacer always encodes the slot that's due now, and
-/// a skipped slot shows the previous picture a little longer. Video never
-/// falls behind real time, so it stays in sync and nothing piles up.
-fn spawn_pacer(fps: u32, mut frames: Frames, encoder: Encoder, clock: Arc<Clock>) -> (Arc<AtomicBool>, JoinHandle<()>) {
-    let stop = Arc::new(AtomicBool::new(false));
-    let stop2 = stop.clone();
-    let encoder = SendBox(encoder);
-    let handle = thread::spawn(move || {
-        let encoder = encoder;
-        let fps_f = fps as f64;
-        let t0 = host_now();
-        clock.set(t0);
-        let mut next: i64 = 0;
-        let mut skipped = 0u64;
-        let mut note = |n: i64| {
-            let before = skipped;
-            skipped += n as u64;
-            crate::count_skipped(n as u64);
-            // Once per doubling, so a long session doesn't flood the log.
-            if before.checked_ilog2() != skipped.checked_ilog2() {
-                eprintln!("video encoder is behind: {skipped} frames skipped so far");
-            }
-        };
-        while !stop2.load(Ordering::Relaxed) {
-            let due = ((host_now() - t0) * fps_f) as i64;
-            if next <= due {
-                // Missed slots (the encoder or the system stalled) are skipped.
-                if due > next {
-                    note(due - next);
-                }
-                if let Some(frame) = frames.next() {
-                    if encoder.0.encode(&frame.0, due, fps) {
-                        crate::count_encoded();
-                    } else {
-                        note(1);
-                    }
-                }
-                next = due + 1;
-            }
-            let wait = t0 + next as f64 / fps_f - host_now();
-            if wait > 0.0 {
-                thread::sleep(Duration::from_secs_f64(wait));
-            }
-        }
-        encoder.0.finish();
-    });
-    (stop, handle)
 }
 
 // ---------------------------------------------------------------------------

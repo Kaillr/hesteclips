@@ -186,7 +186,7 @@ impl Blender {
             }
             Ok(())
         }) {
-            eprintln!("frame blending: {e:#}");
+            crate::eprintln_later!("frame blending: {e:#}");
         }
     }
 
@@ -217,7 +217,7 @@ impl Blender {
         match made {
             Ok(out) => Some(Arc::new(Buffer(out))),
             Err(e) => {
-                eprintln!("frame blending: {e:#}");
+                crate::eprintln_later!("frame blending: {e:#}");
                 None
             }
         }
@@ -245,6 +245,55 @@ impl Blender {
             self.last = Some(cmd);
         }
         result
+    }
+}
+
+/// What a frame is made of: its looks blended on the graphics card, or (one
+/// look a frame) the picture its look took, as it is.
+pub(crate) enum Mix {
+    Blend(Blender),
+    /// Not blended: each frame is the picture that was up at its time,
+    /// taken by its one look, with no graphics card work.
+    One {
+        held: Option<Arc<Buffer>>,
+        /// The frame a look was for, and the picture it took.
+        took: Option<(i64, Arc<Buffer>)>,
+    },
+}
+
+impl Mix {
+    /// One look a frame.
+    pub(crate) fn one() -> Self {
+        Self::One { held: None, took: None }
+    }
+
+    /// `picture` is the one that's up now.
+    fn hold(&mut self, picture: Arc<Buffer>) {
+        match self {
+            Self::Blend(b) => b.hold(picture),
+            Self::One { held, .. } => *held = Some(picture),
+        }
+    }
+
+    /// A look at the picture that's up, for frame `k`, by `weight`.
+    fn add(&mut self, k: i64, weight: f32) {
+        match self {
+            Self::Blend(b) => b.add(k, weight),
+            Self::One { held, took } => {
+                if let Some(picture) = held {
+                    *took = Some((k, picture.clone()));
+                }
+            }
+        }
+    }
+
+    /// Frame `k` is done: what it's made of. None if nothing was added to
+    /// it (no picture yet).
+    fn finish(&mut self, k: i64) -> Option<Arc<Buffer>> {
+        match self {
+            Self::Blend(b) => b.finish(k),
+            Self::One { took, .. } => took.take().filter(|(frame, _)| *frame == k).map(|(_, picture)| picture),
+        }
     }
 }
 
@@ -337,7 +386,7 @@ struct BlendPacer {
     last_taken: Option<u64>,
     /// Different pictures in the frame's own time so far.
     different: u32,
-    blender: Blender,
+    mix: Mix,
     frames: Frames,
     encoder: SendEncoder,
     skipped: u64,
@@ -371,7 +420,7 @@ impl BlendPacer {
         if let Some(id) = self.held {
             for (k, weight) in [(first, weights[0]), (first + 1, weights[1])] {
                 if k > self.closed && weight > 0.0 {
-                    self.blender.add(k, weight);
+                    self.mix.add(k, weight);
                 }
             }
             if self.last_taken != Some(id) {
@@ -396,15 +445,15 @@ impl BlendPacer {
     /// Frame `k` is done: encode it (with the webcam over it).
     fn close(&mut self, k: i64) {
         self.closed = k;
-        let Some(average) = self.blender.finish(k) else { return };
-        let frame = self.frames.make(average);
+        let Some(made) = self.mix.finish(k) else { return };
+        let frame = self.frames.make(made);
         if self.encoder.0.encode(&frame.0, k, self.fps) {
             crate::count_encoded();
         } else {
             crate::count_skipped(1);
             self.skipped += 1;
             if self.skipped.is_power_of_two() {
-                eprintln!("video encoder is behind: {} frames skipped so far", self.skipped);
+                crate::eprintln_later!("video encoder is behind: {} frames skipped so far", self.skipped);
             }
         }
     }
@@ -425,7 +474,7 @@ impl BlendPacer {
         let first = timed && !self.timed;
         self.timed |= timed;
         self.phase = crate::shutter::follow_picture(self.phase, self.step, at - self.t0, first);
-        self.blender.hold(picture);
+        self.mix.hold(picture);
         self.held = Some(id);
         self.stats.pictures += 1;
     }
@@ -434,7 +483,9 @@ impl BlendPacer {
 /// What the blending saw, printed every few seconds (to the log): how many
 /// pictures the screen showed, how many different ones each frame got (all
 /// its looks, when the screen changes at least at the blend rate), and how
-/// many came too late for their frame.
+/// many came too late for their frame. With one look a frame (not blended),
+/// a frame with none is a picture repeated. Written by another thread, as
+/// on Windows: the pacer has a few milliseconds between pictures.
 struct BlendStats {
     since: Instant,
     pictures: u32,
@@ -456,8 +507,9 @@ impl BlendStats {
         self.fewest = self.fewest.min(different);
         self.most = self.most.max(different);
         if self.since.elapsed() >= Duration::from_secs(5) {
-            eprintln!(
-                "frame blending: the screen showed {:.0} pictures/s; {looks} looks per frame, {}-{} different pictures in each, {:.0}% of frames with {looks}; {} pictures too late, over {} frames",
+            crate::eprintln_later!(
+                "{}: the screen showed {:.0} pictures/s; {looks} looks per frame, {}-{} different pictures in each, {:.0}% of frames with {looks}; {} pictures too late, over {} frames",
+                if looks == 1 { "frame timing" } else { "frame blending" },
                 self.pictures as f64 / self.since.elapsed().as_secs_f64(),
                 self.fewest,
                 self.most,
@@ -470,15 +522,20 @@ impl BlendStats {
     }
 }
 
-/// Like `sck::spawn_pacer`, for frame blending: `looks` looks at the screen
-/// per frame, averaged.
+/// The pacer: `looks` looks at the screen per frame, each taking the picture
+/// that was up at its time (by when the screen showed it), kept halfway
+/// between the screen's pictures; the frame is made of them as `mix` says
+/// (blended, or one look's picture as it is). Frame `k` is stamped `k / fps`
+/// on the host clock, the audio's: a frame is made every 1/fps whether the
+/// screen changed or not (constant frame rate), and when the encoder can't
+/// take one it's skipped, not queued, so video never falls behind.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_blend_pacer(
     fps: u32,
     looks: u32,
     shutter: crate::shutter::Shutter,
     latest: Arc<Latest>,
-    blender: Blender,
+    mix: Mix,
     frames: Frames,
     encoder: Encoder,
     clock: Arc<Clock>,
@@ -504,7 +561,7 @@ pub(crate) fn spawn_blend_pacer(
             held: None,
             last_taken: None,
             different: 0,
-            blender,
+            mix,
             frames,
             encoder,
             skipped: 0,
@@ -512,7 +569,7 @@ pub(crate) fn spawn_blend_pacer(
         };
         let mut seen = latest.seq();
         if let Some(b) = latest.get() {
-            p.blender.hold(b);
+            p.mix.hold(b);
             p.held = Some(seen);
         }
         while !stop2.load(Ordering::Relaxed) {
