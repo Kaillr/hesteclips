@@ -57,7 +57,7 @@ use crate::mp4mux::Spec;
 use crate::output::{in_progress, timestamp};
 use crate::sources::{AudioCapture, mix_inputs, track_layout};
 use crate::writer::{self, Media, Writer};
-use crate::{EncodeSettings, Mode, Recorder, VideoSource};
+use crate::{EncodeSettings, Mode, Recorder, VideoSource, eprintln_later};
 use aac::AacEncoder;
 use crate::mp4file::Layout;
 
@@ -1599,7 +1599,8 @@ impl EncodeDiag {
         if self.verbose || self.pool_empty + self.queue_full + self.caught_up > 0 {
             self.gpu_ms.sort_by(f64::total_cmp);
             let pct = |p: f64| self.gpu_ms.get(((self.gpu_ms.len() as f64 - 1.0) * p).round() as usize).copied().unwrap_or(f64::NAN);
-            eprintln!(
+            // On the pacer: written by another thread.
+            eprintln_later!(
                 "encode: {} frames; closed up to {:.1} ms late, closing took up to {:.1} ms; GPU done after {:.1}/{:.1}/{:.1} ms (median/99%/max), {} unfinished; encoder held frames {:.1} ms avg, {:.1} max; fewest free frames {}; skipped {} (no free frame) + {} (queue full) + {} (caught up)",
                 self.frames,
                 self.late_max * 1000.0,
@@ -1726,7 +1727,7 @@ impl BlendPacer {
                     }
                     Err(e) => {
                         self.encoder.pool.give(slot);
-                        eprintln!("{e:#}");
+                        eprintln_later!("{e:#}");
                     }
                 }
             }
@@ -1739,7 +1740,7 @@ impl BlendPacer {
             }
         }
         if let Err(e) = self.preview.submit() {
-            eprintln!("preview: {e:#}");
+            eprintln_later!("preview: {e:#}");
         }
         self.diag.frame(&self.blend.gpu, late, started.elapsed());
     }
@@ -1812,7 +1813,8 @@ impl BlendStats {
         self.fewest = self.fewest.min(different);
         self.most = self.most.max(different);
         if self.since.elapsed() >= Duration::from_secs(5) {
-            eprintln!(
+            // On the pacer: written by another thread.
+            eprintln_later!(
                 "{}: the game showed {:.0} pictures/s; {looks} looks per frame, {}-{} different pictures in each, {:.0}% of frames with {looks}; {} pictures too late (waited up to {:.0} ms), over {} frames{}",
                 if looks == 1 { "frame timing" } else { "frame blending" },
                 self.pictures as f64 / self.since.elapsed().as_secs_f64(),
@@ -1918,7 +1920,7 @@ fn skipped(dropped: &mut u64, n: u64) {
     *dropped += n;
     crate::count_skipped(n);
     if n > 0 && (before == 0 || dropped.ilog2() > before.ilog2()) {
-        eprintln!("video is behind: {dropped} frames skipped");
+        eprintln_later!("video is behind: {dropped} frames skipped");
     }
 }
 
