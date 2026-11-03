@@ -49,7 +49,7 @@ use objc2_core_video::{
 use objc2_foundation::{NSArray, NSError, NSObject, NSObjectProtocol};
 use objc2_screen_capture_kit::{
     SCContentFilter, SCDisplay, SCRunningApplication, SCStream,
-    SCStreamConfiguration, SCStreamOutput, SCStreamOutputType,
+    SCStreamConfiguration, SCStreamDelegate, SCStreamOutput, SCStreamOutputType,
 };
 use objc2_video_toolbox::{
     VTCompressionSession, VTEncodeInfoFlags, VTSessionSetProperty,
@@ -66,7 +66,7 @@ use objc2_video_toolbox::{
 use crate::aac::AacEncoder;
 use crate::mixer::{self, Channel, Clock, LiveAudio, SourceFeed, SourceStatus};
 use crate::output::{in_progress, timestamp};
-use crate::sources::{AudioCapture, AudioSource, SourceKind, mix_inputs, track_layout};
+use crate::sources::{AudioCapture, AudioSource, Retry, SourceKind, mix_inputs, track_layout};
 use crate::avwriter::{SendFormat, SendSample};
 use crate::writer::{self, Layout, Media, Writer};
 use crate::mac::blend::{Blender, Mix, spawn_blend_pacer};
@@ -456,13 +456,49 @@ fn interleaved_pcm(sample: &CMSampleBuffer) -> Option<(Vec<f32>, usize)> {
     }
 }
 
+/// Why the system stopped a stream, once it has (from its delegate).
+#[derive(Default)]
+struct Stopped(std::sync::Mutex<Option<String>>);
+
+impl Stopped {
+    fn take(&self) -> Option<String> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).take()
+    }
+}
+
+define_class!(
+    // SAFETY: NSObject has no subclassing requirements; no Drop impl.
+    #[unsafe(super(NSObject))]
+    #[ivars = Arc<Stopped>]
+    struct StreamWatch;
+
+    unsafe impl NSObjectProtocol for StreamWatch {}
+
+    unsafe impl SCStreamDelegate for StreamWatch {
+        #[unsafe(method(stream:didStopWithError:))]
+        fn did_stop(&self, _stream: &SCStream, error: &NSError) {
+            let why = format!("{} (error {})", error.localizedDescription(), error.code());
+            *self.ivars().0.lock().unwrap_or_else(PoisonError::into_inner) = Some(why);
+        }
+    }
+);
+
+impl StreamWatch {
+    fn new(stopped: Arc<Stopped>) -> Retained<Self> {
+        let this = Self::alloc().set_ivars(stopped);
+        unsafe { msg_send![super(this), init] }
+    }
+}
+
 /// An audio-only stream: everything the Mac plays (`include == false`, minus
-/// `apps`) or just `apps` (`include == true`).
+/// `apps`) or just `apps` (`include == true`). `watch` hears when the system
+/// stops it.
 fn make_audio_stream(
     display: &SCDisplay,
     apps: &[Retained<SCRunningApplication>],
     include: bool,
     output: &StreamOutput,
+    watch: &StreamWatch,
 ) -> Result<Retained<SCStream>> {
     unsafe {
         let filter = audio_filter(display, apps, include);
@@ -478,7 +514,7 @@ fn make_audio_stream(
         // Don't record our own clip previews. Note this excludes by *responsible*
         // app: under `cargo run`, sounds played from the same terminal are muted too.
         config.setExcludesCurrentProcessAudio(true);
-        let stream = SCStream::initWithFilter_configuration_delegate(SCStream::alloc(), &filter, &config, None);
+        let stream = SCStream::initWithFilter_configuration_delegate(SCStream::alloc(), &filter, &config, Some(ProtocolObject::from_ref(watch)));
         let queue = DispatchQueue::new("hasteclip.sck.audio", None);
         stream
             .addStreamOutput_type_sampleHandlerQueue_error(ProtocolObject::from_ref(output), SCStreamOutputType::Audio, Some(&queue))
@@ -545,9 +581,70 @@ struct Tap {
     source: AudioSource,
     feed: Arc<SourceFeed>,
     channel: Arc<Channel>,
-    stream: Option<(Retained<SCStream>, Retained<StreamOutput>)>,
+    stream: Option<Running>,
     /// Pids the current filter was built from, to notice changes.
     pids: Option<Vec<i32>>,
+    restart: Restart,
+}
+
+impl Tap {
+    fn say(&self, line: &str) {
+        eprintln!("{} audio source \"{}\": {line}", chrono::Local::now().format("%H:%M:%S"), self.source.name);
+    }
+}
+
+/// A tap's stream while it runs: what it feeds, and what hears when the
+/// system stops it (kept as long as the stream, which holds neither).
+struct Running {
+    stream: Retained<SCStream>,
+    _output: Retained<StreamOutput>,
+    _watch: Retained<StreamWatch>,
+    stopped: Arc<Stopped>,
+}
+
+/// When a tap's stream is started again, and what the log last said of it.
+/// A start that failed, or a stream the system stopped (the person stopping
+/// it from the menu bar, the display it's on going), is tried again a second
+/// later, then twice as long after each failure in a row, up to every 10 s
+/// (`sources::Retry`); one that had run a while starts over at a second.
+/// Each failure is said once. A start that failed was tried, and said, at
+/// every rescan (every second); a stream the system stopped went silent,
+/// Live all the same, until the capture restarted.
+#[derive(Debug, Default)]
+struct Restart {
+    retry: Option<Retry>,
+    /// When it last started.
+    started: Option<Instant>,
+    /// The failure the log last said.
+    said: String,
+}
+
+impl Restart {
+    /// A stream that ran this long without stopping had worked: a stop after
+    /// it is tried again a second later, not later than the one before.
+    const WORKED: Duration = Duration::from_secs(10);
+
+    /// Whether to try starting it at `now`.
+    fn due(&self, now: Instant) -> bool {
+        self.retry.is_none_or(|r| r.due(now))
+    }
+
+    /// Its start failed, or it stopped, at `now`, for `why`: what to log, if
+    /// it isn't what was said last.
+    fn failed(&mut self, why: String, now: Instant) -> Option<String> {
+        let worked = self.started.take().is_some_and(|t| now.duration_since(t) >= Self::WORKED);
+        self.retry = Some(Retry::after(self.retry.filter(|_| !worked), now));
+        (why != self.said).then(|| {
+            self.said.clone_from(&why);
+            why
+        })
+    }
+
+    /// It started at `now`: what to log, if a failure was said.
+    fn started(&mut self, now: Instant) -> Option<String> {
+        self.started = Some(now);
+        (!std::mem::take(&mut self.said).is_empty()).then(|| "started again".to_owned())
+    }
 }
 
 impl SystemAudio {
@@ -561,7 +658,7 @@ impl SystemAudio {
         let thread = thread::spawn(move || {
             let mut taps: Vec<Tap> = sources
                 .into_iter()
-                .map(|(source, feed, channel)| Tap { source, feed, channel, stream: None, pids: None })
+                .map(|(source, feed, channel)| Tap { source, feed, channel, stream: None, pids: None, restart: Restart::default() })
                 .collect();
             let mut first = true;
             while !stop2.load(Ordering::Relaxed) {
@@ -575,8 +672,8 @@ impl SystemAudio {
                 }
             }
             for tap in &taps {
-                if let Some((stream, _)) = &tap.stream {
-                    stop_capture(stream);
+                if let Some(running) = &tap.stream {
+                    stop_capture(&running.stream);
                 }
                 tap.channel.set_status(SourceStatus::Off);
             }
@@ -638,6 +735,15 @@ fn sync_taps(taps: &mut [Tap]) {
             .collect();
         let mut pids: Vec<i32> = apps.iter().map(|a| unsafe { a.processID() }).collect();
         pids.sort_unstable();
+        let now = Instant::now();
+        // Stopped by the system: let go of, and started again when it's due.
+        if let Some(why) = tap.stream.as_ref().and_then(|r| r.stopped.take()) {
+            tap.stream = None;
+            tap.pids = None;
+            if let Some(line) = tap.restart.failed(format!("stopped ({why}); starting it again"), now) {
+                tap.say(&line);
+            }
+        }
 
         if include && apps.is_empty() {
             // Nothing to listen to until the app opens. A stream left over from a
@@ -647,16 +753,29 @@ fn sync_taps(taps: &mut [Tap]) {
         }
         if tap.pids.as_ref() != Some(&pids) {
             match &tap.stream {
-                Some((stream, _)) => {
+                Some(running) => {
                     let filter = audio_filter(&display, &apps, include);
-                    let _ = await_completion(|h| unsafe { stream.updateContentFilter_completionHandler(&filter, Some(h)) });
+                    let _ = await_completion(|h| unsafe { running.stream.updateContentFilter_completionHandler(&filter, Some(h)) });
                 }
                 None => {
+                    if !tap.restart.due(now) {
+                        tap.channel.set_status(SourceStatus::Unavailable);
+                        continue;
+                    }
                     let output = StreamOutput::new(Arc::new(Shared { audio: Some(tap.feed.clone()) }));
-                    match make_audio_stream(&display, &apps, include, &output).and_then(|st| start_capture(&st).map(|_| st)) {
-                        Ok(stream) => tap.stream = Some((stream, output)),
+                    let stopped = Arc::new(Stopped::default());
+                    let watch = StreamWatch::new(stopped.clone());
+                    match make_audio_stream(&display, &apps, include, &output, &watch).and_then(|st| start_capture(&st).map(|_| st)) {
+                        Ok(stream) => {
+                            tap.stream = Some(Running { stream, _output: output, _watch: watch, stopped });
+                            if let Some(line) = tap.restart.started(Instant::now()) {
+                                tap.say(&line);
+                            }
+                        }
                         Err(e) => {
-                            eprintln!("audio source \"{}\": {e}", tap.source.name);
+                            if let Some(line) = tap.restart.failed(format!("{e:#}"), Instant::now()) {
+                                tap.say(&line);
+                            }
                             tap.channel.set_status(SourceStatus::Unavailable);
                             continue;
                         }
@@ -910,5 +1029,51 @@ pub(crate) fn probe_encoder(width: usize, height: usize) -> String {
     match probe_video_format(width, height, &s) {
         Ok(_) => "ok".into(),
         Err(e) => format!("{e:#}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A desktop or app sound stream that keeps failing to start is tried
+    /// again a second later, then later and later, up to every 10 s, and its
+    /// failure is said once.
+    #[test]
+    fn a_failing_start_is_tried_later_and_later_and_said_once() {
+        let t = Instant::now();
+        let at = |s: f64| t + Duration::from_secs_f64(s);
+        let mut restart = Restart::default();
+        assert!(restart.due(t), "the first try is at once");
+        assert_eq!(restart.failed("can't".into(), t).as_deref(), Some("can't"));
+        assert!(!restart.due(at(0.9)) && restart.due(at(1.0)));
+        let mut tries = Vec::new();
+        let mut now = 1.0;
+        for _ in 0..6 {
+            while !restart.due(at(now)) {
+                now += 0.25;
+            }
+            tries.push(now);
+            assert_eq!(restart.failed("can't".into(), at(now)), None, "said once");
+        }
+        let gaps: Vec<f64> = tries.windows(2).map(|w| w[1] - w[0]).collect();
+        assert_eq!(gaps, [2.0, 4.0, 8.0, 10.0, 10.0]);
+    }
+
+    /// A stream the system stops after it ran a while is started again a
+    /// second later; one stopped again soon after that waits longer.
+    #[test]
+    fn a_stream_that_ran_a_while_starts_over_at_a_second() {
+        let t = Instant::now();
+        let at = |s: f64| t + Duration::from_secs_f64(s);
+        let mut restart = Restart::default();
+        assert_eq!(restart.started(t), None, "nothing had been said");
+        assert!(restart.failed("stopped".into(), at(60.0)).is_some());
+        assert!(!restart.due(at(60.9)) && restart.due(at(61.0)), "a second after it stopped");
+        assert_eq!(restart.started(at(61.0)).as_deref(), Some("started again"));
+        // Stopped again 3 s in: said again (it had started since), and two
+        // seconds later this time.
+        assert!(restart.failed("stopped".into(), at(64.0)).is_some());
+        assert!(!restart.due(at(65.9)) && restart.due(at(66.0)));
     }
 }
