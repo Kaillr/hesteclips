@@ -211,6 +211,19 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport,
         wgpu_options: wgpu_options(),
+        // macOS, started with the computer: the app doesn't take the focus
+        // as it starts, on its way to the tray (winit makes it the active
+        // one by default, over whatever's in front). `with_active` above
+        // doesn't do it here: on macOS it only counts for a window made
+        // visible, and eframe makes it hidden.
+        #[cfg(target_os = "macos")]
+        event_loop_builder: background.then(|| {
+            let hook: eframe::EventLoopBuilderHook = Box::new(|builder| {
+                use winit::platform::macos::EventLoopBuilderExtMacOS;
+                builder.with_activate_ignoring_other_apps(false);
+            });
+            hook
+        }),
         ..Default::default()
     };
 
@@ -220,9 +233,9 @@ fn main() -> eframe::Result<()> {
         Box::new(move |cc| {
             // Started with the computer, the window goes straight to the
             // tray. eframe shows it once its first frame is drawn, whatever
-            // `with_visible` says: cloaked till it's there (Windows; see
-            // `App::start_in_tray`).
-            #[cfg(windows)]
+            // `with_visible` says: cloaked till it's there (Windows; on
+            // macOS, transparent; see `App::start_in_tray`).
+            #[cfg(any(windows, target_os = "macos"))]
             if background {
                 shell::cloak(cc, true);
             }
@@ -588,11 +601,12 @@ struct App {
     tray: Option<tray::Tray>,
     /// The window's hidden in the tray, until it's shown again.
     in_tray: bool,
-    /// Windows, started with the computer: to go to the tray once its first
-    /// frame is drawn, and cloaked till it's there (see `start_in_tray`).
-    #[cfg(windows)]
+    /// Windows and macOS, started with the computer: to go to the tray once
+    /// its first frame is drawn, and cloaked till it's there (see
+    /// `start_in_tray`).
+    #[cfg(any(windows, target_os = "macos"))]
     to_tray: bool,
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     cloaked: bool,
     /// Windows: it was maximized as it went to the tray, to be again.
     #[cfg(windows)]
@@ -710,9 +724,9 @@ impl App {
         }
         let tray = tray::Tray::new(&ctx, tray_tx, tray_rx, quick_save.clone());
         // No tray icon to open it from: it shows after all.
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         let to_tray = background && tray.is_some();
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "macos")))]
         let _ = background;
         let mut app = Self {
             page: Page::Clips,
@@ -824,9 +838,9 @@ impl App {
             last_view: None,
             tray,
             in_tray: false,
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "macos"))]
             to_tray,
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "macos"))]
             cloaked: background,
             #[cfg(windows)]
             tray_maximized: false,
@@ -1423,7 +1437,7 @@ impl eframe::App for App {
         if self.page != Page::Sources {
             self.listening = None;
         }
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         self.start_in_tray(ctx, _frame);
         self.background(ctx);
         self.pump_tray(ctx);
@@ -1459,14 +1473,25 @@ impl App {
     /// hidden window minimized showed it a moment (a taskbar button at
     /// login). Without a tray icon to open it from, it's uncloaked at once,
     /// and shows.
-    #[cfg(windows)]
+    ///
+    /// macOS the same way, the window transparent for its cloak: shown by
+    /// eframe after its first frame, it was on screen 3.4 s after a launch
+    /// with `--background` (measured with a development build). And winit
+    /// makes an app the active one as it starts, over whatever's in front:
+    /// started with the computer, it isn't (see `main`).
+    #[cfg(any(windows, target_os = "macos"))]
     fn start_in_tray(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
         if std::mem::take(&mut self.to_tray) {
             self.hide_window(ctx);
             return;
         }
-        // In the tray now (minimized there), or not going there.
-        if self.cloaked && (!self.in_tray || ctx.input(|i| i.viewport().minimized == Some(true))) {
+        // In the tray now (minimized there on Windows; on macOS, ordered
+        // out), or not going there.
+        #[cfg(windows)]
+        let there = ctx.input(|i| i.viewport().minimized == Some(true));
+        #[cfg(target_os = "macos")]
+        let there = !shell::window_shown(frame);
+        if self.cloaked && (!self.in_tray || there) {
             shell::cloak(frame, false);
             self.cloaked = false;
         }

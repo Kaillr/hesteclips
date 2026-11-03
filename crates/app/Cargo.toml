@@ -90,6 +90,9 @@ sha2 = "0.11"
 # Shortcuts while a game holds the screen: a listen-only key tap (key_tap.rs).
 objc2-core-foundation = { version = "0.3.2", features = ["CFMachPort", "CFRunLoop"] }
 objc2-core-graphics = { version = "0.3.2", features = ["CGEvent", "CGEventTypes"] }
+# Started with the computer, the app doesn't take the focus as it starts
+# (main.rs): winit's option for it, in the winit eframe uses.
+winit = { version = "0.30", default-features = false }
 
 # Windows-only: the system Share UI, and opening files with their default app.
 [target.'cfg(target_os = "windows")'.dependencies]

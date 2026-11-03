@@ -192,6 +192,36 @@ pub fn cloak(window: &impl raw_window_handle::HasWindowHandle, on: bool) {
     }
 }
 
+/// macOS's cloak: the window made fully transparent (`on`), or opaque again.
+/// While it's transparent nothing of it shows, though it's on screen and
+/// drawn. See `App::start_in_tray`.
+#[cfg(target_os = "macos")]
+pub fn cloak(window: &impl raw_window_handle::HasWindowHandle, on: bool) {
+    if let Some(window) = ns_window(window) {
+        window.setAlphaValue(if on { 0.0 } else { 1.0 });
+    }
+}
+
+/// macOS: whether the window is on screen (ordered in), as AppKit has it.
+#[cfg(target_os = "macos")]
+pub fn window_shown(window: &impl raw_window_handle::HasWindowHandle) -> bool {
+    ns_window(window).is_some_and(|w| w.isVisible())
+}
+
+/// macOS: eframe's window, on the main thread.
+#[cfg(target_os = "macos")]
+fn ns_window(window: &impl raw_window_handle::HasWindowHandle) -> Option<objc2::rc::Retained<objc2_app_kit::NSWindow>> {
+    use objc2_app_kit::NSView;
+    use raw_window_handle::RawWindowHandle;
+    let handle = window.window_handle().ok()?;
+    let RawWindowHandle::AppKit(h) = handle.as_raw() else { return None };
+    objc2::MainThreadMarker::new()?;
+    // SAFETY: eframe's AppKit handle points at the live content NSView, and
+    // this runs on the main thread (checked above).
+    let view: &NSView = unsafe { h.ns_view.cast::<NSView>().as_ref() };
+    view.window()
+}
+
 /// Which screen's keyboard shortcuts to show.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Keys {
