@@ -135,19 +135,13 @@ impl Mic {
             drop(open.stream);
             self.feed.remove_child(&open.child);
         }
-        let child = self.feed.add_child(native_rate(&SourceKind::Microphone { device: self.device.clone() }));
-        child.mono_with(self.channel.mono_flag());
-        child.denoise_with(self.channel.denoise_mode());
-        let health = Arc::new(MicHealth::default());
-        let opened = host_now();
-        match start_mic(&self.device, child.clone(), health.clone()) {
-            Ok(stream) => {
+        match open_mic(&self.device, &self.feed, &self.channel) {
+            Ok(open) => {
                 self.channel.set_status(SourceStatus::Live);
-                self.open = Some(OpenMic { stream, child, health, opened });
+                self.open = Some(open);
                 Ok(())
             }
             Err(e) => {
-                self.feed.remove_child(&child);
                 self.channel.set_status(SourceStatus::Unavailable);
                 Err(e)
             }
@@ -368,16 +362,11 @@ impl AudioCapture {
     /// running) doesn't fail the capture: its status says why and its track is
     /// silent until it can.
     pub(crate) fn start(sources: &[AudioSource], live: &LiveAudio, clock: Arc<Clock>) -> Result<Self> {
-        // A mic's own feed is inside its source's (see `Mic`): that one is at
-        // the mixer's rate.
-        let feeds: Vec<Arc<SourceFeed>> = sources
-            .iter()
-            .map(|s| match s.kind {
-                #[cfg(not(target_os = "linux"))]
-                SourceKind::Microphone { .. } => SourceFeed::new(crate::mixer::RATE, clock.clone()),
-                _ => SourceFeed::new(native_rate(&s.kind), clock.clone()),
-            })
-            .collect();
+        // Every source's feed is at the mixer's rate: desktop and app sound
+        // is captured at it, and on Linux so is every mic (PipeWire converts
+        // it). Elsewhere a mic's device fills a feed of its own inside its
+        // source's, at the rate it's opened at (see `open_mic`).
+        let feeds: Vec<Arc<SourceFeed>> = sources.iter().map(|_| SourceFeed::new(crate::mixer::RATE, clock.clone())).collect();
         #[cfg(not(target_os = "linux"))]
         let mut mics = Vec::new();
         #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
@@ -463,18 +452,6 @@ impl AudioCapture {
     }
 }
 
-/// Every source is converted to 48 kHz; desktop/app audio is captured at it,
-/// and on Linux so is every mic (PipeWire converts it).
-fn native_rate(kind: &SourceKind) -> u32 {
-    match kind {
-        #[cfg(not(target_os = "linux"))]
-        SourceKind::Microphone { device } => {
-            find_input(device).and_then(|d| d.default_input_config().ok()).map_or(crate::mixer::RATE, |c| c.sample_rate())
-        }
-        _ => crate::mixer::RATE,
-    }
-}
-
 #[cfg(not(target_os = "linux"))]
 fn find_input(name: &str) -> Option<cpal::Device> {
     cpal::default_host()
@@ -483,10 +460,34 @@ fn find_input(name: &str) -> Option<cpal::Device> {
         .find(|d| d.description().is_ok_and(|desc| desc.name() == name))
 }
 
+/// Open the input device called `name` into a new feed inside `feed` (its
+/// mic source's), made at the rate the device is opened at.
 #[cfg(not(target_os = "linux"))]
-fn start_mic(name: &str, feed: Arc<SourceFeed>, health: Arc<MicHealth>) -> Result<cpal::Stream> {
+fn open_mic(name: &str, feed: &SourceFeed, channel: &crate::mixer::Channel) -> Result<OpenMic> {
     let device = find_input(name).ok_or_else(|| anyhow::anyhow!("not connected"))?;
     let config = device.default_input_config()?;
+    // The feed's rate comes from this same look at the device. Looked up
+    // twice, once for the rate and once to open it, a device that was just
+    // arriving could be missed the first time and taken as 48 kHz, then
+    // found and opened at 44.1 kHz: its sound read 8.8% fast for as long as
+    // it played, a packet thrown away every half second or so.
+    let child = feed.add_child(config.sample_rate());
+    child.mono_with(channel.mono_flag());
+    child.denoise_with(channel.denoise_mode());
+    let health = Arc::new(MicHealth::default());
+    let opened = host_now();
+    match start_mic(name, &device, config, child.clone(), health.clone()) {
+        Ok(stream) => Ok(OpenMic { stream, child, health, opened }),
+        Err(e) => {
+            feed.remove_child(&child);
+            Err(e)
+        }
+    }
+}
+
+/// `device`'s stream, as `config` says, into `feed`.
+#[cfg(not(target_os = "linux"))]
+fn start_mic(name: &str, device: &cpal::Device, config: cpal::SupportedStreamConfig, feed: Arc<SourceFeed>, health: Arc<MicHealth>) -> Result<cpal::Stream> {
     let channels = config.channels() as usize;
     let mut stream_config = config.config();
     // Room for 200 ms of backlog. By default the device's buffer holds only
