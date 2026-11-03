@@ -105,14 +105,90 @@ struct Mic {
     device: String,
     feed: Arc<SourceFeed>,
     channel: Arc<crate::mixer::Channel>,
-    /// The device's stream, while it's open.
-    open: Option<OpenMic>,
-    /// From when it couldn't be opened or stopped until its sound comes
-    /// again: when to try opening it next.
-    retry: Option<Retry>,
+    /// The device's stream and the feed it fills, while it's open.
+    stream: Option<(cpal::Stream, Arc<SourceFeed>)>,
+    /// How it's doing, and when to open it next.
+    watch: Watch,
     /// The last thing the log said about it, so a mic that stays away (or
     /// keeps stopping) is reported once, not at every try.
     said: String,
+}
+
+/// What the mics' watch knows of a mic, and decides at each look: its
+/// stream aside, so the decisions can be tested without a device.
+#[cfg(not(target_os = "linux"))]
+#[derive(Debug, Default)]
+struct Watch {
+    /// Its stream's health, and the host time the stream was open at, while
+    /// it's open.
+    open: Option<(Arc<MicHealth>, f64)>,
+    /// From when it couldn't be opened, or stopped, until its sound has kept
+    /// coming again: when to try opening it next.
+    retry: Option<Retry>,
+    /// Its device is new (the capture just started, or it was switched):
+    /// it's opened at once, and Live as soon as it's open.
+    new: bool,
+}
+
+/// What the watch does about a mic, at a look.
+#[cfg(not(target_os = "linux"))]
+#[derive(Debug, PartialEq)]
+enum Look {
+    Wait,
+    /// Its stream has stopped, for this reason: close it.
+    Close(String),
+    /// Opened again, its sound has kept coming: it's Live again.
+    Back,
+    /// It isn't open, and it's time to open it.
+    Open,
+}
+
+#[cfg(not(target_os = "linux"))]
+impl Watch {
+    /// A new device: opened at once, its old retries forgotten.
+    fn new_device() -> Self {
+        Self { new: true, ..Self::default() }
+    }
+
+    /// A look at host time `host` (`now` on the clock retries go by).
+    fn look(&mut self, now: Instant, host: f64) -> Look {
+        let Some((health, opened)) = &self.open else {
+            return if self.new || self.retry.is_some_and(|r| r.due(now)) { Look::Open } else { Look::Wait };
+        };
+        if let Some(why) = health.stopped(*opened, host) {
+            self.open = None;
+            // Soon after it worked; later and later while it keeps stopping
+            // before its sound has kept coming.
+            self.retry = Some(Retry::after(self.retry, now));
+            return Look::Close(why);
+        }
+        // Not at its first packet: a device that gives one and stops was
+        // "back" each time, its retries starting over at 1 s: opened and
+        // closed every 3.25 s for good, Live and Unavailable in turn.
+        if self.retry.is_some() && health.steady(host) {
+            self.retry = None;
+            return Look::Back;
+        }
+        Look::Wait
+    }
+
+    /// How opening it went (`Some`: its stream's health, and the host time
+    /// the stream was open at): the status it has now.
+    fn opened(&mut self, open: Option<(Arc<MicHealth>, f64)>, now: Instant) -> SourceStatus {
+        let new = std::mem::take(&mut self.new);
+        match open {
+            Some(open) => {
+                self.open = Some(open);
+                // A new device is Live at once; one opened again once its
+                // sound has kept coming (`Look::Back`).
+                if new { SourceStatus::Live } else { SourceStatus::Unavailable }
+            }
+            None => {
+                self.retry = Some(Retry::after(self.retry, now));
+                SourceStatus::Unavailable
+            }
+        }
+    }
 }
 
 /// A mic's open stream.
@@ -128,60 +204,54 @@ struct OpenMic {
 
 #[cfg(not(target_os = "linux"))]
 impl Mic {
-    /// Open its device (closing the stream it had), into a feed of its own:
-    /// Live, or Unavailable and why.
-    fn open(&mut self) -> Result<()> {
-        if let Some(open) = self.open.take() {
-            drop(open.stream);
-            self.feed.remove_child(&open.child);
+    /// Open its device (closing the stream it had), into a feed of its own;
+    /// its status follows.
+    fn open(&mut self, now: Instant) {
+        if let Some((stream, child)) = self.stream.take() {
+            drop(stream);
+            self.feed.remove_child(&child);
         }
-        match open_mic(&self.device, &self.feed, &self.channel) {
+        let open = match open_mic(&self.device, &self.feed, &self.channel) {
             Ok(open) => {
-                self.channel.set_status(SourceStatus::Live);
-                self.open = Some(open);
-                Ok(())
+                self.stream = Some((open.stream, open.child));
+                Some((open.health, open.opened))
             }
             Err(e) => {
-                self.channel.set_status(SourceStatus::Unavailable);
-                Err(e)
+                self.say(format!("{e:#}"));
+                None
             }
-        }
+        };
+        let status = self.watch.opened(open, now);
+        self.channel.set_status(status);
     }
 
     /// Open it as a new device: at once, and if it can't be, again later.
     fn open_new(&mut self, now: Instant) {
-        self.retry = None;
+        self.watch = Watch::new_device();
         self.said.clear();
-        if let Err(e) = self.open() {
-            self.say(format!("{e:#}"));
-            self.retry = Some(Retry::after(None, now));
-        }
+        self.open(now);
     }
 
     /// Looked at every [`Mics::EVERY`]: a stream that stopped is closed, and
     /// a mic that isn't open is opened again when its [`Retry`] says so.
-    fn watch(&mut self, now: Instant) {
-        if let Some(open) = &self.open {
-            if let Some(why) = open.health.stopped(open.opened, host_now()) {
+    fn look(&mut self, now: Instant) {
+        match self.watch.look(now, host_now()) {
+            Look::Wait => {}
+            Look::Open => self.open(now),
+            Look::Close(why) => {
                 self.say(format!("stopped ({why}); opening it again when it's back"));
-                let open = self.open.take().unwrap();
-                self.feed.remove_child(&open.child);
-                // Let go of on a thread of its own: a stream stuck in its
-                // driver would otherwise hold the other mics' watch up.
-                std::thread::spawn(move || drop(open.stream));
+                if let Some((stream, child)) = self.stream.take() {
+                    self.feed.remove_child(&child);
+                    // Let go of on a thread of its own: a stream stuck in its
+                    // driver would otherwise hold the other mics' watch up.
+                    std::thread::spawn(move || drop(stream));
+                }
                 self.channel.set_status(SourceStatus::Unavailable);
-                // Soon after it worked; later and later while it keeps
-                // stopping before any sound comes.
-                self.retry = Some(Retry::after(self.retry, now));
-            } else if self.retry.is_some() && open.health.has_heard() {
-                self.retry = None;
+            }
+            Look::Back => {
+                self.channel.set_status(SourceStatus::Live);
                 self.say("live again".to_owned());
             }
-        } else if self.retry.is_some_and(|r| r.due(now))
-            && let Err(e) = self.open()
-        {
-            self.say(format!("{e:#}"));
-            self.retry = Some(Retry::after(self.retry, now));
         }
     }
 
@@ -225,7 +295,7 @@ impl Mics {
                     while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = stopped.recv_timeout(Self::EVERY) {
                         let now = Instant::now();
                         for mic in locked(&mics).iter_mut() {
-                            mic.watch(now);
+                            mic.look(now);
                         }
                     }
                 })
@@ -310,6 +380,8 @@ impl Retry {
 struct MicHealth {
     /// What its stream said when it ended.
     ended: Mutex<Option<String>>,
+    /// Host time its sound first came at (`f64` bits; 0 until it does).
+    first: AtomicU64,
     /// Host time its sound last came at (`f64` bits; 0 until it first does).
     heard: AtomicU64,
 }
@@ -323,12 +395,19 @@ impl MicHealth {
     /// a moment to switch its mic on.
     const NEVER_CAME: f64 = 5.0;
 
+    /// Its sound came at host time `now` (called from its stream's thread).
     fn heard(&self, now: f64) {
+        if self.first.load(Ordering::Relaxed) == 0 {
+            self.first.store(now.to_bits(), Ordering::Relaxed);
+        }
         self.heard.store(now.to_bits(), Ordering::Relaxed);
     }
 
-    fn has_heard(&self) -> bool {
-        self.heard.load(Ordering::Relaxed) != 0
+    /// Its sound has kept coming for longer than [`Self::STALLED`], at host
+    /// time `now` (asked while it hasn't stopped, so with no gap that long).
+    fn steady(&self, now: f64) -> bool {
+        let first = f64::from_bits(self.first.load(Ordering::Relaxed));
+        first > 0.0 && now - first > Self::STALLED
     }
 
     fn end(&self, why: String) {
@@ -386,8 +465,8 @@ impl AudioCapture {
                         device: device.clone(),
                         feed: feed.clone(),
                         channel,
-                        open: None,
-                        retry: None,
+                        stream: None,
+                        watch: Watch::default(),
                         said: String::new(),
                     };
                     mic.open_new(Instant::now());
@@ -914,9 +993,61 @@ mod tests {
         for k in 0..100 {
             health.heard(105.0 + k as f64 * 0.01);
         }
-        assert!(health.has_heard());
         assert_eq!(health.stopped(100.0, 107.9), None);
         assert_eq!(health.stopped(100.0, 108.1).as_deref(), Some("no sound for 2 s"));
+    }
+
+    /// A device that gives one packet and stops, again and again: it's
+    /// tried later and later (1, 2, 4, 8, then every 10 s after it stops),
+    /// Unavailable meanwhile, and never "back". One whose sound keeps coming
+    /// for over 2 s once opened again is back.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn a_mic_is_back_once_its_sound_keeps_coming() {
+        let t = Instant::now();
+        let at = |s: f64| t + Duration::from_secs_f64(s);
+        // Looked at every 250 ms for 100 s: opened at once (a new device:
+        // Live), one packet 10 ms after each open, then nothing.
+        let mut watch = Watch::new_device();
+        let mut status = SourceStatus::Off;
+        let mut opens = Vec::new();
+        for k in 0..=400 {
+            let s = k as f64 * 0.25;
+            match watch.look(at(s), s) {
+                Look::Open => {
+                    opens.push(s);
+                    let health = Arc::new(MicHealth::default());
+                    status = watch.opened(Some((health.clone(), s)), at(s));
+                    health.heard(s + 0.01);
+                }
+                Look::Close(_) => status = SourceStatus::Unavailable,
+                Look::Back => panic!("back at {s}, after a single packet"),
+                Look::Wait => {}
+            }
+            if k == 0 {
+                assert_eq!(status, SourceStatus::Live, "a new device, opened");
+            } else if s > 2.5 {
+                assert_eq!(status, SourceStatus::Unavailable, "at {s} s");
+            }
+        }
+        // Each stops 2.25 s after it opens (no sound for 2 s, seen at the
+        // next look), then waits its retry.
+        let gaps: Vec<f64> = opens.windows(2).map(|w| w[1] - w[0]).collect();
+        assert_eq!(gaps[..6], [3.25, 4.25, 6.25, 10.25, 12.25, 12.25]);
+
+        // Opened again after it stopped, with its sound coming: Unavailable
+        // until it has come for over 2 s, then back, its retries forgotten.
+        let mut watch = Watch { retry: Some(Retry::after(None, at(0.0))), ..Watch::default() };
+        assert_eq!(watch.look(at(1.0), 1.0), Look::Open);
+        let health = Arc::new(MicHealth::default());
+        assert_eq!(watch.opened(Some((health.clone(), 1.0)), at(1.0)), SourceStatus::Unavailable);
+        for k in 1..=200 {
+            health.heard(1.0 + k as f64 * 0.01);
+        }
+        assert_eq!(watch.look(at(3.0), 3.0), Look::Wait, "its sound has come for 1.99 s");
+        health.heard(3.1);
+        assert_eq!(watch.look(at(3.1), 3.1), Look::Back);
+        assert!(watch.retry.is_none());
     }
 
     #[test]
