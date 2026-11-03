@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -691,11 +691,35 @@ pub(crate) struct EncodedSink {
     pub(crate) probe: Option<Sender<CFRetained<objc2_core_media::CMFormatDescription>>>,
     /// Frames handed to the encoder and not called back yet.
     in_flight: AtomicUsize,
+    /// When each frame in the encoder went in, oldest first (they come back
+    /// in order: no B-frames), and how long those back were held, for the
+    /// encode report (`crate::mac::blend`).
+    held: Mutex<Held>,
+}
+
+impl EncodedSink {
+    fn new(tx: Option<Sender<writer::Command>>, probe: Option<Sender<CFRetained<objc2_core_media::CMFormatDescription>>>) -> Self {
+        Self { tx, probe, in_flight: AtomicUsize::new(0), held: Mutex::default() }
+    }
+
+    fn held(&self) -> std::sync::MutexGuard<'_, Held> {
+        self.held.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// How long the encoder held frames: when each in it went in, and of those
+/// back since the report last asked, altogether, the most, and how many.
+#[derive(Default)]
+struct Held {
+    since: std::collections::VecDeque<Instant>,
+    total: Duration,
+    most: Duration,
+    count: u32,
 }
 
 impl Encoder {
     pub(crate) fn new(width: usize, height: usize, s: &EncodeSettings, tx: Sender<writer::Command>) -> Result<Self> {
-        Self::with_sink(width, height, s, EncodedSink { tx: Some(tx), probe: None, in_flight: AtomicUsize::new(0) })
+        Self::with_sink(width, height, s, EncodedSink::new(Some(tx), None))
     }
 
     fn with_sink(width: usize, height: usize, s: &EncodeSettings, sink: EncodedSink) -> Result<Self> {
@@ -751,6 +775,7 @@ impl Encoder {
             return false;
         }
         sink.in_flight.fetch_add(1, Ordering::Relaxed);
+        sink.held().since.push_back(Instant::now());
         unsafe {
             let status = self.session.encode_frame(
                 frame,
@@ -763,7 +788,8 @@ impl Encoder {
             if status != 0 {
                 // No callback comes for a frame refused outright.
                 sink.in_flight.fetch_sub(1, Ordering::Relaxed);
-                eprintln!("VideoToolbox encode error {status}");
+                sink.held().since.pop_back();
+                crate::eprintln_later!("VideoToolbox encode error {status}");
             }
         }
         true
@@ -773,6 +799,20 @@ impl Encoder {
     #[allow(dead_code)]
     pub(crate) fn in_flight(&self) -> usize {
         unsafe { &*self.ctx }.in_flight.load(Ordering::Relaxed)
+    }
+
+    /// Places free in the encoder's queue before a frame is skipped.
+    pub(crate) fn free(&self) -> usize {
+        QUEUE.saturating_sub(unsafe { &*self.ctx }.in_flight.load(Ordering::Relaxed))
+    }
+
+    /// How long the encoder held the frames it gave back since this was last
+    /// asked: altogether, the most, and how many.
+    pub(crate) fn held(&self) -> (Duration, Duration, u32) {
+        let mut held = unsafe { &*self.ctx }.held();
+        let out = (held.total, held.most, held.count);
+        (held.total, held.most, held.count) = (Duration::ZERO, Duration::ZERO, 0);
+        out
     }
 
     /// Flush pending frames, then release the sink.
@@ -797,6 +837,15 @@ unsafe extern "C-unwind" fn on_encoded(
     let Some(sink) = (unsafe { (ctx as *const EncodedSink).as_ref() }) else { return };
     // Called once per frame handed in, encoded or dropped.
     sink.in_flight.fetch_sub(1, Ordering::Relaxed);
+    {
+        let mut held = sink.held();
+        if let Some(at) = held.since.pop_front() {
+            let took = at.elapsed();
+            held.total += took;
+            held.most = held.most.max(took);
+            held.count += 1;
+        }
+    }
     let Some(sample) = (unsafe { sample.as_ref() }).filter(|_| status == 0) else { return };
     if let Some(probe) = &sink.probe {
         if let Some(fmt) = unsafe { sample.format_description() } {
@@ -820,7 +869,7 @@ pub(crate) fn probe_video_format(
     s: &EncodeSettings,
 ) -> Result<CFRetained<objc2_core_media::CMFormatDescription>> {
     let (tx, rx) = mpsc::channel();
-    let enc = Encoder::with_sink(width, height, s, EncodedSink { tx: None, probe: Some(tx), in_flight: AtomicUsize::new(0) })?;
+    let enc = Encoder::with_sink(width, height, s, EncodedSink::new(None, Some(tx)))?;
     let mut pb: *mut CVPixelBuffer = ptr::null_mut();
     let status = unsafe {
         objc2_core_video::CVPixelBufferCreate(
