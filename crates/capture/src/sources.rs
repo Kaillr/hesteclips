@@ -485,6 +485,7 @@ fn start_mic(name: &str, feed: Arc<SourceFeed>, health: Arc<MicHealth>) -> Resul
     // pinning the CPU) overflowed it and lost audio. It still wakes every
     // ~10 ms, and every packet is placed by its timestamp, so this adds no delay.
     let backlog = config.sample_rate() / 5;
+    let rate = config.sample_rate() as f64;
     stream_config.buffer_size = match config.buffer_size() {
         cpal::SupportedBufferSize::Range { min, max } => cpal::BufferSize::Fixed(backlog.clamp(*min, *max)),
         cpal::SupportedBufferSize::Unknown => cpal::BufferSize::Fixed(backlog),
@@ -506,15 +507,29 @@ fn start_mic(name: &str, feed: Arc<SourceFeed>, health: Arc<MicHealth>) -> Resul
             if !std::mem::replace(&mut scheduled, true) {
                 crate::win::system::multimedia_thread("Audio");
             }
-            health.heard(host_now());
-            let start = info.timestamp().capture.as_nanos() as f64 / 1e9;
-            feed.push(start, data, channels);
+            let now = host_now();
+            health.heard(now);
+            let stamped = info.timestamp().capture.as_nanos() as f64 / 1e9;
+            feed.push(capture_time(stamped, now, (data.len() / channels) as f64 / rate), data, channels);
         },
         errors,
         None,
     )?;
     stream.play()?;
     Ok(stream)
+}
+
+/// When a mic's packet of `length` seconds, stamped `stamped`, was captured,
+/// at host time `now`: at its stamp, unless that can't be right, and then
+/// as if it had just been. Sound isn't captured in the future (a few ms are
+/// let pass for the clocks' rounding), nor handed over a second after, but
+/// a driver can give no time (0) or one that jumps: one that jumped ahead
+/// put silence in up to it, and then threw real sound away until real time
+/// caught up. The same check as desktop and app sound's (`win::loopback`),
+/// which lets more of the future pass.
+#[cfg(not(target_os = "linux"))]
+fn capture_time(stamped: f64, now: f64, length: f64) -> f64 {
+    if stamped > now - 1.0 && stamped < now + 0.005 { stamped } else { now - length }
 }
 
 /// A recording mic's error handler: an error that ends its stream goes to
@@ -830,6 +845,31 @@ mod tests {
         errors(cpal::Error::with_message(cpal::ErrorKind::DeviceNotAvailable, "unplugged"));
         errors(cpal::Error::with_message(cpal::ErrorKind::BackendError, "and then this"));
         assert_eq!(health.stopped(99.0, 100.5).as_deref(), Some("unplugged"), "the first error is the reason");
+    }
+
+    /// A mic's packet with no time, or one from the future or from long
+    /// ago, is taken as just captured. One stamped half a second ahead put
+    /// half a second of silence in, then threw real sound away until real
+    /// time caught up; now the sound goes on as it came.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn mic_times_that_cant_be_right_are_not_used() {
+        assert_eq!(capture_time(99.98, 100.0, 0.01), 99.98);
+        for wrong in [0.0, 100.5, 98.5] {
+            assert_eq!(capture_time(wrong, 100.0, 0.01), 99.99, "{wrong}");
+        }
+        let clock = Arc::new(Clock::default());
+        clock.set(1000.0);
+        let feed = SourceFeed::new(crate::mixer::RATE, clock);
+        // A second of a steady level in 10 ms packets, each handed over a
+        // couple of ms after its last frame; the 50th stamped 0.5 s ahead.
+        for k in 0..100 {
+            let captured = 1000.0 + k as f64 * 0.01;
+            let stamped = if k == 50 { captured + 0.5 } else { captured };
+            feed.push(capture_time(stamped, captured + 0.012, 0.01), &[0.5; 960], 2);
+        }
+        let out = feed.take(0, crate::mixer::RATE as usize);
+        assert!(out.iter().all(|f| f[0] == 0.5), "silence at {:?}", out.iter().position(|f| f[0] != 0.5));
     }
 
     /// cpal can wait forever for a device that went away, without an error:
