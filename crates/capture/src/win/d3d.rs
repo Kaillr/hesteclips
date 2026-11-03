@@ -1098,8 +1098,20 @@ impl Previewer {
                         .unwrap_or_else(|| vec![0u8; size]);
                     let read = unsafe {
                         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-                        // Waits for the GPU to finish this frame — here, not on the pacer.
-                        gpu.context.Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)).map(|()| {
+                        // Waits for the GPU to finish this frame — here, not on
+                        // the pacer — and not inside Map: that holds the device
+                        // until the GPU's done, and the capture, the pacer and
+                        // the encoder wait for it too (as in `Latest::snapshot`).
+                        let asked = std::time::Instant::now();
+                        let ready = loop {
+                            match gpu.context.Map(staging, 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT.0 as u32, Some(&mut mapped)) {
+                                Err(e) if e.code() == windows::Win32::Graphics::Dxgi::DXGI_ERROR_WAS_STILL_DRAWING && asked.elapsed() < std::time::Duration::from_secs(1) => {
+                                    std::thread::sleep(std::time::Duration::from_millis(1));
+                                }
+                                done => break done,
+                            }
+                        };
+                        ready.map(|()| {
                             let src = mapped.pData as *const u8;
                             let pitch = mapped.RowPitch as usize;
                             if pitch == w * 4 {
@@ -1142,7 +1154,12 @@ impl Previewer {
         let Some(slot) = self.slots.iter().position(|(_, busy)| !busy.swap(true, Ordering::AcqRel)) else {
             return Ok(()); // both still on their way
         };
-        let started = self.converter.convert(0).map(|()| unsafe { self.gpu.context.CopyResource(&self.slots[slot].0, &self.target) });
+        // Flushed, so the GPU starts the copy now: the reader only asks
+        // whether it's done (a Map that doesn't wait), it doesn't push it on.
+        let started = self.converter.convert(0).map(|()| unsafe {
+            self.gpu.context.CopyResource(&self.slots[slot].0, &self.target);
+            self.gpu.context.Flush();
+        });
         if started.is_err() || self.tx.as_ref().is_none_or(|tx| tx.send(slot).is_err()) {
             self.slots[slot].1.store(false, Ordering::Release);
         }
