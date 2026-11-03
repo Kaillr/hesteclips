@@ -34,7 +34,7 @@ use windows::core::{IUnknown, Interface, implement};
 
 use super::system::{ProcessTree, audio_session_pids, com_init, host_now};
 use crate::mixer::{Channel, RATE, SourceFeed, SourceStatus};
-use crate::sources::{AudioSource, SourceKind};
+use crate::sources::{AudioSource, Retry, SourceKind};
 
 /// What one loopback stream captures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -238,8 +238,12 @@ struct Tap {
     feed: Arc<SourceFeed>,
     channel: Arc<Channel>,
     streams: HashMap<Target, (Stream, Arc<SourceFeed>)>,
-    /// Targets that failed to start, so they aren't retried every second.
-    failed: HashSet<Target>,
+    /// Targets that failed to start: when to try each again (later and later
+    /// while it keeps failing, see [`Retry`]), and the error it last gave.
+    /// Not never: the desktop's one target is always wanted, so a desktop
+    /// that failed to start once (or to start again after its stream died)
+    /// stayed silent until the capture restarted.
+    failed: HashMap<Target, (Retry, String)>,
     /// What the log last said about this source, to log only changes.
     logged: String,
 }
@@ -256,7 +260,7 @@ impl SystemAudio {
             com_init();
             let mut taps: Vec<Tap> = sources
                 .into_iter()
-                .map(|(source, feed, channel)| Tap { source, feed, channel, streams: HashMap::new(), failed: HashSet::new(), logged: String::new() })
+                .map(|(source, feed, channel)| Tap { source, feed, channel, streams: HashMap::new(), failed: HashMap::new(), logged: String::new() })
                 .collect();
             let mut first = true;
             while !stop2.load(Ordering::Relaxed) {
@@ -350,20 +354,26 @@ fn sync_taps(taps: &mut [Tap]) {
             }
             keep
         });
-        tap.failed.retain(|t| wanted.contains(t));
+        tap.failed.retain(|t, _| wanted.contains(t));
         for target in wanted {
-            if tap.streams.contains_key(&target) || tap.failed.contains(&target) {
+            if tap.streams.contains_key(&target) || tap.failed.get(&target).is_some_and(|(retry, _)| !retry.due(Instant::now())) {
                 continue;
             }
             let child = tap.feed.add_child(RATE);
             match Stream::start(target, child.clone()) {
                 Ok(stream) => {
                     tap.streams.insert(target, (stream, child));
+                    tap.failed.remove(&target);
                 }
                 Err(e) => {
                     tap.feed.remove_child(&child);
-                    eprintln!("audio source \"{}\": {e:#}", tap.source.name);
-                    tap.failed.insert(target);
+                    // Each error once, not at every try.
+                    let error = format!("{e:#}");
+                    let last = tap.failed.remove(&target);
+                    if last.as_ref().is_none_or(|(_, said)| *said != error) {
+                        eprintln!("audio source \"{}\": {error}", tap.source.name);
+                    }
+                    tap.failed.insert(target, (Retry::after(last.map(|(retry, _)| retry), Instant::now()), error));
                 }
             }
         }
@@ -372,7 +382,7 @@ fn sync_taps(taps: &mut [Tap]) {
         tap.channel.set_status(if live { SourceStatus::Live } else { SourceStatus::Unavailable });
         let mut capturing: Vec<String> = tap.streams.keys().map(|t| format!("{t:?}")).collect();
         capturing.sort_unstable();
-        let mut failed: Vec<String> = tap.failed.iter().map(|t| format!("{t:?}")).collect();
+        let mut failed: Vec<String> = tap.failed.keys().map(|t| format!("{t:?}")).collect();
         failed.sort_unstable();
         let what = match &tap.source.kind {
             SourceKind::App { bundle_id } => format!("app {bundle_id}"),
