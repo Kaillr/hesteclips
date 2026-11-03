@@ -490,9 +490,22 @@ fn start_mic(name: &str, feed: Arc<SourceFeed>, health: Arc<MicHealth>) -> Resul
         cpal::SupportedBufferSize::Unknown => cpal::BufferSize::Fixed(backlog),
     };
     let errors = mic_errors(name.to_owned(), health.clone());
+    #[cfg(target_os = "windows")]
+    let mut scheduled = false;
     let stream = device.build_input_stream::<f32, _, _>(
         stream_config,
         move |data, info| {
+            // cpal reads the mic on a thread at normal priority (its
+            // `realtime` feature is off), and noise removal runs on it, on
+            // every packet: while a game kept every core busy, a USB mic
+            // wasn't read in time twice in 6 minutes, and sound was lost. The
+            // first time through, Windows' multimedia scheduler takes the
+            // thread on as an audio thread, as the desktop and app sound
+            // threads already are (see `win::loopback`).
+            #[cfg(target_os = "windows")]
+            if !std::mem::replace(&mut scheduled, true) {
+                crate::win::system::multimedia_thread("Audio");
+            }
             health.heard(host_now());
             let start = info.timestamp().capture.as_nanos() as f64 / 1e9;
             feed.push(start, data, channels);
@@ -522,6 +535,10 @@ fn mic_errors(name: String, health: Arc<MicHealth>) -> impl FnMut(cpal::Error) +
 /// starts as a gap (an "underrun or overrun"), which isn't lost audio: that's
 /// ignored. A real dropout later — the mic's buffer filled before it was read,
 /// usually because the PC was too busy — is reported, at most once a minute.
+/// It runs on the thread that reads the mic, so its lines go to the log
+/// through [`crate::log_later`]: a line written straight to stderr waits for
+/// wherever that goes (11-20 ms to a file, as long as text is selected in a
+/// terminal), and the mic isn't read meanwhile.
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn quiet_xruns(name: String) -> impl FnMut(cpal::Error) + Send + 'static {
     let started = std::time::Instant::now();
@@ -529,7 +546,7 @@ pub(crate) fn quiet_xruns(name: String) -> impl FnMut(cpal::Error) + Send + 'sta
     let mut reported: Option<std::time::Instant> = None;
     move |e| {
         if !matches!(e.kind(), cpal::ErrorKind::Xrun) {
-            eprintln!("microphone \"{name}\": {e}");
+            crate::eprintln_later!("microphone \"{name}\": {e}");
             return;
         }
         if started.elapsed() < std::time::Duration::from_secs(1) {
@@ -537,7 +554,7 @@ pub(crate) fn quiet_xruns(name: String) -> impl FnMut(cpal::Error) + Send + 'sta
         }
         dropouts += 1;
         if reported.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(60)) {
-            eprintln!("microphone \"{name}\": {dropouts} short dropout(s) — it wasn't read in time (the PC was busy)");
+            crate::eprintln_later!("microphone \"{name}\": {dropouts} short dropout(s) — it wasn't read in time (the PC was busy)");
             reported = Some(std::time::Instant::now());
             dropouts = 0;
         }
