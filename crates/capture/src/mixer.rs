@@ -366,6 +366,9 @@ struct FeedState {
     mono: Option<Mono>,
     /// Noise removal, when this feed is a microphone's.
     denoise: Option<Denoise>,
+    /// Its stream has stopped (see [`SourceFeed::remove_child`]): it takes
+    /// no more sound, and goes once the mixer has taken what it has.
+    closed: bool,
 }
 
 impl SourceFeed {
@@ -395,6 +398,7 @@ impl SourceFeed {
                 steer: Steer::default(),
                 mono: None,
                 denoise: None,
+                closed: false,
             }),
             children: Mutex::new(Vec::new()),
         })
@@ -421,8 +425,12 @@ impl SourceFeed {
         child
     }
 
+    /// Stop summing `child`, whose stream has stopped (a mic switched or
+    /// opened again, an app that quit, the player closed), once the mixer
+    /// has taken the sound it had sent: up to the mix's 0.3 s behind real
+    /// time, which went with it. It takes no more sound from now on.
     pub(crate) fn remove_child(&self, child: &Arc<SourceFeed>) {
-        self.children.lock().unwrap().retain(|c| !Arc::ptr_eq(c, child));
+        child.st.lock().unwrap().closed = true;
     }
 
     /// Interleaved samples (`channels` per frame) whose first frame was captured
@@ -435,6 +443,9 @@ impl SourceFeed {
         let rate = self.rate as f64;
         let expected = ((start - t0) * rate).round() as i64;
         let mut st = self.st.lock().unwrap();
+        if st.closed {
+            return;
+        }
 
         // Back after a long gap (playback paused, a device that stopped):
         // start over at its time, as on its first sound, rather than fill the
@@ -538,12 +549,18 @@ impl SourceFeed {
             st.out_base = end;
         }
         drop(st);
-        for child in self.children.lock().unwrap().iter() {
+        let mut children = self.children.lock().unwrap();
+        for child in children.iter() {
             for (a, c) in buf.iter_mut().zip(child.take(from, n)) {
                 a[0] += c[0];
                 a[1] += c[1];
             }
         }
+        // A stopped stream's feed goes once all it had is taken.
+        children.retain(|c| {
+            let st = c.st.lock().unwrap();
+            !(st.closed && st.out.is_empty())
+        });
         buf
     }
 }
@@ -1379,6 +1396,26 @@ mod tests {
         b.push(1000.01, &vec![0.5; 960], 2);
         a.push(1000.01, &vec![0.25; 960], 2);
         assert!(feed.take(480, 480).iter().all(|f| (f[0] - 0.25).abs() < 1e-6));
+    }
+
+    /// A mic switched while its last 300 ms aren't mixed yet (the mix runs
+    /// that far behind): they're in the mix, then the new mic. The old
+    /// feed takes nothing more, and goes once all it had is taken.
+    #[test]
+    fn removed_child_is_mixed_to_its_end() {
+        let feed = SourceFeed::new(RATE, clock_at_zero());
+        let old = feed.add_child(RATE);
+        old.push(1000.0, &vec![0.5; 14_400 * 2], 2);
+        feed.remove_child(&old);
+        old.push(1000.3, &vec![0.5; 480 * 2], 2);
+        let new = feed.add_child(RATE);
+        new.push(1000.3, &vec![0.25; 480 * 2], 2);
+        assert!(feed.take(0, 4_800).iter().all(|f| f[0] == 0.5));
+        assert_eq!(feed.children.lock().unwrap().len(), 2, "not all taken yet");
+        let out = feed.take(4_800, 14_400 - 4_800 + 480);
+        assert!(out[..9_600].iter().all(|f| f[0] == 0.5), "the old mic's last 300 ms");
+        assert!(out[9_600..].iter().all(|f| f[0] == 0.25), "the new mic, alone");
+        assert_eq!(feed.children.lock().unwrap().len(), 1, "the old one's gone");
     }
 
     #[test]
