@@ -256,6 +256,8 @@ fn wgpu_options() -> eframe::egui_wgpu::WgpuConfiguration {
     // repaints continuously (Sources, with its meters and preview) spun at
     // ~7000 tries a second, and right after launch macOS never got to show the
     // window at all, so it stayed blank. Wait a display refresh first.
+    // (D3D12 hands a hidden window its frames all the same: in the tray it's
+    // minimized as well, see `hide_window`.)
     let default = options.on_surface_status.clone();
     options.on_surface_status = std::sync::Arc::new(move |status| {
         if matches!(status, eframe::wgpu::CurrentSurfaceTexture::Occluded) {
@@ -1251,31 +1253,6 @@ impl eframe::App for App {
         ui_kit::pointer_cursor(&ctx);
         ui_kit::lenient_clicks(&ctx);
         laps.lap("dialogs");
-
-        // Library auto-refresh: poll the output folder ~once a second and rescan only
-        // when it actually changed (cheap, no watcher thread).
-        let now = Instant::now();
-        if self.last_poll.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(1)) {
-            self.last_poll = Some(now);
-            self.permission = permission_now();
-            laps.lap("permission");
-            let stamp = clips::stamp(&self.settings.output_dir);
-            if stamp != self.library_stamp {
-                self.library_stamp = stamp;
-                self.refresh_clips();
-            }
-            laps.lap("library scan");
-            self.track_game();
-            self.update_presence();
-            laps.lap("game, discord");
-            // Persist settings as they change; no Save button to forget.
-            let json = self.settings.to_json();
-            if json != self.saved_settings && self.persist_settings {
-                RecordSettings::save_json(&json);
-                self.saved_settings = json;
-            }
-            laps.lap("settings");
-        }
         laps.report();
 
         // Keep repainting: every frame while capturing (live timer), else a steady
@@ -1299,7 +1276,8 @@ impl eframe::App for App {
     }
 
     /// What runs every frame whether the window shows or not (it's hidden
-    /// in the tray): shortcuts, voice, capture events, saves and uploads.
+    /// in the tray): shortcuts, voice, capture events, saves and uploads,
+    /// and once a second the library, the game, Discord and the settings.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // From the first frame, so the press that starts a drag out is heard.
         #[cfg(target_os = "linux")]
@@ -1387,6 +1365,7 @@ impl eframe::App for App {
         self.background(ctx);
         self.pump_tray(ctx);
         self.handle_close(ctx);
+        self.every_second();
         // A steady tick, also while hidden (nothing else wakes it then).
         ctx.request_repaint_after(if self.rec_state != RecState::Idle { Duration::from_millis(100) } else { Duration::from_millis(300) });
     }
@@ -1400,6 +1379,38 @@ impl eframe::App for App {
 
 // --- Running in the background: the tray, closing the window ---
 impl App {
+    /// About once a second, shown or not (in the tray only `logic` runs):
+    /// the library rescanned when its folders changed, the game being
+    /// clipped and what Discord shows, and the settings saved.
+    fn every_second(&mut self) {
+        let now = Instant::now();
+        if self.last_poll.is_some_and(|t| now.duration_since(t) < Duration::from_secs(1)) {
+            return;
+        }
+        let mut laps = Laps::start();
+        self.last_poll = Some(now);
+        self.permission = permission_now();
+        laps.lap("permission");
+        // Rescanned only when a folder actually changed (cheap, no watcher thread).
+        let stamp = clips::stamp(&self.settings.output_dir);
+        if stamp != self.library_stamp {
+            self.library_stamp = stamp;
+            self.refresh_clips();
+        }
+        laps.lap("library scan");
+        self.track_game();
+        self.update_presence();
+        laps.lap("game, discord");
+        // Persist settings as they change; no Save button to forget.
+        let json = self.settings.to_json();
+        if json != self.saved_settings && self.persist_settings {
+            RecordSettings::save_json(&json);
+            self.saved_settings = json;
+        }
+        laps.lap("settings");
+        laps.report();
+    }
+
     fn background(&mut self, ctx: &egui::Context) {
         // Global shortcuts: these fire even while a game is focused. Paused while
         // the Settings recorder listens, so pressing the current key rebinds it
@@ -1554,6 +1565,14 @@ impl App {
             }
             return;
         }
+        // Windows: minimized as well. Windows never tells eframe a hidden
+        // window is hidden, so it went on drawing it, every 100 ms while
+        // anything asked for a frame (all the time while clipping); a
+        // minimized one gets no drawing at all, only `logic`. Minimized
+        // first: hidden first, winit would show a maximized window again
+        // to minimize it.
+        #[cfg(windows)]
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
     }
 
@@ -1565,6 +1584,7 @@ impl App {
             ctx.request_repaint();
             return;
         }
+        // Restored too, where the tray minimizes it (`hide_window`).
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
