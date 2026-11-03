@@ -258,6 +258,18 @@ impl Viewer {
         &self.clip
     }
 
+    /// What the window is doing, for what the player keeps open (see
+    /// [`crate::player::Window`]). Not in use, the last screen's player
+    /// standing in until this one has a picture goes, with all it has open.
+    pub fn set_window(&mut self, ctx: &egui::Context, window: crate::player::Window) {
+        if let State::Ready(r) = &mut self.state {
+            r.player.set_window(ctx, window);
+            if window != crate::player::Window::InUse {
+                r.curtain = None;
+            }
+        }
+    }
+
     /// Where it is (in the recording) and whether it's playing: for the
     /// editor opened from here to carry on there.
     pub fn at(&self) -> Option<Resume> {

@@ -585,6 +585,10 @@ struct App {
     edit_return: Option<PathBuf>,
     /// The tray icon, where there is one: closing the window hides it there.
     tray: Option<tray::Tray>,
+    /// The window's hidden in the tray, until it's shown again.
+    in_tray: bool,
+    /// Since when another window has had the focus (none: this one has).
+    unfocused_since: Option<Instant>,
     /// Quitting for real (closing mustn't just hide the window then).
     quitting: bool,
     /// The first close: ask whether to keep running in the tray.
@@ -796,6 +800,8 @@ impl App {
             free_up_batches: Vec::new(),
             last_view: None,
             tray,
+            in_tray: false,
+            unfocused_since: None,
             quitting: false,
             close_dialog: false,
             setup_open,
@@ -1376,6 +1382,7 @@ impl eframe::App for App {
         self.pump_tray(ctx);
         self.handle_close(ctx);
         self.every_second();
+        self.keep_open(ctx);
         // A steady tick, also while hidden (nothing else wakes it then).
         ctx.request_repaint_after(if self.rec_state != RecState::Idle { Duration::from_millis(100) } else { Duration::from_millis(300) });
     }
@@ -1386,6 +1393,13 @@ impl eframe::App for App {
         self.updater.install_on_exit(false);
     }
 }
+
+/// Other windows in front of this one this long (a game, say), the player
+/// and the editor let go of the scrub engine (`App::keep_open`): long enough
+/// that looking something up and coming back finds it open, and it's opened
+/// again in a moment anyway (scrubbing goes through the playback decoder
+/// meanwhile).
+const BEHIND_FOR: Duration = Duration::from_secs(10);
 
 // --- Running in the background: the tray, closing the window ---
 impl App {
@@ -1419,6 +1433,43 @@ impl App {
         }
         laps.lap("settings");
         laps.report();
+    }
+
+    /// What the player and the editor keep open, by what the window is
+    /// doing (see `player::Window`): everything while it's in use; the scrub
+    /// engine goes once other windows have been in front of it for
+    /// [`BEHIND_FOR`] (a game); out of sight (minimized, in the tray) the
+    /// playback decoder too, and a card's preview in the library.
+    fn keep_open(&mut self, ctx: &egui::Context) {
+        let (minimized, focused) = ctx.input(|i| (i.viewport().minimized == Some(true), i.viewport().focused == Some(true)));
+        if focused {
+            // Back in front, however it was shown: out of the tray. (Not
+            // while it still has the focus it had as it went there.)
+            if self.unfocused_since.take().is_some() {
+                self.in_tray = false;
+            }
+        } else if self.unfocused_since.is_none() {
+            self.unfocused_since = Some(Instant::now());
+        }
+        // Not a development test instance's: its window is often behind the
+        // terminal it was started from while it's measured.
+        let behind = self.persist_settings && self.unfocused_since.is_some_and(|t| t.elapsed() >= BEHIND_FOR);
+        let window = if self.in_tray || minimized {
+            player::Window::Hidden
+        } else if behind {
+            player::Window::Behind
+        } else {
+            player::Window::InUse
+        };
+        if window == player::Window::Hidden {
+            self.hover_play = None;
+        }
+        if let Some(v) = &mut self.viewer {
+            v.set_window(ctx, window);
+        }
+        if let Some(e) = &mut self.editor {
+            e.set_window(ctx, window);
+        }
     }
 
     fn background(&mut self, ctx: &egui::Context) {
@@ -1560,10 +1611,12 @@ impl App {
 
     fn hide_window(&mut self, ctx: &egui::Context) {
         // Nothing to watch while hidden: stop playing, close the preview.
+        // (The editor keeps its edit, and lets go of its decoders: `keep_open`.)
         if matches!(self.page, Page::View | Page::Sources) {
             self.viewer = None;
             self.page = Page::Clips;
         }
+        self.in_tray = true;
         // Wayland can't hide a window: KWin is asked to; elsewhere on
         // Wayland it can only be minimized.
         #[cfg(target_os = "linux")]
@@ -1587,6 +1640,7 @@ impl App {
     }
 
     fn show_window(&mut self, ctx: &egui::Context) {
+        self.in_tray = false;
         // Nor bring one to the front: KWin is asked to.
         #[cfg(target_os = "linux")]
         if kwin_window::available() {
