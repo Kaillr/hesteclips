@@ -345,7 +345,9 @@ pub struct Player {
     on_screen: Option<Picture>,
     /// GPU frames just taken off screen, held a few more frames: the GPU may
     /// still be drawing them, and the decoder reuses a released texture.
-    retired: std::collections::VecDeque<(u64, Picture)>,
+    /// With the pass each left the screen in, and whether it was the scrub
+    /// engine's.
+    retired: std::collections::VecDeque<(u64, Picture, bool)>,
     /// GPU frames opened for drawing (see `gpu_frames.rs`).
     #[cfg(hw_decode)]
     gpu_frames: crate::gpu_frames::Frames,
@@ -386,6 +388,10 @@ pub struct Player {
     /// decoders' textures).
     #[cfg(hw_decode)]
     engine_on_screen: bool,
+    /// Windows: the scrub engine's pools whose frames went on screen, so
+    /// were opened for drawing (`gpu_frames`).
+    #[cfg(all(hw_decode, windows))]
+    engine_pools: Vec<usize>,
     /// The engine, and the playback decoder, were let go of while the
     /// window wasn't in use ([`Self::set_window`]): opened again once it is.
     #[cfg(hw_decode)]
@@ -577,6 +583,8 @@ impl Player {
             scrub_opening,
             #[cfg(hw_decode)]
             engine_on_screen: false,
+            #[cfg(all(hw_decode, windows))]
+            engine_pools: Vec::new(),
             #[cfg(hw_decode)]
             engine_let_go: false,
             #[cfg(hw_decode)]
@@ -664,18 +672,22 @@ impl Player {
     /// picture on screen stay as they are.
     pub fn set_window(&mut self, ctx: &egui::Context, window: Window) {
         #[cfg(hw_decode)]
-        {
-            match window {
-                Window::Hidden => {
-                    if !self.is_playing() && self.drawn_at.is_none_or(|t| t.elapsed() >= UNSEEN) {
-                        self.let_go_of_video();
-                    }
-                }
-                Window::Behind | Window::InUse => self.open_video_again(ctx),
+        match window {
+            // The playback decoder first: the engine opens only beside it.
+            Window::InUse => {
+                self.open_video_again(ctx);
+                self.open_engine_again(ctx);
             }
-            match window {
-                Window::InUse => self.open_engine_again(ctx),
-                Window::Behind | Window::Hidden => self.let_go_of_engine(),
+            Window::Behind => {
+                self.let_go_of_engine();
+                self.open_video_again(ctx);
+            }
+            // The engine first: what it keeps can be on screen.
+            Window::Hidden => {
+                self.let_go_of_engine();
+                if !self.is_playing() && self.drawn_at.is_none_or(|t| t.elapsed() >= UNSEEN) {
+                    self.let_go_of_video();
+                }
             }
         }
         #[cfg(not(hw_decode))]
@@ -702,14 +714,21 @@ impl Player {
         self.motion = None;
         self.stood_in_for = None;
         self.engine_let_go = true;
-        // Its frames hold its decoders' textures: the one on screen (what
-        // draws the picture is kept, so it stays), those just off it, and
-        // those opened for drawing.
-        if std::mem::take(&mut self.engine_on_screen) {
-            self.on_screen = None;
+        // Windows: its frames on screen and just off it hold its decoders'
+        // textures (a pool each), and so does what opened them for drawing.
+        // They go: no decoder of its writes them again, and what draws the
+        // picture on screen keeps that one. Elsewhere the engine keeps
+        // playback's frames too (`scrub::KEEPS_PLAYBACK`): one taken for its
+        // own may be playback's, which would get it back to write over while
+        // it's still on screen. They stay till they're off it.
+        #[cfg(windows)]
+        {
+            if std::mem::take(&mut self.engine_on_screen) {
+                self.on_screen = None;
+            }
+            self.retired.retain(|(_, _, engine)| !engine);
+            self.gpu_frames.forget(&std::mem::take(&mut self.engine_pools));
         }
-        self.retired.clear();
-        self.gpu_frames = Default::default();
     }
 
     /// The scrub engine again, after [`Self::let_go_of_engine`]: opening
@@ -725,9 +744,10 @@ impl Player {
     }
 
     /// Let go of the playback decoder, paused while the window's out of
-    /// sight: its own textures (16 to 24 frames at the video's size: 133 MB
-    /// at 1440p) and its decoder's. The picture on screen stays (what draws
-    /// it is kept).
+    /// sight (after the engine: no decoder is left to write a frame again):
+    /// its own textures (16 to 24 frames at the video's size: 133 MB at
+    /// 1440p) and its decoder's, every frame held, and what opened them for
+    /// drawing. The picture on screen stays (what draws it is kept).
     #[cfg(hw_decode)]
     fn let_go_of_video(&mut self) {
         // None (let go of already), or broken: ffmpeg's frames meanwhile.
@@ -745,6 +765,8 @@ impl Player {
         self.engine_on_screen = false;
         self.retired.clear();
         self.gpu_frames = Default::default();
+        #[cfg(windows)]
+        self.engine_pools.clear();
     }
 
     /// The playback decoder again, after [`Self::let_go_of_video`], told
@@ -1475,6 +1497,9 @@ impl Player {
                 }
             }
         };
+        // Windows: its pool, opened for drawing as it goes on screen.
+        #[cfg(windows)]
+        let pool = p.gpu.as_ref().map(|s| s.key().0);
         #[cfg(not(target_os = "linux"))]
         let got = {
             let _ = speed;
@@ -1482,6 +1507,10 @@ impl Player {
             wanted
         };
         self.engine_on_screen = true;
+        #[cfg(windows)]
+        if let Some(pool) = pool.filter(|p| !self.engine_pools.contains(p)) {
+            self.engine_pools.push(pool);
+        }
         if debug() {
             self.scrub_stats.showed(t.elapsed().as_secs_f64());
         }
@@ -1625,16 +1654,17 @@ impl Player {
         /// Passes to hold a frame after it leaves the screen: more than the
         /// GPU ever runs behind.
         const HOLD: u64 = 4;
-        // The scrub engine's says so once it's on (`show_scrubbed`).
+        // Whether the one going was the scrub engine's; the next says so
+        // once it's on (`show_scrubbed`).
         #[cfg(hw_decode)]
-        {
-            self.engine_on_screen = false;
-        }
+        let engine = std::mem::take(&mut self.engine_on_screen);
+        #[cfg(not(hw_decode))]
+        let engine = false;
         let pass = ctx.cumulative_pass_nr();
         if let Some(old) = std::mem::replace(&mut self.on_screen, next) {
-            self.retired.push_back((pass, old));
+            self.retired.push_back((pass, old, engine));
         }
-        while self.retired.front().is_some_and(|(at, _)| pass >= at + HOLD) {
+        while self.retired.front().is_some_and(|(at, ..)| pass >= at + HOLD) {
             self.retired.pop_front();
         }
     }
