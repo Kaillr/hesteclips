@@ -173,6 +173,25 @@ pub fn tint_title_bar(window: &impl raw_window_handle::HasWindowHandle, caption:
     DONE.store(now, Ordering::Relaxed);
 }
 
+/// Windows: the window cloaked (`on`), or not: the desktop's compositor
+/// keeps a cloaked window off the screen (and out of the taskbar) while it's
+/// shown and drawn. See `App::start_in_tray`.
+#[cfg(target_os = "windows")]
+pub fn cloak(window: &impl raw_window_handle::HasWindowHandle, on: bool) {
+    use raw_window_handle::RawWindowHandle;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Graphics::Dwm::{DWMWA_CLOAK, DwmSetWindowAttribute};
+    use windows::core::BOOL;
+    let Ok(handle) = window.window_handle() else { return };
+    let RawWindowHandle::Win32(h) = handle.as_raw() else { return };
+    let hwnd = HWND(h.hwnd.get() as *mut _);
+    let on = BOOL::from(on);
+    // SAFETY: `hwnd` is our live top-level window; the attribute takes a BOOL.
+    unsafe {
+        let _ = DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, &on as *const _ as *const _, size_of::<BOOL>() as u32);
+    }
+}
+
 /// Which screen's keyboard shortcuts to show.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Keys {
@@ -668,13 +687,22 @@ impl App {
     }
 }
 
-/// The status dot: steady, with a soft ring breathing out from it.
+/// The status dot: steady, with a soft ring breathing out from it while
+/// the window has the focus (the window drawn 30 times a second for it).
+/// Without the focus (a game in front, say) it's the dot alone, which asks
+/// for no drawing: the ring kept a window that was on screen but not in use
+/// drawing 60 times a second while clipping (the 33 ms asked of egui came
+/// after 16, a frame's time taken off), 5-6% of a core more than with the
+/// window minimized.
 pub fn status_dot(painter: &egui::Painter, c: Pos2, color: Color32, time: f64) {
-    let t = (time % 1.6 / 1.6) as f32;
-    let ring = 4.0 + 6.0 * theme::ease_out(t);
-    painter.circle_filled(c, ring, theme::fade(color, 0.35 * (1.0 - t)));
+    let ctx = painter.ctx();
+    if ctx.input(|i| i.viewport().focused) == Some(true) {
+        let t = (time % 1.6 / 1.6) as f32;
+        let ring = 4.0 + 6.0 * theme::ease_out(t);
+        painter.circle_filled(c, ring, theme::fade(color, 0.35 * (1.0 - t)));
+        ui_kit::repaint_after(ctx, Duration::from_millis(33));
+    }
     painter.circle_filled(c, 4.0, color);
-    painter.ctx().request_repaint_after(Duration::from_millis(33));
 }
 
 /// Dragging this (empty) part of the window moves it: there's no title bar
@@ -736,5 +764,32 @@ mod tests {
             });
             out.textures_delta.clear();
         }
+    }
+
+    /// The status dot asks for the window to be drawn again (its ring
+    /// breathing) 30 times a second while it has the focus, and not at all
+    /// without it.
+    #[test]
+    fn the_dot_breathes_only_with_the_focus() {
+        let ctx = egui::Context::default();
+        let next_frame = |focused: Option<bool>| {
+            let mut raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(400.0, 300.0))), max_texture_side: Some(8192), ..Default::default() };
+            raw.viewports.insert(egui::ViewportId::ROOT, egui::ViewportInfo { focused, ..Default::default() });
+            let mut out = ctx.run_ui(raw, |ui| {
+                if focused.is_some() {
+                    status_dot(ui.painter(), Pos2::new(20.0, 20.0), Color32::RED, 0.4);
+                }
+            });
+            out.textures_delta.clear();
+            out.viewport_output[&egui::ViewportId::ROOT].repaint_delay
+        };
+        // Settled first: a new context asks for frames of its own.
+        for _ in 0..3 {
+            next_frame(None);
+        }
+        assert_eq!(next_frame(Some(false)), Duration::MAX, "without the focus");
+        let delay = next_frame(Some(true));
+        assert!(delay >= Duration::from_millis(30) && delay <= Duration::from_millis(34), "with it: {delay:?}");
+        assert_eq!(next_frame(Some(false)), Duration::MAX, "without it again");
     }
 }

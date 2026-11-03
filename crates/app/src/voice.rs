@@ -58,7 +58,14 @@ impl Voice {
         let c = collect.clone();
         std::thread::Builder::new()
             .name("voice".into())
-            .spawn(move || detector::run(rx, heard_tx, quick, live, ctx, p, c))
+            .spawn(move || {
+                // Behind the game, the app and capture: it runs its three
+                // models every 80 ms for as long as clipping runs. On a busy
+                // computer it hears the phrase a moment later, and the clip
+                // ends that much later.
+                crate::video::lower_priority();
+                detector::run(rx, heard_tx, quick, live, ctx, p, c)
+            })
             .expect("spawn voice thread");
         Self { listen, collect, heard, wanted: None, problem }
     }

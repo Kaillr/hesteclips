@@ -349,6 +349,16 @@ impl Editor {
         &self.target.clip
     }
 
+    /// What the window is doing, for what the player keeps open (see
+    /// [`crate::player::Window`]); the edit stays as it is. Not in use, the
+    /// last screen's player standing in until this one has a picture goes,
+    /// with all it has open. Whether anything was let go of just now.
+    pub fn set_window(&mut self, ctx: &egui::Context, window: crate::player::Window) -> bool {
+        let State::Ready(r) = &mut self.state else { return false };
+        let curtain = window != crate::player::Window::InUse && r.curtain.take().is_some();
+        r.player.set_window(ctx, window) || curtain
+    }
+
     /// The preview's share of the height, as last dragged (to remember it);
     /// none: fitted.
     pub fn preview_share(&self) -> Option<f32> {

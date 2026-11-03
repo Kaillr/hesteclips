@@ -194,6 +194,9 @@ fn main() -> eframe::Result<()> {
         .unwrap_or([1040.0, 700.0]);
     let viewport = egui::ViewportBuilder::default()
         .with_visible(!background)
+        // Windows: started with the computer, it takes the focus from nothing
+        // as it's drawn on its way to the tray (`App::start_in_tray`).
+        .with_active(!(background && cfg!(windows)))
         .with_inner_size(size)
         .with_min_inner_size([560.0, 420.0])
         .with_title("HasteClip")
@@ -214,12 +217,20 @@ fn main() -> eframe::Result<()> {
     let result = eframe::run_native(
         "HasteClip",
         options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
+            // Started with the computer, the window goes straight to the
+            // tray. eframe shows it once its first frame is drawn, whatever
+            // `with_visible` says: cloaked till it's there (Windows; see
+            // `App::start_in_tray`).
+            #[cfg(windows)]
+            if background {
+                shell::cloak(cc, true);
+            }
             gpu_frames::init(cc.wgpu_render_state.as_ref(), &cc.egui_ctx);
             #[cfg(target_os = "macos")]
             shell::centre_window_buttons(cc);
             ui_kit::apply(&cc.egui_ctx);
-            Ok(Box::new(App::new(cc.egui_ctx.clone(), instance)))
+            Ok(Box::new(App::new(cc.egui_ctx.clone(), instance, background)))
         }),
     );
     // The window couldn't open because a system library is missing: say
@@ -256,6 +267,8 @@ fn wgpu_options() -> eframe::egui_wgpu::WgpuConfiguration {
     // repaints continuously (Sources, with its meters and preview) spun at
     // ~7000 tries a second, and right after launch macOS never got to show the
     // window at all, so it stayed blank. Wait a display refresh first.
+    // (D3D12 hands a hidden window its frames all the same: in the tray it's
+    // minimized as well, see `hide_window`.)
     let default = options.on_surface_status.clone();
     options.on_surface_status = std::sync::Arc::new(move |status| {
         if matches!(status, eframe::wgpu::CurrentSurfaceTexture::Occluded) {
@@ -573,6 +586,26 @@ struct App {
     edit_return: Option<PathBuf>,
     /// The tray icon, where there is one: closing the window hides it there.
     tray: Option<tray::Tray>,
+    /// The window's hidden in the tray, until it's shown again.
+    in_tray: bool,
+    /// Windows, started with the computer: to go to the tray once its first
+    /// frame is drawn, and cloaked till it's there (see `start_in_tray`).
+    #[cfg(windows)]
+    to_tray: bool,
+    #[cfg(windows)]
+    cloaked: bool,
+    /// Windows: it was maximized as it went to the tray, to be again.
+    #[cfg(windows)]
+    tray_maximized: bool,
+    /// Since when the window hasn't been used: another has had the focus,
+    /// and nothing's been scrolled or pressed over this one.
+    unused_since: Option<Instant>,
+    /// The frame it went to the tray in: a later one drawn while it's used
+    /// says it's out (see `ui`).
+    tray_frame: u64,
+    /// Until when the renderer's settled while out of sight, after the
+    /// player or the editor let go of decoders (see `keep_open`).
+    settle_until: Option<Instant>,
     /// Quitting for real (closing mustn't just hide the window then).
     quitting: bool,
     /// The first close: ask whether to keep running in the tray.
@@ -619,7 +652,8 @@ struct App {
 }
 
 impl App {
-    fn new(ctx: egui::Context, instance: Option<std::net::TcpListener>) -> Self {
+    /// `background`: started with the computer, for the tray.
+    fn new(ctx: egui::Context, instance: Option<std::net::TcpListener>, background: bool) -> Self {
         add_symbol_font(&ctx);
         let settings = RecordSettings::load();
         let screen_placement = std::sync::Arc::new(std::sync::Mutex::new(settings.screen_placement()));
@@ -675,6 +709,11 @@ impl App {
             tray::serve(listener, &ctx, tray_tx.clone());
         }
         let tray = tray::Tray::new(&ctx, tray_tx, tray_rx, quick_save.clone());
+        // No tray icon to open it from: it shows after all.
+        #[cfg(windows)]
+        let to_tray = background && tray.is_some();
+        #[cfg(not(windows))]
+        let _ = background;
         let mut app = Self {
             page: Page::Clips,
             rec_state: RecState::Idle,
@@ -784,6 +823,16 @@ impl App {
             free_up_batches: Vec::new(),
             last_view: None,
             tray,
+            in_tray: false,
+            #[cfg(windows)]
+            to_tray,
+            #[cfg(windows)]
+            cloaked: background,
+            #[cfg(windows)]
+            tray_maximized: false,
+            unused_since: None,
+            tray_frame: 0,
+            settle_until: None,
             quitting: false,
             close_dialog: false,
             setup_open,
@@ -1102,18 +1151,23 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         let mut laps = Laps::start();
 
+        // Out of the tray, however it was shown (a dock; a desktop that
+        // minimized it instead, or wouldn't): drawn after the frame that sent
+        // it there, and used (the focus, or the pointer on it). On Windows
+        // it isn't drawn while it's there.
+        if self.in_tray
+            && ctx.cumulative_frame_nr() > self.tray_frame
+            && ctx.input(|i| {
+                i.viewport().focused == Some(true)
+                    || i.events.iter().any(|e| matches!(e, egui::Event::PointerMoved(_) | egui::Event::MouseWheel { .. } | egui::Event::PointerButton { .. }))
+            })
+        {
+            self.in_tray = false;
+        }
+
         self.navigate(&ctx);
         if let Some(action) = self.demo.as_mut().and_then(demo::Demo::take_action) {
             self.demo_action(action);
-        }
-
-        // A clip plays in its card on Clips only.
-        if self.page != Page::Clips {
-            self.hover_play = None;
-        }
-        // Hearing a microphone is for the Sources page only: never left on.
-        if self.page != Page::Sources {
-            self.listening = None;
         }
 
         // Left the viewer some other way (a hotkey that shows the library): stop it.
@@ -1251,31 +1305,6 @@ impl eframe::App for App {
         ui_kit::pointer_cursor(&ctx);
         ui_kit::lenient_clicks(&ctx);
         laps.lap("dialogs");
-
-        // Library auto-refresh: poll the output folder ~once a second and rescan only
-        // when it actually changed (cheap, no watcher thread).
-        let now = Instant::now();
-        if self.last_poll.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(1)) {
-            self.last_poll = Some(now);
-            self.permission = permission_now();
-            laps.lap("permission");
-            let stamp = clips::stamp(&self.settings.output_dir);
-            if stamp != self.library_stamp {
-                self.library_stamp = stamp;
-                self.refresh_clips();
-            }
-            laps.lap("library scan");
-            self.track_game();
-            self.update_presence();
-            laps.lap("game, discord");
-            // Persist settings as they change; no Save button to forget.
-            let json = self.settings.to_json();
-            if json != self.saved_settings && self.persist_settings {
-                RecordSettings::save_json(&json);
-                self.saved_settings = json;
-            }
-            laps.lap("settings");
-        }
         laps.report();
 
         // Keep repainting: every frame while capturing (live timer), else a steady
@@ -1299,7 +1328,8 @@ impl eframe::App for App {
     }
 
     /// What runs every frame whether the window shows or not (it's hidden
-    /// in the tray): shortcuts, voice, capture events, saves and uploads.
+    /// in the tray): shortcuts, voice, capture events, saves and uploads,
+    /// and once a second the library, the game, Discord and the settings.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // From the first frame, so the press that starts a drag out is heard.
         #[cfg(target_os = "linux")]
@@ -1384,9 +1414,22 @@ impl eframe::App for App {
                 self.save_clip();
             }
         }
+        // A clip plays in its card on Clips only, and hearing a microphone is
+        // for the Sources page only: never left on. Here, not in the UI: in
+        // the tray only this runs, and going there leaves Sources for Clips.
+        if self.page != Page::Clips {
+            self.hover_play = None;
+        }
+        if self.page != Page::Sources {
+            self.listening = None;
+        }
+        #[cfg(windows)]
+        self.start_in_tray(ctx, _frame);
         self.background(ctx);
         self.pump_tray(ctx);
         self.handle_close(ctx);
+        self.every_second();
+        self.keep_open(ctx);
         // A steady tick, also while hidden (nothing else wakes it then).
         ctx.request_repaint_after(if self.rec_state != RecState::Idle { Duration::from_millis(100) } else { Duration::from_millis(300) });
     }
@@ -1398,8 +1441,120 @@ impl eframe::App for App {
     }
 }
 
+/// Not used this long (another window has the focus, a game say, and
+/// nothing's scrolled or pressed over this one), the player and the editor
+/// let go of the scrub engine (`App::keep_open`): long enough that looking
+/// something up and coming back finds it open, and it's opened again in a
+/// moment anyway (scrubbing goes through the playback decoder meanwhile).
+const BEHIND_FOR: Duration = Duration::from_secs(10);
+
 // --- Running in the background: the tray, closing the window ---
 impl App {
+    /// Windows, started with the computer: the window opened cloaked (see
+    /// `main`), kept off the screen and out of the taskbar while eframe
+    /// draws its first frame and shows it (as it does whatever was asked);
+    /// it's hidden in the tray at the end of that frame, then uncloaked. Shown
+    /// from the tray, it comes up with that frame, not blank: minimized
+    /// before its first frame instead, it had never been drawn, and making a
+    /// hidden window minimized showed it a moment (a taskbar button at
+    /// login). Without a tray icon to open it from, it's uncloaked at once,
+    /// and shows.
+    #[cfg(windows)]
+    fn start_in_tray(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        if std::mem::take(&mut self.to_tray) {
+            self.hide_window(ctx);
+            return;
+        }
+        // In the tray now (minimized there), or not going there.
+        if self.cloaked && (!self.in_tray || ctx.input(|i| i.viewport().minimized == Some(true))) {
+            shell::cloak(frame, false);
+            self.cloaked = false;
+        }
+    }
+
+    /// About once a second, shown or not (in the tray only `logic` runs):
+    /// the library rescanned when its folders changed, the game being
+    /// clipped and what Discord shows, and the settings saved.
+    fn every_second(&mut self) {
+        let now = Instant::now();
+        if self.last_poll.is_some_and(|t| now.duration_since(t) < Duration::from_secs(1)) {
+            return;
+        }
+        let mut laps = Laps::start();
+        self.last_poll = Some(now);
+        self.permission = permission_now();
+        laps.lap("permission");
+        // Rescanned only when a folder actually changed (cheap, no watcher thread).
+        let stamp = clips::stamp(&self.settings.output_dir);
+        if stamp != self.library_stamp {
+            self.library_stamp = stamp;
+            self.refresh_clips();
+        }
+        laps.lap("library scan");
+        self.track_game();
+        self.update_presence();
+        laps.lap("game, discord");
+        // Persist settings as they change; no Save button to forget.
+        let json = self.settings.to_json();
+        if json != self.saved_settings && self.persist_settings {
+            RecordSettings::save_json(&json);
+            self.saved_settings = json;
+        }
+        laps.lap("settings");
+        laps.report();
+    }
+
+    /// What the player and the editor keep open, by what the window is
+    /// doing (see `player::Window`): everything while it's used; the scrub
+    /// engine goes once it hasn't been for [`BEHIND_FOR`] (a game in front);
+    /// out of sight (minimized, in the tray) the playback decoder too, and a
+    /// card's preview in the library.
+    fn keep_open(&mut self, ctx: &egui::Context) {
+        let (minimized, used) = ctx.input(|i| {
+            // The focus, or the wheel or a button over it: Windows scrolls the
+            // window under the pointer, focused or not (a clip on another
+            // screen scrubbed with the wheel, a game in focus). A pointer
+            // only passing over it on its way elsewhere doesn't count.
+            let touched = i.events.iter().any(|e| matches!(e, egui::Event::MouseWheel { .. } | egui::Event::PointerButton { pressed: true, .. }));
+            (i.viewport().minimized == Some(true), i.viewport().focused == Some(true) || touched)
+        });
+        if used {
+            self.unused_since = None;
+        } else if self.unused_since.is_none() {
+            self.unused_since = Some(Instant::now());
+        }
+        // Not a development test instance's: its window is often behind the
+        // terminal it was started from while it's measured.
+        let behind = self.persist_settings && self.unused_since.is_some_and(|t| t.elapsed() >= BEHIND_FOR);
+        let window = if self.in_tray || minimized {
+            player::Window::Hidden
+        } else if behind {
+            player::Window::Behind
+        } else {
+            player::Window::InUse
+        };
+        let mut let_go = window == player::Window::Hidden && self.hover_play.take().is_some();
+        if let Some(v) = &mut self.viewer {
+            let_go |= v.set_window(ctx, window);
+        }
+        if let Some(e) = &mut self.editor {
+            let_go |= e.set_window(ctx, window);
+        }
+        // Out of sight nothing's drawn, so nothing has the renderer (or the
+        // driver) let go of what was let go of: settled for a few seconds,
+        // as the decoders close (each finishes the frame it's on first).
+        let now = Instant::now();
+        if let_go {
+            if player::debug() {
+                eprintln!("{:>8.3} app: decoders let go of, settling the renderer", player::uptime());
+            }
+            self.settle_until = Some(now + Duration::from_secs(3));
+        }
+        if window == player::Window::Hidden && self.settle_until.is_some_and(|t| now < t) {
+            gpu_frames::settle();
+        }
+    }
+
     fn background(&mut self, ctx: &egui::Context) {
         // Global shortcuts: these fire even while a game is focused. Paused while
         // the Settings recorder listens, so pressing the current key rebinds it
@@ -1539,10 +1694,13 @@ impl App {
 
     fn hide_window(&mut self, ctx: &egui::Context) {
         // Nothing to watch while hidden: stop playing, close the preview.
+        // (The editor keeps its edit, and lets go of its decoders: `keep_open`.)
         if matches!(self.page, Page::View | Page::Sources) {
             self.viewer = None;
             self.page = Page::Clips;
         }
+        self.in_tray = true;
+        self.tray_frame = ctx.cumulative_frame_nr();
         // Wayland can't hide a window: KWin is asked to; elsewhere on
         // Wayland it can only be minimized.
         #[cfg(target_os = "linux")]
@@ -1554,10 +1712,22 @@ impl App {
             }
             return;
         }
+        // Windows: minimized as well. Windows never tells eframe a hidden
+        // window is hidden, so it went on drawing it, every 100 ms while
+        // anything asked for a frame (all the time while clipping); a
+        // minimized one gets no drawing at all, only `logic`. Minimized
+        // first: hidden first, winit would show a maximized window again
+        // to minimize it.
+        #[cfg(windows)]
+        {
+            self.tray_maximized = ctx.input(|i| i.viewport().maximized == Some(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
     }
 
     fn show_window(&mut self, ctx: &egui::Context) {
+        self.in_tray = false;
         // Nor bring one to the front: KWin is asked to.
         #[cfg(target_os = "linux")]
         if kwin_window::available() {
@@ -1565,8 +1735,16 @@ impl App {
             ctx.request_repaint();
             return;
         }
+        // Restored too, where the tray minimizes it (`hide_window`).
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        // Maximized again if it was: opened started with the computer, it's
+        // shown without taking the focus (see `main`), which Windows does by
+        // restoring it to its normal size.
+        #[cfg(windows)]
+        if std::mem::take(&mut self.tray_maximized) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+        }
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
     }
 
