@@ -92,7 +92,8 @@ pub fn yield_to_scrub() {
 }
 
 /// This thread yields to the game, the app and playback (background decoding
-/// and compressing: scrub frames, the filmstrip).
+/// and compressing: scrub frames, the filmstrip; listening for "HasteClip
+/// that").
 pub fn lower_priority() {
     #[cfg(windows)]
     unsafe {
