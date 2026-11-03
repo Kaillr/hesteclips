@@ -6,8 +6,14 @@
 //! can be set before the moment you want to clip.
 
 use std::sync::Arc;
+#[cfg(not(target_os = "linux"))]
+use std::sync::Mutex;
+#[cfg(not(target_os = "linux"))]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
+#[cfg(not(target_os = "linux"))]
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 #[cfg(not(target_os = "linux"))]
@@ -84,45 +90,259 @@ pub(crate) struct AudioCapture {
     /// One per source, in the order given.
     pub feeds: Vec<Arc<SourceFeed>>,
     #[cfg(not(target_os = "linux"))]
-    mics: Vec<Mic>,
+    mics: Mics,
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     system: Option<SystemAudio>,
 }
 
 /// A microphone source. Its device's sound goes into a feed of its own
 /// (at the device's rate) inside the source's, so the device can be switched
-/// while capturing: the source, and its track, stay.
+/// while capturing, or opened again after it stopped: the source, and its
+/// track, stay.
 #[cfg(not(target_os = "linux"))]
 struct Mic {
     id: String,
     device: String,
     feed: Arc<SourceFeed>,
     channel: Arc<crate::mixer::Channel>,
-    /// The device's stream and the feed it fills, while it's open.
-    open: Option<(cpal::Stream, Arc<SourceFeed>)>,
+    /// The device's stream, while it's open.
+    open: Option<OpenMic>,
+    /// From when it couldn't be opened or stopped until its sound comes
+    /// again: when to try opening it next.
+    retry: Option<Retry>,
+    /// The last thing the log said about it, so a mic that stays away (or
+    /// keeps stopping) is reported once, not at every try.
+    said: String,
+}
+
+/// A mic's open stream.
+#[cfg(not(target_os = "linux"))]
+struct OpenMic {
+    stream: cpal::Stream,
+    /// The feed it fills.
+    child: Arc<SourceFeed>,
+    health: Arc<MicHealth>,
+    /// Host time it was opened at.
+    opened: f64,
 }
 
 #[cfg(not(target_os = "linux"))]
 impl Mic {
-    fn open(&mut self) {
-        if let Some((stream, child)) = self.open.take() {
-            drop(stream);
-            self.feed.remove_child(&child);
+    /// Open its device (closing the stream it had), into a feed of its own:
+    /// Live, or Unavailable and why.
+    fn open(&mut self) -> Result<()> {
+        if let Some(open) = self.open.take() {
+            drop(open.stream);
+            self.feed.remove_child(&open.child);
         }
         let child = self.feed.add_child(native_rate(&SourceKind::Microphone { device: self.device.clone() }));
         child.mono_with(self.channel.mono_flag());
         child.denoise_with(self.channel.denoise_mode());
-        match start_mic(&self.device, child.clone()) {
+        let health = Arc::new(MicHealth::default());
+        let opened = host_now();
+        match start_mic(&self.device, child.clone(), health.clone()) {
             Ok(stream) => {
                 self.channel.set_status(SourceStatus::Live);
-                self.open = Some((stream, child));
+                self.open = Some(OpenMic { stream, child, health, opened });
+                Ok(())
             }
             Err(e) => {
-                eprintln!("microphone \"{}\": {e}", self.device);
                 self.feed.remove_child(&child);
                 self.channel.set_status(SourceStatus::Unavailable);
+                Err(e)
             }
         }
+    }
+
+    /// Open it as a new device: at once, and if it can't be, again later.
+    fn open_new(&mut self, now: Instant) {
+        self.retry = None;
+        self.said.clear();
+        if let Err(e) = self.open() {
+            self.say(format!("{e:#}"));
+            self.retry = Some(Retry::after(None, now));
+        }
+    }
+
+    /// Looked at every [`Mics::EVERY`]: a stream that stopped is closed, and
+    /// a mic that isn't open is opened again when its [`Retry`] says so.
+    fn watch(&mut self, now: Instant) {
+        if let Some(open) = &self.open {
+            if let Some(why) = open.health.stopped(open.opened, host_now()) {
+                self.say(format!("stopped ({why}); opening it again when it's back"));
+                let open = self.open.take().unwrap();
+                self.feed.remove_child(&open.child);
+                // Let go of on a thread of its own: a stream stuck in its
+                // driver would otherwise hold the other mics' watch up.
+                std::thread::spawn(move || drop(open.stream));
+                self.channel.set_status(SourceStatus::Unavailable);
+                // Soon after it worked; later and later while it keeps
+                // stopping before any sound comes.
+                self.retry = Some(Retry::after(self.retry, now));
+            } else if self.retry.is_some() && open.health.has_heard() {
+                self.retry = None;
+                self.say("live again".to_owned());
+            }
+        } else if self.retry.is_some_and(|r| r.due(now))
+            && let Err(e) = self.open()
+        {
+            self.say(format!("{e:#}"));
+            self.retry = Some(Retry::after(self.retry, now));
+        }
+    }
+
+    /// Log `line` about this mic, unless it's what was said last. Through
+    /// [`crate::log_later`]: the mics are locked meanwhile, and a mic switch
+    /// (from the UI) would wait for a line that waits for stderr.
+    fn say(&mut self, line: String) {
+        if line != self.said {
+            crate::eprintln_later!("{} microphone \"{}\": {line}", chrono::Local::now().format("%H:%M:%S"), self.device);
+            self.said = line;
+        }
+    }
+}
+
+/// The microphones of a capture, and a thread that keeps them open: a mic
+/// that stops (unplugged, a USB hiccup, a driver reset) is opened again by
+/// its name until it's back, its source and its track staying as they are.
+/// cpal doesn't: it ends the stream on such an error, and a device opened
+/// by name gets nothing that follows it.
+#[cfg(not(target_os = "linux"))]
+struct Mics {
+    list: Arc<Mutex<Vec<Mic>>>,
+    /// Dropped to stop the watch.
+    stop: Option<std::sync::mpsc::Sender<()>>,
+    watch: Option<JoinHandle<()>>,
+}
+
+#[cfg(not(target_os = "linux"))]
+impl Mics {
+    /// How often the watch looks at the mics.
+    const EVERY: Duration = Duration::from_millis(250);
+
+    fn start(list: Vec<Mic>) -> Self {
+        let watching = !list.is_empty();
+        let list = Arc::new(Mutex::new(list));
+        let (stop, stopped) = std::sync::mpsc::channel::<()>();
+        let mics = list.clone();
+        let watch = watching
+            .then(|| {
+                std::thread::Builder::new().name("mic watch".into()).spawn(move || {
+                    while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = stopped.recv_timeout(Self::EVERY) {
+                        let now = Instant::now();
+                        for mic in mics.lock().unwrap().iter_mut() {
+                            mic.watch(now);
+                        }
+                    }
+                })
+            })
+            .and_then(Result::ok);
+        Self { list, stop: Some(stop), watch }
+    }
+
+    /// Switch the mic of the source `id` to `device`. False if there's no
+    /// such mic.
+    fn set(&self, id: &str, device: &str) -> bool {
+        let mut list = self.list.lock().unwrap();
+        let Some(mic) = list.iter_mut().find(|m| m.id == id) else { return false };
+        if mic.device != device {
+            mic.device = device.to_owned();
+            mic.open_new(Instant::now());
+        }
+        true
+    }
+
+    /// Stop watching, and close every mic.
+    fn stop(&mut self) {
+        self.stop.take();
+        if let Some(watch) = self.watch.take() {
+            let _ = watch.join();
+        }
+        self.list.lock().unwrap().clear();
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl Drop for Mics {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// When to try again something that failed (opening a mic, starting a
+/// desktop or app sound stream): a second later, then twice as long after
+/// each failure in a row, up to every 10 s. Soon enough that a mic plugged
+/// back in is heard within seconds, without asking all the time for a
+/// device that's gone.
+#[cfg(not(target_os = "linux"))]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Retry {
+    at: Instant,
+    wait: Duration,
+}
+
+#[cfg(not(target_os = "linux"))]
+impl Retry {
+    const FIRST: Duration = Duration::from_secs(1);
+    const MOST: Duration = Duration::from_secs(10);
+
+    /// After a failure at `now`; `last` is the retry it failed at, if it
+    /// had already failed.
+    pub(crate) fn after(last: Option<Self>, now: Instant) -> Self {
+        let wait = last.map_or(Self::FIRST, |r| (r.wait * 2).min(Self::MOST));
+        Self { at: now + wait, wait }
+    }
+
+    pub(crate) fn due(&self, now: Instant) -> bool {
+        now >= self.at
+    }
+}
+
+/// How an open mic's stream is doing, from its callbacks. cpal ends a
+/// stream after an error (an unplugged device, a driver that resets) and
+/// says so once. Or, when a device just goes away, it can wait for its next
+/// sound forever without a word: sound that stops coming counts too.
+#[cfg(not(target_os = "linux"))]
+#[derive(Debug, Default)]
+struct MicHealth {
+    /// What its stream said when it ended.
+    ended: Mutex<Option<String>>,
+    /// Host time its sound last came at (`f64` bits; 0 until it first does).
+    heard: AtomicU64,
+}
+
+#[cfg(not(target_os = "linux"))]
+impl MicHealth {
+    /// No sound for this long means it stopped: a packet comes every 10 ms
+    /// on Windows (under 100 ms on a Mac), silent or not.
+    const STALLED: f64 = 2.0;
+    /// None at all this long after opening, too: a Bluetooth headset takes
+    /// a moment to switch its mic on.
+    const NEVER_CAME: f64 = 5.0;
+
+    fn heard(&self, now: f64) {
+        self.heard.store(now.to_bits(), Ordering::Relaxed);
+    }
+
+    fn has_heard(&self) -> bool {
+        self.heard.load(Ordering::Relaxed) != 0
+    }
+
+    fn end(&self, why: String) {
+        self.ended.lock().unwrap().get_or_insert(why);
+    }
+
+    /// Why it has stopped, if it has, at host time `now`; it was opened at
+    /// `opened`.
+    fn stopped(&self, opened: f64, now: f64) -> Option<String> {
+        if let Some(why) = self.ended.lock().unwrap().clone() {
+            return Some(why);
+        }
+        let heard = f64::from_bits(self.heard.load(Ordering::Relaxed));
+        if heard == 0.0 {
+            return (now - opened > Self::NEVER_CAME).then(|| format!("no sound came in {:.0} s", now - opened));
+        }
+        (now - heard > Self::STALLED).then(|| format!("no sound for {:.0} s", now - heard))
     }
 }
 
@@ -163,8 +383,16 @@ impl AudioCapture {
             match &source.kind {
                 #[cfg(not(target_os = "linux"))]
                 SourceKind::Microphone { device } => {
-                    let mut mic = Mic { id: source.id.clone(), device: device.clone(), feed: feed.clone(), channel, open: None };
-                    mic.open();
+                    let mut mic = Mic {
+                        id: source.id.clone(),
+                        device: device.clone(),
+                        feed: feed.clone(),
+                        channel,
+                        open: None,
+                        retry: None,
+                        said: String::new(),
+                    };
+                    mic.open_new(Instant::now());
                     mics.push(mic);
                 }
                 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
@@ -191,7 +419,7 @@ impl AudioCapture {
         Ok(Self {
             feeds,
             #[cfg(not(target_os = "linux"))]
-            mics,
+            mics: Mics::start(mics),
             #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
             system,
         })
@@ -202,11 +430,7 @@ impl AudioCapture {
     /// PipeWire stream, made again aimed at the new device.
     pub(crate) fn set_mic(&mut self, id: &str, device: &str) -> bool {
         #[cfg(not(target_os = "linux"))]
-        if let Some(mic) = self.mics.iter_mut().find(|m| m.id == id) {
-            if mic.device != device {
-                mic.device = device.to_owned();
-                mic.open();
-            }
+        if self.mics.set(id, device) {
             return true;
         }
         #[cfg(target_os = "linux")]
@@ -222,7 +446,7 @@ impl AudioCapture {
             own_sound::forget(feed);
         }
         #[cfg(not(target_os = "linux"))]
-        self.mics.clear();
+        self.mics.stop();
         #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
         if let Some(system) = self.system.take() {
             system.stop();
@@ -251,7 +475,7 @@ fn find_input(name: &str) -> Option<cpal::Device> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn start_mic(name: &str, feed: Arc<SourceFeed>) -> Result<cpal::Stream> {
+fn start_mic(name: &str, feed: Arc<SourceFeed>, health: Arc<MicHealth>) -> Result<cpal::Stream> {
     let device = find_input(name).ok_or_else(|| anyhow::anyhow!("not connected"))?;
     let config = device.default_input_config()?;
     let channels = config.channels() as usize;
@@ -265,17 +489,33 @@ fn start_mic(name: &str, feed: Arc<SourceFeed>) -> Result<cpal::Stream> {
         cpal::SupportedBufferSize::Range { min, max } => cpal::BufferSize::Fixed(backlog.clamp(*min, *max)),
         cpal::SupportedBufferSize::Unknown => cpal::BufferSize::Fixed(backlog),
     };
+    let errors = mic_errors(name.to_owned(), health.clone());
     let stream = device.build_input_stream::<f32, _, _>(
         stream_config,
         move |data, info| {
+            health.heard(host_now());
             let start = info.timestamp().capture.as_nanos() as f64 / 1e9;
             feed.push(start, data, channels);
         },
-        quiet_xruns(name.to_owned()),
+        errors,
         None,
     )?;
     stream.play()?;
     Ok(stream)
+}
+
+/// A recording mic's error handler: an error that ends its stream goes to
+/// `health` (the mics' watch then opens it again, see [`Mics`]); the rest
+/// to [`quiet_xruns`]. Every error ends the stream but a dropout, the
+/// default device changing (the stream follows it) and being refused
+/// real-time priority: cpal stops reading after any other.
+#[cfg(not(target_os = "linux"))]
+fn mic_errors(name: String, health: Arc<MicHealth>) -> impl FnMut(cpal::Error) + Send + 'static {
+    let mut others = quiet_xruns(name);
+    move |e| match e.kind() {
+        cpal::ErrorKind::Xrun | cpal::ErrorKind::DeviceChanged | cpal::ErrorKind::RealtimeDenied => others(e),
+        _ => health.end(e.to_string()),
+    }
 }
 
 /// The mic's error handler. Windows marks the first packets after a stream
@@ -540,6 +780,57 @@ mod tests {
     #[test]
     fn no_sources_no_tracks() {
         assert_eq!(track_layout(&[]).0.len(), 0);
+    }
+
+    /// A mic that's gone is tried again a second later, then less and less
+    /// often, down to every 10 s.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn retries_wait_longer_each_time_up_to_ten_seconds() {
+        let t = Instant::now();
+        let mut retry = Retry::after(None, t);
+        assert!(!retry.due(t + Duration::from_millis(999)));
+        assert!(retry.due(t + Duration::from_secs(1)));
+        let mut waits = Vec::new();
+        for _ in 0..6 {
+            retry = Retry::after(Some(retry), t);
+            waits.push((retry.at - t).as_secs());
+        }
+        assert_eq!(waits, [2, 4, 8, 10, 10, 10]);
+    }
+
+    /// An error that ends the stream (unplugged) stops the mic, and its
+    /// message says why; a dropout, or the default device changing, doesn't.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn a_mic_stops_on_an_error_that_ends_its_stream() {
+        let health = Arc::new(MicHealth::default());
+        let mut errors = mic_errors("test mic".into(), health.clone());
+        health.heard(100.0);
+        errors(cpal::Error::new(cpal::ErrorKind::Xrun));
+        errors(cpal::Error::new(cpal::ErrorKind::DeviceChanged));
+        assert_eq!(health.stopped(99.0, 100.5), None);
+        errors(cpal::Error::with_message(cpal::ErrorKind::DeviceNotAvailable, "unplugged"));
+        errors(cpal::Error::with_message(cpal::ErrorKind::BackendError, "and then this"));
+        assert_eq!(health.stopped(99.0, 100.5).as_deref(), Some("unplugged"), "the first error is the reason");
+    }
+
+    /// cpal can wait forever for a device that went away, without an error:
+    /// no sound for 2 s stops the mic too, and none 5 s after opening.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn a_mic_whose_sound_stops_coming_has_stopped() {
+        let health = MicHealth::default();
+        // Opened at 100 s, nothing yet: a moment to start.
+        assert_eq!(health.stopped(100.0, 104.9), None);
+        assert!(health.stopped(100.0, 105.1).is_some());
+        // Sound every 10 ms, then none.
+        for k in 0..100 {
+            health.heard(105.0 + k as f64 * 0.01);
+        }
+        assert!(health.has_heard());
+        assert_eq!(health.stopped(100.0, 107.9), None);
+        assert_eq!(health.stopped(100.0, 108.1).as_deref(), Some("no sound for 2 s"));
     }
 
     #[test]
