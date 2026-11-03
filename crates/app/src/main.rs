@@ -1125,15 +1125,6 @@ impl eframe::App for App {
             self.demo_action(action);
         }
 
-        // A clip plays in its card on Clips only.
-        if self.page != Page::Clips {
-            self.hover_play = None;
-        }
-        // Hearing a microphone is for the Sources page only: never left on.
-        if self.page != Page::Sources {
-            self.listening = None;
-        }
-
         // Left the viewer some other way (a hotkey that shows the library): stop it.
         if self.page != Page::View && self.viewer.is_some() {
             self.viewer = None;
@@ -1377,6 +1368,15 @@ impl eframe::App for App {
                 eprintln!("dev: saving a clip");
                 self.save_clip();
             }
+        }
+        // A clip plays in its card on Clips only, and hearing a microphone is
+        // for the Sources page only: never left on. Here, not in the UI: in
+        // the tray only this runs, and going there leaves Sources for Clips.
+        if self.page != Page::Clips {
+            self.hover_play = None;
+        }
+        if self.page != Page::Sources {
+            self.listening = None;
         }
         self.background(ctx);
         self.pump_tray(ctx);
