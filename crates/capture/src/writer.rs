@@ -148,9 +148,17 @@ struct Ring {
     items: VecDeque<(f64, Media)>,
     /// How much to keep: the replay window plus room to start on a keyframe.
     keep: f64,
+    /// Everything from this time on is kept too, whatever `keep` says: what
+    /// clips waiting for their sound need (see [`Asked::hold`]). A replay
+    /// window shortened while one waited trimmed its start away.
+    hold: Option<f64>,
 }
 
 impl Ring {
+    fn new(keep: f64) -> Self {
+        Self { items: VecDeque::new(), keep, hold: None }
+    }
+
     fn push(&mut self, media: Media) {
         let t = media_time(&media);
         let key = matches!(media, Media::Video { key: true, .. });
@@ -164,10 +172,11 @@ impl Ring {
         // runs late, and when video stalls, audio newer than the next keyframe
         // arrives before it. (Trimming by position then could never get past
         // such a packet, and looped forever.) Once per keyframe keeps it cheap.
+        let keep = self.hold.map_or(self.keep, |hold| self.keep.max(t - hold));
         let cut = self
             .items
             .iter()
-            .filter(|(k, m)| matches!(m, Media::Video { key: true, .. }) && t - *k >= self.keep)
+            .filter(|(k, m)| matches!(m, Media::Video { key: true, .. }) && t - *k >= keep)
             .map(|(k, _)| *k)
             .fold(None, |a: Option<f64>, k| Some(a.map_or(k, |a| a.max(k))));
         if let Some(cut) = cut {
@@ -262,6 +271,13 @@ impl Asked {
         self.0.iter().map(|a| a.until).min()
     }
 
+    /// The time from which the ring keeps everything for the clips waiting
+    /// ([`Ring::hold`]): the earliest one's start, with the room to start on
+    /// a keyframe that the window's own keep has.
+    fn hold(&self) -> Option<f64> {
+        self.0.iter().map(|a| a.end - a.seconds - 2.0).reduce(f64::min)
+    }
+
     /// The clips that are ready at `now`, each with what's in it.
     fn ready(&mut self, ring: &Ring, audio_tracks: usize, now: Instant) -> Vec<(Ask, Vec<(f64, Media)>)> {
         if self.0.is_empty() {
@@ -281,7 +297,7 @@ impl Asked {
 }
 
 fn replay_loop(rx: Receiver<Command>, window: f64, layout: Layout, fps: u32) -> Result<()> {
-    let mut ring = Ring { items: VecDeque::new(), keep: window + 2.0 };
+    let mut ring = Ring::new(window + 2.0);
     let tracks = layout.audio_tracks();
     let mut asked = Asked::default();
     let mut saves: Vec<JoinHandle<()>> = Vec::new();
@@ -318,6 +334,7 @@ fn replay_loop(rx: Receiver<Command>, window: f64, layout: Layout, fps: u32) -> 
         for (ask, items) in asked.ready(&ring, tracks, Instant::now()) {
             save(ask, items);
         }
+        ring.hold = asked.hold();
     }
     // The capture stopped (its sound is all in): clips still waiting get
     // what there is.
@@ -384,7 +401,7 @@ mod tests {
         let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let done2 = done.clone();
         let t = std::thread::spawn(move || {
-            let mut ring = Ring { items: VecDeque::new(), keep: 2.0 };
+            let mut ring = Ring::new(2.0);
             ring.push(video(0.0, true));
             ring.push(audio(3.5)); // ahead of the stalled video
             for k in 1..=10 {
@@ -408,7 +425,7 @@ mod tests {
     /// about that long rather than up to a keyframe interval longer.
     #[test]
     fn clip_starts_at_the_nearest_keyframe() {
-        let mut ring = Ring { items: VecDeque::new(), keep: 32.0 };
+        let mut ring = Ring::new(32.0);
         // 60 fps, a keyframe every second; ends at 40.65 s.
         for k in 0..=2439 {
             let t = k as f64 / 60.0;
@@ -459,7 +476,7 @@ mod tests {
     /// its sound up to there: not 0.4 s before, and nothing after.
     #[test]
     fn clip_waits_for_its_sound() {
-        let mut ring = Ring { items: VecDeque::new(), keep: 12.0 };
+        let mut ring = Ring::new(12.0);
         let mut pushed = (0, 0);
         play(&mut ring, &mut pushed, 20.0, true);
         let end = ring.newest_video().unwrap();
@@ -488,7 +505,7 @@ mod tests {
     /// at the most, then ends where the sound got to, as it did.
     #[test]
     fn clip_without_its_sound_is_cut_where_it_got_to() {
-        let mut ring = Ring { items: VecDeque::new(), keep: 12.0 };
+        let mut ring = Ring::new(12.0);
         let mut pushed = (0, 0);
         play(&mut ring, &mut pushed, 20.0, true);
         let (end, got_to) = (ring.newest_video().unwrap(), ring.reached(2, f64::INFINITY).unwrap());
@@ -502,5 +519,30 @@ mod tests {
         let (video, sound) = ends(&ready[0].1);
         assert!(video <= got_to && video > got_to - 1.0 / 60.0, "pictures to {video}, sound got to {got_to}");
         assert_eq!(sound, [got_to; 2]);
+    }
+
+    /// The replay window shortened (30 s to 5) while a 30 s clip waits for
+    /// its sound: the ring still has all of the clip when it's taken, and
+    /// keeps only the new window after.
+    #[test]
+    fn a_waiting_clip_keeps_its_start_when_the_window_shrinks() {
+        let mut ring = Ring::new(32.0);
+        let mut pushed = (0, 0);
+        play(&mut ring, &mut pushed, 40.0, true);
+        let end = ring.newest_video().unwrap();
+        let now = Instant::now();
+        let mut asked = Asked::default();
+        asked.0.push(Ask { out: PathBuf::new(), seconds: 30.0, done: mpsc::channel().0, end, until: now + Asked::WAIT });
+        ring.hold = asked.hold();
+        ring.keep = 5.0 + 2.0;
+        // Its sound comes in while pictures (and a keyframe, at 41 s) do.
+        play(&mut ring, &mut pushed, 41.2, true);
+        let ready = asked.ready(&ring, 2, now);
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].1[0].0, 10.0, "from the keyframe 30 s back");
+        assert_eq!(ends(&ready[0].1).0, end);
+        ring.hold = asked.hold();
+        play(&mut ring, &mut pushed, 42.2, true);
+        assert!(ring.items.front().unwrap().0 >= 42.0 - 7.0 - 1.0, "kept from {}", ring.items.front().unwrap().0);
     }
 }
