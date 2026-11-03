@@ -36,10 +36,14 @@ use crate::EncodeSettings;
 use crate::mp4mux::{AvcConfig, annexb_to_avcc};
 use crate::writer::{Command, Media};
 
-/// Frames waiting for the encoder before the pacer starts dropping them:
-/// enough for the pacer's bursts after a stall at high rates (4 skipped 10%
-/// of a 540 fps recording; 8, 0.4%). A guess beyond that.
-const QUEUE: usize = 8;
+/// Frames waiting for the encoder before the pacer starts dropping them, at
+/// `fps`: a tenth of a second's, at least 8 (enough for the pacer's bursts
+/// after a stall at high rates: 4 skipped 10% of a 540 fps recording; 8,
+/// 0.4%), at most 24. Measured at 240 fps: the encoder now and then held a
+/// frame 43 ms, and 8 frames (33 ms) overflowed, 18 dropped at once.
+fn queue_len(fps: u32) -> usize {
+    (fps as usize / 10).clamp(8, 24)
+}
 
 /// One frame to encode: pool slot `slot`, presented at `n / fps`.
 pub(crate) struct Frame {
@@ -81,9 +85,11 @@ impl Encoder {
         // Enough to ride out the GPU being taken by a game for a while: even
         // with our raised GPU priority (`d3d::raise_gpu_priority`), CS2 kept
         // a frame's work waiting up to ~230 ms now and then; 8 frames (133 ms
-        // at 60 fps) ran out and frames were skipped. ~3 MB each at 1080p.
-        let pool = TexturePool::new(gpu, width, height, 16)?;
-        let (tx, rx) = mpsc::sync_channel::<Frame>(QUEUE);
+        // at 60 fps) ran out and frames were skipped. The queue's and 8 more:
+        // 16 at 60 fps, 32 from 240 fps up. ~3 MB each at 1080p.
+        let queue = queue_len(setup.fps);
+        let pool = TexturePool::new(gpu, width, height, queue + 8)?;
+        let (tx, rx) = mpsc::sync_channel::<Frame>(queue);
         let (ready_tx, ready_rx) = mpsc::channel::<Result<String>>();
         let failed = Arc::new(AtomicBool::new(false));
         let (gpu2, pool2, failed2) = (gpu.clone(), pool.clone(), failed.clone());
@@ -637,5 +643,15 @@ impl IMFAsyncCallback_Impl for Release_Impl {
         HELD_N.fetch_add(1, Relaxed);
         self.pool.give(self.slot);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// A tenth of a second's frames wait for the encoder, from 8 to 24.
+    #[test]
+    fn a_tenth_of_a_second_waits() {
+        let lens: Vec<usize> = [30, 60, 120, 240, 540].into_iter().map(super::queue_len).collect();
+        assert_eq!(lens, [8, 8, 12, 24, 24]);
     }
 }
