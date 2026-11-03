@@ -109,6 +109,9 @@ struct Mic {
     stream: Option<(cpal::Stream, Arc<SourceFeed>)>,
     /// How it's doing, and when to open it next.
     watch: Watch,
+    /// Counts the devices it's been given, so an open of one it no longer
+    /// has (switched while it was being opened) isn't kept.
+    generation: u64,
     /// The last thing the log said about it, so a mic that stays away (or
     /// keeps stopping) is reported once, not at every try.
     said: String,
@@ -204,14 +207,29 @@ struct OpenMic {
 
 #[cfg(not(target_os = "linux"))]
 impl Mic {
-    /// Open its device (closing the stream it had), into a feed of its own;
-    /// its status follows.
-    fn open(&mut self, now: Instant) {
+    /// Give it `device`, to be opened as a new device, closing what it had.
+    fn switch(&mut self, device: &str) {
+        self.device = device.to_owned();
+        self.generation += 1;
+        self.watch = Watch::new_device();
+        self.said.clear();
+        self.close();
+    }
+
+    /// Close its stream, if it's open. The stream is let go of on a thread
+    /// of its own: one stuck in its driver would hold up whoever closed it
+    /// (the mics' watch, a mic switch).
+    fn close(&mut self) {
         if let Some((stream, child)) = self.stream.take() {
-            drop(stream);
             self.feed.remove_child(&child);
+            std::thread::spawn(move || drop(stream));
         }
-        let open = match open_mic(&self.device, &self.feed, &self.channel) {
+    }
+
+    /// How opening its device went (see [`open_mic`]); its status follows.
+    fn opened(&mut self, open: Result<OpenMic>, now: Instant) {
+        self.close();
+        let open = match open {
             Ok(open) => {
                 self.stream = Some((open.stream, open.child));
                 Some((open.health, open.opened))
@@ -225,39 +243,30 @@ impl Mic {
         self.channel.set_status(status);
     }
 
-    /// Open it as a new device: at once, and if it can't be, again later.
-    fn open_new(&mut self, now: Instant) {
-        self.watch = Watch::new_device();
-        self.said.clear();
-        self.open(now);
-    }
-
-    /// Looked at every [`Mics::EVERY`]: a stream that stopped is closed, and
-    /// a mic that isn't open is opened again when its [`Retry`] says so.
-    fn look(&mut self, now: Instant) {
+    /// Looked at every [`Mics::EVERY`]: a stream that stopped is closed.
+    /// True if it isn't open and it's time to open it, which the caller
+    /// does (see [`Mics::pass`]).
+    fn look(&mut self, now: Instant) -> bool {
         match self.watch.look(now, host_now()) {
-            Look::Wait => {}
-            Look::Open => self.open(now),
+            Look::Wait => false,
+            Look::Open => true,
             Look::Close(why) => {
                 self.say(format!("stopped ({why}); opening it again when it's back"));
-                if let Some((stream, child)) = self.stream.take() {
-                    self.feed.remove_child(&child);
-                    // Let go of on a thread of its own: a stream stuck in its
-                    // driver would otherwise hold the other mics' watch up.
-                    std::thread::spawn(move || drop(stream));
-                }
+                self.close();
                 self.channel.set_status(SourceStatus::Unavailable);
+                false
             }
             Look::Back => {
                 self.channel.set_status(SourceStatus::Live);
                 self.say("live again".to_owned());
+                false
             }
         }
     }
 
     /// Log `line` about this mic, unless it's what was said last. Through
     /// [`crate::log_later`]: the mics are locked meanwhile, and a mic switch
-    /// (from the UI) would wait for a line that waits for stderr.
+    /// or stopping would wait for a line that waits for stderr.
     fn say(&mut self, line: String) {
         if line != self.said {
             crate::eprintln_later!("{} microphone \"{}\": {line}", chrono::Local::now().format("%H:%M:%S"), self.device);
@@ -274,9 +283,8 @@ impl Mic {
 #[cfg(not(target_os = "linux"))]
 struct Mics {
     list: Arc<Mutex<Vec<Mic>>>,
-    /// Dropped to stop the watch.
-    stop: Option<std::sync::mpsc::Sender<()>>,
-    watch: Option<JoinHandle<()>>,
+    /// Wakes the watch (a mic was switched); dropped to stop it.
+    wake: Option<std::sync::mpsc::Sender<()>>,
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -287,42 +295,73 @@ impl Mics {
     fn start(list: Vec<Mic>) -> Self {
         let watching = !list.is_empty();
         let list = Arc::new(Mutex::new(list));
-        let (stop, stopped) = std::sync::mpsc::channel::<()>();
+        let (wake, woken) = std::sync::mpsc::channel::<()>();
         let mics = list.clone();
-        let watch = watching
-            .then(|| {
-                std::thread::Builder::new().name("mic watch".into()).spawn(move || {
-                    while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = stopped.recv_timeout(Self::EVERY) {
-                        let now = Instant::now();
-                        for mic in locked(&mics).iter_mut() {
-                            mic.look(now);
-                        }
-                    }
-                })
-            })
-            .and_then(Result::ok);
-        Self { list, stop: Some(stop), watch }
+        if watching {
+            // Not waited for when the capture stops (see `stop`).
+            let _ = std::thread::Builder::new().name("mic watch".into()).spawn(move || {
+                while let Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) = woken.recv_timeout(Self::EVERY) {
+                    Self::pass(&mics, open_mic);
+                }
+            });
+        }
+        Self { list, wake: Some(wake) }
     }
 
-    /// Switch the mic of the source `id` to `device`. False if there's no
-    /// such mic.
+    /// One look at every mic, opening those that are due with `open`. They
+    /// are looked at with the list locked, and opened with it let go: an
+    /// open can take seconds (a Bluetooth headset, a USB device in a bad
+    /// state), and stopping the capture or switching a mic (which the app
+    /// does by itself when the default mic changes, on the thread that saves
+    /// clips) waited for the list meanwhile.
+    fn pass(list: &Mutex<Vec<Mic>>, open: impl Fn(&str, &SourceFeed, &crate::mixer::Channel) -> Result<OpenMic>) {
+        let now = Instant::now();
+        let due: Vec<_> = locked(list)
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(i, mic)| mic.look(now).then(|| (i, mic.generation, mic.device.clone(), mic.feed.clone(), mic.channel.clone())))
+            .collect();
+        for (i, generation, device, feed, channel) in due {
+            let opened = open(&device, &feed, &channel);
+            let mut mics = locked(list);
+            match mics.get_mut(i).filter(|mic| mic.generation == generation) {
+                Some(mic) => mic.opened(opened, Instant::now()),
+                // Stopped, or switched to another device, meanwhile: what
+                // was opened goes.
+                None => {
+                    drop(mics);
+                    if let Ok(open) = opened {
+                        feed.remove_child(&open.child);
+                        std::thread::spawn(move || drop(open.stream));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Switch the mic of the source `id` to `device`: the watch opens it,
+    /// woken now. False if there's no such mic.
     fn set(&self, id: &str, device: &str) -> bool {
         let mut list = locked(&self.list);
         let Some(mic) = list.iter_mut().find(|m| m.id == id) else { return false };
         if mic.device != device {
-            mic.device = device.to_owned();
-            mic.open_new(Instant::now());
+            mic.switch(device);
+            drop(list);
+            if let Some(wake) = &self.wake {
+                let _ = wake.send(());
+            }
         }
         true
     }
 
-    /// Stop watching, and close every mic.
+    /// Stop watching, and close every mic. The watch isn't waited for: in
+    /// the middle of opening a device, it can take seconds. It ends at once
+    /// otherwise; if not, once the open is done, letting go of what it
+    /// opened (the list is empty by then).
     fn stop(&mut self) {
-        self.stop.take();
-        if let Some(watch) = self.watch.take() {
-            let _ = watch.join();
-        }
-        locked(&self.list).clear();
+        self.wake.take();
+        let mics = std::mem::take(&mut *locked(&self.list));
+        drop(mics);
     }
 }
 
@@ -466,10 +505,12 @@ impl AudioCapture {
                         feed: feed.clone(),
                         channel,
                         stream: None,
-                        watch: Watch::default(),
+                        watch: Watch::new_device(),
+                        generation: 0,
                         said: String::new(),
                     };
-                    mic.open_new(Instant::now());
+                    let opened = open_mic(&mic.device, &mic.feed, &mic.channel);
+                    mic.opened(opened, Instant::now());
                     mics.push(mic);
                 }
                 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
@@ -920,6 +961,56 @@ mod tests {
         assert!(!mics.set("a mic", "another"));
         mics.stop();
         drop(mics);
+    }
+
+    /// The watch opens a mic with the list let go: an open that takes its
+    /// time holds up neither a mic switch nor stopping, and the outcome for
+    /// a device the mic no longer has isn't kept. (The opener here takes
+    /// 600 ms and finds nothing: no device is touched.)
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn a_slow_open_holds_up_neither_a_switch_nor_stopping() {
+        let live = LiveAudio::new();
+        let mic = Mic {
+            id: "mic".into(),
+            device: "a slow mic".into(),
+            feed: SourceFeed::new(crate::mixer::RATE, Arc::new(Clock::default())),
+            channel: live.channel("mic"),
+            stream: None,
+            watch: Watch::new_device(),
+            generation: 0,
+            said: String::new(),
+        };
+        let mut mics = Mics { list: Arc::new(Mutex::new(vec![mic])), wake: None };
+        let slow_pass = |list: Arc<Mutex<Vec<Mic>>>, opening: std::sync::mpsc::Sender<String>| {
+            std::thread::spawn(move || {
+                Mics::pass(&list, |device: &str, _: &SourceFeed, _: &crate::mixer::Channel| {
+                    opening.send(device.to_owned()).unwrap();
+                    std::thread::sleep(Duration::from_millis(600));
+                    Err(anyhow::anyhow!("not connected"))
+                })
+            })
+        };
+        let (opening, being_opened) = std::sync::mpsc::channel();
+        let pass = slow_pass(mics.list.clone(), opening);
+        assert_eq!(being_opened.recv().unwrap(), "a slow mic");
+        let t = Instant::now();
+        assert!(mics.set("mic", "another mic"));
+        assert!(t.elapsed() < Duration::from_millis(200), "the switch waited {:?}", t.elapsed());
+        pass.join().unwrap();
+        {
+            let list = locked(&mics.list);
+            assert_eq!(list[0].device, "another mic");
+            assert!(list[0].watch.new && list[0].watch.retry.is_none(), "the old device's outcome was kept: {:?}", list[0].watch);
+        }
+        let (opening, being_opened) = std::sync::mpsc::channel();
+        let pass = slow_pass(mics.list.clone(), opening);
+        assert_eq!(being_opened.recv().unwrap(), "another mic");
+        let t = Instant::now();
+        mics.stop();
+        assert!(t.elapsed() < Duration::from_millis(200), "stopping waited {:?}", t.elapsed());
+        pass.join().unwrap();
+        assert!(locked(&mics.list).is_empty());
     }
 
     /// A mic that's gone is tried again a second later, then less and less
