@@ -34,6 +34,7 @@ mod library_view;
 mod library_grid;
 mod links;
 mod glass;
+mod go_live;
 mod handoff;
 mod hover_play;
 #[cfg(target_os = "macos")]
@@ -327,13 +328,53 @@ pub(crate) enum Page {
     View,
 }
 
-/// What capture is currently doing. Replay buffer and manual recording are mutually
-/// exclusive in this simple model.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RecState {
-    Idle,
-    Buffering,
-    Recording,
+/// What capture is doing: clipping, recording and streaming, any of them at
+/// once, from the same capture (what it was started with stays while any of
+/// them runs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct RecState {
+    pub clipping: bool,
+    pub recording: bool,
+    pub streaming: bool,
+}
+
+impl RecState {
+    /// Nothing runs.
+    pub(crate) fn idle(self) -> bool {
+        !(self.clipping || self.recording || self.streaming)
+    }
+
+    fn of(r: capture::Running) -> Self {
+        Self { clipping: r.replay, recording: r.record, streaming: r.stream }
+    }
+
+    pub(crate) fn has(self, mode: capture::Mode) -> bool {
+        match mode {
+            capture::Mode::ReplayBuffer => self.clipping,
+            capture::Mode::Record => self.recording,
+            capture::Mode::Stream => self.streaming,
+        }
+    }
+
+    fn with(mut self, mode: capture::Mode, on: bool) -> Self {
+        match mode {
+            capture::Mode::ReplayBuffer => self.clipping = on,
+            capture::Mode::Record => self.recording = on,
+            capture::Mode::Stream => self.streaming = on,
+        }
+        self
+    }
+
+    /// What a setting fixed while capturing waits for, in words: "clipping",
+    /// "recording and streaming".
+    pub(crate) fn words(self) -> String {
+        let parts: Vec<&str> = [(self.clipping, "clipping"), (self.recording, "recording"), (self.streaming, "streaming")].into_iter().filter(|(on, _)| *on).map(|(_, w)| w).collect();
+        match parts.as_slice() {
+            [] => String::new(),
+            [one] => (*one).to_owned(),
+            [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+        }
+    }
 }
 
 /// Quit from outside the UI's loop (a signal; the tray while the window's
@@ -431,8 +472,15 @@ const TOAST_FOR: Duration = Duration::from_millis(3200);
 struct App {
     pub(crate) page: Page,
     rec_state: RecState,
-    /// When the current recording/buffer started (for the live timer).
+    /// When the recording, and the stream, started (for their timers).
     rec_started: Option<Instant>,
+    stream_started: Option<Instant>,
+    /// How each place streamed to is doing, shared with the stream, and what
+    /// it was last seen as (to say when that changes).
+    pub(crate) stream_status: std::sync::Arc<capture::stream::Status>,
+    stream_seen: Vec<capture::stream::DestinationStatus>,
+    /// The "Go live?" dialog is open.
+    pub(crate) go_live_open: bool,
     /// How the capture keeps up (frames skipped and pictures missed in its
     /// last whole second, frame blending), for the status by the recorder,
     /// and when that was last looked up.
@@ -489,6 +537,9 @@ struct App {
     capturing_sources: Vec<capture::sources::AudioSource>,
     /// The replay length the running capture keeps, to send it changes live.
     capturing_replay: Option<u32>,
+    /// Frame blending as the running capture does it (looks a frame, how
+    /// they're weighed), to send it changes live.
+    capturing_blend: Option<(u32, capture::BlendShape)>,
     /// Shown instead of a game or app while you're tabbed out.
     pub(crate) away_screen: std::sync::Arc<capture::StillImage>,
     /// Where the webcam sits, shared with a running capture so dragging it
@@ -734,8 +785,12 @@ impl App {
         let _ = background;
         let mut app = Self {
             page: Page::Clips,
-            rec_state: RecState::Idle,
+            rec_state: RecState::default(),
             rec_started: None,
+            stream_started: None,
+            stream_status: capture::stream::Status::new(),
+            stream_seen: Vec::new(),
+            go_live_open: false,
             health: None,
             health_at: None,
             saving: 0,
@@ -775,6 +830,7 @@ impl App {
             capturing_video: None,
             capturing_sources: Vec::new(),
             capturing_replay: None,
+            capturing_blend: None,
             away_screen: away::screen(),
             webcam_placement: std::sync::Arc::new(std::sync::Mutex::new(capture::webcam::Placement::default_for(16.0 / 9.0, 16.0 / 9.0))),
             screen_placement,
@@ -1051,7 +1107,21 @@ impl App {
             })),
             screen: self.screen_placement.clone(),
             sources: self.capture_sources(),
+            stream: self.stream_settings(),
         }
+    }
+
+    /// Where Go live sends the stream, and how: the destinations turned on
+    /// and set up, none if there are none.
+    fn stream_settings(&self) -> Option<capture::stream::StreamSettings> {
+        if !capture::STREAMING || self.settings.stream.ready().next().is_none() {
+            return None;
+        }
+        // Over RTMPS where a service has it and ffmpeg can (asked once,
+        // and only for a service that has it).
+        let rtmps = self.settings.stream.ready().any(|d| d.service.server(true) != d.service.server(false)) && capture::stream::rtmps();
+        let destinations: Vec<_> = self.settings.stream.ready().filter_map(|d| d.destination(rtmps)).collect();
+        (!destinations.is_empty()).then(|| capture::stream::StreamSettings { destinations, status: self.stream_status.clone() })
     }
 
     /// Keep the webcam's box, and the screen's when it's placed by hand,
@@ -1066,7 +1136,7 @@ impl App {
         // Asked again now and then too: a display's mode can change, or it
         // can be plugged in, under the same choice. Not while capturing: its
         // frame stays the size it started at, whatever's chosen meanwhile.
-        let capturing = self.rec_state != RecState::Idle;
+        let capturing = !self.rec_state.idle();
         if self.frame_size.as_ref().is_none_or(|(k, _, at)| !capturing && (*k != key || at.elapsed() > Duration::from_secs(2))) {
             let size = capture::frame_size(&key.0, key.1);
             self.frame_size = Some((key, size, Instant::now()));
@@ -1320,6 +1390,7 @@ impl eframe::App for App {
         self.link_dialog(&ctx);
         self.close_dialog(&ctx);
         self.keys_dialog(&ctx);
+        self.go_live_dialog(&ctx);
         #[cfg(target_os = "macos")]
         self.setup_dialog(&ctx);
         ui_kit::pointer_cursor(&ctx);
@@ -1329,7 +1400,7 @@ impl eframe::App for App {
 
         // Keep repainting: every frame while capturing (live timer), else a steady
         // tick so capture-thread events and folder changes are picked up promptly.
-        if self.rec_state != RecState::Idle || self.toast.is_some() {
+        if !self.rec_state.idle() || self.toast.is_some() {
             ctx.request_repaint_after(Duration::from_millis(100));
         } else {
             ctx.request_repaint_after(Duration::from_millis(300));
@@ -1369,7 +1440,7 @@ impl eframe::App for App {
         static SAVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if let Some(secs) = std::env::var("HASTECLIP_DEV_SAVE").ok().and_then(|s| s.parse::<f64>().ok())
             && launched.elapsed().as_secs_f64() > secs
-            && self.rec_state == RecState::Buffering
+            && self.rec_state.clipping
             && !SAVED.swap(true, std::sync::atomic::Ordering::Relaxed)
         {
             eprintln!("dev: saving a clip");
@@ -1418,7 +1489,7 @@ impl eframe::App for App {
         // clipping, and save a clip a second before quitting (to check
         // switching mid-clip).
         if let Some(every) = std::env::var("HASTECLIP_DEV_SWITCH").ok().and_then(|s| s.parse::<f64>().ok())
-            && self.rec_state == RecState::Buffering
+            && self.rec_state.clipping
         {
             static STEP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let step = (launched.elapsed().as_secs_f64() / every) as u64;
@@ -1453,7 +1524,7 @@ impl eframe::App for App {
         self.every_second();
         self.keep_open(ctx);
         // A steady tick, also while hidden (nothing else wakes it then).
-        ctx.request_repaint_after(if self.rec_state != RecState::Idle { Duration::from_millis(100) } else { Duration::from_millis(300) });
+        ctx.request_repaint_after(if !self.rec_state.idle() { Duration::from_millis(100) } else { Duration::from_millis(300) });
     }
 
     fn on_exit(&mut self) {
@@ -1626,27 +1697,23 @@ impl App {
         // Not while samples are played on the speakers: the detector would hear them.
         // (Never in a demo recording: it clips nothing, and the mic stays shut.)
         // While recording, it marks the moment.
-        let listen = self.settings.voice_clip && self.rec_state != RecState::Idle && self.recording_shortcut.is_none() && self.page != Page::VoiceReview && self.demo.is_none();
+        let listen = self.settings.voice_clip && (self.rec_state.clipping || self.rec_state.recording) && self.recording_shortcut.is_none() && self.page != Page::VoiceReview && self.demo.is_none();
         self.voice.collect(self.settings.voice_samples);
         let mic = listen.then(|| self.voice_mic()).flatten();
         self.voice.listen(mic.as_deref());
         self.pump_capture_events();
         self.follow_sessions();
-        let capturing = match self.rec_state {
-            RecState::Idle => games::Capturing::Off,
-            RecState::Buffering => games::Capturing::Buffer(self.settings.replay_seconds),
-            RecState::Recording => games::Capturing::Record,
-        };
+        let capturing = games::Capturing { buffer: self.rec_state.clipping.then_some(self.settings.replay_seconds), record: self.rec_state.recording };
         self.games.set(capturing, &self.listed_apps());
         self.games.events.set_options(self.settings.game_details.then(|| self.settings.game_titles.clone()));
-        let armed = (self.rec_state == RecState::Buffering && self.recording_shortcut.is_none()).then(|| service::Armed {
+        let armed = (self.rec_state.clipping && self.recording_shortcut.is_none()).then(|| service::Armed {
             library: self.settings.output_dir.clone(),
             folder_per_game: self.settings.folder_per_game,
             game_folders: self.settings.game_folders.clone(),
             sound: self.settings.save_sound.clone(),
         });
         self.quick_save.arm(armed);
-        let marking = (self.rec_state == RecState::Recording && self.recording_shortcut.is_none()).then(|| self.settings.save_sound.clone());
+        let marking = (self.rec_state.recording && self.recording_shortcut.is_none()).then(|| self.settings.save_sound.clone());
         self.quick_save.arm_marking(marking);
         let shot = (capture::SCREENSHOTS && self.recording_shortcut.is_none() && self.demo.is_none()).then(|| self.shot_armed());
         self.quick_save.arm_screenshot(shot);
@@ -1663,6 +1730,8 @@ impl App {
         self.sync_capture_video();
         self.sync_capture_mics();
         self.sync_capture_settings();
+        self.sync_capture_blend();
+        self.watch_stream();
         self.refit_boxes();
         // A locked button clicked anywhere: why, in a toast, as a locked
         // setting says it.
@@ -1695,7 +1764,7 @@ impl App {
     /// Do what the tray (or another launch) asked.
     fn pump_tray(&mut self, ctx: &egui::Context) {
         let Some(tray) = &self.tray else { return };
-        tray.update(self.rec_state == RecState::Buffering);
+        tray.update(self.rec_state.clipping);
         for cmd in tray.take() {
             match cmd {
                 tray::Cmd::Open => self.show_window(ctx),
@@ -1842,7 +1911,7 @@ impl App {
     /// How the capture kept up in its last whole second, for the status by
     /// the recorder: looked up a few times a second while capturing.
     fn track_health(&mut self) {
-        if self.rec_state == RecState::Idle {
+        if self.rec_state.idle() {
             (self.health, self.health_at) = (None, None);
             return;
         }
@@ -1954,7 +2023,7 @@ impl App {
     /// Follow the game being clipped, for Discord: the last one in focus, for
     /// as long as it's open.
     fn track_game(&mut self) {
-        if self.rec_state == RecState::Idle {
+        if self.rec_state.idle() {
             self.clipped_game = None;
             return;
         }
@@ -1991,14 +2060,19 @@ impl App {
     /// in it (Desktop without one), or the library itself with folders
     /// turned off.
     fn clip_folder(&self) -> PathBuf {
-        let game = if self.rec_state == RecState::Recording { self.games.recording_game() } else { self.games.clip_game() };
-        games::folder_for(&self.settings.output_dir, self.settings.folder_per_game, &self.settings.game_folders, game.as_deref())
+        games::folder_for(&self.settings.output_dir, self.settings.folder_per_game, &self.settings.game_folders, self.games.clip_game().as_deref())
+    }
+
+    /// Where the recording stopped now goes: as a clip, by the game in focus
+    /// longest while it ran.
+    fn recording_folder(&self) -> PathBuf {
+        games::folder_for(&self.settings.output_dir, self.settings.folder_per_game, &self.settings.game_folders, self.games.recording_game().as_deref())
     }
 
     /// Discord shows the game being clipped while capture runs (when turned
     /// on), and nothing without a game (see `discord.rs`).
     fn update_presence(&mut self) {
-        let game = self.clipped_game.as_ref().map(|(_, g, _)| g.clone()).filter(|_| self.settings.discord_presence && self.rec_state != RecState::Idle);
+        let game = self.clipped_game.as_ref().map(|(_, g, _)| g.clone()).filter(|_| self.settings.discord_presence && !self.rec_state.idle());
         let Some(game) = game else {
             self.presence_since = None;
             self.presence.set(None);
@@ -2009,7 +2083,7 @@ impl App {
             self.presence_since = Some((game.name.clone(), SystemTime::now()));
         }
         let since = self.presence_since.as_ref().map_or_else(SystemTime::now, |(_, at)| *at);
-        self.presence.set(Some(discord::Status { recording: self.rec_state == RecState::Recording, game, since }));
+        self.presence.set(Some(discord::Status { recording: self.rec_state.recording, streaming: self.rec_state.streaming, game, since }));
     }
 
     /// "Update ready", once a new version is downloaded: restarts into it. It
@@ -2020,10 +2094,12 @@ impl App {
             return;
         };
         ui.add_space(4.0);
-        let recording = self.rec_state == RecState::Recording;
-        let tip = if recording {
+        let recording = self.rec_state.recording || self.rec_state.streaming;
+        let tip = if self.rec_state.streaming {
+            format!("HasteClip {version} is ready. It installs when you quit, or restart once your stream is over.")
+        } else if recording {
             format!("HasteClip {version} is ready. It installs when you quit, or restart once your recording is done.")
-        } else if self.rec_state == RecState::Buffering {
+        } else if self.rec_state.clipping {
             let after = if self.settings.auto_start_buffer { "starts again, empty" } else { "stops" };
             format!("HasteClip {version} is ready. Click to restart into it now (clipping {after}), or it installs when you quit.")
         } else {
@@ -2077,7 +2153,7 @@ impl App {
     /// Open the editor on `clip`; from the player, `from` where it was, with
     /// what it hands over (refused while recording: then that's dropped).
     pub(crate) fn open_editor_at(&mut self, clip: PathBuf, from: Option<viewer::Resume>, handoff: Handoff) {
-        if self.rec_state == RecState::Recording {
+        if self.rec_state.recording {
             self.toast_error("Stop recording before editing a clip.");
             return;
         }
@@ -2466,29 +2542,37 @@ fn keep_date(path: &std::path::Path, made: Option<std::time::SystemTime>) {
     }
 }
 
+/// Names in a list as said: "Twitch", "Twitch and YouTube", "Twitch,
+/// YouTube and Kick".
+pub(crate) fn words_and(names: &[String]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
 fn file_stem(path: &std::path::Path) -> String {
     path.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
 // --- Capture actions ---
 impl App {
+    /// Clipping on or off; whatever else runs goes on.
     fn toggle_buffer(&mut self) {
-        match self.rec_state {
-            RecState::Idle => self.start_replay_buffer(),
-            RecState::Buffering => self.stop(),
-            RecState::Recording => {} // busy recording; ignore
+        if self.rec_state.clipping {
+            self.stop_clipping();
+        } else {
+            self.start_replay_buffer();
         }
     }
 
+    /// Recording on or off; clipping (and a stream) go on beside it.
     fn toggle_record(&mut self) {
-        match self.rec_state {
-            RecState::Idle => self.start_recording(),
-            RecState::Recording => self.stop(),
-            // One keypress should do what the user means: stop buffering, record.
-            RecState::Buffering => {
-                self.service.stop(None, games::Details::default());
-                self.start_recording();
-            }
+        if self.rec_state.recording {
+            self.stop_recording();
+        } else {
+            self.start_recording();
         }
     }
 
@@ -2513,10 +2597,10 @@ impl App {
                 }
             }
             demo::Action::Clipping(on) => {
-                if on && self.rec_state == RecState::Idle {
+                if on && !self.rec_state.clipping {
                     self.start_replay_buffer();
-                } else if !on && self.rec_state != RecState::Idle {
-                    self.stop();
+                } else if !on && self.rec_state.clipping {
+                    self.stop_clipping();
                 }
             }
             demo::Action::Shortcut(settings::ShortcutAction::ToggleBuffer) => self.toggle_buffer(),
@@ -2527,30 +2611,51 @@ impl App {
     }
 
     fn start_replay_buffer(&mut self) {
-        self.refresh_audio_devices();
-        self.capturing_video = Some(self.video_source());
-        self.capturing_sources = self.capture_sources();
-        self.capturing_replay = Some(self.settings.replay_seconds);
-        // Optimistic state; a State/Error event confirms or corrects it.
-        self.service.start(capture::Mode::ReplayBuffer, self.encode_settings());
-        self.rec_state = RecState::Buffering;
-        self.rec_started = Some(Instant::now());
-        self.frame_size = None;
+        self.start_mode(capture::Mode::ReplayBuffer);
     }
 
     fn start_recording(&mut self) {
-        self.refresh_audio_devices();
-        self.capturing_video = Some(self.video_source());
-        self.capturing_sources = self.capture_sources();
-        self.capturing_replay = Some(self.settings.replay_seconds);
-        self.service.start(capture::Mode::Record, self.encode_settings());
-        self.rec_state = RecState::Recording;
-        self.rec_started = Some(Instant::now());
-        self.frame_size = None;
+        self.start_mode(capture::Mode::Record);
+    }
+
+    /// Go live, to every destination set up (once it's been confirmed:
+    /// see `go_live_dialog`).
+    pub(crate) fn go_live(&mut self) {
+        if !capture::STREAMING || self.settings.stream.ready().next().is_none() {
+            return;
+        }
+        self.stream_seen.clear();
+        self.start_mode(capture::Mode::Stream);
+    }
+
+    /// Start `mode`. With nothing running, the capture starts with it, with
+    /// the settings as they are now (they stay while any of it runs).
+    fn start_mode(&mut self, mode: capture::Mode) {
+        if self.rec_state.has(mode) {
+            return;
+        }
+        if self.rec_state.idle() {
+            self.refresh_audio_devices();
+            self.capturing_video = Some(self.video_source());
+            self.capturing_sources = self.capture_sources();
+            self.capturing_blend = Some((self.settings.blend_samples(), self.settings.blend_shape.into()));
+            self.frame_size = None;
+        }
+        if mode == capture::Mode::ReplayBuffer {
+            self.capturing_replay = Some(self.settings.replay_seconds);
+        }
+        self.service.start(mode, self.encode_settings());
+        // Optimistic state; a State/Error event confirms or corrects it.
+        self.rec_state = self.rec_state.with(mode, true);
+        match mode {
+            capture::Mode::Record => self.rec_started = Some(Instant::now()),
+            capture::Mode::Stream => self.stream_started = Some(Instant::now()),
+            capture::Mode::ReplayBuffer => {}
+        }
     }
 
     fn save_clip(&mut self) {
-        if self.rec_state != RecState::Buffering {
+        if !self.rec_state.clipping {
             return;
         }
         // Its moment is taken at once; the Saved event lands it in the library.
@@ -2594,20 +2699,36 @@ impl App {
         self.saving += 1;
     }
 
-    fn stop(&mut self) {
-        let (mut dir, mut details) = (None, games::Details::default());
-        let recording = self.rec_state == RecState::Recording;
-        if recording {
-            self.saving += 1; // finishing the file
-            dir = Some(self.clip_folder());
-            details = self.games.recording_details();
+    pub(crate) fn stop_clipping(&mut self) {
+        self.stop_mode(capture::Mode::ReplayBuffer);
+    }
+
+    pub(crate) fn stop_recording(&mut self) {
+        self.stop_mode(capture::Mode::Record);
+    }
+
+    pub(crate) fn end_stream(&mut self) {
+        self.stop_mode(capture::Mode::Stream);
+    }
+
+    /// Stop `mode`; the rest goes on (the capture stops with the last).
+    fn stop_mode(&mut self, mode: capture::Mode) {
+        if !self.rec_state.has(mode) {
+            return;
         }
-        self.service.stop(dir, details);
-        self.rec_state = RecState::Idle;
-        self.rec_started = None;
-        // A session's recording took clipping's place: it comes back.
-        if recording && self.sessions.let_go() {
-            self.start_replay_buffer();
+        let (mut dir, mut details) = (None, games::Details::default());
+        if mode == capture::Mode::Record {
+            self.saving += 1; // finishing the file
+            dir = Some(self.recording_folder());
+            details = self.games.recording_details();
+            self.sessions.let_go();
+        }
+        self.service.stop(mode, dir, details);
+        self.rec_state = self.rec_state.with(mode, false);
+        match mode {
+            capture::Mode::Record => self.rec_started = None,
+            capture::Mode::Stream => self.stream_started = None,
+            capture::Mode::ReplayBuffer => {}
         }
     }
 
@@ -2617,11 +2738,10 @@ impl App {
     fn follow_sessions(&mut self) {
         let watching = self.settings.record_sessions && self.persist_settings && self.demo.is_none() && !self.setup_open && self.permission != capture::Permission::Denied;
         self.games.watch(watching);
-        let (recording, buffering) = (self.rec_state == RecState::Recording, self.rec_state == RecState::Buffering);
-        match self.sessions.step(watching, self.games.listed_open(), recording, buffering, Instant::now()) {
-            // Clipping gives way, as it does for the shortcut.
-            sessions::Do::Record => self.toggle_record(),
-            sessions::Do::Stop => self.stop(),
+        match self.sessions.step(watching, self.games.listed_open(), self.rec_state.recording, Instant::now()) {
+            // Clipping goes on beside it.
+            sessions::Do::Record => self.start_recording(),
+            sessions::Do::Stop => self.stop_recording(),
             sessions::Do::Nothing => {}
         }
     }
@@ -2629,7 +2749,7 @@ impl App {
     /// What to record (games and apps, the whole screen, which display)
     /// reaches a running capture right away; it switches without restarting.
     fn sync_capture_video(&mut self) {
-        if self.rec_state == RecState::Idle {
+        if self.rec_state.idle() {
             self.capturing_video = None;
             return;
         }
@@ -2644,7 +2764,7 @@ impl App {
     /// capture right away: its track stays, only where its sound comes from
     /// changes. Anything else about the sources waits for the next start.
     fn sync_capture_mics(&mut self) {
-        if self.rec_state == RecState::Idle {
+        if self.rec_state.idle() {
             return;
         }
         use capture::sources::SourceKind::Microphone;
@@ -2674,10 +2794,56 @@ impl App {
     /// The replay length reaches a running replay buffer right away. Not
     /// cleared while idle: the next start sends its own.
     fn sync_capture_settings(&mut self) {
-        if self.rec_state == RecState::Buffering && self.capturing_replay != Some(self.settings.replay_seconds) {
+        if self.rec_state.clipping && self.capturing_replay != Some(self.settings.replay_seconds) {
             self.service.set_replay_seconds(self.settings.replay_seconds);
             self.capturing_replay = Some(self.settings.replay_seconds);
         }
+    }
+
+    /// Frame blending reaches a running capture right away, where it can
+    /// change while capturing (`capture::BLEND_WHILE_CAPTURING`).
+    fn sync_capture_blend(&mut self) {
+        if self.rec_state.idle() {
+            self.capturing_blend = None;
+            return;
+        }
+        let now = (self.settings.blend_samples(), self.settings.blend_shape.into());
+        if capture::BLEND_WHILE_CAPTURING && self.capturing_blend != Some(now) {
+            self.service.set_blend(now.0, now.1);
+            self.capturing_blend = Some(now);
+        }
+    }
+
+    /// Say when a place streamed to goes live, drops, or can't be reached.
+    fn watch_stream(&mut self) {
+        use capture::stream::Link;
+        if !self.rec_state.streaming {
+            self.stream_seen.clear();
+            return;
+        }
+        let now = self.stream_status.get();
+        let was = |i: usize| self.stream_seen.get(i).map(|d| d.link);
+        let mut live = Vec::new();
+        let mut lost = None;
+        for (i, d) in now.iter().enumerate() {
+            match (was(i), d.link) {
+                (Some(Link::Live { .. }), Link::Live { .. }) => {}
+                (_, Link::Live { .. }) => live.push(d.name.clone()),
+                (Some(Link::Live { .. }), Link::Waiting { .. }) => lost = Some(format!("Lost the stream to {}. Trying again…", d.name)),
+                // Couldn't connect, the first time it tried.
+                (Some(Link::Connecting { attempt: 0 }) | None, Link::Waiting { .. }) => {
+                    let why = d.problem.as_deref().map(|p| format!(": {p}")).unwrap_or_default();
+                    lost = Some(format!("Couldn't reach {}{why}. Trying again…", d.name));
+                }
+                _ => {}
+            }
+        }
+        if let Some(text) = lost {
+            self.toast_error(text);
+        } else if !live.is_empty() {
+            self.toast_icon(egui_phosphor::regular::BROADCAST, format!("Live on {}", words_and(&live)));
+        }
+        self.stream_seen = now;
     }
 
     /// Drain capture-thread events each frame.
@@ -2685,18 +2851,25 @@ impl App {
         while let Some(evt) = self.service.poll() {
             match evt {
                 // Authoritative state from the capture thread — keeps the UI honest.
-                Evt::State(state) => {
-                    let new = match state {
-                        None => RecState::Idle,
-                        Some(capture::Mode::ReplayBuffer) => RecState::Buffering,
-                        Some(capture::Mode::Record) => RecState::Recording,
-                    };
-                    if new != self.rec_state {
-                        self.rec_started = (new != RecState::Idle).then(Instant::now);
+                Evt::State(running) => {
+                    let new = RecState::of(running);
+                    // Timed from when each started (as it was asked, if it was).
+                    if !new.recording {
+                        self.rec_started = None;
+                    } else if self.rec_started.is_none() {
+                        self.rec_started = Some(Instant::now());
+                    }
+                    if !new.streaming {
+                        self.stream_started = None;
+                    } else if self.stream_started.is_none() {
+                        self.stream_started = Some(Instant::now());
+                    }
+                    if new.idle() != self.rec_state.idle() {
                         self.frame_size = None;
                     }
+                    let stopped_recording = self.rec_state.recording && !new.recording;
                     self.rec_state = new;
-                    if new == RecState::Idle {
+                    if new.idle() || stopped_recording {
                         self.refresh_clips();
                     }
                 }
@@ -2799,4 +2972,24 @@ fn permission_now() -> capture::Permission {
             .expect("spawn permission thread");
     });
     NOW.lock().unwrap().unwrap_or_else(capture::screen_permission)
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+
+    /// What runs, said as a lock says it, and the state as the capture
+    /// reports it.
+    #[test]
+    fn what_runs_in_words() {
+        let s = |clipping, recording, streaming| RecState { clipping, recording, streaming };
+        assert!(s(false, false, false).idle());
+        assert_eq!(s(true, false, false).words(), "clipping");
+        assert_eq!(s(true, false, true).words(), "clipping and streaming");
+        assert_eq!(s(true, true, true).words(), "clipping, recording and streaming");
+        let r = RecState::of(capture::Running { replay: true, record: false, stream: true });
+        assert!(r.has(capture::Mode::Stream) && !r.has(capture::Mode::Record));
+        assert_eq!(r.with(capture::Mode::Stream, false), s(true, false, false));
+        assert_eq!(words_and(&["Twitch".into(), "YouTube".into(), "Kick".into()]), "Twitch, YouTube and Kick");
+    }
 }

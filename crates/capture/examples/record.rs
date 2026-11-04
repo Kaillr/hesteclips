@@ -128,6 +128,7 @@ default: {:?}", d.inputs.iter().map(|i| &i.name).collect::<Vec<_>>(), d.default_
             capture::ScreenPlacement { rect: rect.unwrap_or([0.0, 0.0, 1.0, 1.0]), framing, in_front: env("SCREEN_FRONT").is_some(), hidden: env("SCREEN_OFF").is_some(), crop, ..capture::ScreenPlacement::whole(framing) }
         })),
         sources: sources.clone(),
+        stream: None,
     })?;
     let secs: u64 = std::env::var("SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
     for tick in 0..secs * 2 {
@@ -157,7 +158,7 @@ default: {:?}", d.inputs.iter().map(|i| &i.name).collect::<Vec<_>>(), d.default_
             println!("save {}: {:?}", n + 1, pending.and_then(|p| p.finish()));
         }
     }
-    println!("{:?}", rec.stop(None)?);
+    println!("{:?}", rec.stop(mode, None)?);
     Ok(())
 }
 

@@ -46,6 +46,8 @@ pub struct Pal {
     pub primary_fg: Color32,
     pub live: Color32,
     pub rec: Color32,
+    /// Streaming: live for everyone watching.
+    pub stream: Color32,
     pub warn: Color32,
     pub danger: Color32,
     /// Settings that open under a switch sit in this, recessed.
@@ -96,6 +98,7 @@ pub const DARK: Pal = Pal {
     primary_fg: rgb(0x141518),
     live: rgb(0x3DD68C),
     rec: rgb(0xFF5050),
+    stream: rgb(0xA970FF),
     warn: rgb(0xF2B544),
     danger: rgb(0xFF6B6B),
     well: rgba(0x000000, 0.22),
@@ -131,6 +134,7 @@ pub const LIGHT: Pal = Pal {
     primary_fg: rgb(0xFFFFFF),
     live: rgb(0x12A467),
     rec: rgb(0xE0362F),
+    stream: rgb(0x7C3AED),
     warn: rgb(0xB07615),
     danger: rgb(0xD23B3B),
     well: rgb(0xF3F4F6),

@@ -24,6 +24,166 @@ impl Encoder {
     }
 }
 
+/// A place to stream to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum StreamService {
+    #[default]
+    Twitch,
+    YouTube,
+    Kick,
+    /// Any RTMP or RTMPS server: its address and key given.
+    Custom,
+}
+
+impl StreamService {
+    pub const ALL: [StreamService; 4] = [StreamService::Twitch, StreamService::YouTube, StreamService::Kick, StreamService::Custom];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            StreamService::Twitch => "Twitch",
+            StreamService::YouTube => "YouTube",
+            StreamService::Kick => "Kick",
+            StreamService::Custom => "Another server",
+        }
+    }
+
+    /// The address everyone streams to, for a service that has one (Kick's
+    /// is your own, from its dashboard). Over RTMPS where ffmpeg can.
+    pub fn server(self, rtmps: bool) -> Option<&'static str> {
+        match self {
+            StreamService::Twitch => Some("rtmp://live.twitch.tv/app"),
+            StreamService::YouTube if rtmps => Some("rtmps://a.rtmps.youtube.com:443/live2"),
+            StreamService::YouTube => Some("rtmp://a.rtmp.youtube.com/live2"),
+            StreamService::Kick | StreamService::Custom => None,
+        }
+    }
+
+    /// Where the stream key is found.
+    pub fn key_from(self) -> &'static str {
+        match self {
+            StreamService::Twitch => "Twitch's Creator Dashboard, in Settings → Stream",
+            StreamService::YouTube => "YouTube Studio, under Go live → Stream",
+            StreamService::Kick => "Kick's Creator Dashboard, in Channel → Stream URL and Key (the URL too)",
+            StreamService::Custom => "your server",
+        }
+    }
+}
+
+/// One place to stream to, whether Go live goes there, and what it's sent:
+/// each place its own picture (Twitch takes less than YouTube).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StreamDestination {
+    pub service: StreamService,
+    /// The stream key: a password, never shown unless asked.
+    pub key: String,
+    /// The server, for Kick and another server (Twitch's and YouTube's are
+    /// their own).
+    pub server: String,
+    /// What another server's called ("Restream").
+    pub name: String,
+    pub enabled: bool,
+    /// The picture's short side brought down to this (never up), in p; 0
+    /// keeps the size clips are recorded at.
+    pub height: u32,
+    /// Frames a second, at most: a whole fraction of the recording's frame
+    /// rate is sent (`capture::stream::stream_rate`).
+    pub fps: u32,
+    pub kbps: u32,
+}
+
+impl Default for StreamDestination {
+    fn default() -> Self {
+        Self::new(StreamService::Twitch)
+    }
+}
+
+/// Its key never printed.
+impl std::fmt::Debug for StreamDestination {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.debug_struct("StreamDestination")
+            .field("service", &self.service)
+            .field("server", &self.server)
+            .field("enabled", &self.enabled)
+            .field("height", &self.height)
+            .field("fps", &self.fps)
+            .field("kbps", &self.kbps)
+            .finish_non_exhaustive()
+    }
+}
+
+impl StreamDestination {
+    /// A place on `service`, sent what it takes: 1080p at 60 fps, at
+    /// Twitch's 6,000 kbps (its most, for most channels), YouTube's 12,000
+    /// (what it suggests for 1080p at 60) or Kick's 8,000 (its most).
+    pub fn new(service: StreamService) -> Self {
+        let kbps = match service {
+            StreamService::Twitch | StreamService::Custom => 6000,
+            StreamService::YouTube => 12_000,
+            StreamService::Kick => 8000,
+        };
+        Self { service, key: String::new(), server: String::new(), name: String::new(), enabled: true, height: 1080, fps: 60, kbps }
+    }
+
+    /// What it's sent, for the capture.
+    pub fn quality(&self) -> capture::stream::Quality {
+        capture::stream::Quality { short_side: (self.height > 0).then_some(self.height), fps: self.fps.max(1), kbps: self.kbps.max(100) }
+    }
+
+    /// What it's called: the service, or another server's own name.
+    pub fn name(&self) -> String {
+        match self.service {
+            StreamService::Custom if !self.name.trim().is_empty() => self.name.trim().to_owned(),
+            s => s.label().to_owned(),
+        }
+    }
+
+    /// Its server: the service's own, or the one given.
+    pub fn server(&self, rtmps: bool) -> String {
+        self.service.server(rtmps).map_or_else(|| self.server.trim().to_owned(), str::to_owned)
+    }
+
+    /// What's missing before it can be streamed to, if anything.
+    pub fn missing(&self) -> Option<&'static str> {
+        let server = self.server(false);
+        if self.service.server(false).is_none() && server.is_empty() {
+            return Some("its server");
+        }
+        if self.service.server(false).is_none() && !(server.starts_with("rtmp://") || server.starts_with("rtmps://")) {
+            return Some("a server starting rtmp:// or rtmps://");
+        }
+        // Another server's key may be in its address already.
+        if self.key.trim().is_empty() && self.service != StreamService::Custom {
+            return Some("its stream key");
+        }
+        None
+    }
+
+    /// Where the capture sends it, when it's set up.
+    pub fn destination(&self, rtmps: bool) -> Option<capture::stream::Destination> {
+        if self.missing().is_some() {
+            return None;
+        }
+        let key = self.key.trim().to_owned();
+        Some(capture::stream::Destination { name: self.name(), url: capture::stream::join(&self.server(rtmps), &key), secret: key, quality: self.quality() })
+    }
+}
+
+/// Going live: where to, each place with its own picture (clips and
+/// recordings keep theirs).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StreamCfg {
+    pub destinations: Vec<StreamDestination>,
+}
+
+impl StreamCfg {
+    /// The destinations Go live sends to: turned on, and set up.
+    pub fn ready(&self) -> impl Iterator<Item = &StreamDestination> {
+        self.destinations.iter().filter(|d| d.enabled && d.missing().is_none())
+    }
+}
+
 /// Light or dark look: the system's, or one chosen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Theme {
@@ -920,6 +1080,8 @@ pub struct RecordSettings {
     pub auto_update: bool,
     /// Show what you're clipping on your Discord profile (Rich Presence).
     pub discord_presence: bool,
+    /// Going live: where to, and how.
+    pub stream: StreamCfg,
     /// Saying "HasteClip that" saves a clip (while the replay buffer runs).
     pub voice_clip: bool,
     /// Keep short snippets of the microphone around what the voice detector fires on or
@@ -1030,6 +1192,7 @@ impl Default for RecordSettings {
             // On to begin with: friends see what you clip, and where to get
             // HasteClip. Settings saved before keep theirs (off).
             discord_presence: true,
+            stream: StreamCfg::default(),
             voice_clip: true,
             voice_samples: false,
             encoder: Encoder::Auto,
@@ -1409,6 +1572,59 @@ impl RecordSettings {
             }
             let _ = std::fs::write(path, json);
         }
+    }
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+
+    /// Settings saved before streaming load with nowhere to stream to;
+    /// what's set is kept. A place added is sent what its service takes.
+    #[test]
+    fn older_settings_load_and_streams_are_kept() {
+        let s: RecordSettings = serde_json::from_str(r#"{"fps": 60}"#).unwrap();
+        assert!(s.stream.destinations.is_empty());
+        let q = |s: StreamService| {
+            let d = StreamDestination::new(s);
+            (d.height, d.fps, d.kbps)
+        };
+        assert_eq!([q(StreamService::Twitch), q(StreamService::YouTube), q(StreamService::Kick)], [(1080, 60, 6000), (1080, 60, 12_000), (1080, 60, 8000)]);
+        let mut s = RecordSettings::default();
+        s.stream.destinations.push(StreamDestination { key: "live_1".into(), ..StreamDestination::new(StreamService::Twitch) });
+        let back: RecordSettings = serde_json::from_str(&s.to_json()).unwrap();
+        assert_eq!(back.stream, s.stream);
+    }
+
+    /// A place is streamed to once it has what it needs: Twitch and YouTube
+    /// a key, Kick its server too, another server its address (its key may
+    /// be on it).
+    #[test]
+    fn destinations_need_what_they_need() {
+        let twitch = |key: &str| StreamDestination { key: key.into(), ..StreamDestination::new(StreamService::Twitch) };
+        assert_eq!(twitch("").missing(), Some("its stream key"));
+        let d = twitch(" live_123 ").destination(true).unwrap();
+        assert_eq!((d.name.as_str(), d.url.as_str(), d.secret.as_str()), ("Twitch", "rtmp://live.twitch.tv/app/live_123", "live_123"));
+        let youtube = StreamDestination { key: "abcd-efgh".into(), ..StreamDestination::new(StreamService::YouTube) };
+        assert_eq!(youtube.destination(true).unwrap().url, "rtmps://a.rtmps.youtube.com:443/live2/abcd-efgh");
+        assert_eq!(youtube.destination(false).unwrap().url, "rtmp://a.rtmp.youtube.com/live2/abcd-efgh");
+        let mut kick = StreamDestination { key: "sk_us".into(), ..StreamDestination::new(StreamService::Kick) };
+        assert_eq!(kick.missing(), Some("its server"));
+        kick.server = "rtmps://abc.global-contribute.live-video.net/app".into();
+        assert_eq!(kick.destination(true).unwrap().url, "rtmps://abc.global-contribute.live-video.net/app/sk_us");
+        let mut own = StreamDestination::new(StreamService::Custom);
+        own.server = "srt://nope".into();
+        assert!(own.missing().is_some(), "only RTMP and RTMPS");
+        own.server = "rtmp://my.server/live/stream".into();
+        assert_eq!(own.destination(true).unwrap().url, "rtmp://my.server/live/stream");
+        assert_eq!(own.name(), "Another server");
+        own.name = "Restream".into();
+        assert_eq!(own.name(), "Restream");
+        // Off: Go live leaves it out.
+        let mut cfg = StreamCfg { destinations: vec![twitch("k"), twitch("")], ..Default::default() };
+        assert_eq!(cfg.ready().count(), 1);
+        cfg.destinations[0].enabled = false;
+        assert_eq!(cfg.ready().count(), 0);
     }
 }
 

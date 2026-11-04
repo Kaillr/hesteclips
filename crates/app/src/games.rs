@@ -24,18 +24,18 @@ use std::time::Duration;
 
 use crate::discord::Game;
 
-/// What's being captured, as the focus history needs it.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Capturing {
-    Off,
-    /// The replay buffer: clips are of the last this many seconds.
-    Buffer(u32),
-    Record,
+/// What's being captured, as the focus history needs it: clipping and
+/// recording can run at once (streaming needs nothing of it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Capturing {
+    /// Clipping: clips are of the last this many seconds.
+    pub buffer: Option<u32>,
+    pub record: bool,
 }
 
 #[derive(Default)]
 struct State {
-    capturing: Option<Capturing>,
+    capturing: Capturing,
     /// The games and apps list: (id, name).
     apps: Vec<(String, String)>,
     /// The replay buffer: what was in focus each second, newest last (`None`:
@@ -46,7 +46,7 @@ struct State {
     /// Games by where their app is installed, so the stores' files are read
     /// once per app.
     by_path: HashMap<PathBuf, Option<String>>,
-    /// When the current capture started.
+    /// When the recording started.
     started: Option<std::time::Instant>,
     /// A recording: the moments marked in it.
     marks: Vec<std::time::Instant>,
@@ -96,15 +96,20 @@ impl Tracker {
     }
 
     /// Keep up with the capture and the games and apps list (cheap when
-    /// nothing changed). A new capture starts a new history.
+    /// nothing changed). Clipping or a recording that starts starts a new
+    /// history of its own.
     pub fn set(&self, capturing: Capturing, apps: &[(String, String)]) {
         let mut s = self.state.lock().unwrap();
-        if s.capturing.as_ref() != Some(&capturing) {
-            s.recent.clear();
-            s.totals.clear();
-            s.marks.clear();
-            s.capturing = Some(capturing);
-            s.started = Some(std::time::Instant::now());
+        if s.capturing != capturing {
+            if capturing.buffer.is_none() || s.capturing.buffer.is_none() {
+                s.recent.clear();
+            }
+            if capturing.record != s.capturing.record {
+                s.totals.clear();
+                s.marks.clear();
+                s.started = capturing.record.then(std::time::Instant::now);
+            }
+            s.capturing = capturing;
         }
         if s.apps != apps {
             s.apps = apps.to_vec();
@@ -130,10 +135,7 @@ impl Tracker {
     /// What happened in the game in a replay clip saved now ("3 kills on
     /// Mirage", and when each kill was), if the game reports it.
     pub fn clip_details(&self) -> Details {
-        let secs = match self.state.lock().unwrap().capturing {
-            Some(Capturing::Buffer(secs)) => secs,
-            _ => return Details::default(),
-        };
+        let Some(secs) = self.state.lock().unwrap().capturing.buffer else { return Details::default() };
         let now = std::time::Instant::now();
         let Some(since) = now.checked_sub(Duration::from_secs(secs.into())) else { return Details::default() };
         Details { summary: self.events.summary(since), moments: self.events.moments(since, now), marks: Vec::new() }
@@ -153,7 +155,7 @@ impl Tracker {
     /// Mark this moment in the recording, if one runs. Whether it did.
     pub fn mark(&self) -> bool {
         let mut s = self.state.lock().unwrap();
-        if s.capturing != Some(Capturing::Record) {
+        if !s.capturing.record {
             return false;
         }
         s.marks.push(std::time::Instant::now());
@@ -213,21 +215,20 @@ fn longest(counts: impl Iterator<Item = (Option<String>, u32)>) -> Option<String
 /// Note what's in focus now.
 fn sample(tracker: &Tracker) {
     let state = &tracker.state;
-    let seconds = match state.lock().unwrap().capturing {
-        Some(Capturing::Buffer(secs)) => Some(secs.max(1) as usize),
-        Some(Capturing::Record) => None,
-        _ => return,
-    };
+    let capturing = state.lock().unwrap().capturing;
+    if capturing.buffer.is_none() && !capturing.record {
+        return;
+    }
     let game = tracker.focused().map(|(_, g)| g.name);
     let mut s = state.lock().unwrap();
-    match seconds {
-        Some(window) => {
-            s.recent.push_back(game);
-            while s.recent.len() > window {
-                s.recent.pop_front();
-            }
+    if let Some(secs) = s.capturing.buffer {
+        s.recent.push_back(game.clone());
+        while s.recent.len() > secs.max(1) as usize {
+            s.recent.pop_front();
         }
-        None => *s.totals.entry(game).or_default() += 1,
+    }
+    if s.capturing.record {
+        *s.totals.entry(game).or_default() += 1;
     }
 }
 

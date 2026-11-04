@@ -137,6 +137,8 @@ impl FileWriter {
                 let fmt = &self.audio_formats[*track].0;
                 (input, packet_sample(&shifted, fmt).context("couldn't wrap an audio packet")?)
             }
+            // The stream's own pictures never go in a file.
+            Media::Stream(_) => return Ok(()),
         };
         unsafe {
             // Real-time inputs interleave themselves; this only waits when the disk
