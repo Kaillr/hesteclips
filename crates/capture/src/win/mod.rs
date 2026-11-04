@@ -460,6 +460,12 @@ impl Session {
             stop.store(true, Ordering::Relaxed);
             let _ = handle.join();
         }
+        // A stream the pacer stopped before it took it up: finished here
+        // (its encoder would hold the writer open).
+        let pending = self.stream_ctl.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+        if let Some(Some(s)) = pending {
+            s.encoder.finish();
+        }
         step("frame pacer stopped");
         if let Some(video) = self.video.take() {
             video.stop();
