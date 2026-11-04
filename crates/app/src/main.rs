@@ -532,9 +532,13 @@ struct App {
     pub(crate) anticheat_apps: Vec<(capture::Device, String)>,
     /// What the running capture records, to send it list changes live.
     capturing_video: Option<capture::VideoSource>,
-    /// The audio sources the running capture started with (mics follow
-    /// device changes).
+    /// The audio sources the running capture has: those it started with,
+    /// mics following device changes, and where it can be
+    /// (`capture::SOURCES_WHILE_CAPTURING`), those added and taken out since.
     capturing_sources: Vec<capture::sources::AudioSource>,
+    /// The audio sources the running capture started with: its file's
+    /// tracks are theirs.
+    pub(crate) started_sources: Vec<capture::sources::AudioSource>,
     /// The replay length the running capture keeps, to send it changes live.
     capturing_replay: Option<u32>,
     /// Frame blending as the running capture does it (looks a frame, how
@@ -829,6 +833,7 @@ impl App {
             anticheat_apps: Vec::new(),
             capturing_video: None,
             capturing_sources: Vec::new(),
+            started_sources: Vec::new(),
             capturing_replay: None,
             capturing_blend: None,
             away_screen: away::screen(),
@@ -1728,7 +1733,7 @@ impl App {
         self.ensure_level_monitor();
         self.ensure_video_preview();
         self.sync_capture_video();
-        self.sync_capture_mics();
+        self.sync_capture_sources();
         self.sync_capture_settings();
         self.sync_capture_blend();
         self.watch_stream();
@@ -2638,6 +2643,7 @@ impl App {
             self.refresh_audio_devices();
             self.capturing_video = Some(self.video_source());
             self.capturing_sources = self.capture_sources();
+            self.started_sources = self.capturing_sources.clone();
             self.capturing_blend = Some((self.settings.blend_samples(), self.settings.blend_shape.into()));
             self.frame_size = None;
         }
@@ -2760,11 +2766,22 @@ impl App {
         }
     }
 
-    /// A microphone source switched to another device reaches the running
-    /// capture right away: its track stays, only where its sound comes from
-    /// changes. Anything else about the sources waits for the next start.
-    fn sync_capture_mics(&mut self) {
+    /// The audio sources reach the running capture right away. Where it can
+    /// (`capture::SOURCES_WHILE_CAPTURING`), one added or turned on goes into
+    /// it, one removed or turned off leaves it, and a microphone switched to
+    /// another device switches; its tracks stay as they started. Elsewhere
+    /// only a microphone's device: its track stays, only where its sound
+    /// comes from changes, and anything else waits for the next start.
+    fn sync_capture_sources(&mut self) {
         if self.rec_state.idle() {
+            return;
+        }
+        if capture::SOURCES_WHILE_CAPTURING {
+            let now = self.live_sources();
+            if now != self.capturing_sources {
+                self.service.set_sources(now.clone());
+                self.capturing_sources = now;
+            }
             return;
         }
         use capture::sources::SourceKind::Microphone;
@@ -2789,6 +2806,21 @@ impl App {
         for (old, new) in self.capturing_sources.iter_mut().zip(now) {
             old.kind = new.kind;
         }
+    }
+
+    /// The audio sources a running capture is to have now: those on,
+    /// resolved as at its start (`capture_sources`). One whose microphone
+    /// can't be resolved now (it's on the default, and there's none) stays
+    /// as the capture has it: it isn't taken out (it's opened again when
+    /// it's back), nor added until it can be.
+    fn live_sources(&self) -> Vec<capture::sources::AudioSource> {
+        let resolved = self.capture_sources();
+        self.settings
+            .audio_sources
+            .iter()
+            .filter(|s| s.enabled && (s.in_mix || s.own_track))
+            .filter_map(|s| resolved.iter().chain(&self.capturing_sources).find(|r| r.id == s.id).cloned())
+            .collect()
     }
 
     /// The replay length reaches a running replay buffer right away. Not

@@ -87,8 +87,14 @@ pub fn track_layout(sources: &[AudioSource]) -> (Vec<String>, String, bool) {
 
 /// Live capture of a set of sources, each feeding its own [`SourceFeed`].
 pub(crate) struct AudioCapture {
-    /// One per source, in the order given.
+    /// One per source it started with, in the order given.
     pub feeds: Vec<Arc<SourceFeed>>,
+    /// The sources captured now, with their feeds: those it started with,
+    /// and those added since ([`Self::set_sources`]), less those taken out.
+    captured: Vec<(AudioSource, Arc<SourceFeed>)>,
+    /// What every source's sound is placed by.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    clock: Arc<Clock>,
     #[cfg(not(target_os = "linux"))]
     mics: Mics,
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
@@ -109,8 +115,9 @@ struct Mic {
     stream: Option<(cpal::Stream, Arc<SourceFeed>)>,
     /// How it's doing, and when to open it next.
     watch: Watch,
-    /// Counts the devices it's been given, so an open of one it no longer
-    /// has (switched while it was being opened) isn't kept.
+    /// Which device it has, of every one any mic has been given (see
+    /// [`next_generation`]): an open of one it no longer has (switched, or
+    /// the mic taken out, while it was being opened) isn't kept.
     generation: u64,
     /// The last thing the log said about it, so a mic that stays away (or
     /// keeps stopping) is reported once, not at every try.
@@ -205,12 +212,35 @@ struct OpenMic {
     opened: f64,
 }
 
+/// A generation no mic has had: a mic's own count, kept across mics, so an
+/// open of one taken out can't be taken for one added in its place.
+#[cfg(not(target_os = "linux"))]
+fn next_generation() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 #[cfg(not(target_os = "linux"))]
 impl Mic {
+    /// The mic of the source `id`, on `device`, not open yet: a new device,
+    /// to open at once.
+    fn new(id: &str, device: &str, feed: Arc<SourceFeed>, channel: Arc<crate::mixer::Channel>) -> Self {
+        Self {
+            id: id.to_owned(),
+            device: device.to_owned(),
+            feed,
+            channel,
+            stream: None,
+            watch: Watch::new_device(),
+            generation: next_generation(),
+            said: String::new(),
+        }
+    }
+
     /// Give it `device`, to be opened as a new device, closing what it had.
     fn switch(&mut self, device: &str) {
         self.device = device.to_owned();
-        self.generation += 1;
+        self.generation = next_generation();
         self.watch = Watch::new_device();
         self.said.clear();
         self.close();
@@ -283,7 +313,8 @@ impl Mic {
 #[cfg(not(target_os = "linux"))]
 struct Mics {
     list: Arc<Mutex<Vec<Mic>>>,
-    /// Wakes the watch (a mic was switched); dropped to stop it.
+    /// Wakes the watch (a mic was switched or added); dropped to stop it.
+    /// None while it isn't watching: it starts with the first mic.
     wake: Option<std::sync::mpsc::Sender<()>>,
 }
 
@@ -294,18 +325,52 @@ impl Mics {
 
     fn start(list: Vec<Mic>) -> Self {
         let watching = !list.is_empty();
-        let list = Arc::new(Mutex::new(list));
-        let (wake, woken) = std::sync::mpsc::channel::<()>();
-        let mics = list.clone();
+        let mut mics = Self { list: Arc::new(Mutex::new(list)), wake: None };
         if watching {
-            // Not waited for when the capture stops (see `stop`).
-            let _ = std::thread::Builder::new().name("mic watch".into()).spawn(move || {
-                while let Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) = woken.recv_timeout(Self::EVERY) {
-                    Self::pass(&mics, open_mic);
-                }
-            });
+            mics.watch();
         }
-        Self { list, wake: Some(wake) }
+        mics
+    }
+
+    /// Start the watch, unless it runs.
+    fn watch(&mut self) {
+        if self.wake.is_some() {
+            return;
+        }
+        let (wake, woken) = std::sync::mpsc::channel::<()>();
+        let mics = self.list.clone();
+        // Not waited for when the capture stops (see `stop`).
+        let _ = std::thread::Builder::new().name("mic watch".into()).spawn(move || {
+            while let Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) = woken.recv_timeout(Self::EVERY) {
+                Self::pass(&mics, open_mic);
+            }
+        });
+        self.wake = Some(wake);
+    }
+
+    /// Capture `mic` too, while capturing: the watch opens it, woken now.
+    /// Not here: an open can take seconds (a Bluetooth headset), and
+    /// whoever adds it would wait.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    fn add(&mut self, mic: Mic) {
+        locked(&self.list).push(mic);
+        self.watch();
+        if let Some(wake) = &self.wake {
+            let _ = wake.send(());
+        }
+    }
+
+    /// Stop capturing the mic of the source `id`, while capturing: it's
+    /// closed, and Off. False if there's no such mic.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    fn remove(&self, id: &str) -> bool {
+        let mut list = locked(&self.list);
+        let Some(at) = list.iter().position(|m| m.id == id) else { return false };
+        let mut mic = list.remove(at);
+        drop(list);
+        mic.close();
+        mic.channel.set_status(SourceStatus::Off);
+        true
     }
 
     /// One look at every mic, opening those that are due with `open`. They
@@ -318,16 +383,17 @@ impl Mics {
         let now = Instant::now();
         let due: Vec<_> = locked(list)
             .iter_mut()
-            .enumerate()
-            .filter_map(|(i, mic)| mic.look(now).then(|| (i, mic.generation, mic.device.clone(), mic.feed.clone(), mic.channel.clone())))
+            .filter_map(|mic| mic.look(now).then(|| (mic.generation, mic.device.clone(), mic.feed.clone(), mic.channel.clone())))
             .collect();
-        for (i, generation, device, feed, channel) in due {
+        for (generation, device, feed, channel) in due {
             let opened = open(&device, &feed, &channel);
             let mut mics = locked(list);
-            match mics.get_mut(i).filter(|mic| mic.generation == generation) {
+            // By its generation, not its place: mics are added and taken
+            // out meanwhile.
+            match mics.iter_mut().find(|mic| mic.generation == generation) {
                 Some(mic) => mic.opened(opened, Instant::now()),
-                // Stopped, or switched to another device, meanwhile: what
-                // was opened goes.
+                // Stopped, switched to another device or taken out,
+                // meanwhile: what was opened goes.
                 None => {
                     drop(mics);
                     if let Ok(open) = opened {
@@ -499,16 +565,7 @@ impl AudioCapture {
             match &source.kind {
                 #[cfg(not(target_os = "linux"))]
                 SourceKind::Microphone { device } => {
-                    let mut mic = Mic {
-                        id: source.id.clone(),
-                        device: device.clone(),
-                        feed: feed.clone(),
-                        channel,
-                        stream: None,
-                        watch: Watch::new_device(),
-                        generation: 0,
-                        said: String::new(),
-                    };
+                    let mut mic = Mic::new(&source.id, device, feed.clone(), channel);
                     let opened = open_mic(&mic.device, &mic.feed, &mic.channel);
                     mic.opened(opened, Instant::now());
                     mics.push(mic);
@@ -521,26 +578,120 @@ impl AudioCapture {
         }
         #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
         let system = if system_sources.is_empty() { None } else { Some(SystemAudio::start(system_sources)?) };
-        // HasteClip' own sound: into its app source if it has one, else into
-        // the desktop (unless the desktop leaves out apps with their own source).
+        let capture = Self {
+            captured: sources.iter().cloned().zip(feeds.iter().cloned()).collect(),
+            feeds,
+            clock,
+            #[cfg(not(target_os = "linux"))]
+            mics: Mics::start(mics),
+            #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+            system,
+        };
+        capture.route_own_sound();
+        Ok(capture)
+    }
+
+    /// HasteClip' own sound into the sources that take it: its app source
+    /// if it has one, else the desktop (unless the desktop leaves out apps
+    /// with their own source).
+    fn route_own_sound(&self) {
         let own = own_app_id();
-        let own_source = sources.iter().any(|s| is_own_app(&s.kind, own.as_deref()));
-        for (source, feed) in sources.iter().zip(&feeds) {
+        let own_source = self.captured.iter().any(|(s, _)| is_own_app(&s.kind, own.as_deref()));
+        for (source, feed) in &self.captured {
             let takes = match source.kind {
                 SourceKind::Desktop { exclude_app_sources } => !(own_source && exclude_app_sources),
                 ref kind => is_own_app(kind, own.as_deref()),
             };
             if takes {
                 own_sound::listen(feed);
+            } else {
+                own_sound::forget(feed);
             }
         }
-        Ok(Self {
-            feeds,
-            #[cfg(not(target_os = "linux"))]
-            mics: Mics::start(mics),
-            #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
-            system,
-        })
+    }
+
+    /// Capture `sources` from now on, without stopping anything: one not
+    /// captured yet starts (it isn't waited for: a mic can take seconds to
+    /// open), one captured that isn't among them stops, its feed taking no
+    /// more sound, and a microphone given another device switches to it (as
+    /// [`Self::set_mic`]). Anything else about one captured already (where
+    /// it goes, which apps it leaves out) stays as it started. The sources
+    /// added, with their feeds, and those taken out, for the mixer.
+    #[cfg(target_os = "windows")]
+    pub(crate) fn set_sources(&mut self, sources: &[AudioSource], live: &LiveAudio) -> (Vec<(AudioSource, Arc<SourceFeed>)>, Vec<AudioSource>) {
+        let mut gone = Vec::new();
+        self.captured.retain(|(s, feed)| {
+            let keep = sources.iter().any(|n| n.id == s.id);
+            if !keep {
+                gone.push((s.clone(), feed.clone()));
+            }
+            keep
+        });
+        for (source, feed) in &gone {
+            self.stop_one(source, feed);
+        }
+        let mut added = Vec::new();
+        for source in sources {
+            match self.captured.iter().position(|(s, _)| s.id == source.id) {
+                None => added.push((source.clone(), self.start_one(source, live))),
+                Some(at) => {
+                    if let (SourceKind::Microphone { device: was }, SourceKind::Microphone { device }) = (&self.captured[at].0.kind, &source.kind)
+                        && was != device
+                        && self.set_mic(&source.id, device)
+                    {
+                        self.captured[at].0.kind = source.kind.clone();
+                    }
+                }
+            }
+        }
+        if !gone.is_empty() || !added.is_empty() {
+            self.route_own_sound();
+        }
+        (added, gone.into_iter().map(|(s, _)| s).collect())
+    }
+
+    /// Start capturing `source` too, while capturing: its feed.
+    #[cfg(target_os = "windows")]
+    fn start_one(&mut self, source: &AudioSource, live: &LiveAudio) -> Arc<SourceFeed> {
+        let feed = SourceFeed::new(crate::mixer::RATE, self.clock.clone());
+        let channel = live.channel(&source.id);
+        match &source.kind {
+            SourceKind::Microphone { device } => self.mics.add(Mic::new(&source.id, device, feed.clone(), channel)),
+            // Desktop or app sound, to a capture of it started now if
+            // there's none (started empty: nothing's waited for).
+            _ => {
+                if self.system.is_none() {
+                    match SystemAudio::start(Vec::new()) {
+                        Ok(system) => self.system = Some(system),
+                        Err(e) => eprintln!("audio source \"{}\": {e:#}", source.name),
+                    }
+                }
+                match &self.system {
+                    Some(system) => system.add(source.clone(), feed.clone(), channel),
+                    None => channel.set_status(SourceStatus::Unavailable),
+                }
+            }
+        }
+        self.captured.push((source.clone(), feed.clone()));
+        feed
+    }
+
+    /// Stop capturing `source`, whose feed is `feed`, while capturing: what
+    /// its feed has is still there to mix.
+    #[cfg(target_os = "windows")]
+    fn stop_one(&mut self, source: &AudioSource, feed: &Arc<SourceFeed>) {
+        feed.close();
+        own_sound::forget(feed);
+        match source.kind {
+            SourceKind::Microphone { .. } => {
+                self.mics.remove(&source.id);
+            }
+            _ => {
+                if let Some(system) = &self.system {
+                    system.remove(&source.id);
+                }
+            }
+        }
     }
 
     /// Switch the microphone of the source `id` to `device`, without stopping
@@ -560,7 +711,7 @@ impl AudioCapture {
     }
 
     pub(crate) fn stop(mut self) {
-        for feed in &self.feeds {
+        for (_, feed) in &self.captured {
             own_sound::forget(feed);
         }
         #[cfg(not(target_os = "linux"))]
@@ -728,16 +879,24 @@ pub mod own_sound {
     }
     static GENERATION: AtomicU64 = AtomicU64::new(0);
 
+    /// `feed` takes HasteClip' sound (once, however often it's said).
     pub(crate) fn listen(feed: &Arc<SourceFeed>) {
         let mut d = listeners().lock().unwrap();
         d.retain(|w| w.strong_count() > 0);
-        d.push(Arc::downgrade(feed));
-        GENERATION.fetch_add(1, Ordering::Relaxed);
+        if !d.iter().any(|w| std::ptr::eq(w.as_ptr(), Arc::as_ptr(feed))) {
+            d.push(Arc::downgrade(feed));
+            GENERATION.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
+    /// `feed` doesn't take HasteClip' sound (any more).
     pub(crate) fn forget(feed: &Arc<SourceFeed>) {
-        listeners().lock().unwrap().retain(|w| w.strong_count() > 0 && !std::ptr::eq(w.as_ptr(), Arc::as_ptr(feed)));
-        GENERATION.fetch_add(1, Ordering::Relaxed);
+        let mut d = listeners().lock().unwrap();
+        let had = d.len();
+        d.retain(|w| w.strong_count() > 0 && !std::ptr::eq(w.as_ptr(), Arc::as_ptr(feed)));
+        if d.len() != had {
+            GENERATION.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// One sound being played: what it pushes goes into every source taking
@@ -876,6 +1035,7 @@ pub(crate) fn mix_inputs(
         .iter()
         .zip(feeds)
         .map(|(s, feed)| MixInput {
+            id: s.id.clone(),
             feed: feed.clone(),
             channel: live.channel(&s.id),
             in_mix: s.in_mix,
@@ -1013,6 +1173,61 @@ mod tests {
         assert!(locked(&mics.list).is_empty());
     }
 
+    /// A mic taken out while the watch opens it, and added again in its
+    /// place (its source turned off and on): how that open went isn't taken
+    /// for the new one, which is opened afresh. Taken out, it's Off. (The
+    /// opener finds nothing: no device is touched.)
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn a_mic_taken_out_while_it_opens_leaves_the_one_added_back_alone() {
+        let live = LiveAudio::new();
+        let clock = Arc::new(Clock::default());
+        let channel = live.channel("mic");
+        let mic = Mic::new("mic", "a slow mic", SourceFeed::new(crate::mixer::RATE, clock.clone()), channel.clone());
+        let mics = Mics { list: Arc::new(Mutex::new(vec![mic])), wake: None };
+        let (opening, being_opened) = std::sync::mpsc::channel();
+        let list = mics.list.clone();
+        let pass = std::thread::spawn(move || {
+            Mics::pass(&list, |device: &str, _: &SourceFeed, _: &crate::mixer::Channel| {
+                opening.send(device.to_owned()).unwrap();
+                std::thread::sleep(Duration::from_millis(300));
+                Err(anyhow::anyhow!("not connected"))
+            })
+        });
+        assert_eq!(being_opened.recv().unwrap(), "a slow mic");
+        channel.set_status(SourceStatus::Live);
+        assert!(mics.remove("mic"));
+        assert_eq!(channel.status(), SourceStatus::Off);
+        assert!(!mics.remove("mic"), "taken out already");
+        // Added back as `Mics::add` does, but for starting the watch.
+        locked(&mics.list).push(Mic::new("mic", "a slow mic", SourceFeed::new(crate::mixer::RATE, clock), channel));
+        pass.join().unwrap();
+        let list = locked(&mics.list);
+        assert_eq!(list.len(), 1);
+        assert!(list[0].watch.new && list[0].watch.retry.is_none(), "the one taken out's open was taken for it: {:?}", list[0].watch);
+    }
+
+    /// HasteClip' sound goes into a source that takes it once, however often
+    /// that's said (the sources are routed again whenever one is added or
+    /// taken out while capturing), and none goes in once it's forgotten.
+    #[test]
+    fn own_sound_goes_into_a_source_once() {
+        let clock = Arc::new(Clock::default());
+        clock.set(host_now());
+        let feed = SourceFeed::new(crate::mixer::RATE, clock);
+        own_sound::listen(&feed);
+        own_sound::listen(&feed);
+        let mut playing = own_sound::Playing::start();
+        playing.push(&[0.25; 960]);
+        let loudest = feed.peek(0, 60 * crate::mixer::RATE as usize).iter().map(|f| f[0]).fold(0.0, f32::max);
+        assert_eq!(loudest, 0.25, "in it once");
+        let arrived = feed.arrived();
+        own_sound::forget(&feed);
+        std::thread::sleep(Duration::from_millis(20));
+        playing.push(&[0.25; 960]);
+        assert_eq!(feed.arrived(), arrived, "none after it's forgotten");
+    }
+
     /// A mic that's gone is tried again a second later, then less and less
     /// often, down to every 10 s.
     #[cfg(not(target_os = "linux"))]
@@ -1139,6 +1354,40 @@ mod tests {
         health.heard(3.1);
         assert_eq!(watch.look(at(3.1), 3.1), Look::Back);
         assert!(watch.retry.is_none());
+    }
+
+    /// Desktop sound added to a capture that started without it, then taken
+    /// out: live within a moment, its feed filling; Off once taken out.
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "captures real system audio; run with --ignored"]
+    fn desktop_sound_added_while_capturing_goes_live() {
+        let live = LiveAudio::new();
+        let clock = Arc::new(Clock::default());
+        clock.set(host_now());
+        let mut capture = AudioCapture::start(&[], &live, clock).unwrap();
+        let desktop = src("Desktop", true, false);
+        let (added, gone) = capture.set_sources(std::slice::from_ref(&desktop), &live);
+        assert_eq!((added.len(), gone.len()), (1, 0));
+        let channel = live.channel("Desktop");
+        let until = |status: SourceStatus| {
+            let t = Instant::now();
+            while channel.status() != status && t.elapsed() < Duration::from_secs(5) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            t.elapsed()
+        };
+        let took = until(SourceStatus::Live);
+        eprintln!("desktop sound live {took:?} after it was added");
+        assert_eq!(channel.status(), SourceStatus::Live);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(added[0].1.arrived().is_some(), "its sound is coming");
+        let (added, gone) = capture.set_sources(&[], &live);
+        assert_eq!((added.len(), gone.len()), (0, 1));
+        let took = until(SourceStatus::Off);
+        eprintln!("desktop sound off {took:?} after it was taken out");
+        assert_eq!(channel.status(), SourceStatus::Off);
+        capture.stop();
     }
 
     #[test]

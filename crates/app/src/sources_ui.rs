@@ -280,11 +280,12 @@ impl App {
             let channel = self.live_audio.channel(&self.settings.audio_sources[i].id);
             let id = self.settings.audio_sources[i].id.clone();
             let id_for_listen = id.clone();
+            let note = self.added_note(&self.settings.audio_sources[i]);
             let meters = self.sources_view.meters.entry(id).or_default();
             meters.input.update(channel.input.take(), now, dt);
             meters.output.update(channel.meter.take(), now, dt);
             let listening = self.listening.as_ref().filter(|l| l.source == id_for_listen).map(|l| l.monitor.latency_ms());
-            let action = source_card(ui, &mut self.settings.audio_sources[i], &channel, meters, &self.audio, has_app_sources, &mut self.sources_view.renaming, listening, locked.as_deref(), i == 0, &mut self.app_icons);
+            let action = source_card(ui, &mut self.settings.audio_sources[i], &channel, meters, &self.audio, has_app_sources, &mut self.sources_view.renaming, listening, locked.as_deref(), note, i == 0, &mut self.app_icons);
             match action {
                 CardAction::Remove => remove = Some(i),
                 CardAction::MoveUp if i > 0 => move_up = Some(i),
@@ -315,10 +316,15 @@ impl App {
             ui.add_space(12.0);
             let mic = if cfg!(target_os = "linux") { ", noise removal" } else { ", noise removal and which microphone" };
             let stop = format!("Stop {}", self.rec_state.words());
+            let note = if capture::SOURCES_WHILE_CAPTURING {
+                format!("Volume, mute{mic} change right away, as do sources added, turned off or removed. {stop} to move one or change where it goes.")
+            } else {
+                format!("Volume, mute{mic} change right away. {stop} to add or remove sources.")
+            };
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 ui.label(crate::theme::ic(egui_phosphor::regular::LOCK_SIMPLE, 12.0).color(pal.text3));
-                ui.add(egui::Label::new(crate::theme::text(format!("Volume, mute{mic} change right away. {stop} to add or remove sources."), 12.5, crate::theme::W::Regular).color(pal.text3)).wrap());
+                ui.add(egui::Label::new(crate::theme::text(note, 12.5, crate::theme::W::Regular).color(pal.text3)).wrap());
             });
         });
     }
@@ -370,15 +376,22 @@ impl App {
     fn add_source_buttons(&mut self, ui: &mut egui::Ui) {
         use crate::ui_kit::{Btn, Item};
         use egui_phosphor::regular as icon;
-        // Which sources are recorded is set when capture starts.
+        // Which sources are recorded is set when capture starts, but where
+        // one can be added to it as it runs (`capture::SOURCES_WHILE_CAPTURING`).
         let idle = self.rec_state.idle();
+        let can_add = idle || capture::SOURCES_WHILE_CAPTURING;
         let stop_first = self.stop_first();
         let stop_first = stop_first.as_str();
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
-            let mic = Btn::normal("Microphone").with_icon(icon::PLUS).small().tip(if idle { "Add a microphone or audio interface" } else { stop_first }).show(ui);
+            let mic = Btn::normal("Microphone").with_icon(icon::PLUS).small().tip(if can_add { "Add a microphone or audio interface" } else { stop_first }).show(ui);
             if mic.clicked() {
-                if idle {
+                if can_add {
+                    // Captured at once: the default microphone as it is now
+                    // (the list is looked at again when capturing starts).
+                    if !idle {
+                        self.refresh_audio_devices();
+                    }
                     let n = self.settings.audio_sources.iter().filter(|s| matches!(s.kind, SourceKind::Microphone { .. })).count();
                     let name = if n == 0 { "Microphone".to_owned() } else { format!("Microphone {}", n + 1) };
                     self.settings.audio_sources.push(AudioSourceCfg::new(&name, SourceKind::Microphone { device: capture::audio::DEFAULT_DEVICE.into() }));
@@ -386,16 +399,16 @@ impl App {
                     self.toast_icon(icon::LOCK_SIMPLE, stop_first.trim_end_matches('.'));
                 }
             }
-            let app = Btn::normal("App").with_icon(icon::PLUS).trail(icon::CARET_DOWN).small().id("add_app_source").tip(if idle { "Record one app on its own: a game, Discord, music" } else { stop_first }).show(ui);
+            let app = Btn::normal("App").with_icon(icon::PLUS).trail(icon::CARET_DOWN).small().id("add_app_source").tip(if can_add { "Record one app on its own: a game, Discord, music" } else { stop_first }).show(ui);
             if app.clicked() {
-                if idle {
+                if can_add {
                     self.sources_view.apps = capture::list_apps();
                 } else {
                     self.toast_icon(icon::LOCK_SIMPLE, stop_first.trim_end_matches('.'));
                     egui::Popup::close_id(ui.ctx(), app.id.with("menu"));
                 }
             }
-            if idle {
+            if can_add {
                 crate::ui_kit::menu_popup(&app, true, 260.0, |ui| {
                     crate::ui_kit::menu_head(ui, "Record one app on its own");
                     let taken: Vec<String> = self.settings.audio_sources.iter().filter_map(|s| match &s.kind {
@@ -421,7 +434,7 @@ impl App {
             }
             let has_desktop = self.settings.audio_sources.iter().any(|s| matches!(s.kind, SourceKind::Desktop { .. }));
             if !has_desktop && Btn::normal("Desktop sound").with_icon(icon::PLUS).small().show(ui).clicked() {
-                if idle {
+                if can_add {
                     self.settings.audio_sources.push(AudioSourceCfg::new("Desktop sound", SourceKind::Desktop { exclude_apps: true }));
                 } else {
                     self.toast_icon(icon::LOCK_SIMPLE, stop_first.trim_end_matches('.'));
@@ -433,6 +446,39 @@ impl App {
     /// Why something that's set when capture starts is locked now.
     pub(crate) fn stop_first(&self) -> String {
         format!("Stop {} to change this.", if self.rec_state.idle() { "clipping".to_owned() } else { self.rec_state.words() })
+    }
+
+    /// What a source added while capturing doesn't have yet, said on its
+    /// card, and whether that leaves something out (a warning). The file's
+    /// tracks are set when the capture starts: a source added since is in
+    /// the clip's sound at once, with no track of its own, and in the track
+    /// of the rest of it if there is one. Without, the editor, which makes
+    /// the clip's sound again from the tracks, leaves it out. None for a
+    /// source the capture started with (its own track goes on, though it's
+    /// turned off and on), one it doesn't have, or one that's all there.
+    fn added_note(&self, source: &AudioSourceCfg) -> Option<(String, bool)> {
+        let has = |list: &[capture::sources::AudioSource]| list.iter().any(|s| s.id == source.id);
+        let added = capture::SOURCES_WHILE_CAPTURING && !self.rec_state.idle() && has(&self.capturing_sources) && !has(&self.started_sources);
+        if !added {
+            return None;
+        }
+        // The capture starts again once all it does has stopped.
+        let again = format!("you stop {} and start again", self.rec_state.words());
+        let (tracks, _, rest) = capture::sources::track_layout(&self.started_sources);
+        if tracks.is_empty() {
+            return Some((format!("Not recorded until {again}: this started without sound."), true));
+        }
+        if !source.in_mix {
+            return Some((format!("Not recorded until {again}: its own track starts then."), true));
+        }
+        // In a track apart: the rest's, or there are no tracks apart.
+        let kept = rest || tracks.len() == 1;
+        match (source.own_track, kept) {
+            (true, true) => Some((format!("In the clip's sound now. Its own track starts once {again}."), false)),
+            (true, false) => Some((format!("In the clip's sound now. Its own track starts once {again}; until then, changing track volumes in the editor leaves it out."), true)),
+            (false, true) => None,
+            (false, false) => Some((format!("In the clip's sound now, but until {again}, changing track volumes in the editor leaves it out."), true)),
+        }
     }
 
     /// The video's sources, one card each, the one in front first: a card's
@@ -1684,11 +1730,6 @@ impl Route {
     }
 }
 
-/// One source: its icon, name and device; its level and volume as one
-/// control (the meter runs along the fader's track, the knob sits on it); the
-/// number to type a value; mute; where it goes; and for a microphone, noise
-/// removal and Listen.
-#[allow(clippy::too_many_arguments)]
 /// A name edited in place: focused as it opens (once: taking the focus
 /// back every frame left no way out of it). Enter or clicking away keeps
 /// what's typed, trimmed; Esc, or leaving it empty, puts back what it was.
@@ -1725,6 +1766,11 @@ fn forget_name_field(ui: &egui::Ui, id: egui::Id) {
     ui.data_mut(|d| d.remove::<String>(id.with("was")));
 }
 
+/// One source: its icon, name and device; its level and volume as one
+/// control (the meter runs along the fader's track, the knob sits on it); the
+/// number to type a value; mute; where it goes; and for a microphone, noise
+/// removal and Listen.
+#[allow(clippy::too_many_arguments)]
 fn source_card(
     ui: &mut egui::Ui,
     source: &mut AudioSourceCfg,
@@ -1737,6 +1783,9 @@ fn source_card(
     listening: Option<Option<f32>>,
     // While capturing: why what's recorded can't change (it's set at the start).
     locked: Option<&str>,
+    // Added while capturing: what it doesn't have yet, and whether that
+    // leaves something out (see `App::added_note`).
+    note: Option<(String, bool)>,
     first: bool,
     app_icons: &mut crate::app_icons::AppIcons,
 ) -> CardAction {
@@ -1747,6 +1796,9 @@ fn source_card(
     let mut action = CardAction::None;
     // A mic can switch device while capturing (its track stays).
     let picker_locked = locked.filter(|_| !matches!(source.kind, SourceKind::Microphone { .. }));
+    // And where the capture can take it, a source can be turned off or
+    // removed (its tracks going silent), and on again.
+    let fixed = locked.filter(|_| !capture::SOURCES_WHILE_CAPTURING);
     let card_id = source.id.clone();
     group(ui, ("source", card_id), |ui| {
         ui.multiply_opacity(if source.enabled { 1.0 } else { 0.6 });
@@ -1813,7 +1865,7 @@ fn source_card(
                     if Item::new(if source.muted { "Unmute" } else { "Mute" }).icon(icon::SPEAKER_X).show(ui).clicked() {
                         source.muted = !source.muted;
                     }
-                    let on = Item::new(if source.enabled { "Turn off" } else { "Turn on" }).icon(icon::POWER).enabled(locked.is_none());
+                    let on = Item::new(if source.enabled { "Turn off" } else { "Turn on" }).icon(icon::POWER).enabled(fixed.is_none());
                     if on.show(ui).clicked() {
                         source.enabled = !source.enabled;
                     }
@@ -1828,7 +1880,7 @@ fn source_card(
                     crate::ui_kit::menu_sep(ui);
                     let rm = Item::new("Remove").icon(icon::TRASH).danger();
                     if rm.show(ui).clicked() {
-                        action = if locked.is_some() { CardAction::Locked } else { CardAction::Remove };
+                        action = if fixed.is_some() { CardAction::Locked } else { CardAction::Remove };
                     }
                 });
                 if matches!(source.kind, SourceKind::Microphone { .. }) {
@@ -1899,6 +1951,11 @@ fn source_card(
                 });
             }
         });
+        // Added while capturing: where its sound is until it starts again.
+        if let Some((note, leaves_out)) = &note {
+            ui.add_space(6.0);
+            ui.add(egui::Label::new(theme::text(note, 12.0, W::Regular).color(if *leaves_out { pal.warn } else { pal.text3 })).wrap());
+        }
         // Noise reduction: a setting of the mic that stays as set, of three,
         // so a segmented control, right after its name, not across the card
         // from it: there, among the card's other controls, the two read as

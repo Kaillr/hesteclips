@@ -230,6 +230,15 @@ impl IActivateAudioInterfaceCompletionHandler_Impl for Activated_Impl {
 pub(crate) struct SystemAudio {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    /// Sources added and taken out while it runs, for its thread.
+    changes: mpsc::Sender<TapChange>,
+}
+
+/// A source added to a [`SystemAudio`] that runs, or taken out.
+enum TapChange {
+    Add(AudioSource, Arc<SourceFeed>, Arc<Channel>),
+    /// By its id.
+    Remove(String),
 }
 
 /// One desktop/app source and its streams, owned by the `SystemAudio` thread.
@@ -253,6 +262,23 @@ struct Tap {
     logged: String,
 }
 
+impl Tap {
+    fn new(source: AudioSource, feed: Arc<SourceFeed>, channel: Arc<Channel>) -> Self {
+        Self { source, feed, channel, streams: HashMap::new(), failed: HashMap::new(), retrying: HashMap::new(), logged: String::new() }
+    }
+
+    /// Stop its streams: it's Off.
+    fn stop(&mut self) {
+        for (_, (_, child)) in self.streams.drain() {
+            self.feed.remove_child(&child);
+        }
+        // A start under way isn't waited for: a stream it starts is let go
+        // of on its thread.
+        self.retrying.clear();
+        self.channel.set_status(SourceStatus::Off);
+    }
+}
+
 impl SystemAudio {
     /// How often to look for apps that opened, quit or relaunched.
     const RESCAN: Duration = Duration::from_secs(1);
@@ -261,42 +287,58 @@ impl SystemAudio {
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
         let (ready_tx, ready_rx) = mpsc::channel();
+        let (changes, changed) = mpsc::channel();
         let thread = thread::spawn(move || {
             com_init();
-            let mut taps: Vec<Tap> = sources
-                .into_iter()
-                .map(|(source, feed, channel)| Tap {
-                    source,
-                    feed,
-                    channel,
-                    streams: HashMap::new(),
-                    failed: HashMap::new(),
-                    retrying: HashMap::new(),
-                    logged: String::new(),
-                })
-                .collect();
+            let mut taps: Vec<Tap> = sources.into_iter().map(|(source, feed, channel)| Tap::new(source, feed, channel)).collect();
             let mut first = true;
-            while !stop2.load(Ordering::Relaxed) {
+            let mut ended = false;
+            while !ended && !stop2.load(Ordering::Relaxed) {
                 sync_taps(&mut taps, Stream::start);
                 if std::mem::take(&mut first) {
                     let _ = ready_tx.send(());
                 }
+                // Until the next rescan, or a source added or taken out:
+                // then at once, so one added starts now, and the desktop
+                // leaves out an app added on its own, or no longer does.
                 let until = Instant::now() + Self::RESCAN;
                 while Instant::now() < until && !stop2.load(Ordering::Relaxed) {
-                    thread::sleep(Duration::from_millis(50));
+                    match changed.recv_timeout(Duration::from_millis(50)) {
+                        Ok(change) => {
+                            change_taps(&mut taps, change);
+                            while let Ok(change) = changed.try_recv() {
+                                change_taps(&mut taps, change);
+                            }
+                            break;
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        // Let go of without being stopped.
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            ended = true;
+                            break;
+                        }
+                    }
                 }
             }
             for tap in &mut taps {
-                tap.streams.clear();
-                // A start under way isn't waited for: a stream it starts is
-                // let go of on its thread.
-                tap.retrying.clear();
-                tap.channel.set_status(SourceStatus::Off);
+                tap.stop();
             }
         });
         // Give the first scan a moment, so capture starts with the audio running.
         let _ = ready_rx.recv_timeout(Duration::from_secs(5));
-        Ok(Self { stop, thread: Some(thread) })
+        Ok(Self { stop, thread: Some(thread), changes })
+    }
+
+    /// Capture `source` too, into `feed`, while it runs: started by its
+    /// thread, at once (not waited for).
+    pub(crate) fn add(&self, source: AudioSource, feed: Arc<SourceFeed>, channel: Arc<Channel>) {
+        let _ = self.changes.send(TapChange::Add(source, feed, channel));
+    }
+
+    /// Stop capturing the source `id`, while it runs: by its thread, at
+    /// once (not waited for).
+    pub(crate) fn remove(&self, id: &str) {
+        let _ = self.changes.send(TapChange::Remove(id.to_owned()));
     }
 
     pub(crate) fn stop(mut self) {
@@ -451,6 +493,29 @@ fn started(tap: &mut Tap, target: Target, child: Arc<SourceFeed>, outcome: Resul
     }
 }
 
+/// A source added to the taps, or taken out, while capturing.
+fn change_taps(taps: &mut Vec<Tap>, change: TapChange) {
+    match change {
+        TapChange::Add(source, feed, channel) => {
+            // One with its id is never there already, but if it were, this
+            // one takes its place.
+            if let Some(at) = taps.iter().position(|t| t.source.id == source.id) {
+                taps.remove(at).stop();
+            }
+            let mut tap = Tap::new(source, feed, channel);
+            log_change(&mut tap, "added".to_owned());
+            taps.push(tap);
+        }
+        TapChange::Remove(id) => {
+            if let Some(at) = taps.iter().position(|t| t.source.id == id) {
+                let mut tap = taps.remove(at);
+                tap.stop();
+                log_change(&mut tap, "taken out".to_owned());
+            }
+        }
+    }
+}
+
 /// Log what a source is doing when it changes (a line a second otherwise).
 fn log_change(tap: &mut Tap, line: String) {
     if tap.logged != line {
@@ -509,15 +574,7 @@ mod tests {
             in_mix: true,
             own_track: false,
         };
-        let mut taps = vec![Tap {
-            source,
-            feed: SourceFeed::new(RATE, Arc::new(Clock::default())),
-            channel: live.channel("desktop"),
-            streams: HashMap::new(),
-            failed: HashMap::new(),
-            retrying: HashMap::new(),
-            logged: String::new(),
-        }];
+        let mut taps = vec![Tap::new(source, SourceFeed::new(RATE, Arc::new(Clock::default())), live.channel("desktop"))];
         sync_taps(&mut taps, start);
         assert_eq!(taps[0].channel.status(), SourceStatus::Unavailable);
         // Its retry is due a second later.
@@ -531,6 +588,58 @@ mod tests {
         assert_eq!(taps[0].channel.status(), SourceStatus::Live);
         assert!(taps[0].failed.is_empty() && taps[0].retrying.is_empty() && taps[0].streams.len() == 1);
         assert_eq!(TRIES.load(Ordering::SeqCst), 2);
+    }
+
+    fn app(id: &str, exe: &str) -> AudioSource {
+        AudioSource { id: id.into(), name: id.into(), kind: SourceKind::App { bundle_id: exe.into() }, in_mix: true, own_track: false }
+    }
+
+    /// A source taken out while capturing stops its streams (what they had
+    /// sent is still there to mix, nothing after) and is Off.
+    #[test]
+    fn a_source_taken_out_stops_its_streams() {
+        let live = crate::mixer::LiveAudio::new();
+        let clock = Arc::new(Clock::default());
+        clock.set(1000.0);
+        let feed = SourceFeed::new(RATE, clock);
+        let mut taps = Vec::new();
+        change_taps(&mut taps, TapChange::Add(app("discord", "Discord.exe"), feed.clone(), live.channel("discord")));
+        assert_eq!(taps.len(), 1);
+        // One of its streams, running (with no thread: nothing's captured).
+        let child = feed.add_child(RATE);
+        let stream = Stream { stop: Arc::new(AtomicBool::new(false)), alive: Arc::new(AtomicBool::new(true)), thread: None };
+        taps[0].streams.insert(Target::Include(1), (stream, child.clone()));
+        taps[0].channel.set_status(SourceStatus::Live);
+        child.push(1000.0, &[0.5; 960], 2);
+        change_taps(&mut taps, TapChange::Remove("discord".into()));
+        assert!(taps.is_empty());
+        assert_eq!(live.channel("discord").status(), SourceStatus::Off);
+        child.push(1000.01, &[0.5; 960], 2);
+        assert_eq!(feed.arrived(), Some(480), "what came before, and nothing after");
+    }
+
+    /// Sources added to and taken out of a running capture of desktop and
+    /// app sound are taken up at once, not at its next rescan. (An app that
+    /// doesn't run: nothing's captured.)
+    #[test]
+    fn a_running_capture_takes_sources_added_and_taken_out() {
+        let live = crate::mixer::LiveAudio::new();
+        let channel = live.channel("app");
+        let system = SystemAudio::start(Vec::new()).unwrap();
+        let until = |status: SourceStatus| {
+            let t = Instant::now();
+            while channel.status() != status && t.elapsed() < Duration::from_secs(3) {
+                thread::sleep(Duration::from_millis(5));
+            }
+            t.elapsed()
+        };
+        system.add(app("app", "hasteclip-test-no-such-app.exe"), SourceFeed::new(RATE, Arc::new(Clock::default())), channel.clone());
+        let took = until(SourceStatus::WaitingForApp);
+        assert!(took < Duration::from_millis(500), "added: waiting for its app after {took:?}");
+        system.remove("app");
+        let took = until(SourceStatus::Off);
+        assert!(took < Duration::from_millis(500), "taken out: Off after {took:?}");
+        system.stop();
     }
 
     #[test]

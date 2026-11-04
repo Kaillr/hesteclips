@@ -28,6 +28,9 @@ pub(crate) enum Cmd {
     ReplaySeconds(u32),
     /// Switch a microphone source (by id) to another device.
     SetMic(String, String),
+    /// Capture these audio sources from now on: added and taken out while
+    /// capturing, where that can be (`capture::SOURCES_WHILE_CAPTURING`).
+    SetSources(Vec<capture::sources::AudioSource>),
     /// Frame blending changed while capturing: looks a frame, and how
     /// they're weighed.
     SetBlend(u32, capture::BlendShape),
@@ -278,6 +281,11 @@ impl CaptureService {
                             eprintln!("couldn't switch the microphone of {id} while capturing");
                         }
                     }
+                    Cmd::SetSources(sources) => {
+                        if !recorder.set_sources(&sources) {
+                            eprintln!("couldn't add or take out audio sources while capturing");
+                        }
+                    }
                     Cmd::SetBlend(looks, shape) => {
                         if !recorder.set_blend(looks, shape) {
                             eprintln!("couldn't change frame blending while capturing");
@@ -332,6 +340,9 @@ impl CaptureService {
     }
     pub fn set_mic(&self, id: String, device: String) {
         self.send(Cmd::SetMic(id, device));
+    }
+    pub fn set_sources(&self, sources: Vec<capture::sources::AudioSource>) {
+        self.send(Cmd::SetSources(sources));
     }
     pub fn set_replay_seconds(&self, seconds: u32) {
         self.send(Cmd::ReplaySeconds(seconds));
