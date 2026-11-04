@@ -11,6 +11,17 @@
 //! the reader uses too, in its normal mode: low-latency mode (each frame out
 //! as soon as it's decoded) made jumps slower, 25-35 ms instead of 15-20, and
 //! reading in order 600 fps instead of 850 (measured on a quiet machine).
+//!
+//! Except for scrubbing ([`Stream::open`]'s `low_latency`), whose decoders
+//! jump to a keyframe for little more than that one frame: in its normal
+//! mode the decoder gives a frame back only once eleven more are in (it
+//! keeps room to put frames in order, B-frames or not), and each jump
+//! decoded those too. Measured on an RTX 4060 Ti (1080p60, 2026-11-04):
+//! a jump to a keyframe 2.0-2.7 ms instead of 3.5-4.1 with one decoder,
+//! 5.4-7.1 instead of 10.3-11.7 each with three at once; reading in order
+//! the same, about 1 ms a frame. A clip with B-frames keeps the normal
+//! mode: its frames come out in another order than they go in, which the
+//! decoder only sorts out holding them back.
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -50,8 +61,10 @@ struct Inner {
 const BLOCK: usize = 4 << 20;
 
 impl Inner {
-    /// The decoder for `path`'s video, on the GPU of `manager`.
-    fn open(path: &Path, manager: &IMFDXGIDeviceManager) -> Result<Self> {
+    /// The decoder for `path`'s video, on the GPU of `manager`; in
+    /// low-latency mode if asked and the video has no B-frames (see the
+    /// module's doc).
+    fn open(path: &Path, manager: &IMFDXGIDeviceManager, low_latency: bool) -> Result<Self> {
         let index = Index::read(path)?;
         if index.samples.is_empty() {
             bail!("no video frames");
@@ -70,6 +83,18 @@ impl Inner {
                 bail!("the H.264 decoder can't use the graphics card");
             }
             mft.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, manager.as_raw() as usize)?;
+            // Best effort: a decoder without the mode decodes as it does.
+            // (It takes the value as a VT_UI4, not a VT_BOOL.)
+            // `HASTECLIP_SCRUB_NORMAL_DECODE=1` keeps the normal mode, to compare.
+            if low_latency && !reordered && std::env::var_os("HASTECLIP_SCRUB_NORMAL_DECODE").is_none_or(|v| v == "0") {
+                let set = mft.cast::<ICodecAPI>().and_then(|api| api.SetValue(&CODECAPI_AVLowLatencyMode, &windows::Win32::System::Variant::VARIANT::from(1u32)));
+                if std::env::var_os("HASTECLIP_DEBUG_VIDEO").is_some() {
+                    match set {
+                        Ok(()) => eprintln!("decoder: low-latency mode"),
+                        Err(e) => eprintln!("decoder: no low-latency mode ({e})"),
+                    }
+                }
+            }
             let t = MFCreateMediaType()?;
             t.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
             t.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
@@ -247,7 +272,10 @@ pub(crate) struct Stream {
 
 impl Stream {
     /// The decoder for `path`'s video, on the GPU of `manager`.
-    pub(crate) fn open(path: &Path, manager: &IMFDXGIDeviceManager) -> Result<Self> {
+    /// `low_latency`: each frame out as soon as it's decoded, for decoders
+    /// that jump about (scrubbing's), where the video allows it (see the
+    /// module's doc).
+    pub(crate) fn open(path: &Path, manager: &IMFDXGIDeviceManager, low_latency: bool) -> Result<Self> {
         let (cmd, cmds) = std::sync::mpsc::channel::<Cmd>();
         let (frames_tx, frames) = std::sync::mpsc::channel::<Result<Option<Frame>>>();
         let (opened_tx, opened) = std::sync::mpsc::channel::<Result<(Index, Vec<usize>, i64, bool, f64)>>();
@@ -255,7 +283,7 @@ impl Stream {
         std::thread::Builder::new().name("direct decode".into()).spawn(move || {
             super::system::com_init();
             let manager = manager;
-            let mut inner = match Inner::open(&path, &manager.0) {
+            let mut inner = match Inner::open(&path, &manager.0, low_latency) {
                 Ok(i) => {
                     let _ = opened_tx.send(Ok((i.index.clone(), i.keys.clone(), i.frame_units, i.reordered, i.fps())));
                     i
