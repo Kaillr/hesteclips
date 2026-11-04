@@ -1946,10 +1946,13 @@ pub fn dialog_text(ui: &mut egui::Ui, text: &str) {
 }
 
 /// A dialog's buttons, right-aligned, the main one last (given first, as
-/// they're laid out right to left).
+/// they're laid out right to left). In a row as tall as a button: a
+/// dialog's box is laid out in the size it had last frame, and buttons
+/// centred in all the height left kept a box that was taller once (a frame
+/// whose text wrapped narrow) that tall for good, its buttons halfway down.
 pub fn dialog_buttons(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
     ui.add_space(14.0);
-    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+    ui.allocate_ui_with_layout(vec2(ui.available_width(), CONTROL_H), egui::Layout::right_to_left(egui::Align::Center), |ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
         add(ui);
     });
@@ -2860,6 +2863,39 @@ pub fn replay_click(ctx: &egui::Context, raw: &mut egui::RawInput) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A dialog's box is as tall as what's in it, even after a frame in
+    /// which it was taller (it's laid out in the size it had last frame):
+    /// its buttons used to keep it that tall, halfway down it.
+    #[test]
+    fn a_dialog_comes_back_to_its_height() {
+        let ctx = egui::Context::default();
+        apply(&ctx);
+        let height = |tall: bool, frame: u32| {
+            let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1040.0, 700.0))), max_texture_side: Some(8192), time: Some(f64::from(frame)), ..Default::default() };
+            let mut out = ctx.run_ui(raw, |ui| {
+                let ctx = ui.ctx().clone();
+                let _ = dialog(&ctx, "grows_once", 440.0, |ui| {
+                    dialog_title(ui, "A dialog");
+                    dialog_text(ui, "Its words, wrapped to its width.");
+                    if tall {
+                        ui.add_space(400.0);
+                    }
+                    dialog_buttons(ui, |ui| {
+                        let _ = ui.add(button("Yes", true));
+                        let _ = ui.add(button("Cancel", false).ghost());
+                    });
+                });
+            });
+            out.textures_delta.clear();
+            ctx.memory(|m| m.area_rect(egui::Id::new("grows_once"))).map_or(0.0, |r| r.height())
+        };
+        let fits = height(false, 0);
+        assert!(fits > 100.0 && fits < 200.0, "{fits}");
+        assert!(height(true, 1) > 500.0);
+        height(false, 2);
+        assert_eq!(height(false, 3), fits, "back to what's in it");
+    }
 
     /// A volume is read however it's typed: either minus sign, a comma for
     /// the point, with or without "dB"; silence as −∞ or -inf.
