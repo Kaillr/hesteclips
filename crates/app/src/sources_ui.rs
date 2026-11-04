@@ -455,30 +455,16 @@ impl App {
     /// of the rest of it if there is one. Without, the editor, which makes
     /// the clip's sound again from the tracks, leaves it out. None for a
     /// source the capture started with (its own track goes on, though it's
-    /// turned off and on), one it doesn't have, or one that's all there.
+    /// turned off and on), one it doesn't have, or one that's all there (as
+    /// it is while only streaming, once there's sound: a stream sends the
+    /// clip's sound alone).
     fn added_note(&self, source: &AudioSourceCfg) -> Option<(String, bool)> {
         let has = |list: &[capture::sources::AudioSource]| list.iter().any(|s| s.id == source.id);
         let added = capture::SOURCES_WHILE_CAPTURING && !self.rec_state.idle() && has(&self.capturing_sources) && !has(&self.started_sources);
         if !added {
             return None;
         }
-        // The capture starts again once all it does has stopped.
-        let again = format!("you stop {} and start again", self.rec_state.words());
-        let (tracks, _, rest) = capture::sources::track_layout(&self.started_sources);
-        if tracks.is_empty() {
-            return Some((format!("Not recorded until {again}: this started without sound."), true));
-        }
-        if !source.in_mix {
-            return Some((format!("Not recorded until {again}: its own track starts then."), true));
-        }
-        // In a track apart: the rest's, or there are no tracks apart.
-        let kept = rest || tracks.len() == 1;
-        match (source.own_track, kept) {
-            (true, true) => Some((format!("In the clip's sound now. Its own track starts once {again}."), false)),
-            (true, false) => Some((format!("In the clip's sound now. Its own track starts once {again}; until then, changing track volumes in the editor leaves it out."), true)),
-            (false, true) => None,
-            (false, false) => Some((format!("In the clip's sound now, but until {again}, changing track volumes in the editor leaves it out."), true)),
-        }
+        added_source_note(self.rec_state, &self.started_sources, source)
     }
 
     /// The video's sources, one card each, the one in front first: a card's
@@ -1766,6 +1752,39 @@ fn forget_name_field(ui: &egui::Ui, id: egui::Id) {
     ui.data_mut(|d| d.remove::<String>(id.with("was")));
 }
 
+/// What `source`, added while `state` runs, doesn't have yet, on a capture
+/// that started with the sources `started` (see [`App::added_note`]).
+fn added_source_note(state: crate::RecState, started: &[capture::sources::AudioSource], source: &AudioSourceCfg) -> Option<(String, bool)> {
+    // The capture starts again once all it does has stopped.
+    let again = format!("you stop {} and start again", state.words());
+    let (tracks, _, rest) = capture::sources::track_layout(started);
+    if tracks.is_empty() {
+        // Nothing made has a track for sound: "clips or the stream".
+        let made: Vec<&str> = [(state.clipping, "clips"), (state.recording, "the recording"), (state.streaming, "the stream")].into_iter().filter(|(on, _)| *on).map(|(_, w)| w).collect();
+        let made = match made.as_slice() {
+            [first @ .., last] if !first.is_empty() => format!("{} or {last}", first.join(", ")),
+            _ => made.concat(),
+        };
+        return Some((format!("Not in {made} until {again}: this started without sound."), true));
+    }
+    // Streaming alone writes no file, and a stream sends the mix: a source
+    // added goes into it at once (and one left out of the mix never does).
+    if !(state.clipping || state.recording) {
+        return None;
+    }
+    if !source.in_mix {
+        return Some((format!("Not recorded until {again}: its own track starts then."), true));
+    }
+    // In a track apart: the rest's, or there are no tracks apart.
+    let kept = rest || tracks.len() == 1;
+    match (source.own_track, kept) {
+        (true, true) => Some((format!("In the clip's sound now. Its own track starts once {again}."), false)),
+        (true, false) => Some((format!("In the clip's sound now. Its own track starts once {again}; until then, changing track volumes in the editor leaves it out."), true)),
+        (false, true) => None,
+        (false, false) => Some((format!("In the clip's sound now, but until {again}, changing track volumes in the editor leaves it out."), true)),
+    }
+}
+
 /// One source: its icon, name and device; its level and volume as one
 /// control (the meter runs along the fader's track, the knob sits on it); the
 /// number to type a value; mute; where it goes; and for a microphone, noise
@@ -2340,5 +2359,64 @@ mod tests {
         f.frame(Vec::new());
         assert!(f.done, "clicking away ends editing");
         assert_eq!(f.name, "Desktop sound");
+    }
+
+    fn doing(clipping: bool, recording: bool, streaming: bool) -> crate::RecState {
+        crate::RecState { clipping, recording, streaming }
+    }
+
+    /// A source a capture started with.
+    fn started(id: &str, in_mix: bool, own_track: bool) -> capture::sources::AudioSource {
+        let kind = capture::sources::SourceKind::Desktop { exclude_app_sources: true };
+        capture::sources::AudioSource { id: id.to_owned(), name: id.to_owned(), kind, in_mix, own_track }
+    }
+
+    /// A source added since.
+    fn added(in_mix: bool, own_track: bool) -> AudioSourceCfg {
+        let mut s = AudioSourceCfg::new("Game", SourceKind::Desktop { exclude_apps: true });
+        (s.in_mix, s.own_track) = (in_mix, own_track);
+        s
+    }
+
+    #[test]
+    fn a_source_added_while_only_streaming_is_all_there() {
+        let started = [started("mic", true, true)];
+        // In the mix (the stream's sound), with a track or without; or kept
+        // out of it, as it would be from any stream.
+        for (in_mix, own_track) in [(true, true), (true, false), (false, true)] {
+            assert_eq!(added_source_note(doing(false, false, true), &started, &added(in_mix, own_track)), None);
+        }
+    }
+
+    #[test]
+    fn a_source_added_to_a_capture_without_sound_says_what_it_isnt_in() {
+        let note = |state| added_source_note(state, &[], &added(true, true));
+        let stream = "Not in the stream until you stop streaming and start again: this started without sound.";
+        assert_eq!(note(doing(false, false, true)), Some((stream.to_owned(), true)));
+        let both = "Not in clips or the stream until you stop clipping and streaming and start again: this started without sound.";
+        assert_eq!(note(doing(true, false, true)), Some((both.to_owned(), true)));
+        let all = "Not in clips, the recording or the stream until you stop clipping, recording and streaming and start again: this started without sound.";
+        assert_eq!(note(doing(true, true, true)), Some((all.to_owned(), true)));
+    }
+
+    #[test]
+    fn a_source_added_while_clipping_says_what_it_waits_for() {
+        let clipping = doing(true, false, false);
+        // A mic on its own track and the desktop in the mix alone: the rest
+        // track keeps a source added in the mix.
+        let with_rest = [started("mic", true, true), started("desktop", true, false)];
+        assert_eq!(added_source_note(clipping, &with_rest, &added(true, false)), None);
+        let (text, warn) = added_source_note(clipping, &with_rest, &added(true, true)).unwrap();
+        assert!(!warn && text.ends_with("Its own track starts once you stop clipping and start again."), "{text}");
+        // Every source on its own track: none keeps it, so the editor's
+        // track volumes leave it out.
+        let own_tracks = [started("mic", true, true)];
+        let (text, warn) = added_source_note(clipping, &own_tracks, &added(true, false)).unwrap();
+        assert!(warn && text.ends_with("changing track volumes in the editor leaves it out."), "{text}");
+        // Out of the mix: only its own track takes it, once the capture
+        // starts again.
+        let note = added_source_note(doing(true, false, true), &own_tracks, &added(false, true));
+        let wait = "Not recorded until you stop clipping and streaming and start again: its own track starts then.";
+        assert_eq!(note, Some((wait.to_owned(), true)));
     }
 }
