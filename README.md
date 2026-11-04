@@ -89,7 +89,7 @@ Clips are saved in a `hasteclip` folder in your Videos folder (Movies on macOS),
 - **Replay buffer.** It keeps the last 5 seconds to 1 hour in memory. Save it with a shortcut, or by voice: “HasteClip that” is recognised on your computer and never sent anywhere.
 - **Clips named after the play.** “3 kills on Mirage”, “Pentakill as Jinx”, “412pp FC”: clips of Counter-Strike 2, Dota 2, League of Legends and osu! are named after what happened. Other games' clips are named by the time.
 - **Recording.** Record straight to disk for as long as you like. A crash or power loss still leaves a playable file.
-- **Go live.** Stream to Twitch, YouTube, Kick or a server of your own, to several at once, at a size, frame rate and bitrate of the stream's own, frame blending and all. Clipping and recording go on beside it, all from one capture. (Windows for now.)
+- **Go live.** Stream to Twitch, YouTube, Kick or a server of your own, to several at once, at a size, frame rate and bitrate of the stream's own, frame blending and all. Clipping and recording go on beside it, all from one capture.
 - **Native, hardware encoding.** H.264 on your graphics card's video engine, at native resolution or scaled down, up to 540 fps at 1080p. HasteClip is written in Rust and draws on the GPU, with no browser running behind your game.
 - **Any shape.** Record the whole screen or a game's window, in its own aspect ratio or another, like 16:9 from an ultrawide screen.
 - **Sound as sources, not tracks.** Add your microphone, desktop sound, or single apps like the game, Discord or music. For each one, choose whether it's in the clip's sound, has its own track for editing later, or both. Each source has a live meter and a fader. There's noise reduction and mono for microphones, and a limiter on the mix.
@@ -165,13 +165,14 @@ HasteClip is in beta (versions 0.x). It works day to day, but not every feature 
 | Record a single game or app window | ✅ | ✅ | ✅ (see below) |
 | Drag clips out, system share sheet | ✅ | ✅ | Drag out on Wayland (no share sheet) |
 | Frame blending | ✅ | ✅ | ✅ |
+| Go live (streaming) | ✅ | ✅ | ✅ |
 | Automatic updates | ✅ | ✅ | ✅ |
 | Screenshots | — | ✅ | ✅ |
 | Game capture for fullscreen games | — | ✅ | — |
 
 **Games and apps on Linux:** every window on KDE Plasma, on X11 desktops, and on Sway and other desktops with the ext window capture protocols (Sway 1.11 and later). On GNOME, the windows of X11 apps, which includes games run through Proton or Wine; GNOME doesn't let apps follow its native Wayland windows, so record the whole screen for those.
 
-**Encoders:** VideoToolbox on macOS. NVENC, AMF or Quick Sync through Media Foundation on Windows. NVENC or VA-API through ffmpeg on Linux, with x264 when there's no GPU encoder.
+**Encoders:** VideoToolbox on macOS. NVENC, AMF or Quick Sync through Media Foundation on Windows. NVENC or VA-API through ffmpeg on Linux, with x264 when there's no GPU encoder. A stream gets an encoder of its own (on Linux, always ffmpeg's).
 
 **Frame blending** captures several times faster than the clip's frame rate and blends those pictures into each frame, for smooth motion.
 

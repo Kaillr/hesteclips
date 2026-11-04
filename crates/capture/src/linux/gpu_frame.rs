@@ -481,6 +481,40 @@ impl Nv12Target {
     }
 }
 
+/// The frame made another size on the card, for a stream's pictures
+/// ([`GpuPicture::scaled`]): the picture that size, the scale's uniforms,
+/// NV12 made from it, and where that's read back.
+pub(crate) struct Scaled {
+    width: u32,
+    height: u32,
+    texture: wgpu::Texture,
+    uniforms: wgpu::Buffer,
+    nv12_buf: wgpu::Buffer,
+    readback: wgpu::Buffer,
+    nv12_bind: wgpu::BindGroup,
+}
+
+/// A stream frame made of every frame in its own time (frame blending on,
+/// the stream at a fraction of the frame rate: 48 fps from 144): their
+/// light averaged, as a frame's looks are, so its motion is blurred over
+/// all of its time as the recording's is over each frame's (as Windows'
+/// `StreamBlend`; one frame in three instead blurred a third of it).
+/// [`GpuPicture::frame_sum`].
+pub(crate) struct FrameSum {
+    accumulate: wgpu::ComputePipeline,
+    resolve: wgpu::ComputePipeline,
+    /// The frames' light added up, a pixel each.
+    sum: wgpu::Buffer,
+    /// The accumulate's uniforms (the same for every frame), and the
+    /// resolve's.
+    look: wgpu::Buffer,
+    resolve_uniforms: wgpu::Buffer,
+    /// The average, as the frame is: RGBA, its size.
+    texture: wgpu::Texture,
+    /// Frames added since it was last made or let go of.
+    count: u32,
+}
+
 /// A small copy of the frame for the preview, kept for its size.
 struct PreviewTarget {
     texture: wgpu::Texture,
@@ -689,6 +723,8 @@ impl GpuPicture {
     }
 
     /// Blend frames from now on, `open` of them at once (`Shutter::frames_open`).
+    /// Blending already, its sums are made anew (the frames under way let
+    /// go of) and nothing's held: its kernels stay as they are.
     pub(crate) fn start_blending(&mut self, open: usize) {
         let device = &self.gpu.device;
         let pipeline = |source: &str, entry: &str| {
@@ -697,7 +733,7 @@ impl GpuPicture {
         };
         let uniform = |label| device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size: 64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let bytes = self.width as u64 * self.height as u64 * 16;
-        let slots = (0..open.max(1))
+        let slots: Vec<Slot> = (0..open.max(1))
             .map(|_| Slot {
                 sum: device.create_buffer(&wgpu::BufferDescriptor { label: Some("blend sum"), size: bytes, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }),
                 uniforms: uniform("look"),
@@ -706,7 +742,219 @@ impl GpuPicture {
                 pending: 0.0,
             })
             .collect();
+        if let Some(b) = &mut self.blend {
+            b.slots = slots;
+            b.held = None;
+            return;
+        }
         self.blend = Some(Blend { accumulate: pipeline(BLEND_SHADER, "accumulate"), resolve: pipeline(RESOLVE_SHADER, "resolve"), slots, resolve_uniforms: uniform("resolve"), held: None, dst: [0; 4] });
+    }
+
+    /// Blend no more: its sums let go of (the frames are drawn again).
+    pub(crate) fn stop_blending(&mut self) {
+        self.blend = None;
+    }
+
+    /// Where the frame is made another size ([`Self::scaled_nv12`]):
+    /// `width`×`height`, for a stream's pictures.
+    pub(crate) fn scaled(&self, width: u32, height: u32) -> Scaled {
+        let device = &self.gpu.device;
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("scaled frame"),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let uniform = |label| device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size: 64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let (uniforms, sizes) = (uniform("scaled frame"), uniform("scaled size"));
+        // The whole frame into all of it, the webcam's layer not laid over
+        // again (it's in the frame), as the preview's.
+        let scale: Vec<u8> = [0.0f32, 0.0, self.width as f32, self.height as f32, 0.0, 0.0, width as f32, height as f32]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .chain([width, height, 0, 0, 0, 0, 0, 0].iter().flat_map(|v| v.to_le_bytes()))
+            .collect();
+        self.gpu.queue.write_buffer(&uniforms, 0, &scale);
+        // Its rows packed, as ffmpeg takes them.
+        let size: Vec<u8> = [width, height, width, 0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        self.gpu.queue.write_buffer(&sizes, 0, &size);
+        let bytes = nv12_len(width, height).div_ceil(4) as u64 * 4;
+        let nv12_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("scaled nv12"), size: bytes, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+        let readback = device.create_buffer(&wgpu::BufferDescriptor { label: Some("scaled nv12 read"), size: bytes, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+        let view = texture.create_view(&Default::default());
+        let nv12_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("scaled nv12"),
+            layout: &self.nv12.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
+                wgpu::BindGroupEntry { binding: 1, resource: nv12_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: sizes.as_entire_binding() },
+            ],
+        });
+        Scaled { width, height, texture, uniforms, nv12_buf, readback, nv12_bind }
+    }
+
+    /// A sum of frames, for a stream's ([`Self::add_to_sum`]): the
+    /// accumulate and resolve kernels frame blending's looks use, the whole
+    /// frame taken as it is, each frame weighing the same.
+    pub(crate) fn frame_sum(&self) -> FrameSum {
+        let device = &self.gpu.device;
+        let pipeline = |source: &str, entry: &str| {
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(entry), source: wgpu::ShaderSource::Wgsl(source.into()) });
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some(entry), layout: None, module: &module, entry_point: Some(entry), compilation_options: Default::default(), cache: None })
+        };
+        let uniform = |label| device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size: 64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let (w, h) = (self.width, self.height);
+        let sum = device.create_buffer(&wgpu::BufferDescriptor { label: Some("stream sum"), size: w as u64 * h as u64 * 16, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let look = uniform("stream look");
+        // The whole frame into all of the sum, as it is, by one.
+        let bytes: Vec<u8> = [0.0f32, 0.0, w as f32, h as f32, 0.0, 0.0, w as f32, h as f32]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .chain(w.to_le_bytes())
+            .chain(h.to_le_bytes())
+            .chain(1f32.to_le_bytes())
+            .chain(0f32.to_le_bytes())
+            .chain([0u32, 0, 0, 0].iter().flat_map(|v| v.to_le_bytes()))
+            .collect();
+        self.gpu.queue.write_buffer(&look, 0, &bytes);
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("stream average"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        FrameSum { accumulate: pipeline(BLEND_SHADER, "accumulate"), resolve: pipeline(RESOLVE_SHADER, "resolve"), sum, look, resolve_uniforms: uniform("stream resolve"), texture, count: 0 }
+    }
+
+    /// The frame as it is now, its light added to `to`'s.
+    pub(crate) fn add_to_sum(&self, to: &mut FrameSum) {
+        let device = &self.gpu.device;
+        let frame_view = self.frame.create_view(&Default::default());
+        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("stream look"),
+            layout: &to.accumulate.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&frame_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: to.sum.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: to.look.as_entire_binding() },
+            ],
+        });
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("stream look") });
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&to.accumulate);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups(self.width.div_ceil(8), self.height.div_ceil(8), 1);
+        }
+        self.gpu.queue.submit([enc.finish()]);
+        to.count += 1;
+    }
+
+    /// `to`'s frames' average light made, back to sRGB, into its picture
+    /// (for [`Self::scaled_nv12`]), and its sum emptied. False if no frame
+    /// was added.
+    pub(crate) fn resolve_sum(&self, to: &mut FrameSum) -> bool {
+        if to.count == 0 {
+            return false;
+        }
+        let (w, h) = (self.width, self.height);
+        // No webcam layer laid over (it's in each frame).
+        let bytes: Vec<u8> = [w.to_le_bytes(), h.to_le_bytes(), (to.count as f32).to_le_bytes(), 0u32.to_le_bytes()]
+            .into_iter()
+            .chain([0.0f32, 0.0, w as f32, h as f32].map(f32::to_le_bytes))
+            .chain([0u32, 0, 0, 0].map(u32::to_le_bytes))
+            .collect::<Vec<_>>()
+            .concat();
+        self.gpu.queue.write_buffer(&to.resolve_uniforms, 0, &bytes);
+        let device = &self.gpu.device;
+        let out_view = to.texture.create_view(&Default::default());
+        let overlay_view = self.layer.texture.create_view(&Default::default());
+        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("stream resolve"),
+            layout: &to.resolve.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: to.sum.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&out_view) },
+                wgpu::BindGroupEntry { binding: 2, resource: to.resolve_uniforms.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&overlay_view) },
+            ],
+        });
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("stream resolve") });
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&to.resolve);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups(w.div_ceil(8), h.div_ceil(8), 1);
+        }
+        enc.clear_buffer(&to.sum, 0, None);
+        self.gpu.queue.submit([enc.finish()]);
+        to.count = 0;
+        true
+    }
+
+    /// `to`'s sum let go of (a frame of it left unfinished).
+    pub(crate) fn clear_sum(&self, to: &mut FrameSum) {
+        if to.count == 0 {
+            return;
+        }
+        let mut enc = self.gpu.device.create_command_encoder(&Default::default());
+        enc.clear_buffer(&to.sum, 0, None);
+        self.gpu.queue.submit([enc.finish()]);
+        to.count = 0;
+    }
+
+    /// The frame as it is now, or `from`'s average of frames, made `to`'s
+    /// size and NV12 on the card (each pixel the average of what it
+    /// covers), read back into `out`.
+    pub(crate) fn scaled_nv12(&self, to: &Scaled, from: Option<&FrameSum>, out: &mut Vec<u8>) {
+        let device = &self.gpu.device;
+        let frame_view = from.map_or(&self.frame, |s| &s.texture).create_view(&Default::default());
+        let scaled_view = to.texture.create_view(&Default::default());
+        let overlay_view = self.layer.texture.create_view(&Default::default());
+        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("scaled frame"),
+            layout: &self.scale.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&frame_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&scaled_view) },
+                wgpu::BindGroupEntry { binding: 2, resource: to.uniforms.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&overlay_view) },
+            ],
+        });
+        let groups = ((to.nv12_buf.size() / 4) as u32).div_ceil(64);
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("scaled nv12") });
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.scale);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups(to.width.div_ceil(8), to.height.div_ceil(8), 1);
+        }
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.nv12);
+            pass.set_bind_group(0, &to.nv12_bind, &[]);
+            // Past 65535 groups a dimension, rows of them.
+            pass.dispatch_workgroups(groups.min(65535), groups.div_ceil(65535), 1);
+        }
+        enc.copy_buffer_to_buffer(&to.nv12_buf, 0, &to.readback, 0, to.nv12_buf.size());
+        let done = self.gpu.queue.submit([enc.finish()]);
+        let slice = to.readback.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        let _ = device.poll(wgpu::PollType::Wait { submission_index: Some(done), timeout: None });
+        out.clear();
+        if let Ok(data) = slice.get_mapped_range() {
+            out.extend_from_slice(&data[..nv12_len(to.width, to.height)]);
+        }
+        to.readback.unmap();
     }
 
     /// The looks from now on see this picture (number `seq`).

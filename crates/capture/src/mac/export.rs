@@ -239,14 +239,14 @@ struct Frame(CFRetained<CVPixelBuffer>);
 unsafe impl Send for Frame {}
 
 /// A frame to encode, and the GPU's work making it (if it's still to do).
-struct Made {
+pub(crate) struct Made {
     frame: CFRetained<CVPixelBuffer>,
     gpu: Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
 }
 
 impl Made {
     /// The frame, once the GPU has made it.
-    fn ready(&self) -> Result<&CVPixelBuffer> {
+    pub(crate) fn ready(&self) -> Result<&CVPixelBuffer> {
         if let Some(cmd) = &self.gpu {
             cmd.waitUntilCompleted();
             if cmd.status() != MTLCommandBufferStatus::Completed {
@@ -370,8 +370,9 @@ fn matrix_between((kr, kb): (f64, f64), (kr2, kb2): (f64, f64)) -> [[f64; 3]; 3]
 /// `Nv12Scaler`): by Lanczos (3 lobes, as ffmpeg's export scaled), across
 /// into rows of the new width, then down into a frame of the encoder's. The
 /// same size is an exact copy. BT.601's colours are made BT.709's on the way
-/// down ([`Convert`]), rounded once.
-struct Scaler {
+/// down ([`Convert`]), rounded once. A stream's pictures are made its size
+/// by it too (`super::blend::StreamOut`).
+pub(crate) struct Scaler {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     across_luma: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
@@ -401,7 +402,7 @@ impl Scaler {
     /// For frames `size` big, `crop` of them used (left, top, width, height:
     /// even), made `frame` big (even), on `queue`; their colours BT.601's,
     /// made BT.709's, or BT.709's.
-    fn new(
+    pub(crate) fn new(
         device: &Retained<ProtocolObject<dyn MTLDevice>>,
         queue: &Retained<ProtocolObject<dyn MTLCommandQueue>>,
         size: (u32, u32),
@@ -443,7 +444,7 @@ impl Scaler {
 
     /// `src` (NV12, the size given) cropped and scaled into a new frame, on
     /// the GPU: not waited for ([`Made::ready`]).
-    fn scale(&self, src: CFRetained<CVPixelBuffer>) -> Result<Made> {
+    pub(crate) fn scale(&self, src: CFRetained<CVPixelBuffer>) -> Result<Made> {
         let out = self.pool.take()?;
         let planes = [plane_texture(&self.device, &src, 0, false)?, plane_texture(&self.device, &src, 1, false)?];
         let made = [plane_texture(&self.device, &out, 0, true)?, plane_texture(&self.device, &out, 1, true)?];
@@ -793,7 +794,7 @@ fn encoded(sample: &CMSampleBuffer, fps: u32) -> Result<Encoded> {
 }
 
 /// The SPS and PPS the encoder's frames need (it writes 4-byte lengths).
-fn avc_config(format: &CMFormatDescription) -> Result<AvcConfig> {
+pub(crate) fn avc_config(format: &CMFormatDescription) -> Result<AvcConfig> {
     let set = |i: usize| -> Result<Vec<u8>> {
         let (mut at, mut len, mut count, mut length_size): (*const u8, usize, usize, c_int) = (ptr::null(), 0, 0, 0);
         let status = unsafe { CMVideoFormatDescriptionGetH264ParameterSetAtIndex(format, i, &mut at, &mut len, &mut count, &mut length_size) };

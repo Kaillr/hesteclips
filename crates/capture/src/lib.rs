@@ -1009,14 +1009,14 @@ impl Running {
     }
 }
 
-/// Whether going live is here ([`Mode::Stream`]): the stream's own encoder
-/// is on Windows so far.
-pub const STREAMING: bool = cfg!(target_os = "windows");
+/// Whether going live is here ([`Mode::Stream`]): the stream has an encoder
+/// of its own on Windows (Media Foundation's), macOS (VideoToolbox) and
+/// Linux (ffmpeg's: NVENC, VA-API or x264).
+pub const STREAMING: bool = cfg!(any(target_os = "windows", target_os = "macos", target_os = "linux"));
 
 /// Whether frame blending can be changed while capturing
-/// ([`Recorder::set_blend`]): on Windows so far; elsewhere it's set when
-/// the capture starts.
-pub const BLEND_WHILE_CAPTURING: bool = cfg!(target_os = "windows");
+/// ([`Recorder::set_blend`]): taken up at the capture's next frame.
+pub const BLEND_WHILE_CAPTURING: bool = cfg!(any(target_os = "windows", target_os = "macos", target_os = "linux"));
 
 /// A capture device (screen, app, or audio device) as seen by the backend.
 #[derive(Debug, Clone)]

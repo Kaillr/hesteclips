@@ -34,7 +34,7 @@ use objc2::{AllocAnyThread, DefinedClass, define_class, msg_send};
 use objc2_core_audio_types::{
     AudioBuffer, AudioBufferList, AudioStreamBasicDescription, kAudioFormatFlagIsNonInterleaved,
 };
-use objc2_core_foundation::{CFBoolean, CFDictionary, CFNumber, CFRetained, CFString, CFType};
+use objc2_core_foundation::{CFArray, CFBoolean, CFDictionary, CFNumber, CFRetained, CFString, CFType};
 use objc2_core_media::{
     CMAudioFormatDescriptionGetStreamBasicDescription, CMBlockBuffer, CMClock, CMSampleBuffer, CMTime,
     kCMSampleAttachmentKey_NotSync,
@@ -54,7 +54,7 @@ use objc2_screen_capture_kit::{
 use objc2_video_toolbox::{
     VTCompressionSession, VTEncodeInfoFlags, VTSessionSetProperty,
     kVTCompressionPropertyKey_AllowFrameReordering, kVTCompressionPropertyKey_AverageBitRate,
-    kVTCompressionPropertyKey_ColorPrimaries, kVTCompressionPropertyKey_ExpectedFrameRate,
+    kVTCompressionPropertyKey_ColorPrimaries, kVTCompressionPropertyKey_DataRateLimits, kVTCompressionPropertyKey_ExpectedFrameRate,
     kVTCompressionPropertyKey_MaxKeyFrameInterval,
     kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, kVTCompressionPropertyKey_ProfileLevel,
     kVTCompressionPropertyKey_RealTime, kVTCompressionPropertyKey_TransferFunction,
@@ -66,12 +66,14 @@ use objc2_video_toolbox::{
 use crate::aac::AacEncoder;
 use crate::mixer::{self, Channel, Clock, LiveAudio, SourceFeed, SourceStatus};
 use crate::outputs::{Capture, Outputs};
+use crate::shutter::Shutter;
 use crate::sources::{AudioCapture, AudioSource, Retry, SourceKind, mix_inputs, track_layout};
+use crate::stream::{StreamFrame, StreamSettings};
 use crate::avwriter::{SendFormat, SendSample};
 use crate::writer::{self, Layout, Media, Writer};
-use crate::mac::blend::{Blender, Mix, spawn_blend_pacer};
+use crate::mac::blend::{BlendChange, Blender, Mix, PacerCtl, StreamOut, spawn_blend_pacer};
 use crate::mac::video::{self, Frames, Picture, pick_display, shareable_content};
-use crate::{EncodeSettings, Mode, Recorder};
+use crate::{BlendShape, EncodeSettings, Mode, Recorder, VideoSource};
 
 use crate::AUDIO_BITRATE;
 
@@ -115,11 +117,21 @@ impl Recorder for SckRecorder {
     }
 
     fn update_video(&mut self, video: &crate::VideoSource) -> bool {
-        self.outputs.session.as_mut().and_then(|s| s.video.as_mut()).is_some_and(|p| p.update(video))
+        let Some(session) = self.outputs.session.as_mut() else { return false };
+        let updated = session.video.as_mut().is_some_and(|p| p.update(video));
+        if updated {
+            // How fast it can be looked at follows (a display's refresh).
+            session.source = video.clone();
+        }
+        updated
     }
 
     fn set_mic(&mut self, id: &str, device: &str) -> bool {
         self.outputs.session.as_mut().and_then(|s| s.audio.as_mut()).is_some_and(|a| a.set_mic(id, device))
+    }
+
+    fn set_blend(&mut self, looks: u32, shape: BlendShape) -> bool {
+        self.outputs.session.as_mut().is_some_and(|s| s.set_blend(looks, shape))
     }
 }
 
@@ -151,11 +163,51 @@ struct Session {
     encoders: Vec<JoinHandle<()>>,
     writer_tx: Sender<writer::Command>,
     writer: Option<Writer>,
+    /// Frames a second, the frame's size, and whether only the media engine
+    /// encodes: what the stream's own encoder is set up from.
+    fps: u32,
+    size: (usize, usize),
+    hardware: bool,
+    /// What's recorded: how often it can be looked at follows from it.
+    source: VideoSource,
+    /// Frame blending as the pacer has it (or will, at its next frame):
+    /// looks a frame, and how they're weighed.
+    blend: (u32, Shutter),
+    /// What's changed in the running pacer: frame blending, and the stream's
+    /// pictures.
+    ctl: PacerCtl,
 }
 
 impl Capture for Session {
     fn writer(&self) -> &Sender<writer::Command> {
         &self.writer_tx
+    }
+
+    /// The stream's own pictures, one for each rendition
+    /// (`stream::renditions`: as many as the places streamed to want
+    /// different ones): a frame for every `every` the pacer makes, at the
+    /// rendition's size (scaled by Metal) and rate, through a VideoToolbox
+    /// encoder of its own.
+    fn stream_video(&mut self, stream: Option<&StreamSettings>) -> Result<()> {
+        let Some(st) = stream else {
+            *self.ctl.stream.lock().unwrap_or_else(PoisonError::into_inner) = Some(Vec::new());
+            return Ok(());
+        };
+        if self.pacer.is_none() {
+            bail!("the capture can't stream");
+        }
+        let (renditions, _) = crate::stream::renditions(st, self.fps);
+        let mut outs = Vec::with_capacity(renditions.len());
+        for (i, r) in renditions.iter().enumerate() {
+            let every = (self.fps / r.fps.max(1)).max(1) as i64;
+            let (w, h) = crate::output_size(self.size.0 as u32, self.size.1 as u32, r.short_side);
+            let setup = Setup { fps: r.fps, kbps: r.kbps, hardware: self.hardware, stream: Some(i) };
+            let encoder = Encoder::stream(w as usize, h as usize, setup, self.writer_tx.clone())?;
+            outs.push(StreamOut::start(every, self.size, (w as usize, h as usize), r.fps, encoder)?);
+            eprintln!("stream: VideoToolbox at {w}×{h}, {} fps, {} kb/s", r.fps, r.kbps);
+        }
+        *self.ctl.stream.lock().unwrap_or_else(PoisonError::into_inner) = Some(outs);
+        Ok(())
     }
 
     fn finish(self) -> Result<()> {
@@ -189,8 +241,25 @@ impl Session {
         let writer = Writer::new(layout, s.fps);
         let writer_tx = writer.tx.clone();
 
-        let mut session =
-            Self { video: None, pacer: None, audio: None, mixer: None, encoders: Vec::new(), writer_tx, writer: Some(writer) };
+        // With blending, the screen is looked at faster than the frame
+        // rate, never faster than the display shows new pictures.
+        let looks = blend_looks(&s.video, s.fps, s.blend_samples);
+        let shutter = Shutter::new(looks, s.blend_shape);
+        let mut session = Self {
+            video: None,
+            pacer: None,
+            audio: None,
+            mixer: None,
+            encoders: Vec::new(),
+            writer_tx,
+            writer: Some(writer),
+            fps: s.fps,
+            size: (width, height),
+            hardware: s.use_hardware,
+            source: s.video.clone(),
+            blend: (looks, shutter),
+            ctl: PacerCtl::default(),
+        };
         let started = (|| -> Result<()> {
             // One PCM channel + AAC thread per track, in layout order: the mix,
             // each own track, the rest.
@@ -220,9 +289,6 @@ impl Session {
             session.mixer = Some((stop, mixer));
 
             let encoder = Encoder::new(width, height, s, session.writer_tx.clone())?;
-            // With blending, the screen is looked at faster than the frame
-            // rate, never faster than the display shows new pictures.
-            let looks = blend_looks(s);
             let placed = *s.screen.lock().unwrap();
             let picture = Picture::start(&s.video, &content, &display, (width, height), s.fps * looks, away, placed)?;
             // A webcam that can't open doesn't stop the recording: its status
@@ -236,9 +302,9 @@ impl Session {
             // newest one when the frame was due, a game at the frame rate whose
             // pictures came near those times had one in a frame twice and
             // the next in none, by chance: measured, up to 1 frame in 5.
-            let shutter = crate::shutter::Shutter::new(looks, s.blend_shape);
             let mix = if looks > 1 { Mix::Blend(Blender::new(width, height, shutter.frames_open())?) } else { Mix::one() };
-            session.pacer = Some(spawn_blend_pacer(s.fps, looks, shutter, latest, mix, frames, encoder, clock));
+            let ctl = session.ctl.clone();
+            session.pacer = Some(spawn_blend_pacer(s.fps, looks, shutter, latest, mix, frames, encoder, clock, ctl));
             Ok(())
         })();
         if let Err(e) = started {
@@ -248,6 +314,34 @@ impl Session {
         Ok(session)
     }
 
+    /// Change frame blending while it runs: the pacer takes it up at its
+    /// next frame (its blender made here, so the pacer doesn't wait for
+    /// Metal), and the screen is looked at as fast as the looks need (the
+    /// stream set up again for that rate). False if it can't.
+    fn set_blend(&mut self, looks: u32, shape: BlendShape) -> bool {
+        let (Some(picture), Some(_)) = (&self.video, &self.pacer) else { return false };
+        let looks = blend_looks(&self.source, self.fps, looks);
+        let shutter = Shutter::new(looks, shape);
+        if self.blend == (looks, shutter) {
+            return true;
+        }
+        let mix = if looks > 1 {
+            match Blender::new(self.size.0, self.size.1, shutter.frames_open()) {
+                Ok(b) => Mix::Blend(b),
+                Err(e) => {
+                    eprintln!("frame blending couldn't change: {e:#}");
+                    return false;
+                }
+            }
+        } else {
+            Mix::one()
+        };
+        *self.ctl.blend.lock().unwrap_or_else(PoisonError::into_inner) = Some(BlendChange { looks, shutter, mix });
+        self.blend = (looks, shutter);
+        picture.set_rate(self.fps * looks);
+        true
+    }
+
     /// Stop capturing and finish what the writer was doing (a recording's
     /// file; the ring's let go).
     fn end(mut self) -> Result<()> {
@@ -255,6 +349,12 @@ impl Session {
         if let Some((stop, handle)) = self.pacer.take() {
             stop.store(true, Ordering::Relaxed);
             let _ = handle.join();
+        }
+        // A stream the pacer stopped before it took it up: finished here
+        // (its encoders would hold the writer open).
+        let pending = self.ctl.stream.lock().unwrap_or_else(PoisonError::into_inner).take();
+        for s in pending.into_iter().flatten() {
+            s.finish();
         }
         if let Some(picture) = self.video.take() {
             picture.stop();
@@ -276,11 +376,12 @@ impl Session {
     }
 }
 
-/// Looks at the screen per frame for frame blending: as asked, but no more
-/// than the display can show new pictures in a frame's time (1: no blending).
-fn blend_looks(s: &EncodeSettings) -> u32 {
-    let asked = s.blend_samples.max(1);
-    let most = crate::max_blend_rate(&s.video).map_or(asked, |hz| (hz / s.fps.max(1)).max(1));
+/// Looks at the screen per frame for frame blending: `asked`, but no more
+/// than the display `video` shows can show new pictures in a frame's time
+/// at `fps` (1: no blending).
+fn blend_looks(video: &VideoSource, fps: u32, asked: u32) -> u32 {
+    let asked = asked.max(1);
+    let most = crate::max_blend_rate(video).map_or(asked, |hz| (hz / fps.max(1)).max(1));
     asked.min(most)
 }
 
@@ -744,11 +845,27 @@ pub(crate) struct Encoder {
     ctx: *mut EncodedSink,
 }
 
+/// How an encoder is set up.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Setup {
+    pub fps: u32,
+    pub kbps: u32,
+    /// The media engine only (else VideoToolbox's software encoder too).
+    pub hardware: bool,
+    /// For a stream (`crate::stream`): a constant bitrate and a keyframe
+    /// every two seconds, as the services ask, and its frames handed over
+    /// as the stream's own, this one of its pictures (its rendition).
+    pub stream: Option<usize>,
+}
+
 /// Where encoded frames go.
 pub(crate) struct EncodedSink {
     pub(crate) tx: Option<Sender<writer::Command>>,
     /// Catches the format description of the first frame (`probe_video_format`).
     pub(crate) probe: Option<Sender<CFRetained<objc2_core_media::CMFormatDescription>>>,
+    /// A stream's encoder: its frames are the stream's own (this one of its
+    /// pictures).
+    stream: Option<usize>,
     /// Frames handed to the encoder and not called back yet.
     in_flight: AtomicUsize,
     /// When each frame in the encoder went in, oldest first (they come back
@@ -758,8 +875,8 @@ pub(crate) struct EncodedSink {
 }
 
 impl EncodedSink {
-    fn new(tx: Option<Sender<writer::Command>>, probe: Option<Sender<CFRetained<objc2_core_media::CMFormatDescription>>>) -> Self {
-        Self { tx, probe, in_flight: AtomicUsize::new(0), held: Mutex::default() }
+    fn new(tx: Option<Sender<writer::Command>>, probe: Option<Sender<CFRetained<objc2_core_media::CMFormatDescription>>>, stream: Option<usize>) -> Self {
+        Self { tx, probe, stream, in_flight: AtomicUsize::new(0), held: Mutex::default() }
     }
 
     fn held(&self) -> std::sync::MutexGuard<'_, Held> {
@@ -779,17 +896,23 @@ struct Held {
 
 impl Encoder {
     pub(crate) fn new(width: usize, height: usize, s: &EncodeSettings, tx: Sender<writer::Command>) -> Result<Self> {
-        Self::with_sink(width, height, s, EncodedSink::new(Some(tx), None))
+        Self::with_sink(width, height, Setup::of(s), EncodedSink::new(Some(tx), None, None))
     }
 
-    fn with_sink(width: usize, height: usize, s: &EncodeSettings, sink: EncodedSink) -> Result<Self> {
+    /// One of a stream's encoders (`setup.stream`: which of its pictures):
+    /// its frames go to `tx` as the stream's own.
+    pub(crate) fn stream(width: usize, height: usize, setup: Setup, tx: Sender<writer::Command>) -> Result<Self> {
+        Self::with_sink(width, height, setup, EncodedSink::new(Some(tx), None, setup.stream))
+    }
+
+    fn with_sink(width: usize, height: usize, s: Setup, sink: EncodedSink) -> Result<Self> {
         unsafe {
-            let spec_key = if s.use_hardware {
+            let spec_key = if s.hardware {
                 kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder
             } else {
                 kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder
             };
-            let spec = CFDictionary::<CFString, CFType>::from_slices(&[spec_key], &[CFBoolean::new(s.use_hardware)]);
+            let spec = CFDictionary::<CFString, CFType>::from_slices(&[spec_key], &[CFBoolean::new(s.hardware)]);
             let ctx = Box::into_raw(Box::new(sink));
             let mut out: *mut VTCompressionSession = ptr::null_mut();
             let status = VTCompressionSession::create(
@@ -810,13 +933,28 @@ impl Encoder {
             };
             let session = CFRetained::from_raw(session);
 
-            let gop = crate::keyframe_every(s.fps);
+            // A stream: a keyframe every two seconds (where a connection
+            // can start), as the services ask.
+            let gop = if s.stream.is_some() { s.fps.max(1) * 2 } else { crate::keyframe_every(s.fps) };
             let set = |key: &CFString, value: &CFType| VTSessionSetProperty(&session, key, Some(value));
             set(kVTCompressionPropertyKey_RealTime, CFBoolean::new(true));
             set(kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_H264_High_AutoLevel);
             // No B-frames: frames come out in order, so decode time = presentation time.
             set(kVTCompressionPropertyKey_AllowFrameReordering, CFBoolean::new(false));
-            set(kVTCompressionPropertyKey_AverageBitRate, &CFNumber::new_i64(s.video_bitrate_kbps as i64 * 1000));
+            let bitrate = s.kbps.max(100) as i64 * 1000;
+            // A stream's bitrate is constant (what the services ask for, and
+            // what a connection can be counted on to carry), where the media
+            // engine can (Apple silicon, macOS 13 on: its key by name, so an
+            // older macOS without it still starts); else its mean, with no
+            // more than that in any second.
+            let constant = s.stream.is_some() && set(&CFString::from_static_str("ConstantBitRate"), &CFNumber::new_i64(bitrate)) == 0;
+            if !constant {
+                set(kVTCompressionPropertyKey_AverageBitRate, &CFNumber::new_i64(bitrate));
+            }
+            if s.stream.is_some() && !constant {
+                let limits = CFArray::<CFNumber>::from_retained_objects(&[CFNumber::new_i64(bitrate / 8), CFNumber::new_f64(1.0)]);
+                set(kVTCompressionPropertyKey_DataRateLimits, limits.as_ref());
+            }
             set(kVTCompressionPropertyKey_ExpectedFrameRate, &CFNumber::new_i32(s.fps as i32));
             set(kVTCompressionPropertyKey_MaxKeyFrameInterval, &CFNumber::new_i32(gop as i32));
             set(kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, &CFNumber::new_f64(gop as f64 / s.fps.max(1) as f64));
@@ -913,11 +1051,55 @@ unsafe extern "C-unwind" fn on_encoded(
         }
         return;
     }
+    if let Some(rendition) = sink.stream {
+        match stream_frame(sample, rendition) {
+            Ok(frame) => {
+                if let Some(tx) = &sink.tx {
+                    let _ = tx.send(writer::Command::Media(Media::Stream(frame)));
+                }
+            }
+            Err(e) => crate::eprintln_later!("stream: {e:#}"),
+        }
+        return;
+    }
     let pts = unsafe { sample.presentation_time_stamp().seconds() };
     let key = is_keyframe(sample);
     let sample = unsafe { CFRetained::retain(NonNull::from(sample)) };
     if let Some(tx) = &sink.tx {
         let _ = tx.send(writer::Command::Media(Media::Video { frame: SendSample(sample), pts, key }));
+    }
+}
+
+/// A frame of the stream's picture `rendition`, as VideoToolbox encoded it:
+/// its NAL units with their 4-byte lengths, and on keyframes the decoder's
+/// set-up (an `avcC` record of the SPS and PPS, which VideoToolbox keeps
+/// beside them).
+fn stream_frame(sample: &CMSampleBuffer, rendition: usize) -> Result<StreamFrame> {
+    let block = unsafe { sample.data_buffer() }.context("an encoded frame with no data")?;
+    let len = unsafe { block.data_length() };
+    let mut data = vec![0u8; len];
+    if len > 0 {
+        let status = unsafe { block.copy_data_bytes(0, len, NonNull::new(data.as_mut_ptr().cast()).context("no room for a frame")?) };
+        if status != 0 {
+            bail!("couldn't read an encoded frame (error {status})");
+        }
+    }
+    let pts = unsafe { sample.presentation_time_stamp().seconds() };
+    let key = is_keyframe(sample);
+    let avcc = match key {
+        true => {
+            let format = unsafe { sample.format_description() }.context("a keyframe with no format")?;
+            Some(Arc::from(crate::mac::export::avc_config(&format)?.record()))
+        }
+        false => None,
+    };
+    Ok(StreamFrame { rendition, data: Arc::from(data), avcc, pts, key })
+}
+
+impl Setup {
+    /// A recording's, as `s` asks.
+    fn of(s: &EncodeSettings) -> Self {
+        Self { fps: s.fps, kbps: s.video_bitrate_kbps, hardware: s.use_hardware, stream: None }
     }
 }
 
@@ -929,7 +1111,7 @@ pub(crate) fn probe_video_format(
     s: &EncodeSettings,
 ) -> Result<CFRetained<objc2_core_media::CMFormatDescription>> {
     let (tx, rx) = mpsc::channel();
-    let enc = Encoder::with_sink(width, height, s, EncodedSink::new(None, Some(tx)))?;
+    let enc = Encoder::with_sink(width, height, Setup::of(s), EncodedSink::new(None, Some(tx), None))?;
     let mut pb: *mut CVPixelBuffer = ptr::null_mut();
     let status = unsafe {
         objc2_core_video::CVPixelBufferCreate(
@@ -977,6 +1159,17 @@ pub(crate) fn probe_encoder(width: usize, height: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Clipping, going live, frame blending changed while it runs, and a
+    /// recording beside them, all from one capture: each gets what it
+    /// should (`crate::outputs::tests::everything_at_once`). Needs ffmpeg
+    /// and ffprobe on `PATH`, and Screen Recording allowed to the terminal.
+    #[test]
+    #[ignore = "captures the screen and streams it to a local server: cargo test -p capture everything_at_once -- --ignored --nocapture"]
+    fn everything_at_once() {
+        let mut rec = SckRecorder::new(Arc::new(LiveAudio::default()));
+        crate::outputs::tests::everything_at_once(&mut rec);
+    }
 
     /// A desktop or app sound stream that keeps failing to start is tried
     /// again a second later, then later and later, up to every 10 s, and its

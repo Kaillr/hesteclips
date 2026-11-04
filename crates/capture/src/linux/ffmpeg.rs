@@ -25,6 +25,7 @@ use crate::EncodeSettings;
 use crate::mixer::RATE;
 use crate::mp4file::{EncodedFrame, VideoFrame};
 use crate::mp4mux::{AvcConfig, annexb_to_avcc};
+use crate::stream::StreamFrame;
 use crate::writer::{AacPacket, Command as WriterCommand, Media};
 
 /// The ffmpeg to run: one shipped next to the app wins over the one on `PATH`
@@ -83,35 +84,51 @@ impl Codec {
         matches!(self, Codec::Nvenc | Codec::Vaapi)
     }
 
-    /// ffmpeg's arguments to encode `width`×`height` NV12 from stdin to
-    /// H.264 Annex B on stdout.
-    fn args(self, width: u32, height: u32, fps: u32, kbps: u32, gop: u32) -> Vec<String> {
+    /// ffmpeg's arguments to encode NV12 `input` big from stdin to H.264
+    /// Annex B on stdout, `output` big (made that size here where they
+    /// differ, each pixel the average of what it covers). A stream's
+    /// (`stream`, `crate::stream`): a constant bitrate over a second's
+    /// buffer, as the services ask.
+    fn args(self, input: (u32, u32), output: (u32, u32), fps: u32, kbps: u32, gop: u32, stream: bool) -> Vec<String> {
         let mut a: Vec<String> = Vec::new();
         let mut push = |s: &[&str]| a.extend(s.iter().map(|s| s.to_string()));
         if self == Codec::Vaapi {
             let device = render_node().unwrap_or_else(|| "/dev/dri/renderD128".into());
             push(&["-init_hw_device", &format!("vaapi=va:{device}"), "-filter_hw_device", "va"]);
         }
-        push(&["-f", "rawvideo", "-pix_fmt", "nv12", "-video_size", &format!("{width}x{height}"), "-framerate", &fps.to_string()]);
+        push(&["-f", "rawvideo", "-pix_fmt", "nv12", "-video_size", &format!("{}x{}", input.0, input.1), "-framerate", &fps.to_string()]);
         push(&["-color_range", "tv", "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"]);
         push(&["-i", "pipe:0"]);
+        let mut filters = Vec::new();
+        if input != output {
+            filters.push(format!("scale={}:{}:flags=area", output.0, output.1));
+        }
         if self == Codec::Vaapi {
-            push(&["-vf", "format=nv12,hwupload"]);
+            filters.push("format=nv12,hwupload".to_owned());
+        }
+        if !filters.is_empty() {
+            push(&["-vf", &filters.join(",")]);
         }
         push(&["-c:v", self.ffmpeg_name()]);
-        let (rate, max, buf) = (format!("{kbps}k"), format!("{}k", kbps * 3 / 2), format!("{}k", kbps * 2));
+        let (rate, max, buf) = match stream {
+            true => (format!("{kbps}k"), format!("{kbps}k"), format!("{kbps}k")),
+            false => (format!("{kbps}k"), format!("{}k", kbps * 3 / 2), format!("{}k", kbps * 2)),
+        };
         // No B-frames, so frames come out in the order they went in: the Nth
         // packet is the Nth frame. Encoders tuned for low delay, so a clip
         // saved right after a moment has that moment in it.
         match self {
             Codec::Nvenc => push(&[
-                "-preset", "p4", "-tune", "ll", "-rc", "vbr", "-b:v", &rate, "-maxrate", &max, "-bufsize", &buf, "-profile:v", "high",
-                "-zerolatency", "1",
+                "-preset", "p4", "-tune", "ll", "-rc", if stream { "cbr" } else { "vbr" }, "-b:v", &rate, "-maxrate", &max, "-bufsize", &buf,
+                "-profile:v", "high", "-zerolatency", "1",
             ]),
-            Codec::Vaapi => push(&["-rc_mode", "VBR", "-b:v", &rate, "-maxrate", &max, "-bufsize", &buf, "-profile:v", "high"]),
-            Codec::X264 => push(&[
-                "-preset", "veryfast", "-tune", "zerolatency", "-b:v", &rate, "-maxrate", &max, "-bufsize", &buf, "-profile:v", "high",
-            ]),
+            Codec::Vaapi => push(&["-rc_mode", if stream { "CBR" } else { "VBR" }, "-b:v", &rate, "-maxrate", &max, "-bufsize", &buf, "-profile:v", "high"]),
+            Codec::X264 => {
+                push(&["-preset", "veryfast", "-tune", "zerolatency", "-b:v", &rate, "-maxrate", &max, "-bufsize", &buf, "-profile:v", "high"]);
+                if stream {
+                    push(&["-x264-params", "nal-hrd=cbr"]);
+                }
+            }
             Codec::OpenH264 => push(&["-rc_mode", "bitrate", "-allow_skip_frames", "0", "-b:v", &rate, "-maxrate", &max]),
         }
         push(&["-g", &gop.to_string(), "-bf", "0", "-fps_mode", "passthrough"]);
@@ -172,7 +189,7 @@ pub fn encoder(hardware: bool) -> Result<Codec> {
 fn works(codec: Codec) -> bool {
     let (w, h) = (320, 180);
     let mut child = match ffmpeg()
-        .args(codec.args(w, h, 30, 1000, 30))
+        .args(codec.args((w, h), (w, h), 30, 1000, 30, false))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -260,8 +277,30 @@ impl H264 {
         let codec = encoder(s.use_hardware)?;
         eprintln!("video encoder: {} ({}x{} at {} fps)", codec.label(), width, height, s.fps);
         let gop = crate::keyframe_every(s.fps);
+        let args = codec.args((width, height), (width, height), s.fps, s.video_bitrate_kbps.max(100), gop, false);
+        Self::spawn(codec, args, s.fps, None, out)
+    }
+
+    /// The encoder of one of a stream's pictures (`crate::stream`, its
+    /// `rendition`): frames `input` big made `output` big (by ffmpeg, where
+    /// they differ), `fps` a second at a constant `kbps`, a keyframe every
+    /// two seconds (where a connection can start), as the services ask; its
+    /// frames go to `out` as the stream's own. The graphics card's encoder
+    /// where ffmpeg has one that works (`hardware`), as a recording's.
+    pub(crate) fn stream(input: (u32, u32), output: (u32, u32), fps: u32, kbps: u32, hardware: bool, rendition: usize, out: Sender<WriterCommand>) -> Result<Self> {
+        let codec = encoder(hardware)?;
+        let kbps = kbps.max(100);
+        let args = codec.args(input, output, fps, kbps, fps.max(1) * 2, true);
+        let encoder = Self::spawn(codec, args, fps, Some(rendition), out)?;
+        eprintln!("stream: {} at {}x{}, {fps} fps, {kbps} kb/s", codec.label(), output.0, output.1);
+        Ok(encoder)
+    }
+
+    /// Run ffmpeg with `args`, its frames to `out` (`stream`: as one of the
+    /// stream's pictures, which), frame N at N/`fps`.
+    fn spawn(codec: Codec, args: Vec<String>, fps: u32, stream: Option<usize>, out: Sender<WriterCommand>) -> Result<Self> {
         let mut child = ffmpeg()
-            .args(codec.args(width, height, s.fps, s.video_bitrate_kbps.max(100), gop))
+            .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -271,7 +310,7 @@ impl H264 {
         let stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
         let errors = spawn_stderr(stderr);
-        let (tx, rx) = mpsc::sync_channel::<(Vec<u8>, i64)>(queue_len(s.fps));
+        let (tx, rx) = mpsc::sync_channel::<(Vec<u8>, i64)>(queue_len(fps));
         let (spare_tx, spare) = mpsc::channel();
         // The frame numbers sent, in order: the Nth packet back is the Nth sent.
         let sent = Arc::new(Mutex::new(VecDeque::<i64>::new()));
@@ -280,15 +319,13 @@ impl H264 {
             thread::Builder::new().name("h264-in".into()).spawn(move || feed(stdin, rx, sent, spare_tx))?
         };
         let child = Arc::new(Mutex::new(child));
-        let reader = {
-            let fps = s.fps;
-            thread::Builder::new().name("h264-out".into()).spawn(move || {
-                if let Err(e) = read_video(stdout, fps, &sent, &out) {
-                    let detail = errors.join().unwrap_or_default();
-                    eprintln!("video encoder ({}) stopped: {e:#}{}", codec.ffmpeg_name(), detail.map(|d| format!("\n{d}")).unwrap_or_default());
-                }
-            })?
-        };
+        let reader = thread::Builder::new().name("h264-out".into()).spawn(move || {
+            if let Err(e) = read_video(stdout, fps, &sent, &out, stream) {
+                let detail = errors.join().unwrap_or_default();
+                let what = if stream.is_some() { "the stream's video encoder" } else { "video encoder" };
+                eprintln!("{what} ({}) stopped: {e:#}{}", codec.ffmpeg_name(), detail.map(|d| format!("\n{d}")).unwrap_or_default());
+            }
+        })?;
         Ok(Self { tx: Some(tx), spare, spare_tx, feeder: Some(feeder), reader: Some(reader), child })
     }
 
@@ -346,8 +383,9 @@ fn feed(mut stdin: ChildStdin, rx: Receiver<(Vec<u8>, i64)>, sent: Arc<Mutex<Vec
 }
 
 /// Read ffmpeg's H.264 output, one access unit per frame, and pass each to
-/// the writer as frame `sent[k]`.
-fn read_video(mut stdout: impl Read, fps: u32, sent: &Mutex<VecDeque<i64>>, out: &Sender<WriterCommand>) -> Result<()> {
+/// the writer as frame `sent[k]` (`stream`: as a frame of that one of the
+/// stream's pictures).
+fn read_video(mut stdout: impl Read, fps: u32, sent: &Mutex<VecDeque<i64>>, out: &Sender<WriterCommand>, stream: Option<usize>) -> Result<()> {
     let mut pending = Vec::with_capacity(1 << 20);
     let mut chunk = vec![0u8; 1 << 18];
     let mut config: Option<AvcConfig> = None;
@@ -367,10 +405,14 @@ fn read_video(mut stdout: impl Read, fps: u32, sent: &Mutex<VecDeque<i64>>, out:
             let n = sent.lock().unwrap().pop_front().unwrap_or(last + 1);
             last = n;
             let key = frame.idr;
-            let media = Media::Video {
-                frame: VideoFrame(Arc::new(EncodedFrame { data: Arc::from(frame.data), config: if key { config.clone() } else { None } })),
-                pts: n as f64 / fps as f64,
-                key,
+            let pts = n as f64 / fps as f64;
+            let media = match stream {
+                Some(rendition) => Media::Stream(StreamFrame { rendition, data: Arc::from(frame.data), avcc: config.as_ref().filter(|_| key).map(|c| Arc::from(c.record())), pts, key }),
+                None => Media::Video {
+                    frame: VideoFrame(Arc::new(EncodedFrame { data: Arc::from(frame.data), config: if key { config.clone() } else { None } })),
+                    pts,
+                    key,
+                },
             };
             if out.send(WriterCommand::Media(media)).is_err() {
                 bail!("the file writer stopped");

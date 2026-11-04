@@ -206,3 +206,133 @@ impl<C: Capture> Outputs<C> {
         }
     }
 }
+
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+pub(crate) mod tests {
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use crate::stream::{Destination, Link, Quality, Status, StreamSettings};
+    use crate::{BlendShape, EncodeSettings, Mode, Recorder, Running, VideoSource};
+
+    /// As Windows' `everything_at_once` (`crate::win`), for the backend
+    /// `rec`: clipping, then going live to two places (RTMP servers here:
+    /// ffmpegs listening), each sent a picture of its own, frame blending
+    /// turned on and off while it all runs, a recording beside them, a clip
+    /// saved: each gets what it should, from the one capture. The capture's
+    /// 1080p, at 60 fps where the display shows 120 pictures a second or
+    /// more, else at 30, so two looks a frame are as many as it shows. The
+    /// places at their own sizes and rates: 720p at 30 (at 60, its frames
+    /// blended from the capture's two while blending's on), and as the
+    /// capture is; the recording and the clip at the capture's.
+    pub(crate) fn everything_at_once(rec: &mut dyn Recorder) {
+        /// What's taken of the screen goes, and the servers stop, however
+        /// the test ends.
+        struct Leave(PathBuf, Vec<std::process::Child>);
+        impl Drop for Leave {
+            fn drop(&mut self) {
+                for c in &mut self.1 {
+                    let _ = c.kill();
+                    let _ = c.wait();
+                }
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let screen = crate::list_screens().into_iter().next().expect("a screen");
+        let video = VideoSource::Screen { id: screen.id.clone(), hook: crate::GameHook { auto: false, allowed: Vec::new() }, method: Default::default() };
+        let fps = if crate::max_blend_rate(&video).unwrap_or(120) >= 120 { 60 } else { 30 };
+        let size = crate::VideoSize { short_side: Some(1080), shape: None, exact: None };
+        let (_, height) = crate::frame_size(&video, size).expect("the screen's size");
+        let dir = std::env::temp_dir().join(format!("hc-at-once-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut leave = Leave(dir.clone(), Vec::new());
+        let mut urls = Vec::new();
+        for name in ["small", "full"] {
+            let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+            let url = format!("rtmp://127.0.0.1:{port}/live/test_key");
+            let got = dir.join(format!("{name}.flv"));
+            leave.1.push(crate::stream::ffmpeg().args(["-v", "error", "-y", "-timeout", "30", "-i"]).arg(&url).args(["-c", "copy"]).arg(&got).stdin(std::process::Stdio::null()).spawn().unwrap());
+            urls.push(url);
+        }
+        thread::sleep(Duration::from_millis(700));
+        let status = Status::new();
+        let mut settings = EncodeSettings {
+            output_dir: dir.clone(),
+            container_ext: "mp4".into(),
+            fps,
+            blend_samples: 1,
+            blend_shape: BlendShape::Even,
+            video_bitrate_kbps: 12000,
+            size,
+            use_hardware: true,
+            replay_seconds: 10,
+            video,
+            away_screen: None,
+            webcam: None,
+            screen: Arc::new(Mutex::new(crate::ScreenPlacement::whole(crate::Framing::Fit))),
+            sources: Vec::new(),
+            stream: None,
+        };
+        let place = |name: &str, url: &str, short_side, fps, kbps| Destination { name: name.into(), url: url.into(), secret: "test_key".into(), quality: Quality { short_side: Some(short_side), fps, kbps } };
+        settings.stream = Some(StreamSettings { destinations: vec![place("Small", &urls[0], 720, 30, 3000), place("Full", &urls[1], 1080, fps, 6000)], status: status.clone() });
+        rec.start(Mode::ReplayBuffer, &settings).unwrap();
+        thread::sleep(Duration::from_secs(1));
+        rec.start(Mode::Stream, &settings).unwrap();
+        assert_eq!(rec.running(), Running { replay: true, record: false, stream: true });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !status.get().iter().all(|d| matches!(d.link, Link::Live { .. })) {
+            assert!(Instant::now() < deadline, "never live: {:?}", status.get());
+            thread::sleep(Duration::from_millis(50));
+        }
+        // Frame blending on, and off again, while it runs.
+        assert!(rec.set_blend(2, BlendShape::Soft), "blending didn't change");
+        thread::sleep(Duration::from_secs(2));
+        let blending = crate::health().and_then(|h| h.blend).map(|b| b.looks);
+        rec.start(Mode::Record, &settings).unwrap();
+        thread::sleep(Duration::from_secs(2));
+        assert!(rec.set_blend(1, BlendShape::Even));
+        thread::sleep(Duration::from_secs(1));
+        let clip = rec.save_clip(&dir).unwrap().finish().unwrap();
+        let recording = rec.stop(Mode::Record, None).unwrap().expect("a recording");
+        assert_eq!(rec.running(), Running { replay: true, record: false, stream: true });
+        rec.stop(Mode::Stream, None).unwrap();
+        rec.stop(Mode::ReplayBuffer, None).unwrap();
+        assert!(!rec.is_running());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while leave.1.iter_mut().any(|c| c.try_wait().unwrap().is_none()) {
+            assert!(Instant::now() < deadline, "a server didn't end");
+            thread::sleep(Duration::from_millis(50));
+        }
+        let probe = |f: &Path| {
+            let out = std::process::Command::new("ffprobe")
+                .args(["-v", "error", "-select_streams", "v:0", "-count_frames", "-show_entries", "stream=width,height,avg_frame_rate,nb_read_frames:format=duration", "-of", "default=nw=1"])
+                .arg(f)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).to_string()
+        };
+        let (s, full, r, c) = (probe(&dir.join("small.flv")), probe(&dir.join("full.flv")), probe(&recording), probe(&clip));
+        eprintln!("blending while it ran: {blending:?} looks\nsmall stream:\n{s}\nfull stream:\n{full}\nrecording:\n{r}\nclip:\n{c}");
+        let field = |t: &str, name: &str| t.lines().find_map(|l| l.strip_prefix(name)?.strip_prefix('=').map(str::to_owned)).unwrap_or_default();
+        // Frames a second, from "60/1" (or what it averaged, a frame skipped).
+        let rate = |t: &str| {
+            let r = field(t, "avg_frame_rate");
+            let (n, d) = r.split_once('/').unwrap_or((r.as_str(), "1"));
+            n.parse::<f64>().unwrap_or(0.0) / d.parse::<f64>().unwrap_or(1.0).max(1e-9)
+        };
+        let secs = |t: &str| field(t, "duration").parse::<f64>().unwrap_or(0.0);
+        assert_eq!(blending, Some(2), "blending changed while running");
+        assert_eq!(field(&s, "height"), "720", "{s}");
+        assert!((rate(&s) - 30.0).abs() < 0.5, "the small stream at 30 fps: {s}");
+        assert_eq!(field(&full, "height"), height.to_string(), "{full}");
+        assert!((rate(&full) - fps as f64).abs() < 0.5, "the full stream at {fps} fps: {full}");
+        assert_eq!(field(&r, "height"), height.to_string(), "{r}");
+        assert!((rate(&r) - fps as f64).abs() < 0.5, "the recording at {fps} fps: {r}");
+        assert_eq!(field(&c, "height"), height.to_string(), "{c}");
+        assert!(secs(&s) > 4.0, "the stream ran on: {}", secs(&s));
+        assert!((2.5..4.5).contains(&secs(&r)), "the recording's 3 s: {}", secs(&r));
+    }
+}

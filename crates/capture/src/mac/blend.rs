@@ -27,8 +27,9 @@
 
 use std::ffi::c_void;
 use std::ptr::NonNull;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, SyncSender};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -36,15 +37,18 @@ use anyhow::{Context, Result};
 use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
+use objc2_core_foundation::CFRetained;
 use objc2_metal::{
     MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
     MTLPixelFormat, MTLSize, MTLStorageMode, MTLTexture, MTLTextureDescriptor, MTLTextureUsage,
 };
 
+use super::export::Scaler;
 use super::gpu::{FramePool, kernels, plane_texture};
 use super::video::{Buffer, Frames, Latest};
 use crate::mixer::Clock;
 use crate::sck::{Encoder, host_now};
+use crate::shutter::Shutter;
 
 /// Adds looks at a picture to the frame's average, on the GPU, and turns the
 /// average back into an NV12 frame to encode.
@@ -421,7 +425,7 @@ struct BlendPacer {
     /// A picture the stream timed has come up (it set `phase`).
     timed: bool,
     /// Which frames each look counts toward.
-    shutter: crate::shutter::Shutter,
+    shutter: Shutter,
     /// The next look to take.
     next: i64,
     /// The last frame done (made or empty): later looks don't count toward it.
@@ -429,16 +433,163 @@ struct BlendPacer {
     /// The picture that's up (its number), and the one the last look took.
     held: Option<u64>,
     last_taken: Option<u64>,
+    /// The picture that's up, for a mix that takes over (blending changed).
+    up: Option<Arc<Buffer>>,
     /// Different pictures in the frame's own time so far.
     different: u32,
     mix: Mix,
     frames: Frames,
     encoder: SendEncoder,
+    /// The stream's own pictures, while it streams (one per rendition).
+    stream: Vec<StreamOut>,
     skipped: u64,
     stats: BlendStats,
     report: EncodeReport,
     /// Blended frames the GPU is still making, oldest first.
     making: std::collections::VecDeque<Making>,
+}
+
+/// What the session changes in a running pacer: frame blending, and the
+/// stream's pictures (see `Session::set_blend` and `Session::stream_video`
+/// in `crate::sck`). Each is taken up at the pacer's next turn.
+#[derive(Clone, Default)]
+pub(crate) struct PacerCtl {
+    pub(crate) blend: Arc<Mutex<Option<BlendChange>>>,
+    /// The stream started (one per rendition, `stream::renditions`), or
+    /// stopped (none).
+    pub(crate) stream: Arc<Mutex<Option<Vec<StreamOut>>>>,
+}
+
+/// Frame blending changed: `looks` a frame from the next frame on, where
+/// `shutter` says, made by `mix` (made beforehand: a blender's kernels take
+/// a moment to build, which the pacer mustn't wait for).
+pub(crate) struct BlendChange {
+    pub(crate) looks: u32,
+    pub(crate) shutter: Shutter,
+    pub(crate) mix: Mix,
+}
+
+/// One of the stream's pictures (a rendition, `stream::renditions`): a
+/// frame for every `every` the pacer makes, made the rendition's size by
+/// Metal (`super::export::Scaler`, as an export's) and encoded by a
+/// VideoToolbox encoder of its own, all on a thread of its own so the pacer
+/// never waits for any of it. A frame that comes while the thread is still
+/// busy with those before is left out.
+pub(crate) struct StreamOut {
+    every: i64,
+    /// The pacer's frames, their numbers, and whether it blends.
+    tx: Option<SyncSender<(Arc<Buffer>, i64, bool)>>,
+    thread: Option<JoinHandle<()>>,
+    /// Frames left out, its thread busy.
+    dropped: u64,
+}
+
+/// A buffer to hand to the GPU, from one that's shared.
+fn retain(buf: &objc2_core_video::CVPixelBuffer) -> CFRetained<objc2_core_video::CVPixelBuffer> {
+    unsafe { CFRetained::retain(NonNull::from(buf)) }
+}
+
+impl StreamOut {
+    /// A frame for every `every` of the pacer's, `from` big, made `to` big
+    /// and encoded by `encoder` (at the rendition's rate). With frame
+    /// blending on, and `every` over one (48 fps from 144), each frame is
+    /// the average of all the pacer's in its time, as light, as a frame is
+    /// of its looks, so its motion is blurred over all of its time as the
+    /// recording's is over each frame's (as Windows' `StreamBlend`); taking
+    /// one in three instead blurred a third of it. The average's made on
+    /// the scaler's queue, so it's made before it's scaled.
+    pub(crate) fn start(every: i64, from: (usize, usize), to: (usize, usize), fps: u32, encoder: Encoder) -> Result<Self> {
+        let device = MTLCreateSystemDefaultDevice().context("no Metal device")?;
+        let queue = device.newCommandQueue().context("no Metal command queue")?;
+        let size = |(w, h): (usize, usize)| (w as u32, h as u32);
+        let scaler = Scaler::new(&device, &queue, size(from), [0, 0, from.0 as u32, from.1 as u32], size(to), false)?;
+        let blender = if every > 1 { Some(Blender::queued(device.clone(), queue.clone(), from.0, from.1, 1)?) } else { None };
+        // Room for a stream frame's worth of the pacer's frames, and more.
+        let (tx, rx) = mpsc::sync_channel::<(Arc<Buffer>, i64, bool)>((2 * every as usize).clamp(2, 16));
+        let encoder = SendEncoder(encoder);
+        let thread = thread::Builder::new().name("stream video".into()).spawn(move || {
+            // All of it moves here (not just the encoder inside).
+            let encoder = encoder;
+            let mut blender = blender;
+            // The stream frame whose average is being made.
+            let mut summing: Option<i64> = None;
+            let mut skipped = 0u64;
+            for (frame, k, blending) in rx {
+                let n = k.div_euclid(every);
+                let made = match blender.as_mut().filter(|_| blending) {
+                    Some(b) => {
+                        // A frame of a later one: the one being made never
+                        // got its last (left out), and is let go of.
+                        if summing.is_some_and(|s| s != n) {
+                            let _ = b.finish(0);
+                        }
+                        summing = Some(n);
+                        b.hold(frame);
+                        b.add(0, 1.0);
+                        if k.rem_euclid(every) != every - 1 {
+                            continue;
+                        }
+                        summing = None;
+                        match b.finish(0) {
+                            Some(average) => average,
+                            None => continue,
+                        }
+                    }
+                    None => {
+                        // Blending stopped partway through one: let go of.
+                        if summing.take().is_some()
+                            && let Some(b) = blender.as_mut()
+                        {
+                            let _ = b.finish(0);
+                        }
+                        if k.rem_euclid(every) != 0 {
+                            continue;
+                        }
+                        frame
+                    }
+                };
+                // Made the rendition's size in a buffer of its own (the
+                // screen's own go back to it at once), then encoded.
+                let scaled = scaler.scale(retain(&made.0));
+                drop(made);
+                match scaled.and_then(|m| Ok(encoder.0.encode(m.ready()?, n, fps))) {
+                    Ok(true) => {}
+                    Ok(false) => skipped += 1,
+                    Err(e) => crate::eprintln_later!("stream: {e:#}"),
+                }
+            }
+            if skipped > 0 {
+                eprintln!("stream: its encoder couldn't take {skipped} frames");
+            }
+            encoder.0.finish();
+        })?;
+        Ok(Self { every, tx: Some(tx), thread: Some(thread), dropped: 0 })
+    }
+
+    /// The pacer's frame `k`, `frame` (`blending`: frame blending's on):
+    /// handed over if it's wanted, every one while it averages its own,
+    /// else those at its own frames' times.
+    fn offer(&mut self, k: i64, frame: &Arc<Buffer>, blending: bool) {
+        if !(blending && self.every > 1) && k.rem_euclid(self.every) != 0 {
+            return;
+        }
+        if let Some(tx) = &self.tx
+            && tx.try_send((frame.clone(), k, blending)).is_err()
+        {
+            self.dropped += 1;
+        }
+    }
+
+    /// The frames handed in encoded and sent on (waited for).
+    pub(crate) fn finish(mut self) {
+        drop(self.tx.take());
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+        if self.dropped > 0 {
+            eprintln!("stream: {} frames left out, it was busy", self.dropped);
+        }
+    }
 }
 
 /// A blended frame the GPU is still making: encoded once it's made.
@@ -539,6 +690,12 @@ impl BlendPacer {
     fn encode(&mut self, k: i64, made: Arc<Buffer>, late: f64, mixed: Duration, gpu: Option<Duration>) {
         let started = Instant::now();
         let frame = self.frames.make(made);
+        // The stream's pictures', where they want it (whether or not the
+        // recording's encoder takes it).
+        let blending = self.looks > 1;
+        for s in &mut self.stream {
+            s.offer(k, &frame, blending);
+        }
         let composed = started.elapsed();
         let free = self.encoder.0.free();
         let encoded = self.encoder.0.encode(&frame.0, k, self.fps);
@@ -572,10 +729,49 @@ impl BlendPacer {
         self.timed |= timed;
         self.phase = crate::shutter::follow_picture(self.phase, self.step, at - self.t0, first);
         let adding = Instant::now();
+        self.up = Some(picture.clone());
         self.mix.hold(picture);
         self.report.added(adding.elapsed());
         self.held = Some(id);
         self.stats.pictures += 1;
+    }
+
+    /// Blend as `c` says from the next frame on: the frame under way is made
+    /// from the looks it gets from now (at the new rate, by the new mix),
+    /// and the looks lock onto the pictures again. The old mix's frames
+    /// still being made are encoded as they're done.
+    fn change_blend(&mut self, c: BlendChange) {
+        let looks = c.looks.max(1);
+        let k = self.closed + 1;
+        self.looks = looks as i64;
+        self.step = 1.0 / (self.fps.max(1) * looks) as f64;
+        self.shutter = c.shutter;
+        self.mix = c.mix;
+        if let Some(up) = &self.up {
+            self.mix.hold(up.clone());
+        }
+        // Frame `k`'s own time is where it was: looks `k * looks` on, at the
+        // new step. The first picture the stream times puts them halfway
+        // between pictures again.
+        self.phase = 0.0;
+        self.timed = false;
+        self.next = self.shutter.first_look(k);
+        self.different = 0;
+        self.stats = BlendStats::new();
+        crate::blending(self.fps, looks);
+        crate::eprintln_later!("{}", if looks > 1 { format!("frame blending: {looks} looks a frame from now on") } else { "frame blending: off from now on".to_owned() });
+    }
+
+    /// The stream started or stopped, if the session says so. A stopped
+    /// stream's pictures are finished on a thread of their own (that waits
+    /// for their encoders).
+    fn take_stream(&mut self, ctl: &PacerCtl) {
+        let Some(change) = ctl.stream.lock().unwrap_or_else(PoisonError::into_inner).take() else { return };
+        let old = std::mem::replace(&mut self.stream, change);
+        if old.is_empty() {
+            return;
+        }
+        let _ = thread::Builder::new().name("stream-end".into()).spawn(move || old.into_iter().for_each(StreamOut::finish));
     }
 }
 
@@ -723,17 +919,20 @@ impl EncodeReport {
 /// (blended, or one look's picture as it is). Frame `k` is stamped `k / fps`
 /// on the host clock, the audio's: a frame is made every 1/fps whether the
 /// screen changed or not (constant frame rate), and when the encoder can't
-/// take one it's skipped, not queued, so video never falls behind.
+/// take one it's skipped, not queued, so video never falls behind. What
+/// `ctl` says changed (frame blending, the stream) is taken up at its next
+/// turn.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_blend_pacer(
     fps: u32,
     looks: u32,
-    shutter: crate::shutter::Shutter,
+    shutter: Shutter,
     latest: Arc<Latest>,
     mix: Mix,
     frames: Frames,
     encoder: Encoder,
     clock: Arc<Clock>,
+    ctl: PacerCtl,
 ) -> (Arc<AtomicBool>, JoinHandle<()>) {
     let stop = Arc::new(AtomicBool::new(false));
     let stop2 = stop.clone();
@@ -755,10 +954,12 @@ pub(crate) fn spawn_blend_pacer(
             closed: -1,
             held: None,
             last_taken: None,
+            up: None,
             different: 0,
             mix,
             frames,
             encoder,
+            stream: Vec::new(),
             skipped: 0,
             stats: BlendStats::new(),
             report: EncodeReport::new(),
@@ -766,10 +967,17 @@ pub(crate) fn spawn_blend_pacer(
         };
         let mut seen = latest.seq();
         if let Some(b) = latest.get() {
+            p.up = Some(b.clone());
             p.mix.hold(b);
             p.held = Some(seen);
         }
         while !stop2.load(Ordering::Relaxed) {
+            // Frame blending changed, the stream started or stopped.
+            let change = ctl.blend.lock().unwrap_or_else(PoisonError::into_inner).take();
+            if let Some(c) = change {
+                p.change_blend(c);
+            }
+            p.take_stream(&ctl);
             let wait = p.frame_end() + BLEND_LATE - host_now();
             if wait > 0.0 {
                 latest.wait(seen, Duration::from_secs_f64(wait.min(0.05)));
@@ -793,6 +1001,9 @@ pub(crate) fn spawn_blend_pacer(
             p.encode_made(false);
         }
         p.encode_made(true);
+        for s in std::mem::take(&mut p.stream) {
+            s.finish();
+        }
         p.encoder.0.finish();
     });
     (stop, handle)
