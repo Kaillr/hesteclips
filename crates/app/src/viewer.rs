@@ -711,9 +711,15 @@ impl Ready {
         // --- Picture: everything above the transport and timeline; in
         // fullscreen the whole screen, with them floating over it ---
         let controls_h = crate::transport::BAR_H + TIMELINE_H + 14.0;
-        let preview_h = if full { ui.available_height() } else { (ui.available_height() - controls_h).max(160.0) };
+        // The transport starts right at the picture's edge, as the picture
+        // starts at the header's: a strip of the page and a line under the
+        // dark stage read as a second edge. The picture takes the gap's room,
+        // so the timeline stays where it was.
+        let gap = if full { 0.0 } else { ui.spacing().item_spacing.y };
+        let preview_h = if full { ui.available_height() } else { (ui.available_height() - controls_h + gap).max(160.0) };
         // Click to play or pause; drag out of the window to share the clip.
         let (preview, preview_resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), preview_h), Sense::click_and_drag());
+        ui.add_space(-gap);
 
         // A click or drag on the timeline, and the wheel, before anything
         // that shows where the playhead is: the picture, the time and the
@@ -796,12 +802,12 @@ impl Ready {
                 child.multiply_opacity(shown);
                 // White on the shade, whatever the look.
                 child.visuals_mut().dark_mode = true;
-                self.controls(&mut child, preview, true, timeline);
+                self.controls(&mut child, preview, timeline);
             } else if pointer_over(&ctx, preview) {
                 ctx.set_cursor_icon(egui::CursorIcon::None);
             }
         } else {
-            self.controls(ui, preview, false, timeline);
+            self.controls(ui, preview, timeline);
         }
 
         let preview_resp = preview_resp.on_hover_cursor(if full { egui::CursorIcon::Default } else { egui::CursorIcon::PointingHand });
@@ -843,7 +849,7 @@ impl Ready {
     /// The transport bar and the timeline under it, from the top of `ui`.
     /// `timeline`: what the pointer does on the timeline (read at the start
     /// of the frame, see [`Ready::ui`]).
-    fn controls(&mut self, ui: &mut egui::Ui, preview: Rect, over_picture: bool, timeline: Option<&egui::Response>) {
+    fn controls(&mut self, ui: &mut egui::Ui, preview: Rect, timeline: Option<&egui::Response>) {
         use crate::ui_kit::{Btn, Kind};
         let ctx = ui.ctx().clone();
         let bar = Rect::from_min_size(ui.cursor().min, Vec2::new(ui.available_width(), crate::transport::BAR_H));
@@ -858,7 +864,9 @@ impl Ready {
         crate::transport::bar(
             ui,
             bar,
-            !over_picture,
+            // No line on top: in the window the picture's edge is the line,
+            // and in fullscreen the bar is over the picture.
+            false,
             150.0,
             |ui, part| match part {
             crate::transport::Part::Left => crate::transport::timecode(ui, t, self.info.duration, self.info.fps, &mut frames),
