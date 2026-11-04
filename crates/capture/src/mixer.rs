@@ -11,7 +11,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -423,11 +423,34 @@ impl SourceFeed {
         self.st.lock().unwrap().mono = Some(Mono::new(on));
     }
 
-    /// A new feed (at `rate`) whose audio is added to this one's.
+    /// A new feed (at `rate`) whose audio is added to this one's. Closed
+    /// from the start if this one is (see [`Self::close`]).
     pub(crate) fn add_child(&self, rate: u32) -> Arc<SourceFeed> {
         let child = SourceFeed::new(rate, self.clock.clone());
-        self.children.lock().unwrap().push(child.clone());
+        // Its state held throughout, so it can't be closed in between.
+        let st = self.st.lock().unwrap();
+        if st.closed {
+            child.st.lock().unwrap().closed = true;
+        } else {
+            self.children.lock().unwrap().push(child.clone());
+        }
+        drop(st);
         child
+    }
+
+    /// Its source has stopped being captured (taken out while recording):
+    /// it takes no more sound, nor do the feeds it sums, now or added
+    /// later. What they've sent is still taken: the mixer runs behind, and
+    /// mixes it to its end.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub(crate) fn close(&self) {
+        // Held while its feeds are closed: none is added meanwhile.
+        let mut st = self.st.lock().unwrap();
+        st.closed = true;
+        for child in self.children.lock().unwrap().iter() {
+            child.close();
+        }
+        drop(st);
     }
 
     /// Stop summing `child`, whose stream has stopped (a mic switched or
@@ -920,11 +943,27 @@ impl Denoise {
 
 /// A source as the mixer sees it.
 pub(crate) struct MixInput {
+    /// Its source's id: what a [`MixChange`] names it by.
+    pub id: String,
     pub feed: Arc<SourceFeed>,
     pub channel: Arc<Channel>,
     pub in_mix: bool,
     /// Its own track, if it has one.
     pub track: Option<Sender<Vec<f32>>>,
+}
+
+/// A change to the sources of a mixer that's running (see
+/// [`spawn_changing_mixer`]). The tracks stay as they are: a file's are set
+/// once it's started.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) enum MixChange {
+    /// Mix this source in from now on. One taken out before (by its id)
+    /// gets its own track back, if it had one. Any other has none: in the
+    /// mix, it goes into the rest track, with the others that have none.
+    Add(MixInput),
+    /// Take out the source with this id: the sound it has sent is mixed,
+    /// then it goes, and its own track, if it has one, goes on silent.
+    Remove(String),
 }
 
 /// How far behind real time the meters run: just enough for the sources'
@@ -962,109 +1001,36 @@ pub(crate) fn spawn_mixer(
     latency: f64,
     stop: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
+    // Nothing sends it changes: its sources stay as they are.
+    let (_, changes) = std::sync::mpsc::channel();
+    spawn_changing_mixer(inputs, changes, mix_track, rest_track, live, clock, now, latency, stop)
+}
+
+/// [`spawn_mixer`], with its sources changed while it runs by what `changes`
+/// brings: one added, one taken out (see [`MixChange`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_changing_mixer(
+    inputs: Vec<MixInput>,
+    changes: Receiver<MixChange>,
+    mix_track: Option<Sender<Vec<f32>>>,
+    rest_track: Option<Sender<Vec<f32>>>,
+    live: Arc<LiveAudio>,
+    clock: Arc<Clock>,
+    now: fn() -> f64,
+    latency: f64,
+    stop: Arc<AtomicBool>,
+) -> JoinHandle<()> {
     thread::spawn(move || {
-        let mut gains: Vec<f32> = inputs.iter().map(|i| i.channel.effective_gain()).collect();
-        let mut limiter = Limiter::new();
-        let mut mixed: Option<i64> = None;
-        // The meters' own position and limiter, ahead of the mix.
-        let mut metered: Option<i64> = None;
-        let mut meter_limiter = Limiter::new();
-        // When the meters last moved, and whether that's been said: they
-        // stood still now and then, until clipping was restarted; this says
-        // where they were stuck, in the log.
-        let mut moved = Instant::now();
-        let mut said_stuck = false;
+        let mut mixer = Mixing::new(inputs, mix_track, rest_track, live.clone(), latency);
         loop {
             let tick = Instant::now();
             let stopping = stop.load(Ordering::Relaxed);
+            while let Ok(change) = changes.try_recv() {
+                mixer.change(change);
+            }
             if let Some(t0) = clock.get() {
-                let mut target = ((now() - t0 - METER_LAG) * RATE as f64).floor() as i64;
-                let stalled = target - (STALLED * RATE as f64) as i64;
-                if let Some(slowest) = inputs.iter().filter_map(|i| i.feed.arrived()).filter(|&a| a > stalled).min() {
-                    target = target.min(slowest);
-                }
-                let from = metered.get_or_insert(target.max(0));
-                // Never meter what's already been written (and so is gone).
-                *from = (*from).max(mixed.unwrap_or(0));
-                while *from < target {
-                    let n = ((target - *from) as usize).min(RATE as usize / 50);
-                    let mut mix = vec![[0f32; 2]; n];
-                    for input in &inputs {
-                        let mut block = input.feed.peek(*from, n);
-                        input.channel.input.record(&block);
-                        input.channel.send_tap(&block);
-                        let g = input.channel.effective_gain();
-                        for f in block.iter_mut() {
-                            f[0] *= g;
-                            f[1] *= g;
-                        }
-                        input.channel.meter.record(&block);
-                        if input.in_mix {
-                            add(&mut mix, &block);
-                        }
-                    }
-                    if live.limiter.load(Ordering::Relaxed) {
-                        let reduction = meter_limiter.process(&mut mix);
-                        live.reduction_db.fetch_max(reduction);
-                    }
-                    live.master.record(&mix);
-                    *from += n as i64;
-                    moved = Instant::now();
-                }
-                if !stopping && moved.elapsed() > Duration::from_secs(2) {
-                    if !said_stuck {
-                        said_stuck = true;
-                        let arrived: Vec<Option<i64>> = inputs.iter().map(|i| i.feed.arrived()).collect();
-                        eprintln!(
-                            "meters: stuck for {:.1} s at frame {}, aiming at {} ({:.3} s since the start), mixed to {mixed:?}; newest audio per source: {arrived:?}",
-                            moved.elapsed().as_secs_f32(),
-                            metered.unwrap_or(0),
-                            target,
-                            now() - t0
-                        );
-                    }
-                } else if said_stuck && moved.elapsed() < Duration::from_secs(1) {
-                    said_stuck = false;
-                    eprintln!("meters: moving again");
-                }
-                let behind = if stopping { 0.0 } else { latency };
-                let target = ((now() - t0 - behind) * RATE as f64).floor() as i64;
-                let from = mixed.get_or_insert(0);
-                while *from < target {
-                    let n = ((target - *from) as usize).min(RATE as usize / 50);
-                    let mut mix = vec![[0f32; 2]; n];
-                    let mut rest = vec![[0f32; 2]; if rest_track.is_some() { n } else { 0 }];
-                    for (input, gain) in inputs.iter().zip(gains.iter_mut()) {
-                        let mut block = input.feed.take(*from, n);
-                        // Ramp to the new volume across the block so fader moves don't click.
-                        let target_gain = input.channel.effective_gain();
-                        for (k, f) in block.iter_mut().enumerate() {
-                            let g = *gain + (target_gain - *gain) * (k + 1) as f32 / n as f32;
-                            f[0] *= g;
-                            f[1] *= g;
-                        }
-                        *gain = target_gain;
-                        if input.in_mix {
-                            add(&mut mix, &block);
-                            if input.track.is_none() {
-                                add(&mut rest, &block);
-                            }
-                        }
-                        if let Some(tx) = &input.track {
-                            let _ = tx.send(interleave(&block));
-                        }
-                    }
-                    if live.limiter.load(Ordering::Relaxed) {
-                        limiter.process(&mut mix);
-                    }
-                    if let Some(tx) = &mix_track {
-                        let _ = tx.send(interleave(&mix));
-                    }
-                    if let Some(tx) = &rest_track {
-                        let _ = tx.send(interleave(&rest));
-                    }
-                    *from += n as i64;
-                }
+                mixer.meter(now() - t0, stopping);
+                mixer.mix(now() - t0, stopping);
             }
             if stopping {
                 break;
@@ -1076,6 +1042,208 @@ pub(crate) fn spawn_mixer(
         }
         live.all_off();
     })
+}
+
+/// A running mixer: its sources and tracks, and how far it has got, in
+/// mixing them and in metering them.
+struct Mixing {
+    inputs: Vec<Input>,
+    /// The own tracks of sources taken out, by the source's id. They go on,
+    /// silent (every track runs to the file's end), and go back to the
+    /// source if it's added again.
+    parked: Vec<(String, Sender<Vec<f32>>)>,
+    mix_track: Option<Sender<Vec<f32>>>,
+    rest_track: Option<Sender<Vec<f32>>>,
+    live: Arc<LiveAudio>,
+    latency: f64,
+    limiter: Limiter,
+    /// The next frame to mix, once mixing has begun.
+    mixed: Option<i64>,
+    /// The meters' own position and limiter, ahead of the mix.
+    metered: Option<i64>,
+    meter_limiter: Limiter,
+    /// When the meters last moved, and whether that's been said: they
+    /// stood still now and then, until clipping was restarted; this says
+    /// where they were stuck, in the log.
+    moved: Instant,
+    said_stuck: bool,
+}
+
+/// One of a mixer's sources.
+struct Input {
+    mix: MixInput,
+    /// The gain its last block ended at, which the next one ramps from.
+    gain: f32,
+    /// Taken out: mixed up to where its sound ends, then let go of.
+    leaving: bool,
+}
+
+impl Input {
+    fn new(mix: MixInput) -> Self {
+        Self { gain: mix.channel.effective_gain(), mix, leaving: false }
+    }
+}
+
+impl Mixing {
+    fn new(inputs: Vec<MixInput>, mix_track: Option<Sender<Vec<f32>>>, rest_track: Option<Sender<Vec<f32>>>, live: Arc<LiveAudio>, latency: f64) -> Self {
+        Self {
+            inputs: inputs.into_iter().map(Input::new).collect(),
+            parked: Vec::new(),
+            mix_track,
+            rest_track,
+            live,
+            latency,
+            limiter: Limiter::new(),
+            mixed: None,
+            metered: None,
+            meter_limiter: Limiter::new(),
+            moved: Instant::now(),
+            said_stuck: false,
+        }
+    }
+
+    fn change(&mut self, change: MixChange) {
+        match change {
+            MixChange::Add(mut input) => {
+                // Its own track, if it was here before: from it still
+                // leaving (which goes now, the last of its sound with it),
+                // or from it gone.
+                let mut tracks = Vec::new();
+                if let Some(at) = self.inputs.iter().position(|i| i.mix.id == input.id) {
+                    tracks.extend(self.inputs.remove(at).mix.track);
+                }
+                if let Some(at) = self.parked.iter().position(|(id, _)| *id == input.id) {
+                    tracks.push(self.parked.remove(at).1);
+                }
+                for tx in tracks {
+                    if input.track.is_none() {
+                        input.track = Some(tx);
+                    } else {
+                        // A source has one track of its own at most, but a
+                        // track is never let go of before the file ends.
+                        self.parked.push((input.id.clone(), tx));
+                    }
+                }
+                self.inputs.push(Input::new(input));
+            }
+            MixChange::Remove(id) => {
+                for input in self.inputs.iter_mut().filter(|i| i.mix.id == id) {
+                    input.leaving = true;
+                }
+            }
+        }
+    }
+
+    /// Meter up to `at` (seconds on the clock) less [`METER_LAG`], or as far
+    /// as the sources' sound has come, if that's less. Sources taken out
+    /// aren't: their sound is only mixed, to its end.
+    fn meter(&mut self, at: f64, stopping: bool) {
+        let mut target = ((at - METER_LAG) * RATE as f64).floor() as i64;
+        let stalled = target - (STALLED * RATE as f64) as i64;
+        if let Some(slowest) = self.inputs.iter().filter(|i| !i.leaving).filter_map(|i| i.mix.feed.arrived()).filter(|&a| a > stalled).min() {
+            target = target.min(slowest);
+        }
+        let from = self.metered.get_or_insert(target.max(0));
+        // Never meter what's already been written (and so is gone).
+        *from = (*from).max(self.mixed.unwrap_or(0));
+        while *from < target {
+            let n = ((target - *from) as usize).min(RATE as usize / 50);
+            let mut mix = vec![[0f32; 2]; n];
+            for input in self.inputs.iter().filter(|i| !i.leaving).map(|i| &i.mix) {
+                let mut block = input.feed.peek(*from, n);
+                input.channel.input.record(&block);
+                input.channel.send_tap(&block);
+                let g = input.channel.effective_gain();
+                for f in block.iter_mut() {
+                    f[0] *= g;
+                    f[1] *= g;
+                }
+                input.channel.meter.record(&block);
+                if input.in_mix {
+                    add(&mut mix, &block);
+                }
+            }
+            if self.live.limiter.load(Ordering::Relaxed) {
+                let reduction = self.meter_limiter.process(&mut mix);
+                self.live.reduction_db.fetch_max(reduction);
+            }
+            self.live.master.record(&mix);
+            *from += n as i64;
+            self.moved = Instant::now();
+        }
+        if !stopping && self.moved.elapsed() > Duration::from_secs(2) {
+            if !self.said_stuck {
+                self.said_stuck = true;
+                let arrived: Vec<Option<i64>> = self.inputs.iter().map(|i| i.mix.feed.arrived()).collect();
+                eprintln!(
+                    "meters: stuck for {:.1} s at frame {}, aiming at {target} ({at:.3} s since the start), mixed to {:?}; newest audio per source: {arrived:?}",
+                    self.moved.elapsed().as_secs_f32(),
+                    self.metered.unwrap_or(0),
+                    self.mixed,
+                );
+            }
+        } else if self.said_stuck && self.moved.elapsed() < Duration::from_secs(1) {
+            self.said_stuck = false;
+            eprintln!("meters: moving again");
+        }
+    }
+
+    /// Mix up to `latency` behind `at` (seconds on the clock; all of it,
+    /// `stopping`), and send every track its part.
+    fn mix(&mut self, at: f64, stopping: bool) {
+        let behind = if stopping { 0.0 } else { self.latency };
+        let target = ((at - behind) * RATE as f64).floor() as i64;
+        let from = self.mixed.get_or_insert(0);
+        while *from < target {
+            let n = ((target - *from) as usize).min(RATE as usize / 50);
+            let mut mix = vec![[0f32; 2]; n];
+            let mut rest = vec![[0f32; 2]; if self.rest_track.is_some() { n } else { 0 }];
+            for input in &mut self.inputs {
+                let mut block = input.mix.feed.take(*from, n);
+                // Ramp to the new volume across the block so fader moves don't click.
+                let target_gain = input.mix.channel.effective_gain();
+                for (k, f) in block.iter_mut().enumerate() {
+                    let g = input.gain + (target_gain - input.gain) * (k + 1) as f32 / n as f32;
+                    f[0] *= g;
+                    f[1] *= g;
+                }
+                input.gain = target_gain;
+                if input.mix.in_mix {
+                    add(&mut mix, &block);
+                    if input.mix.track.is_none() {
+                        add(&mut rest, &block);
+                    }
+                }
+                if let Some(tx) = &input.mix.track {
+                    let _ = tx.send(interleave(&block));
+                }
+            }
+            for (_, tx) in &self.parked {
+                let _ = tx.send(vec![0.0; n * 2]);
+            }
+            if self.live.limiter.load(Ordering::Relaxed) {
+                self.limiter.process(&mut mix);
+            }
+            if let Some(tx) = &self.mix_track {
+                let _ = tx.send(interleave(&mix));
+            }
+            if let Some(tx) = &self.rest_track {
+                let _ = tx.send(interleave(&rest));
+            }
+            *from += n as i64;
+        }
+        // Those taken out go once all their sound is mixed: their own
+        // tracks go on, silent.
+        let mixed = *from;
+        let parked = &mut self.parked;
+        self.inputs.retain_mut(|input| {
+            let gone = input.leaving && input.mix.feed.arrived().is_none_or(|a| a <= mixed);
+            if gone && let Some(tx) = input.mix.track.take() {
+                parked.push((input.mix.id.clone(), tx));
+            }
+            !gone
+        });
+    }
 }
 
 fn add(acc: &mut [[f32; 2]], block: &[[f32; 2]]) {
@@ -1556,6 +1724,147 @@ mod tests {
         assert_eq!(feed.arrived(), Some(480));
         feed.take(0, 4800);
         assert_eq!(feed.arrived(), Some(480), "the mixer reading on isn't sound arriving");
+    }
+
+    /// Everything a track got, as frames.
+    fn frames(track: &Receiver<Vec<f32>>) -> Vec<[f32; 2]> {
+        track.try_iter().flatten().collect::<Vec<f32>>().chunks_exact(2).map(|f| [f[0], f[1]]).collect()
+    }
+
+    /// A source of the clip's sound (unity gain), in or out of the mix.
+    fn source(live: &LiveAudio, id: &str, feed: &Arc<SourceFeed>, track: Option<Sender<Vec<f32>>>) -> MixInput {
+        MixInput { id: id.into(), feed: feed.clone(), channel: live.channel(id), in_mix: true, track }
+    }
+
+    /// Frame `at` seconds in.
+    fn frame(at: f64) -> usize {
+        (at * RATE as f64) as usize
+    }
+
+    /// `seconds` of a steady level, as interleaved stereo.
+    fn steady(level: f32, seconds: f64) -> Vec<f32> {
+        vec![level; frame(seconds) * 2]
+    }
+
+    /// A source added while mixing (one added while recording, which has no
+    /// track of its own in the file) goes into the mix and, so the separate
+    /// tracks still add up to it, into the rest track. The others' tracks
+    /// go on as they were.
+    #[test]
+    fn a_source_added_while_mixing_goes_into_the_mix_and_the_rest_track() {
+        let clock = clock_at_zero();
+        let live = LiveAudio::new();
+        live.set_limiter(false);
+        let (mix_tx, mix) = std::sync::mpsc::channel();
+        let (rest_tx, rest) = std::sync::mpsc::channel();
+        let (game_tx, game_track) = std::sync::mpsc::channel();
+        let game = SourceFeed::new(RATE, clock.clone());
+        let mut mixer = Mixing::new(vec![source(&live, "game", &game, Some(game_tx))], Some(mix_tx), Some(rest_tx), live.clone(), 0.25);
+        game.push(1000.0, &steady(0.25, 2.0), 2);
+        mixer.mix(1.25, false);
+        // Added when the mix is at 1 s; its sound from 1.1 s on.
+        let music = SourceFeed::new(RATE, clock.clone());
+        mixer.change(MixChange::Add(source(&live, "music", &music, None)));
+        music.push(1001.1, &steady(0.5, 0.9), 2);
+        mixer.mix(2.25, false);
+        let (mix, rest, game_track) = (frames(&mix), frames(&rest), frames(&game_track));
+        assert_eq!((mix.len(), rest.len(), game_track.len()), (frame(2.0), frame(2.0), frame(2.0)), "every track as long");
+        assert!(mix[..frame(1.1)].iter().all(|f| f[0] == 0.25));
+        assert!(mix[frame(1.1)..].iter().all(|f| f[0] == 0.75), "the added source mixed in");
+        assert!(rest[..frame(1.1)].iter().all(|f| f[0] == 0.0));
+        assert!(rest[frame(1.1)..].iter().all(|f| f[0] == 0.5), "and in the rest track");
+        assert!(game_track.iter().all(|f| f[0] == 0.25), "the game's own track, the game alone");
+    }
+
+    /// A source taken out while mixing (its capture stopped when the mix is
+    /// 250 ms behind) is mixed to where its sound ended, in the mix and in
+    /// its own track; then it's gone, and its track goes on silent, as long
+    /// as the others. Added again, it has its own track back.
+    #[test]
+    fn a_source_taken_out_is_mixed_to_its_end_then_its_track_goes_on_silent() {
+        let clock = clock_at_zero();
+        let live = LiveAudio::new();
+        live.set_limiter(false);
+        let (mix_tx, mix) = std::sync::mpsc::channel();
+        let (rest_tx, rest) = std::sync::mpsc::channel();
+        let (game_tx, game_track) = std::sync::mpsc::channel();
+        let (mic_tx, mic_track) = std::sync::mpsc::channel();
+        let (game, mic) = (SourceFeed::new(RATE, clock.clone()), SourceFeed::new(RATE, clock.clone()));
+        let inputs = vec![source(&live, "game", &game, Some(game_tx)), source(&live, "mic", &mic, Some(mic_tx))];
+        let mut mixer = Mixing::new(inputs, Some(mix_tx), Some(rest_tx), live.clone(), 0.25);
+        game.push(1000.0, &steady(0.25, 3.0), 2);
+        mic.push(1000.0, &steady(0.5, 1.0), 2);
+        mixer.mix(1.0, false);
+        // Taken out at 1 s: what it sends after isn't taken.
+        mic.close();
+        mixer.change(MixChange::Remove("mic".into()));
+        mic.push(1001.0, &steady(0.5, 0.5), 2);
+        mixer.mix(2.0, false);
+        assert!(mixer.inputs.iter().all(|i| i.mix.id != "mic"), "gone once its sound is mixed");
+        assert_eq!(mixer.parked.len(), 1);
+        mixer.mix(2.25, false);
+        let mic_was = frames(&mic_track);
+        assert_eq!((mic_was.len(), frames(&game_track).len()), (frame(2.0), frame(2.0)), "its track goes on, as long as the game's");
+        assert!(mic_was[..frame(1.0)].iter().all(|f| f[0] == 0.5), "its last 250 ms too");
+        assert!(mic_was[frame(1.0)..].iter().all(|f| f[0] == 0.0), "silent once it's taken out");
+        let mixed = frames(&mix);
+        assert!(mixed[..frame(1.0)].iter().all(|f| f[0] == 0.75));
+        assert!(mixed[frame(1.0)..].iter().all(|f| f[0] == 0.25));
+
+        // Added again when the mix is at 2 s, its sound from 2.5 s: on its
+        // own track.
+        let mic = SourceFeed::new(RATE, clock.clone());
+        mixer.change(MixChange::Add(source(&live, "mic", &mic, None)));
+        mic.push(1002.5, &steady(0.5, 0.5), 2);
+        mixer.mix(3.25, false);
+        let mic_now = frames(&mic_track);
+        assert_eq!(mic_now.len(), frame(1.0));
+        assert!(mic_now[..frame(0.5)].iter().all(|f| f[0] == 0.0));
+        assert!(mic_now[frame(0.5)..].iter().all(|f| f[0] == 0.5), "its own track back");
+        assert!(mixer.parked.is_empty());
+        assert!(frames(&rest).iter().all(|f| f[0] == 0.0), "not in the rest track: it has a track of its own");
+    }
+
+    /// A feed whose source has stopped being captured takes no more sound,
+    /// in itself or the feeds it sums, nor in one added to it after; what
+    /// came before is still there to mix.
+    #[test]
+    fn a_closed_feed_takes_no_more_sound() {
+        let feed = SourceFeed::new(RATE, clock_at_zero());
+        let child = feed.add_child(RATE);
+        child.push(1000.0, &steady(0.5, 0.01), 2);
+        feed.close();
+        child.push(1000.01, &steady(0.5, 0.01), 2);
+        feed.push(1000.01, &steady(0.5, 0.01), 2);
+        feed.add_child(RATE).push(1000.01, &steady(0.5, 0.01), 2);
+        assert_eq!(feed.arrived(), Some(480), "only what came before");
+        let out = feed.take(0, 960);
+        assert!(out[..480].iter().all(|f| f[0] == 0.5));
+        assert!(out[480..].iter().all(|f| f[0] == 0.0));
+    }
+
+    /// A change sent to a mixer that's running is taken up: here a source
+    /// added before its first pass, which (stopping) mixes all there is.
+    #[test]
+    fn a_running_mixer_takes_changes() {
+        static NOW: AtomicU64 = AtomicU64::new(0);
+        fn now() -> f64 {
+            f64::from_bits(NOW.load(Ordering::Relaxed))
+        }
+        NOW.store(1001.0f64.to_bits(), Ordering::Relaxed);
+        let clock = clock_at_zero();
+        let live = LiveAudio::new();
+        live.set_limiter(false);
+        let (mix_tx, mix) = std::sync::mpsc::channel();
+        let (changes, changed) = std::sync::mpsc::channel();
+        let music = SourceFeed::new(RATE, clock.clone());
+        music.push(1000.0, &steady(0.5, 1.0), 2);
+        changes.send(MixChange::Add(source(&live, "music", &music, None))).unwrap();
+        let stop = Arc::new(AtomicBool::new(true));
+        spawn_changing_mixer(Vec::new(), changed, Some(mix_tx), None, live, clock, now, 0.25, stop).join().unwrap();
+        let mix = frames(&mix);
+        assert_eq!(mix.len(), frame(1.0));
+        assert!(mix.iter().all(|f| f[0] == 0.5));
     }
 
     #[test]

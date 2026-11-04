@@ -1018,6 +1018,11 @@ pub const STREAMING: bool = cfg!(any(target_os = "windows", target_os = "macos",
 /// ([`Recorder::set_blend`]): taken up at the capture's next frame.
 pub const BLEND_WHILE_CAPTURING: bool = cfg!(any(target_os = "windows", target_os = "macos", target_os = "linux"));
 
+/// Whether audio sources can be added to and taken out of a running capture
+/// ([`Recorder::set_sources`]): on Windows so far; elsewhere they're set
+/// when the capture starts.
+pub const SOURCES_WHILE_CAPTURING: bool = cfg!(target_os = "windows");
+
 /// A capture device (screen, app, or audio device) as seen by the backend.
 #[derive(Debug, Clone)]
 pub struct Device {
@@ -1455,6 +1460,18 @@ pub trait Recorder {
     /// Switch the running capture's microphone source `id` to `device`
     /// (its track stays). Returns whether it was applied.
     fn set_mic(&mut self, _id: &str, _device: &str) -> bool {
+        false
+    }
+
+    /// Capture these audio sources from now on, without restarting (see
+    /// [`SOURCES_WHILE_CAPTURING`]). The file's tracks stay as they started:
+    /// a source added goes into the mix at once, and into the rest track if
+    /// there's one, having no track of its own (but the one it had at the
+    /// start, if it's added back). One taken out goes silent in its tracks.
+    /// A microphone given another device switches to it (as
+    /// [`Self::set_mic`]). Anything else about a source waits for the next
+    /// start. Returns whether it was applied.
+    fn set_sources(&mut self, _sources: &[sources::AudioSource]) -> bool {
         false
     }
 

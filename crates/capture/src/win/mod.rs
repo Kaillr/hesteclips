@@ -52,10 +52,10 @@ pub(crate) use camera::{controls as camera_controls, picture as camera_picture, 
 pub use system::{cursor_state, foreground_app_path, foreground_exe, list_apps, list_screens, list_windowed_apps};
 pub(crate) use system::display_pixels;
 
-use crate::mixer::{self, Clock, LiveAudio};
+use crate::mixer::{self, Clock, LiveAudio, MixChange, MixInput};
 use crate::mp4mux::Spec;
 use crate::outputs::{Capture, Outputs};
-use crate::sources::{AudioCapture, mix_inputs, track_layout};
+use crate::sources::{AudioCapture, AudioSource, mix_inputs, track_layout};
 use crate::stream::StreamSettings;
 use crate::writer::{self, Media, Writer};
 use crate::{BlendShape, EncodeSettings, Mode, Recorder, Running, VideoSource, eprintln_later};
@@ -113,6 +113,10 @@ impl Recorder for WinRecorder {
 
     fn set_blend(&mut self, looks: u32, shape: BlendShape) -> bool {
         self.outputs.session.as_mut().is_some_and(|s| s.set_blend(looks, shape))
+    }
+
+    fn set_sources(&mut self, sources: &[AudioSource]) -> bool {
+        self.outputs.session.as_mut().is_some_and(|s| s.set_sources(sources, &self.live))
     }
 
     fn screenshot(&mut self, video: &VideoSource) -> Result<crate::PendingShot> {
@@ -176,6 +180,8 @@ struct Session {
     pacer: Option<(Arc<AtomicBool>, JoinHandle<()>)>,
     audio: Option<AudioCapture>,
     mixer: Option<(Arc<AtomicBool>, JoinHandle<()>)>,
+    /// The sources added and taken out while it runs, for the mixer.
+    mix_changes: Option<Sender<MixChange>>,
     /// AAC encoder threads, one per track; they end when the mixer drops its senders.
     encoders: Vec<JoinHandle<()>>,
     writer_tx: Sender<writer::Command>,
@@ -380,6 +386,7 @@ impl Session {
             pacer: None,
             audio: None,
             mixer: None,
+            mix_changes: None,
             encoders: Vec::new(),
             writer_tx,
             writer: Some(writer),
@@ -405,8 +412,11 @@ impl Session {
             let rest_track = if has_rest { tracks.next() } else { None };
             session.audio = Some(audio);
             let stop = Arc::new(AtomicBool::new(false));
-            let mixer = mixer::spawn_mixer(
+            let (mix_changes, changes) = mpsc::channel();
+            session.mix_changes = Some(mix_changes);
+            let mixer = mixer::spawn_changing_mixer(
                 inputs,
+                changes,
                 mix_track,
                 rest_track,
                 live.clone(),
@@ -560,6 +570,24 @@ impl Session {
                 false
             }
         }
+    }
+
+    /// Capture these audio sources from now on, without restarting (see
+    /// [`Recorder::set_sources`]): the capture starts and stops them, and
+    /// the mixer takes them in and out.
+    fn set_sources(&mut self, sources: &[AudioSource], live: &LiveAudio) -> bool {
+        let (Some(audio), Some(changes)) = (self.audio.as_mut(), &self.mix_changes) else { return false };
+        let (added, gone) = audio.set_sources(sources, live);
+        for source in gone {
+            eprintln!("audio source \"{}\": taken out while capturing", source.name);
+            let _ = changes.send(MixChange::Remove(source.id));
+        }
+        for (source, feed) in added {
+            eprintln!("audio source \"{}\": added while capturing, into the mix", source.name);
+            let input = MixInput { channel: live.channel(&source.id), id: source.id, feed, in_mix: source.in_mix, track: None };
+            let _ = changes.send(MixChange::Add(input));
+        }
+        true
     }
 
     /// Stop capturing and finish what the writer was doing (a recording's
