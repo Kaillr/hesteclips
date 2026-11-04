@@ -141,28 +141,18 @@ impl App {
                         });
                     }
                 }
-                ui.label(theme::text(&count, 13.5, W::Regular).color(theme::pal(ui).text3));
+                // How many clips and screenshots are here, which is also where
+                // they're picked between.
+                if let Some(a) = app.kind_counts(ui, &count, tight) {
+                    head_action = Some(a);
+                }
                 ui.add_space(2.0);
                 let sort = app.settings.library_sort;
                 let all_folded = days.iter().all(|d| app.folded.contains(d));
                 let fold_label = if all_folded { "Expand all" } else { "Collapse all" };
-                // Clips, screenshots or both: once there are screenshots.
-                let kinds = app.shown.any_shots;
-                let chosen = ShowKind::ALL.iter().position(|k| *k == app.library_kind).unwrap_or(0);
                 if tight {
-                    // Not enough room: clips or screenshots as their icons,
-                    // the order and fold-all in a menu (the recorder keeps
-                    // its words longer).
-                    if kinds {
-                        let opts = [
-                            ui_kit::Seg::from("All"),
-                            ui_kit::Seg { icon: Some(icon::FILM_STRIP), label: "", tip: Some("Clips") },
-                            ui_kit::Seg { icon: Some(icon::CAMERA), label: "", tip: Some("Screenshots") },
-                        ];
-                        if let Some(i) = ui_kit::segmented_opts(ui, "lib_kind_tight", &opts, chosen, None, true) {
-                            head_action = Some(Action::Kind(ShowKind::ALL[i]));
-                        }
-                    }
+                    // Not enough room: the order and fold-all in a menu (the
+                    // recorder keeps its words longer).
                     let r = Btn::icon(Kind::Ghost, icon::DOTS_THREE).small().id("lib_more").tip(format!("Order: {}", sort.label())).show(ui);
                     ui_kit::menu_popup(&r, true, 200.0, |ui| {
                         ui_kit::menu_head(ui, "Order");
@@ -179,12 +169,6 @@ impl App {
                         }
                     });
                 } else {
-                    if kinds {
-                        let opts: Vec<ui_kit::Seg> = ShowKind::ALL.iter().map(|k| ui_kit::Seg::from(k.label())).collect();
-                        if let Some(i) = ui_kit::segmented_opts(ui, "lib_kind", &opts, chosen, None, true) {
-                            head_action = Some(Action::Kind(ShowKind::ALL[i]));
-                        }
-                    }
                     let r = Btn::ghost(sort.label()).with_icon(icon::ARROWS_DOWN_UP).small().id("lib_sort").show(ui);
                     ui_kit::menu_popup(&r, true, 200.0, |ui| {
                         for s in LibrarySort::ALL {
@@ -417,6 +401,44 @@ impl App {
             Filter::Folder(name) => name.clone(),
             Filter::Collection(id) => self.collections.get(id).map(|c| c.name.clone()).unwrap_or_default(),
         }
+    }
+
+    /// The heading's count, which also picks between clips and screenshots.
+    /// Where both are here (found, while searching), each kind's number is a
+    /// quiet button that shows only that kind; the kind shown is a chip that
+    /// shows both again (with ✕ while there's room), the other beside it to
+    /// switch to. Otherwise `count`, in words. (Picking them had a control of
+    /// its own, which took room the clipping bar needs.) `tight`: each kind
+    /// as its icon and number.
+    fn kind_counts(&self, ui: &mut egui::Ui, count: &str, tight: bool) -> Option<Action> {
+        let (clips, shots) = self.shown.found;
+        let kind = self.library_kind;
+        if kind == ShowKind::All && (clips == 0 || shots == 0) {
+            ui.label(theme::text(count, 13.5, W::Regular).color(theme::pal(ui).text3));
+            return None;
+        }
+        let mut action = None;
+        ui.scope(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            for (k, n, glyph, one, many) in [(ShowKind::Clips, clips, icon::FILM_STRIP, "clip", "clips"), (ShowKind::Screenshots, shots, icon::CAMERA, "screenshot", "screenshots")] {
+                let chosen = kind == k;
+                // A kind that isn't here, to switch to: left out.
+                if n == 0 && !chosen {
+                    continue;
+                }
+                let label = if tight { n.to_string() } else { format!("{n} {}", if n == 1 { one } else { many }) };
+                let b = Btn::new(if chosen { Kind::On } else { Kind::Ghost }, label).with_icon(glyph).small().id(("lib_kind", many));
+                let b = match (chosen, tight) {
+                    (true, false) => b.trail(icon::X).tip("Show clips and screenshots"),
+                    (true, true) => b.tip("Show clips and screenshots"),
+                    (false, _) => b.tip(format!("Show only {many}")),
+                };
+                if b.show(ui).clicked() {
+                    action = Some(Action::Kind(if chosen { ShowKind::All } else { k }));
+                }
+            }
+        });
+        action
     }
 
     /// The Clips panel: title and search, then the card of filters.
@@ -737,7 +759,7 @@ impl App {
                 let hint = match key {
                     Some(key) if shots => format!("Press {key} in a game to take one."),
                     None if shots => "Choose a key for them in Settings, under Shortcuts.".to_owned(),
-                    _ => "Show All to see everything here.".to_owned(),
+                    _ => "Show all to see everything here.".to_owned(),
                 };
                 ui.label(theme::text(hint, 13.5, W::Regular).color(p.text3));
                 ui.add_space(10.0);

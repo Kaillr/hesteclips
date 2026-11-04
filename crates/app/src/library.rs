@@ -54,8 +54,8 @@ pub(crate) enum Filter {
     Shared,
 }
 
-/// Whether the library shows clips, screenshots or both (once it has any
-/// screenshots: until then, there's nothing to choose).
+/// Whether the library shows clips, screenshots or both: picked on the
+/// heading's count where both are (see `App::kind_counts`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum ShowKind {
     #[default]
@@ -65,21 +65,11 @@ pub(crate) enum ShowKind {
 }
 
 impl ShowKind {
-    pub(crate) const ALL: [ShowKind; 3] = [ShowKind::All, ShowKind::Clips, ShowKind::Screenshots];
-
     pub(crate) fn matches(self, clip: &clips::Clip) -> bool {
         match self {
             ShowKind::All => true,
             ShowKind::Clips => !clip.is_image(),
             ShowKind::Screenshots => clip.is_image(),
-        }
-    }
-
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            ShowKind::All => "All",
-            ShowKind::Clips => "Clips",
-            ShowKind::Screenshots => "Screenshots",
         }
     }
 }

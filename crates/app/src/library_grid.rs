@@ -70,6 +70,9 @@ pub struct Shown {
     /// screenshots.
     pub in_filter: usize,
     pub shots_in_filter: usize,
+    /// The clips and the screenshots here and found by the search, whichever
+    /// kind is shown: what the heading counts, and picks between.
+    pub found: (usize, usize),
     /// Whether the library has any screenshots (then clips or screenshots
     /// can be chosen).
     pub any_shots: bool,
@@ -148,14 +151,21 @@ impl Shown {
         }
         let clips = inp.clips;
         let sets = inp.collections.sets();
-        let in_filter = |c: &Clip| {
-            inp.kind.matches(c)
-                && match inp.filter {
-                    Filter::Collection(id) => sets.get(id).is_some_and(|s| s.contains(&c.path)),
-                    f => f.matches(c, inp.collections, inp.links),
-                }
+        let in_place = |c: &Clip| match inp.filter {
+            Filter::Collection(id) => sets.get(id).is_some_and(|s| s.contains(&c.path)),
+            f => f.matches(c, inp.collections, inp.links),
         };
+        let in_filter = |c: &Clip| inp.kind.matches(c) && in_place(c);
         let matches = |c: &Clip| query.is_empty() || c.title().to_lowercase().contains(&query) || c.folder.as_ref().is_some_and(|f| f.to_lowercase().contains(&query));
+        // Here and found by the search, of each kind, whichever kind is shown.
+        let (mut found_clips, mut found_shots) = (0, 0);
+        for c in clips.iter().filter(|c| in_place(c) && matches(c)) {
+            if c.is_image() {
+                found_shots += 1;
+            } else {
+                found_clips += 1;
+            }
+        }
         let filtered: Vec<usize> = (0..clips.len()).filter(|&i| in_filter(&clips[i])).collect();
         let mut shown: Vec<usize> = filtered.iter().copied().filter(|&i| matches(&clips[i])).collect();
         match inp.sort {
@@ -173,6 +183,7 @@ impl Shown {
         self.days = self.groups.iter().filter_map(|g| g.day).collect();
         self.in_filter = filtered.len();
         self.shots_in_filter = filtered.iter().filter(|&&i| clips[i].is_image()).count();
+        self.found = (found_clips, found_shots);
         self.any_shots = clips.iter().any(Clip::is_image);
         self.shared = clips.iter().filter(|c| inp.links.get(&c.path).is_some()).count();
         self.clips = shown;
@@ -752,6 +763,29 @@ mod tests {
         let start = m.place_day(day, is, true, 10.0, view);
         assert_eq!(start.at, was);
         assert_eq!(m.place_day(day, is, true, 10.0 + f64::from(SLIDE), view).at, is);
+    }
+
+    /// What the heading counts and picks between: the clips and the
+    /// screenshots here (found by the search, while searching), whichever
+    /// kind is shown, so with one picked the other's number is still there to
+    /// switch to.
+    #[test]
+    fn found_counts_both_kinds_whichever_is_shown() {
+        let mut clips: Vec<Clip> = (0..5).map(|i| clip(i, "osu!")).collect();
+        clips.extend((5..8).map(|i| Clip { path: PathBuf::from(format!("/lib/osu!/screenshot_2026-01-01_12-00-{i:02}.png")), ..clip(i, "osu!") }));
+        clips.push(clip(9, "CS2"));
+        let cols = Collections::default();
+        let links = crate::links::Links::default();
+        let osu = Filter::Folder("osu!".into());
+        let inp = |kind, q: &'static str| Inputs { clips: &clips, library_version: 1, collections: &cols, filter: &osu, kind, links: &links, query: q, sort: LibrarySort::Newest, lengths_version: 0, placeholders: 0, new_renders: Vec::new(), renders: &[] };
+        let mut shown = Shown::default();
+        for kind in [ShowKind::All, ShowKind::Clips, ShowKind::Screenshots] {
+            shown.update(inp(kind, ""), false, |_| None);
+            assert_eq!(shown.found, (5, 3), "showing {kind:?}");
+        }
+        assert_eq!(shown.clips.len(), 3, "the screenshots shown");
+        shown.update(inp(ShowKind::Clips, "screenshot"), false, |_| None);
+        assert_eq!((shown.found, shown.clips.len()), ((0, 3), 0), "searching: what it finds of each");
     }
 
     /// Worked out again only when something changed.
