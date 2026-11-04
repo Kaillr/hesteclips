@@ -240,16 +240,18 @@ impl Decoder {
     /// Feeds the decoder directly when it can (see `direct`), else through the
     /// file reader; `HASTECLIP_NO_DIRECT_DECODE=1` always uses the reader.
     pub fn open(path: &Path, width: u32, share_on: Option<u64>) -> Result<Self> {
-        Self::open_with(path, width, kept(share_on), direct_wanted())
+        Self::open_with(path, width, kept(share_on), direct_wanted(), false)
     }
 
     /// [`Self::open_direct`] at the video's own size, frames shared on
     /// `share_on` in a pool of their own holding about `bytes` of them (16
     /// to 2048 frames) instead of playback's few dozen: for the scrub
     /// engine, which keeps hundreds. (A decoder whose textures are all held
-    /// waits for one to come free.)
+    /// waits for one to come free.) In low-latency mode where the video
+    /// allows it: a jump to a keyframe decodes that frame, not the dozen
+    /// after it too (see `direct`).
     pub fn open_direct_pooled(path: &Path, share_on: u64, bytes: u64) -> Result<Self> {
-        let d = Self::open_with(path, u32::MAX, Kept::Shared { luid: share_on, bytes: Some(bytes) }, true)?;
+        let d = Self::open_with(path, u32::MAX, Kept::Shared { luid: share_on, bytes: Some(bytes) }, true, true)?;
         if d.way() != "direct" {
             bail!("this file can't be decoded directly");
         }
@@ -261,7 +263,7 @@ impl Decoder {
     /// Each is copied out of the decoder's own pictures, so holding a few
     /// never runs it out of them.
     pub(crate) fn open_nv12(path: &Path) -> Result<Self> {
-        Self::open_with(path, u32::MAX, Kept::Own, direct_wanted())
+        Self::open_with(path, u32::MAX, Kept::Own, direct_wanted(), false)
     }
 
     /// The dedicated memory of the graphics card with this LUID, in bytes:
@@ -294,7 +296,7 @@ impl Decoder {
     /// [`Self::open`], feeding the decoder directly; an error if the file
     /// can't be read that way.
     pub fn open_direct(path: &Path, width: u32, share_on: Option<u64>) -> Result<Self> {
-        let d = Self::open_with(path, width, kept(share_on), true)?;
+        let d = Self::open_with(path, width, kept(share_on), true, false)?;
         if d.way() != "direct" {
             bail!("this file can't be decoded directly");
         }
@@ -304,7 +306,7 @@ impl Decoder {
     /// [`Self::open`], always through Media Foundation's file reader (to
     /// compare with the direct way).
     pub fn open_file_reader(path: &Path, width: u32, share_on: Option<u64>) -> Result<Self> {
-        Self::open_with(path, width, kept(share_on), false)
+        Self::open_with(path, width, kept(share_on), false, false)
     }
 
     /// Which way frames come: "direct" or "file reader".
@@ -315,7 +317,9 @@ impl Decoder {
         }
     }
 
-    fn open_with(path: &Path, width: u32, kept: Kept, direct: bool) -> Result<Self> {
+    /// `low_latency`: the direct decoder in low-latency mode where the video
+    /// allows it (scrubbing's, which jump to keyframes: see `direct`).
+    fn open_with(path: &Path, width: u32, kept: Kept, direct: bool, low_latency: bool) -> Result<Self> {
         com_init();
         mf_startup()?;
         let gpu = match kept {
@@ -335,7 +339,7 @@ impl Decoder {
             manager.ResetDevice(&gpu.device, token)?;
 
             let direct = if direct {
-                match super::direct::Stream::open(path, &manager) {
+                match super::direct::Stream::open(path, &manager, low_latency) {
                     Ok(d) => Some(d),
                     Err(e) => {
                         if std::env::var_os("HASTECLIP_DEBUG_VIDEO").is_some() {
@@ -524,7 +528,7 @@ impl Decoder {
         // Frames read ahead are past: the decoder is where they ended.
         self.coming.clear();
         let near = match (&self.src, self.next_index) {
-            (Source::Direct(d), Some(n)) => d.decode_on(self.time_of(n), self.time_of(index)),
+            (Source::Direct(d), Some(n)) => d.decode_on(self.time_of(n), self.slot_end(index)),
             (Source::Reader(_), Some(n)) => n <= index && index - n <= MAX_SKIP,
             (_, None) => false,
         };
@@ -598,10 +602,24 @@ impl Decoder {
         (index as f64 / self.fps * UNITS) as i64 + self.offset
     }
 
+    /// The last moment of frame `index`'s slot on the grid, as
+    /// [`Self::index_of`] rounds (it takes a time a thousandth of a frame
+    /// early as the next frame's): a picture at any time up to this is that
+    /// frame's, so a jump to the frame starts from the keyframe at or before
+    /// it. (From the slot's start, a keyframe a hair after it, the frame's
+    /// own picture, was missed for the one before: on a clip whose frames run
+    /// a little behind the grid, its average rate a hair over its frames',
+    /// every jump to a keyframe decoded the whole stretch before it, 60-100
+    /// ms instead of 2-4.)
+    fn slot_end(&self, index: u64) -> i64 {
+        let early = (1e-3 / self.fps * UNITS).ceil() as i64 + 1;
+        self.time_of(index + 1) - early
+    }
+
     fn seek(&mut self, index: u64) -> Result<()> {
         self.peeked = None;
         self.next_index = None;
-        let t = self.time_of(index);
+        let t = self.slot_end(index);
         match &mut self.src {
             Source::Direct(d) => d.seek(t)?,
             Source::Reader(r) => {
