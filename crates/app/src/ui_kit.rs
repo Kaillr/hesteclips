@@ -472,6 +472,8 @@ pub enum Kind {
     Ghost,
     /// Recording's stop, destructive confirmations: red.
     Stop,
+    /// Going live, and the stream's end: streaming's purple.
+    Live,
     /// A destructive action that isn't the point of the screen: red text.
     DangerText,
     /// On, like a toggled tool (snapping on).
@@ -673,6 +675,7 @@ impl<'a> Btn<'a> {
                 Kind::Normal => (theme::mix(p.control, p.control_h, hv), p.text),
                 Kind::Ghost => (theme::fade(p.sel, hv * if p.dark { 1.0 } else { 0.0 }).blend(theme::fade(p.control, if p.dark { 0.0 } else { hv })), theme::mix(p.text2, p.text, hv)),
                 Kind::Stop => (theme::mix(p.rec, Color32::WHITE, hv * 0.12), Color32::WHITE),
+                Kind::Live => (theme::mix(p.stream, Color32::WHITE, hv * 0.12), Color32::WHITE),
                 Kind::DangerText => (theme::fade(p.sel, hv).blend(theme::fade(p.control, if p.dark { 0.0 } else { hv })), p.danger),
                 Kind::On => (p.seg_on, p.text),
             };
@@ -1943,10 +1946,13 @@ pub fn dialog_text(ui: &mut egui::Ui, text: &str) {
 }
 
 /// A dialog's buttons, right-aligned, the main one last (given first, as
-/// they're laid out right to left).
+/// they're laid out right to left). In a row as tall as a button: a
+/// dialog's box is laid out in the size it had last frame, and buttons
+/// centred in all the height left kept a box that was taller once (a frame
+/// whose text wrapped narrow) that tall for good, its buttons halfway down.
 pub fn dialog_buttons(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
     ui.add_space(14.0);
-    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+    ui.allocate_ui_with_layout(vec2(ui.available_width(), CONTROL_H), egui::Layout::right_to_left(egui::Align::Center), |ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
         add(ui);
     });
@@ -1991,6 +1997,37 @@ pub fn text_field(ui: &mut egui::Ui, text: &mut String, hint: &str) -> egui::tex
         })
         .inner;
     out
+}
+
+/// A [`text_field`] for a secret (a stream key): free text, shown as dots
+/// unless `shown`. As wide as `width`.
+#[allow(clippy::disallowed_methods)] // the free-text box itself
+pub fn secret_field(ui: &mut egui::Ui, id: egui::Id, text: &mut String, hint: &str, shown: bool, width: f32) -> Response {
+    let p = theme::pal(ui);
+    let focused = ui.memory(|m| m.has_focus(id));
+    ui.allocate_ui(vec2(width, CONTROL_H), |ui| {
+        egui::Frame::new()
+            .fill(p.control)
+            .corner_radius(RADIUS)
+            .stroke(Stroke::new(1.5, if focused { p.text2 } else { Color32::TRANSPARENT }))
+            .inner_margin(Margin::symmetric(10, 7))
+            .show(ui, |ui| {
+                egui::TextEdit::singleline(text)
+                    .id(id)
+                    .password(!shown)
+                    .frame(egui::Frame::NONE)
+                    .hint_text(theme::text(hint, 13.0, W::Regular).color(p.text3))
+                    .font(theme::font(13.0, W::Regular))
+                    .text_color(p.text)
+                    .desired_width(f32::INFINITY)
+                    .margin(Margin::ZERO)
+                    .show(ui)
+                    .response
+                    .response
+            })
+            .inner
+    })
+    .inner
 }
 
 // --- Inputs ---
@@ -2826,6 +2863,39 @@ pub fn replay_click(ctx: &egui::Context, raw: &mut egui::RawInput) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A dialog's box is as tall as what's in it, even after a frame in
+    /// which it was taller (it's laid out in the size it had last frame):
+    /// its buttons used to keep it that tall, halfway down it.
+    #[test]
+    fn a_dialog_comes_back_to_its_height() {
+        let ctx = egui::Context::default();
+        apply(&ctx);
+        let height = |tall: bool, frame: u32| {
+            let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1040.0, 700.0))), max_texture_side: Some(8192), time: Some(f64::from(frame)), ..Default::default() };
+            let mut out = ctx.run_ui(raw, |ui| {
+                let ctx = ui.ctx().clone();
+                let _ = dialog(&ctx, "grows_once", 440.0, |ui| {
+                    dialog_title(ui, "A dialog");
+                    dialog_text(ui, "Its words, wrapped to its width.");
+                    if tall {
+                        ui.add_space(400.0);
+                    }
+                    dialog_buttons(ui, |ui| {
+                        let _ = ui.add(button("Yes", true));
+                        let _ = ui.add(button("Cancel", false).ghost());
+                    });
+                });
+            });
+            out.textures_delta.clear();
+            ctx.memory(|m| m.area_rect(egui::Id::new("grows_once"))).map_or(0.0, |r| r.height())
+        };
+        let fits = height(false, 0);
+        assert!(fits > 100.0 && fits < 200.0, "{fits}");
+        assert!(height(true, 1) > 500.0);
+        height(false, 2);
+        assert_eq!(height(false, 3), fits, "back to what's in it");
+    }
 
     /// A volume is read however it's typed: either minus sign, a comma for
     /// the point, with or without "dB"; silence as −∞ or -inf.

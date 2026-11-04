@@ -15,10 +15,10 @@
 use crate::ui_kit::Dismissed as _;
 use egui::{Align2, Color32, FontId, Pos2, Rect, vec2};
 
-use crate::settings::{self, Container, Encoder, OutputResolution, ShortcutAction};
+use crate::settings::{self, Container, Encoder, OutputResolution, ShortcutAction, StreamDestination, StreamService};
 use crate::theme::{self, W, icon};
 use crate::ui_kit::{self, Btn, Choice, ChoiceField, Chosen, Item, Kind, Preset, Row, Seg, ValueField};
-use crate::{App, Page, RecState, reveal_label, shortcuts};
+use crate::{App, Page, reveal_label, shortcuts};
 
 /// Replay lengths offered as one-click choices (seconds).
 pub(crate) const REPLAY_CHOICES: [u32; 8] = [15, 30, 60, 120, 300, 600, 1200, 1800];
@@ -31,6 +31,9 @@ pub(crate) enum Pane {
     #[default]
     Clipping,
     Video,
+    /// Going live: where to, and the stream's picture (where it's here:
+    /// `capture::STREAMING`).
+    Streaming,
     Clips,
     Shortcuts,
     #[cfg(target_os = "macos")]
@@ -40,14 +43,20 @@ pub(crate) enum Pane {
 
 impl Pane {
     #[cfg(target_os = "macos")]
-    pub(crate) const ALL: [Pane; 6] = [Pane::Clipping, Pane::Video, Pane::Clips, Pane::Shortcuts, Pane::Permissions, Pane::App];
+    pub(crate) const ALL: [Pane; 7] = [Pane::Clipping, Pane::Video, Pane::Streaming, Pane::Clips, Pane::Shortcuts, Pane::Permissions, Pane::App];
     #[cfg(not(target_os = "macos"))]
-    pub(crate) const ALL: [Pane; 5] = [Pane::Clipping, Pane::Video, Pane::Clips, Pane::Shortcuts, Pane::App];
+    pub(crate) const ALL: [Pane; 6] = [Pane::Clipping, Pane::Video, Pane::Streaming, Pane::Clips, Pane::Shortcuts, Pane::App];
+
+    /// The panes there are here (Streaming only where it streams).
+    pub(crate) fn here() -> impl Iterator<Item = Pane> {
+        Self::ALL.into_iter().filter(|p| *p != Pane::Streaming || capture::STREAMING)
+    }
 
     pub(crate) fn label(self) -> &'static str {
         match self {
             Pane::Clipping => "Clipping",
             Pane::Video => "Video",
+            Pane::Streaming => "Streaming",
             Pane::Clips => "Clips",
             Pane::Shortcuts => "Shortcuts",
             #[cfg(target_os = "macos")]
@@ -62,6 +71,7 @@ impl Pane {
         match self {
             Pane::Clipping => f::TIMER,
             Pane::Video => f::VIDEO_CAMERA,
+            Pane::Streaming => f::BROADCAST,
             Pane::Clips => f::FOLDER_SIMPLE,
             Pane::Shortcuts => f::KEYBOARD,
             #[cfg(target_os = "macos")]
@@ -76,6 +86,7 @@ impl Pane {
         match self {
             Pane::Clipping => &["Clipping", "Saved sound", "Voice"],
             Pane::Video => &["Video", "Motion", "File", "Capture"],
+            Pane::Streaming => &["Streaming"],
             Pane::Clips => &["Clips", "Screenshots"],
             Pane::Shortcuts => &["Shortcuts"],
             #[cfg(target_os = "macos")]
@@ -106,6 +117,7 @@ fn group_matches(name: &str, f: &Filter) -> bool {
         "Motion" => f.shows(FPS_WORDS) || capture::frame_blending() && f.shows(BLEND_WORDS),
         "File" => f.shows(QUALITY_WORDS) || f.shows(ENCODER_WORDS) || f.shows(FORMAT_WORDS),
         "Capture" => capture::game_hook_available() && f.shows(GAME_CAPTURE_WORDS) || SCREEN_CAPTURE && f.shows(SCREEN_CAPTURE_WORDS),
+        "Streaming" => capture::STREAMING && f.shows(STREAM_WORDS),
         "Clips" => f.shows(&["clips folder", "location", "directory", "folder per game", "name clips after what happened", "game events", "osu", "names", "delete", "trash", "permanently", "output", "titles", "recycle"]),
         "Screenshots" => capture::SCREENSHOTS && f.shows(&["screenshots", "take a screenshot", "shortcut", "hotkey", "format", "png", "jpg", "jpeg", "copy", "clipboard", "paste", "keyboard"]),
         "Saved sound" => f.shows(&["play a sound when a clip is saved", "sound", "volume", "record the sound", "in clip", "add your own"]),
@@ -182,7 +194,7 @@ impl App {
         cui.spacing_mut().item_spacing.y = 2.0;
         let searching = !f.q.is_empty();
         let locked = self.locked_while();
-        for pane in Pane::ALL {
+        for pane in Pane::here() {
             let chosen = !searching && self.settings_pane == pane;
             let found = searching.then(|| pane.groups().iter().any(|g| group_matches(g, f)));
             let lock = if pane == Pane::Video { locked.as_deref() } else { None };
@@ -228,7 +240,7 @@ impl App {
         let searching = !self.settings_query.trim().is_empty();
         let mut picked = None;
         ui_kit::menu_popup(&r, true, 200.0, |ui| {
-            for pane in Pane::ALL {
+            for pane in Pane::here() {
                 if Item::new(pane.label()).check(!searching && self.settings_pane == pane).show(ui).clicked() {
                     picked = Some(pane);
                 }
@@ -250,7 +262,7 @@ impl App {
             ui.vertical(|ui| {
                 ui.set_width(width);
                 if searching {
-                    let found: Vec<&str> = Pane::ALL.iter().flat_map(|p| p.groups().iter().copied()).filter(|g| group_matches(g, f)).collect();
+                    let found: Vec<&str> = Pane::here().flat_map(|p| p.groups().iter().copied()).filter(|g| group_matches(g, f)).collect();
                     // Video's lock by the first of its groups found, as on its pane's heading.
                     let locked_at = found.iter().position(|g| Pane::Video.groups().contains(g));
                     for (i, name) in found.iter().enumerate() {
@@ -288,6 +300,7 @@ impl App {
             "Motion" => self.motion_group(ui, f),
             "File" => self.file_group(ui, f),
             "Capture" => self.capture_group(ui, f),
+            "Streaming" => self.streaming_group(ui, f),
             "Clips" => self.clips_group(ui, f),
             "Screenshots" => self.screenshots_group(ui, f),
             "Saved sound" => self.sound_group(ui, f),
@@ -325,23 +338,21 @@ impl App {
         }
     }
 
-    /// "Locked while clipping" (or recording), while a setting fixed at
-    /// capture start can't change.
+    /// "Locked while clipping" (or recording, or streaming), while a
+    /// setting fixed at capture start can't change.
     fn locked_while(&self) -> Option<String> {
-        match self.rec_state {
-            RecState::Idle => None,
-            RecState::Buffering => Some("Locked while clipping".into()),
-            RecState::Recording => Some("Locked while recording".into()),
-        }
+        (!self.rec_state.idle()).then(|| format!("Locked while {}", self.rec_state.words()))
     }
 
     /// Why a setting fixed at capture start is locked now, if it is.
     fn lock(&self) -> Option<String> {
-        match self.rec_state {
-            RecState::Idle => None,
-            RecState::Buffering => Some("Stop clipping to change this".into()),
-            RecState::Recording => Some("Stop recording to change this".into()),
-        }
+        (!self.rec_state.idle()).then(|| format!("Stop {} to change this", self.rec_state.words()))
+    }
+
+    /// Frame blending's lock: none where it changes while capturing (it's
+    /// taken up at the next frame), else as the rest of Video's.
+    fn blend_lock(&self) -> Option<String> {
+        if capture::BLEND_WHILE_CAPTURING { None } else { self.lock() }
     }
 
     fn clipping_group(&mut self, ui: &mut egui::Ui, f: &Filter) {
@@ -412,10 +423,13 @@ impl App {
     /// made from faster captures than it.
     fn motion_group(&mut self, ui: &mut egui::Ui, f: &Filter) {
         let lock = self.lock();
+        let blend_lock = self.blend_lock();
         let max_blend = capture::max_blend_rate(&self.video_source());
         let blends = settings::blend_choices(self.settings.fps, max_blend);
         let samples = self.settings.blend_samples();
-        let blend_note = if samples > 1 {
+        let blend_note = if samples > 1 && !self.rec_state.idle() && capture::BLEND_WHILE_CAPTURING {
+            format!("Captured at {} fps, blended down to {}. Changes take effect at once", self.settings.fps * samples, self.settings.fps)
+        } else if samples > 1 {
             format!("Captured at {} fps, blended down to {}", self.settings.fps * samples, self.settings.fps)
         } else if blends.is_empty() {
             max_blend.map_or(String::new(), |hz| format!("Your display shows {hz} pictures a second: blending needs {} fps or less", hz / 2))
@@ -430,11 +444,11 @@ impl App {
                 locked_click |= c;
             }
             if capture::frame_blending() && f.shows(BLEND_WORDS) {
-                let (_, c) = l.row(Row::new("Frame blending").tip("Frame blending", "Captures faster than the frame rate and averages the pictures into each frame, for smooth motion like motion blur. On macOS and Linux, up to your display's refresh rate.").note(blend_note.clone()).locked(lock.clone()), |ui| self.blend_field(ui, &blends));
+                let (_, c) = l.row(Row::new("Frame blending").tip("Frame blending", "Captures faster than the frame rate and averages the pictures into each frame, for smooth motion like motion blur. It goes into clips, recordings and the stream alike. On macOS and Linux, up to your display's refresh rate.").note(blend_note.clone()).locked(blend_lock.clone()), |ui| self.blend_field(ui, &blends));
                 locked_click |= c;
                 let on = samples > 1;
                 l.well("blend_well", on, |l| {
-                    let (_, c) = l.row(Row::new("Blend").tip("Blend", BLEND_TIP).kid().locked(lock.clone()), |ui| {
+                    let (_, c) = l.row(Row::new("Blend").tip("Blend", BLEND_TIP).kid().locked(blend_lock.clone()), |ui| {
                         if let Some(s) = blend_shape_field(ui, self.settings.blend_shape) {
                             self.settings.blend_shape = s;
                         }
@@ -520,8 +534,115 @@ impl App {
         self.say_locked(locked_click, lock);
     }
 
+    /// Where Go live streams to: each place with its stream key (dots
+    /// unless shown), on or off, and what it's sent (its own size, frame
+    /// rate and bitrate: Twitch takes less than YouTube), then adding one.
+    /// Locked while live: what the stream was started with stays.
+    fn streaming_group(&mut self, ui: &mut egui::Ui, f: &Filter) {
+        let live = self.rec_state.streaming;
+        let lock = live.then(|| "End the stream to change this".to_owned());
+        let status = if live { self.stream_status.get() } else { Vec::new() };
+        let recorded = self.recorded_size();
+        let rec_fps = self.settings.fps;
+        let rates = capture::stream::stream_rates(rec_fps);
+        let looks = self.settings.blend_samples();
+        let mut remove = None;
+        let mut add = None;
+        let mut locked_click = false;
+        // Two of a service are told apart: "Twitch", "Twitch 2".
+        let names: Vec<String> = {
+            let ds = &self.settings.stream.destinations;
+            ds.iter()
+                .enumerate()
+                .map(|(i, d)| {
+                    let n = ds[..i].iter().filter(|e| e.name() == d.name()).count();
+                    if n == 0 { d.name() } else { format!("{} {}", d.name(), n + 1) }
+                })
+                .collect()
+        };
+        // Going live takes all of the bitrate, for each place at once.
+        let upload: u32 = self.settings.stream.ready().map(|d| d.kbps + 192).sum();
+        let places = self.settings.stream.ready().count();
+        // The stream's destinations, in order: the ready ones went.
+        let mut sent = status.iter();
+        ui_kit::list(ui, "streaming", |l| {
+            if !f.shows(STREAM_WORDS) {
+                return;
+            }
+            if self.settings.stream.destinations.is_empty() {
+                l.row(Row::new("Nowhere to stream to yet").note("Add Twitch, YouTube, Kick or a server of your own, with its stream key. Go live sends to all of them at once."), |_| {});
+            }
+            for (i, d) in self.settings.stream.destinations.iter_mut().enumerate() {
+                let went = (live && d.enabled && d.missing().is_none()).then(|| sent.next()).flatten();
+                let note = match (went, d.missing()) {
+                    (Some(s), _) => crate::shell::link_words(s),
+                    (None, Some(what)) => format!("Add {what}, from {}", d.service.key_from()),
+                    (None, None) if d.enabled => "Goes live with Go live".to_owned(),
+                    (None, None) => "Off: Go live leaves it out".to_owned(),
+                };
+                let warn = went.is_some_and(|s| matches!(s.link, capture::stream::Link::Waiting { .. }));
+                let (_, c) = l.row(Row::new(&names[i]).note(note).warn(warn).locked(lock.clone()), |ui| {
+                    if Btn::icon(Kind::Ghost, icon::TRASH).small().tip("Remove").show(ui).clicked() {
+                        remove = Some(i);
+                    }
+                    ui_kit::switch(ui, &mut d.enabled);
+                    let shown_id = egui::Id::new(("stream_key_shown", i));
+                    let shown = ui.data(|m| m.get_temp::<bool>(shown_id)).unwrap_or(false);
+                    if Btn::icon(Kind::Ghost, if shown { icon::EYE_SLASH } else { icon::EYE }).small().tip(if shown { "Hide the key" } else { "Show the key" }).show(ui).clicked() {
+                        ui.data_mut(|m| m.insert_temp(shown_id, !shown));
+                    }
+                    let width = (ui.available_width() - 8.0).clamp(120.0, 220.0);
+                    ui_kit::secret_field(ui, egui::Id::new(("stream_key", i)), &mut d.key, "Stream key", shown, width);
+                });
+                locked_click |= c;
+                // Where it goes (Kick's and another server's own), and what
+                // it's sent: under it while it's on.
+                l.well(("stream_well", i), d.enabled, |l| {
+                    if d.service.server(false).is_none() {
+                        let hint = if d.service == StreamService::Kick { "rtmps://….live-video.net/app" } else { "rtmp://server/app" };
+                        let (_, c) = l.row(Row::new("Server").kid().locked(lock.clone()), |ui| {
+                            let width = (ui.available_width() - 8.0).clamp(160.0, 300.0);
+                            ui.allocate_ui(vec2(width, ui_kit::CONTROL_H), |ui| ui_kit::text_field(ui, &mut d.server, hint));
+                        });
+                        locked_click |= c;
+                    }
+                    let size = recorded.map(|(w, h)| capture::output_size(w, h, d.quality().short_side));
+                    let res_note = size.map_or(String::new(), |(w, h)| format!("Streams at {w}×{h}"));
+                    let (_, c) = l.row(Row::new("Resolution").kid().note(res_note).locked(lock.clone()), |ui| stream_resolution_field(ui, i, d, recorded));
+                    locked_click |= c;
+                    let fps = capture::stream::stream_rate(rec_fps, d.fps);
+                    let (_, c) = l.row(Row::new("Frame rate").tip("Stream frame rate", STREAM_FPS_TIP).kid().note(stream_fps_note(rec_fps, fps, looks)).locked(lock.clone()), |ui| stream_fps_field(ui, i, d, &rates, rec_fps));
+                    locked_click |= c;
+                    let (note, over) = stream_bitrate_note(d);
+                    let (_, c) = l.row(Row::new("Bitrate").tip("Stream bitrate", STREAM_BITRATE_TIP).kid().note(note).warn(over).locked(lock.clone()), |ui| stream_bitrate_field(ui, i, d));
+                    locked_click |= c;
+                });
+            }
+            let note = (places > 1).then(|| format!("Going live takes about {} Mbps of your upload in all", mbps_words(f64::from(upload) / 1000.0)));
+            let (_, c) = l.row(Row::new("Add a place to stream to").note(note.unwrap_or_default()).locked(lock.clone()), |ui| {
+                let r = Btn::normal("Add").with_icon(icon::PLUS).trail(icon::CARET_DOWN).small().id("add_stream_destination").show(ui);
+                ui_kit::menu_popup(&r, false, 200.0, |ui| {
+                    for s in StreamService::ALL {
+                        if Item::new(s.label()).show(ui).clicked() {
+                            add = Some(s);
+                        }
+                    }
+                });
+            });
+            locked_click |= c;
+        });
+        if let Some(i) = remove {
+            let gone = self.settings.stream.destinations.remove(i);
+            self.toast_icon(icon::TRASH, format!("Removed {}", gone.name()));
+        }
+        if let Some(s) = add {
+            self.settings.stream.destinations.push(StreamDestination::new(s));
+        }
+        self.say_locked(locked_click, lock);
+    }
+
     /// A locked row's control was clicked: why it's locked, in a toast.
-    fn say_locked(&mut self, clicked: bool, why: Option<String>) {
+    pub(crate) fn say_locked(&mut self, clicked: bool, why: Option<String>) {
         if clicked && let Some(why) = why {
             self.toast_icon(icon::LOCK_SIMPLE, why);
         }
@@ -838,7 +959,7 @@ impl App {
                 });
             }
             if f.shows(&["discord", "activity", "rich presence"]) {
-                let clipping_a_game = self.rec_state != RecState::Idle && self.clipped_game.is_some();
+                let clipping_a_game = !self.rec_state.idle() && self.clipped_game.is_some();
                 let note = match (self.settings.discord_presence, clipping_a_game) {
                     (false, _) => "",
                     (true, false) => "Shows while you clip a game",
@@ -865,7 +986,7 @@ impl App {
             Status::Ready(v) => format!("Version {v} is ready and installs when you quit HasteClip."),
             Status::Failed(e) => e.clone(),
         };
-        let idle = self.rec_state == RecState::Idle;
+        let idle = self.rec_state.idle();
         ui_kit::list(ui, "about", |l| {
             if f.shows(&["update", "version", "what's new"]) {
                 let title = format!("HasteClip {}", self.updater.version());
@@ -875,8 +996,12 @@ impl App {
                     }
                     match status {
                         Status::Ready(_) => {
-                            let recording = self.rec_state == RecState::Recording;
-                            if Btn::normal("Restart now").small().tip("Restart into the new version").locked(recording.then(|| "Finish your recording first".to_owned())).show(ui).clicked() && self.updater.install_on_exit(true) {
+                            let busy = if self.rec_state.streaming {
+                                Some("End your stream first".to_owned())
+                            } else {
+                                self.rec_state.recording.then(|| "Finish your recording first".to_owned())
+                            };
+                            if Btn::normal("Restart now").small().tip("Restart into the new version").locked(busy).show(ui).clicked() && self.updater.install_on_exit(true) {
                                 self.quit(ui.ctx());
                             }
                         }
@@ -900,7 +1025,7 @@ impl App {
                 });
             }
             if f.shows(&["reset", "defaults"]) {
-                l.row(Row::new("Reset all settings").note("Your clips, folders and sources are kept."), |ui| {
+                l.row(Row::new("Reset all settings").note("Your clips, folders, sources and stream keys are kept."), |ui| {
                     let b = Btn::new(Kind::DangerText, "Reset…").small().tip("Back to the defaults").locked((!idle).then(|| "Stop capturing first".to_owned()));
                     if b.show(ui).clicked() {
                         self.confirm_reset = true;
@@ -1126,7 +1251,7 @@ impl App {
 
     /// The size recordings come out at with the chosen resolution, when the
     /// display is known.
-    fn recorded_size(&self) -> Option<(u32, u32)> {
+    pub(crate) fn recorded_size(&self) -> Option<(u32, u32)> {
         capture::frame_size(&self.video_source(), self.settings.video_size())
     }
 
@@ -1222,7 +1347,7 @@ impl App {
         }
         let modal = ui_kit::dialog(ctx, "reset_settings", 400.0, |ui| {
             ui_kit::dialog_title(ui, "Reset all settings?");
-            ui_kit::dialog_text(ui, "Clipping, video, saving and shortcuts go back to their defaults. Your clips, folders and sources are kept.");
+            ui_kit::dialog_text(ui, "Clipping, video, saving and shortcuts go back to their defaults. Your clips, folders, sources and where you stream to are kept.");
             ui_kit::dialog_buttons(ui, |ui| {
                 if ui.add(ui_kit::danger_button("Reset")).clicked() {
                     let mut fresh = settings::RecordSettings::default();
@@ -1238,6 +1363,7 @@ impl App {
                     fresh.limiter = self.settings.limiter;
                     fresh.save_sound.custom = std::mem::take(&mut self.settings.save_sound.custom);
                     fresh.library_sort = self.settings.library_sort;
+                    fresh.stream.destinations = std::mem::take(&mut self.settings.stream.destinations);
                     self.settings = fresh;
                     self.confirm_reset = false;
                     ui.ctx().set_theme(self.settings.theme.preference());
@@ -1547,6 +1673,8 @@ const FPS_WORDS: &[&str] = &["frame rate", "fps"];
 const QUALITY_WORDS: &[&str] = &["quality", "bitrate", "mbps"];
 /// What finds Frame blending in the search.
 const BLEND_WORDS: &[&str] = &["frame blending", "motion blur"];
+/// What finds where to stream, and what each place is sent, in the search.
+const STREAM_WORDS: &[&str] = &["streaming", "go live", "live", "twitch", "youtube", "kick", "stream key", "rtmp", "rtmps", "server", "multistream", "restream", "broadcast", "stream quality", "stream resolution", "stream frame rate", "stream bitrate", "kbps"];
 /// What finds Encoder in the search.
 const ENCODER_WORDS: &[&str] = &["encoder", "hardware", "software", "gpu"];
 /// What finds File format in the search.
@@ -1638,6 +1766,88 @@ fn blend_shape_field(ui: &mut egui::Ui, now: settings::BlendShape) -> Option<set
 const SAME_AS_SCREEN: &str = "Same as screen";
 
 /// "48 MB", "1.2 GB".
+/// The stream's frame rate, explained.
+const STREAM_FPS_TIP: &str = "The stream's frames are your recording's own frames (or, with frame blending, the blend of all of them in each), so only rates your frame rate divides into evenly are offered: anything else would show some frames longer than others, and motion would stutter. Change the frame rate in Video to have others.";
+/// The stream's bitrate, explained.
+const STREAM_BITRATE_TIP: &str = "How much the stream sends each second, all the time. More looks better in fast motion, but your upload has to keep up with all of it, for every place at once, with room to spare. It doesn't change the stream's size or frame rate.";
+
+/// A place's picture size: as clips are, or a height of its own.
+fn stream_resolution_field(ui: &mut egui::Ui, i: usize, d: &mut StreamDestination, recorded: Option<(u32, u32)>) {
+    const HEIGHTS: [u32; 5] = [1440, 1080, 900, 720, 480];
+    let mut choices = vec![Choice::new("As clips are").note(recorded.map_or(String::new(), |(w, h)| format!("{w}×{h}")))];
+    choices.extend(HEIGHTS.iter().map(|h| Choice::new(format!("{h}p"))));
+    let now = if d.height == 0 { Some(0) } else { HEIGHTS.iter().position(|h| *h == d.height).map(|i| i + 1) };
+    let number = if d.height == 0 { recorded.map_or(1080, |(w, h)| w.min(h)) } else { d.height };
+    let id = format!("stream_resolution_{i}");
+    let field = ChoiceField { id: &id, choices, custom: Some(ui_kit::Custom { unit: "p", range: 144..=2160, note: "any height" }), width: 150.0 };
+    match field.show(ui, now, number) {
+        Some(Chosen::Choice(0)) => d.height = 0,
+        Some(Chosen::Choice(k)) => d.height = HEIGHTS[k - 1],
+        Some(Chosen::Number(h)) => d.height = h & !1,
+        None => {}
+    }
+}
+
+/// A place's frame rate: only the rates the recording's divides into
+/// evenly (`capture::stream::stream_rates`), so each stream frame is one of
+/// its frames (or their blend) and motion stays even.
+fn stream_fps_field(ui: &mut egui::Ui, i: usize, d: &mut StreamDestination, rates: &[u32], rec_fps: u32) {
+    let now = capture::stream::stream_rate(rec_fps, d.fps);
+    let choices = rates.iter().map(|r| Choice::new(format!("{r} fps"))).collect();
+    let id = format!("stream_fps_{i}");
+    let field = ChoiceField { id: &id, choices, custom: None, width: 110.0 };
+    if let Some(Chosen::Choice(k)) = field.show(ui, rates.iter().position(|r| *r == now), now) {
+        d.fps = rates[k];
+    }
+}
+
+/// What a place's frame rate is, in a few words: what it's made of.
+fn stream_fps_note(rec_fps: u32, fps: u32, looks: u32) -> String {
+    let every = rec_fps / fps.max(1);
+    match (every > 1, looks > 1) {
+        (false, true) => format!("Blended from {} fps, as your clips are", rec_fps * looks),
+        (false, false) => "As your clips are".to_owned(),
+        (true, true) => format!("Each frame blends {every} of your {rec_fps} fps"),
+        (true, false) => format!("Each frame one in {every} of your {rec_fps} fps"),
+    }
+}
+
+/// A place's bitrate: typed, or one of the usual ones.
+fn stream_bitrate_field(ui: &mut egui::Ui, i: usize, d: &mut StreamDestination) {
+    let field = ValueField {
+        id: egui::Id::new(("vf_stream_kbps", i)),
+        value: f64::from(d.kbps),
+        decimals: 0,
+        range: 500.0..=51_000.0,
+        unit: "kbps",
+        width: 124.0,
+        hint: "Any bitrate from 500 to 51,000 kbps",
+        presets: [3000, 4500, 6000, 8000, 12_000, 20_000].into_iter().map(|k| Preset::new(format!("{k} kbps"), f64::from(k))).collect(),
+    };
+    if let Some(v) = field.show(ui) {
+        d.kbps = v as u32;
+    }
+}
+
+/// What a place's bitrate takes of your upload (all of it, the whole
+/// time, with its sound), and whether it's more than its service takes.
+fn stream_bitrate_note(d: &StreamDestination) -> (String, bool) {
+    let most = match d.service {
+        StreamService::Twitch => Some(6000),
+        StreamService::Kick => Some(8000),
+        StreamService::YouTube | StreamService::Custom => None,
+    };
+    match most.filter(|m| d.kbps > *m) {
+        Some(m) => (format!("{} takes up to {} kbps from most channels: more may not get through", d.service.label(), m), true),
+        None => (format!("Takes about {} Mbps of your upload", mbps_words(f64::from(d.kbps + 192) / 1000.0)), false),
+    }
+}
+
+/// Megabits a second, as said: "6.2", "18".
+fn mbps_words(v: f64) -> String {
+    if v < 10.0 { format!("{v:.1}") } else { format!("{v:.0}") }
+}
+
 fn human_bytes(b: f64) -> String {
     const MB: f64 = 1024.0 * 1024.0;
     const GB: f64 = MB * 1024.0;

@@ -37,6 +37,9 @@ mod shutter;
 pub mod export;
 mod steady;
 pub mod stores;
+pub mod stream;
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+mod outputs;
 
 #[cfg(target_os = "macos")]
 pub mod mac;
@@ -102,11 +105,11 @@ impl Recorder for Unsupported {
     fn save_clip(&mut self, _: &Path) -> anyhow::Result<PendingClip> {
         anyhow::bail!("recording isn't available on this platform yet")
     }
-    fn stop(&mut self, _: Option<&Path>) -> anyhow::Result<Option<PathBuf>> {
+    fn stop(&mut self, _: Mode, _: Option<&Path>) -> anyhow::Result<Option<PathBuf>> {
         Ok(None)
     }
-    fn is_running(&self) -> bool {
-        false
+    fn running(&self) -> Running {
+        Running::default()
     }
 }
 
@@ -961,14 +964,59 @@ pub fn request_screen_permission() {
     }
 }
 
-/// How the recorder is running.
+/// What a capture does with what it captures. Any of them can run at once,
+/// from the same pictures and sound ([`Running`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
-    /// Continuously buffer the last N seconds; `save_clip` flushes it to a file.
+    /// Clipping: keep the last N seconds; `save_clip` saves them as a clip.
     ReplayBuffer,
     /// Record straight to disk until stopped.
     Record,
+    /// Send it live to the stream's destinations ([`EncodeSettings::stream`]).
+    Stream,
 }
+
+/// Which of the [`Mode`]s a capture is doing now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Running {
+    pub replay: bool,
+    pub record: bool,
+    pub stream: bool,
+}
+
+impl Running {
+    /// Something runs.
+    pub fn any(self) -> bool {
+        self.replay || self.record || self.stream
+    }
+
+    pub fn has(self, mode: Mode) -> bool {
+        match mode {
+            Mode::ReplayBuffer => self.replay,
+            Mode::Record => self.record,
+            Mode::Stream => self.stream,
+        }
+    }
+
+    /// The same, `mode` on or off.
+    pub fn with(mut self, mode: Mode, on: bool) -> Self {
+        match mode {
+            Mode::ReplayBuffer => self.replay = on,
+            Mode::Record => self.record = on,
+            Mode::Stream => self.stream = on,
+        }
+        self
+    }
+}
+
+/// Whether going live is here ([`Mode::Stream`]): the stream's own encoder
+/// is on Windows so far.
+pub const STREAMING: bool = cfg!(target_os = "windows");
+
+/// Whether frame blending can be changed while capturing
+/// ([`Recorder::set_blend`]): on Windows so far; elsewhere it's set when
+/// the capture starts.
+pub const BLEND_WHILE_CAPTURING: bool = cfg!(target_os = "windows");
 
 /// A capture device (screen, app, or audio device) as seen by the backend.
 #[derive(Debug, Clone)]
@@ -1310,6 +1358,8 @@ pub struct EncodeSettings {
     /// `in_mix` (so the file sounds right in any player); each source with
     /// `own_track` follows on its own track, for rebalancing later.
     pub sources: Vec<sources::AudioSource>,
+    /// Where to stream, and how: for [`Mode::Stream`].
+    pub stream: Option<stream::StreamSettings>,
 }
 
 /// A replay clip being saved: what it shows is settled, the file is still
@@ -1352,22 +1402,44 @@ impl PendingShot {
 /// A capture backend. Implemented by `SckRecorder` (macOS), `WinRecorder`
 /// (Windows) and `LinuxRecorder` (Linux).
 pub trait Recorder {
-    /// Begin capturing in the given mode with the given settings.
+    /// Begin `mode`. When nothing runs, the capture starts with `settings`;
+    /// while it runs, `mode` joins it, from the same pictures and sound, and
+    /// what it was started with stays (only what's the mode's own is taken
+    /// from `settings`: the clip length, the stream).
     fn start(&mut self, mode: Mode, settings: &EncodeSettings) -> anyhow::Result<()>;
 
-    /// In `ReplayBuffer` mode, save the buffered window as a clip in `dir` (a
+    /// While clipping, save the buffered window as a clip in `dir` (a
     /// game's folder in the library, say). Its moment is taken right away; the
     /// returned [`PendingClip`] finishes writing it, which can take a while — so
     /// another can be saved meanwhile.
     fn save_clip(&mut self, dir: &Path) -> anyhow::Result<PendingClip>;
 
-    /// Stop capturing. In `Record` mode, returns the finished file, moved into
-    /// `dir` if given (it's written in the output folder: which game it was is
-    /// only known at the end).
-    fn stop(&mut self, dir: Option<&Path>) -> anyhow::Result<Option<PathBuf>>;
+    /// Stop `mode`; the capture stops with the last one. Stopping `Record`
+    /// returns the finished file, moved into `dir` if given (it's written in
+    /// the output folder: which game it was is only known at the end).
+    fn stop(&mut self, mode: Mode, dir: Option<&Path>) -> anyhow::Result<Option<PathBuf>>;
+
+    /// Stop everything (quitting): a recording is finished where it's written.
+    fn stop_all(&mut self) {
+        for mode in [Mode::Stream, Mode::ReplayBuffer, Mode::Record] {
+            let _ = self.stop(mode, None);
+        }
+    }
+
+    /// What the capture is doing now.
+    fn running(&self) -> Running;
 
     /// Whether a capture is currently running.
-    fn is_running(&self) -> bool;
+    fn is_running(&self) -> bool {
+        self.running().any()
+    }
+
+    /// Change frame blending while capturing: `looks` at the screen a frame
+    /// (one: none), weighed by `shape`. Whether it was applied (see
+    /// [`BLEND_WHILE_CAPTURING`]); otherwise it's taken at the next start.
+    fn set_blend(&mut self, _looks: u32, _shape: BlendShape) -> bool {
+        false
+    }
 
     /// Change what the running capture records, without restarting it, if the
     /// change allows (a different list of games and apps). Returns whether it

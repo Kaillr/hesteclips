@@ -29,7 +29,7 @@ pub enum BlendShape {
 }
 
 /// Where the looks go, for `looks` a frame.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Shutter {
     looks: i64,
     soft: bool,

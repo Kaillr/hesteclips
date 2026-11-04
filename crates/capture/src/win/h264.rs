@@ -63,6 +63,10 @@ pub(crate) struct Setup {
     /// (x264 does better on the CPU), keyframes seconds apart and the
     /// bitrate free to follow the picture, as x264's.
     pub export: bool,
+    /// For a stream (`crate::stream`): a constant bitrate and a keyframe
+    /// every two seconds, as the services ask, and its frames handed over
+    /// as the stream's own, this one of its pictures (its rendition).
+    pub stream: Option<usize>,
 }
 
 /// The encoder thread.
@@ -78,7 +82,7 @@ pub(crate) struct Encoder {
 
 impl Encoder {
     pub(crate) fn start(gpu: &Gpu, width: u32, height: u32, s: &EncodeSettings, out: Sender<Command>) -> Result<Self> {
-        Self::start_with(gpu, width, height, Setup { fps: s.fps, kbps: s.video_bitrate_kbps, hardware: s.use_hardware, export: false }, out)
+        Self::start_with(gpu, width, height, Setup { fps: s.fps, kbps: s.video_bitrate_kbps, hardware: s.use_hardware, export: false, stream: None }, out)
     }
 
     pub(crate) fn start_with(gpu: &Gpu, width: u32, height: u32, setup: Setup, out: Sender<Command>) -> Result<Self> {
@@ -108,7 +112,7 @@ impl Encoder {
             };
             let _ = ready_tx.send(Ok(name));
             let last_out = setup.export.then_some(None);
-            let mut run = Run { gpu: gpu2, pool: pool2, fps: setup.fps, out, config: None, width, height, staging: None, last_out };
+            let mut run = Run { gpu: gpu2, pool: pool2, fps: setup.fps, out, config: None, width, height, staging: None, last_out, stream: setup.stream };
             if let Err(e) = run.run(mft, rx) {
                 eprintln!("video encoder stopped: {e:#}");
                 failed2.store(true, Ordering::Relaxed);
@@ -292,14 +296,24 @@ fn configure(mft: &IMFTransform, width: u32, height: u32, s: &Setup) -> Result<(
     // A recording: keyframes often (a clip starts on one), the bitrate held
     // near its mean. An export, a file to watch: keyframes every few
     // seconds and peaks of three times the bitrate, as Linux's NVENC export.
-    let (gop, peak) = if s.export { ((s.fps * 4).min(600), bitrate.saturating_mul(3)) } else { (crate::keyframe_every(s.fps), bitrate.saturating_mul(3) / 2) };
+    // A stream: a keyframe every two seconds, the bitrate held to it.
+    let (gop, peak) = if s.export {
+        ((s.fps * 4).min(600), bitrate.saturating_mul(3))
+    } else if s.stream.is_some() {
+        (s.fps * 2, bitrate)
+    } else {
+        (crate::keyframe_every(s.fps), bitrate.saturating_mul(3) / 2)
+    };
     unsafe {
         if let Ok(api) = mft.cast::<ICodecAPI>() {
             // Each is best effort: encoders support different subsets.
             let set = |key: &windows::core::GUID, v: VARIANT| {
                 let _ = api.SetValue(key, &v);
             };
-            if api.SetValue(&CODECAPI_AVEncCommonRateControlMode, &variant_u32(eAVEncCommonRateControlMode_PeakConstrainedVBR.0 as u32)).is_err() {
+            // A stream's bitrate is constant: what the services ask for, and
+            // what a connection can be counted on to carry.
+            let rate = if s.stream.is_some() { eAVEncCommonRateControlMode_CBR } else { eAVEncCommonRateControlMode_PeakConstrainedVBR };
+            if api.SetValue(&CODECAPI_AVEncCommonRateControlMode, &variant_u32(rate.0 as u32)).is_err() {
                 set(&CODECAPI_AVEncCommonRateControlMode, variant_u32(eAVEncCommonRateControlMode_UnconstrainedVBR.0 as u32));
             }
             set(&CODECAPI_AVEncCommonMeanBitRate, variant_u32(bitrate));
@@ -310,6 +324,9 @@ fn configure(mft: &IMFTransform, width: u32, height: u32, s: &Setup) -> Result<(
                 // (quality against speed 100) made a 1080p export no better
                 // (+0.007 dB SSIM) at 1.7 times the time.
                 set(&CODECAPI_AVEncCommonBufferSize, variant_u32(bitrate.saturating_mul(6)));
+            } else if s.stream.is_some() {
+                // A second's worth: no burst the connection can't carry.
+                set(&CODECAPI_AVEncCommonBufferSize, variant_u32(bitrate));
             }
             set(&CODECAPI_AVEncMPVGOPSize, variant_u32(gop));
             set(&CODECAPI_AVEncMPVDefaultBPictureCount, variant_u32(0));
@@ -388,6 +405,9 @@ struct Run {
     /// An export's last frame out: frames must come out in order (see
     /// `process_output`).
     last_out: Option<Option<i64>>,
+    /// A stream's encoder: its frames are the stream's own (this one of
+    /// its pictures).
+    stream: Option<usize>,
 }
 
 impl Run {
@@ -592,10 +612,11 @@ impl Run {
             }
             let key = frame.idr || clean;
             let config = if key { self.config.clone() } else { None };
-            let media = Media::Video {
-                frame: VideoFrame(Arc::new(EncodedFrame { data: Arc::from(frame.data), config })),
-                pts: n as f64 / self.fps as f64,
-                key,
+            let pts = n as f64 / self.fps as f64;
+            let media = if let Some(rendition) = self.stream {
+                Media::Stream(crate::stream::StreamFrame { rendition, data: Arc::from(frame.data), avcc: config.map(|c| Arc::from(c.record())), pts, key })
+            } else {
+                Media::Video { frame: VideoFrame(Arc::new(EncodedFrame { data: Arc::from(frame.data), config })), pts, key }
             };
             if self.out.send(Command::Media(media)).is_err() {
                 bail!("the file writer stopped");

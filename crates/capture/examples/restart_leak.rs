@@ -24,6 +24,7 @@ fn main() -> anyhow::Result<()> {
         webcam: None,
         screen: std::sync::Arc::new(std::sync::Mutex::new(capture::ScreenPlacement::whole(capture::Framing::Fill))),
         sources: Vec::new(),
+        stream: None,
     };
     crash_report();
     println!("before: {}", memory());
@@ -36,7 +37,7 @@ fn main() -> anyhow::Result<()> {
         if env("SAVE").is_some() {
             println!("  saved: {:?}", rec.save_clip(&out).and_then(|p| p.finish()));
         }
-        rec.stop(None)?;
+        rec.stop(Mode::ReplayBuffer, None)?;
         std::thread::sleep(std::time::Duration::from_millis(500));
         println!("round {round}: while recording {running}; after stop {}", memory());
     }

@@ -275,7 +275,7 @@ impl App {
         let mut move_up = None;
         let n = self.settings.audio_sources.len();
         let has_app_sources = self.settings.audio_sources.iter().any(|s| matches!(s.kind, SourceKind::App { .. }));
-        let locked = (self.rec_state != crate::RecState::Idle).then(|| self.stop_first());
+        let locked = (!self.rec_state.idle()).then(|| self.stop_first());
         for i in 0..n {
             let channel = self.live_audio.channel(&self.settings.audio_sources[i].id);
             let id = self.settings.audio_sources[i].id.clone();
@@ -284,12 +284,12 @@ impl App {
             meters.input.update(channel.input.take(), now, dt);
             meters.output.update(channel.meter.take(), now, dt);
             let listening = self.listening.as_ref().filter(|l| l.source == id_for_listen).map(|l| l.monitor.latency_ms());
-            let action = source_card(ui, &mut self.settings.audio_sources[i], &channel, meters, &self.audio, has_app_sources, &mut self.sources_view.renaming, listening, locked, i == 0, &mut self.app_icons);
+            let action = source_card(ui, &mut self.settings.audio_sources[i], &channel, meters, &self.audio, has_app_sources, &mut self.sources_view.renaming, listening, locked.as_deref(), i == 0, &mut self.app_icons);
             match action {
                 CardAction::Remove => remove = Some(i),
                 CardAction::MoveUp if i > 0 => move_up = Some(i),
                 CardAction::Listen => self.toggle_listening(i),
-                CardAction::Locked => self.toast_icon(egui_phosphor::regular::LOCK_SIMPLE, locked.unwrap_or_default().trim_end_matches('.')),
+                CardAction::Locked => self.toast_icon(egui_phosphor::regular::LOCK_SIMPLE, locked.as_deref().unwrap_or_default().trim_end_matches('.').to_owned()),
                 _ => {}
             }
             // Volume applies live, even mid-recording.
@@ -310,12 +310,11 @@ impl App {
         self.keep_listening();
         self.add_source_buttons(ui);
 
-        let capturing = self.rec_state != crate::RecState::Idle;
-        let recording = self.rec_state == crate::RecState::Recording;
+        let capturing = !self.rec_state.idle();
         crate::ui_kit::reveal(ui, "sources_locked", capturing, |ui| {
             ui.add_space(12.0);
             let mic = if cfg!(target_os = "linux") { ", noise removal" } else { ", noise removal and which microphone" };
-            let stop = if recording { "Stop recording" } else { "Stop clipping" };
+            let stop = format!("Stop {}", self.rec_state.words());
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 ui.label(crate::theme::ic(egui_phosphor::regular::LOCK_SIMPLE, 12.0).color(pal.text3));
@@ -372,8 +371,9 @@ impl App {
         use crate::ui_kit::{Btn, Item};
         use egui_phosphor::regular as icon;
         // Which sources are recorded is set when capture starts.
-        let idle = self.rec_state == crate::RecState::Idle;
+        let idle = self.rec_state.idle();
         let stop_first = self.stop_first();
+        let stop_first = stop_first.as_str();
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
             let mic = Btn::normal("Microphone").with_icon(icon::PLUS).small().tip(if idle { "Add a microphone or audio interface" } else { stop_first }).show(ui);
@@ -431,11 +431,8 @@ impl App {
     }
 
     /// Why something that's set when capture starts is locked now.
-    pub(crate) fn stop_first(&self) -> &'static str {
-        match self.rec_state {
-            crate::RecState::Recording => "Stop recording to change this.",
-            _ => "Stop clipping to change this.",
-        }
+    pub(crate) fn stop_first(&self) -> String {
+        format!("Stop {} to change this.", if self.rec_state.idle() { "clipping".to_owned() } else { self.rec_state.words() })
     }
 
     /// The video's sources, one card each, the one in front first: a card's
@@ -698,7 +695,7 @@ impl App {
     /// or your games and apps), which display and how much of it, and where
     /// it sits.
     fn screen_rows(&mut self, ui: &mut egui::Ui, frame: Option<&capture::preview::PreviewFrame>) {
-        let idle = self.rec_state == crate::RecState::Idle;
+        let idle = self.rec_state.idle();
         let pal = crate::theme::pal(ui);
         let apps_mode = matches!(self.settings.capture, CaptureTarget::Apps { .. });
         let row = |ui: &mut egui::Ui, add: &mut dyn FnMut(&mut egui::Ui)| {
@@ -766,7 +763,8 @@ impl App {
                     None => Vec::new(),
                 };
                 let waits = |i: usize| recording.is_some_and(|now| sized.get(i).copied().flatten().is_some_and(|size| size != now));
-                let stop = if self.rec_state == crate::RecState::Recording { "Stop recording" } else { "Stop clipping" };
+                let stop = format!("Stop {}", self.rec_state.words());
+                let stop = stop.as_str();
                 row(ui, &mut |ui| {
                     ui.label(crate::theme::text("Display", 13.5, crate::theme::W::Regular).color(pal.text));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -805,7 +803,7 @@ impl App {
     fn size_button(&mut self, ui: &mut egui::Ui, text: &str) {
         use crate::theme::{self, W};
         let pal = theme::pal(ui);
-        let locked = self.rec_state != crate::RecState::Idle;
+        let locked = !self.rec_state.idle();
         let galley = ui.painter().layout_no_wrap(text.to_owned(), theme::font(12.5, W::Regular), pal.text3);
         let (rect, resp) = ui.allocate_exact_size(egui::vec2(galley.size().x + 30.0, 24.0), Sense::click());
         crate::demo::mark(ui.ctx(), || "button:Video size".into(), rect);
@@ -823,7 +821,7 @@ impl App {
         } else {
             crate::ui_kit::chevron(ui.painter(), mark, 3.5, theme::value(ui.ctx(), resp.id.with("turn"), if open { 1.0 } else { 0.0 }, theme::NORMAL), ink);
         }
-        let tip = if locked { "Locked while clipping: the video's size is set when clipping starts" } else { "The video's size: what your clips are" };
+        let tip = if locked { format!("Locked while {}: the video's size is set when the capture starts", self.rec_state.words()) } else { "The video's size: what your clips are".to_owned() };
         let resp = resp.on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand);
         egui::Popup::from_toggle_button_response(&resp)
             .id(id)
@@ -1021,7 +1019,7 @@ impl App {
         let (tw, th) = crate::canvas_ui::Turned::of(&self.settings.screen).size((w, h));
         let matched = capture::output_size(tw, th, None);
         let filling = self.settings.screen.placed.is_none() && (w, h) != (sw & !1, sh & !1);
-        let size_lock = (self.rec_state != crate::RecState::Idle).then(|| "Stop clipping to change your video's size: it's set when clipping starts".to_owned());
+        let size_lock = (!self.rec_state.idle()).then(|| format!("Stop {} to change your video's size: it's set when the capture starts", self.rec_state.words()));
         let mut match_crop = false;
         // The least kept each way.
         let least = 64u32;
@@ -1323,7 +1321,7 @@ impl App {
         use egui_phosphor::regular as icon;
         let pal = theme::pal(ui);
         let showing = frame.filter(|f| !f.waiting).and_then(|f| f.app.clone());
-        let capturing = self.rec_state != crate::RecState::Idle;
+        let capturing = !self.rec_state.idle();
         let mut list = apps.clone();
         let mut away = away_screen;
         let mut remove = None;
@@ -1515,7 +1513,7 @@ impl App {
         }
         // While clipping, the capture shows what it records; the crop's page
         // has one of its own, of all of the screen (shown over it till it closes).
-        let want = capture::preview::AVAILABLE && self.wants_sources_capture() && (self.rec_state == crate::RecState::Idle || self.sources_view.crop_open);
+        let want = capture::preview::AVAILABLE && self.wants_sources_capture() && (self.rec_state.idle() || self.sources_view.crop_open);
         if !want {
             self.video_preview = None;
             return;
@@ -1560,7 +1558,7 @@ impl App {
     }
 
     pub(crate) fn ensure_level_monitor(&mut self) {
-        let want = self.wants_sources_capture() && self.rec_state == crate::RecState::Idle;
+        let want = self.wants_sources_capture() && self.rec_state.idle();
         if !want {
             self.level_monitor = None;
             return;

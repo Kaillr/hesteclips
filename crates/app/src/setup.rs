@@ -77,7 +77,7 @@ impl App {
             self.setup_open = false;
             self.settings.setup_shown = SETUP_ROUND;
             // Clipping starts as it would have at launch, now it can.
-            if self.settings.auto_start_buffer && self.rec_state == crate::RecState::Idle && capture::screen_permission() != capture::Permission::Denied {
+            if self.settings.auto_start_buffer && !self.rec_state.clipping && capture::screen_permission() != capture::Permission::Denied {
                 self.start_replay_buffer();
             }
         }

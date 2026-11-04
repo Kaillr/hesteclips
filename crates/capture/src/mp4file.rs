@@ -70,6 +70,8 @@ impl FileWriter {
                 }
                 mux.audio(*track, Arc::from(packet.data.as_slice()), frame)
             }
+            // The stream's own pictures never go in a file.
+            Media::Stream(_) => Ok(()),
         }
     }
 
