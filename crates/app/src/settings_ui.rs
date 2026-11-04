@@ -86,7 +86,7 @@ impl Pane {
         match self {
             Pane::Clipping => &["Clipping", "Saved sound", "Voice"],
             Pane::Video => &["Video", "Motion", "File", "Capture"],
-            Pane::Streaming => &["Streaming", "Stream video"],
+            Pane::Streaming => &["Streaming"],
             Pane::Clips => &["Clips", "Screenshots"],
             Pane::Shortcuts => &["Shortcuts"],
             #[cfg(target_os = "macos")]
@@ -118,7 +118,6 @@ fn group_matches(name: &str, f: &Filter) -> bool {
         "File" => f.shows(QUALITY_WORDS) || f.shows(ENCODER_WORDS) || f.shows(FORMAT_WORDS),
         "Capture" => capture::game_hook_available() && f.shows(GAME_CAPTURE_WORDS) || SCREEN_CAPTURE && f.shows(SCREEN_CAPTURE_WORDS),
         "Streaming" => capture::STREAMING && f.shows(STREAM_WORDS),
-        "Stream video" => capture::STREAMING && f.shows(STREAM_VIDEO_WORDS),
         "Clips" => f.shows(&["clips folder", "location", "directory", "folder per game", "name clips after what happened", "game events", "osu", "names", "delete", "trash", "permanently", "output", "titles", "recycle"]),
         "Screenshots" => capture::SCREENSHOTS && f.shows(&["screenshots", "take a screenshot", "shortcut", "hotkey", "format", "png", "jpg", "jpeg", "copy", "clipboard", "paste", "keyboard"]),
         "Saved sound" => f.shows(&["play a sound when a clip is saved", "sound", "volume", "record the sound", "in clip", "add your own"]),
@@ -302,7 +301,6 @@ impl App {
             "File" => self.file_group(ui, f),
             "Capture" => self.capture_group(ui, f),
             "Streaming" => self.streaming_group(ui, f),
-            "Stream video" => self.stream_video_group(ui, f),
             "Clips" => self.clips_group(ui, f),
             "Screenshots" => self.screenshots_group(ui, f),
             "Saved sound" => self.sound_group(ui, f),
@@ -537,23 +535,34 @@ impl App {
     }
 
     /// Where Go live streams to: each place with its stream key (dots
-    /// unless shown), on or off, and adding one. Locked while live: what
-    /// the stream was started with stays.
+    /// unless shown), on or off, and what it's sent (its own size, frame
+    /// rate and bitrate: Twitch takes less than YouTube), then adding one.
+    /// Locked while live: what the stream was started with stays.
     fn streaming_group(&mut self, ui: &mut egui::Ui, f: &Filter) {
         let live = self.rec_state.streaming;
         let lock = live.then(|| "End the stream to change this".to_owned());
         let status = if live { self.stream_status.get() } else { Vec::new() };
+        let recorded = self.recorded_size();
+        let rec_fps = self.settings.fps;
+        let rates = capture::stream::stream_rates(rec_fps);
+        let looks = self.settings.blend_samples();
         let mut remove = None;
         let mut add = None;
         let mut locked_click = false;
         // Two of a service are told apart: "Twitch", "Twitch 2".
         let names: Vec<String> = {
             let ds = &self.settings.stream.destinations;
-            ds.iter().enumerate().map(|(i, d)| {
-                let n = ds[..i].iter().filter(|e| e.name() == d.name()).count();
-                if n == 0 { d.name() } else { format!("{} {}", d.name(), n + 1) }
-            }).collect()
+            ds.iter()
+                .enumerate()
+                .map(|(i, d)| {
+                    let n = ds[..i].iter().filter(|e| e.name() == d.name()).count();
+                    if n == 0 { d.name() } else { format!("{} {}", d.name(), n + 1) }
+                })
+                .collect()
         };
+        // Going live takes all of the bitrate, for each place at once.
+        let upload: u32 = self.settings.stream.ready().map(|d| d.kbps + 192).sum();
+        let places = self.settings.stream.ready().count();
         // The stream's destinations, in order: the ready ones went.
         let mut sent = status.iter();
         ui_kit::list(ui, "streaming", |l| {
@@ -586,16 +595,31 @@ impl App {
                     ui_kit::secret_field(ui, egui::Id::new(("stream_key", i)), &mut d.key, "Stream key", shown, width);
                 });
                 locked_click |= c;
-                if d.service.server(false).is_none() {
-                    let hint = if d.service == StreamService::Kick { "rtmps://….live-video.net/app" } else { "rtmp://server/app" };
-                    let (_, c) = l.row(Row::new("Server").kid().locked(lock.clone()), |ui| {
-                        let width = (ui.available_width() - 8.0).clamp(160.0, 300.0);
-                        ui.allocate_ui(vec2(width, ui_kit::CONTROL_H), |ui| ui_kit::text_field(ui, &mut d.server, hint));
-                    });
+                // Where it goes (Kick's and another server's own), and what
+                // it's sent: under it while it's on.
+                l.well(("stream_well", i), d.enabled, |l| {
+                    if d.service.server(false).is_none() {
+                        let hint = if d.service == StreamService::Kick { "rtmps://….live-video.net/app" } else { "rtmp://server/app" };
+                        let (_, c) = l.row(Row::new("Server").kid().locked(lock.clone()), |ui| {
+                            let width = (ui.available_width() - 8.0).clamp(160.0, 300.0);
+                            ui.allocate_ui(vec2(width, ui_kit::CONTROL_H), |ui| ui_kit::text_field(ui, &mut d.server, hint));
+                        });
+                        locked_click |= c;
+                    }
+                    let size = recorded.map(|(w, h)| capture::output_size(w, h, d.quality().short_side));
+                    let res_note = size.map_or(String::new(), |(w, h)| format!("Streams at {w}×{h}"));
+                    let (_, c) = l.row(Row::new("Resolution").kid().note(res_note).locked(lock.clone()), |ui| stream_resolution_field(ui, i, d, recorded));
                     locked_click |= c;
-                }
+                    let fps = capture::stream::stream_rate(rec_fps, d.fps);
+                    let (_, c) = l.row(Row::new("Frame rate").tip("Stream frame rate", STREAM_FPS_TIP).kid().note(stream_fps_note(rec_fps, fps, looks)).locked(lock.clone()), |ui| stream_fps_field(ui, i, d, &rates, rec_fps));
+                    locked_click |= c;
+                    let (note, over) = stream_bitrate_note(d);
+                    let (_, c) = l.row(Row::new("Bitrate").tip("Stream bitrate", STREAM_BITRATE_TIP).kid().note(note).warn(over).locked(lock.clone()), |ui| stream_bitrate_field(ui, i, d));
+                    locked_click |= c;
+                });
             }
-            let (_, c) = l.row(Row::new("Add a place to stream to").locked(lock.clone()), |ui| {
+            let note = (places > 1).then(|| format!("Going live takes about {} Mbps of your upload in all", mbps_words(f64::from(upload) / 1000.0)));
+            let (_, c) = l.row(Row::new("Add a place to stream to").note(note.unwrap_or_default()).locked(lock.clone()), |ui| {
                 let r = Btn::normal("Add").with_icon(icon::PLUS).trail(icon::CARET_DOWN).small().id("add_stream_destination").show(ui);
                 ui_kit::menu_popup(&r, false, 200.0, |ui| {
                     for s in StreamService::ALL {
@@ -615,78 +639,6 @@ impl App {
             self.settings.stream.destinations.push(StreamDestination::new(s));
         }
         self.say_locked(locked_click, lock);
-    }
-
-    /// The stream's own picture: its size, frame rate and bitrate. Clips and
-    /// recordings keep theirs; frame blending (Video's) goes into it too.
-    fn stream_video_group(&mut self, ui: &mut egui::Ui, f: &Filter) {
-        let lock = self.rec_state.streaming.then(|| "End the stream to change this".to_owned());
-        let size = self.recorded_size().map(|(w, h)| capture::output_size(w, h, self.settings.stream.short_side()));
-        let fps = capture::stream::stream_rate(self.settings.fps, self.settings.stream.fps);
-        let res_note = size.map_or(String::new(), |(w, h)| format!("Streams at {w}×{h}"));
-        let fps_note = if fps == self.settings.stream.fps {
-            String::new()
-        } else {
-            format!("Streams at {fps} fps: each frame one of your {} fps", self.settings.fps)
-        };
-        let samples = self.settings.blend_samples();
-        let blend_note = if samples > 1 { format!("Blended from {} fps, as your clips are", self.settings.fps * samples) } else { String::new() };
-        let fps_note = [fps_note, blend_note].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(". ");
-        let mut locked_click = false;
-        ui_kit::list(ui, "stream_video", |l| {
-            if !f.shows(STREAM_VIDEO_WORDS) {
-                return;
-            }
-            let (_, c) = l.row(Row::new("Resolution").tip("Stream resolution", "The stream's picture size, on its short side. Clips and recordings keep theirs. 1080p is what most viewers watch, and what Twitch takes from everyone.").note(res_note.clone()).locked(lock.clone()), |ui| self.stream_resolution_field(ui));
-            locked_click |= c;
-            let (_, c) = l.row(Row::new("Frame rate").note(fps_note.clone()).locked(lock.clone()), |ui| {
-                let chosen = usize::from(self.settings.stream.fps >= 60);
-                if let Some(i) = ui_kit::segmented_opts(ui, "stream_fps", &[Seg::from("30 fps"), Seg::from("60 fps")], chosen, None, ui.is_enabled()) {
-                    self.settings.stream.fps = if i == 0 { 30 } else { 60 };
-                }
-            });
-            locked_click |= c;
-            let (_, c) = l.row(Row::new("Bitrate").tip("Stream bitrate", "How much the stream sends each second, all the time. More looks better, but your upload has to keep up with all of it: with room to spare, for every place at once. Twitch takes up to 6,000 kbps from most channels.").note(stream_bitrate_note(self.settings.stream.kbps, self.settings.stream.ready().count())).locked(lock.clone()), |ui| self.stream_bitrate_field(ui));
-            locked_click |= c;
-        });
-        self.say_locked(locked_click, lock);
-    }
-
-    /// The stream's size: as clips are, or a height of its own.
-    fn stream_resolution_field(&mut self, ui: &mut egui::Ui) {
-        const HEIGHTS: [u32; 5] = [1440, 1080, 900, 720, 480];
-        let recorded = self.recorded_size();
-        let mut choices = vec![Choice::new("As clips are").note(recorded.map_or(String::new(), |(w, h)| format!("{w}×{h}")))];
-        choices.extend(HEIGHTS.iter().map(|h| Choice::new(format!("{h}p"))));
-        let height = self.settings.stream.height;
-        let now = if height == 0 { Some(0) } else { HEIGHTS.iter().position(|h| *h == height).map(|i| i + 1) };
-        let number = if height == 0 { recorded.map_or(1080, |(w, h)| w.min(h)) } else { height };
-        let field = ChoiceField { id: "stream_resolution", choices, custom: Some(ui_kit::Custom { unit: "p", range: 144..=2160, note: "any height" }), width: 150.0 };
-        match field.show(ui, now, number) {
-            Some(Chosen::Choice(0)) => self.settings.stream.height = 0,
-            Some(Chosen::Choice(i)) => self.settings.stream.height = HEIGHTS[i - 1],
-            Some(Chosen::Number(h)) => self.settings.stream.height = h & !1,
-            None => {}
-        }
-    }
-
-    fn stream_bitrate_field(&mut self, ui: &mut egui::Ui) {
-        let field = ValueField {
-            id: egui::Id::new("vf_stream_kbps"),
-            value: f64::from(self.settings.stream.kbps),
-            decimals: 0,
-            range: 500.0..=51_000.0,
-            unit: "kbps",
-            width: 124.0,
-            hint: "Any bitrate from 500 to 51,000 kbps",
-            presets: [(2500, "720p, 30 fps"), (4500, "720p, 60 fps"), (6000, "1080p, 60 fps"), (8000, ""), (12_000, "YouTube's 1080p, 60 fps")]
-                .into_iter()
-                .map(|(k, note)| Preset::new(format!("{k} kbps"), f64::from(k)).note(note))
-                .collect(),
-        };
-        if let Some(v) = field.show(ui) {
-            self.settings.stream.kbps = v as u32;
-        }
     }
 
     /// A locked row's control was clicked: why it's locked, in a toast.
@@ -1721,10 +1673,8 @@ const FPS_WORDS: &[&str] = &["frame rate", "fps"];
 const QUALITY_WORDS: &[&str] = &["quality", "bitrate", "mbps"];
 /// What finds Frame blending in the search.
 const BLEND_WORDS: &[&str] = &["frame blending", "motion blur"];
-/// What finds where to stream in the search.
-const STREAM_WORDS: &[&str] = &["streaming", "go live", "live", "twitch", "youtube", "kick", "stream key", "rtmp", "rtmps", "server", "multistream", "restream", "broadcast"];
-/// What finds the stream's picture in the search.
-const STREAM_VIDEO_WORDS: &[&str] = &["stream quality", "stream resolution", "stream frame rate", "stream bitrate", "kbps"];
+/// What finds where to stream, and what each place is sent, in the search.
+const STREAM_WORDS: &[&str] = &["streaming", "go live", "live", "twitch", "youtube", "kick", "stream key", "rtmp", "rtmps", "server", "multistream", "restream", "broadcast", "stream quality", "stream resolution", "stream frame rate", "stream bitrate", "kbps"];
 /// What finds Encoder in the search.
 const ENCODER_WORDS: &[&str] = &["encoder", "hardware", "software", "gpu"];
 /// What finds File format in the search.
@@ -1816,15 +1766,86 @@ fn blend_shape_field(ui: &mut egui::Ui, now: settings::BlendShape) -> Option<set
 const SAME_AS_SCREEN: &str = "Same as screen";
 
 /// "48 MB", "1.2 GB".
-/// What the stream's bitrate takes of your upload: all of it, the whole
-/// time, with its sound, for each place streamed to at once.
-fn stream_bitrate_note(kbps: u32, places: usize) -> String {
-    let each = f64::from(kbps + 192) / 1000.0;
-    let mbps = |v: f64| if v < 10.0 { format!("{v:.1}") } else { format!("{v:.0}") };
-    match places {
-        0 | 1 => format!("Takes about {} Mbps of your upload", mbps(each)),
-        n => format!("Takes about {} Mbps of your upload: {} for each of the {n} places", mbps(each * n as f64), mbps(each)),
+/// The stream's frame rate, explained.
+const STREAM_FPS_TIP: &str = "The stream's frames are your recording's own frames (or, with frame blending, the blend of all of them in each), so only rates your frame rate divides into evenly are offered: anything else would show some frames longer than others, and motion would stutter. Change the frame rate in Video to have others.";
+/// The stream's bitrate, explained.
+const STREAM_BITRATE_TIP: &str = "How much the stream sends each second, all the time. More looks better in fast motion, but your upload has to keep up with all of it, for every place at once, with room to spare. It doesn't change the stream's size or frame rate.";
+
+/// A place's picture size: as clips are, or a height of its own.
+fn stream_resolution_field(ui: &mut egui::Ui, i: usize, d: &mut StreamDestination, recorded: Option<(u32, u32)>) {
+    const HEIGHTS: [u32; 5] = [1440, 1080, 900, 720, 480];
+    let mut choices = vec![Choice::new("As clips are").note(recorded.map_or(String::new(), |(w, h)| format!("{w}×{h}")))];
+    choices.extend(HEIGHTS.iter().map(|h| Choice::new(format!("{h}p"))));
+    let now = if d.height == 0 { Some(0) } else { HEIGHTS.iter().position(|h| *h == d.height).map(|i| i + 1) };
+    let number = if d.height == 0 { recorded.map_or(1080, |(w, h)| w.min(h)) } else { d.height };
+    let id = format!("stream_resolution_{i}");
+    let field = ChoiceField { id: &id, choices, custom: Some(ui_kit::Custom { unit: "p", range: 144..=2160, note: "any height" }), width: 150.0 };
+    match field.show(ui, now, number) {
+        Some(Chosen::Choice(0)) => d.height = 0,
+        Some(Chosen::Choice(k)) => d.height = HEIGHTS[k - 1],
+        Some(Chosen::Number(h)) => d.height = h & !1,
+        None => {}
     }
+}
+
+/// A place's frame rate: only the rates the recording's divides into
+/// evenly (`capture::stream::stream_rates`), so each stream frame is one of
+/// its frames (or their blend) and motion stays even.
+fn stream_fps_field(ui: &mut egui::Ui, i: usize, d: &mut StreamDestination, rates: &[u32], rec_fps: u32) {
+    let now = capture::stream::stream_rate(rec_fps, d.fps);
+    let choices = rates.iter().map(|r| Choice::new(format!("{r} fps"))).collect();
+    let id = format!("stream_fps_{i}");
+    let field = ChoiceField { id: &id, choices, custom: None, width: 110.0 };
+    if let Some(Chosen::Choice(k)) = field.show(ui, rates.iter().position(|r| *r == now), now) {
+        d.fps = rates[k];
+    }
+}
+
+/// What a place's frame rate is, in a few words: what it's made of.
+fn stream_fps_note(rec_fps: u32, fps: u32, looks: u32) -> String {
+    let every = rec_fps / fps.max(1);
+    match (every > 1, looks > 1) {
+        (false, true) => format!("Blended from {} fps, as your clips are", rec_fps * looks),
+        (false, false) => "As your clips are".to_owned(),
+        (true, true) => format!("Each frame blends {every} of your {rec_fps} fps"),
+        (true, false) => format!("Each frame one in {every} of your {rec_fps} fps"),
+    }
+}
+
+/// A place's bitrate: typed, or one of the usual ones.
+fn stream_bitrate_field(ui: &mut egui::Ui, i: usize, d: &mut StreamDestination) {
+    let field = ValueField {
+        id: egui::Id::new(("vf_stream_kbps", i)),
+        value: f64::from(d.kbps),
+        decimals: 0,
+        range: 500.0..=51_000.0,
+        unit: "kbps",
+        width: 124.0,
+        hint: "Any bitrate from 500 to 51,000 kbps",
+        presets: [3000, 4500, 6000, 8000, 12_000, 20_000].into_iter().map(|k| Preset::new(format!("{k} kbps"), f64::from(k))).collect(),
+    };
+    if let Some(v) = field.show(ui) {
+        d.kbps = v as u32;
+    }
+}
+
+/// What a place's bitrate takes of your upload (all of it, the whole
+/// time, with its sound), and whether it's more than its service takes.
+fn stream_bitrate_note(d: &StreamDestination) -> (String, bool) {
+    let most = match d.service {
+        StreamService::Twitch => Some(6000),
+        StreamService::Kick => Some(8000),
+        StreamService::YouTube | StreamService::Custom => None,
+    };
+    match most.filter(|m| d.kbps > *m) {
+        Some(m) => (format!("{} takes up to {} kbps from most channels: more may not get through", d.service.label(), m), true),
+        None => (format!("Takes about {} Mbps of your upload", mbps_words(f64::from(d.kbps + 192) / 1000.0)), false),
+    }
+}
+
+/// Megabits a second, as said: "6.2", "18".
+fn mbps_words(v: f64) -> String {
+    if v < 10.0 { format!("{v:.1}") } else { format!("{v:.0}") }
 }
 
 fn human_bytes(b: f64) -> String {

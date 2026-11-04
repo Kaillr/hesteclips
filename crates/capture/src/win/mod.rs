@@ -185,9 +185,9 @@ struct Session {
     size: (u32, u32),
     /// Frame blending changed while it runs, for the pacer to take up.
     blend_ctl: Arc<std::sync::Mutex<Option<(u32, BlendShape)>>>,
-    /// The stream's own pictures, for the pacer to take up: started
-    /// (`Some(Some)`), or stopped (`Some(None)`).
-    stream_ctl: Arc<std::sync::Mutex<Option<Option<StreamOut>>>>,
+    /// The stream's own pictures, for the pacer to take up: one per
+    /// rendition (`stream::renditions`) when it starts, none when it stops.
+    stream_ctl: Arc<std::sync::Mutex<Option<Vec<StreamOut>>>>,
     /// What the stream's pictures are made from.
     stream_from: Option<StreamFrom>,
 }
@@ -203,14 +203,117 @@ struct StreamFrom {
     hardware: bool,
 }
 
-/// The stream's own pictures, in the pacer: every `every`th frame, in the
-/// stream's size, through an encoder of its own.
+/// One of the stream's pictures (a rendition: `stream::renditions`), in the
+/// pacer: a frame for every `every` of the pacer's, in its own size,
+/// through an encoder of its own.
 struct StreamOut {
-    converter: d3d::Converter,
+    /// Made from the pacer's frame as it is: one in every `every`.
+    direct: d3d::Converter,
+    /// At a fraction of the frame rate, with frame blending on: the frames
+    /// in its own time averaged (`StreamBlend`), and converted from that.
+    blended: Option<(StreamBlend, d3d::Converter)>,
     encoder: h264::Encoder,
     every: i64,
-    /// Frames the stream's encoder couldn't take.
+    /// Frames its encoder couldn't take.
     dropped: u64,
+}
+
+impl StreamOut {
+    /// Whether frame `k` is wanted: every one while it blends its own,
+    /// else the ones at its own frames' times.
+    fn wants(&self, k: i64, blending: bool) -> bool {
+        (blending && self.blended.is_some()) || k.rem_euclid(self.every) == 0
+    }
+
+    /// Frame `k` is made (in the pacer's average, `content` of it valid):
+    /// the stream's frame from it, once one's due.
+    fn frame(&mut self, gpu: &d3d::Gpu, k: i64, blending: bool, content: (u32, u32)) {
+        let phase = k.rem_euclid(self.every);
+        if !blending && let Some((b, _)) = &mut self.blended {
+            b.count = 0;
+        }
+        let converter = match self.blended.as_mut().filter(|_| blending) {
+            Some((b, c)) => {
+                b.add(gpu);
+                if phase != self.every - 1 {
+                    return;
+                }
+                b.finish(gpu, content);
+                &*c
+            }
+            None => {
+                if phase != 0 {
+                    return;
+                }
+                &self.direct
+            }
+        };
+        let Some(slot) = self.encoder.pool.take() else {
+            self.dropped += 1;
+            return;
+        };
+        match converter.convert(slot) {
+            Ok(()) => {
+                if !self.encoder.encode(slot, k / self.every) {
+                    self.dropped += 1;
+                }
+            }
+            Err(e) => {
+                self.encoder.pool.give(slot);
+                eprintln_later!("stream: {e:#}");
+            }
+        }
+    }
+}
+
+/// A stream frame made of every frame in its own time (frame blending on,
+/// and the stream at a fraction of the frame rate: 48 fps from 144): their
+/// average, as light, as frames are made of their looks, so its motion is
+/// blurred over all of its time as the recording's is over each frame's.
+/// Taking one frame in three instead blurred a third of it.
+struct StreamBlend {
+    quad: quad::Quad,
+    light: (windows::Win32::Graphics::Direct3D11::ID3D11RenderTargetView, windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView),
+    /// The pacer's frame, read as each is added.
+    from: windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView,
+    /// The stream frame, as its converter reads it.
+    out: Arc<d3d::Latest>,
+    out_target: windows::Win32::Graphics::Direct3D11::ID3D11RenderTargetView,
+    size: (u32, u32),
+    /// Frames in the one being made so far.
+    count: u32,
+}
+
+impl StreamBlend {
+    fn new(gpu: &d3d::Gpu, average: &Arc<d3d::Latest>) -> Result<Self> {
+        use windows::Win32::Graphics::Direct3D11::{D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_USAGE_DEFAULT};
+        let bind = (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32;
+        let size = (average.width, average.height);
+        let light = gpu.texture(size.0, size.1, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT, bind, D3D11_USAGE_DEFAULT, 0)?;
+        let out = d3d::Latest::new(gpu, size.0, size.1)?;
+        Ok(Self {
+            quad: quad::Quad::new(gpu)?,
+            light: (quad::target_view(gpu, &light)?, quad::shader_view(gpu, &light)?),
+            from: quad::shader_view(gpu, &average.texture)?,
+            out_target: quad::target_view(gpu, &out.texture)?,
+            out,
+            size,
+            count: 0,
+        })
+    }
+
+    /// The pacer's frame, added (each the same in the average).
+    fn add(&mut self, gpu: &d3d::Gpu) {
+        self.count += 1;
+        self.quad.average_light(gpu, &self.light.0, self.size, &self.from, 1.0 / self.count as f32);
+    }
+
+    /// The stream frame's done: its average, for the converter.
+    fn finish(&mut self, gpu: &d3d::Gpu, content: (u32, u32)) {
+        self.quad.from_light(gpu, &self.out_target, self.size, &self.light.1);
+        self.out.mark_frame(content);
+        self.count = 0;
+    }
 }
 
 impl Capture for Session {
@@ -220,19 +323,30 @@ impl Capture for Session {
 
     fn stream_video(&mut self, stream: Option<&StreamSettings>) -> Result<()> {
         let Some(st) = stream else {
-            *self.stream_ctl.lock().unwrap() = Some(None);
+            *self.stream_ctl.lock().unwrap() = Some(Vec::new());
             return Ok(());
         };
         let from = self.stream_from.as_ref().context("the capture can't stream")?;
-        let fps = crate::stream::stream_rate(self.fps, st.fps);
-        let every = (self.fps / fps.max(1)).max(1) as i64;
-        let (width, height) = crate::output_size(self.size.0, self.size.1, st.short_side);
-        let setup = h264::Setup { fps, kbps: st.kbps.max(100), hardware: from.hardware, export: false, stream: true };
-        let encoder = h264::Encoder::start_with(&from.gpu, width, height, setup, self.writer_tx.clone())?;
-        let camera = from.camera.as_ref().map(|(latest, placement)| (latest, placement.clone()));
-        let converter = d3d::Converter::new(&from.gpu, &from.average, camera, &encoder.pool.textures, true, width, height, fps, from.screen.clone())?;
-        eprintln!("stream: {} at {width}×{height}, {fps} fps, {} kb/s", encoder.name, st.kbps);
-        *self.stream_ctl.lock().unwrap() = Some(Some(StreamOut { converter, encoder, every, dropped: 0 }));
+        let camera = || from.camera.as_ref().map(|(latest, placement)| (latest, placement.clone()));
+        let (renditions, _) = crate::stream::renditions(st, self.fps);
+        let mut outs = Vec::with_capacity(renditions.len());
+        for (i, r) in renditions.iter().enumerate() {
+            let every = (self.fps / r.fps.max(1)).max(1) as i64;
+            let (width, height) = crate::output_size(self.size.0, self.size.1, r.short_side);
+            let setup = h264::Setup { fps: r.fps, kbps: r.kbps, hardware: from.hardware, export: false, stream: Some(i) };
+            let encoder = h264::Encoder::start_with(&from.gpu, width, height, setup, self.writer_tx.clone())?;
+            let direct = d3d::Converter::new(&from.gpu, &from.average, camera(), &encoder.pool.textures, true, width, height, r.fps, from.screen.clone())?;
+            let blended = if every > 1 {
+                let b = StreamBlend::new(&from.gpu, &from.average)?;
+                let c = d3d::Converter::new(&from.gpu, &b.out, camera(), &encoder.pool.textures, true, width, height, r.fps, from.screen.clone())?;
+                Some((b, c))
+            } else {
+                None
+            };
+            eprintln!("stream: {} at {width}×{height}, {} fps, {} kb/s", encoder.name, r.fps, r.kbps);
+            outs.push(StreamOut { direct, blended, encoder, every, dropped: 0 });
+        }
+        *self.stream_ctl.lock().unwrap() = Some(outs);
         Ok(())
     }
 
@@ -461,9 +575,9 @@ impl Session {
             let _ = handle.join();
         }
         // A stream the pacer stopped before it took it up: finished here
-        // (its encoder would hold the writer open).
+        // (its encoders would hold the writer open).
         let pending = self.stream_ctl.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
-        if let Some(Some(s)) = pending {
+        for s in pending.into_iter().flatten() {
             s.encoder.finish();
         }
         step("frame pacer stopped");
@@ -1607,8 +1721,8 @@ struct BlendPacer {
     encoder: h264::Encoder,
     preview: d3d::Previewer,
     camera: Option<camera::CameraLayer>,
-    /// The stream's own pictures, while it streams.
-    stream: Option<StreamOut>,
+    /// The stream's own pictures, while it streams (one per rendition).
+    stream: Vec<StreamOut>,
     dropped: u64,
     stats: BlendStats,
     diag: EncodeDiag,
@@ -1618,7 +1732,7 @@ struct BlendPacer {
 /// stream's pictures (see `Session::set_blend`, `Session::stream_video`).
 struct PacerCtl {
     blend: Arc<std::sync::Mutex<Option<(u32, BlendShape)>>>,
-    stream: Arc<std::sync::Mutex<Option<Option<StreamOut>>>>,
+    stream: Arc<std::sync::Mutex<Option<Vec<StreamOut>>>>,
 }
 
 /// Where frames wait, logged for every 5 s in which frames were skipped
@@ -1832,17 +1946,22 @@ impl BlendPacer {
     }
 
     /// The stream started or stopped, if the session says so. A stopped
-    /// stream's encoder is finished on a thread of its own (it waits for it).
+    /// stream's encoders are finished on a thread of their own (it waits
+    /// for them).
     fn take_stream(&mut self, ctl: &PacerCtl) {
         let Some(change) = ctl.stream.lock().unwrap().take() else { return };
-        if let Some(old) = std::mem::replace(&mut self.stream, change) {
-            let _ = thread::Builder::new().name("stream-end".into()).spawn(move || {
-                if old.dropped > 0 {
-                    eprintln!("stream: its encoder couldn't take {} frames", old.dropped);
-                }
-                old.encoder.finish();
-            });
+        let old = std::mem::replace(&mut self.stream, change);
+        if old.is_empty() {
+            return;
         }
+        let _ = thread::Builder::new().name("stream-end".into()).spawn(move || {
+            for s in old {
+                if s.dropped > 0 {
+                    eprintln!("stream: its encoder couldn't take {} frames", s.dropped);
+                }
+                s.encoder.finish();
+            }
+        });
     }
 
     /// Take every look before `t`: each sees the picture that's up.
@@ -1902,16 +2021,10 @@ impl BlendPacer {
         }
         steps.webcam = took();
         self.diag.free_min = self.diag.free_min.min(self.encoder.pool.free_count());
-        // The stream's frames are every `every`th of these, from its own
-        // encoder's frames.
-        let stream_due = self.stream.as_ref().is_some_and(|s| k.rem_euclid(s.every) == 0);
-        let stream_slot = if stream_due { self.stream.as_ref().and_then(|s| s.encoder.pool.take()) } else { None };
-        if stream_due
-            && stream_slot.is_none()
-            && let Some(s) = self.stream.as_mut()
-        {
-            s.dropped += 1;
-        }
+        // The stream's pictures want this frame too: each blending its own
+        // frames wants every one, else those at its frames' times.
+        let blending = self.looks > 1;
+        let streams_want = self.stream.iter().any(|s| s.wants(k, blending));
         match self.encoder.pool.take() {
             Some(slot) => {
                 self.blend.finish(k);
@@ -1938,7 +2051,7 @@ impl BlendPacer {
             // a graphics card that's behind can't spare), unless the stream
             // takes it.
             None => {
-                if stream_slot.is_some() {
+                if streams_want {
                     self.blend.finish(k);
                 } else {
                     self.blend.drop_frame(k);
@@ -1947,17 +2060,10 @@ impl BlendPacer {
                 self.diag.pool_empty += 1;
             }
         }
-        if let (Some(s), Some(slot)) = (self.stream.as_mut(), stream_slot) {
-            match s.converter.convert(slot) {
-                Ok(()) => {
-                    if !s.encoder.encode(slot, k / s.every) {
-                        s.dropped += 1;
-                    }
-                }
-                Err(e) => {
-                    s.encoder.pool.give(slot);
-                    eprintln_later!("stream: {e:#}");
-                }
+        if streams_want {
+            let content = self.blend.average.content();
+            for s in &mut self.stream {
+                s.frame(&self.blend.gpu, k, blending, content);
             }
         }
         let _ = took();
@@ -2093,7 +2199,7 @@ fn spawn_blend_pacer(
             encoder,
             preview,
             camera,
-            stream: None,
+            stream: Vec::new(),
             dropped: 0,
             stats: BlendStats::new(),
             diag: EncodeDiag::new(),
@@ -2127,7 +2233,7 @@ fn spawn_blend_pacer(
             // Looks whose time is past (and late pictures' too) see what's up.
             p.look_until(host_now() - p.wait());
         }
-        if let Some(s) = p.stream.take() {
+        for s in std::mem::take(&mut p.stream) {
             s.encoder.finish();
         }
         p.encoder.finish();
@@ -2245,23 +2351,26 @@ mod tests {
         }
     }
 
-    /// Clipping, then going live (to an RTMP server here: an ffmpeg
-    /// listening), frame blending turned on and off while it all runs, a
-    /// recording beside them, a clip saved: each gets what it should, from
-    /// the one capture. The stream at its own size and rate (720p at 30
-    /// from a 1080p capture at 60); the recording and the clip at the
-    /// capture's.
+    /// Clipping, then going live to two places (RTMP servers here: ffmpegs
+    /// listening), each sent a picture of its own, frame blending turned on
+    /// and off while it all runs, a recording beside them, a clip saved:
+    /// each gets what it should, from the one capture. The places at their
+    /// own sizes and rates (720p at 30, its frames blended from the
+    /// capture's while blending's on, and 1080p at 60, from a 1080p capture
+    /// at 60); the recording and the clip at the capture's.
     #[test]
     #[ignore = "captures the screen: cargo test -p capture everything_at_once -- --ignored --nocapture"]
     fn everything_at_once() {
         use crate::stream::{Destination, Link, Status, StreamSettings};
-        /// What's taken of the screen goes, and the server stops, however
+        /// What's taken of the screen goes, and the servers stop, however
         /// the test ends.
-        struct Leave(PathBuf, std::process::Child);
+        struct Leave(PathBuf, Vec<std::process::Child>);
         impl Drop for Leave {
             fn drop(&mut self) {
-                let _ = self.1.kill();
-                let _ = self.1.wait();
+                for c in &mut self.1 {
+                    let _ = c.kill();
+                    let _ = c.wait();
+                }
                 let _ = std::fs::remove_dir_all(&self.0);
             }
         }
@@ -2269,11 +2378,15 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("hc-at-once-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-        let url = format!("rtmp://127.0.0.1:{port}/live/test_key");
-        let got = dir.join("stream.flv");
-        let server = crate::stream::ffmpeg().args(["-v", "error", "-y", "-timeout", "30", "-i"]).arg(&url).args(["-c", "copy"]).arg(&got).stdin(std::process::Stdio::null()).spawn().unwrap();
-        let mut leave = Leave(dir.clone(), server);
+        let mut leave = Leave(dir.clone(), Vec::new());
+        let mut urls = Vec::new();
+        for name in ["small", "full"] {
+            let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+            let url = format!("rtmp://127.0.0.1:{port}/live/test_key");
+            let got = dir.join(format!("{name}.flv"));
+            leave.1.push(crate::stream::ffmpeg().args(["-v", "error", "-y", "-timeout", "30", "-i"]).arg(&url).args(["-c", "copy"]).arg(&got).stdin(std::process::Stdio::null()).spawn().unwrap());
+            urls.push(url);
+        }
         thread::sleep(Duration::from_millis(700));
         let status = Status::new();
         let mut settings = EncodeSettings {
@@ -2293,20 +2406,15 @@ mod tests {
             sources: Vec::new(),
             stream: None,
         };
-        settings.stream = Some(StreamSettings {
-            destinations: vec![Destination { name: "Test".into(), url: url.clone(), secret: "test_key".into() }],
-            short_side: Some(720),
-            fps: 30,
-            kbps: 3000,
-            status: status.clone(),
-        });
+        let place = |name: &str, url: &str, short_side, fps, kbps| Destination { name: name.into(), url: url.into(), secret: "test_key".into(), quality: crate::stream::Quality { short_side: Some(short_side), fps, kbps } };
+        settings.stream = Some(StreamSettings { destinations: vec![place("Small", &urls[0], 720, 30, 3000), place("Full", &urls[1], 1080, 60, 6000)], status: status.clone() });
         let mut rec = WinRecorder::new(Arc::new(LiveAudio::default()));
         rec.start(Mode::ReplayBuffer, &settings).unwrap();
         thread::sleep(Duration::from_secs(1));
         rec.start(Mode::Stream, &settings).unwrap();
         assert_eq!(rec.running(), Running { replay: true, record: false, stream: true });
         let deadline = Instant::now() + Duration::from_secs(10);
-        while !matches!(status.get()[0].link, Link::Live { .. }) {
+        while !status.get().iter().all(|d| matches!(d.link, Link::Live { .. })) {
             assert!(Instant::now() < deadline, "never live: {:?}", status.get());
             thread::sleep(Duration::from_millis(50));
         }
@@ -2325,8 +2433,8 @@ mod tests {
         rec.stop(Mode::ReplayBuffer, None).unwrap();
         assert!(!rec.is_running());
         let deadline = Instant::now() + Duration::from_secs(10);
-        while leave.1.try_wait().unwrap().is_none() {
-            assert!(Instant::now() < deadline, "the server didn't end");
+        while leave.1.iter_mut().any(|c| c.try_wait().unwrap().is_none()) {
+            assert!(Instant::now() < deadline, "a server didn't end");
             thread::sleep(Duration::from_millis(50));
         }
         let probe = |f: &Path| {
@@ -2337,10 +2445,11 @@ mod tests {
                 .unwrap();
             String::from_utf8_lossy(&out.stdout).to_string()
         };
-        let (s, r, c) = (probe(&got), probe(&recording), probe(&clip));
-        eprintln!("blending while it ran: {blending:?} looks\nstream:\n{s}\nrecording:\n{r}\nclip:\n{c}");
+        let (s, full, r, c) = (probe(&dir.join("small.flv")), probe(&dir.join("full.flv")), probe(&recording), probe(&clip));
+        eprintln!("blending while it ran: {blending:?} looks\nsmall stream:\n{s}\nfull stream:\n{full}\nrecording:\n{r}\nclip:\n{c}");
         assert_eq!(blending, Some(4), "blending changed while running");
         assert!(s.contains("width=1280") && s.contains("height=720") && s.contains("avg_frame_rate=30/1"), "{s}");
+        assert!(full.contains("width=1920") && full.contains("height=1080") && full.contains("avg_frame_rate=60/1"), "{full}");
         assert!(r.contains("height=1080") && r.contains("avg_frame_rate=60/1"), "{r}");
         assert!(c.contains("height=1080"), "{c}");
         let secs = |t: &str| t.lines().find_map(|l| l.strip_prefix("duration=")).and_then(|d| d.parse::<f64>().ok()).unwrap_or(0.0);

@@ -65,8 +65,8 @@ pub(crate) struct Setup {
     pub export: bool,
     /// For a stream (`crate::stream`): a constant bitrate and a keyframe
     /// every two seconds, as the services ask, and its frames handed over
-    /// as the stream's own.
-    pub stream: bool,
+    /// as the stream's own, this one of its pictures (its rendition).
+    pub stream: Option<usize>,
 }
 
 /// The encoder thread.
@@ -82,7 +82,7 @@ pub(crate) struct Encoder {
 
 impl Encoder {
     pub(crate) fn start(gpu: &Gpu, width: u32, height: u32, s: &EncodeSettings, out: Sender<Command>) -> Result<Self> {
-        Self::start_with(gpu, width, height, Setup { fps: s.fps, kbps: s.video_bitrate_kbps, hardware: s.use_hardware, export: false, stream: false }, out)
+        Self::start_with(gpu, width, height, Setup { fps: s.fps, kbps: s.video_bitrate_kbps, hardware: s.use_hardware, export: false, stream: None }, out)
     }
 
     pub(crate) fn start_with(gpu: &Gpu, width: u32, height: u32, setup: Setup, out: Sender<Command>) -> Result<Self> {
@@ -299,7 +299,7 @@ fn configure(mft: &IMFTransform, width: u32, height: u32, s: &Setup) -> Result<(
     // A stream: a keyframe every two seconds, the bitrate held to it.
     let (gop, peak) = if s.export {
         ((s.fps * 4).min(600), bitrate.saturating_mul(3))
-    } else if s.stream {
+    } else if s.stream.is_some() {
         (s.fps * 2, bitrate)
     } else {
         (crate::keyframe_every(s.fps), bitrate.saturating_mul(3) / 2)
@@ -312,7 +312,7 @@ fn configure(mft: &IMFTransform, width: u32, height: u32, s: &Setup) -> Result<(
             };
             // A stream's bitrate is constant: what the services ask for, and
             // what a connection can be counted on to carry.
-            let rate = if s.stream { eAVEncCommonRateControlMode_CBR } else { eAVEncCommonRateControlMode_PeakConstrainedVBR };
+            let rate = if s.stream.is_some() { eAVEncCommonRateControlMode_CBR } else { eAVEncCommonRateControlMode_PeakConstrainedVBR };
             if api.SetValue(&CODECAPI_AVEncCommonRateControlMode, &variant_u32(rate.0 as u32)).is_err() {
                 set(&CODECAPI_AVEncCommonRateControlMode, variant_u32(eAVEncCommonRateControlMode_UnconstrainedVBR.0 as u32));
             }
@@ -324,7 +324,7 @@ fn configure(mft: &IMFTransform, width: u32, height: u32, s: &Setup) -> Result<(
                 // (quality against speed 100) made a 1080p export no better
                 // (+0.007 dB SSIM) at 1.7 times the time.
                 set(&CODECAPI_AVEncCommonBufferSize, variant_u32(bitrate.saturating_mul(6)));
-            } else if s.stream {
+            } else if s.stream.is_some() {
                 // A second's worth: no burst the connection can't carry.
                 set(&CODECAPI_AVEncCommonBufferSize, variant_u32(bitrate));
             }
@@ -405,8 +405,9 @@ struct Run {
     /// An export's last frame out: frames must come out in order (see
     /// `process_output`).
     last_out: Option<Option<i64>>,
-    /// A stream's encoder: its frames are the stream's own.
-    stream: bool,
+    /// A stream's encoder: its frames are the stream's own (this one of
+    /// its pictures).
+    stream: Option<usize>,
 }
 
 impl Run {
@@ -612,8 +613,8 @@ impl Run {
             let key = frame.idr || clean;
             let config = if key { self.config.clone() } else { None };
             let pts = n as f64 / self.fps as f64;
-            let media = if self.stream {
-                Media::Stream(crate::stream::StreamFrame { data: Arc::from(frame.data), avcc: config.map(|c| Arc::from(c.record())), pts, key })
+            let media = if let Some(rendition) = self.stream {
+                Media::Stream(crate::stream::StreamFrame { rendition, data: Arc::from(frame.data), avcc: config.map(|c| Arc::from(c.record())), pts, key })
             } else {
                 Media::Video { frame: VideoFrame(Arc::new(EncodedFrame { data: Arc::from(frame.data), config })), pts, key }
             };

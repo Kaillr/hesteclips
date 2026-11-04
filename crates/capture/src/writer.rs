@@ -233,7 +233,7 @@ fn writer_loop(rx: Receiver<Command>, layout: Layout, fps: u32) -> Result<()> {
                 if let Some(old) = stream.take() {
                     old.stop();
                 }
-                stream = Some(Sink::start(&s, tracks > 0));
+                stream = Some(Sink::start(&s, tracks > 0, fps));
             }
             // Each destination's ffmpeg ends its stream properly, which can
             // take a moment: waited for off this thread, so the ring and the

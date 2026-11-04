@@ -32,11 +32,18 @@ const AAC_CONFIG: [u8; 2] = [0x11, 0x90];
 /// The sound's rate (`mixer::RATE`).
 const AUDIO_RATE: f64 = 48_000.0;
 
-/// How a stream is sent, besides where to: what the stream's own encoder
-/// makes.
+/// Where a stream goes, and how each place gets it.
 #[derive(Debug, Clone)]
 pub struct StreamSettings {
     pub destinations: Vec<Destination>,
+    /// How each destination is doing, kept up to date for the app.
+    pub status: Arc<Status>,
+}
+
+/// What a destination is sent: a picture of its own size, frame rate and
+/// bitrate (Twitch takes less than YouTube).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Quality {
     /// The picture's short side brought down to this (never up): 1080 is
     /// 1080p. None keeps the size the capture records at.
     pub short_side: Option<u32>,
@@ -44,8 +51,6 @@ pub struct StreamSettings {
     /// of it ([`stream_rate`]).
     pub fps: u32,
     pub kbps: u32,
-    /// How each destination is doing, kept up to date for the app.
-    pub status: Arc<Status>,
 }
 
 /// Where a stream goes.
@@ -57,6 +62,7 @@ pub struct Destination {
     pub url: String,
     /// The secret part of `url` (its stream key): never said or logged.
     pub secret: String,
+    pub quality: Quality,
 }
 
 /// Its address, the key on it, never printed.
@@ -99,6 +105,45 @@ pub fn stream_rate(fps: u32, most: u32) -> u32 {
     let most = most.clamp(1, 60);
     let fps = fps.max(1);
     (1..=fps).find(|n| fps.is_multiple_of(*n) && fps / n <= most).map_or(1, |n| fps / n)
+}
+
+/// The frame rates a stream can be sent at from a capture at `fps`, fastest
+/// first: its whole fractions from 60 down to 20 (each stream frame one of
+/// its frames, so motion stays even), at most four. A capture slower than
+/// 20 has only its own.
+pub fn stream_rates(fps: u32) -> Vec<u32> {
+    let fps = fps.max(1);
+    let rates: Vec<u32> = (1..=fps).filter(|n| fps.is_multiple_of(*n)).map(|n| fps / n).filter(|r| (20..=60).contains(r)).take(4).collect();
+    if rates.is_empty() { vec![stream_rate(fps, 60)] } else { rates }
+}
+
+/// One picture a stream sends, made by an encoder of its own: as many as
+/// there are different ones among the destinations (two of the same share).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Rendition {
+    pub short_side: Option<u32>,
+    /// Frames a second, as sent (see [`stream_rate`]).
+    pub fps: u32,
+    pub kbps: u32,
+}
+
+/// The pictures a stream needs from a capture at `fps`, and which of them
+/// each destination is sent (by its place in the list).
+pub(crate) fn renditions(s: &StreamSettings, fps: u32) -> (Vec<Rendition>, Vec<usize>) {
+    let mut list: Vec<Rendition> = Vec::new();
+    let mut of = Vec::with_capacity(s.destinations.len());
+    for d in &s.destinations {
+        let r = Rendition { short_side: d.quality.short_side, fps: stream_rate(fps, d.quality.fps), kbps: d.quality.kbps.max(100) };
+        let i = match list.iter().position(|x| *x == r) {
+            Some(i) => i,
+            None => {
+                list.push(r);
+                list.len() - 1
+            }
+        };
+        of.push(i);
+    }
+    (list, of)
 }
 
 /// How a destination is doing.
@@ -160,6 +205,8 @@ impl Status {
 /// 4-byte lengths.
 #[derive(Clone)]
 pub(crate) struct StreamFrame {
+    /// Which of the stream's pictures it is ([`renditions`]).
+    pub rendition: usize,
     pub data: Arc<[u8]>,
     /// The decoder's set-up for it (an `avcC` record): on every keyframe.
     pub avcc: Option<Arc<[u8]>>,
@@ -227,34 +274,40 @@ struct Feed {
     /// can't keep up).
     skipping: bool,
     index: usize,
+    /// Which of the stream's pictures it's sent.
+    rendition: usize,
 }
 
 impl Sink {
     /// Start sending to each destination (each connects on the first
-    /// keyframe). `audio`: whether there's a mix track to send.
-    pub(crate) fn start(s: &StreamSettings, audio: bool) -> Self {
+    /// keyframe of its picture), from a capture at `fps`. `audio`: whether
+    /// there's a mix track to send.
+    pub(crate) fn start(s: &StreamSettings, audio: bool, fps: u32) -> Self {
         s.status.begin(s.destinations.iter().map(|d| d.name.clone()));
-        // A few seconds of pictures and sound wait for a connection that's
-        // slow (or still connecting) before frames are left out.
-        let queue = ((s.fps.max(1) + 50) * 4) as usize;
-        let meta = Meta { width: 0, height: 0, fps: s.fps, kbps: s.kbps, audio };
+        let (list, of) = renditions(s, fps);
         let feeds = s
             .destinations
             .iter()
+            .zip(of)
             .enumerate()
-            .map(|(index, dest)| {
+            .map(|(index, (dest, rendition))| {
+                let r = list[rendition];
+                // A few seconds of pictures and sound wait for a connection
+                // that's slow (or still connecting) before frames are left out.
+                let queue = ((r.fps.max(1) + 50) * 4) as usize;
+                let meta = Meta { width: 0, height: 0, fps: r.fps, kbps: r.kbps, audio };
                 let (tx, rx) = mpsc::sync_channel(queue);
                 let (dest, status) = (dest.clone(), s.status.clone());
                 let thread = thread::Builder::new().name("stream".into()).spawn(move || send_loop(dest, rx, status, index, meta)).ok();
-                Feed { tx: Some(tx), thread, skipping: false, index }
+                Feed { tx: Some(tx), thread, skipping: false, index, rendition }
             })
             .collect();
         Self { feeds, audio, status: s.status.clone() }
     }
 
-    /// One of the stream's pictures.
+    /// One of the stream's pictures: to the destinations sent that one.
     pub(crate) fn video(&mut self, frame: &StreamFrame) {
-        for f in &mut self.feeds {
+        for f in self.feeds.iter_mut().filter(|f| f.rendition == frame.rendition) {
             if f.skipping && !frame.key {
                 self.status.set(f.index, |d| d.dropped += 1);
                 continue;
@@ -735,7 +788,7 @@ mod tests {
     /// address it's in.
     #[test]
     fn the_key_is_hidden() {
-        let d = Destination { name: "Twitch".into(), url: "rtmp://live.twitch.tv/app/live_123_abc".into(), secret: "live_123_abc".into() };
+        let d = Destination { name: "Twitch".into(), url: "rtmp://live.twitch.tv/app/live_123_abc".into(), secret: "live_123_abc".into(), quality: Quality { short_side: None, fps: 60, kbps: 6000 } };
         assert_eq!(d.hide("[rtmp @ 0x1] rtmp://live.twitch.tv/app/live_123_abc: I/O error"), "[rtmp @ 0x1] Twitch: I/O error");
         assert_eq!(d.hide("Server error: bad key live_123_abc"), "Server error: bad key ••••");
         assert_eq!(problem_of(&["[rtmp @ 0000021f] Server error: Invalid stream key".into(), "Error opening output Twitch: I/O error".into()]).unwrap(), "Server error: Invalid stream key");
@@ -745,7 +798,7 @@ mod tests {
     /// Each stream frame is one of the capture's: a whole fraction of its
     /// rate, at most what's asked (and 60).
     #[test]
-    fn stream_rates() {
+    fn each_stream_frame_is_one_of_the_captures() {
         assert_eq!(stream_rate(60, 60), 60);
         assert_eq!(stream_rate(120, 60), 60);
         assert_eq!(stream_rate(240, 60), 60);
@@ -756,6 +809,32 @@ mod tests {
         assert_eq!(stream_rate(30, 60), 30);
         assert_eq!(stream_rate(240, 144), 60, "never over 60");
         assert_eq!(stream_rate(75, 60), 25);
+    }
+
+    /// The rates a stream can have are the capture's whole fractions from
+    /// 60 down to 20: 60 and 30 from 60, none of them from 144.
+    #[test]
+    fn rates_offered() {
+        assert_eq!(stream_rates(60), [60, 30, 20]);
+        assert_eq!(stream_rates(144), [48, 36, 24]);
+        assert_eq!(stream_rates(120), [60, 40, 30, 24]);
+        assert_eq!(stream_rates(240), [60, 48, 40, 30]);
+        assert_eq!(stream_rates(165), [55, 33]);
+        assert_eq!(stream_rates(15), [15]);
+    }
+
+    /// One encoder per different picture: two places sent the same share
+    /// it, whatever rate each asked for that comes out the same.
+    #[test]
+    fn places_alike_share_a_picture() {
+        let d = |name: &str, short_side, fps, kbps| Destination { name: name.into(), url: String::new(), secret: String::new(), quality: Quality { short_side, fps, kbps } };
+        let s = StreamSettings {
+            destinations: vec![d("Twitch", Some(1080), 60, 6000), d("YouTube", Some(1440), 60, 12000), d("Kick", Some(1080), 50, 6000)],
+            status: Status::new(),
+        };
+        let (list, of) = renditions(&s, 144);
+        assert_eq!(list, [Rendition { short_side: Some(1080), fps: 48, kbps: 6000 }, Rendition { short_side: Some(1440), fps: 48, kbps: 12000 }]);
+        assert_eq!(of, [0, 1, 0], "50 at most from 144 is 48 too");
     }
 
     #[test]
@@ -814,7 +893,7 @@ mod tests {
             .enumerate()
             .map(|(n, w)| {
                 let au = crate::mp4mux::annexb_to_avcc(&es[w[0]..w[1]]);
-                StreamFrame { data: Arc::from(au.data), avcc: au.config.map(|c| Arc::from(c.record())), pts: n as f64 / 30.0, key: au.idr }
+                StreamFrame { rendition: 0, data: Arc::from(au.data), avcc: au.config.map(|c| Arc::from(c.record())), pts: n as f64 / 30.0, key: au.idr }
             })
             .collect();
         // ADTS: a 7-byte header (9 with its checksum) before each packet.
@@ -852,13 +931,10 @@ mod tests {
         thread::sleep(Duration::from_millis(700));
         let status = Status::new();
         let settings = StreamSettings {
-            destinations: vec![Destination { name: "Test".into(), url: url.clone(), secret: "sk_test_key".into() }],
-            short_side: None,
-            fps: 30,
-            kbps: 1000,
+            destinations: vec![Destination { name: "Test".into(), url: url.clone(), secret: "sk_test_key".into(), quality: Quality { short_side: None, fps: 30, kbps: 1000 } }],
             status: status.clone(),
         };
-        let mut sink = Sink::start(&settings, true);
+        let mut sink = Sink::start(&settings, true, 30);
         let mut sound = packets.iter().enumerate().peekable();
         for f in &frames {
             sink.video(f);

@@ -69,7 +69,8 @@ impl StreamService {
     }
 }
 
-/// One place to stream to, and whether Go live goes there.
+/// One place to stream to, whether Go live goes there, and what it's sent:
+/// each place its own picture (Twitch takes less than YouTube).
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StreamDestination {
@@ -82,24 +83,51 @@ pub struct StreamDestination {
     /// What another server's called ("Restream").
     pub name: String,
     pub enabled: bool,
+    /// The picture's short side brought down to this (never up), in p; 0
+    /// keeps the size clips are recorded at.
+    pub height: u32,
+    /// Frames a second, at most: a whole fraction of the recording's frame
+    /// rate is sent (`capture::stream::stream_rate`).
+    pub fps: u32,
+    pub kbps: u32,
 }
 
 impl Default for StreamDestination {
     fn default() -> Self {
-        Self { service: StreamService::Twitch, key: String::new(), server: String::new(), name: String::new(), enabled: true }
+        Self::new(StreamService::Twitch)
     }
 }
 
 /// Its key never printed.
 impl std::fmt::Debug for StreamDestination {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        f.debug_struct("StreamDestination").field("service", &self.service).field("server", &self.server).field("enabled", &self.enabled).finish_non_exhaustive()
+        f.debug_struct("StreamDestination")
+            .field("service", &self.service)
+            .field("server", &self.server)
+            .field("enabled", &self.enabled)
+            .field("height", &self.height)
+            .field("fps", &self.fps)
+            .field("kbps", &self.kbps)
+            .finish_non_exhaustive()
     }
 }
 
 impl StreamDestination {
+    /// A place on `service`, sent what it takes: 1080p at 60 fps, at
+    /// Twitch's 6,000 kbps (its most, for most channels), YouTube's 12,000
+    /// (what it suggests for 1080p at 60) or Kick's 8,000 (its most).
     pub fn new(service: StreamService) -> Self {
-        Self { service, ..Default::default() }
+        let kbps = match service {
+            StreamService::Twitch | StreamService::Custom => 6000,
+            StreamService::YouTube => 12_000,
+            StreamService::Kick => 8000,
+        };
+        Self { service, key: String::new(), server: String::new(), name: String::new(), enabled: true, height: 1080, fps: 60, kbps }
+    }
+
+    /// What it's sent, for the capture.
+    pub fn quality(&self) -> capture::stream::Quality {
+        capture::stream::Quality { short_side: (self.height > 0).then_some(self.height), fps: self.fps.max(1), kbps: self.kbps.max(100) }
     }
 
     /// What it's called: the service, or another server's own name.
@@ -137,41 +165,22 @@ impl StreamDestination {
             return None;
         }
         let key = self.key.trim().to_owned();
-        Some(capture::stream::Destination { name: self.name(), url: capture::stream::join(&self.server(rtmps), &key), secret: key })
+        Some(capture::stream::Destination { name: self.name(), url: capture::stream::join(&self.server(rtmps), &key), secret: key, quality: self.quality() })
     }
 }
 
-/// Going live: where to, and the stream's own picture (clips and
+/// Going live: where to, each place with its own picture (clips and
 /// recordings keep theirs).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StreamCfg {
     pub destinations: Vec<StreamDestination>,
-    /// The picture's short side brought down to this (never up), in p; 0
-    /// keeps the size clips are recorded at.
-    pub height: u32,
-    /// Frames a second, at most (30 or 60): a whole fraction of the
-    /// recording's frame rate (`capture::stream::stream_rate`).
-    pub fps: u32,
-    pub kbps: u32,
-}
-
-impl Default for StreamCfg {
-    fn default() -> Self {
-        // As Twitch suggests for 1080p at 60 fps, and what it takes from
-        // everyone.
-        Self { destinations: Vec::new(), height: 1080, fps: 60, kbps: 6000 }
-    }
 }
 
 impl StreamCfg {
     /// The destinations Go live sends to: turned on, and set up.
     pub fn ready(&self) -> impl Iterator<Item = &StreamDestination> {
         self.destinations.iter().filter(|d| d.enabled && d.missing().is_none())
-    }
-
-    pub fn short_side(&self) -> Option<u32> {
-        (self.height > 0).then_some(self.height)
     }
 }
 
@@ -1570,13 +1579,17 @@ impl RecordSettings {
 mod stream_tests {
     use super::*;
 
-    /// Settings saved before streaming load with nowhere to stream to, and
-    /// 1080p at 60 fps, 6,000 kbps; what's set is kept.
+    /// Settings saved before streaming load with nowhere to stream to;
+    /// what's set is kept. A place added is sent what its service takes.
     #[test]
     fn older_settings_load_and_streams_are_kept() {
         let s: RecordSettings = serde_json::from_str(r#"{"fps": 60}"#).unwrap();
         assert!(s.stream.destinations.is_empty());
-        assert_eq!((s.stream.height, s.stream.fps, s.stream.kbps), (1080, 60, 6000));
+        let q = |s: StreamService| {
+            let d = StreamDestination::new(s);
+            (d.height, d.fps, d.kbps)
+        };
+        assert_eq!([q(StreamService::Twitch), q(StreamService::YouTube), q(StreamService::Kick)], [(1080, 60, 6000), (1080, 60, 12_000), (1080, 60, 8000)]);
         let mut s = RecordSettings::default();
         s.stream.destinations.push(StreamDestination { key: "live_1".into(), ..StreamDestination::new(StreamService::Twitch) });
         let back: RecordSettings = serde_json::from_str(&s.to_json()).unwrap();

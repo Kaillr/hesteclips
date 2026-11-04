@@ -1121,13 +1121,7 @@ impl App {
         // and only for a service that has it).
         let rtmps = self.settings.stream.ready().any(|d| d.service.server(true) != d.service.server(false)) && capture::stream::rtmps();
         let destinations: Vec<_> = self.settings.stream.ready().filter_map(|d| d.destination(rtmps)).collect();
-        (!destinations.is_empty()).then(|| capture::stream::StreamSettings {
-            destinations,
-            short_side: self.settings.stream.short_side(),
-            fps: self.settings.stream.fps,
-            kbps: self.settings.stream.kbps,
-            status: self.stream_status.clone(),
-        })
+        (!destinations.is_empty()).then(|| capture::stream::StreamSettings { destinations, status: self.stream_status.clone() })
     }
 
     /// Keep the webcam's box, and the screen's when it's placed by hand,
