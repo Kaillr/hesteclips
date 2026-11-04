@@ -50,8 +50,6 @@ const PACKET_SECS: f64 = 1024.0 / RATE as f64;
 pub(crate) enum Media {
     Video { frame: VideoFrame, pts: f64, key: bool },
     Audio { track: usize, packet: AacPacket },
-    // Only Windows has a stream encoder so far (`crate::STREAMING`).
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     Stream(StreamFrame),
 }
 

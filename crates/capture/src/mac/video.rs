@@ -380,6 +380,21 @@ impl StreamCtl {
         self.ctl.lock().unwrap().wanted.display
     }
 
+    /// At most `fps` pictures a second from now on (the looks' rate, frame
+    /// blending): the stream set up again for it (a few milliseconds).
+    fn set_rate(&self, fps: u32) {
+        {
+            let mut c = self.ctl.lock().unwrap();
+            if c.fps == fps {
+                return;
+            }
+            c.fps = fps;
+        }
+        if let (_, Err(e)) = self.set_up() {
+            eprintln!("can't look at the screen {fps} times a second: {e:#}");
+        }
+    }
+
     /// Put what's recorded into the frame as `framing` says from now on,
     /// showing `crop` of a display. Called for every frame: a change sets
     /// the stream up again on a thread of its own, so the frames don't wait
@@ -594,6 +609,12 @@ impl Picture {
     /// The stream's settings as they change, for the frames made from it.
     pub(crate) fn ctl(&self) -> Arc<StreamCtl> {
         self.ctl.clone()
+    }
+
+    /// Hand over at most `fps` pictures a second from now on (the looks'
+    /// rate, frame blending changed while it runs).
+    pub(crate) fn set_rate(&self, fps: u32) {
+        self.ctl.set_rate(fps);
     }
 
     pub(crate) fn stop(mut self) {
