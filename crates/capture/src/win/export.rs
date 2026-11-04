@@ -833,7 +833,7 @@ impl Encoder {
         if !job.fit && card {
             let spec = Spec { width: w, height: h, fps: job.out_fps, audio_titles: Vec::new(), audio_bitrate: 0, comment: String::new(), mov: false, reorder: 0 };
             let writer = Writer::record(partial.to_path_buf(), Layout { spec }, job.out_fps);
-            let setup = Setup { fps: job.out_fps, kbps: job.kbps.max(100), hardware: true, export: true };
+            let setup = Setup { fps: job.out_fps, kbps: job.kbps.max(100), hardware: true, export: true, stream: false };
             let started = h264::Encoder::start_with(gpu, w, h, setup, writer.tx.clone()).and_then(|encoder| {
                 let targets = encoder.pool.textures.iter().map(|t| planes_drawn(gpu, t)).collect::<Result<Vec<_>>>()?;
                 Ok((encoder, targets))

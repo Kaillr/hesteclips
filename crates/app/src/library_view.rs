@@ -24,7 +24,7 @@ use crate::library::{Action, CardDrag, DropOn, Filter, ShowKind, View};
 use crate::settings::LibrarySort;
 use crate::theme::{self, W, icon};
 use crate::ui_kit::{self, Btn, Item, Kind};
-use crate::{App, RecState, clips, share, thumbs};
+use crate::{App, clips, share, thumbs};
 
 /// The panel's width, from the rail's edge (Settings' panel is the same).
 pub const PANEL_W: f32 = 244.0;
@@ -41,7 +41,7 @@ impl App {
     pub(crate) fn library(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
         self.hover_seen = false;
         // One card for a recording in progress, and one per clip still being written.
-        let placeholders = usize::from(self.rec_state == RecState::Recording) + self.saving;
+        let placeholders = usize::from(self.rec_state.recording) + self.saving;
         let new_renders: Vec<usize> = (0..self.renders.len()).filter(|&i| self.renders[i].as_new).collect();
         let empty_library = self.clips.is_empty() && placeholders == 0 && new_renders.is_empty();
         // What's shown: worked out again only when something it's made of
@@ -348,7 +348,7 @@ impl App {
                         cui.multiply_opacity(open * p.shown);
                     }
                     match item {
-                        GridItem::Placeholder(_) => self.placeholder_card(&mut cui, rect),
+                        GridItem::Placeholder(n) => self.placeholder_card(&mut cui, rect, n),
                         GridItem::NewRender(r) => self.new_render_card(&mut cui, r, rect),
                         GridItem::Clip(ci) => {
                             let c = self.clips[ci].clone();
@@ -779,10 +779,13 @@ impl App {
         cui.label(theme::text("Your clips will show up here", 22.0, W::Semibold).color(p.text));
         cui.add_space(8.0);
         let key = save.as_ref().map(|k| ui_kit::key_text(k)).unwrap_or_else(|| "the shortcut".into());
-        let text = match self.rec_state {
-            RecState::Idle => format!("Start clipping and play as usual. When something worth keeping happens, press {key} to save the last {len}."),
-            RecState::Buffering => format!("Clipping. Play as usual, and when something worth keeping happens, press {key} to save the last {len}."),
-            RecState::Recording => "Recording. Stop it to see your recording here.".to_owned(),
+        let state = self.rec_state;
+        let text = if state.clipping {
+            format!("Clipping. Play as usual, and when something worth keeping happens, press {key} to save the last {len}.")
+        } else if state.recording {
+            "Recording. Stop it to see your recording here.".to_owned()
+        } else {
+            format!("Start clipping and play as usual. When something worth keeping happens, press {key} to save the last {len}.")
         };
         cui.allocate_ui(vec2(440.0, 60.0), |ui| {
             ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
@@ -791,7 +794,7 @@ impl App {
         });
         cui.add_space(18.0);
         // The row is as wide as its buttons, so it centres on them.
-        let start = (self.rec_state == RecState::Idle).then(|| Btn::primary("Start clipping").min_width(130.0));
+        let start = (!self.rec_state.clipping && !self.rec_state.recording).then(|| Btn::primary("Start clipping").min_width(130.0));
         let choose = Btn::normal("Choose what's recorded");
         let gap = 8.0;
         let row_w = choose.width(&cui) + start.as_ref().map_or(0.0, |b| b.width(&cui) + gap);
@@ -876,9 +879,11 @@ impl App {
         }
     }
 
-    fn placeholder_card(&mut self, ui: &mut egui::Ui, rect: Rect) {
+    /// Placeholder `n`: the recording in progress first (while one runs),
+    /// then the clips still being written.
+    fn placeholder_card(&mut self, ui: &mut egui::Ui, rect: Rect, n: usize) {
         let p = theme::pal(ui);
-        if self.rec_state == RecState::Recording {
+        if self.rec_state.recording && n == 0 {
             let secs = self.rec_started.map_or(0, |t| t.elapsed().as_secs());
             Self::progress_card(ui, rect, &format!("Recording {}", thumbs::format_duration(Duration::from_secs(secs))), "Recording", p.rec, None);
         } else {

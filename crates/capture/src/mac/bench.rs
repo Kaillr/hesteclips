@@ -40,6 +40,7 @@ fn settings(fps: u32, kbps: u32) -> EncodeSettings {
         webcam: None,
         screen: Arc::new(Mutex::new(crate::ScreenPlacement::whole(crate::Framing::Fit))),
         sources: Vec::new(),
+        stream: None,
     }
 }
 

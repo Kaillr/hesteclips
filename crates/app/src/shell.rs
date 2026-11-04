@@ -6,21 +6,23 @@
 //!   On macOS it runs to the top of the window, under the traffic lights.
 //! - **The recorder** sits in the same place on every page but the player and
 //!   editor: what's happening, then the one thing you'd do now (Start
-//!   clipping, Save clip, Stop recording). The ∨ by the status holds the rest
-//!   as plain actions. Clipping and recording never run together, so Record
-//!   is only offered when you're not clipping.
+//!   clipping, Save clip, Stop recording, End stream). Clipping, recording
+//!   and streaming run together: each shows with its dot (live is purple)
+//!   and has a stop of its own beside the status. The ∨ by the status holds
+//!   the rest as plain actions, Go live among them.
 //! - **Toasts** rise in at the bottom, say what happened with an icon, and
 //!   can carry one action (Undo, Show).
 
 use std::time::{Duration, Instant};
 
+use capture::Mode;
 use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, vec2};
 
 use crate::settings::ShortcutAction as A;
 use crate::theme::{self, W, icon};
 use crate::ui_kit::{self, Btn, Item, Kind};
 use crate::ui_kit::Dismissed as _;
-use crate::{App, Page, RecState, thumbs};
+use crate::{App, Page, thumbs};
 
 /// The rail's width.
 pub const RAIL_W: f32 = 78.0;
@@ -349,49 +351,92 @@ impl App {
         }
     }
 
-    /// The recorder: the status (its ∨ opens the other options) and the one
-    /// action that makes sense now, with its shortcut. `main`: its action is
-    /// the screen's main one (on Clips); elsewhere it's a normal button.
-    /// `compact`: a narrow window, so just the status dot and ∨, and the
-    /// action without its shortcut.
+    /// The recorder: what's running (its ∨ opens the other options), a stop
+    /// for each, and the one action that makes sense now, with its shortcut.
+    /// Clipping, recording and streaming run at once: each has its dot (the
+    /// stream's purple), and each its own stop beside the status, but the
+    /// one the action stops. `compact`: a narrow window, so just the dots
+    /// and ∨, and the action without its shortcut.
     pub(crate) fn recorder(&mut self, ui: &mut egui::Ui, compact: bool) {
         let p = theme::pal(ui);
         let state = self.rec_state;
-        let elapsed = self.rec_started.map_or(Duration::ZERO, |t| t.elapsed());
-        let len = reach(self.settings.replay_seconds);
-        let (dot, title, sub) = match state {
-            RecState::Idle => (None, "Not clipping".to_owned(), None),
-            RecState::Buffering => (Some(p.live), "Clipping".to_owned(), Some(len)),
-            RecState::Recording => (Some(p.rec), "Recording".to_owned(), Some(thumbs::format_duration(elapsed))),
+        let since = |t: Option<Instant>| thumbs::format_duration(t.map_or(Duration::ZERO, |t| t.elapsed()));
+        // Streaming first (it's what others see), then recording, then
+        // clipping (its reach said only when it's alone).
+        let mut parts: Vec<(Mode, Color32, &str, Option<String>)> = Vec::new();
+        if state.streaming {
+            parts.push((Mode::Stream, p.stream, "Live", Some(since(self.stream_started))));
+        }
+        if state.recording {
+            parts.push((Mode::Record, p.rec, "Recording", Some(since(self.rec_started))));
+        }
+        if state.clipping {
+            let alone = parts.is_empty();
+            parts.push((Mode::ReplayBuffer, p.live, "Clipping", alone.then(|| reach(self.settings.replay_seconds))));
+        }
+        let title_font = theme::font(13.0, W::Semibold);
+        let sub_font = theme::font(13.0, W::Medium);
+        let words: Vec<(Color32, std::sync::Arc<egui::Galley>, Option<std::sync::Arc<egui::Galley>>)> = if parts.is_empty() {
+            vec![(Color32::TRANSPARENT, ui.painter().layout_no_wrap("Not clipping".into(), title_font.clone(), p.text), None)]
+        } else {
+            parts
+                .iter()
+                .map(|(_, color, title, sub)| {
+                    let t = ui.painter().layout_no_wrap((*title).to_owned(), title_font.clone(), p.text);
+                    let s = sub.as_ref().map(|s| ui.painter().layout_no_wrap(s.clone(), sub_font.clone(), p.text3));
+                    (*color, t, s)
+                })
+                .collect()
         };
-        let font = theme::font(13.0, W::Semibold);
-        let tg = ui.painter().layout_no_wrap(title.clone(), font, p.text);
-        let sg = sub.as_ref().map(|s| ui.painter().layout_no_wrap(s.clone(), theme::font(13.0, W::Medium), p.text3));
-        let stat_target = if compact { 27.0 + 22.0 } else { 27.0 + tg.size().x + sg.as_ref().map_or(0.0, |g| g.size().x + 6.0) + 8.0 + 20.0 };
+        // Each part: its dot, then its words; the next part's dot 18 px on.
+        let part_w = |(_, t, s): &(Color32, std::sync::Arc<egui::Galley>, Option<std::sync::Arc<egui::Galley>>)| t.size().x + s.as_ref().map_or(0.0, |g| g.size().x + 6.0);
+        let stat_target = if compact {
+            15.0 + 14.0 * (words.len() as f32 - 1.0) + 34.0
+        } else {
+            27.0 + words.iter().map(part_w).sum::<f32>() + 30.0 * (words.len() as f32 - 1.0) + 8.0 + 20.0
+        };
         let stat_w = theme::value(ui.ctx(), egui::Id::new("rec_stat_w"), stat_target, theme::NORMAL);
-        // The one action.
         let saving = self.saving > 0;
-        // The app's main action, the same on every page.
-        let kind = Kind::Primary;
-        let btn = match state {
-            RecState::Idle => Btn::new(kind, "Start clipping")
-                .keys(self.shortcut_keys(A::ToggleBuffer))
-                .tip(format!("Keep the last {} ready to save", crate::settings_ui::length_words(self.settings.replay_seconds))),
-            RecState::Buffering => Btn::new(kind, if saving { "Saving…" } else { "Save clip" })
+        // The one action: Save clip while clipping (what you'd do now),
+        // else the stop of what runs, else Start clipping. The app's main
+        // action, the same on every page.
+        let main = if state.clipping {
+            None
+        } else if state.recording {
+            Some(Mode::Record)
+        } else if state.streaming {
+            Some(Mode::Stream)
+        } else {
+            None
+        };
+        let btn = if state.clipping {
+            Btn::new(Kind::Primary, if saving { "Saving…" } else { "Save clip" })
                 .keys(self.shortcut_keys(A::SaveClip))
-                .tip(format!("Save the last {}", crate::settings_ui::length_words(self.settings.replay_seconds))),
-            RecState::Recording => Btn::new(Kind::Stop, "Stop recording").with_icon(egui_phosphor::fill::STOP).filled().keys(self.shortcut_keys(A::ToggleRecord)).tip("Stop and save the recording"),
+                .tip(format!("Save the last {}", crate::settings_ui::length_words(self.settings.replay_seconds)))
+        } else if state.recording {
+            Btn::new(Kind::Stop, "Stop recording").with_icon(egui_phosphor::fill::STOP).filled().keys(self.shortcut_keys(A::ToggleRecord)).tip("Stop and save the recording")
+        } else if state.streaming {
+            Btn::new(Kind::Live, "End stream").with_icon(egui_phosphor::fill::STOP).filled().tip("Stop streaming, everywhere it's going")
+        } else {
+            Btn::new(Kind::Primary, "Start clipping")
+                .keys(self.shortcut_keys(A::ToggleBuffer))
+                .tip(format!("Keep the last {} ready to save", crate::settings_ui::length_words(self.settings.replay_seconds)))
         }
         .id("recorder_action");
         let btn = if compact { btn.keys(None) } else { btn };
-        // While clipping, Stop before Save clip: its slot (the button and the
-        // gap after it) opens from nothing, so the pill and Save clip move with
-        // it instead of the button arriving at full width.
-        let stop_t = theme::toggle(ui.ctx(), egui::Id::new("rec_stop"), state == RecState::Buffering, theme::NORMAL);
-        let stop_w = (ui_kit::CONTROL_H + 2.0) * stop_t;
-        let total = 2.0 + stat_w + 2.0 + stop_w + btn.width(ui) + 2.0;
-        // Status first, then the action: laid out left to right in a box
-        // allocated from the right.
+        // A stop by the status for each thing running that the action
+        // doesn't stop. Each slot (the button and the gap after it) opens
+        // from nothing, so the pill and the action move with it instead of
+        // the button arriving at full width.
+        let stops: Vec<(Mode, f32)> = [Mode::Stream, Mode::Record, Mode::ReplayBuffer]
+            .into_iter()
+            .map(|m| (m, theme::toggle(ui.ctx(), egui::Id::new(("rec_stop", stop_key(m))), state.has(m) && main != Some(m), theme::NORMAL)))
+            .filter(|(_, t)| *t > 0.0)
+            .collect();
+        let stops_w: f32 = stops.iter().map(|(_, t)| (ui_kit::CONTROL_H + 2.0) * t).sum();
+        let total = 2.0 + stat_w + 2.0 + stops_w + btn.width(ui) + 2.0;
+        // Status first, then the stops, then the action: laid out left to
+        // right in a box allocated from the right.
         ui.allocate_ui_with_layout(vec2(total, 34.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
             let (outer, _) = ui.allocate_exact_size(vec2(total, 34.0), Sense::hover());
             ui.painter().rect_filled(outer, 8, p.control);
@@ -405,92 +450,168 @@ impl App {
             let hv = theme::toggle(ui.ctx(), resp.id.with("hv"), resp.hovered() || open, theme::FAST);
             let painter = ui.painter_at(r);
             painter.rect_filled(r, ui_kit::RADIUS, theme::fade(p.control_h, hv));
-            let c = Pos2::new(r.left() + 15.0, r.center().y);
-            match dot {
-                Some(color) => status_dot(&painter, c, color, ui.input(|i| i.time)),
-                None => {
-                    painter.circle_stroke(c, 3.5, Stroke::new(1.5, p.text3));
-                }
-            }
             // Clipped to the box while its width eases between compact and not.
-            let words = ui.painter_at(r.with_max_x(r.right() - 24.0));
-            let mut x = r.left() + 27.0;
-            words.galley(Pos2::new(x, r.center().y - tg.size().y / 2.0), tg.clone(), p.text);
-            x += tg.size().x + 6.0;
-            if let Some(g) = sg {
-                words.galley(Pos2::new(x, r.center().y - g.size().y / 2.0), g.clone(), p.text3);
+            let clip = ui.painter_at(r.with_max_x(r.right() - 24.0));
+            let time = ui.input(|i| i.time);
+            let mut x = r.left() + 15.0;
+            for (color, title, sub) in &words {
+                let c = Pos2::new(x, r.center().y);
+                if parts.is_empty() {
+                    painter.circle_stroke(c, 3.5, Stroke::new(1.5, p.text3));
+                } else {
+                    status_dot(&painter, c, *color, time);
+                }
+                if compact {
+                    x += 14.0;
+                    continue;
+                }
+                let mut tx = x + 12.0;
+                clip.galley(Pos2::new(tx, r.center().y - title.size().y / 2.0), title.clone(), p.text);
+                tx += title.size().x + 6.0;
+                if let Some(g) = sub {
+                    clip.galley(Pos2::new(tx, r.center().y - g.size().y / 2.0), g.clone(), p.text3);
+                    tx += g.size().x + 6.0;
+                }
+                x = tx - 6.0 + 18.0;
             }
             let turn = theme::toggle(ui.ctx(), resp.id.with("turn"), open, theme::NORMAL);
             ui_kit::chevron(&painter, Pos2::new(r.right() - 14.0, r.center().y), 3.5, turn, p.text3);
-            let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(if compact { format!("{title}{}", sub.as_ref().map(|s| format!("  {s}")).unwrap_or_default()) } else { "More options".to_owned() });
+            let said = || {
+                let all: Vec<String> = parts.iter().map(|(_, _, t, s)| s.as_ref().map_or_else(|| (*t).to_owned(), |s| format!("{t}  {s}"))).collect();
+                if all.is_empty() { "Not clipping".to_owned() } else { all.join(" · ") }
+            };
+            let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(if compact { said() } else { "More options".to_owned() });
             egui::Popup::menu(&resp)
                 .id(menu_id)
                 .gap(6.0)
                 .align(egui::RectAlign::BOTTOM_END)
                 .frame(ui_kit::menu_frame(ui))
                 .style(ui_kit::menu_style)
-                .show(|ui| ui_kit::menu_body(ui, 220.0, |ui| self.recorder_menu(ui)));
-            // Stop sits by the status it acts on, so Save clip stays at the edge.
-            ui.spacing_mut().item_spacing.x = 0.0;
-            let (slot, _) = ui.allocate_exact_size(vec2(stop_w, ui_kit::CONTROL_H), Sense::hover());
-            ui.spacing_mut().item_spacing.x = 2.0;
-            if stop_t > 0.0 && self.stop_clipping_button(ui, slot, stop_t, state == RecState::Buffering && !saving) {
-                self.stop();
+                .show(|ui| ui_kit::menu_body(ui, 240.0, |ui| self.recorder_menu(ui)));
+            // The stops sit by the status they act on, so the action stays
+            // at the edge.
+            let mut stop = None;
+            for (mode, t) in &stops {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                let (slot, _) = ui.allocate_exact_size(vec2((ui_kit::CONTROL_H + 2.0) * t, ui_kit::CONTROL_H), Sense::hover());
+                ui.spacing_mut().item_spacing.x = 2.0;
+                let enabled = state.has(*mode) && !(*mode == Mode::ReplayBuffer && saving);
+                if self.stop_button(ui, slot, *t, enabled, *mode) {
+                    stop = Some(*mode);
+                }
+            }
+            match stop {
+                Some(Mode::ReplayBuffer) => self.stop_clipping(),
+                Some(Mode::Record) => self.stop_recording(),
+                Some(Mode::Stream) => self.end_stream(),
+                None => {}
             }
             if btn.show(ui).clicked() {
-                match state {
-                    RecState::Idle => self.start_replay_buffer(),
-                    RecState::Buffering => self.save_clip(),
-                    RecState::Recording => self.stop(),
+                if state.clipping {
+                    self.save_clip();
+                } else if state.recording {
+                    self.stop_recording();
+                } else if state.streaming {
+                    self.end_stream();
+                } else {
+                    self.start_replay_buffer();
                 }
             }
         });
     }
 
-    /// The recorder's Stop clipping, at the left of `slot` (cut to it while it
-    /// opens), `t` of the way in. Quiet until pointed at, then red: Save clip
-    /// stays the bright thing in the bar. True when clicked.
-    fn stop_clipping_button(&self, ui: &mut egui::Ui, slot: Rect, t: f32, enabled: bool) -> bool {
+    /// A stop by the recorder's status, at the left of `slot` (cut to it
+    /// while it opens), `t` of the way in. Quiet until pointed at, then the
+    /// colour of what it stops: the action stays the bright thing in the
+    /// bar. Its square has a touch of that colour, so stops side by side
+    /// can be told apart. True when clicked.
+    fn stop_button(&self, ui: &mut egui::Ui, slot: Rect, t: f32, enabled: bool, mode: Mode) -> bool {
         let p = theme::pal(ui);
         let rect = Rect::from_min_size(slot.left_top(), vec2(ui_kit::CONTROL_H, ui_kit::CONTROL_H));
-        let resp = ui.interact(rect.intersect(slot), egui::Id::new("recorder_stop"), if enabled { Sense::click() } else { Sense::hover() });
+        let resp = ui.interact(rect.intersect(slot), egui::Id::new(("recorder_stop", stop_key(mode))), if enabled { Sense::click() } else { Sense::hover() });
         let hv = theme::toggle(ui.ctx(), resp.id.with("hv"), enabled && resp.hovered(), theme::FAST);
         let pressed = enabled && resp.is_pointer_button_down_on();
         let painter = ui.painter_at(slot);
-        let alpha = t * if enabled || self.rec_state != RecState::Buffering { 1.0 } else { 0.4 };
-        let fill = theme::mix(p.control_h, p.rec, hv);
+        let alpha = t * if enabled || !self.rec_state.has(mode) { 1.0 } else { 0.4 };
+        let color = match mode {
+            Mode::Stream => p.stream,
+            Mode::Record | Mode::ReplayBuffer => p.rec,
+        };
+        let fill = theme::mix(p.control_h, color, hv);
         let rect = if pressed { rect.shrink(0.5) } else { rect };
         painter.rect_filled(rect, ui_kit::RADIUS, theme::fade(fill, alpha));
         let square = Rect::from_center_size(rect.center(), vec2(10.0, 10.0));
-        painter.rect_filled(square, 2, theme::fade(theme::mix(p.text2, Color32::WHITE, hv), alpha));
-        let key = self.shortcut_keys(A::ToggleBuffer).map(|k| format!("  {}", ui_kit::key_text(&k))).unwrap_or_default();
+        let mark = match mode {
+            Mode::ReplayBuffer => p.text2,
+            Mode::Record => theme::mix(p.text2, p.rec, 0.55),
+            Mode::Stream => theme::mix(p.text2, p.stream, 0.65),
+        };
+        painter.rect_filled(square, 2, theme::fade(theme::mix(mark, Color32::WHITE, hv), alpha));
+        let (what, keys) = match mode {
+            Mode::ReplayBuffer => ("Stop clipping", self.shortcut_keys(A::ToggleBuffer)),
+            Mode::Record => ("Stop recording", self.shortcut_keys(A::ToggleRecord)),
+            Mode::Stream => ("End stream", None),
+        };
+        let key = keys.map(|k| format!("  {}", ui_kit::key_text(&k))).unwrap_or_default();
         let resp = if enabled { resp.on_hover_cursor(egui::CursorIcon::PointingHand) } else { resp };
-        resp.on_hover_text(format!("Stop clipping{key}")).clicked() && enabled
+        resp.on_hover_text(format!("{what}{key}")).clicked() && enabled
     }
 
-    /// The recorder's ∨: the other things to do now, then shortcuts to what's
-    /// recorded and how far back a clip reaches. No status repeated.
+    /// The recorder's ∨: the other things to start or stop now, how the
+    /// stream's going, then shortcuts to what's recorded and how far back a
+    /// clip reaches. No status repeated.
     fn recorder_menu(&mut self, ui: &mut egui::Ui) {
-        match self.rec_state {
-            RecState::Idle => {
-                if Item::new("Record until you stop").icon(egui_phosphor::fill::RECORD).keys(self.shortcut_keys(A::ToggleRecord)).show(ui).clicked() {
-                    self.start_recording();
-                }
+        let state = self.rec_state;
+        // The bar's action stops this already (not repeated here).
+        let main = if state.clipping {
+            None
+        } else if state.recording {
+            Some(Mode::Record)
+        } else if state.streaming {
+            Some(Mode::Stream)
+        } else {
+            None
+        };
+        // Starting clipping is the action itself while nothing runs.
+        if state.clipping {
+            if Item::new("Stop clipping").icon(egui_phosphor::fill::STOP).keys(self.shortcut_keys(A::ToggleBuffer)).show(ui).clicked() {
+                self.stop_clipping();
             }
-            RecState::Buffering => {
-                if Item::new("Stop clipping").icon(egui_phosphor::fill::STOP).keys(self.shortcut_keys(A::ToggleBuffer)).show(ui).clicked() {
-                    self.stop();
-                }
-            }
-            RecState::Recording => {}
+        } else if !state.idle() && Item::new("Start clipping").icon(egui_phosphor::fill::TIMER).keys(self.shortcut_keys(A::ToggleBuffer)).show(ui).clicked() {
+            self.start_replay_buffer();
         }
-        if self.rec_state != RecState::Recording {
+        if state.recording {
+            if main != Some(Mode::Record) && Item::new("Stop recording").icon(egui_phosphor::fill::STOP).keys(self.shortcut_keys(A::ToggleRecord)).show(ui).clicked() {
+                self.stop_recording();
+            }
+        } else if Item::new("Record until you stop").icon(egui_phosphor::fill::CIRCLE).keys(self.shortcut_keys(A::ToggleRecord)).show(ui).clicked() {
+            self.start_recording();
+        }
+        if capture::STREAMING {
+            if state.streaming {
+                if main != Some(Mode::Stream) && Item::new("End stream").icon(egui_phosphor::fill::STOP).show(ui).clicked() {
+                    self.end_stream();
+                }
+            } else if Item::new("Go live…").icon(egui_phosphor::fill::BROADCAST).show(ui).clicked() {
+                self.go_live_open = true;
+                ui.close();
+            }
+        }
+        if state.streaming {
             ui_kit::menu_sep(ui);
+            for d in self.stream_status.get() {
+                Item::new(d.name.clone()).icon(egui_phosphor::regular::BROADCAST).value(link_words(&d)).enabled(false).show(ui);
+            }
         }
+        ui_kit::menu_sep(ui);
         if Item::new("Sources").icon(icon::FADERS).value(self.sources_summary()).show(ui).clicked() {
             self.page = Page::Sources;
         }
-        if self.rec_state == RecState::Recording {
+        if state.streaming && Item::new("Streaming settings").icon(icon::GEAR).show(ui).clicked() {
+            self.open_settings(crate::settings_ui::Pane::Streaming);
+        }
+        // How far back a clip reaches: while clipping, or for when it starts.
+        if !(state.clipping || state.idle()) {
             return;
         }
         let words = crate::settings_ui::length_words(self.settings.replay_seconds);
@@ -514,7 +635,7 @@ impl App {
     }
 
     /// What's recorded, in a few words: "osu!, mic, desktop".
-    fn sources_summary(&self) -> String {
+    pub(crate) fn sources_summary(&self) -> String {
         let mut parts: Vec<String> = Vec::new();
         match &self.settings.capture {
             crate::settings::CaptureTarget::Apps { apps, .. } if !apps.is_empty() => {
@@ -762,6 +883,27 @@ pub fn status_dot(painter: &egui::Painter, c: Pos2, color: Color32, time: f64) {
         ui_kit::repaint_after(ctx, Duration::from_millis(33));
     }
     painter.circle_filled(c, 4.0, color);
+}
+
+/// A stop's place in the recorder, for its id.
+fn stop_key(mode: Mode) -> &'static str {
+    match mode {
+        Mode::ReplayBuffer => "clip",
+        Mode::Record => "record",
+        Mode::Stream => "stream",
+    }
+}
+
+/// How a place streamed to is doing, in a few words: "Live 12:03",
+/// "Connecting…", "Trying again in 8 s".
+pub(crate) fn link_words(d: &capture::stream::DestinationStatus) -> String {
+    use capture::stream::Link;
+    match d.link {
+        Link::Connecting { .. } => "Connecting…".into(),
+        Link::Live { since } => format!("Live {}", thumbs::format_duration(since.elapsed())),
+        Link::Waiting { at, .. } => format!("Trying again in {} s", at.saturating_duration_since(Instant::now()).as_secs().max(1)),
+        Link::Ended => "Ended".into(),
+    }
 }
 
 /// Dragging this (empty) part of the window moves it: there's no title bar

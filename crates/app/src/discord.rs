@@ -37,6 +37,8 @@ const GAMES_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 pub struct Status {
     /// Recording, not just the replay buffer.
     pub recording: bool,
+    /// Live.
+    pub streaming: bool,
     pub game: Game,
     /// Since when, for Discord's "elapsed" timer: when the game showed up.
     pub since: SystemTime,
@@ -122,7 +124,7 @@ fn run(rx: mpsc::Receiver<Option<Status>>, connected: Arc<AtomicBool>) {
 }
 
 fn activity(status: &Status) -> Activity<'_> {
-    let doing = if status.recording { "Recording" } else { "Clipping" };
+    let doing = if status.streaming { "Streaming" } else if status.recording { "Recording" } else { "Clipping" };
     // As Medal does it: the activity is named after the game ("osu! with
     // HasteClip") instead of the app, so it reads like the game itself.
     let g = &status.game;

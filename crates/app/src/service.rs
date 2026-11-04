@@ -15,7 +15,7 @@ use capture::{EncodeSettings, Mode};
 use crate::games::Details;
 
 pub(crate) enum Cmd {
-    Start(Mode, EncodeSettings),
+    Start(Mode, Box<EncodeSettings>),
     /// Save the replay buffer as a clip in this folder, its name ending in what
     /// happened in the game, if known.
     SaveClip(PathBuf, Details),
@@ -28,9 +28,14 @@ pub(crate) enum Cmd {
     ReplaySeconds(u32),
     /// Switch a microphone source (by id) to another device.
     SetMic(String, String),
-    /// Stop; a recording goes into this folder, named after what happened.
-    Stop(Option<PathBuf>, Details),
-    /// Stop, then signal once the file is finished (app being killed).
+    /// Frame blending changed while capturing: looks a frame, and how
+    /// they're weighed.
+    SetBlend(u32, capture::BlendShape),
+    /// Stop clipping, recording or streaming; a recording goes into this
+    /// folder, named after what happened.
+    Stop(Mode, Option<PathBuf>, Details),
+    /// Stop everything, then signal once the file is finished (app being
+    /// killed).
     StopAndAck(Sender<()>),
     /// The app is closing: end the thread (dropping the recorder finishes any
     /// recording). Asked for outright, as the shortcut handler keeps a sender
@@ -40,9 +45,10 @@ pub(crate) enum Cmd {
 
 /// Results from the capture thread, drained by the UI.
 pub enum Evt {
-    /// Authoritative capture state: `None` = idle, `Some(mode)` = capturing.
-    /// The UI syncs its own state to this so the two can never drift apart.
-    State(Option<Mode>),
+    /// Authoritative capture state: what runs now (clipping, recording,
+    /// streaming, any of them). The UI syncs its own state to this so the two
+    /// can never drift apart.
+    State(capture::Running),
     Saved(PathBuf),
     /// A screenshot is saved here, and was copied (or not).
     Shot(PathBuf, bool),
@@ -142,12 +148,12 @@ impl QuickSave {
         true
     }
 
-    /// Save a clip now, if the replay buffer runs. Whether it was asked for.
-    /// While recording, the moment's marked in the recording instead (no
-    /// clip: false).
+    /// Save a clip now, if clipping runs. Whether it was asked for. While
+    /// recording, the moment's marked in the recording too (without
+    /// clipping, only that: no clip, false).
     pub fn save(&self) -> bool {
         let Some(a) = self.armed.lock().ok().and_then(|a| a.clone()) else {
-            self.mark();
+            self.mark(true);
             return false;
         };
         let dir = crate::games::folder_for(&a.library, a.folder_per_game, &a.game_folders, self.games.clip_game().as_deref());
@@ -155,14 +161,16 @@ impl QuickSave {
             return false;
         }
         crate::sound::play_saved(&a.sound);
+        // The clip's sound says it for the mark too.
+        self.mark(false);
         true
     }
 
-    /// Mark this moment in the recording, if one runs.
-    fn mark(&self) {
-        let Some(sound) = self.marking.lock().ok().and_then(|s| s.clone()) else { return };
-        if self.games.mark() {
-            crate::sound::play_saved(&sound);
+    /// Mark this moment in the recording, if one runs (`sound`: saying so).
+    fn mark(&self, sound: bool) {
+        let Some(said) = self.marking.lock().ok().and_then(|s| s.clone()) else { return };
+        if self.games.mark() && sound {
+            crate::sound::play_saved(&said);
         }
     }
 }
@@ -212,13 +220,14 @@ impl CaptureService {
             let mut recorder = capture::default_recorder(live);
             while let Ok(cmd) = cmd_rx.recv() {
                 match cmd {
-                    Cmd::Start(mode, settings) => match recorder.start(mode, &settings) {
-                        Ok(()) => send(&evt_tx, Evt::State(Some(mode))),
-                        Err(e) => {
-                            send(&evt_tx, Evt::Error(describe(&e)));
-                            send(&evt_tx, Evt::State(None));
+                    Cmd::Start(mode, settings) => {
+                        if let Err(e) = recorder.start(mode, &settings) {
+                            eprintln!("starting {mode:?} failed: {e:#}");
+                            let why = describe(&e);
+                            send(&evt_tx, Evt::Error(if mode == Mode::Stream { format!("Couldn't go live: {why}") } else { why }));
                         }
-                    },
+                        send(&evt_tx, Evt::State(recorder.running()));
+                    }
                     // Save doesn't change capture state — still buffering afterwards.
                     // The clip's moment is taken now; it's written on its own
                     // thread, so this one is free for the next save at once.
@@ -269,16 +278,21 @@ impl CaptureService {
                             eprintln!("couldn't switch the microphone of {id} while capturing");
                         }
                     }
-                    Cmd::Stop(dir, details) => {
-                        match recorder.stop(dir.as_deref()) {
+                    Cmd::SetBlend(looks, shape) => {
+                        if !recorder.set_blend(looks, shape) {
+                            eprintln!("couldn't change frame blending while capturing");
+                        }
+                    }
+                    Cmd::Stop(mode, dir, details) => {
+                        match recorder.stop(mode, dir.as_deref()) {
                             Ok(Some(path)) => send(&evt_tx, Evt::Saved(landed(path, details))),
                             Ok(None) => {}
                             Err(e) => send(&evt_tx, Evt::Error(describe(&e))),
                         }
-                        send(&evt_tx, Evt::State(None));
+                        send(&evt_tx, Evt::State(recorder.running()));
                     }
                     Cmd::StopAndAck(ack) => {
-                        let _ = recorder.stop(None);
+                        recorder.stop_all();
                         let _ = ack.send(());
                     }
                     Cmd::Quit => break,
@@ -291,7 +305,7 @@ impl CaptureService {
 
     pub fn start(&self, mode: Mode, settings: EncodeSettings) {
         self.in_flight.sent();
-        self.send(Cmd::Start(mode, settings));
+        self.send(Cmd::Start(mode, Box::new(settings)));
     }
     /// A way to save a clip from another thread (a shortcut's).
     pub fn quick_save(&self, games: crate::games::Tracker) -> QuickSave {
@@ -305,9 +319,13 @@ impl CaptureService {
     pub fn screenshot(&self, dir: PathBuf, video: capture::VideoSource, options: crate::screenshot::Options) {
         self.send(Cmd::Screenshot(dir, video, options));
     }
-    pub fn stop(&self, dir: Option<PathBuf>, details: Details) {
+    /// Stop `mode` (a recording into `dir`, named after `details`).
+    pub fn stop(&self, mode: Mode, dir: Option<PathBuf>, details: Details) {
         self.in_flight.sent();
-        self.send(Cmd::Stop(dir, details));
+        self.send(Cmd::Stop(mode, dir, details));
+    }
+    pub fn set_blend(&self, looks: u32, shape: capture::BlendShape) {
+        self.send(Cmd::SetBlend(looks, shape));
     }
     pub fn update_video(&self, video: capture::VideoSource) {
         self.send(Cmd::UpdateVideo(video));

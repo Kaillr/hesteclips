@@ -65,7 +65,7 @@ use objc2_video_toolbox::{
 
 use crate::aac::AacEncoder;
 use crate::mixer::{self, Channel, Clock, LiveAudio, SourceFeed, SourceStatus};
-use crate::output::{in_progress, timestamp};
+use crate::outputs::{Capture, Outputs};
 use crate::sources::{AudioCapture, AudioSource, Retry, SourceKind, mix_inputs, track_layout};
 use crate::avwriter::{SendFormat, SendSample};
 use crate::writer::{self, Layout, Media, Writer};
@@ -76,125 +76,58 @@ use crate::{EncodeSettings, Mode, Recorder};
 use crate::AUDIO_BITRATE;
 
 pub struct SckRecorder {
-    session: Option<Session>,
-    mode: Option<Mode>,
-    current_file: Option<PathBuf>,
-    replay_seconds: u32,
-    output_dir: PathBuf,
-    container_ext: String,
+    outputs: Outputs<Session>,
     live: Arc<LiveAudio>,
 }
 
 impl SckRecorder {
     /// `live` receives the meters and supplies each source's volume.
     pub fn new(live: Arc<LiveAudio>) -> Self {
-        Self {
-            session: None,
-            mode: None,
-            current_file: None,
-            replay_seconds: 60,
-            output_dir: PathBuf::from("."),
-            container_ext: "mp4".to_string(),
-            live,
-        }
+        Self { outputs: Outputs::new(), live }
     }
 }
 
 impl Recorder for SckRecorder {
     fn start(&mut self, mode: Mode, settings: &EncodeSettings) -> Result<()> {
-        if self.session.is_some() {
-            let _ = self.stop(None);
-        }
-        self.replay_seconds = settings.replay_seconds;
-        self.output_dir = settings.output_dir.clone();
-        // AVAssetWriter writes MP4 and MOV; MKV isn't one of them.
-        self.container_ext = if settings.container_ext == "mov" { "mov".into() } else { "mp4".into() };
-        std::fs::create_dir_all(&settings.output_dir)?;
-
-        let s = settings.clone();
-        let target = match mode {
-            Mode::Record => {
-                let file = self.output_dir.join(format!("recording_{}.{}", timestamp(), self.container_ext));
-                self.current_file = Some(file.clone());
-                Target::Record(in_progress(&file))
-            }
-            Mode::ReplayBuffer => {
-                self.current_file = None;
-                Target::Replay(settings.replay_seconds as f64)
-            }
-        };
-        self.session = Some(Session::start(&s, target, &self.live)?);
-        self.mode = Some(mode);
-        Ok(())
+        let live = self.live.clone();
+        // AVAssetWriter writes MP4 and MOV by the file's name.
+        self.outputs.start(mode, settings, |s, _mov| Session::start(s, &live))
     }
 
     fn save_clip(&mut self, dir: &Path) -> Result<crate::PendingClip> {
-        let session = self.session.as_ref().filter(|_| self.mode == Some(Mode::ReplayBuffer));
-        let session = session.context("replay buffer is not running")?;
-        std::fs::create_dir_all(dir)?;
-        writer::request_clip(&session.writer_tx, dir, &self.container_ext, self.replay_seconds as f64)
+        self.outputs.save_clip(dir)
     }
 
-    fn stop(&mut self, dir: Option<&Path>) -> Result<Option<PathBuf>> {
-        let finished = self.session.take().map(Session::finish);
-        let file = self.current_file.take();
-        let was_record = self.mode == Some(Mode::Record);
-        self.mode = None;
-        if !was_record {
-            return Ok(None);
-        }
-        let Some(file) = file else { return Ok(None) };
-        let partial = in_progress(&file);
-        if let Some(Err(e)) = finished {
-            // A fragmented MP4 is still playable up to the failure: keep what we got.
-            if !partial.exists() {
-                return Err(e.context("recording failed"));
-            }
-            eprintln!("recording ended with an error: {e:#}");
-        }
-        if !partial.exists() {
-            bail!("recording failed — nothing was written");
-        }
-        let file = crate::output::destination(&file, dir);
-        crate::output::finish_rename(&partial, &file).context("couldn't finish the recording")?;
-        Ok(Some(file))
+    fn stop(&mut self, mode: Mode, dir: Option<&Path>) -> Result<Option<PathBuf>> {
+        self.outputs.stop(mode, dir)
     }
 
-    fn is_running(&self) -> bool {
-        self.session.is_some()
+    fn stop_all(&mut self) {
+        self.outputs.stop_all();
+    }
+
+    fn running(&self) -> crate::Running {
+        self.outputs.running()
     }
 
     fn set_replay_seconds(&mut self, seconds: u32) {
-        self.replay_seconds = seconds;
-        if let Some(session) = self.session.as_ref().filter(|_| self.mode == Some(Mode::ReplayBuffer)) {
-            let _ = session.writer_tx.send(writer::Command::SetWindow(seconds as f64));
-        }
+        self.outputs.set_replay_seconds(seconds);
     }
 
     fn update_video(&mut self, video: &crate::VideoSource) -> bool {
-        self.session.as_mut().and_then(|s| s.video.as_mut()).is_some_and(|p| p.update(video))
+        self.outputs.session.as_mut().and_then(|s| s.video.as_mut()).is_some_and(|p| p.update(video))
     }
 
     fn set_mic(&mut self, id: &str, device: &str) -> bool {
-        self.session.as_mut().and_then(|s| s.audio.as_mut()).is_some_and(|a| a.set_mic(id, device))
+        self.outputs.session.as_mut().and_then(|s| s.audio.as_mut()).is_some_and(|a| a.set_mic(id, device))
     }
 }
 
 impl Drop for SckRecorder {
     /// Dropping (app quit) must still finalise the file.
     fn drop(&mut self) {
-        if self.session.is_some() {
-            let _ = self.stop(None);
-        }
+        self.outputs.stop_all();
     }
-}
-
-/// Where a session's media goes.
-enum Target {
-    /// Straight to this (hidden, partial) file.
-    Record(PathBuf),
-    /// An in-memory ring of this many seconds.
-    Replay(f64),
 }
 
 // ---------------------------------------------------------------------------
@@ -220,8 +153,18 @@ struct Session {
     writer: Option<Writer>,
 }
 
+impl Capture for Session {
+    fn writer(&self) -> &Sender<writer::Command> {
+        &self.writer_tx
+    }
+
+    fn finish(self) -> Result<()> {
+        self.end()
+    }
+}
+
 impl Session {
-    fn start(s: &EncodeSettings, target: Target, live: &Arc<LiveAudio>) -> Result<Self> {
+    fn start(s: &EncodeSettings, live: &Arc<LiveAudio>) -> Result<Self> {
         // How it keeps up (the warnings by the recorder) counts from here.
         crate::capture_started();
         let (content, display, (width, height)) = video::plan(&s.video, s.size)?;
@@ -243,10 +186,7 @@ impl Session {
             audio_titles: titles.clone(),
             comment,
         };
-        let writer = match target {
-            Target::Record(file) => Writer::record(file, layout, s.fps),
-            Target::Replay(seconds) => Writer::replay(seconds, layout, s.fps),
-        };
+        let writer = Writer::new(layout, s.fps);
         let writer_tx = writer.tx.clone();
 
         let mut session =
@@ -302,14 +242,15 @@ impl Session {
             Ok(())
         })();
         if let Err(e) = started {
-            let _ = session.finish();
+            let _ = session.end();
             return Err(e);
         }
         Ok(session)
     }
 
-    /// Stop capturing and finish the file (record) or drop the ring (replay).
-    fn finish(mut self) -> Result<()> {
+    /// Stop capturing and finish what the writer was doing (a recording's
+    /// file; the ring's let go).
+    fn end(mut self) -> Result<()> {
         // The pacer flushes the video encoder on its way out.
         if let Some((stop, handle)) = self.pacer.take() {
             stop.store(true, Ordering::Relaxed);
@@ -1025,6 +966,7 @@ pub(crate) fn probe_encoder(width: usize, height: usize) -> String {
         output_dir: std::env::temp_dir(), container_ext: "mp4".into(), fps: 60, blend_samples: 1, blend_shape: Default::default(), video_bitrate_kbps: 20000, size: Default::default(),
         use_hardware: true, replay_seconds: 5, video: crate::VideoSource::Screen { id: String::new(), hook: Default::default(), method: Default::default() },
         away_screen: None, webcam: None, screen: std::sync::Arc::new(std::sync::Mutex::new(crate::ScreenPlacement::whole(crate::Framing::Fit))), sources: Vec::new(),
+        stream: None,
     };
     match probe_video_format(width, height, &s) {
         Ok(_) => "ok".into(),

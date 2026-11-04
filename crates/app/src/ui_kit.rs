@@ -472,6 +472,8 @@ pub enum Kind {
     Ghost,
     /// Recording's stop, destructive confirmations: red.
     Stop,
+    /// Going live, and the stream's end: streaming's purple.
+    Live,
     /// A destructive action that isn't the point of the screen: red text.
     DangerText,
     /// On, like a toggled tool (snapping on).
@@ -673,6 +675,7 @@ impl<'a> Btn<'a> {
                 Kind::Normal => (theme::mix(p.control, p.control_h, hv), p.text),
                 Kind::Ghost => (theme::fade(p.sel, hv * if p.dark { 1.0 } else { 0.0 }).blend(theme::fade(p.control, if p.dark { 0.0 } else { hv })), theme::mix(p.text2, p.text, hv)),
                 Kind::Stop => (theme::mix(p.rec, Color32::WHITE, hv * 0.12), Color32::WHITE),
+                Kind::Live => (theme::mix(p.stream, Color32::WHITE, hv * 0.12), Color32::WHITE),
                 Kind::DangerText => (theme::fade(p.sel, hv).blend(theme::fade(p.control, if p.dark { 0.0 } else { hv })), p.danger),
                 Kind::On => (p.seg_on, p.text),
             };
@@ -1991,6 +1994,37 @@ pub fn text_field(ui: &mut egui::Ui, text: &mut String, hint: &str) -> egui::tex
         })
         .inner;
     out
+}
+
+/// A [`text_field`] for a secret (a stream key): free text, shown as dots
+/// unless `shown`. As wide as `width`.
+#[allow(clippy::disallowed_methods)] // the free-text box itself
+pub fn secret_field(ui: &mut egui::Ui, id: egui::Id, text: &mut String, hint: &str, shown: bool, width: f32) -> Response {
+    let p = theme::pal(ui);
+    let focused = ui.memory(|m| m.has_focus(id));
+    ui.allocate_ui(vec2(width, CONTROL_H), |ui| {
+        egui::Frame::new()
+            .fill(p.control)
+            .corner_radius(RADIUS)
+            .stroke(Stroke::new(1.5, if focused { p.text2 } else { Color32::TRANSPARENT }))
+            .inner_margin(Margin::symmetric(10, 7))
+            .show(ui, |ui| {
+                egui::TextEdit::singleline(text)
+                    .id(id)
+                    .password(!shown)
+                    .frame(egui::Frame::NONE)
+                    .hint_text(theme::text(hint, 13.0, W::Regular).color(p.text3))
+                    .font(theme::font(13.0, W::Regular))
+                    .text_color(p.text)
+                    .desired_width(f32::INFINITY)
+                    .margin(Margin::ZERO)
+                    .show(ui)
+                    .response
+                    .response
+            })
+            .inner
+    })
+    .inner
 }
 
 // --- Inputs ---

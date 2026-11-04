@@ -865,10 +865,12 @@ static SAVES: OnceLock<std::sync::Mutex<std::collections::VecDeque<(PathBuf, Pat
 pub(crate) fn capture_thread(rx: mpsc::Receiver<crate::service::Cmd>, tx: mpsc::Sender<crate::service::Evt>) -> std::thread::JoinHandle<()> {
     use crate::service::{Cmd, Evt};
     std::thread::spawn(move || {
+        let mut running = capture::Running::default();
         while let Ok(cmd) = rx.recv() {
             match cmd {
                 Cmd::Start(mode, _) => {
-                    let _ = tx.send(Evt::State(Some(mode)));
+                    running = running.with(mode, true);
+                    let _ = tx.send(Evt::State(running));
                 }
                 Cmd::SaveClip(dir, details) => {
                     let next = SAVES.get().and_then(|q| q.lock().ok()?.pop_front());
@@ -901,14 +903,15 @@ pub(crate) fn capture_thread(rx: mpsc::Receiver<crate::service::Cmd>, tx: mpsc::
                         let _ = tx.send(Evt::Saved(crate::service::landed(to, details)));
                     });
                 }
-                Cmd::Stop(..) => {
-                    let _ = tx.send(Evt::State(None));
+                Cmd::Stop(mode, ..) => {
+                    running = running.with(mode, false);
+                    let _ = tx.send(Evt::State(running));
                 }
                 Cmd::StopAndAck(ack) => {
                     let _ = ack.send(());
                 }
                 Cmd::Quit => break,
-                Cmd::UpdateVideo(_) | Cmd::ReplaySeconds(_) | Cmd::SetMic(..) | Cmd::Screenshot(..) => {}
+                Cmd::UpdateVideo(_) | Cmd::ReplaySeconds(_) | Cmd::SetMic(..) | Cmd::SetBlend(..) | Cmd::Screenshot(..) => {}
             }
         }
     })
