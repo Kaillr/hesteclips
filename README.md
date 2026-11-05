@@ -29,6 +29,7 @@
 - [Compared with other recorders](#compared-with-other-recorders)
 - [Platform support](#platform-support)
 - [Building from source](#building-from-source)
+- [Star history](#star-history)
 - [License](#license)
 
 ## Download
@@ -220,6 +221,16 @@ The release scripts build the app and bundle ffmpeg:
 - `scripts/release.ps1` (Windows) also bundles OBS Studio's game capture hook. It packs everything with [Velopack](https://velopack.io) into the installer and the delta update packages.
 - `scripts/release-mac.sh` builds the `.dmg`.
 - `scripts/release-linux.sh` builds the tarball.
+
+## Star history
+
+<a href="https://www.star-history.com/?repos=hasteclip%2Fhasteclip&type=date&legend=bottom-right">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=hasteclip/hasteclip&type=date&theme=dark&legend=bottom-right" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=hasteclip/hasteclip&type=date&legend=bottom-right" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=hasteclip/hasteclip&type=date&legend=bottom-right" />
+ </picture>
+</a>
 
 ## License
 
