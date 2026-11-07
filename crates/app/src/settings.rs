@@ -409,9 +409,94 @@ pub enum CaptureTarget {
     App { id: String, name: String },
 }
 
+/// One of the video's sources, as its order names it: the screen (or games
+/// and apps), a webcam, another display (by their own `key`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LayerKey {
+    Screen,
+    Webcam(u64),
+    Visual(u64),
+}
+
+/// What a source in a box of its own shows.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Visual {
+    /// Another display, all of it (`capture::Device::id`; `name` while it
+    /// isn't connected).
+    Display { id: String, name: String },
+    /// One app's main window, by executable.
+    Window { app: String, name: String },
+    /// An image file (its transparency kept).
+    Image { path: PathBuf },
+    /// All of its box one colour (R, G, B, A).
+    Colour { rgba: [u8; 4] },
+    /// Words, one line each, drawn `size` pixels tall (in the video's pixels
+    /// at 1080p) in `rgba`, with a soft shadow under them or not.
+    Text { text: String, size: u32, rgba: [u8; 4], shadow: bool },
+    /// A web page (alerts, a chat overlay), drawn `width`×`height` big.
+    Browser { url: String, width: u32, height: u32 },
+}
+
+impl Visual {
+    /// What it's called on its card.
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            Visual::Display { .. } => "Display",
+            Visual::Window { .. } => "Window",
+            Visual::Image { .. } => "Image",
+            Visual::Colour { .. } => "Colour",
+            Visual::Text { .. } => "Text",
+            Visual::Browser { .. } => "Browser",
+        }
+    }
+
+    /// Whether its box takes any shape (a colour has none of its own).
+    pub fn shapeless(&self) -> bool {
+        matches!(self, Visual::Colour { .. })
+    }
+}
+
+/// A source in the video in a box of its own, beside the screen: another
+/// display, an app's window, an image, a colour, words. All of it, in its
+/// box (or the video's middle, fitted, until it's placed; a colour all of
+/// the video), turned and flipped. On the platforms that draw more than one
+/// source (`capture::layers::MANY`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VisualCfg {
+    /// Its own, for the video's order; never another source's.
+    pub key: u64,
+    #[serde(flatten)]
+    pub visual: Visual,
+    /// In the clips. Off keeps its place for later.
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    /// Placed by hand: its box. `None`: fitted in the middle of the video.
+    #[serde(default)]
+    pub placed: Option<BoxCfg>,
+    #[serde(default)]
+    pub turns: u8,
+    #[serde(default)]
+    pub flip_h: bool,
+    #[serde(default)]
+    pub flip_v: bool,
+}
+
+impl VisualCfg {
+    /// `visual`, on, where it goes at first.
+    pub fn new(key: u64, visual: Visual) -> Self {
+        Self { key, visual, enabled: true, placed: None, turns: 0, flip_h: false, flip_v: false }
+    }
+}
+
 /// A webcam drawn over the recording.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WebcamCfg {
+    /// Its own, for the video's order; never another webcam's. 0 in one
+    /// from before there could be several (given one on load).
+    #[serde(default)]
+    pub key: u64,
     /// Backend id (`capture::webcam::list_cameras`).
     pub id: String,
     /// What to call it while it isn't connected.
@@ -1009,8 +1094,17 @@ pub struct RecordSettings {
     /// The games and apps list while the whole screen is recorded, so
     /// switching back to games and apps brings it back.
     pub idle_apps: Option<CaptureTarget>,
-    /// A webcam over the picture (or under it), if any.
+    /// The first webcam, as older versions read it (they had one): written
+    /// on save, moved into `webcams` on load, `None` in between.
     pub webcam: Option<WebcamCfg>,
+    /// The webcams over the picture (or under it).
+    pub webcams: Vec<WebcamCfg>,
+    /// Other displays in the video, besides the screen.
+    pub visuals: Vec<VisualCfg>,
+    /// The video's sources, the one in front first (see `layer_order`).
+    /// Empty in settings from before it was kept: the screen's `in_front`
+    /// says then.
+    pub layer_order: Vec<LayerKey>,
     /// The screen as a source in the video: in front or behind, its box.
     pub screen: ScreenCfg,
     /// Each camera's settings changed from its defaults (control id, as
@@ -1169,6 +1263,9 @@ impl Default for RecordSettings {
             capture: CaptureTarget::Screen,
             idle_apps: None,
             webcam: None,
+            webcams: Vec::new(),
+            visuals: Vec::new(),
+            layer_order: Vec::new(),
             screen: ScreenCfg::default(),
             camera_controls: Default::default(),
             display_id: None,
@@ -1374,7 +1471,7 @@ impl RecordSettings {
             None => ([0.0, 0.0, 1.0, 1.0], self.framing.into()),
         };
         let crop = self.screen_crop.filter(|c| capture::SCREEN_CROP && !apps && !c.is_none()).map(Into::into);
-        capture::ScreenPlacement { rect, framing, in_front: s.in_front, hidden: !s.enabled, crop, turns: s.turns % 4, flip_h: s.flip_h, flip_v: s.flip_v }
+        capture::ScreenPlacement { rect, framing, in_front: self.screen_in_front(), hidden: !s.enabled, crop, turns: s.turns % 4, flip_h: s.flip_h, flip_v: s.flip_v }
     }
 
     pub fn blend_samples(&self) -> u32 {
@@ -1457,6 +1554,7 @@ impl RecordSettings {
     fn from_saved(bytes: Option<&[u8]>) -> Self {
         let mut s: Self = bytes.and_then(Self::from_json).unwrap_or_default();
         s.upgrade_capture();
+        s.upgrade_webcams();
         s.upgrade_save_sound();
         s.upgrade_noise_reduction();
         if let Some(old) = s.audio_tracks.take() {
@@ -1475,6 +1573,118 @@ impl RecordSettings {
                 away_screen: true,
             };
         }
+    }
+
+    /// The one webcam of settings from before there could be several
+    /// becomes the first of the list, in front of the screen or behind it
+    /// as it was; every webcam and display gets a key of its own.
+    fn upgrade_webcams(&mut self) {
+        if let Some(w) = self.webcam.take()
+            && self.webcams.is_empty()
+        {
+            self.webcams.push(w);
+        }
+        let mut used: Vec<u64> = Vec::new();
+        for w in &mut self.webcams {
+            if w.key == 0 || used.contains(&w.key) {
+                w.key = used.iter().copied().max().unwrap_or(0) + 1;
+            }
+            used.push(w.key);
+        }
+        let mut used: Vec<u64> = Vec::new();
+        for d in &mut self.visuals {
+            if d.key == 0 || used.contains(&d.key) {
+                d.key = used.iter().copied().max().unwrap_or(0) + 1;
+            }
+            used.push(d.key);
+        }
+        if self.layer_order.is_empty() {
+            let cams = self.webcams.iter().map(|w| LayerKey::Webcam(w.key));
+            self.layer_order = if self.screen.in_front { std::iter::once(LayerKey::Screen).chain(cams).collect() } else { cams.chain(std::iter::once(LayerKey::Screen)).collect() };
+        }
+        self.layer_order = self.layer_order();
+    }
+
+    /// The video's sources, the one in front first: as they were put, any
+    /// not in the order yet in front (new ones), each once.
+    pub fn layer_order(&self) -> Vec<LayerKey> {
+        let exists = |k: &LayerKey| match k {
+            LayerKey::Screen => true,
+            LayerKey::Webcam(key) => self.webcams.iter().any(|w| w.key == *key),
+            LayerKey::Visual(key) => self.visuals.iter().any(|d| d.key == *key),
+        };
+        let all = std::iter::once(LayerKey::Screen).chain(self.webcams.iter().map(|w| LayerKey::Webcam(w.key))).chain(self.visuals.iter().map(|d| LayerKey::Visual(d.key)));
+        let mut order: Vec<LayerKey> = all.filter(|k| !self.layer_order.contains(k)).collect();
+        for k in &self.layer_order {
+            if exists(k) && !order.contains(k) {
+                order.push(*k);
+            }
+        }
+        order
+    }
+
+    /// A key no webcam or display has.
+    pub fn new_key(&self) -> u64 {
+        self.webcams.iter().map(|w| w.key).chain(self.visuals.iter().map(|d| d.key)).max().unwrap_or(0) + 1
+    }
+
+    pub fn webcam(&self, key: u64) -> Option<&WebcamCfg> {
+        self.webcams.iter().find(|w| w.key == key)
+    }
+
+    pub fn webcam_mut(&mut self, key: u64) -> Option<&mut WebcamCfg> {
+        self.webcams.iter_mut().find(|w| w.key == key)
+    }
+
+    /// The webcam showing camera `device`, if one does.
+    pub fn webcam_of(&self, device: &str) -> Option<&WebcamCfg> {
+        self.webcams.iter().find(|w| w.id == device)
+    }
+
+    pub fn visual(&self, key: u64) -> Option<&VisualCfg> {
+        self.visuals.iter().find(|d| d.key == key)
+    }
+
+    pub fn visual_mut(&mut self, key: u64) -> Option<&mut VisualCfg> {
+        self.visuals.iter_mut().find(|d| d.key == key)
+    }
+
+    /// Take a webcam or display out (the screen stays).
+    pub fn remove_layer(&mut self, layer: LayerKey) {
+        match layer {
+            LayerKey::Screen => {}
+            LayerKey::Webcam(key) => self.webcams.retain(|w| w.key != key),
+            LayerKey::Visual(key) => self.visuals.retain(|d| d.key != key),
+        }
+        self.layer_order.retain(|l| *l != layer);
+    }
+
+    /// The first webcam in the order (the one in front), if any: the one
+    /// drawn where only one is (`capture::layers::MANY`).
+    pub fn first_webcam(&self) -> Option<&WebcamCfg> {
+        self.layer_order().into_iter().find_map(|l| match l {
+            LayerKey::Webcam(key) => self.webcam(key),
+            _ => None,
+        })
+    }
+
+    /// Whether the screen's in front of the first webcam (see `first_webcam`).
+    pub fn screen_in_front(&self) -> bool {
+        let order = self.layer_order();
+        let first = self.first_webcam().map(|w| LayerKey::Webcam(w.key));
+        let at = |k: LayerKey| order.iter().position(|l| *l == k);
+        first.is_none_or(|w| at(LayerKey::Screen) < at(w))
+    }
+
+    /// Where another display goes in the video (`frame_aspect`: the video's
+    /// shape; `picture`: the display's size, when known): its box, all of
+    /// it fitted in; off, hidden.
+    pub fn visual_placement(&self, d: &VisualCfg) -> capture::ScreenPlacement {
+        let (rect, framing) = match d.placed {
+            Some(b) => ([b.x, b.y, b.w, b.h], if b.stretched() || d.visual.shapeless() { capture::Framing::Stretch } else { capture::Framing::Fit }),
+            None => ([0.0, 0.0, 1.0, 1.0], if d.visual.shapeless() { capture::Framing::Stretch } else { capture::Framing::Fit }),
+        };
+        capture::ScreenPlacement { rect, framing, in_front: false, hidden: !d.enabled, crop: None, turns: d.turns % 4, flip_h: d.flip_h, flip_v: d.flip_v }
     }
 
     /// A built-in sound that's gone (Silverfish) becomes the default, so the
@@ -1562,6 +1772,10 @@ impl RecordSettings {
         let mut s = self.clone();
         s.saved_size = Some(SizeCfg { resolution: self.resolution, shape: self.shape });
         (s.resolution, s.shape) = self.size_for_older();
+        // Older versions have one webcam, in front of the screen or behind it.
+        s.webcam = self.first_webcam().cloned();
+        s.screen.in_front = self.screen_in_front();
+        s.layer_order = self.layer_order();
         serde_json::to_string_pretty(&s).unwrap_or_default()
     }
 
@@ -2070,6 +2284,47 @@ mod tests {
         )
         .unwrap();
         assert!(s.webcam.unwrap().enabled);
+    }
+
+    /// The one webcam of older settings becomes the first of the list, in
+    /// front of the screen or behind it as it was; saved, older versions
+    /// read their one webcam and which is in front back.
+    #[test]
+    fn one_webcam_becomes_a_list_and_back() {
+        let cam = r#""webcam": {"id": "cam", "name": "Cam", "placement": {"x": 0.7, "y": 0.7, "w": 0.25, "h": 0.25}}"#;
+        let behind = RecordSettings::from_saved(Some(format!("{{{cam}}}").as_bytes()));
+        assert!(behind.webcam.is_none());
+        assert_eq!(behind.webcams.len(), 1);
+        let key = behind.webcams[0].key;
+        assert!(key != 0);
+        assert_eq!(behind.layer_order(), vec![LayerKey::Webcam(key), LayerKey::Screen]);
+        let front = RecordSettings::from_saved(Some(format!(r#"{{{cam}, "screen": {{"in_front": true}}}}"#).as_bytes()));
+        assert_eq!(front.layer_order(), vec![LayerKey::Screen, LayerKey::Webcam(front.webcams[0].key)]);
+        // Saved: the first webcam (the one in front) where older versions look.
+        let mut two = behind.clone();
+        two.webcams.push(WebcamCfg { key: 9, id: "other".into(), ..two.webcams[0].clone() });
+        two.layer_order = vec![LayerKey::Screen, LayerKey::Webcam(9), LayerKey::Webcam(key)];
+        let old: serde_json::Value = serde_json::from_str(&two.to_json()).unwrap();
+        assert_eq!(old["webcam"]["id"], "other");
+        assert_eq!(old["screen"]["in_front"], true);
+        // And read back as it was.
+        let again = RecordSettings::from_saved(Some(two.to_json().as_bytes()));
+        assert_eq!(again.webcams.len(), 2);
+        assert_eq!(again.layer_order(), two.layer_order());
+    }
+
+    /// The order names each source once, new ones in front, gone ones left out.
+    #[test]
+    fn the_order_keeps_up_with_the_sources() {
+        let mut s = RecordSettings::default();
+        assert_eq!(s.layer_order(), vec![LayerKey::Screen]);
+        s.visuals.push(VisualCfg::new(3, Visual::Display { id: "d".into(), name: "D".into() }));
+        s.layer_order = vec![LayerKey::Screen, LayerKey::Webcam(7)];
+        assert_eq!(s.layer_order(), vec![LayerKey::Visual(3), LayerKey::Screen]);
+        assert_eq!(s.new_key(), 4);
+        s.remove_layer(LayerKey::Visual(3));
+        assert_eq!(s.layer_order(), vec![LayerKey::Screen]);
+        assert!(s.screen_in_front());
     }
 
     #[test]

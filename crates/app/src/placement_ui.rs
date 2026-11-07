@@ -67,7 +67,8 @@ impl App {
         let aspect = vw as f32 / vh.max(1) as f32;
         let rect = match layer {
             Layer::Screen => self.screen_rect(aspect),
-            Layer::Webcam => self.webcam_placement().map(|p| Rect::from_min_size(Pos2::new(p.x, p.y), vec2(p.w, p.h)))?,
+            Layer::Webcam(key) => self.webcam_placement(key).map(|p| Rect::from_min_size(Pos2::new(p.x, p.y), vec2(p.w, p.h)))?,
+            Layer::Visual(key) => self.visual_rect(key, aspect),
         };
         Some(((vw, vh), aspect, rect))
     }
@@ -88,9 +89,13 @@ impl App {
                 let at = s.placed.and(at.as_deref());
                 summary(at, s.placed.is_some_and(|b| b.stretched()), s.turns, s.flip_h, s.flip_v)
             }
-            Layer::Webcam => {
-                let Some(p) = self.webcam_placement() else { return };
+            Layer::Webcam(key) => {
+                let Some(p) = self.webcam_placement(key) else { return };
                 summary(at.as_deref(), (p.stretch - 1.0).abs() > 0.02, p.turns, p.flip_h, p.flip_v)
+            }
+            Layer::Visual(key) => {
+                let Some(d) = self.settings.visual(key).cloned() else { return };
+                summary(d.placed.and(at.as_deref()), d.placed.is_some_and(|b| b.stretched()), d.turns, d.flip_h, d.flip_v)
             }
         };
         let was = self.arrangement();
@@ -143,14 +148,21 @@ impl App {
     fn placement_numbers(&mut self, ui: &mut egui::Ui, layer: Layer) {
         use egui_phosphor::regular as icon;
         let Some(((vw, vh), aspect, rect)) = self.placed_in(layer) else { return };
-        let screen = layer == Layer::Screen;
+        // The screen and other displays can reach past the video's edges.
+        let screen = matches!(layer, Layer::Screen | Layer::Visual(_));
         let [x, y, w, h] = to_pixels(rect, (vw, vh));
-        let (can_place, can_size) = if screen { self.screen_resettable(aspect) } else { self.webcam_resettable() };
+        let (can_place, can_size) = self.layer_resettable(layer, aspect);
         let (turns, mirrored, upside_down) = match layer {
             Layer::Screen => (self.settings.screen.turns, self.settings.screen.flip_h, self.settings.screen.flip_v),
-            Layer::Webcam => self.webcam_placement().map_or((0, false, false), |p| (p.turns, p.flip_h, p.flip_v)),
+            Layer::Webcam(key) => self.webcam_placement(key).map_or((0, false, false), |p| (p.turns, p.flip_h, p.flip_v)),
+            Layer::Visual(key) => self.settings.visual(key).map_or((0, false, false), |d| (d.turns, d.flip_h, d.flip_v)),
         };
-        let size_id = if screen { "placement_screen_size" } else { "placement_webcam_size" };
+        let size_id = match layer {
+            Layer::Screen => "placement_screen_size".to_owned(),
+            Layer::Webcam(key) => format!("placement_webcam_size_{key}"),
+            Layer::Visual(key) => format!("placement_display_size_{key}"),
+        };
+        let size_id = size_id.as_str();
         // Linked at first: typed, the size keeps its shape, as dragging does
         // (unlinked, it stretches, as Shift does).
         let linked_once = egui::Id::new((size_id, "linked"));
@@ -241,7 +253,8 @@ impl App {
                 let size_tip = match layer {
                     Layer::Screen if self.video_shaped() => "Back to the size the video gives it, where it is",
                     Layer::Screen => "As big as the video again, where it is",
-                    Layer::Webcam => "A quarter of the video wide again, unstretched, where it is",
+                    Layer::Webcam(_) => "A quarter of the video wide again, unstretched, where it is",
+                    Layer::Visual(_) => "As big as fits in the video again, where it is",
                 };
                 reset_size = Btn::ghost("Reset size").small().enabled(can_size).tip(size_tip).show(ui).clicked();
                 let place_tip = if screen { "Back in the middle of the video, its size kept" } else { "Back to the bottom-right corner, its size kept" };
@@ -255,17 +268,18 @@ impl App {
         ui.add_space((ui_kit::WELL_GAP - (crate::sources_ui::GROUP_PAD - (crate::sources_ui::GROUP_ROW_H - ui_kit::CONTROL_H) / 2.0)).max(0.0));
 
         if reset_place {
-            if screen { self.screen_reset_position(aspect) } else { self.webcam_reset_position(aspect) }
+            self.layer_reset_position(layer, aspect);
         }
         if reset_size {
-            if screen { self.screen_reset_size(aspect) } else { self.webcam_reset_size(aspect) }
+            self.layer_reset_size(layer, aspect);
         }
         if let Some(px) = moved {
             let r = from_pixels(px, (vw, vh));
             match layer {
                 Layer::Screen => self.place_or_frame(r, aspect),
-                Layer::Webcam => {
-                    if let Some(cam) = self.settings.webcam.as_mut() {
+                Layer::Visual(key) => self.place_visual(key, r, aspect),
+                Layer::Webcam(key) => {
+                    if let Some(cam) = self.settings.webcam_mut(key) {
                         let p: capture::webcam::Placement = cam.placement.into();
                         // Another shape typed (unlinked): as much more stretched.
                         let stretch = p.stretch * (r.width() / r.height().max(1e-6)) / (p.w / p.h.max(1e-6));

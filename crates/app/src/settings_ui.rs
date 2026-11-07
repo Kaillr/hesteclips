@@ -1356,7 +1356,9 @@ impl App {
                     fresh.audio_sources = std::mem::take(&mut self.settings.audio_sources);
                     fresh.capture = std::mem::take(&mut self.settings.capture);
                     fresh.idle_apps = self.settings.idle_apps.take();
-                    fresh.webcam = self.settings.webcam.take();
+                    fresh.webcams = std::mem::take(&mut self.settings.webcams);
+                    fresh.visuals = std::mem::take(&mut self.settings.visuals);
+                    fresh.layer_order = std::mem::take(&mut self.settings.layer_order);
                     fresh.camera_controls = std::mem::take(&mut self.settings.camera_controls);
                     fresh.display_id = self.settings.display_id.take();
                     fresh.display_index = self.settings.display_index;

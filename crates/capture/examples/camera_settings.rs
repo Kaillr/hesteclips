@@ -13,7 +13,7 @@ fn main() {
     }) {
         capture::webcam::remember_controls(&cam.id, vec![(id, value)]);
     }
-    capture::webcam::keep_open(Some((cam.id.clone(), None)));
+    capture::webcam::keep_open(vec![(cam.id.clone(), None)]);
     let t = std::time::Instant::now();
     while !matches!(capture::webcam::status(), capture::webcam::Status::Live { .. }) && t.elapsed().as_secs() < 10 {
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -46,5 +46,5 @@ fn main() {
             println!("put back {}: {:?}", b.value, capture::webcam::set_camera_control(&cam.id, id, b.value));
         }
     }
-    capture::webcam::keep_open(None);
+    capture::webcam::keep_open(Vec::new());
 }

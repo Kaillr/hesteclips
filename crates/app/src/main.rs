@@ -19,6 +19,7 @@ mod clips;
 mod collections;
 mod crop_ui;
 mod demo;
+mod visuals_ui;
 mod webcam_ui;
 mod discord;
 mod editor;
@@ -546,18 +547,22 @@ struct App {
     capturing_blend: Option<(u32, capture::BlendShape)>,
     /// Shown instead of a game or app while you're tabbed out.
     pub(crate) away_screen: std::sync::Arc<capture::StillImage>,
-    /// Where the webcam sits, shared with a running capture so dragging it
-    /// takes effect at once. Mirrors `settings.webcam` every frame.
+    /// Where the first webcam sits (where only one is drawn:
+    /// `capture::layers::MANY`), shared with a running capture so dragging
+    /// it takes effect at once. Mirrors the settings every frame.
     webcam_placement: capture::webcam::SharedPlacement,
+    /// Every source in the video, in order, as placed: shared with the
+    /// capture like the placements (kept in step with the settings each frame).
+    pub(crate) capture_layers: capture::SharedLayers,
     /// Where the screen's picture goes in the video, shared with the capture
     /// like the webcam's placement (kept in step with the settings each frame).
     pub(crate) screen_placement: capture::SharedScreen,
     pub(crate) webcam_view: webcam_ui::WebcamView,
     /// The picture's sources on the Sources page's preview: dragging them.
     pub(crate) canvas: canvas_ui::CanvasView,
-    /// The camera last asked to stay open (it stays open while a webcam is set
-    /// up, so its own settings don't reset).
-    kept_camera: Option<(String, Option<capture::webcam::Format>)>,
+    /// The cameras last asked to stay open (each stays open while its
+    /// webcam is set up, so its own settings don't reset).
+    kept_cameras: Vec<(String, Option<capture::webcam::Format>)>,
     /// System audio inputs/outputs (+ current OS defaults).
     audio: capture::audio::AudioDevices,
     /// Live per-source volume and meters, shared with the capture thread.
@@ -838,10 +843,11 @@ impl App {
             capturing_blend: None,
             away_screen: away::screen(),
             webcam_placement: std::sync::Arc::new(std::sync::Mutex::new(capture::webcam::Placement::default_for(16.0 / 9.0, 16.0 / 9.0))),
+            capture_layers: capture::layers::main_only(),
             screen_placement,
             webcam_view: Default::default(),
             canvas: Default::default(),
-            kept_camera: None,
+            kept_cameras: Vec::new(),
             audio: capture::audio::list_audio_devices(),
             live_audio,
             level_monitor: None,
@@ -1008,7 +1014,8 @@ impl App {
         let open_sources = std::env::var_os("HASTECLIP_OPEN_SOURCES").is_some();
         if let Some(v) = std::env::var_os("HASTECLIP_OPEN_SOURCES") {
             app.page = Page::Sources;
-            app.sources_view.open_dev(&v.to_string_lossy());
+            let first_webcam = app.settings.first_webcam().map(|w| w.key);
+            app.sources_view.open_dev(&v.to_string_lossy(), first_webcam);
         }
         // `HASTECLIP_OPEN_VOICE_REVIEW=1` opens the voice samples review.
         let open_review = std::env::var_os("HASTECLIP_OPEN_VOICE_REVIEW").is_some();
@@ -1110,6 +1117,9 @@ impl App {
                 format: None,
                 placement: self.webcam_placement.clone(),
             })),
+            // Kept in step every frame: sources added, taken out, moved or
+            // reordered show while capturing.
+            layers: self.capture_layers.clone(),
             screen: self.screen_placement.clone(),
             sources: self.capture_sources(),
             stream: self.stream_settings(),
@@ -1134,7 +1144,7 @@ impl App {
     /// the frame, so switching to a display of another shape would stretch
     /// it into that shape (a strip on an ultrawide).
     fn refit_boxes(&mut self) {
-        if self.settings.webcam.is_none() && self.settings.screen.placed.is_none() {
+        if self.settings.webcams.is_empty() && self.settings.visuals.is_empty() && self.settings.screen.placed.is_none() {
             return;
         }
         let key = (self.video_source(), self.settings.video_size());
@@ -1151,9 +1161,17 @@ impl App {
         if let Some(b) = self.settings.screen.placed.as_mut() {
             b.refit(frame_aspect, screen_aspect);
         }
-        let camera_aspect = self.camera_size().map(|(w, h)| w as f32 / h.max(1) as f32);
-        if let Some(w) = self.settings.webcam.as_mut() {
-            w.placement.refit(frame_aspect, camera_aspect);
+        for key in self.settings.webcams.iter().map(|w| w.key).collect::<Vec<_>>() {
+            let camera_aspect = self.camera_size(key).map(|(w, h)| w as f32 / h.max(1) as f32);
+            if let Some(w) = self.settings.webcam_mut(key) {
+                w.placement.refit(frame_aspect, camera_aspect);
+            }
+        }
+        for key in self.settings.visuals.iter().map(|d| d.key).collect::<Vec<_>>() {
+            let aspect = self.visual_size(key).map(|(w, h)| w as f32 / h.max(1) as f32);
+            if let Some(b) = self.settings.visual_mut(key).and_then(|d| d.placed.as_mut()) {
+                b.refit(frame_aspect, aspect);
+            }
         }
     }
 
@@ -1164,19 +1182,62 @@ impl App {
         size.map(|(w, h)| w as f32 / h.max(1) as f32)
     }
 
-    /// The webcam's picture size as it's turned, once it's live.
-    pub(crate) fn camera_size(&self) -> Option<(u32, u32)> {
-        let turned = self.settings.webcam.as_ref().is_some_and(|w| w.placement.turns % 2 == 1);
-        match capture::webcam::status() {
+    /// Webcam `key`'s picture size as it's turned, once it's live.
+    pub(crate) fn camera_size(&self, key: u64) -> Option<(u32, u32)> {
+        let w = self.settings.webcam(key)?;
+        let turned = w.placement.turns % 2 == 1;
+        match capture::webcam::status_of(&w.id) {
             capture::webcam::Status::Live { width, height } if turned => Some((height, width)),
             capture::webcam::Status::Live { width, height } => Some((width, height)),
             _ => None,
         }
     }
 
+    /// The first webcam, for where only one is drawn (`capture::layers::MANY`).
     pub(crate) fn webcam_source(&self) -> Option<capture::webcam::Webcam> {
-        let w = self.settings.webcam.as_ref().filter(|_| capture::webcam::AVAILABLE)?;
+        let w = self.settings.first_webcam().filter(|_| capture::webcam::AVAILABLE)?;
         Some(capture::webcam::Webcam { device: w.id.clone(), format: w.format.map(Into::into), placement: self.webcam_placement.clone() })
+    }
+
+    /// The video's sources for the capture, bottom first, as they're placed
+    /// now (see `capture::layers`): the screen, each webcam (hidden while
+    /// it's off), each other display.
+    fn layers_for_capture(&self) -> Vec<capture::Layer> {
+        use capture::{Layer, LayerSource};
+        use settings::LayerKey;
+        let mut layers = Vec::new();
+        for l in self.settings.layer_order().into_iter().rev() {
+            match l {
+                LayerKey::Screen => layers.push(Layer { id: 0, source: LayerSource::Main }),
+                LayerKey::Webcam(key) if capture::webcam::AVAILABLE => {
+                    if let Some(w) = self.settings.webcam(key) {
+                        let placement = if w.enabled { w.placement.into() } else { capture::webcam::Placement::hidden() };
+                        layers.push(Layer { id: 1 << 32 | key, source: LayerSource::Camera { device: w.id.clone(), format: w.format.map(Into::into), placement } });
+                    }
+                }
+                LayerKey::Visual(key) if capture::layers::MANY => {
+                    use settings::Visual;
+                    let Some(d) = self.settings.visual(key) else { continue };
+                    let placement = self.settings.visual_placement(d);
+                    let source = match &d.visual {
+                        Visual::Display { id, .. } => LayerSource::Display { id: id.clone(), placement },
+                        Visual::Window { app, .. } => LayerSource::Window { app: app.clone(), placement },
+                        Visual::Colour { rgba } => LayerSource::Colour { rgba: *rgba, placement },
+                        Visual::Browser { url, width, height } if capture::layers::BROWSER && url.len() > "https://".len() => LayerSource::Browser { url: url.clone(), width: *width, height: *height, placement },
+                        Visual::Browser { .. } => continue,
+                        // Its picture, once it's made (`refresh_visual_pictures`).
+                        Visual::Image { .. } | Visual::Text { .. } => match self.visual_picture(key) {
+                            Some(p) => LayerSource::Picture { picture: capture::layers::Picture(p), placement },
+                            None => continue,
+                        },
+                    };
+                    layers.push(Layer { id: 2 << 32 | key, source });
+                }
+                LayerKey::Visual(_) => {}
+                LayerKey::Webcam(_) => {}
+            }
+        }
+        layers
     }
 
     /// Where the chosen display is in `screens`: found by its id, by its
@@ -1455,7 +1516,7 @@ impl eframe::App for App {
         // (to look at it without clicking there); `=crop`, the webcam's crop page.
         static CAMERA_PANEL: std::sync::Once = std::sync::Once::new();
         if std::env::var_os("HASTECLIP_DEV_CAMERA_PANEL").is_some()
-            && let Some(w) = &self.settings.webcam
+            && let Some(w) = self.settings.first_webcam()
         {
             let id = w.id.clone();
             CAMERA_PANEL.call_once(|| {
@@ -1743,26 +1804,39 @@ impl App {
         if let Some(why) = ui_kit::take_locked_click(ctx) {
             self.toast_icon(egui_phosphor::regular::LOCK_SIMPLE, why);
         }
-        *self.webcam_placement.lock().unwrap() = match &self.settings.webcam {
+        *self.webcam_placement.lock().unwrap() = match self.settings.first_webcam() {
             Some(w) if w.enabled => w.placement.into(),
             _ => capture::webcam::Placement::hidden(),
         };
         *self.screen_placement.lock().unwrap() = self.settings.screen_placement();
-        // Keep the webcam open whenever one is set up and on, previewed or
+        self.refresh_visual_pictures();
+        let layers = self.layers_for_capture();
+        {
+            let mut shared = self.capture_layers.lock().unwrap();
+            if *shared != layers {
+                *shared = layers;
+            }
+        }
+        // Keep each webcam open whenever it's set up and on, previewed or
         // recorded or not: closing a camera can reset its own settings. Off,
         // it's closed (its light goes out), but while its crop's set (its
         // picture's cropped on) or its Camera page is open (its picture, and
         // on Windows its settings, are the open camera's); a capture takes
-        // it up again.
-        let on = self.settings.webcam.as_ref().is_some_and(|w| w.enabled) || self.webcam_view.crop.is_some() || self.camera_panel.is_some();
-        let camera = self.webcam_source().filter(|_| on).map(|w| (w.device, w.format));
-        if camera != self.kept_camera {
-            // Its settings go back on as it opens.
-            if let Some((device, _)) = &camera {
+        // it up again. Where only one camera can be open, the first webcam's.
+        let paged = self.webcam_view.crop.as_ref().or(self.camera_panel.as_ref()).map(|p| p.device.clone());
+        let webcams: Vec<&settings::WebcamCfg> = if capture::webcam::MANY { self.settings.webcams.iter().collect() } else { self.settings.first_webcam().into_iter().collect() };
+        let cameras: Vec<(String, Option<capture::webcam::Format>)> = webcams
+            .into_iter()
+            .filter(|w| capture::webcam::AVAILABLE && (w.enabled || paged.as_deref() == Some(w.id.as_str())))
+            .map(|w| (w.id.clone(), w.format.map(Into::into)))
+            .collect();
+        if cameras != self.kept_cameras {
+            // Their settings go back on as each opens.
+            for (device, _) in &cameras {
                 capture::webcam::remember_controls(device, self.settings.camera_controls.get(device).map(|m| m.iter().map(|(k, v)| (*k, *v)).collect()).unwrap_or_default());
             }
-            capture::webcam::keep_open(camera.clone());
-            self.kept_camera = camera;
+            capture::webcam::keep_open(cameras.clone());
+            self.kept_cameras = cameras;
         }
     }
 

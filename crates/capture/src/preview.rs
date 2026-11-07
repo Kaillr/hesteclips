@@ -153,31 +153,36 @@ pub struct VideoPreview {
 }
 
 impl VideoPreview {
-    /// `size`, `fps`, `away_screen`, `webcam` and `screen` as in
+    /// `size`, `fps`, `away_screen`, `webcam`, `layers` and `screen` as in
     /// [`crate::EncodeSettings`].
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         source: &VideoSource,
         size: crate::VideoSize,
         fps: u32,
         away_screen: Option<std::sync::Arc<crate::StillImage>>,
         webcam: Option<crate::webcam::Webcam>,
+        layers: crate::SharedLayers,
         screen: crate::SharedScreen,
     ) -> Self {
         #[cfg(target_os = "windows")]
         {
-            Self { inner: crate::win::PreviewCapture::start(source.clone(), size, fps, away_screen, webcam, screen) }
+            let _ = webcam;
+            Self { inner: crate::win::PreviewCapture::start(source.clone(), size, fps, away_screen, layers, screen) }
         }
         #[cfg(target_os = "macos")]
         {
+            let _ = layers;
             Self { inner: crate::mac::preview::PreviewCapture::start(source.clone(), size, fps, away_screen, webcam, screen) }
         }
         #[cfg(target_os = "linux")]
         {
+            let _ = layers;
             Self { inner: crate::linux::PreviewCapture::start(source.clone(), size, fps, away_screen, webcam, screen) }
         }
         #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
         {
-            let _ = (source, size, fps, away_screen, webcam, screen);
+            let _ = (source, size, fps, away_screen, webcam, layers, screen);
             Self {}
         }
     }

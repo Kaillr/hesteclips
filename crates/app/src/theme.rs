@@ -215,11 +215,13 @@ pub fn ic(name: &str, size: f32) -> egui::RichText {
 }
 
 
+/// The app's typeface, Hanken Grotesk (variable: its weight's an axis).
+pub(crate) static HANKEN: &[u8] = include_bytes!("../assets/fonts/HankenGrotesk.ttf");
+
 /// Install the typeface and icon fonts. egui's own fonts and the system's
 /// symbol font stay as fallbacks for characters Hanken Grotesk lacks.
 pub fn install_fonts(ctx: &egui::Context) {
     use egui::epaint::text::{FontTweak, VariationCoords};
-    static HANKEN: &[u8] = include_bytes!("../assets/fonts/HankenGrotesk.ttf");
     let mut fonts = egui::FontDefinitions::default();
     let weight = |w: f32| egui::FontData::from_static(HANKEN).tweak(FontTweak { coords: VariationCoords::new([(b"wght", w)]), ..Default::default() });
     fonts.font_data.insert("hanken-400".into(), weight(400.0).into());

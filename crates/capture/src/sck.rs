@@ -1147,7 +1147,7 @@ pub(crate) fn probe_encoder(width: usize, height: usize) -> String {
     let s = EncodeSettings {
         output_dir: std::env::temp_dir(), container_ext: "mp4".into(), fps: 60, blend_samples: 1, blend_shape: Default::default(), video_bitrate_kbps: 20000, size: Default::default(),
         use_hardware: true, replay_seconds: 5, video: crate::VideoSource::Screen { id: String::new(), hook: Default::default(), method: Default::default() },
-        away_screen: None, webcam: None, screen: std::sync::Arc::new(std::sync::Mutex::new(crate::ScreenPlacement::whole(crate::Framing::Fit))), sources: Vec::new(),
+        away_screen: None, webcam: None, layers: crate::layers::main_only(), screen: std::sync::Arc::new(std::sync::Mutex::new(crate::ScreenPlacement::whole(crate::Framing::Fit))), sources: Vec::new(),
         stream: None,
     };
     match probe_video_format(width, height, &s) {

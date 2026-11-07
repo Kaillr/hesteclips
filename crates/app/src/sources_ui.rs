@@ -1,7 +1,8 @@
 //! The Sources page: what goes into your clips. The picture: a live preview
 //! of the video, its sources placed on it (`canvas_ui`), and under it a card
-//! for each (the screen or your games and apps, the webcam), the one in front
-//! first, opened for its settings and dragged to put it in front or behind.
+//! for each (the screen or your games and apps, each webcam, each other
+//! display), the one in front first, opened for its settings and dragged to
+//! put it in front or behind.
 //! The sound: your mic, everything the computer plays, or single apps, each
 //! with a live meter and a volume fader, plus the clip's mix meter.
 //!
@@ -78,21 +79,24 @@ pub(crate) struct SourcesView {
     /// how far below its top it was taken hold of, and how the sources were
     /// before (to undo it).
     reorder: Option<(crate::canvas_ui::Layer, f32, crate::canvas_ui::Arrangement)>,
+    /// Displays for the Add menu, refreshed when it opens.
+    pub(crate) add_displays: Vec<capture::Device>,
     /// The cards' order as last shown, and when it last changed: they slide
     /// to their new places for a moment after.
     card_order: (Vec<crate::canvas_ui::Layer>, Option<Instant>),
 }
 
 impl SourcesView {
-    /// Dev aid: the cards named open (`screen`, `webcam`), their Placement
-    /// numbers (`placement`), or the crop's page (`crop`).
-    pub(crate) fn open_dev(&mut self, names: &str) {
+    /// Dev aid: the cards named open (`screen`, `webcam`: the first one's),
+    /// their Placement numbers (`placement`), or the crop's page (`crop`).
+    pub(crate) fn open_dev(&mut self, names: &str, first_webcam: Option<u64>) {
         use crate::canvas_ui::Layer;
+        let webcam = first_webcam.map(Layer::Webcam);
         for name in names.split(',').map(str::trim) {
             match name {
                 "screen" => self.open_cards.push(Layer::Screen),
-                "webcam" => self.open_cards.push(Layer::Webcam),
-                "placement" => self.placement_open.extend([Layer::Screen, Layer::Webcam]),
+                "webcam" => self.open_cards.extend(webcam),
+                "placement" => self.placement_open.extend(std::iter::once(Layer::Screen).chain(webcam)),
                 "crop" => self.crop_open = true,
                 _ => {}
             }
@@ -479,9 +483,7 @@ impl App {
         use egui::{pos2, vec2};
         let pal = theme::pal(ui);
         let aspect = frame.map_or(16.0 / 9.0, |f| f.width as f32 / f.height.max(1) as f32);
-        if self.settings.webcam.is_some() {
-            self.webcam_fit_pending(ui.ctx(), aspect);
-        }
+        self.webcam_fit_pending(ui.ctx(), aspect);
         // Over the cards: undo and redo on the left (where the sources are),
         // which is in front on the right. Its height is kept while the
         // buttons come and go, so the cards don't move.
@@ -506,7 +508,7 @@ impl App {
         // Slides for a moment after the order changed (dragged, or put in
         // front from a menu); else a card's place follows the ones above it
         // at once (one opening pushes the others down as it opens).
-        let held = self.sources_view.reorder.map(|(l, grab, _)| (l, grab));
+        let held = self.sources_view.reorder.as_ref().map(|(l, grab, _)| (*l, *grab));
         let sliding = held.is_some() || self.sources_view.card_order.1.is_some_and(|t| t.elapsed() < Duration::from_millis(400));
         const GAP: f32 = 8.0;
         let w = ui.available_width();
@@ -556,24 +558,87 @@ impl App {
             }
         }
         self.reorder_cards(ui, &slots);
-        // Adding sources.
-        if capture::webcam::AVAILABLE && self.settings.webcam.is_none() {
-            ui.add_space(12.0);
-            let add = crate::ui_kit::Btn::normal("Webcam").with_icon(egui_phosphor::regular::PLUS).small().tip("Put your camera in your clips, placed and sized on the preview");
-            if add.show(ui).clicked() {
-                self.add_webcam(aspect);
-                if self.settings.webcam.is_some() && !self.sources_view.open_cards.contains(&Layer::Webcam) {
-                    self.sources_view.open_cards.push(Layer::Webcam);
-                }
-            }
+        self.add_layer_buttons(ui, aspect);
+    }
+
+    /// Adding a webcam (one more where several are drawn, `capture::layers::MANY`;
+    /// else while there's none), and where several are, another display, a
+    /// window, an image, a colour or words.
+    fn add_layer_buttons(&mut self, ui: &mut egui::Ui, aspect: f32) {
+        use crate::canvas_ui::Layer;
+        use crate::ui_kit::{Btn, Item};
+        use egui_phosphor::regular as icon;
+        let webcam = capture::webcam::AVAILABLE && (capture::layers::MANY || self.settings.webcams.is_empty());
+        let display = capture::layers::MANY && capture::screens_listed();
+        if !webcam && !capture::layers::MANY {
+            return;
         }
+        ui.add_space(12.0);
+        let mut added = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            if webcam {
+                let b = Btn::normal("Webcam").with_icon(icon::PLUS).trail(icon::CARET_DOWN).small().id("add_webcam").tip("Put a camera or capture card in your clips, placed and sized on the preview").show(ui);
+                if b.clicked() {
+                    self.refresh_cameras();
+                }
+                crate::ui_kit::menu_popup(&b, true, 260.0, |ui| {
+                    crate::ui_kit::menu_head(ui, "Put a camera in your clips");
+                    for c in self.cameras().to_vec() {
+                        // A camera opens once: in your clips once.
+                        let shown = self.settings.webcam_of(&c.id).is_some();
+                        let item = Item::new(c.name.clone()).enabled(!shown);
+                        let item = if shown { item.tip("Already in your clips") } else { item };
+                        if item.show(ui).clicked() {
+                            added = Some(Layer::Webcam(self.add_webcam(c, aspect)));
+                        }
+                    }
+                    if self.cameras().is_empty() {
+                        crate::ui_kit::menu_head(ui, "No cameras found.");
+                    }
+                });
+            }
+            if display {
+                let b = Btn::normal("Display").with_icon(icon::PLUS).trail(icon::CARET_DOWN).small().id("add_display").tip("Put another display in your clips too, in a box of its own").show(ui);
+                if b.clicked() {
+                    self.sources_view.add_displays = capture::list_screens();
+                }
+                crate::ui_kit::menu_popup(&b, true, 260.0, |ui| {
+                    crate::ui_kit::menu_head(ui, "Put another display in your clips");
+                    for d in self.sources_view.add_displays.clone() {
+                        if Item::new(d.name.clone()).show(ui).clicked() {
+                            added = Some(Layer::Visual(self.add_display(d)));
+                        }
+                    }
+                    if self.sources_view.add_displays.is_empty() {
+                        crate::ui_kit::menu_head(ui, "No displays found.");
+                    }
+                });
+            }
+            if capture::layers::MANY
+                && let Some(l) = self.add_visual_buttons(ui)
+            {
+                added = Some(l);
+            }
+        });
+        if let Some(layer) = added
+            && !self.sources_view.open_cards.contains(&layer)
+        {
+            self.sources_view.open_cards.push(layer);
+        }
+    }
+
+    /// Put display `d` in the video too, in front of the rest, fitted in the
+    /// middle until it's placed. Its key.
+    fn add_display(&mut self, d: capture::Device) -> u64 {
+        self.add_visual(crate::settings::Visual::Display { id: d.id, name: d.name })
     }
 
     /// Dragging a card by its handle, live (the preview shows it): it goes
     /// above a card once its top (following the pointer) is past that
     /// card's middle, below one once its bottom is. Let go, it can be undone.
     fn reorder_cards(&mut self, ui: &egui::Ui, slots: &[(crate::canvas_ui::Layer, egui::Rect, f32)]) {
-        let Some((held, grab, was)) = self.sources_view.reorder else { return };
+        let Some((held, grab)) = self.sources_view.reorder.as_ref().map(|(l, g, _)| (*l, *g)) else { return };
         let down = ui.input(|i| i.pointer.primary_down());
         if down
             && let Some(p) = ui.input(|i| i.pointer.interact_pos())
@@ -588,10 +653,11 @@ impl App {
             self.set_layer_order(&order);
         }
         if !down {
-            if self.arrangement() != was {
+            if let Some((_, _, was)) = self.sources_view.reorder.take()
+                && self.arrangement() != was
+            {
                 self.keep_for_undo(was);
             }
-            self.sources_view.reorder = None;
             // Let go: it slides from there into its place.
             self.sources_view.card_order.1 = Some(Instant::now());
         }
@@ -607,7 +673,7 @@ impl App {
         use egui_phosphor::regular as icon;
         let pal = theme::pal(ui);
         let open = self.sources_view.open_cards.contains(&layer);
-        let held = self.sources_view.reorder.is_some_and(|(l, ..)| l == layer);
+        let held = self.sources_view.reorder.as_ref().is_some_and(|(l, ..)| *l == layer);
         // Its line: what it is, then what's wrong with it, if anything.
         let (glyph, name, line, state, on) = match layer {
             Layer::Screen => {
@@ -628,11 +694,24 @@ impl App {
                 };
                 (if apps { icon::APP_WINDOW } else { icon::MONITOR }, if apps { "Games and apps" } else { "Screen" }, line, None, self.settings.screen.enabled)
             }
-            Layer::Webcam => {
-                let (state, warn) = self.webcam_state();
-                let cam = self.settings.webcam.as_ref();
+            Layer::Webcam(key) => {
+                let (state, warn) = self.webcam_state(key);
+                let cam = self.settings.webcam(key);
                 let state = (!state.is_empty()).then_some((state, if warn { pal.warn } else { pal.text3 }));
                 (icon::WEBCAM, "Webcam", cam.map(|w| w.name.clone()).unwrap_or_default(), state, cam.is_some_and(|w| w.enabled))
+            }
+            Layer::Visual(key) => {
+                let d = self.settings.visual(key);
+                let state = self.visual_state(key).map(|s| (s, pal.warn));
+                let glyph = match d.map(|d| &d.visual) {
+                    Some(crate::settings::Visual::Window { .. }) => icon::APP_WINDOW,
+                    Some(crate::settings::Visual::Image { .. }) => icon::IMAGE,
+                    Some(crate::settings::Visual::Colour { .. }) => icon::PAINT_BUCKET,
+                    Some(crate::settings::Visual::Text { .. }) => icon::TEXT_T,
+                    Some(crate::settings::Visual::Browser { .. }) => icon::GLOBE,
+                    _ => icon::MONITOR,
+                };
+                (glyph, d.map_or("Display", |d| d.visual.kind_name()), self.visual_line(key), state, d.is_some_and(|d| d.enabled))
             }
         };
         let state = state.or_else(|| (!on).then_some(("Off", pal.text3)));
@@ -674,11 +753,17 @@ impl App {
             let (c, _) = rui.allocate_exact_size(vec2(12.0, 12.0), Sense::hover());
             let turn = theme::toggle(ui.ctx(), resp.id.with("turn"), open, theme::NORMAL);
             crate::ui_kit::chevron(&painter, c.center(), 3.5, turn, if resp.hovered() { pal.text } else { pal.text3 });
-            if layer == Layer::Webcam
-                && let Some(w) = self.settings.webcam.as_mut()
+            if let Layer::Webcam(key) = layer
+                && let Some(w) = self.settings.webcam_mut(key)
             {
                 let tip = if w.enabled { "Turn the webcam off: it leaves your clips, and its place, size, crop and format are kept" } else { "Put your webcam back in your clips" };
                 crate::ui_kit::switch(&mut rui, &mut w.enabled).on_hover_text(tip);
+            }
+            if let Layer::Visual(key) = layer
+                && let Some(d) = self.settings.visual_mut(key)
+            {
+                let tip = if d.enabled { "Turn it off: it leaves your clips, and its place is kept" } else { "Put it back in your clips" };
+                crate::ui_kit::switch(&mut rui, &mut d.enabled).on_hover_text(tip);
             }
             if layer == Layer::Screen {
                 let what = if name == "Screen" { "your screen" } else { "your games and apps" };
@@ -686,7 +771,7 @@ impl App {
                 crate::ui_kit::switch(&mut rui, &mut self.settings.screen.enabled).on_hover_text(tip);
             }
             rui.add_space(-4.0);
-            let more = crate::ui_kit::Btn::icon(crate::ui_kit::Kind::Ghost, icon::DOTS_THREE).small().tip(if layer == Layer::Webcam { "Reset, turn, flip, put in front or behind, remove" } else { "Fill or fit, reset, turn, flip, put in front or behind" }).show(&mut rui);
+            let more = crate::ui_kit::Btn::icon(crate::ui_kit::Kind::Ghost, icon::DOTS_THREE).small().tip(if layer == Layer::Screen { "Fill or fit, reset, turn, flip, put in front or behind" } else { "Reset, turn, flip, put in front or behind, remove" }).show(&mut rui);
             let was = self.arrangement();
             crate::ui_kit::menu_popup(&more, false, 230.0, |ui| self.layer_menu(ui, layer, aspect));
             crate::ui_kit::context_menu(&resp, 230.0, |ui| self.layer_menu(ui, layer, aspect));
@@ -716,7 +801,8 @@ impl App {
                     }
                     match layer {
                         Layer::Screen => self.screen_rows(ui, frame),
-                        Layer::Webcam => self.webcam_rows(ui),
+                        Layer::Webcam(key) => self.webcam_rows(ui, key),
+                        Layer::Visual(key) => self.visual_rows(ui, key),
                     }
                 });
             }
@@ -1330,7 +1416,7 @@ impl App {
             // While a new preview starts (another frame rate, size, webcam)
             // the last picture stays up; the message is only for when there's
             // none to show. With every source off, the video is black: said.
-            let webcam_on = self.settings.webcam.as_ref().is_some_and(|w| w.enabled);
+            let webcam_on = self.settings.webcams.iter().any(|w| w.enabled) || (capture::layers::MANY && self.settings.visuals.iter().any(|d| d.enabled));
             match self.video_preview.as_ref().and_then(|(_, p)| p.error()) {
                 Some(e) => message(&format!("No preview: {e}")),
                 None if !drawn => message("Starting preview…"),
@@ -1558,7 +1644,9 @@ impl App {
         }
         // What a recording would be: same picture, size and frame rate. While
         // the crop's set: all of the screen as it is, to crop on.
-        let webcam = self.webcam_source();
+        // Where every source is drawn, they're taken up live (`capture_layers`);
+        // where one webcam is, another one starts the preview again.
+        let webcam = if capture::layers::MANY { None } else { self.webcam_source() };
         let wanted = match self.video_source() {
             source @ capture::VideoSource::Screen { .. } if self.sources_view.crop_open => (source, Default::default(), self.settings.fps, None, true),
             source => (source, self.settings.video_size(), self.settings.fps, webcam.clone(), false),
@@ -1584,7 +1672,8 @@ impl App {
             let screen = if *whole { std::sync::Arc::new(std::sync::Mutex::new(capture::ScreenPlacement::whole(capture::Framing::Fit))) } else { self.screen_placement.clone() };
             // Both happen in the background: the old capture closes as the new
             // one opens, and only the new one's frames are shown.
-            let preview = capture::preview::VideoPreview::start(source, *size, *fps, Some(self.away_screen.clone()), webcam, screen);
+            let layers = if *whole { capture::layers::main_only() } else { self.capture_layers.clone() };
+            let preview = capture::preview::VideoPreview::start(source, *size, *fps, Some(self.away_screen.clone()), webcam, layers, screen);
             self.video_preview = Some((wanted, preview));
         }
     }

@@ -272,6 +272,7 @@ pub(crate) mod tests {
             video,
             away_screen: None,
             webcam: None,
+            layers: crate::layers::main_only(),
             screen: Arc::new(Mutex::new(crate::ScreenPlacement::whole(crate::Framing::Fit))),
             sources: Vec::new(),
             stream: None,

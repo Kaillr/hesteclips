@@ -30,6 +30,7 @@ mod mp4file;
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 mod mp4mux;
 pub mod output;
+pub mod layers;
 pub mod preview;
 pub mod webcam;
 pub mod sources;
@@ -55,6 +56,7 @@ pub mod linux;
 mod writer;
 
 /// The in-process hardware video decoder, for playback (same API on both).
+pub use layers::{Layer, LayerSource, SharedLayers};
 pub use shutter::BlendShape;
 #[cfg(target_os = "macos")]
 pub use mac::decode;
@@ -1355,8 +1357,12 @@ pub struct EncodeSettings {
     /// Shown while recording games and apps and there's nothing to show (none
     /// is open, or you've tabbed out); black if `None`. Scaled to the frame.
     pub away_screen: Option<std::sync::Arc<StillImage>>,
-    /// A webcam drawn over the picture (or under it, as `screen` says).
+    /// A webcam drawn over the picture (or under it, as `screen` says), on
+    /// the platforms that draw one (see [`layers::MANY`]).
     pub webcam: Option<webcam::Webcam>,
+    /// Every picture in the frame, bottom first, read every frame, on the
+    /// platforms that draw them all (see [`layers::MANY`]).
+    pub layers: SharedLayers,
     /// Where the screen's picture goes in the frame, read every frame.
     pub screen: SharedScreen,
     /// Audio sources, in track order. Track 1 is the mix of every source with

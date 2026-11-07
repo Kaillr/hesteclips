@@ -30,9 +30,9 @@ const SNAP: f32 = 0.012;
 pub(crate) struct WebcamView {
     /// Cameras for the picker, refreshed when it opens.
     cameras: Vec<capture::Device>,
-    /// Just added, or a new camera or format: size its box to the camera's
-    /// shape once the camera delivers it.
-    fit_pending: bool,
+    /// Just added, or a new camera or format: size this webcam's box to the
+    /// camera's shape once the camera delivers it.
+    fit_pending: Option<u64>,
     /// The camera's size when that was asked for: until it changes, the
     /// camera is still the old one (it takes a moment to reopen), and fitting
     /// to it would shape the box for the format just left.
@@ -42,10 +42,11 @@ pub(crate) struct WebcamView {
 }
 
 impl WebcamView {
-    /// Fit the box to the camera's shape once the camera reopens.
-    fn ask_fit(&mut self) {
-        self.fit_pending = true;
-        self.fit_from = match capture::webcam::status() {
+    /// Fit webcam `key`'s box to its camera's shape once the camera
+    /// (`device`, as it was) reopens.
+    fn ask_fit(&mut self, key: u64, device: &str) {
+        self.fit_pending = Some(key);
+        self.fit_from = match capture::webcam::status_of(device) {
             Status::Live { width, height } => Some((width, height)),
             _ => None,
         };
@@ -358,13 +359,18 @@ impl App {
     /// the webcam's box that shape (same width, same top-left; crop kept),
     /// in a video of shape `frame_aspect`.
     pub(crate) fn webcam_fit_pending(&mut self, ctx: &egui::Context, frame_aspect: f32) {
-        let status = capture::webcam::status();
-        if self.webcam_view.fit_pending {
+        let Some(key) = self.webcam_view.fit_pending else { return };
+        let Some(device) = self.settings.webcam(key).map(|w| w.id.clone()) else {
+            self.webcam_view.fit_pending = None;
+            return;
+        };
+        let status = capture::webcam::status_of(&device);
+        {
             let live = match &status {
                 Status::Live { width, height } => Some((*width, *height)),
                 _ => None,
             };
-            let wanted = self.settings.webcam.as_ref().and_then(|w| w.format).map(|f| (f.width, f.height));
+            let wanted = self.settings.webcam(key).and_then(|w| w.format).map(|f| (f.width, f.height));
             // The new camera or format is open: its size is the one asked
             // for, or (Automatic, another camera) not the one before.
             let reopened = live.is_some_and(|l| match wanted {
@@ -374,42 +380,51 @@ impl App {
             if !reopened {
                 ctx.request_repaint_after(std::time::Duration::from_millis(50));
             }
-            if let (true, Status::Live { width, height }, Some(w)) = (reopened, &status, self.settings.webcam.as_mut()) {
+            if let (true, Status::Live { width, height }, Some(w)) = (reopened, &status, self.settings.webcam_mut(key)) {
                 let p = &mut w.placement;
                 let (cw, ch) = if p.turns % 2 == 1 { (*height, *width) } else { (*width, *height) };
                 let camera_aspect = cw as f32 / ch.max(1) as f32;
                 let visible = (1.0 - p.crop[0] - p.crop[2]).max(0.05) / (1.0 - p.crop[1] - p.crop[3]).max(0.05);
                 p.h = p.w * frame_aspect / (camera_aspect * visible);
                 p.frame_aspect = Some(frame_aspect);
-                self.webcam_view.fit_pending = false;
+                self.webcam_view.fit_pending = None;
                 self.webcam_view.fit_from = None;
             }
         }
     }
 
-    /// Put a webcam in the video: the first camera, in the bottom-right
-    /// corner of a video of shape `frame_aspect`.
-    pub(crate) fn add_webcam(&mut self, frame_aspect: f32) {
+    /// Cameras for the Add menu and the pickers, looked for again.
+    pub(crate) fn refresh_cameras(&mut self) {
         self.webcam_view.cameras = capture::webcam::list_cameras();
-        match self.webcam_view.cameras.first().cloned() {
-            Some(c) => {
-                self.settings.webcam = Some(WebcamCfg {
-                    id: c.id,
-                    name: c.name,
-                    format: None,
-                    placement: PlacementCfg::laid_out(Placement::default_for(16.0 / 9.0, frame_aspect), frame_aspect),
-                    enabled: true,
-                });
-                self.webcam_view.ask_fit();
-            }
-            None => self.toast_error("No cameras found"),
-        }
     }
 
-    /// What the webcam's doing, for its card's line (nothing while it's
+    /// The cameras found when last looked (see `refresh_cameras`).
+    pub(crate) fn cameras(&self) -> &[capture::Device] {
+        &self.webcam_view.cameras
+    }
+
+    /// Put camera `c` in the video, in front of the rest, in the
+    /// bottom-right corner of a video of shape `frame_aspect`. Its key.
+    pub(crate) fn add_webcam(&mut self, c: capture::Device, frame_aspect: f32) -> u64 {
+        let key = self.settings.new_key();
+        self.webcam_view.ask_fit(key, &c.id);
+        self.settings.webcams.push(WebcamCfg {
+            key,
+            id: c.id,
+            name: c.name,
+            format: None,
+            placement: PlacementCfg::laid_out(Placement::default_for(16.0 / 9.0, frame_aspect), frame_aspect),
+            enabled: true,
+        });
+        self.settings.layer_order.insert(0, crate::canvas_ui::Layer::Webcam(key));
+        key
+    }
+
+    /// What webcam `key`'s doing, for its card's line (nothing while it's
     /// fine, or off: its switch says so), and whether it's wrong.
-    pub(crate) fn webcam_state(&self) -> (&'static str, bool) {
-        match (self.settings.webcam.as_ref().map(|w| w.enabled), capture::webcam::status()) {
+    pub(crate) fn webcam_state(&self, key: u64) -> (&'static str, bool) {
+        let w = self.settings.webcam(key);
+        match (w.map(|w| w.enabled), w.map_or(Status::Off, |w| capture::webcam::status_of(&w.id))) {
             (Some(false), _) => ("", false),
             (_, Status::Opening) => ("Opening…", false),
             (_, Status::Unavailable(_)) => ("Not working", true),
@@ -420,13 +435,13 @@ impl App {
     /// The webcam's settings, in its card: what's wrong with it, its camera
     /// (and its format, where there's no Camera page), its own settings, and
     /// where it sits. `frame_aspect`: the video's shape.
-    pub(crate) fn webcam_rows(&mut self, ui: &mut egui::Ui) {
+    pub(crate) fn webcam_rows(&mut self, ui: &mut egui::Ui, key: u64) {
         use crate::theme::{self, W};
         use crate::ui_kit::{Btn, Item};
         use egui_phosphor::regular as icon;
         let pal = theme::pal(ui);
-        let status = capture::webcam::status();
-        let Some(cam) = self.settings.webcam.clone() else { return };
+        let Some(cam) = self.settings.webcam(key).cloned() else { return };
+        let status = capture::webcam::status_of(&cam.id);
         if cam.enabled
             && let Status::Unavailable(why) = &status
         {
@@ -453,13 +468,17 @@ impl App {
             }
             crate::ui_kit::menu_popup(&r, false, 240.0, |ui| {
                 for c in self.webcam_view.cameras.clone() {
-                    if Item::new(c.name.clone()).check(c.id == cam.id).show(ui).clicked() && c.id != cam.id {
-                        if let Some(w) = self.settings.webcam.as_mut() {
+                    // A camera opens once: one another webcam shows can't be this one's too.
+                    let taken = c.id != cam.id && self.settings.webcam_of(&c.id).is_some();
+                    let item = Item::new(c.name.clone()).check(c.id == cam.id).enabled(!taken);
+                    let item = if taken { item.tip("Another webcam in your clips shows it") } else { item };
+                    if item.show(ui).clicked() && c.id != cam.id && !taken {
+                        self.webcam_view.ask_fit(key, &cam.id);
+                        if let Some(w) = self.settings.webcam_mut(key) {
                             w.id = c.id;
                             w.name = c.name;
                             w.format = None; // that camera's own formats
                         }
-                        self.webcam_view.ask_fit();
                     }
                 }
                 if self.webcam_view.cameras.is_empty() {
@@ -509,10 +528,10 @@ impl App {
                 });
             }
             if let Some(p) = pick {
-                if let Some(w) = self.settings.webcam.as_mut() {
+                self.webcam_view.ask_fit(key, &cam.id);
+                if let Some(w) = self.settings.webcam_mut(key) {
                     w.format = p.map(Into::into);
                 }
-                self.webcam_view.ask_fit();
             }
         }
         // Its own settings: a page of them (Linux, Windows).
@@ -529,7 +548,7 @@ impl App {
         // screen's crop has). Off, the camera opens while it's cropped.
         crate::ui_kit::divider(ui, 0.0);
         let cropped = cam.placement.crop.iter().any(|c| *c > 0.0);
-        let kept = self.webcam_kept();
+        let kept = self.webcam_kept(&cam.id);
         row(ui, "Crop", &mut |ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
             if Btn::normal("Adjust").trail(icon::CARET_RIGHT).small().tip("Show only part of your camera's picture").show(ui).clicked() {
@@ -544,21 +563,21 @@ impl App {
         });
         // Where it is in the video, in a few words; its numbers under it.
         crate::ui_kit::divider(ui, 0.0);
-        self.placement_row(ui, crate::canvas_ui::Layer::Webcam);
+        self.placement_row(ui, crate::canvas_ui::Layer::Webcam(key));
     }
 
-    /// Whether the webcam's position, and its size, can be reset: it's not
+    /// Whether webcam `key`'s position, and its size, can be reset: it's not
     /// in the bottom-right corner, or not a quarter of the video wide, or
     /// stretched.
-    pub(crate) fn webcam_resettable(&self) -> (bool, bool) {
-        let Some(p) = self.settings.webcam.as_ref().map(|w| w.placement) else { return (false, false) };
+    pub(crate) fn webcam_resettable(&self, key: u64) -> (bool, bool) {
+        let Some(p) = self.settings.webcam(key).map(|w| w.placement) else { return (false, false) };
         let at_corner = (p.x - (1.0 - p.w)).abs() < 1e-3 && (p.y - (1.0 - p.h)).abs() < 1e-3;
         (!at_corner, (p.w - FIRST_WIDTH).abs() > 1e-3 || (p.stretch - 1.0).abs() > 1e-3)
     }
 
     /// The webcam back in the bottom-right corner, its size kept.
-    pub(crate) fn webcam_reset_position(&mut self, frame_aspect: f32) {
-        let Some(w) = self.settings.webcam.as_mut() else { return };
+    pub(crate) fn webcam_reset_position(&mut self, key: u64, frame_aspect: f32) {
+        let Some(w) = self.settings.webcam_mut(key) else { return };
         let mut p: Placement = w.placement.into();
         (p.x, p.y) = (1.0 - p.w, 1.0 - p.h);
         w.placement = PlacementCfg::laid_out(contain(p), frame_aspect);
@@ -566,8 +585,8 @@ impl App {
 
     /// The webcam a quarter of the video wide again, in its own shape
     /// (unstretched), where it is (in a corner, it stays in it).
-    pub(crate) fn webcam_reset_size(&mut self, frame_aspect: f32) {
-        let Some(w) = self.settings.webcam.as_mut() else { return };
+    pub(crate) fn webcam_reset_size(&mut self, key: u64, frame_aspect: f32) {
+        let Some(w) = self.settings.webcam_mut(key) else { return };
         let mut p: Placement = w.placement.into();
         if p.w <= 0.0 || p.h <= 0.0 {
             return;
@@ -581,8 +600,8 @@ impl App {
 
     /// All of the webcam's picture again: its box grows back around what
     /// showed, at the same scale, kept in the video.
-    pub(crate) fn webcam_uncropped(&mut self, frame_aspect: f32) {
-        if let Some(w) = self.settings.webcam.as_mut() {
+    pub(crate) fn webcam_uncropped(&mut self, key: u64, frame_aspect: f32) {
+        if let Some(w) = self.settings.webcam_mut(key) {
             w.placement = PlacementCfg::laid_out(uncrop(w.placement.into()), frame_aspect);
         }
     }
@@ -755,7 +774,7 @@ mod tests {
 /// The Camera page's state (or the crop page's): the camera's settings as
 /// last read, and its picture.
 pub(crate) struct CameraPanel {
-    device: String,
+    pub(crate) device: String,
     controls: Vec<CameraControl>,
     picture: Option<egui::TextureHandle>,
     seq: u64,
@@ -786,7 +805,7 @@ impl CameraPanel {
     }
 
     fn picture_of(device: &str) -> Self {
-        let live = matches!(capture::webcam::status(), Status::Live { .. });
+        let live = matches!(capture::webcam::status_of(device), Status::Live { .. });
         Self { device: device.to_owned(), controls: Vec::new(), picture: None, seq: 0, new_pictures: 0, counted: None, fps: None, live, cropping: false, crop_drag: None }
     }
 }
@@ -933,15 +952,12 @@ impl App {
     pub(crate) fn camera_page(&mut self, ui: &mut egui::Ui) {
         use crate::theme::{self, W};
         use crate::ui_kit::Btn;
-        // Another camera picked: its settings; none: closed.
-        match (&self.settings.webcam, &self.camera_panel) {
-            (Some(w), Some(p)) if w.id != p.device => self.camera_panel = Some(CameraPanel::open(&w.id)),
-            (None, _) => self.camera_panel = None,
-            _ => {}
-        }
-        if self.camera_panel.is_none() {
+        // The webcam showing its camera: gone (taken out, another camera
+        // picked), it's closed.
+        let Some(key) = self.camera_panel.as_ref().and_then(|p| self.settings.webcam_of(&p.device)).map(|w| w.key) else {
+            self.camera_panel = None;
             return;
-        }
+        };
         // Back to Sources: the arrow, or Esc (as Settings' own pages).
         if !crate::ui_kit::overlay_open(ui.ctx()) && !ui.ctx().egui_wants_keyboard_input() && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
             self.camera_panel = None;
@@ -953,18 +969,18 @@ impl App {
             let p = theme::pal(ui);
             ui.label(theme::text("Camera", 20.0, W::Semibold).color(p.text));
         });
-        let name = self.settings.webcam.as_ref().map(|w| w.name.clone()).unwrap_or_default();
-        let current = self.settings.webcam.as_ref().and_then(|w| w.format).map(capture::webcam::Format::from);
+        let name = self.settings.webcam(key).map(|w| w.name.clone()).unwrap_or_default();
+        let current = self.settings.webcam(key).and_then(|w| w.format).map(capture::webcam::Format::from);
         let mut pick: Option<Option<capture::webcam::Format>> = None;
         // How it's turned and mirrored in the clips (the webcam's placement).
-        let orient = self.settings.webcam.as_ref().map_or_else(Orientation::default, |w| Orientation { flip_h: w.placement.flip_h, flip_v: w.placement.flip_v, turns: w.placement.turns });
+        let orient = self.settings.webcam(key).map_or_else(Orientation::default, |w| Orientation { flip_h: w.placement.flip_h, flip_v: w.placement.flip_v, turns: w.placement.turns });
         let mut reorient: Option<Orientation> = None;
         // Its crop (the camera's sides cut off), set on its own page.
-        let crop = self.settings.webcam.as_ref().map_or([0.0; 4], |w| w.placement.crop);
+        let crop = self.settings.webcam(key).map_or([0.0; 4], |w| w.placement.crop);
         // The frame rate the camera runs at: as picked, or Automatic's pick.
         let fps = current.or_else(|| self.camera_panel.as_ref().and_then(|p| capture::webcam::formats(&p.device).into_iter().max_by_key(|f| f.auto_rank()))).map(|f| f.fps());
         let Some(panel) = self.camera_panel.as_mut() else { return };
-        let live = matches!(capture::webcam::status(), Status::Live { .. });
+        let live = matches!(capture::webcam::status_of(&panel.device), Status::Live { .. });
         if live && !panel.live {
             panel.controls = capture::webcam::camera_controls(&panel.device);
         }
@@ -1035,14 +1051,14 @@ impl App {
             panel.controls = capture::webcam::camera_controls(&device);
         }
         if let Some(p) = pick {
-            if let Some(w) = self.settings.webcam.as_mut() {
+            self.webcam_view.ask_fit(key, &device);
+            if let Some(w) = self.settings.webcam_mut(key) {
                 w.format = p.map(Into::into);
             }
-            self.webcam_view.ask_fit();
         }
         // Turned or mirrored: the placement, as the preview's right-click does
         // it (a quarter turn swaps the box's sides).
-        if let (Some(o), Some(w)) = (reorient, self.settings.webcam.as_mut()) {
+        if let (Some(o), Some(w)) = (reorient, self.settings.webcam_mut(key)) {
             let aspect = w.placement.frame_aspect.unwrap_or(16.0 / 9.0);
             let mut p: Placement = w.placement.into();
             p.flip_h = o.flip_h;
@@ -1068,11 +1084,11 @@ impl App {
     /// What's kept of the webcam's picture, in the camera's pixels as it
     /// shows (turned): its size, and the whole picture's. From the camera
     /// while it's live, else its format, if one's picked.
-    fn webcam_kept(&self) -> Option<((u32, u32), (u32, u32))> {
-        let w = self.settings.webcam.as_ref()?;
+    fn webcam_kept(&self, device: &str) -> Option<((u32, u32), (u32, u32))> {
+        let w = self.settings.webcam_of(device)?;
         let p = w.placement;
         let picked = w.format.map(|f| if p.turns % 2 == 1 { (f.height, f.width) } else { (f.width, f.height) });
-        let (cw, ch) = self.camera_size().or(picked)?;
+        let (cw, ch) = self.camera_size(w.key).or(picked)?;
         let kept = |n: u32, a: f32, b: f32| ((n as f32 * (1.0 - a - b)).round() as u32).max(1);
         Some(((kept(cw, p.crop[0], p.crop[2]), kept(ch, p.crop[1], p.crop[3])), (cw, ch)))
     }
@@ -1081,11 +1097,11 @@ impl App {
     /// its box takes the shape of what's left, as stretched as it was (its
     /// width and middle kept),
     /// so nothing more is cut off to fill it; inside the video.
-    fn webcam_recrop(&mut self, orient: Orientation, c: [f32; 4]) {
-        let Some(w) = self.settings.webcam.as_mut() else { return };
+    fn webcam_recrop(&mut self, key: u64, orient: Orientation, c: [f32; 4]) {
+        let Some(w) = self.settings.webcam_mut(key) else { return };
         let aspect = w.placement.frame_aspect.unwrap_or(16.0 / 9.0);
         let mut p: Placement = w.placement.into();
-        if let Status::Live { width, height } = capture::webcam::status() {
+        if let Status::Live { width, height } = capture::webcam::status_of(&w.id) {
             let raw = width as f32 / height.max(1) as f32;
             let full = if p.turns % 2 == 1 { 1.0 / raw } else { raw };
             let kept = crop_shown(orient, c);
@@ -1108,19 +1124,16 @@ impl App {
         use crate::theme::{self, W};
         use crate::ui_kit::Btn;
         let pal = theme::pal(ui);
-        // Closed with the arrow or Esc, or when there's no webcam to crop.
-        // Off, its camera's open while this is (see `App::logic`).
-        let Some(cam) = self.settings.webcam.clone() else {
+        // Closed with the arrow or Esc, or when there's no webcam showing
+        // its camera to crop. Off, its camera's open while this is (see
+        // `App::logic`).
+        let Some(cam) = self.webcam_view.crop.as_ref().and_then(|p| self.settings.webcam_of(&p.device)).cloned() else {
             self.webcam_view.crop = None;
             return;
         };
         if !crate::ui_kit::overlay_open(ui.ctx()) && !ui.ctx().egui_wants_keyboard_input() && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
             self.webcam_view.crop = None;
             return;
-        }
-        // Another camera picked: its picture.
-        if self.webcam_view.crop.as_ref().is_some_and(|p| p.device != cam.id) {
-            self.webcam_view.crop = Some(CameraPanel::cropping(&cam.id));
         }
         let mut back = false;
         self.page_head(ui, "", |_, ui| {
@@ -1139,7 +1152,7 @@ impl App {
         let crop = cam.placement.crop;
         // Its size's link keeps the shape as its edges are dragged too.
         let keep = crate::ui_kit::size_field_keeps(ui.ctx(), "webcam_crop").is_some();
-        let size = self.camera_size();
+        let size = self.camera_size(cam.key);
         let mut recrop: Option<[f32; 4]> = None;
         let Some(panel) = self.webcam_view.crop.as_mut() else { return };
         let picture = |ui: &mut egui::Ui, panel: &mut CameraPanel, max_h: f32, recrop: &mut Option<[f32; 4]>| {
@@ -1180,7 +1193,7 @@ impl App {
             });
         }
         if let Some(c) = recrop {
-            self.webcam_recrop(orient, c);
+            self.webcam_recrop(cam.key, orient, c);
         }
     }
 }
@@ -1415,7 +1428,7 @@ fn picture_side(ui: &mut egui::Ui, panel: &mut CameraPanel, name: &str, fps: Opt
     let pal = theme::pal(ui);
     picture_view(ui, panel, orient, crop, max_h, false);
     crate::ui_kit::gap(ui, crate::ui_kit::STACK_GAP);
-    let status = match (capture::webcam::status(), panel.fps) {
+    let status = match (capture::webcam::status_of(&panel.device), panel.fps) {
         (capture::webcam::Status::Live { width, height }, Some(fps)) => format!("{name} · {width}×{height} · {fps:.0} new pictures/s"),
         (capture::webcam::Status::Live { width, height }, None) => format!("{name} · {width}×{height}"),
         _ => name.to_owned(),
@@ -1463,7 +1476,7 @@ fn slowdown(measured: Option<f32>, fps: Option<f32>) -> Option<String> {
 fn picture_view(ui: &mut egui::Ui, panel: &mut CameraPanel, orient: Orientation, crop: [f32; 4], max_h: f32, keep: bool) -> Option<[f32; 4]> {
     let pal = crate::theme::pal(ui);
     let w = ui.available_width();
-    if let Some(p) = capture::webcam::camera_picture((w * ui.ctx().pixels_per_point()) as u32, panel.seq) {
+    if let Some(p) = capture::webcam::camera_picture(&panel.device,(w * ui.ctx().pixels_per_point()) as u32, panel.seq) {
         let image = egui::ColorImage::from_rgba_unmultiplied([p.width as usize, p.height as usize], &p.rgba);
         match &mut panel.picture {
             Some(t) if t.size() == [p.width as usize, p.height as usize] => t.set(image, egui::TextureOptions::LINEAR),

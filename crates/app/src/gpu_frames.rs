@@ -1120,7 +1120,7 @@ mod tests {
         let (device, _queue) = pollster::block_on(adapter.request_device(&Default::default())).expect("device");
         let whole = std::sync::Arc::new(std::sync::Mutex::new(capture::ScreenPlacement::whole(capture::Framing::Fit)));
         let size = capture::VideoSize { short_side: Some(720), ..Default::default() };
-        let preview = capture::preview::VideoPreview::start(&capture::VideoSource::Screen { id: String::new(), hook: Default::default(), method: Default::default() }, size, 30, None, None, whole);
+        let preview = capture::preview::VideoPreview::start(&capture::VideoSource::Screen { id: String::new(), hook: Default::default(), method: Default::default() }, size, 30, None, None, capture::layers::main_only(), whole);
         let frame = (0..100)
             .find_map(|_| {
                 capture::preview::request();

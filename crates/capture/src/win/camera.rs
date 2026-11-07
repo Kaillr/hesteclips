@@ -21,7 +21,7 @@ use super::d3d::{Gpu, Latest};
 use super::h264::take_activates;
 use super::system::com_init;
 use crate::Device;
-use crate::webcam::{Status, set_status};
+use crate::webcam::{Status, set_status_of};
 
 const STREAM: u32 = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
 
@@ -70,7 +70,7 @@ pub(crate) struct Frame {
     pub bgra: Vec<u8>,
 }
 
-/// The camera, kept open for as long as a webcam is set up — not just while
+/// A camera, kept open for as long as a webcam is set up — not just while
 /// something previews or records it. Closing a camera can reset what was set
 /// in its own settings window (exposure, focus…), and some, like the C922, do.
 /// Captures and previews take its newest frame ([`CameraFeed::latest`]) and
@@ -81,61 +81,92 @@ pub(crate) struct CameraFeed {
     frame: Mutex<Option<Arc<Frame>>>,
     /// Its settings, while it's open.
     settings: Mutex<Option<Arc<Settings>>>,
+    /// How many of its pictures were new, not repeats of the one before (as
+    /// a camera sends while its exposure is longer than a frame): its real
+    /// frame rate.
+    new_pictures: AtomicU64,
     stop: AtomicBool,
 }
 
-/// The one open camera.
-static CURRENT: Mutex<Option<Arc<CameraFeed>>> = Mutex::new(None);
+/// The cameras kept open.
+static OPEN: Mutex<Vec<Arc<CameraFeed>>> = Mutex::new(Vec::new());
 
 /// Pictures from any camera so far, numbering them: going on from camera to
 /// camera and format to format, so a reader waiting for one newer than the
 /// last it had (the Camera page) gets the next camera's at once.
 static PICTURES: AtomicU64 = AtomicU64::new(0);
 
-/// How many of them were new, not repeats of the one before (as a camera
-/// sends while its exposure is longer than a frame): its real frame rate.
-static NEW_PICTURES: AtomicU64 = AtomicU64::new(0);
-
 impl CameraFeed {
     pub(crate) fn latest(&self) -> Option<Arc<Frame>> {
         self.frame.lock().unwrap().clone()
     }
 
-    /// The open camera, if it's `device` in `format`.
-    pub(crate) fn current(device: &str, format: Option<crate::webcam::Format>) -> Option<Arc<CameraFeed>> {
-        CURRENT.lock().unwrap().clone().filter(|f| f.device == device && f.format == format)
+    fn stopped(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
+    }
+
+    /// Camera `device`, if it's open (in whatever format).
+    fn of(device: &str) -> Option<Arc<CameraFeed>> {
+        OPEN.lock().unwrap().iter().find(|f| f.device == device && !f.stopped()).cloned()
+    }
+
+    fn start(device: String, format: Option<crate::webcam::Format>) -> Arc<CameraFeed> {
+        let feed = Arc::new(CameraFeed { device, format, frame: Mutex::new(None), settings: Mutex::new(None), new_pictures: AtomicU64::new(0), stop: AtomicBool::new(false) });
+        let run_feed = feed.clone();
+        thread::spawn(move || run(run_feed));
+        feed
+    }
+
+    /// Close it: its thread does, and says it's off.
+    fn close(&self) {
+        self.stop.store(true, Ordering::Relaxed);
     }
 }
 
-/// Keep camera `want` (device, format) open, or none. Opening and closing
-/// happen in the background; asking for what's already open does nothing.
-pub fn keep_open(want: Option<(String, Option<crate::webcam::Format>)>) {
-    let mut current = CURRENT.lock().unwrap();
-    let same = match (&*current, &want) {
-        (Some(f), Some((d, fm))) => f.device == *d && f.format == *fm,
-        (None, None) => true,
-        _ => false,
-    };
-    if same {
-        return;
+/// Keep cameras `want` (device, format) open, and close the rest. Opening
+/// and closing happen in the background; asking for what's already open
+/// does nothing. A camera asked for twice is opened once, in the first
+/// format asked for.
+pub fn keep_open(want: Vec<(String, Option<crate::webcam::Format>)>) {
+    let mut open = OPEN.lock().unwrap();
+    let mut kept: Vec<Arc<CameraFeed>> = Vec::new();
+    for (device, format) in want {
+        if kept.iter().any(|f| f.device == device) {
+            continue;
+        }
+        match open.iter().position(|f| f.device == device && f.format == format) {
+            Some(i) => kept.push(open.remove(i)),
+            None => kept.push(CameraFeed::start(device, format)),
+        }
     }
-    if let Some(old) = current.take() {
-        old.stop.store(true, Ordering::Relaxed); // its thread closes it
+    // The rest close (another format of one kept too: its new one's opening).
+    for old in open.drain(..) {
+        old.close();
     }
-    let Some((device, format)) = want else {
-        set_status(Status::Off);
-        return;
-    };
-    let feed = Arc::new(CameraFeed { device, format, frame: Mutex::new(None), settings: Mutex::new(None), stop: AtomicBool::new(false) });
-    *current = Some(feed.clone());
-    thread::spawn(move || run(feed));
+    *open = kept;
 }
 
-/// The open camera's newest picture, if it's newer than picture
-/// `newer_than`: shrunk to at most `max_width` wide (each pixel the one
-/// under it), in RGBA, for showing it on its own (the webcam's crop page).
-pub(crate) fn picture(max_width: u32, newer_than: u64) -> Option<crate::webcam::CameraPreview> {
-    let feed = CURRENT.lock().unwrap().clone().filter(|f| !f.stop.load(Ordering::Relaxed))?;
+/// Open camera `device` in `format`, if it isn't: the others stay as they are.
+fn open_too(device: &str, format: Option<crate::webcam::Format>) {
+    let mut open = OPEN.lock().unwrap();
+    if open.iter().any(|f| f.device == device && f.format == format) {
+        return;
+    }
+    open.retain(|f| {
+        let other = f.device != device;
+        if !other {
+            f.close();
+        }
+        other
+    });
+    open.push(CameraFeed::start(device.to_owned(), format));
+}
+
+/// Camera `device`'s newest picture, if it's open and has one newer than
+/// picture `newer_than`: shrunk to at most `max_width` wide (each pixel the
+/// one under it), in RGBA, for showing it on its own (the webcam's crop page).
+pub(crate) fn picture(device: &str, max_width: u32, newer_than: u64) -> Option<crate::webcam::CameraPreview> {
+    let feed = CameraFeed::of(device)?;
     let f = feed.latest().filter(|f| f.seq > newer_than)?;
     let (sw, sh) = (f.width as usize, f.height as usize);
     if sw == 0 || sh == 0 || f.bgra.len() < sw * sh * 4 {
@@ -153,19 +184,26 @@ pub(crate) fn picture(max_width: u32, newer_than: u64) -> Option<crate::webcam::
             (to[0], to[1], to[2]) = (from[2], from[1], from[0]);
         }
     }
-    Some(crate::webcam::CameraPreview { width: w as u32, height: h as u32, rgba, seq: f.seq, new_pictures: NEW_PICTURES.load(Ordering::Relaxed) })
+    Some(crate::webcam::CameraPreview { width: w as u32, height: h as u32, rgba, seq: f.seq, new_pictures: feed.new_pictures.load(Ordering::Relaxed) })
 }
 
 /// Open the camera and keep reading it until told to stop. If it can't be
 /// opened (unplugged, in use) or stops, try again every few seconds.
 fn run(feed: Arc<CameraFeed>) {
     com_init();
-    while !feed.stop.load(Ordering::Relaxed) {
-        set_status(Status::Opening);
+    // What it says of itself, unless it's been closed: a camera closed and
+    // opened again in another format says so through its new one.
+    let say = |s: Status| {
+        if !feed.stopped() {
+            set_status_of(&feed.device, s);
+        }
+    };
+    while !feed.stopped() {
+        say(Status::Opening);
         let (reader, source, width, height) = match open_reader(&feed.device, feed.format) {
             Ok(r) => r,
             Err(e) => {
-                set_status(Status::Unavailable(format!("{e:#}")));
+                say(Status::Unavailable(format!("{e:#}")));
                 wait_or_stop(&feed, Duration::from_secs(3));
                 continue;
             }
@@ -175,19 +213,19 @@ fn run(feed: Arc<CameraFeed>) {
         *feed.settings.lock().unwrap() = Some(Arc::new(Settings { amp: source.cast().ok(), cam: source.cast().ok(), ks: source.cast().ok() }));
         drop(source);
         crate::webcam::apply_remembered(&feed.device);
-        set_status(Status::Live { width, height });
+        say(Status::Live { width, height });
         let mut rows = Vec::new();
         let mut last_print = None;
-        while !feed.stop.load(Ordering::Relaxed) {
+        while !feed.stopped() {
             let mut flags = 0u32;
             let mut sample = None;
             // Blocks until the camera's next frame.
             if let Err(e) = unsafe { reader.ReadSample(STREAM, 0, None, Some(&mut flags), None, Some(&mut sample)) } {
-                set_status(Status::Unavailable(e.message()));
+                say(Status::Unavailable(read_error(&e)));
                 break;
             }
             if flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32 != 0 {
-                set_status(Status::Unavailable("the camera stopped".into()));
+                say(Status::Unavailable("the camera stopped".into()));
                 break;
             }
             let Some(sample) = sample else { continue };
@@ -196,7 +234,7 @@ fn run(feed: Arc<CameraFeed>) {
                     let seq = PICTURES.fetch_add(1, Ordering::Relaxed) + 1;
                     let print = crate::webcam::fingerprint(&rows);
                     if last_print != Some(print) {
-                        NEW_PICTURES.fetch_add(1, Ordering::Relaxed);
+                        feed.new_pictures.fetch_add(1, Ordering::Relaxed);
                         last_print = Some(print);
                     }
                     let bgra = std::mem::take(&mut rows);
@@ -207,26 +245,44 @@ fn run(feed: Arc<CameraFeed>) {
         }
         *feed.settings.lock().unwrap() = None;
         drop(reader);
-        if !feed.stop.load(Ordering::Relaxed) {
+        if !feed.stopped() {
             wait_or_stop(&feed, Duration::from_secs(3));
         }
     }
+    // Off, unless it's open again by now (in another format).
+    if CameraFeed::of(&feed.device).is_none() {
+        set_status_of(&feed.device, Status::Off);
+    }
+}
+
+/// What's wrong when a camera that opened gives no pictures, in words: one
+/// another app has (or took over) is said to be in use, not in Media
+/// Foundation's words ("Hardware MFT failed to start streaming due to lack
+/// of hardware resources", the C922's while another app streams it).
+fn read_error(e: &windows::core::Error) -> String {
+    /// `MF_E_VIDEO_RECORDING_DEVICE_INUSE`, which the windows crate doesn't name.
+    const IN_USE: windows::core::HRESULT = windows::core::HRESULT(0xC00D3EA2_u32 as _);
+    let code = e.code();
+    if code == MF_E_HW_MFT_FAILED_START_STREAMING || code == IN_USE || code == MF_E_VIDEO_RECORDING_DEVICE_PREEMPTED {
+        return "another app is using the camera. Close it there, and it comes back here by itself".to_owned();
+    }
+    e.message()
 }
 
 fn wait_or_stop(feed: &CameraFeed, d: Duration) {
     let until = std::time::Instant::now() + d;
-    while std::time::Instant::now() < until && !feed.stop.load(Ordering::Relaxed) {
+    while std::time::Instant::now() < until && !feed.stopped() {
         thread::sleep(Duration::from_millis(50));
     }
 }
 
-/// The webcam layer of a running capture: the newest picture of whichever
-/// camera the app keeps open, turned as placed, in a GPU texture for the
-/// compositor. A new camera or format, the webcam switched off and on, a
-/// dropout: it follows along without the capture restarting.
+/// A webcam layer of a running capture: the newest picture of its camera
+/// (kept open by the app), turned as placed, in a GPU texture for the
+/// compositor. Another format, the webcam switched off and on, a dropout:
+/// it follows along without the capture restarting.
 pub(crate) struct CameraLayer {
+    device: String,
     feed: Option<Arc<CameraFeed>>,
-    placement: crate::webcam::SharedPlacement,
     /// Square, as big as a camera picture can be turned either way: any
     /// format fits, and only its top-left `content` is drawn.
     pub latest: Arc<Latest>,
@@ -240,25 +296,25 @@ pub(crate) struct CameraLayer {
 const MAX_SIDE: u32 = 1920;
 
 impl CameraLayer {
-    /// For webcam `w`, opening it if nothing has (the app keeps it open
-    /// itself), unless it's switched off: then it waits for the app to.
-    pub(crate) fn new(gpu: &Gpu, w: &crate::webcam::Webcam) -> Result<Self> {
-        let hidden = w.placement.lock().unwrap().is_hidden();
-        if !hidden && CameraFeed::current(&w.device, w.format).is_none() {
-            keep_open(Some((w.device.clone(), w.format)));
+    /// For camera `device`, opening it in `format` if nothing has (the app
+    /// keeps it open itself), unless it's switched off (`hidden`): then it
+    /// waits for the app to.
+    pub(crate) fn new(gpu: &Gpu, device: &str, format: Option<crate::webcam::Format>, hidden: bool) -> Result<Self> {
+        if !hidden && CameraFeed::of(device).is_none() {
+            open_too(device, format);
         }
-        Ok(Self { feed: None, placement: w.placement.clone(), latest: Latest::new(gpu, MAX_SIDE, MAX_SIDE)?, last: (0, 0), turned: Vec::new() })
+        Ok(Self { device: device.to_owned(), feed: None, latest: Latest::new(gpu, MAX_SIDE, MAX_SIDE)?, last: (0, 0), turned: Vec::new() })
     }
 
-    /// Upload the camera's newest frame, if it has one we haven't (or it's
-    /// turned another way now).
-    pub(crate) fn pull(&mut self) {
-        if self.feed.as_ref().is_none_or(|f| f.stop.load(Ordering::Relaxed)) {
-            self.feed = CURRENT.lock().unwrap().clone().filter(|f| !f.stop.load(Ordering::Relaxed));
+    /// Upload the camera's newest frame, turned `turns` quarters clockwise,
+    /// if it has one we haven't (or it's turned another way now).
+    pub(crate) fn pull(&mut self, turns: u8) {
+        if self.feed.as_ref().is_none_or(|f| f.stopped()) {
+            self.feed = CameraFeed::of(&self.device);
             self.last = (0, 0);
         }
         let Some(f) = self.feed.as_ref().and_then(|feed| feed.latest()) else { return };
-        let turns = self.placement.lock().unwrap().turns % 4;
+        let turns = turns % 4;
         if (f.seq, turns) == self.last {
             return;
         }
@@ -581,9 +637,9 @@ fn in_mta<T: Send>(f: impl FnOnce() -> T + Send) -> T {
     })
 }
 
-/// The settings of camera `device`, if it's the one open.
+/// The settings of camera `device`, if it's open.
 fn settings_of(device: &str) -> Option<Arc<Settings>> {
-    let feed = CURRENT.lock().unwrap().clone().filter(|f| f.device == device && !f.stop.load(Ordering::Relaxed))?;
+    let feed = CameraFeed::of(device)?;
     feed.settings.lock().unwrap().clone()
 }
 

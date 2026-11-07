@@ -1426,6 +1426,7 @@ mod tests {
                 placement: Arc::new(Mutex::new(crate::webcam::Placement::default_for(16.0 / 9.0, 16.0 / 9.0))),
             }),
             screen: Arc::new(Mutex::new(crate::ScreenPlacement::whole(crate::Framing::Fit))),
+            layers: crate::layers::main_only(),
             sources: Vec::new(),
             stream: None,
         };
