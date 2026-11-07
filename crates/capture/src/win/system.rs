@@ -169,6 +169,12 @@ pub(crate) fn display_pixels(id: Option<&str>) -> Option<(u32, u32)> {
     Some((m.width, m.height))
 }
 
+/// The display called `id` (a GDI device name) if it's there now: not
+/// while it's gone (a monitor that sleeps can go, as if unplugged).
+pub(crate) fn monitor_of(id: &str) -> Option<HMONITOR> {
+    monitors().into_iter().find(|m| m.device == id).map(|m| m.handle)
+}
+
 /// The monitor with this device name, else the main one.
 pub(crate) fn find_monitor(id: &str) -> HMONITOR {
     monitors()

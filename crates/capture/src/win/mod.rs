@@ -637,9 +637,9 @@ impl Session {
 
 /// Where a session's picture comes from: a display, or an app's window.
 enum PictureSource {
-    /// A display (and which), when to switch to the game capture hook, and
-    /// how to capture it.
-    Screen(windows::Graphics::Capture::GraphicsCaptureItem, windows::Win32::Graphics::Gdi::HMONITOR, crate::GameHook, crate::ScreenCapture),
+    /// A display (its name, and its capture item and handle now), when to
+    /// switch to the game capture hook, and how to capture it.
+    Screen(String, windows::Graphics::Capture::GraphicsCaptureItem, windows::Win32::Graphics::Gdi::HMONITOR, crate::GameHook, crate::ScreenCapture),
     /// The apps to follow, changeable while capturing.
     Apps(AppList),
 }
@@ -692,7 +692,7 @@ impl PictureSource {
                 let monitor = system::find_monitor(id);
                 let item = d3d::monitor_item(monitor)?;
                 let size = item.Size()?;
-                (PictureSource::Screen(item, monitor, hook.clone(), *method), (size.Width.max(2) as u32, size.Height.max(2) as u32))
+                (PictureSource::Screen(id.clone(), item, monitor, hook.clone(), *method), (size.Width.max(2) as u32, size.Height.max(2) as u32))
             }
             VideoSource::Apps { .. } => {
                 let (_, w, h) = system::primary_monitor();
@@ -732,7 +732,7 @@ impl PictureSource {
                 }
                 Video::follow_apps(gpu.clone(), latest.clone(), list, fps, away)
             }
-            PictureSource::Screen(item, monitor, hook, method) => {
+            PictureSource::Screen(id, item, monitor, hook, method) => {
                 let by = NEXT_FOLLOWER.fetch_add(1, Ordering::Relaxed);
                 let capture = DisplayCapture::start(gpu, &item, monitor, latest, fps, method, by)?;
                 // Wait for the first frame so a capture that can't see the screen
@@ -744,7 +744,7 @@ impl PictureSource {
                     }
                     thread::sleep(Duration::from_millis(10));
                 }
-                Video::follow_screen(gpu.clone(), latest.clone(), item, monitor, capture, fps, hook, method, by)
+                Video::follow_screen(gpu.clone(), latest.clone(), id, item, monitor, capture, fps, hook, method, by)
             }
         })
     }
@@ -1293,6 +1293,7 @@ impl Video {
     fn follow_screen(
         gpu: d3d::Gpu,
         latest: Arc<d3d::Latest>,
+        id: String,
         item: windows::Graphics::Capture::GraphicsCaptureItem,
         monitor: windows::Win32::Graphics::Gdi::HMONITOR,
         first: DisplayCapture,
@@ -1307,9 +1308,14 @@ impl Video {
         let thread = thread::spawn(move || {
             // Whole wrappers (they make these Send), not their fields.
             let (item, monitor, first) = (item, monitor, first);
-            let (item, monitor) = (item.0, monitor.0);
+            let (mut item, mut monitor) = (item.0, monitor.0);
             system::com_init();
             let mut display = Some(first.0);
+            // The display went away since its capture started (a monitor
+            // that sleeps can go, as if unplugged).
+            let mut went = false;
+            // Its capture couldn't start again, which has been said.
+            let mut said = false;
             // While Windows' capture stands in for Desktop Duplication: when
             // to try it again, and how long to wait after that if it can't.
             let mut retry = (Instant::now() + RETRY_DUPLICATION.0, RETRY_DUPLICATION.0);
@@ -1321,6 +1327,29 @@ impl Video {
             let mut sight = Sight::default();
             let mut gpu_use = gpu_meter();
             while !stop2.load(Ordering::Relaxed) {
+                // The display came back from going away, or as another (a
+                // monitor that slept, or was unplugged and plugged back in),
+                // or its capture by Windows ended: that capture showed the
+                // last picture from before for good, until the recording
+                // started again (issue #34). Its capture starts again, of the
+                // display as it is now. While it's gone, the last picture stays.
+                let closed = matches!(&display, Some(DisplayCapture::Wgc(c) | DisplayCapture::StandIn(c)) if c.is_closed());
+                match system::monitor_of(&id) {
+                    None => went = true,
+                    Some(now) if went || now != monitor || closed => match d3d::monitor_item(now) {
+                        Ok(again) => {
+                            eprintln!("the display {}: capturing it again", if went || now != monitor { "came back" } else { "capture ended" });
+                            (item, monitor, went, said) = (again, now, false, false);
+                            display = None;
+                        }
+                        Err(e) => {
+                            if !std::mem::replace(&mut said, true) {
+                                eprintln!("the display came back but can't be captured: {e:#}");
+                            }
+                        }
+                    },
+                    Some(_) => {}
+                }
                 // A fullscreen window in focus on this display.
                 let game = system::foreground_app()
                     .filter(|f| f.main && !system::window_hidden(f.hwnd) && system::fullscreen_on(f.hwnd, monitor))
