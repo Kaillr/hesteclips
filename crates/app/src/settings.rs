@@ -1459,6 +1459,7 @@ impl RecordSettings {
         s.upgrade_capture();
         s.upgrade_save_sound();
         s.upgrade_noise_reduction();
+        s.clean_app_names();
         if let Some(old) = s.audio_tracks.take() {
             s.audio_sources = migrate(&old);
             // Persist now: sources get fresh ids, and their volumes key on them.
@@ -1474,6 +1475,41 @@ impl RecordSettings {
                 apps: vec![CaptureApp { id: id.clone(), name: name.clone() }],
                 away_screen: true,
             };
+        }
+    }
+
+    /// App names saved with the start of the next entry of the executable's
+    /// version info after a NUL ("Spotify\0" then "8\u{16}\u{1}FileV"), from
+    /// before its description was cut at its NUL: cut there now. One left
+    /// with nothing is named after its executable, as such an app is listed.
+    fn clean_app_names(&mut self) {
+        let cut = |name: &mut String, or: &str| {
+            if let Some(end) = name.find('\0') {
+                name.truncate(name[..end].trim_end().len());
+                if name.is_empty() {
+                    *name = or.to_owned();
+                }
+            }
+        };
+        for s in &mut self.audio_sources {
+            if let SourceKind::App { bundle_id, app_name } = &mut s.kind {
+                cut(app_name, bundle_id.trim_end_matches(".exe"));
+                cut(&mut s.name, app_name);
+            }
+        }
+        for target in std::iter::once(&mut self.capture).chain(&mut self.idle_apps) {
+            match target {
+                CaptureTarget::Apps { apps, .. } => {
+                    for a in apps {
+                        cut(&mut a.name, a.id.trim_end_matches(".exe"));
+                    }
+                }
+                CaptureTarget::App { id, name } => cut(name, id.trim_end_matches(".exe")),
+                CaptureTarget::Screen => {}
+            }
+        }
+        for g in &mut self.game_capture_allowed {
+            cut(&mut g.name, g.id.trim_end_matches(".exe"));
         }
     }
 
@@ -2087,5 +2123,38 @@ mod tests {
         );
         let round: RecordSettings = serde_json::from_str(&s.to_json()).unwrap();
         assert_eq!(round.capture, s.capture);
+    }
+
+    /// App names saved with the next entry's start after a NUL (Spotify's,
+    /// as a settings file had it) load cut at the NUL, wherever they're
+    /// kept; one left with nothing is named after its executable, and
+    /// names without a NUL stay as they are.
+    #[test]
+    fn saved_app_names_end_at_their_nul() {
+        let saved = r#"{
+            "audio_sources": [
+                {"id": "a", "name": "Spotify\u0000", "kind": {"type": "app", "bundle_id": "Spotify.exe", "app_name": "Spotify\u00008\u0016\u0001FileV"}},
+                {"id": "b", "name": "\u0000x", "kind": {"type": "app", "bundle_id": "Blank.exe", "app_name": "\u0000\u0016\u0001FileV"}},
+                {"id": "c", "name": "Microphone", "kind": {"type": "microphone", "device": "default"}}
+            ],
+            "capture": {"type": "apps", "apps": [{"id": "Spotify.exe", "name": "Spotify\u00008\u0016\u0001FileV"}, {"id": "game.exe", "name": "Game"}]},
+            "idle_apps": {"type": "apps", "apps": [{"id": "Spotify.exe", "name": "Spotify \u0000"}]},
+            "game_capture_allowed": [{"id": "Spotify.exe", "name": "Spotify\u00008\u0016\u0001FileV", "anticheat": "Easy Anti-Cheat"}]
+        }"#;
+        let s = RecordSettings::from_saved(Some(saved.as_bytes()));
+        let sources: Vec<_> = s
+            .audio_sources
+            .iter()
+            .map(|a| match &a.kind {
+                SourceKind::App { app_name, .. } => (a.name.as_str(), Some(app_name.as_str())),
+                _ => (a.name.as_str(), None),
+            })
+            .collect();
+        assert_eq!(sources, [("Spotify", Some("Spotify")), ("Blank", Some("Blank")), ("Microphone", None)]);
+        let app = |id: &str, name: &str| CaptureApp { id: id.into(), name: name.into() };
+        assert_eq!(s.capture, CaptureTarget::Apps { apps: vec![app("Spotify.exe", "Spotify"), app("game.exe", "Game")], away_screen: true });
+        assert_eq!(s.idle_apps, Some(CaptureTarget::Apps { apps: vec![app("Spotify.exe", "Spotify")], away_screen: true }));
+        assert_eq!(s.game_capture_allowed[0].name, "Spotify");
+        assert!(!s.to_json().contains("\\u0000"), "saved without them");
     }
 }
