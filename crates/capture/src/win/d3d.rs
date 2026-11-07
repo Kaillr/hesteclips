@@ -588,8 +588,113 @@ pub(crate) struct Capture {
     closed: Arc<AtomicBool>,
     /// When the last frame arrived (when it started, before the first).
     last_frame: Arc<Mutex<std::time::Instant>>,
+    /// Draws the cursor again when only it moved (see [`Overlay`]).
+    ticker: Option<std::thread::JoinHandle<()>>,
+    stop: Arc<AtomicBool>,
 }
 unsafe impl Send for Capture {}
+
+/// What a [`Capture`] captures.
+#[derive(Clone, Copy)]
+pub(crate) enum Of {
+    /// A display (`item` made by [`monitor_item`]).
+    Display(HMONITOR),
+    /// A window (`item` made by [`window_item`]), its client area only (no
+    /// title bar or borders).
+    Window(HWND),
+}
+
+/// The cursor, drawn by us over Windows' capture, which leaves it out.
+///
+/// Windows can draw it in itself, but while it does, a game in fullscreen
+/// can lose its own cursor: it's gone from the game, on the screen, while
+/// it's captured (CS2, Valorant, Deadlock; issue #33). So it's drawn here as
+/// over the capture hook's and Desktop Duplication's pictures: each frame
+/// goes into `clean`, then up into the `Latest` with the cursor drawn on it.
+/// The cursor moving brings no frame now, so `clean` goes up again with it
+/// where it moved to while no frame comes (a still desktop or menu).
+struct Overlay {
+    quad: super::quad::Quad,
+    /// Draws into the `Latest`.
+    target: ID3D11RenderTargetView,
+    /// The last frame, without the cursor, `size` of it from its top-left corner.
+    clean: ID3D11Texture2D,
+    size: (u32, u32),
+    layer: super::cursor::CursorLayer,
+    of: Of,
+    /// The window's process, which has to be in focus for the cursor to show.
+    pid: Option<u32>,
+    /// The cursor as last drawn.
+    drawn: Option<((i32, i32), isize)>,
+}
+unsafe impl Send for Overlay {}
+
+impl Overlay {
+    fn new(gpu: &Gpu, latest: &Latest, of: Of) -> Result<Self> {
+        let pid = match of {
+            Of::Window(window) => {
+                let mut pid = 0u32;
+                unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(window, Some(&mut pid)) };
+                Some(pid)
+            }
+            Of::Display(_) => None,
+        };
+        let bind = (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32;
+        Ok(Self {
+            quad: super::quad::Quad::new(gpu)?,
+            target: super::quad::target_view(gpu, &latest.texture)?,
+            clean: gpu.texture(latest.width, latest.height, DXGI_FORMAT_B8G8R8A8_UNORM, bind, D3D11_USAGE_DEFAULT, 0)?,
+            size: (0, 0),
+            layer: super::cursor::CursorLayer::new(),
+            of,
+            pid,
+            drawn: None,
+        })
+    }
+
+    /// The cursor isn't as it was last drawn: moved, another, or shown or
+    /// hidden since.
+    fn moved(&self) -> bool {
+        super::cursor::showing(self.pid) != self.drawn
+    }
+
+    /// `clean` up into `latest`, with the cursor drawn on it.
+    fn put_up(&mut self, gpu: &Gpu, latest: &Latest) {
+        let (w, h) = self.size;
+        if w == 0 || h == 0 {
+            return;
+        }
+        let _held = gpu.exclusive();
+        let region = D3D11_BOX { left: 0, top: 0, front: 0, right: w, bottom: h, back: 1 };
+        unsafe { gpu.context.CopySubresourceRegion(&latest.texture, 0, 0, 0, 0, &self.clean, 0, Some(&region)) };
+        // Physical pixels, as the picture is, whatever this thread was.
+        use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetThreadDpiAwarenessContext};
+        let previous = unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+        self.drawn = super::cursor::showing(self.pid);
+        match self.of {
+            Of::Window(window) => self.layer.draw(gpu, &self.quad, latest, &self.target, window, self.pid.unwrap_or(0), self.size),
+            Of::Display(monitor) => {
+                if let Some((origin, display)) = monitor_rect(monitor) {
+                    self.layer.draw_on_screen(gpu, &self.quad, latest, &self.target, origin, display, self.size);
+                }
+            }
+        }
+        unsafe { SetThreadDpiAwarenessContext(previous) };
+        unsafe { gpu.context.Flush() };
+    }
+}
+
+/// Where a display is on the desktop and how big, in physical pixels (asked
+/// on a thread that's per-monitor DPI aware).
+fn monitor_rect(monitor: HMONITOR) -> Option<((i32, i32), (u32, u32))> {
+    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITORINFO};
+    let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+    if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+        return None;
+    }
+    let r = info.rcMonitor;
+    Some(((r.left, r.top), ((r.right - r.left).max(1) as u32, (r.bottom - r.top).max(1) as u32)))
+}
 
 fn check_supported() -> Result<()> {
     if !GraphicsCaptureSession::IsSupported().unwrap_or(false) {
@@ -611,9 +716,14 @@ pub(crate) fn window_item(window: HWND) -> Result<GraphicsCaptureItem> {
 }
 
 impl Capture {
-    /// Capture `item` into `latest`, at most `fps` × 4 times a second. For a
-    /// window, only its client area is kept (no title bar or borders).
-    pub(crate) fn start(gpu: &Gpu, item: &GraphicsCaptureItem, latest: &Arc<Latest>, window: Option<HWND>, fps: u32) -> Result<Self> {
+    /// Capture `item`, which is `of`, into `latest`, at most `fps` × 4 times
+    /// a second. For a window, only its client area is kept (no title bar or
+    /// borders).
+    pub(crate) fn start(gpu: &Gpu, item: &GraphicsCaptureItem, latest: &Arc<Latest>, of: Of, fps: u32) -> Result<Self> {
+        let window = match of {
+            Of::Window(window) => Some(window),
+            Of::Display(_) => None,
+        };
         let size = item.Size()?;
         let dxgi: IDXGIDevice = gpu.device.cast()?;
         let winrt_device: IDirect3DDevice = unsafe { CreateDirect3D11DeviceFromDXGIDevice(&dxgi)? }.cast()?;
@@ -621,10 +731,12 @@ impl Capture {
         // Free-threaded: frames arrive on a system thread, no message loop needed.
         let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(&winrt_device, format, 2, size)?;
         let session = pool.CreateCaptureSession(item)?;
-        // `HASTECLIP_CURSOR_CAPTURE=0` leaves the cursor out: a test for a
-        // cursor that vanishes in some games while they're captured.
-        let cursor = std::env::var_os("HASTECLIP_CURSOR_CAPTURE").is_none_or(|v| v != "0");
-        let _ = session.SetIsCursorCaptureEnabled(cursor);
+        // The cursor is drawn by us (see `Overlay`), not by Windows.
+        // `HASTECLIP_CURSOR_CAPTURE=1` has Windows draw it, as it used to.
+        let by_windows = std::env::var_os("HASTECLIP_CURSOR_CAPTURE").is_some_and(|v| v == "1");
+        let _ = session.SetIsCursorCaptureEnabled(by_windows);
+        let overlay = if by_windows { None } else { Some(Arc::new(Mutex::new(Overlay::new(gpu, latest, of)?))) };
+        let overlay2 = overlay.clone();
         // Windows 11: no yellow "being captured" border.
         let _ = session.SetIsBorderRequired(false);
         // Not every display refresh (540 a second on a 540 Hz monitor), just
@@ -682,18 +794,26 @@ impl Capture {
                     return Ok(None);
                 }
                 let region = D3D11_BOX { left: x, top: y, front: 0, right: x + w, bottom: y + h, back: 1 };
+                // Into `latest`, or kept without the cursor, to go up into
+                // `latest` with the cursor drawn on it.
+                let mut overlay = overlay2.as_ref().map(|o| o.lock().unwrap());
+                let into = overlay.as_ref().map_or(&latest2.texture, |o| &o.clean);
                 // Too big for `latest` (a display whose mode grew after the
                 // capture started, a window bigger than every display):
                 // shrunk to fit, keeping its shape, not cut off.
                 let fitted = super::quad::fit_within(w, h, latest2.width, latest2.height);
                 if fitted == (w, h) {
-                    unsafe { gpu2.context.CopySubresourceRegion(&latest2.texture, 0, 0, 0, 0, &tex, 0, Some(&region)) };
+                    unsafe { gpu2.context.CopySubresourceRegion(into, 0, 0, 0, 0, &tex, 0, Some(&region)) };
                 } else {
                     let mut shrink = shrink.lock().unwrap();
                     if shrink.is_none() {
-                        *shrink = Some(Shrink::new(gpu2, &latest2)?);
+                        *shrink = Some(Shrink::new(gpu2, into)?);
                     }
-                    shrink.as_mut().unwrap().draw(gpu2, &tex, region, fitted, &latest2)?;
+                    shrink.as_mut().unwrap().draw(gpu2, &tex, region, fitted, (latest2.width, latest2.height))?;
+                }
+                if let Some(o) = overlay.as_mut() {
+                    o.size = fitted;
+                    o.put_up(gpu2, &latest2);
                 }
                 Ok(Some(fitted))
             })();
@@ -733,7 +853,30 @@ impl Capture {
             Ok(())
         }))?;
         session.StartCapture()?;
-        Ok(Self { pool, session, item: item.clone(), closed_token, closed, last_frame })
+        let stop = Arc::new(AtomicBool::new(false));
+        let ticker = overlay.map(|overlay| {
+            let (gpu, latest, last_frame, stop) = (gpu.clone(), latest.clone(), last_frame.clone(), stop.clone());
+            // As often as the recording's frames: a cursor that moved within
+            // a frame goes up with the next anyway.
+            let every = std::time::Duration::from_secs_f64(1.0 / fps.max(1) as f64);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    std::thread::sleep(every);
+                    if last_frame.lock().unwrap().elapsed() < every {
+                        continue;
+                    }
+                    let mut o = overlay.lock().unwrap();
+                    // Not over a still (the away screen) or black.
+                    if o.size.0 == 0 || latest.waiting() || !o.moved() {
+                        continue;
+                    }
+                    o.put_up(&gpu, &latest);
+                    // As a frame of Windows' with the cursor moved was.
+                    latest.mark_frame(o.size);
+                }
+            })
+        });
+        Ok(Self { pool, session, item: item.clone(), closed_token, closed, last_frame, ticker, stop })
     }
 
     /// How long since the last frame (since the capture started, before the
@@ -754,6 +897,10 @@ impl Drop for Capture {
         let _ = self.item.RemoveClosed(self.closed_token);
         let _ = self.session.Close();
         let _ = self.pool.Close();
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.ticker.take() {
+            let _ = t.join();
+        }
     }
 }
 
@@ -764,7 +911,7 @@ impl Drop for Capture {
 /// time a frame is too big.
 struct Shrink {
     quad: super::quad::Quad,
-    /// Draws into the `Latest`.
+    /// Draws into the `Latest` (or the copy of it the cursor goes on).
     target: ID3D11RenderTargetView,
     /// The copy, a view to read it through, and its size (made again when
     /// that changes).
@@ -773,12 +920,14 @@ struct Shrink {
 unsafe impl Send for Shrink {}
 
 impl Shrink {
-    fn new(gpu: &Gpu, latest: &Latest) -> Result<Self> {
-        Ok(Self { quad: super::quad::Quad::new(gpu)?, target: super::quad::target_view(gpu, &latest.texture)?, copy: None })
+    /// Drawing into `into`: the `Latest`'s texture, or one as big.
+    fn new(gpu: &Gpu, into: &ID3D11Texture2D) -> Result<Self> {
+        Ok(Self { quad: super::quad::Quad::new(gpu)?, target: super::quad::target_view(gpu, into)?, copy: None })
     }
 
-    /// Draw `region` of `frame` into `latest`, `size` big, from its top-left corner.
-    fn draw(&mut self, gpu: &Gpu, frame: &ID3D11Texture2D, region: D3D11_BOX, size: (u32, u32), latest: &Latest) -> Result<()> {
+    /// Draw `region` of `frame` into its texture (`whole` big), `size` big,
+    /// from its top-left corner.
+    fn draw(&mut self, gpu: &Gpu, frame: &ID3D11Texture2D, region: D3D11_BOX, size: (u32, u32), whole: (u32, u32)) -> Result<()> {
         let part = (region.right - region.left, region.bottom - region.top);
         if self.copy.as_ref().is_none_or(|(_, _, s)| *s != part) {
             let texture = gpu.texture(part.0, part.1, DXGI_FORMAT_B8G8R8A8_UNORM, D3D11_BIND_SHADER_RESOURCE.0 as u32, D3D11_USAGE_DEFAULT, 0)?;
@@ -793,7 +942,7 @@ impl Shrink {
             clip: RECT { left: 0, top: 0, right: size.0 as i32, bottom: size.1 as i32 },
             turns: 0,
         };
-        self.quad.draw(gpu, &self.target, (latest.width, latest.height), view, &at, true);
+        self.quad.draw(gpu, &self.target, whole, view, &at, true);
         Ok(())
     }
 }
