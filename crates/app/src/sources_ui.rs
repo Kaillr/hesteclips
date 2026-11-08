@@ -525,15 +525,41 @@ impl App {
         // this narrow it was cut to a word, and its settings say it all.
         let name = self.settings.layer_title(layer);
         let (line, warn) = self.layer_line(layer, frame);
-        let problem = warn.filter(|_| on).map(|_| self.layer_problem(layer).unwrap_or_else(|| line.clone()));
-        let room = (right - x).max(10.0);
-        let g = painter.layout_job(crate::ui_kit::single_line_job(&name, theme::font(13.5, W::Medium), dim(pal.text), if problem.is_some() { room * 0.55 } else { room }));
-        let name_w = g.size().x;
-        painter.galley(pos2(x, cy - g.size().y / 2.0), g, pal.text);
-        x += name_w + 8.0;
-        if let Some(p) = problem {
-            let g = painter.layout_job(crate::ui_kit::single_line_job(&p, theme::font(12.5, W::Regular), pal.warn, (right - x).max(10.0)));
-            painter.galley(pos2(x, cy - g.size().y / 2.0), g, pal.warn);
+        // Being renamed (Rename in its menu, or F2): a box for its name in
+        // its place. Not while its settings are open: their head has it.
+        let rename_id = egui::Id::new(("rename_layer", layer));
+        let draft_id = rename_id.with("draft");
+        let in_dialog = matches!(&self.sources_view.editing, Some(crate::inspector_ui::Editing::Layer { layer: open, .. }) if *open == layer);
+        match ui.data(|d| d.get_temp::<String>(draft_id)).filter(|_| !in_dialog) {
+            Some(mut draft) => {
+                let field = egui::Rect::from_min_max(pos2(x - 4.0, rect.top() + 3.0), pos2(right, rect.bottom() - 3.0));
+                let mut fui = ui.new_child(egui::UiBuilder::new().max_rect(field).layout(egui::Layout::left_to_right(egui::Align::Center)));
+                if name_field(&mut fui, rename_id, &mut draft, theme::font(13.5, W::Medium), field.width()) {
+                    ui.data_mut(|d| d.remove::<String>(draft_id));
+                    if draft != name {
+                        let was = self.arrangement();
+                        self.settings.set_layer_title(layer, &draft);
+                        self.keep_for_undo(was);
+                    }
+                } else {
+                    ui.data_mut(|d| d.insert_temp(draft_id, draft));
+                }
+            }
+            None => {
+                if !in_dialog {
+                    forget_name_field(ui, rename_id);
+                }
+                let problem = warn.filter(|_| on).map(|_| self.layer_problem(layer).unwrap_or_else(|| line.clone()));
+                let room = (right - x).max(10.0);
+                let g = painter.layout_job(crate::ui_kit::single_line_job(&name, theme::font(13.5, W::Medium), dim(pal.text), if problem.is_some() { room * 0.55 } else { room }));
+                let name_w = g.size().x;
+                painter.galley(pos2(x, cy - g.size().y / 2.0), g, pal.text);
+                x += name_w + 8.0;
+                if let Some(p) = problem {
+                    let g = painter.layout_job(crate::ui_kit::single_line_job(&p, theme::font(12.5, W::Regular), pal.warn, (right - x).max(10.0)));
+                    painter.galley(pos2(x, cy - g.size().y / 2.0), g, pal.warn);
+                }
+            }
         }
         let resp = if line.is_empty() || held { resp } else { resp.on_hover_text(line) };
         // A click selects it; Ctrl-click picks it too (or not), Shift-click
@@ -574,7 +600,7 @@ impl App {
             self.canvas.picked.clear();
             self.select_layer(layer);
         }
-        if resp.double_clicked() {
+        if crate::ui_kit::opened(&resp) {
             self.edit_layer(layer);
         }
         let was = self.arrangement();
@@ -919,7 +945,7 @@ impl App {
         }
         let gear_rect = egui::Rect::from_center_size(pos2(rect.right() - GEAR_ROOM / 2.0, cy), vec2(26.0, 26.0));
         let gear = settings_button(ui, resp.id.with("gear"), gear_rect, ui.rect_contains_pointer(rect), "Its settings: the limiter  (double-click it)");
-        if resp.on_hover_text("Every source in the clip's sound, mixed: what people hear").double_clicked() || gear {
+        if crate::ui_kit::opened(&resp.on_hover_text("Every source in the clip's sound, mixed: what people hear")) || gear {
             self.sources_view.editing = Some(crate::inspector_ui::Editing::Mix);
         }
     }
@@ -992,7 +1018,7 @@ impl App {
         // Its settings: its button (while the pointer's on the row), or
         // twice on the row.
         let gear_rect = egui::Rect::from_center_size(pos2(rect.right() - GEAR_ROOM / 2.0, cy), vec2(26.0, 26.0));
-        if settings_button(ui, resp.id.with("gear"), gear_rect, ui.rect_contains_pointer(rect), "Its settings  (double-click it)") || resp.double_clicked() {
+        if settings_button(ui, resp.id.with("gear"), gear_rect, ui.rect_contains_pointer(rect), "Its settings  (double-click it)") || crate::ui_kit::opened(&resp) {
             action = Some(CardAction::Settings);
         }
         crate::ui_kit::context_menu(&resp, 220.0, |ui| {

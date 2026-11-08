@@ -170,7 +170,7 @@ impl App {
         }
         let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
         ui_kit::context_menu(&resp, 220.0, |ui| self.scene_menu(ui, id, rename_id));
-        if resp.double_clicked() {
+        if ui_kit::opened(&resp) {
             ui.data_mut(|d| d.insert_temp(draft_id, name));
         } else if resp.clicked() {
             self.show_scene(id);

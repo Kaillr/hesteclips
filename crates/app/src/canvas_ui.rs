@@ -690,6 +690,19 @@ impl App {
         }
     }
 
+    /// Start renaming `layer`: a box for its name in its row, or in its
+    /// settings' head where they're open for it.
+    pub(crate) fn rename_layer(&mut self, ctx: &egui::Context, layer: Layer) {
+        // Its row shows: its group unfolded.
+        if let Some(id) = self.settings.group_of(layer).map(|g| g.id)
+            && let Some(g) = self.settings.group_mut(id)
+        {
+            g.collapsed = false;
+        }
+        let title = self.settings.layer_title(layer);
+        ctx.data_mut(|d| d.insert_temp(egui::Id::new(("rename_layer", layer)).with("draft"), title));
+    }
+
     /// The sources selected, front first: the one selected and those picked
     /// with it (Ctrl- or Shift-clicked in the list).
     pub(crate) fn chosen(&self) -> Vec<Layer> {
@@ -1299,13 +1312,16 @@ impl App {
         let counted = |one: &str| if many { format!("{one} {} sources", set.len()) } else { one.to_owned() };
         // Its settings, but in their dialog (whose ⋯ this is).
         let in_dialog = self.sources_view.editing.is_some();
-        if !in_dialog {
-            if Item::new("Settings…").icon(icon::SLIDERS_HORIZONTAL).tip("What it shows, and where: in a dialog").show(ui).clicked() {
-                self.edit_layer(layer);
-                ui.close();
-            }
-            crate::ui_kit::menu_sep(ui);
+        if !in_dialog && Item::new("Settings…").icon(icon::SLIDERS_HORIZONTAL).tip("What it shows, and where: in a dialog").show(ui).clicked() {
+            self.edit_layer(layer);
+            ui.close();
         }
+        // Its name, in its row (or its settings' head, where they're open).
+        if Item::new("Rename").icon(icon::PENCIL_SIMPLE).keys(keys(&["F2"])).show(ui).clicked() {
+            self.rename_layer(ui.ctx(), layer);
+            ui.close();
+        }
+        crate::ui_kit::menu_sep(ui);
         // Cut, copy, paste; a copy of it here, it into another scene.
         self.clipboard_items(ui, true, aspect);
         let visuals: Vec<Layer> = set.iter().copied().filter(|l| matches!(l, Layer::Visual(_))).collect();
@@ -1624,6 +1640,12 @@ impl App {
             let was = self.arrangement();
             self.group_layers(&set);
             self.keep_for_undo(was);
+            return;
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F2))
+            && let Some(layer) = self.selected_layer()
+        {
+            self.rename_layer(ctx, layer);
             return;
         }
         // Cropping on the preview: Esc or Enter is done (it stays selected).

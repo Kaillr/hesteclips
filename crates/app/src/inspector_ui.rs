@@ -252,7 +252,10 @@ impl App {
                 Some(mut draft) => {
                     let done = crate::sources_ui::name_field(ui, rename_id, &mut draft, theme::font(16.0, W::Semibold), name_w - 8.0);
                     if done {
-                        self.settings.set_layer_title(layer, &draft);
+                        // As it was (Esc), it keeps no name of its own.
+                        if draft != title {
+                            self.settings.set_layer_title(layer, &draft);
+                        }
                         ui.data_mut(|d| d.remove::<String>(draft_id));
                     } else {
                         ui.data_mut(|d| d.insert_temp(draft_id, draft));

@@ -103,6 +103,29 @@ pub fn apply(ctx: &egui::Context) {
     for (theme, p) in [(egui::Theme::Dark, &theme::DARK), (egui::Theme::Light, &theme::LIGHT)] {
         ctx.style_mut_of(theme, |style| style_for(style, p));
     }
+    // Two clicks are a double-click as far apart as the system has it
+    // (Windows' is half a second): egui's own 0.3 s missed many.
+    ctx.options_mut(|o| o.input_options.max_double_click_delay = double_click_time());
+}
+
+/// How far apart two clicks can be and still be a double-click: as the
+/// system has it.
+fn double_click_time() -> f64 {
+    #[cfg(target_os = "windows")]
+    {
+        let ms = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime() };
+        if ms > 0 {
+            return f64::from(ms) / 1000.0;
+        }
+    }
+    0.5
+}
+
+/// Whether `resp` was double-clicked, to open what it is: a click quickly
+/// before it (selecting it first) makes egui count three, which is no
+/// double-click to it, and it was missed.
+pub fn opened(resp: &Response) -> bool {
+    resp.clicked() && resp.ctx.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary) || i.pointer.button_triple_clicked(egui::PointerButton::Primary))
 }
 
 fn style_for(style: &mut egui::Style, p: &Pal) {

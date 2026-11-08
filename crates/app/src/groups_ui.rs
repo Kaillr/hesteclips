@@ -168,7 +168,7 @@ impl App {
             let line = painter.layout_job(ui_kit::single_line_job(&count, theme::font(12.5, W::Regular), pal.text3, (right - x - 32.0 - name_w).max(10.0)));
             painter.galley(pos2(x + 32.0 + name_w, cy - line.size().y / 2.0), line, pal.text3);
         }
-        if resp.double_clicked() {
+        if crate::ui_kit::opened(&resp) {
             ui.data_mut(|d| d.insert_temp(draft_id, g.name.clone()));
         } else if resp.clicked() || resp.secondary_clicked() {
             self.canvas.selected = Some(Selected::Group(id));
@@ -189,7 +189,7 @@ impl App {
         let Some(g) = self.settings.group(id).cloned() else { return };
         let ctrl = crate::shortcuts::ctrl_name();
         let keys = |k: &[&str]| Some(k.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>());
-        if Item::new("Rename").icon(icon::PENCIL_SIMPLE).show(ui).clicked() {
+        if Item::new("Rename").icon(icon::PENCIL_SIMPLE).keys(keys(&["F2"])).show(ui).clicked() {
             ui.data_mut(|d| d.insert_temp(egui::Id::new(("rename_group", id)).with("draft"), g.name.clone()));
             ui.close();
         }
@@ -261,6 +261,12 @@ impl App {
         });
         if esc {
             self.canvas.selected = None;
+            return;
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F2))
+            && let Some(name) = self.settings.group(id).map(|g| g.name.clone())
+        {
+            ctx.data_mut(|d| d.insert_temp(egui::Id::new(("rename_group", id)).with("draft"), name));
             return;
         }
         if remove {
