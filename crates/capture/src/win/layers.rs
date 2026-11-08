@@ -196,11 +196,17 @@ impl Feeds {
         }
         for (id, feed) in feeds.iter_mut() {
             if let Feed::Camera { layer, .. } = feed {
-                let turns = layers.iter().find(|l| l.id == *id).map_or(0, |l| match &l.source {
-                    LayerSource::Camera { placement, .. } => placement.turns,
-                    _ => 0,
+                let placement = layers.iter().find(|l| l.id == *id).and_then(|l| match &l.source {
+                    LayerSource::Camera { placement, .. } => Some(placement),
+                    _ => None,
                 });
-                layer.pull(turns);
+                // Hidden (off, or in another scene: kept open, so switching to
+                // it shows it at once), its frames aren't uploaded till it
+                // shows; the newest is taken then.
+                if placement.is_some_and(|p| p.is_hidden()) {
+                    continue;
+                }
+                layer.pull(placement.map_or(0, |p| p.turns));
             }
         }
         if changed {

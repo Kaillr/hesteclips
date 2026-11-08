@@ -539,12 +539,26 @@ impl App {
         self.settings.webcams = a.webcams;
         self.settings.visuals = a.visuals;
         self.settings.layer_order = a.order;
+        // A source no scene has any more (one deleted meanwhile) goes.
+        self.settings.tidy_pool();
         // What's selected may be gone.
         if let Some(Selected::Layer(l)) = self.canvas.selected
             && !self.settings.layer_order().contains(&l)
         {
             self.canvas.selected = None;
         }
+    }
+
+    /// What belonged to the scene shown before a switch: its undo steps
+    /// (they'd put its sources' places into the one shown now), a drag, the
+    /// right-click menu.
+    pub(crate) fn forget_canvas_steps(&mut self) {
+        self.canvas.undo.clear();
+        self.canvas.redo.clear();
+        self.canvas.last_step = None;
+        self.canvas.drag = None;
+        self.canvas.menu = None;
+        self.canvas.card_hover = None;
     }
 
     /// The video source selected, if one is.
@@ -1253,19 +1267,21 @@ impl App {
         self.set_layer_order(&order);
     }
 
-    /// A webcam or boxed source taken out (the screen stays: it's hidden
-    /// instead). Ctrl+Z puts it back.
+    /// A webcam or boxed source taken out of the scene shown (the screen
+    /// stays: it's hidden instead); gone for good once no other scene has
+    /// it. Ctrl+Z puts it back.
     pub(crate) fn remove_layer(&mut self, layer: Layer) {
         if layer == Layer::Screen {
             return;
         }
         let name = self.settings.layer_title(layer);
-        self.settings.remove_layer(layer);
+        let gone = self.settings.remove_from_scene(layer);
         if self.selected_layer() == Some(layer) {
             self.canvas.selected = None;
         }
         let ctrl = crate::shortcuts::ctrl_name();
-        self.toast_icon(icon::TRASH, format!("Removed {name} · {ctrl}+Z puts it back"));
+        let what = if gone { format!("Removed {name}") } else { format!("Took {name} out of this scene") };
+        self.toast_icon(icon::TRASH, format!("{what} · {ctrl}+Z puts it back"));
     }
 
     /// A copy of a boxed source, in front of it, a little down and right,

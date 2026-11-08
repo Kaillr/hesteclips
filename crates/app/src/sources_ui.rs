@@ -86,7 +86,7 @@ pub(crate) struct SourcesView {
     crop_drag: Option<(crate::webcam_ui::Handle, egui::Rect, egui::Pos2)>,
     /// A row of the video's list dragged by its grip to put it in front or
     /// behind, and how the sources were before (to undo it).
-    row_drag: Option<(crate::canvas_ui::Layer, crate::canvas_ui::Arrangement)>,
+    pub(crate) row_drag: Option<(crate::canvas_ui::Layer, crate::canvas_ui::Arrangement)>,
     /// Displays for the Add menu, refreshed when it opens.
     pub(crate) add_displays: Vec<capture::Device>,
 }

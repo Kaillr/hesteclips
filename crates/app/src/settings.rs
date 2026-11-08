@@ -572,6 +572,211 @@ impl VisualCfg {
     }
 }
 
+// --- Scenes and presets ---
+
+/// A scene: which of the preset's video sources it shows, the one in front
+/// first, each placed as it is there (see [`SceneItem`]). The sources are
+/// the preset's: a webcam set up once shows in every scene it's put in,
+/// placed its own way in each. The scene shown keeps its placements in the
+/// live fields (`layer_order`, the screen's, each webcam's and source's), so
+/// its own `items` are empty.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SceneCfg {
+    pub id: u64,
+    pub name: String,
+    #[serde(default, deserialize_with = "lenient_list")]
+    pub items: Vec<SceneItem>,
+}
+
+impl SceneCfg {
+    pub fn new(id: u64, name: &str) -> Self {
+        Self { id, name: name.to_owned(), items: Vec::new() }
+    }
+}
+
+/// One of a stored scene's sources, and how it's placed there: what of the
+/// screen's, a webcam's or a source's settings goes with the scene (its
+/// switch, box, turns, flips and crop). The rest is the source's own, the
+/// same in every scene.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum SceneItem {
+    Screen {
+        #[serde(default = "yes")]
+        enabled: bool,
+        #[serde(default)]
+        placed: Option<BoxCfg>,
+        #[serde(default)]
+        turns: u8,
+        #[serde(default)]
+        flip_h: bool,
+        #[serde(default)]
+        flip_v: bool,
+        #[serde(default = "filled")]
+        framing: Framing,
+        #[serde(default)]
+        crop: Option<ScreenCrop>,
+    },
+    Webcam {
+        key: u64,
+        #[serde(default = "yes")]
+        enabled: bool,
+        placement: PlacementCfg,
+    },
+    Visual {
+        key: u64,
+        #[serde(default = "yes")]
+        enabled: bool,
+        #[serde(default)]
+        placed: Option<BoxCfg>,
+        #[serde(default)]
+        turns: u8,
+        #[serde(default)]
+        flip_h: bool,
+        #[serde(default)]
+        flip_v: bool,
+        #[serde(default)]
+        crop: Option<ScreenCrop>,
+    },
+}
+
+impl SceneItem {
+    /// The source it places.
+    pub fn layer(&self) -> LayerKey {
+        match self {
+            SceneItem::Screen { .. } => LayerKey::Screen,
+            SceneItem::Webcam { key, .. } => LayerKey::Webcam(*key),
+            SceneItem::Visual { key, .. } => LayerKey::Visual(*key),
+        }
+    }
+
+    /// A webcam's or a source's key.
+    fn key(&self) -> Option<u64> {
+        match self {
+            SceneItem::Screen { .. } => None,
+            SceneItem::Webcam { key, .. } | SceneItem::Visual { key, .. } => Some(*key),
+        }
+    }
+
+    /// The screen filling the video: what a new scene starts with (`on`),
+    /// or a scene found without it gets (hidden: it never had it showing).
+    fn screen(on: bool) -> Self {
+        SceneItem::Screen { enabled: on, placed: None, turns: 0, flip_h: false, flip_v: false, framing: Framing::Fit, crop: None }
+    }
+}
+
+/// A setup for a task (streaming, plain clipping): its own video sources,
+/// scenes and sound. The one in use keeps its setup in the live fields, so
+/// its own `setup` is `None`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PresetCfg {
+    pub id: u64,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup: Option<Box<PresetSetup>>,
+}
+
+/// What a preset holds, as the live fields hold it for the one in use (see
+/// [`RecordSettings::take_setup`]): what the screen records and what it's
+/// called, the webcams and other sources, the scene shown (in the screen's,
+/// the sources' and `layer_order`'s placements) and the others, and the
+/// sound.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PresetSetup {
+    pub capture: CaptureTarget,
+    pub idle_apps: Option<CaptureTarget>,
+    pub display_id: Option<String>,
+    pub display_index: usize,
+    pub screen: ScreenCfg,
+    pub screen_title: Option<String>,
+    pub framing: Framing,
+    pub screen_crop: Option<ScreenCrop>,
+    pub webcams: Vec<WebcamCfg>,
+    pub visuals: Vec<VisualCfg>,
+    pub layer_order: Vec<LayerKey>,
+    #[serde(deserialize_with = "lenient_list")]
+    pub scenes: Vec<SceneCfg>,
+    pub active_scene: u64,
+    pub audio_sources: Vec<AudioSourceCfg>,
+    pub limiter: bool,
+}
+
+impl Default for PresetSetup {
+    /// The screen filling the video, with your mic and your computer's
+    /// sound, in one scene.
+    fn default() -> Self {
+        RecordSettings::default().take_setup()
+    }
+}
+
+impl PresetSetup {
+    /// Every source it has: the screen, each webcam, each other.
+    fn pool(&self) -> Vec<LayerKey> {
+        std::iter::once(LayerKey::Screen).chain(self.webcams.iter().map(|w| LayerKey::Webcam(w.key))).chain(self.visuals.iter().map(|v| LayerKey::Visual(v.key))).collect()
+    }
+}
+
+/// A list read one element at a time: one this version can't read (written
+/// by a newer one, or damaged) is left out, rather than every setting going
+/// back to its default.
+fn lenient_list<'de, D, T>(d: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    Ok(match serde_json::Value::deserialize(d)? {
+        serde_json::Value::Array(items) => items.into_iter().filter_map(|i| serde_json::from_value(i).ok()).collect(),
+        _ => Vec::new(),
+    })
+}
+
+/// `name`, or with a number after it (2, 3, …) if `taken` says it's used.
+fn unused_name(name: &str, taken: impl Fn(&str) -> bool) -> String {
+    if !taken(name) {
+        return name.to_owned();
+    }
+    (2u32..).map(|i| format!("{name} {i}")).find(|n| !taken(n)).unwrap_or_else(|| name.to_owned())
+}
+
+/// A preset's scenes as they should be (see `upgrade_scenes`), given the
+/// sources it has (`pool`): one at least, ids each once, the scene shown
+/// there with its items in the live fields (none of its own), the others'
+/// items only sources there are, each once, and the screen in each.
+fn check_scenes(scenes: &mut Vec<SceneCfg>, active: &mut u64, pool: &[LayerKey]) {
+    if scenes.is_empty() {
+        scenes.push(SceneCfg::new(1, "Scene 1"));
+    }
+    let mut next = scenes.iter().map(|s| s.id).max().unwrap_or(0) + 1;
+    let mut seen: Vec<u64> = Vec::new();
+    for s in scenes.iter_mut() {
+        if s.id == 0 || seen.contains(&s.id) {
+            s.id = next;
+            next += 1;
+        }
+        seen.push(s.id);
+    }
+    if !scenes.iter().any(|s| s.id == *active) {
+        *active = scenes[0].id;
+    }
+    for s in scenes.iter_mut() {
+        if s.id == *active {
+            s.items.clear();
+            continue;
+        }
+        let mut items: Vec<SceneItem> = Vec::new();
+        for i in std::mem::take(&mut s.items) {
+            if pool.contains(&i.layer()) && !items.iter().any(|x| x.layer() == i.layer()) {
+                items.push(i);
+            }
+        }
+        if !items.iter().any(|i| i.layer() == LayerKey::Screen) {
+            items.push(SceneItem::screen(false));
+        }
+        s.items = items;
+    }
+}
+
 /// A webcam drawn over the recording.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WebcamCfg {
@@ -1195,6 +1400,18 @@ pub struct RecordSettings {
     /// What you called the screen, if you did.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub screen_title: Option<String>,
+    /// The preset in use's scenes, in order. The one shown (`active_scene`)
+    /// keeps its placements in the live fields above: its own items are
+    /// empty. None in settings from before scenes (see `upgrade_scenes`).
+    #[serde(default, deserialize_with = "lenient_list")]
+    pub scenes: Vec<SceneCfg>,
+    pub active_scene: u64,
+    /// Every preset, in order. The one in use (`active_preset`) keeps its
+    /// setup in the live fields (the sources, scenes and sound): its own
+    /// is `None`.
+    #[serde(default, deserialize_with = "lenient_list")]
+    pub presets: Vec<PresetCfg>,
+    pub active_preset: u64,
     /// Each camera's settings changed from its defaults (control id, as
     /// V4L2 numbers them, to value), by camera id: put back each time it's
     /// opened, as cameras forget them when unplugged.
@@ -1356,6 +1573,10 @@ impl Default for RecordSettings {
             layer_order: Vec::new(),
             screen: ScreenCfg::default(),
             screen_title: None,
+            scenes: vec![SceneCfg::new(1, "Scene 1")],
+            active_scene: 1,
+            presets: vec![PresetCfg { id: 1, name: "Default".to_owned(), setup: None }],
+            active_preset: 1,
             camera_controls: Default::default(),
             display_id: None,
             display_index: 0,
@@ -1644,6 +1865,7 @@ impl RecordSettings {
         let mut s: Self = bytes.and_then(Self::from_json).unwrap_or_default();
         s.upgrade_capture();
         s.upgrade_webcams();
+        s.upgrade_scenes();
         s.upgrade_save_sound();
         s.upgrade_noise_reduction();
         if let Some(old) = s.audio_tracks.take() {
@@ -1694,27 +1916,38 @@ impl RecordSettings {
         self.layer_order = self.layer_order();
     }
 
-    /// The video's sources, the one in front first: as they were put, any
-    /// not in the order yet in front (new ones), each once.
+    /// The scene shown's sources, the one in front first: each once, those
+    /// gone left out, and the screen (every scene has it; at the back if
+    /// it's missing). A source of the preset's the scene doesn't have isn't
+    /// in it (see `outside_scene`).
     pub fn layer_order(&self) -> Vec<LayerKey> {
         let exists = |k: &LayerKey| match k {
             LayerKey::Screen => true,
             LayerKey::Webcam(key) => self.webcams.iter().any(|w| w.key == *key),
             LayerKey::Visual(key) => self.visuals.iter().any(|d| d.key == *key),
         };
-        let all = std::iter::once(LayerKey::Screen).chain(self.webcams.iter().map(|w| LayerKey::Webcam(w.key))).chain(self.visuals.iter().map(|d| LayerKey::Visual(d.key)));
-        let mut order: Vec<LayerKey> = all.filter(|k| !self.layer_order.contains(k)).collect();
+        let mut order: Vec<LayerKey> = Vec::new();
         for k in &self.layer_order {
             if exists(k) && !order.contains(k) {
                 order.push(*k);
             }
         }
+        if !order.contains(&LayerKey::Screen) {
+            order.push(LayerKey::Screen);
+        }
         order
     }
 
-    /// A key no webcam or display has.
+    /// A key no webcam or source has, in any scene or preset (so one never
+    /// stands for another, in the picture caches or the capture's layers).
     pub fn new_key(&self) -> u64 {
-        self.webcams.iter().map(|w| w.key).chain(self.visuals.iter().map(|d| d.key)).max().unwrap_or(0) + 1
+        let live = self.webcams.iter().map(|w| w.key).chain(self.visuals.iter().map(|d| d.key));
+        let stored = self.scenes.iter().flat_map(|s| s.items.iter()).filter_map(SceneItem::key);
+        let others = self.presets.iter().filter_map(|p| p.setup.as_deref()).flat_map(|s| {
+            let scenes = s.scenes.iter().flat_map(|c| c.items.iter()).filter_map(SceneItem::key);
+            s.webcams.iter().map(|w| w.key).chain(s.visuals.iter().map(|v| v.key)).chain(scenes)
+        });
+        live.chain(stored).chain(others).max().unwrap_or(0) + 1
     }
 
     pub fn webcam(&self, key: u64) -> Option<&WebcamCfg> {
@@ -1805,6 +2038,419 @@ impl RecordSettings {
         }
     }
 
+    // --- Scenes: the live fields are the scene shown ---
+
+    /// How `layer` is placed in the scene shown, as a stored scene keeps it.
+    pub fn item_of(&self, layer: LayerKey) -> Option<SceneItem> {
+        match layer {
+            LayerKey::Screen => {
+                let s = &self.screen;
+                Some(SceneItem::Screen { enabled: s.enabled, placed: s.placed, turns: s.turns, flip_h: s.flip_h, flip_v: s.flip_v, framing: self.framing, crop: self.screen_crop })
+            }
+            LayerKey::Webcam(key) => self.webcam(key).map(|w| SceneItem::Webcam { key, enabled: w.enabled, placement: w.placement }),
+            LayerKey::Visual(key) => self.visual(key).map(|v| SceneItem::Visual { key, enabled: v.enabled, placed: v.placed, turns: v.turns, flip_h: v.flip_h, flip_v: v.flip_v, crop: v.crop }),
+        }
+    }
+
+    /// Place a source in the scene shown as `item` has it: false if its
+    /// source is gone.
+    fn put_item(&mut self, item: &SceneItem) -> bool {
+        match item {
+            SceneItem::Screen { enabled, placed, turns, flip_h, flip_v, framing, crop } => {
+                let s = &mut self.screen;
+                (s.enabled, s.placed, s.turns, s.flip_h, s.flip_v) = (*enabled, *placed, *turns, *flip_h, *flip_v);
+                (self.framing, self.screen_crop) = (*framing, *crop);
+                true
+            }
+            SceneItem::Webcam { key, enabled, placement } => match self.webcam_mut(*key) {
+                Some(w) => {
+                    (w.enabled, w.placement) = (*enabled, *placement);
+                    true
+                }
+                None => false,
+            },
+            SceneItem::Visual { key, enabled, placed, turns, flip_h, flip_v, crop } => match self.visual_mut(*key) {
+                Some(v) => {
+                    (v.enabled, v.placed, v.turns, v.flip_h, v.flip_v, v.crop) = (*enabled, *placed, *turns, *flip_h, *flip_v, *crop);
+                    true
+                }
+                None => false,
+            },
+        }
+    }
+
+    /// The scene shown, as a stored scene keeps it.
+    pub fn live_items(&self) -> Vec<SceneItem> {
+        self.layer_order().into_iter().filter_map(|l| self.item_of(l)).collect()
+    }
+
+    /// Every source the preset has: the screen, each webcam, each other.
+    fn pool(&self) -> Vec<LayerKey> {
+        std::iter::once(LayerKey::Screen).chain(self.webcams.iter().map(|w| LayerKey::Webcam(w.key))).chain(self.visuals.iter().map(|v| LayerKey::Visual(v.key))).collect()
+    }
+
+    /// The preset's sources the scene shown doesn't have: kept going hidden
+    /// in the capture, so switching to a scene with them shows them at once.
+    pub fn outside_scene(&self) -> Vec<LayerKey> {
+        let order = self.layer_order();
+        self.pool().into_iter().filter(|k| !order.contains(k)).collect()
+    }
+
+    /// Whether a scene other than the one shown has `layer`.
+    fn stored_scene_has(&self, layer: LayerKey) -> bool {
+        self.scenes.iter().any(|s| s.id != self.active_scene && s.items.iter().any(|i| i.layer() == layer))
+    }
+
+    /// The scene shown.
+    pub fn scene(&self) -> Option<&SceneCfg> {
+        self.scenes.iter().find(|s| s.id == self.active_scene)
+    }
+
+    /// Show scene `id`: the one shown is put away as it is, and `id`'s
+    /// placements come out into the live fields. False if it's shown
+    /// already, or isn't there.
+    pub fn switch_scene(&mut self, id: u64) -> bool {
+        if id == self.active_scene {
+            return false;
+        }
+        let Some(to) = self.scenes.iter().position(|s| s.id == id) else { return false };
+        let items = self.live_items();
+        let shown = self.active_scene;
+        if let Some(from) = self.scenes.iter_mut().find(|s| s.id == shown) {
+            from.items = items;
+        }
+        let items = std::mem::take(&mut self.scenes[to].items);
+        self.active_scene = id;
+        self.layer_order.clear();
+        for item in &items {
+            if !self.layer_order.contains(&item.layer()) && self.put_item(item) {
+                self.layer_order.push(item.layer());
+            }
+        }
+        if !self.layer_order.contains(&LayerKey::Screen) {
+            self.put_item(&SceneItem::screen(false));
+            self.layer_order.push(LayerKey::Screen);
+        }
+        true
+    }
+
+    /// A new scene after the one shown: a copy of it, or just the screen.
+    /// Its id (it isn't shown yet).
+    pub fn add_scene(&mut self, copy_of_shown: bool) -> u64 {
+        let id = self.new_scene_id();
+        let (name, items) = match self.scene().filter(|_| copy_of_shown) {
+            Some(s) => (format!("{} copy", s.name), self.live_items()),
+            None => (format!("Scene {}", self.scenes.len() + 1), vec![SceneItem::screen(true)]),
+        };
+        let name = self.unused_scene_name(&name);
+        let at = self.scenes.iter().position(|s| s.id == self.active_scene).map_or(self.scenes.len(), |i| i + 1);
+        self.scenes.insert(at, SceneCfg { id, name, items });
+        id
+    }
+
+    /// A copy of scene `id`, after it: its id.
+    pub fn duplicate_scene(&mut self, id: u64) -> Option<u64> {
+        let at = self.scenes.iter().position(|s| s.id == id)?;
+        let items = if id == self.active_scene { self.live_items() } else { self.scenes[at].items.clone() };
+        let name = self.unused_scene_name(&format!("{} copy", self.scenes[at].name));
+        let new = self.new_scene_id();
+        self.scenes.insert(at + 1, SceneCfg { id: new, name, items });
+        Some(new)
+    }
+
+    /// Take scene `id` out (never the last): the one after it (else before)
+    /// is shown if it was. Sources no scene has any more go too.
+    pub fn delete_scene(&mut self, id: u64) -> bool {
+        if self.scenes.len() < 2 {
+            return false;
+        }
+        let Some(at) = self.scenes.iter().position(|s| s.id == id) else { return false };
+        if id == self.active_scene {
+            let next = self.scenes.get(at + 1).or_else(|| at.checked_sub(1).and_then(|i| self.scenes.get(i))).map(|s| s.id);
+            let Some(next) = next else { return false };
+            self.switch_scene(next);
+        }
+        self.scenes.retain(|s| s.id != id);
+        self.tidy_pool();
+        true
+    }
+
+    /// Call scene `id` `name` (an empty name leaves it as it was).
+    pub fn rename_scene(&mut self, id: u64, name: &str) {
+        let name = name.trim();
+        if let Some(s) = self.scenes.iter_mut().find(|s| s.id == id).filter(|_| !name.is_empty()) {
+            s.name = name.to_owned();
+        }
+    }
+
+    /// Move scene `id` one place up the list (`up`) or down.
+    pub fn move_scene(&mut self, id: u64, up: bool) {
+        let Some(at) = self.scenes.iter().position(|s| s.id == id) else { return };
+        let to = if up { at.checked_sub(1) } else { (at + 1 < self.scenes.len()).then_some(at + 1) };
+        if let Some(to) = to {
+            self.scenes.swap(at, to);
+        }
+    }
+
+    /// Put one of the preset's sources the scene shown doesn't have into
+    /// it, in front, showing, where it was last placed. False if it's there
+    /// already, or gone.
+    pub fn add_to_scene(&mut self, layer: LayerKey) -> bool {
+        if self.layer_order().contains(&layer) || !self.pool().contains(&layer) {
+            return false;
+        }
+        match layer {
+            LayerKey::Webcam(key) => self.webcam_mut(key).into_iter().for_each(|w| w.enabled = true),
+            LayerKey::Visual(key) => self.visual_mut(key).into_iter().for_each(|v| v.enabled = true),
+            LayerKey::Screen => {}
+        }
+        self.layer_order = self.layer_order();
+        self.layer_order.insert(0, layer);
+        true
+    }
+
+    /// Take a source out of the scene shown (never the screen, which every
+    /// scene has): gone for good once no other scene has it. Whether it went
+    /// for good.
+    pub fn remove_from_scene(&mut self, layer: LayerKey) -> bool {
+        if layer == LayerKey::Screen {
+            return false;
+        }
+        self.layer_order.retain(|l| *l != layer);
+        let elsewhere = self.stored_scene_has(layer);
+        if !elsewhere {
+            self.remove_layer(layer);
+        }
+        !elsewhere
+    }
+
+    /// Sources no scene has any more (one deleted, an undo) go.
+    pub fn tidy_pool(&mut self) {
+        let order = self.layer_order();
+        let gone: Vec<LayerKey> = self.pool().into_iter().filter(|k| !order.contains(k) && !self.stored_scene_has(*k)).collect();
+        for k in gone {
+            self.remove_layer(k);
+        }
+    }
+
+    /// The webcams to keep open: showing in the scene shown, or in another
+    /// of the preset's (switching to it shows them at once). One hidden in
+    /// every scene is closed.
+    pub fn cameras_in_use(&self) -> Vec<&WebcamCfg> {
+        let order = self.layer_order();
+        let stored = |key: u64| self.scenes.iter().any(|s| s.items.iter().any(|i| matches!(i, SceneItem::Webcam { key: k, enabled: true, .. } if *k == key)));
+        self.webcams.iter().filter(|w| (w.enabled && order.contains(&LayerKey::Webcam(w.key))) || stored(w.key)).collect()
+    }
+
+    /// An id no scene has, in any preset.
+    fn new_scene_id(&self) -> u64 {
+        let others = self.presets.iter().filter_map(|p| p.setup.as_deref()).flat_map(|s| s.scenes.iter().map(|c| c.id));
+        self.scenes.iter().map(|s| s.id).chain(others).max().unwrap_or(0) + 1
+    }
+
+    /// `name`, or with a number after it if a scene's called that already.
+    fn unused_scene_name(&self, name: &str) -> String {
+        unused_name(name, |n| self.scenes.iter().any(|s| s.name == n))
+    }
+
+    // --- Presets: the live fields are the preset in use ---
+
+    /// The preset in use.
+    pub fn preset(&self) -> Option<&PresetCfg> {
+        self.presets.iter().find(|p| p.id == self.active_preset)
+    }
+
+    /// The preset in use's setup, out of the live fields (left as they are
+    /// when new): to store it, or carry it over (Reset settings).
+    pub fn take_setup(&mut self) -> PresetSetup {
+        PresetSetup {
+            capture: std::mem::take(&mut self.capture),
+            idle_apps: self.idle_apps.take(),
+            display_id: self.display_id.take(),
+            display_index: std::mem::take(&mut self.display_index),
+            screen: std::mem::take(&mut self.screen),
+            screen_title: self.screen_title.take(),
+            framing: std::mem::take(&mut self.framing),
+            screen_crop: self.screen_crop.take(),
+            webcams: std::mem::take(&mut self.webcams),
+            visuals: std::mem::take(&mut self.visuals),
+            layer_order: std::mem::take(&mut self.layer_order),
+            scenes: std::mem::take(&mut self.scenes),
+            active_scene: std::mem::take(&mut self.active_scene),
+            audio_sources: std::mem::take(&mut self.audio_sources),
+            limiter: self.limiter,
+        }
+    }
+
+    /// `setup` into the live fields (see `take_setup`).
+    pub fn put_setup(&mut self, s: PresetSetup) {
+        self.capture = s.capture;
+        self.idle_apps = s.idle_apps;
+        (self.display_id, self.display_index) = (s.display_id, s.display_index);
+        self.screen = s.screen;
+        self.screen_title = s.screen_title;
+        (self.framing, self.screen_crop) = (s.framing, s.screen_crop);
+        self.webcams = s.webcams;
+        self.visuals = s.visuals;
+        self.layer_order = s.layer_order;
+        (self.scenes, self.active_scene) = (s.scenes, s.active_scene);
+        self.audio_sources = s.audio_sources;
+        self.limiter = s.limiter;
+    }
+
+    /// `old`'s presets, with the one in use's setup, carried over into these
+    /// settings (Reset settings keeps your sources, scenes and sound).
+    pub fn keep_presets_from(&mut self, old: &mut RecordSettings) {
+        self.put_setup(old.take_setup());
+        self.presets = std::mem::take(&mut old.presets);
+        self.active_preset = old.active_preset;
+    }
+
+    /// Use preset `id`: the one in use is stored as it is, and `id`'s setup
+    /// comes out into the live fields. False if it's in use already, or
+    /// isn't there. (A capture keeps what it started with: switch while
+    /// it's stopped.)
+    pub fn switch_preset(&mut self, id: u64) -> bool {
+        if id == self.active_preset {
+            return false;
+        }
+        let Some(setup) = self.presets.iter_mut().find(|p| p.id == id).and_then(|p| p.setup.take()) else { return false };
+        let current = self.take_setup();
+        let using = self.active_preset;
+        if let Some(from) = self.presets.iter_mut().find(|p| p.id == using) {
+            from.setup = Some(Box::new(current));
+        }
+        self.put_setup(*setup);
+        self.active_preset = id;
+        true
+    }
+
+    /// A new preset after the one in use, called `name`: a copy of it (with
+    /// sources of its own, so changing one leaves the other alone), or just
+    /// the screen with your mic and your computer's sound. Its id (it isn't
+    /// in use yet).
+    pub fn add_preset(&mut self, name: &str, copy: bool) -> u64 {
+        let setup = if copy { self.copied_setup() } else { self.fresh_setup() };
+        let id = self.presets.iter().map(|p| p.id).max().unwrap_or(0) + 1;
+        let name = unused_name(name.trim(), |n| self.presets.iter().any(|p| p.name == n));
+        let at = self.presets.iter().position(|p| p.id == self.active_preset).map_or(self.presets.len(), |i| i + 1);
+        self.presets.insert(at, PresetCfg { id, name, setup: Some(Box::new(setup)) });
+        id
+    }
+
+    /// The preset in use's setup, copied, its sources, scenes and sounds
+    /// given keys and ids of their own.
+    fn copied_setup(&self) -> PresetSetup {
+        let mut s = self.clone().take_setup();
+        // Webcams and sources share one key space: old key → new.
+        let mut next = self.new_key();
+        let mut keys: Vec<(u64, u64)> = Vec::new();
+        for key in s.webcams.iter_mut().map(|w| &mut w.key).chain(s.visuals.iter_mut().map(|v| &mut v.key)) {
+            keys.push((*key, next));
+            *key = next;
+            next += 1;
+        }
+        let new_key = |k: u64| keys.iter().find(|(was, _)| *was == k).map_or(k, |(_, now)| *now);
+        for l in &mut s.layer_order {
+            if let LayerKey::Webcam(k) | LayerKey::Visual(k) = l {
+                *k = new_key(*k);
+            }
+        }
+        let shown = s.active_scene;
+        let mut id = self.new_scene_id();
+        for scene in &mut s.scenes {
+            if scene.id == shown {
+                s.active_scene = id;
+            }
+            scene.id = id;
+            id += 1;
+            for item in &mut scene.items {
+                if let SceneItem::Webcam { key, .. } | SceneItem::Visual { key, .. } = item {
+                    *key = new_key(*key);
+                }
+            }
+        }
+        for a in &mut s.audio_sources {
+            a.id = new_source_id();
+        }
+        s
+    }
+
+    /// A new preset's setup: the screen (the display in use now) filling the
+    /// video, your mic and your computer's sound, in one scene.
+    fn fresh_setup(&self) -> PresetSetup {
+        let mut s = PresetSetup { display_id: self.display_id.clone(), display_index: self.display_index, ..PresetSetup::default() };
+        let id = self.new_scene_id();
+        s.scenes = vec![SceneCfg::new(id, "Scene 1")];
+        s.active_scene = id;
+        s
+    }
+
+    /// Take preset `id` out (never the last): the one after it (else before)
+    /// is used if it was in use.
+    pub fn delete_preset(&mut self, id: u64) -> bool {
+        if self.presets.len() < 2 {
+            return false;
+        }
+        let Some(at) = self.presets.iter().position(|p| p.id == id) else { return false };
+        if id == self.active_preset {
+            let next = self.presets.get(at + 1).or_else(|| at.checked_sub(1).and_then(|i| self.presets.get(i))).map(|p| p.id);
+            if !next.is_some_and(|next| self.switch_preset(next)) {
+                return false;
+            }
+        }
+        self.presets.retain(|p| p.id != id);
+        true
+    }
+
+    /// Call preset `id` `name` (an empty name leaves it as it was).
+    pub fn rename_preset(&mut self, id: u64, name: &str) {
+        let name = name.trim();
+        if let Some(p) = self.presets.iter_mut().find(|p| p.id == id).filter(|_| !name.is_empty()) {
+            p.name = name.to_owned();
+        }
+    }
+
+    /// Scenes and presets as they should be. Settings from before them get
+    /// one preset with one scene showing every source (those not in the
+    /// order in front, as they showed then); with them, they're checked (see
+    /// `check_scenes`), the preset in use there without a setup of its own,
+    /// the others each with theirs.
+    fn upgrade_scenes(&mut self) {
+        if self.scenes.is_empty() {
+            let order = self.layer_order.clone();
+            let mut all: Vec<LayerKey> = self.pool().into_iter().filter(|k| !order.contains(k)).collect();
+            all.extend(order);
+            self.layer_order = all;
+            let id = self.new_scene_id();
+            self.scenes.push(SceneCfg::new(id, "Scene 1"));
+            self.active_scene = id;
+        }
+        let pool = self.pool();
+        check_scenes(&mut self.scenes, &mut self.active_scene, &pool);
+        self.layer_order = self.layer_order();
+        let using = self.active_preset;
+        let mut seen: Vec<u64> = Vec::new();
+        self.presets.retain(|p| {
+            let keep = (p.setup.is_some() || p.id == using) && !seen.contains(&p.id);
+            seen.push(p.id);
+            keep
+        });
+        if !self.presets.iter().any(|p| p.id == using) {
+            let id = self.presets.iter().map(|p| p.id).max().unwrap_or(0) + 1;
+            self.presets.insert(0, PresetCfg { id, name: "Default".to_owned(), setup: None });
+            self.active_preset = id;
+        }
+        for p in &mut self.presets {
+            if p.id == self.active_preset {
+                p.setup = None;
+            } else if let Some(s) = p.setup.as_deref_mut() {
+                let pool = s.pool();
+                check_scenes(&mut s.scenes, &mut s.active_scene, &pool);
+            }
+        }
+    }
+
     /// A built-in sound that's gone (Silverfish) becomes the default, so the
     /// picker names what plays.
     fn upgrade_save_sound(&mut self) {
@@ -1890,8 +2536,10 @@ impl RecordSettings {
         let mut s = self.clone();
         s.saved_size = Some(SizeCfg { resolution: self.resolution, shape: self.shape });
         (s.resolution, s.shape) = self.size_for_older();
-        // Older versions have one webcam, in front of the screen or behind it.
-        s.webcam = self.first_webcam().cloned();
+        // Older versions have one webcam, in front of the screen or behind it:
+        // the scene shown's, else the preset's first, off (so its camera
+        // and place aren't lost there).
+        s.webcam = self.first_webcam().cloned().or_else(|| self.webcams.first().map(|w| WebcamCfg { enabled: false, ..w.clone() }));
         s.screen.in_front = self.screen_in_front();
         s.layer_order = self.layer_order();
         serde_json::to_string_pretty(&s).unwrap_or_default()
@@ -2431,17 +3079,20 @@ mod tests {
         assert_eq!(again.layer_order(), two.layer_order());
     }
 
-    /// The order names each source once, new ones in front, gone ones left out.
+    /// The order is the scene shown's: each source once, gone ones left out,
+    /// the screen always there. One of the preset's the scene doesn't have
+    /// isn't in it.
     #[test]
     fn the_order_keeps_up_with_the_sources() {
         let mut s = RecordSettings::default();
         assert_eq!(s.layer_order(), vec![LayerKey::Screen]);
         s.visuals.push(VisualCfg::new(3, Visual::Display { id: "d".into(), name: "D".into() }));
-        s.layer_order = vec![LayerKey::Screen, LayerKey::Webcam(7)];
-        assert_eq!(s.layer_order(), vec![LayerKey::Visual(3), LayerKey::Screen]);
+        s.layer_order = vec![LayerKey::Webcam(7)];
+        assert_eq!(s.layer_order(), vec![LayerKey::Screen]);
+        assert_eq!(s.outside_scene(), vec![LayerKey::Visual(3)]);
         assert_eq!(s.new_key(), 4);
         s.remove_layer(LayerKey::Visual(3));
-        assert_eq!(s.layer_order(), vec![LayerKey::Screen]);
+        assert!(s.outside_scene().is_empty());
         assert!(s.screen_in_front());
     }
 
@@ -2460,5 +3111,269 @@ mod tests {
         );
         let round: RecordSettings = serde_json::from_str(&s.to_json()).unwrap();
         assert_eq!(round.capture, s.capture);
+    }
+}
+
+#[cfg(test)]
+mod scene_tests {
+    use super::*;
+
+    fn cam(key: u64, id: &str) -> WebcamCfg {
+        let placement = PlacementCfg { x: 0.7, y: 0.7, w: 0.25, h: 0.25, crop: [0.0; 4], flip_h: false, flip_v: false, turns: 0, frame_aspect: Some(16.0 / 9.0), stretch: 1.0 };
+        WebcamCfg { key, id: id.into(), name: id.into(), title: None, format: None, placement, enabled: true }
+    }
+
+    /// A webcam and an image in front of the screen, in the one scene.
+    fn setup() -> RecordSettings {
+        let mut s = RecordSettings::default();
+        s.webcams.push(cam(1, "cam"));
+        s.visuals.push(VisualCfg::new(2, Visual::Image { path: "logo.png".into() }));
+        s.layer_order = vec![LayerKey::Webcam(1), LayerKey::Visual(2), LayerKey::Screen];
+        s
+    }
+
+    fn placed(x: f32) -> Option<BoxCfg> {
+        Some(BoxCfg::new([x, 0.1, 0.2, 0.2], 16.0 / 9.0, None))
+    }
+
+    #[test]
+    fn settings_from_before_scenes_become_one_preset_with_one_scene() {
+        // Sources, and an order without the colour (as before scenes).
+        let json = r#"{"webcams": [{"key": 1, "id": "cam", "name": "Cam", "placement": {"x": 0.7, "y": 0.7, "w": 0.25, "h": 0.25}}],
+            "visuals": [{"key": 2, "type": "colour", "rgba": [1, 2, 3, 255]}],
+            "layer_order": ["screen", {"webcam": 1}]}"#;
+        let s = RecordSettings::from_saved(Some(json.as_bytes()));
+        assert_eq!((s.presets.len(), s.scenes.len()), (1, 1));
+        assert_eq!(s.preset().map(|p| (p.name.as_str(), p.setup.is_none())), Some(("Default", true)));
+        assert_eq!(s.scene().map(|c| (c.name.as_str(), c.items.len())), Some(("Scene 1", 0)));
+        // Every source showing, as they did then: the one not in the order in front.
+        assert_eq!(s.layer_order(), vec![LayerKey::Visual(2), LayerKey::Screen, LayerKey::Webcam(1)]);
+        assert!(s.outside_scene().is_empty());
+        let again = RecordSettings::from_saved(Some(s.to_json().as_bytes()));
+        assert_eq!(again.to_json(), s.to_json());
+    }
+
+    #[test]
+    fn scenes_and_presets_are_saved_and_read_back() {
+        let mut s = setup();
+        let b = s.add_scene(false);
+        s.rename_scene(b, "BRB");
+        s.add_preset("Streaming", true);
+        let json = s.to_json();
+        let back = RecordSettings::from_saved(Some(json.as_bytes()));
+        assert_eq!(back.scenes, s.scenes);
+        assert_eq!(back.active_scene, s.active_scene);
+        let presets = |s: &RecordSettings| s.presets.iter().map(|p| (p.id, p.name.clone(), p.setup.is_some())).collect::<Vec<_>>();
+        assert_eq!(presets(&back), presets(&s));
+        assert_eq!(back.to_json(), json);
+    }
+
+    /// A version from before scenes reads the scene shown: its one webcam
+    /// there, and the screen's place.
+    #[test]
+    fn older_versions_read_the_scene_shown() {
+        let mut s = setup();
+        let b = s.add_scene(false);
+        s.switch_scene(b);
+        let old: serde_json::Value = serde_json::from_str(&s.to_json()).unwrap();
+        // No webcam in this scene: the preset's, off, so it isn't lost there.
+        assert_eq!(old["webcam"]["id"], "cam");
+        assert_eq!(old["webcam"]["enabled"], false);
+        assert_eq!(old["screen"]["enabled"], true);
+    }
+
+    #[test]
+    fn switching_scenes_keeps_each_ones_placements() {
+        let mut s = setup();
+        s.screen.placed = placed(0.1);
+        let a = s.active_scene;
+        let b = s.duplicate_scene(a).unwrap();
+        assert!(s.switch_scene(b));
+        // In B: the screen elsewhere, the image hidden, the webcam behind
+        // and moved.
+        s.screen.placed = placed(0.5);
+        s.visual_mut(2).unwrap().enabled = false;
+        s.layer_order = vec![LayerKey::Visual(2), LayerKey::Screen, LayerKey::Webcam(1)];
+        s.webcam_mut(1).unwrap().placement.x = 0.05;
+        // A source's own settings are the same in every scene.
+        s.webcam_mut(1).unwrap().title = Some("Face".into());
+        assert!(s.switch_scene(a));
+        assert_eq!(s.screen.placed, placed(0.1));
+        assert!(s.visual(2).unwrap().enabled);
+        assert_eq!(s.layer_order(), vec![LayerKey::Webcam(1), LayerKey::Visual(2), LayerKey::Screen]);
+        assert_eq!(s.webcam(1).unwrap().placement.x, 0.7);
+        assert_eq!(s.webcam(1).unwrap().title.as_deref(), Some("Face"));
+        // And B as it was left.
+        assert!(s.switch_scene(b));
+        assert_eq!(s.screen.placed, placed(0.5));
+        assert!(!s.visual(2).unwrap().enabled);
+        assert_eq!(s.layer_order(), vec![LayerKey::Visual(2), LayerKey::Screen, LayerKey::Webcam(1)]);
+        assert_eq!(s.webcam(1).unwrap().placement.x, 0.05);
+        assert!(!s.switch_scene(b), "shown already");
+        assert!(!s.switch_scene(999), "no such scene");
+    }
+
+    #[test]
+    fn a_source_another_scene_has_is_hidden_here_not_gone() {
+        let mut s = setup();
+        let b = s.add_scene(false);
+        s.switch_scene(b);
+        assert_eq!(s.layer_order(), vec![LayerKey::Screen]);
+        assert_eq!(s.outside_scene(), vec![LayerKey::Webcam(1), LayerKey::Visual(2)]);
+        assert!(s.webcam(1).is_some() && s.visual(2).is_some());
+    }
+
+    #[test]
+    fn taking_out_keeps_what_another_scene_has() {
+        let mut s = setup();
+        let a = s.active_scene;
+        let b = s.duplicate_scene(a).unwrap();
+        // Out of A, but B has it: still the preset's.
+        assert!(!s.remove_from_scene(LayerKey::Webcam(1)));
+        assert!(s.webcam(1).is_some());
+        assert_eq!(s.outside_scene(), vec![LayerKey::Webcam(1)]);
+        // Out of both: gone.
+        assert!(!s.remove_from_scene(LayerKey::Visual(2)));
+        s.switch_scene(b);
+        assert!(s.remove_from_scene(LayerKey::Visual(2)));
+        assert!(s.visual(2).is_none());
+        // Never the screen.
+        assert!(!s.remove_from_scene(LayerKey::Screen));
+        assert!(s.layer_order().contains(&LayerKey::Screen));
+    }
+
+    #[test]
+    fn putting_in_from_another_scene_shares_the_source() {
+        let mut s = setup();
+        s.webcam_mut(1).unwrap().enabled = false;
+        let b = s.add_scene(false);
+        s.switch_scene(b);
+        assert!(s.add_to_scene(LayerKey::Webcam(1)));
+        // The same webcam, where it was last placed, in front, showing.
+        assert_eq!(s.webcams.len(), 1);
+        assert_eq!(s.layer_order(), vec![LayerKey::Webcam(1), LayerKey::Screen]);
+        assert_eq!(s.webcam(1).unwrap().placement.x, 0.7);
+        assert!(s.webcam(1).unwrap().enabled);
+        assert!(!s.add_to_scene(LayerKey::Webcam(1)), "there already");
+        assert!(!s.add_to_scene(LayerKey::Webcam(9)), "no such source");
+    }
+
+    #[test]
+    fn sources_no_scene_has_go_with_the_last_scene_they_were_in() {
+        let mut s = setup();
+        let a = s.active_scene;
+        let b = s.add_scene(false);
+        s.switch_scene(b);
+        assert!(s.delete_scene(a));
+        assert!(s.webcams.is_empty() && s.visuals.is_empty());
+        assert_eq!(s.scenes.len(), 1);
+        assert!(!s.delete_scene(b), "never the last");
+        // Deleting the one shown shows another.
+        let c = s.add_scene(false);
+        assert!(s.delete_scene(b));
+        assert_eq!(s.active_scene, c);
+    }
+
+    #[test]
+    fn new_keys_are_no_other_presets() {
+        let mut s = setup();
+        let p = s.add_preset("Other", false);
+        s.presets.iter_mut().find(|x| x.id == p).unwrap().setup.as_mut().unwrap().webcams.push(cam(50, "x"));
+        assert_eq!(s.new_key(), 51);
+    }
+
+    #[test]
+    fn cameras_open_are_those_a_scene_shows() {
+        let mut s = setup();
+        let a = s.active_scene;
+        let ids = |s: &RecordSettings| s.cameras_in_use().iter().map(|w| w.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&s), ["cam"]);
+        let b = s.add_scene(false);
+        s.switch_scene(b);
+        assert_eq!(ids(&s), ["cam"], "A shows it: kept open for going back");
+        s.switch_scene(a);
+        s.webcam_mut(1).unwrap().enabled = false;
+        assert!(ids(&s).is_empty(), "hidden in every scene: closed");
+    }
+
+    #[test]
+    fn switching_presets_and_back() {
+        let mut s = setup();
+        s.fps = 144;
+        let first = s.active_preset;
+        let json = s.to_json();
+        let other = s.add_preset("Clipping", false);
+        assert!(s.switch_preset(other));
+        // Its own: the screen, a mic and the computer's sound, one scene.
+        assert!(s.webcams.is_empty() && s.visuals.is_empty());
+        assert_eq!((s.audio_sources.len(), s.scenes.len()), (2, 1));
+        assert_eq!(s.fps, 144, "output settings are every preset's");
+        assert!(s.preset().unwrap().setup.is_none());
+        assert!(s.switch_preset(first));
+        let without_presets = |j: &str| {
+            let mut v: serde_json::Value = serde_json::from_str(j).unwrap();
+            v.as_object_mut().unwrap().remove("presets");
+            v
+        };
+        assert_eq!(without_presets(&s.to_json()), without_presets(&json));
+        assert!(!s.switch_preset(first), "in use already");
+        assert!(!s.switch_preset(999), "no such preset");
+    }
+
+    #[test]
+    fn a_copied_preset_has_sources_of_its_own() {
+        let mut s = setup();
+        s.add_scene(true);
+        let p = s.add_preset("Streaming", true);
+        let setup = s.presets.iter().find(|x| x.id == p).unwrap().setup.clone().unwrap();
+        let key = setup.webcams[0].key;
+        assert_ne!(key, 1);
+        assert_ne!(setup.audio_sources[0].id, s.audio_sources[0].id);
+        assert!(setup.layer_order.contains(&LayerKey::Webcam(key)));
+        let stored = setup.scenes.iter().find(|c| c.id != setup.active_scene).unwrap();
+        assert!(stored.items.iter().any(|i| i.layer() == LayerKey::Webcam(key)));
+        assert!(setup.scenes.iter().all(|c| !s.scenes.iter().any(|x| x.id == c.id)), "scene ids of its own");
+    }
+
+    #[test]
+    fn a_damaged_file_is_put_right() {
+        let mut s = setup();
+        s.add_scene(true);
+        let mut v: serde_json::Value = serde_json::from_str(&s.to_json()).unwrap();
+        // Two scenes with one id, the one shown not there, an item of a
+        // source that isn't, one this version can't read, and a preset not
+        // in use without a setup.
+        let scenes = v["scenes"].as_array_mut().unwrap();
+        scenes[1]["id"] = scenes[0]["id"].clone();
+        let items = scenes[1]["items"].as_array_mut().unwrap();
+        items.push(serde_json::json!({"source": "webcam", "key": 77, "placement": {"x": 0, "y": 0, "w": 0.1, "h": 0.1}}));
+        items.push(serde_json::json!({"source": "hologram"}));
+        v["active_scene"] = serde_json::json!(4242);
+        v["presets"] = serde_json::json!([{"id": 5, "name": "Ghost"}]);
+        let fixed = RecordSettings::from_saved(Some(v.to_string().as_bytes()));
+        assert_eq!(fixed.fps, s.fps, "the rest of the settings kept");
+        assert_eq!(fixed.webcams.len(), 1);
+        let ids: Vec<u64> = fixed.scenes.iter().map(|c| c.id).collect();
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1]);
+        assert!(fixed.scene().is_some_and(|c| c.items.is_empty()));
+        for c in fixed.scenes.iter().filter(|c| c.id != fixed.active_scene) {
+            assert!(c.items.iter().all(|i| i.layer() != LayerKey::Webcam(77)));
+            assert!(c.items.iter().any(|i| i.layer() == LayerKey::Screen));
+        }
+        assert_eq!(fixed.presets.len(), 1);
+        assert!(fixed.preset().is_some_and(|p| p.setup.is_none()));
+    }
+
+    #[test]
+    fn reset_keeps_the_presets() {
+        let mut s = setup();
+        s.add_scene(true);
+        let p = s.add_preset("Streaming", true);
+        let mut fresh = RecordSettings::default();
+        fresh.keep_presets_from(&mut s);
+        assert_eq!((fresh.scenes.len(), fresh.webcams.len()), (2, 1));
+        assert!(fresh.presets.iter().any(|x| x.id == p));
+        assert!(fresh.preset().is_some_and(|x| x.setup.is_none()));
     }
 }

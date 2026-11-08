@@ -1347,22 +1347,14 @@ impl App {
         }
         let modal = ui_kit::dialog(ctx, "reset_settings", 400.0, |ui| {
             ui_kit::dialog_title(ui, "Reset all settings?");
-            ui_kit::dialog_text(ui, "Clipping, video, saving and shortcuts go back to their defaults. Your clips, folders, sources and where you stream to are kept.");
+            ui_kit::dialog_text(ui, "Clipping, video, saving and shortcuts go back to their defaults. Your clips, folders, presets with their scenes, sources and sound, and where you stream to are kept.");
             ui_kit::dialog_buttons(ui, |ui| {
                 if ui.add(ui_kit::danger_button("Reset")).clicked() {
                     let mut fresh = settings::RecordSettings::default();
                     fresh.output_dir = self.settings.output_dir.clone();
                     fresh.game_folders = std::mem::take(&mut self.settings.game_folders);
-                    fresh.audio_sources = std::mem::take(&mut self.settings.audio_sources);
-                    fresh.capture = std::mem::take(&mut self.settings.capture);
-                    fresh.idle_apps = self.settings.idle_apps.take();
-                    fresh.webcams = std::mem::take(&mut self.settings.webcams);
-                    fresh.visuals = std::mem::take(&mut self.settings.visuals);
-                    fresh.layer_order = std::mem::take(&mut self.settings.layer_order);
+                    fresh.keep_presets_from(&mut self.settings);
                     fresh.camera_controls = std::mem::take(&mut self.settings.camera_controls);
-                    fresh.display_id = self.settings.display_id.take();
-                    fresh.display_index = self.settings.display_index;
-                    fresh.limiter = self.settings.limiter;
                     fresh.save_sound.custom = std::mem::take(&mut self.settings.save_sound.custom);
                     fresh.library_sort = self.settings.library_sort;
                     fresh.stream.destinations = std::mem::take(&mut self.settings.stream.destinations);
