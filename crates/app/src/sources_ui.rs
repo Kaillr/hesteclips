@@ -668,7 +668,7 @@ impl App {
                 added = Some(crate::canvas_ui::Layer::Visual(key));
             }
             if capture::layers::BROWSER && Item::new("Web page").icon(icon::GLOBE).tip("Alerts, a chat overlay, a widget (its transparency kept)").show(ui).clicked() {
-                added = Some(crate::canvas_ui::Layer::Visual(self.add_visual(Visual::Browser { url: "https://".into(), width: 800, height: 600, reload: 0 })));
+                added = Some(crate::canvas_ui::Layer::Visual(self.add_visual(Visual::Browser { url: "https://".into(), width: 800, height: 600, reload: 0, css: String::new() })));
                 fill_in = true;
             }
             // The preset's sources this scene doesn't have: the same source

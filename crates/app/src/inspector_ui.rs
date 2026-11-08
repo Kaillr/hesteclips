@@ -587,7 +587,7 @@ impl App {
                     }
                 });
             }
-            Visual::Browser { url, width, height, reload } => {
+            Visual::Browser { url, width, height, reload, css } => {
                 // Typed in full, then taken when it's done (Enter, or
                 // clicking away): each key would load the page again.
                 let draft_id = egui::Id::new(("browser_url", key));
@@ -603,21 +603,49 @@ impl App {
                     let typed = draft.trim().to_owned();
                     if typed != *url && !typed.is_empty() {
                         let typed = if typed.contains("://") { typed } else { format!("https://{typed}") };
-                        set = Some(Visual::Browser { url: typed, width: *width, height: *height, reload: *reload });
+                        set = Some(Visual::Browser { url: typed, width: *width, height: *height, reload: *reload, css: css.clone() });
                     }
                 } else {
                     l.ui.data_mut(|d| d.insert_temp(draft_id, draft));
                 }
                 l.row(Row::new("Page size").note("How big it's drawn, as a browser window would be"), |ui| {
                     if let Some((w, h)) = ui_kit::size_field(ui, &format!("browser_size_{key}"), (*width, *height), 16..=3840, 16..=2160) {
-                        set = Some(Visual::Browser { url: url.clone(), width: w, height: h, reload: *reload });
+                        set = Some(Visual::Browser { url: url.clone(), width: w, height: h, reload: *reload, css: css.clone() });
                     }
                 });
                 l.row(Row::new("Page").note("Transparent where the page is"), |ui| {
                     if Btn::normal("Reload").with_icon(icon::ARROWS_CLOCKWISE).small().tip("Load the page again").show(ui).clicked() {
-                        set = Some(Visual::Browser { url: url.clone(), width: *width, height: *height, reload: reload.wrapping_add(1) });
+                        set = Some(Visual::Browser { url: url.clone(), width: *width, height: *height, reload: reload.wrapping_add(1), css: css.clone() });
                     }
                 });
+                // Its own look over the page's (as a style sheet added to
+                // it): taken when it's done, as the address is, since the
+                // page loads again with it.
+                let css_id = egui::Id::new(("browser_css", key));
+                let mut draft: String = l.ui.data(|d| d.get_temp(css_id)).unwrap_or_else(|| css.clone());
+                let mut done = false;
+                wide_row(l, "Custom CSS", &mut |ui| {
+                    // Free text: a style sheet.
+                    #[allow(clippy::disallowed_methods)]
+                    let edit = egui::TextEdit::multiline(&mut draft)
+                        .code_editor()
+                        .desired_rows(4)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("body { background-color: rgba(0, 0, 0, 0); overflow: hidden; }");
+                    let pal = theme::pal(ui);
+                    let r = egui::Frame::new().fill(pal.control).corner_radius(ui_kit::RADIUS).inner_margin(egui::Margin::symmetric(10, 7)).show(ui, |ui| ui.add(edit)).inner;
+                    done = r.lost_focus();
+                    ui.add_space(4.0);
+                    ui.label(theme::text("Added to the page as it loads, over its own style. Taken when you click away.", 12.0, W::Regular).color(pal.text3));
+                });
+                if done {
+                    l.ui.data_mut(|d| d.remove::<String>(css_id));
+                    if draft != *css {
+                        set = Some(Visual::Browser { url: url.clone(), width: *width, height: *height, reload: *reload, css: draft });
+                    }
+                } else {
+                    l.ui.data_mut(|d| d.insert_temp(css_id, draft));
+                }
             }
             Visual::Text(_) => {}
         });

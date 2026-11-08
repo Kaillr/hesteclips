@@ -17,7 +17,7 @@ use anyhow::{Context, Result, anyhow};
 use webview2_com::Microsoft::Web::WebView2::Win32::{
     COREWEBVIEW2_COLOR, ICoreWebView2Controller, ICoreWebView2Controller2, ICoreWebView2Environment, ICoreWebView2EnvironmentOptions,
 };
-use webview2_com::{CoreWebView2EnvironmentOptions, CreateCoreWebView2ControllerCompletedHandler, CreateCoreWebView2EnvironmentCompletedHandler};
+use webview2_com::{AddScriptToExecuteOnDocumentCreatedCompletedHandler, CoreWebView2EnvironmentOptions, CreateCoreWebView2ControllerCompletedHandler, CreateCoreWebView2EnvironmentCompletedHandler};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -45,13 +45,13 @@ pub(crate) struct BrowserHost {
 }
 
 impl BrowserHost {
-    /// Show `url` in a page `width`×`height` big.
-    pub(crate) fn start(url: String, width: u32, height: u32) -> Self {
+    /// Show `url` in a page `width`×`height` big, `css` added to it.
+    pub(crate) fn start(url: String, width: u32, height: u32, css: String) -> Self {
         let window = Arc::new(AtomicIsize::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let (window2, stop2) = (window.clone(), stop.clone());
         thread::spawn(move || {
-            if let Err(e) = run(&url, width.max(16), height.max(16), &window2, &stop2) {
+            if let Err(e) = run(&url, width.max(16), height.max(16), &css, &window2, &stop2) {
                 eprintln!("browser source {url}: {e:#}");
             }
             window2.store(0, Ordering::Release);
@@ -81,9 +81,21 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
-/// The page's window, made, shown off every display, its page loaded; then
-/// its messages pumped until it's to stop.
-fn run(url: &str, width: u32, height: u32, out: &AtomicIsize, stop: &AtomicBool) -> Result<()> {
+/// A script adding `css` to a page as it's made (a style sheet at the end
+/// of its head, so it goes over the page's own), if there's any.
+fn css_script(css: &str) -> Option<String> {
+    if css.trim().is_empty() {
+        return None;
+    }
+    let text = serde_json::to_string(css).ok()?;
+    Some(format!(
+        "(() => {{ const add = () => {{ const s = document.createElement('style'); s.textContent = {text}; (document.head || document.documentElement).appendChild(s); }}; if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', add); else add(); }})();"
+    ))
+}
+
+/// The page's window, made, shown off every display, its page loaded (with
+/// `css`); then its messages pumped until it's to stop.
+fn run(url: &str, width: u32, height: u32, css: &str, out: &AtomicIsize, stop: &AtomicBool) -> Result<()> {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
         let instance = GetModuleHandleW(None)?;
@@ -131,6 +143,14 @@ fn run(url: &str, width: u32, height: u32, out: &AtomicIsize, stop: &AtomicBool)
                 c2.SetDefaultBackgroundColor(COREWEBVIEW2_COLOR { A: 0, R: 0, G: 0, B: 0 })?;
             }
             let view = controller.CoreWebView2()?;
+            if let Some(script) = css_script(css) {
+                let v = view.clone();
+                AddScriptToExecuteOnDocumentCreatedCompletedHandler::wait_for_async_operation(
+                    Box::new(move |handler| v.AddScriptToExecuteOnDocumentCreated(&HSTRING::from(script), &handler).map_err(webview2_com::Error::WindowsError)),
+                    Box::new(|error, _id| error),
+                )
+                .map_err(|e| anyhow!("{e}"))?;
+            }
             view.Navigate(&HSTRING::from(url))?;
             Ok(controller)
         })();
@@ -179,4 +199,17 @@ fn environment() -> Result<ICoreWebView2Environment> {
     )
     .map_err(|e| anyhow!("WebView2 (Edge's web view, part of Windows) couldn't start: {e}"))?;
     Ok(rx.recv().context("WebView2 didn't start")??)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::css_script;
+
+    /// No style, no script; a style's quotes and lines kept, as a string.
+    #[test]
+    fn a_style_sheet_goes_in_as_written() {
+        assert_eq!(css_script("  \n"), None);
+        let s = css_script("body { font-family: \"Inter\"; }\n.x{}").unwrap();
+        assert!(s.contains(r#""body { font-family: \"Inter\"; }\n.x{}""#), "{s}");
+    }
 }

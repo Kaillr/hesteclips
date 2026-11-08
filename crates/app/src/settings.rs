@@ -434,14 +434,17 @@ pub enum Visual {
     Colour { rgba: [u8; 4] },
     /// Words, drawn as their style says.
     Text(TextStyle),
-    /// A web page (alerts, a chat overlay), drawn `width`×`height` big.
-    /// `reload` goes up to load it again.
+    /// A web page (alerts, a chat overlay), drawn `width`×`height` big,
+    /// with `css` added to it. `reload` goes up to load it again.
     Browser {
         url: String,
         width: u32,
         height: u32,
         #[serde(default, skip_serializing)]
         reload: u32,
+        /// A style sheet of its own, added to every page it loads.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        css: String,
     },
 }
 

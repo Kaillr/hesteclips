@@ -1253,7 +1253,7 @@ impl App {
                         Visual::Display { id, .. } => LayerSource::Display { id: id.clone(), placement },
                         Visual::Window { app, .. } => LayerSource::Window { app: app.clone(), placement },
                         Visual::Colour { rgba } => LayerSource::Colour { rgba: *rgba, placement },
-                        Visual::Browser { url, width, height, .. } if capture::layers::BROWSER && url.len() > "https://".len() => LayerSource::Browser { url: url.clone(), width: *width, height: *height, placement },
+                        Visual::Browser { url, width, height, css, .. } if capture::layers::BROWSER && url.len() > "https://".len() => LayerSource::Browser { url: url.clone(), width: *width, height: *height, css: css.clone(), placement },
                         Visual::Browser { .. } => continue,
                         // Its picture, once it's made (`refresh_visual_pictures`).
                         Visual::Image { .. } | Visual::Text { .. } => match self.visual_picture(key) {

@@ -38,7 +38,7 @@ enum Feed {
     Camera { device: String, format: Option<crate::webcam::Format>, layer: CameraLayer },
     Display { id: String, display: CaptureFeed },
     Window { app: String, window: CaptureFeed },
-    Browser { url: String, size: (u32, u32), page: CaptureFeed },
+    Browser { url: String, size: (u32, u32), css: String, page: CaptureFeed },
     /// A picture or a colour, uploaded once.
     Still { of: Still, latest: Arc<Latest> },
 }
@@ -65,7 +65,7 @@ impl Feed {
             (Feed::Camera { device, format, .. }, LayerSource::Camera { device: d, format: f, .. }) => device == d && format == f,
             (Feed::Display { id, .. }, LayerSource::Display { id: i, .. }) => id == i,
             (Feed::Window { app, .. }, LayerSource::Window { app: a, .. }) => app == a,
-            (Feed::Browser { url, size, .. }, LayerSource::Browser { url: u, width, height, .. }) => url == u && *size == (*width, *height),
+            (Feed::Browser { url, size, css, .. }, LayerSource::Browser { url: u, width, height, css: c, .. }) => url == u && *size == (*width, *height) && css == c,
             (Feed::Still { of: Still::Picture(p), .. }, LayerSource::Picture { picture, .. }) => p == picture,
             (Feed::Still { of: Still::Colour(c), .. }, LayerSource::Colour { rgba, .. }) => c == rgba,
             _ => false,
@@ -162,10 +162,10 @@ impl Feeds {
                         continue;
                     }
                 },
-                LayerSource::Browser { url, width, height, .. } => {
-                    let host = super::browser::BrowserHost::start(url.clone(), *width, *height);
+                LayerSource::Browser { url, width, height, css, .. } => {
+                    let host = super::browser::BrowserHost::start(url.clone(), *width, *height, css.clone());
                     match CaptureFeed::start(&self.gpu, Target::Browser(host), self.fps) {
-                        Ok(page) => Feed::Browser { url: url.clone(), size: (*width, *height), page },
+                        Ok(page) => Feed::Browser { url: url.clone(), size: (*width, *height), css: css.clone(), page },
                         Err(e) => {
                             eprintln!("browser layer: {e:#}");
                             continue;

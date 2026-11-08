@@ -44,9 +44,10 @@ pub enum LayerSource {
     Picture { picture: Picture, placement: ScreenPlacement },
     /// All of its box one colour (R, G, B, A: blended by A).
     Colour { rgba: [u8; 4], placement: ScreenPlacement },
-    /// A web page (alerts, a chat overlay), `width`×`height` big, blended
-    /// by its transparency, placed as a display is (Windows: see [`BROWSER`]).
-    Browser { url: String, width: u32, height: u32, placement: ScreenPlacement },
+    /// A web page (alerts, a chat overlay), `width`×`height` big, `css`
+    /// added to it, blended by its transparency, placed as a display is
+    /// (Windows: see [`BROWSER`]).
+    Browser { url: String, width: u32, height: u32, css: String, placement: ScreenPlacement },
 }
 
 /// Whether this platform can show a web page as a layer.
