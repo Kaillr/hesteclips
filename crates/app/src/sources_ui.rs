@@ -248,7 +248,8 @@ impl App {
             let layers = Rect::from_min_size(area.min, vec2(LAYERS_W, h));
             let props = Rect::from_min_max(pos2(area.right() - INSPECTOR_W, area.top()), area.max);
             let mid = Rect::from_min_max(pos2(layers.right() + COLUMN_GAP, area.top()), pos2(props.left() - COLUMN_GAP, area.bottom()));
-            let frame = self.picture_column(&mut place(ui, mid), h);
+            // The toolbar's over it.
+            let frame = self.picture_column(&mut place(ui, mid), (h - 40.0).max(120.0));
             crate::ui_kit::scroll(&mut place(ui, layers), "scene_layers", |ui| {
                 self.video_list(ui, frame.as_deref(), aspect);
                 ui.add_space(28.0);
