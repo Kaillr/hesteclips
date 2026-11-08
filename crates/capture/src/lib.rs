@@ -904,6 +904,23 @@ pub fn display_bounds(id: &str) -> Option<[i32; 4]> {
     }
 }
 
+/// This app's window called `title` over all of a display (`bounds`, as
+/// [`display_bounds`] gives them), frameless, and left out of what captures
+/// the screen, so a preview of the screen on it doesn't capture itself.
+/// Windows; elsewhere it isn't done (`false`). Whether it's there now (else
+/// it's been put there: call again).
+pub fn cover_display(title: &str, bounds: [i32; 4]) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        win::cover_display(title, bounds)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (title, bounds);
+        false
+    }
+}
+
 /// Screens the backend can capture; their ids go in [`VideoSource::Screen`].
 pub fn list_screens() -> Vec<Device> {
     #[cfg(target_os = "macos")]

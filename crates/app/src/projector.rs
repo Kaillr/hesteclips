@@ -24,6 +24,14 @@ pub(crate) struct Projector {
     placed: bool,
 }
 
+impl Projector {
+    /// Its window's title (Windows finds it by this, to put it over its
+    /// display and leave it out of screen capture).
+    fn title(&self) -> String {
+        format!("HasteClip preview: {}", self.name)
+    }
+}
+
 impl App {
     /// Preview on display `d`, instead of where it was.
     pub(crate) fn open_projector(&mut self, d: &capture::Device) {
@@ -63,7 +71,8 @@ impl App {
         let Some(p) = self.projector.as_ref() else { return };
         let bounds = capture::display_bounds(&p.display);
         let id = egui::ViewportId::from_hash_of(("hasteclip_projector", &p.display));
-        let mut builder = egui::ViewportBuilder::default().with_title(format!("HasteClip preview: {}", p.name)).with_decorations(false).with_inner_size([960.0, 540.0]);
+        let title = p.title();
+        let mut builder = egui::ViewportBuilder::default().with_title(title.clone()).with_decorations(false).with_resizable(false).with_inner_size([960.0, 540.0]);
         // Opened on its display (as near as points go), made fullscreen once
         // it's there; where that isn't known, fullscreen where it opens.
         builder = match bounds {
@@ -71,7 +80,7 @@ impl App {
             None => builder.with_fullscreen(true),
         };
         let mut close = false;
-        ctx.show_viewport_immediate(id, builder, |ui, _| close = self.projector_frame(ui, bounds));
+        ctx.show_viewport_immediate(id, builder, |ui, _| close = self.projector_frame(ui, bounds, &title));
         if close {
             self.projector = None;
         }
@@ -80,10 +89,22 @@ impl App {
 
     /// One frame of the preview's window: put on its display, then the
     /// video in the middle, as big as fits. Whether it's to close.
-    fn projector_frame(&mut self, ui: &mut egui::Ui, bounds: Option<[i32; 4]>) -> bool {
+    fn projector_frame(&mut self, ui: &mut egui::Ui, bounds: Option<[i32; 4]>, title: &str) -> bool {
         let ctx = ui.ctx().clone();
         let ctx = &ctx;
-        if let Some(p) = self.projector.as_mut().filter(|p| !p.placed) {
+        // Windows: over all of its display exactly, frameless, and out of
+        // screen capture (on the display it previews, it captured itself:
+        // each frame the last one, a pixel lower, smeared down the screen).
+        // Checked every frame: it's cheap, and a change of display or scale
+        // puts it back.
+        if cfg!(windows)
+            && let Some(b) = bounds
+        {
+            let there = capture::cover_display(title, b);
+            if let Some(p) = self.projector.as_mut() {
+                p.placed = there;
+            }
+        } else if let Some(p) = self.projector.as_mut().filter(|p| !p.placed) {
             match bounds {
                 Some(b) => {
                     let ppp = ctx.pixels_per_point();
