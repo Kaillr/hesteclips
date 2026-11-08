@@ -340,6 +340,10 @@ pub mod cid {
     pub const IRIS: u32 = 0x9a0911;
     /// `V4L2_EXPOSURE_MANUAL`, among the automatic exposure menu's items.
     pub const EXPOSURE_MANUAL: i64 = 1;
+    /// `V4L2_CID_EXPOSURE`: an exposure in the camera's own steps, not a
+    /// time (the PS3 Eye's; on Windows, one whose driver doesn't give it in
+    /// DirectShow's powers of two of a second).
+    pub const EXPOSURE_STEPS: u32 = 0x980911;
 }
 
 /// A setting a camera offers: a V4L2 control (Linux), or one of DirectShow's

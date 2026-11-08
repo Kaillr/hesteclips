@@ -646,7 +646,15 @@ fn settings_of(device: &str) -> Option<Arc<Settings>> {
 /// An exposure time as DirectShow has it, in powers of two of a second.
 fn exposure_label(log2: i32) -> String {
     let secs = 2f64.powi(log2);
-    if secs >= 1.0 { format!("{secs} s") } else { format!("{:.1} ms", secs * 1000.0) }
+    if secs >= 1.0 { format!("{secs:.0} s") } else { format!("{:.1} ms", secs * 1000.0) }
+}
+
+/// Whether a camera's exposure range (`min` to `max`) can be DirectShow's,
+/// powers of two of a second: from 1/1,000,000 s to 32 s at most. Some
+/// drivers give steps of their own instead (the PS3 Eye's: 0 to 255),
+/// which read as powers of two were times of 2^200 seconds.
+fn exposure_in_log2(min: i32, max: i32) -> bool {
+    min >= -20 && max <= 5
 }
 
 /// The settings camera `device` offers, with their values now: none until
@@ -668,6 +676,13 @@ pub(crate) fn controls(device: &str) -> Vec<crate::webcam::CameraControl> {
                 // Cameras start out automatic.
                 out.push(CameraControl { id, name: name.to_owned(), kind: ControlKind::Bool, value: i64::from(auto), default: 1, inactive: false });
             }
+            // An exposure that isn't a time: in its own steps, as Linux has
+            // such a camera's (`cid::EXPOSURE_STEPS`).
+            if s.id == cid::EXPOSURE && !exposure_in_log2(min, max) {
+                let kind = ControlKind::Int { min: min.into(), max: max.into(), step: step.max(1).into() };
+                out.push(CameraControl { id: cid::EXPOSURE_STEPS, name: "Exposure".to_owned(), kind, value: value.into(), default: default.into(), inactive: switch.is_some() && auto });
+                continue;
+            }
             let kind = match s.id {
                 cid::EXPOSURE => ControlKind::Menu((min..=max).map(|v| (i64::from(v), exposure_label(v))).collect()),
                 cid::POWER_LINE => {
@@ -687,6 +702,8 @@ pub(crate) fn controls(device: &str) -> Vec<crate::webcam::CameraControl> {
 /// taken over is refused (as V4L2 does).
 pub(crate) fn set_control(device: &str, id: u32, value: i64) -> Result<()> {
     let settings = settings_of(device).context("the camera isn't open")?;
+    // Its exposure in its own steps is still its exposure.
+    let id = if id == crate::webcam::cid::EXPOSURE_STEPS { crate::webcam::cid::EXPOSURE } else { id };
     let s = SETTINGS.iter().find(|s| s.id == id || s.auto.is_some_and(|(a, _)| a == id)).context("the camera has no such setting")?;
     in_mta(|| {
         let (now, auto) = settings.get(s).context("the camera's setting can't be read")?;
@@ -771,4 +788,19 @@ pub fn open_camera_settings(device: String, name: String) {
             eprintln!("camera settings: {e:#}");
         }
     });
+}
+
+#[cfg(test)]
+mod exposure_tests {
+    /// DirectShow's ranges are powers of two of a second; a driver's own
+    /// steps aren't, and aren't shown as times.
+    #[test]
+    fn an_exposure_in_steps_of_its_own_isnt_a_time() {
+        assert!(super::exposure_in_log2(-13, -1));
+        assert!(super::exposure_in_log2(-11, 1));
+        assert!(!super::exposure_in_log2(0, 255), "the PS3 Eye's");
+        assert!(!super::exposure_in_log2(1, 100));
+        assert_eq!(super::exposure_label(-5), "31.2 ms");
+        assert_eq!(super::exposure_label(1), "2 s");
+    }
 }

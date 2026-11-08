@@ -895,7 +895,8 @@ fn panel_groups(controls: &[CameraControl]) -> Vec<(&'static str, Vec<PanelRow<'
         (
             "Exposure",
             vec![
-                auto(AUTO_EXPOSURE, "Automatic exposure", EXPOSURE, "Exposure time"),
+                // A time, or the camera's own steps (no time to it).
+                if find(EXPOSURE).is_some() { auto(AUTO_EXPOSURE, "Automatic exposure", EXPOSURE, "Exposure time") } else { auto(AUTO_EXPOSURE, "Automatic exposure", EXPOSURE_STEPS, "Exposure") },
                 named(GAIN, "Gain"),
                 named(BACKLIGHT, "Backlight compensation"),
                 named(EXPOSURE_DYNAMIC_FPS, "Lower frame rate in the dark"),
@@ -907,7 +908,7 @@ fn panel_groups(controls: &[CameraControl]) -> Vec<(&'static str, Vec<PanelRow<'
         ("Zoom and framing", vec![named(ZOOM, "Zoom"), named(PAN, "Pan"), named(TILT, "Tilt")]),
         (OTHER, Vec::new()),
     ];
-    let known = [BRIGHTNESS, CONTRAST, SATURATION, HUE, AUTO_WHITE_BALANCE, GAMMA, GAIN, POWER_LINE, WHITE_BALANCE, SHARPNESS, BACKLIGHT, AUTO_EXPOSURE, EXPOSURE, EXPOSURE_DYNAMIC_FPS, PAN, TILT, FOCUS, AUTO_FOCUS, ZOOM];
+    let known = [BRIGHTNESS, CONTRAST, SATURATION, HUE, AUTO_WHITE_BALANCE, GAMMA, GAIN, POWER_LINE, WHITE_BALANCE, SHARPNESS, BACKLIGHT, AUTO_EXPOSURE, EXPOSURE, EXPOSURE_STEPS, EXPOSURE_DYNAMIC_FPS, PAN, TILT, FOCUS, AUTO_FOCUS, ZOOM];
     let own = controls.iter().filter(|c| !known.contains(&c.id)).map(|c| Some(PanelRow::Control { label: c.name.clone(), control: c }));
     groups
         .into_iter()
@@ -1858,7 +1859,9 @@ fn controls_view(ui: &mut egui::Ui, panel: &CameraPanel, fps: Option<f32>, set: 
                                     };
                                     l.row(row, |ui| exposure_widget(ui, m, set));
                                 } else {
-                                    l.row(crate::ui_kit::Row::new(label).kid(), |ui| control_widget(ui, m, set));
+                                    let row = crate::ui_kit::Row::new(label).kid();
+                                    let row = if m.id == cid::EXPOSURE_STEPS { row.tip("Exposure", "In the camera's own steps: its driver doesn't say how long they are. Higher is longer, and brighter.") } else { row };
+                                    l.row(row, |ui| control_widget(ui, m, set));
                                 }
                             });
                         }
@@ -1954,6 +1957,15 @@ mod panel_tests {
         assert!(auto_on(ae));
         assert_eq!(auto_value(ae, false), cid::EXPOSURE_MANUAL);
         assert_eq!(auto_value(ae, true), 3);
+        // An exposure in the camera's own steps (no time): under automatic
+        // exposure too, as "Exposure".
+        let steps = vec![
+            ctl(AUTO_EXPOSURE, "Auto Exposure", menu(&[(1, "Manual Mode"), (3, "Aperture Priority Mode")]), 3),
+            ctl(cid::EXPOSURE_STEPS, "Exposure", ControlKind::Int { min: 0, max: 255, step: 1 }, 120),
+        ];
+        let groups = panel_groups(&steps);
+        assert!(matches!(groups[0].1[0], PanelRow::Auto { manual: Some(("Exposure", _)), .. }), "{:?}", groups.iter().map(|(h, _)| *h).collect::<Vec<_>>());
+        assert_eq!(groups.len(), 1, "nothing under Other");
     }
 }
 
