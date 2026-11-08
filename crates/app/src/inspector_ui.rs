@@ -1,5 +1,5 @@
 //! A source's settings, in a dialog of its own, as OBS has its Properties:
-//! double-click the source on the preview or in the layers, or click its
+//! double-click its row in the layers, or click its
 //! row's settings button, or Settings… in its menu. They're set once and
 //! looked at now and then, so they don't take the page's room.
 //!

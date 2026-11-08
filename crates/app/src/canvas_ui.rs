@@ -55,12 +55,25 @@ const MIN_SIZE: f32 = 0.05;
 /// One of the picture's sources.
 pub(crate) use crate::settings::LayerKey as Layer;
 
-/// What's selected on the Sources page: a source in the video, on the
-/// preview or in the layers. It's outlined, with handles, and the keys act
-/// on it; its settings are in a dialog (see `inspector_ui`).
+/// What's selected on the Sources page: a source in the video, or a group
+/// of them (by its id), on the preview or in the layers. It's outlined,
+/// with handles, and the keys act on it; a source's settings are in a
+/// dialog (see `inspector_ui`).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Selected {
     Layer(Layer),
+    Group(u64),
+}
+
+/// A group held on the preview: by what, where, its box then, and each of
+/// its sources' boxes then (fractions of the video), to move or resize
+/// them all from.
+#[derive(Debug, Clone)]
+struct GroupHold {
+    handle: Handle,
+    from: Pos2,
+    start: Rect,
+    members: Vec<(Layer, Rect)>,
 }
 
 /// A drag on the preview.
@@ -138,11 +151,13 @@ pub(crate) struct CanvasView {
     /// thing in quick succession (typing, a number stepped) are one step.
     last_step: Option<(String, std::time::Instant)>,
     drag: Option<Drag>,
-    /// The right-click menu is open, on this source.
-    menu: Option<Layer>,
-    /// What was selected before the last click on the preview (which may
-    /// have gone on to the source under it): a double-click's for that.
-    click_was: Option<Layer>,
+    /// The right-click menu is open, on this source or group.
+    menu: Option<Selected>,
+    /// A group held on the preview, moved or resized as one.
+    group_hold: Option<GroupHold>,
+    /// Sources picked besides the one selected, Ctrl- or Shift-clicked in
+    /// the list: to group them.
+    pub(crate) picked: Vec<Layer>,
     /// The screen's picture size (what's kept of it), asked for now and then.
     picture: Option<(capture::VideoSource, Option<(u32, u32)>, std::time::Instant)>,
     /// Each boxed source's size, by key, asked for now and then, and its
@@ -172,6 +187,7 @@ pub(crate) struct Arrangement {
     webcams: Vec<crate::settings::WebcamCfg>,
     visuals: Vec<crate::settings::VisualCfg>,
     order: Vec<Layer>,
+    groups: Vec<crate::settings::GroupCfg>,
 }
 
 /// What's at `p` on the preview (`shown` puts a box there, as much of it as
@@ -197,14 +213,38 @@ fn under(layers: &[(Layer, Rect)], shown: &dyn Fn(Rect) -> Rect, p: Pos2) -> Vec
     layers.iter().filter(|(_, r)| shown(*r).expand(2.0).contains(p)).map(|(l, _)| *l).collect()
 }
 
-/// What a click at a place on the preview selects, of `under` (the sources
+/// What clicks at `p` on the preview go down through, front first: each
+/// source there, a group (of `groups`) before the first of its own there.
+fn picks_at(layers: &[(Layer, Rect)], shown: &dyn Fn(Rect) -> Rect, p: Pos2, groups: &[crate::settings::GroupCfg]) -> Vec<Selected> {
+    let mut out = Vec::new();
+    for l in under(layers, shown, p) {
+        if let Some(g) = groups.iter().find(|g| g.members.contains(&l))
+            && !out.contains(&Selected::Group(g.id))
+        {
+            out.push(Selected::Group(g.id));
+        }
+        out.push(Selected::Layer(l));
+    }
+    out
+}
+
+/// What a click at a place on the preview selects, of `under` (what's
 /// there, front first): the one in front, or, with one of them selected,
 /// the next one down (round to the front again from the back).
-fn clicked_through(under: &[Layer], selected: Option<Layer>) -> Option<Layer> {
-    match selected.and_then(|s| under.iter().position(|l| *l == s)) {
-        Some(i) => under.get((i + 1) % under.len()).copied(),
-        None => under.first().copied(),
+fn clicked_through<T: PartialEq + Clone>(under: &[T], selected: Option<&T>) -> Option<T> {
+    match selected.and_then(|s| under.iter().position(|l| l == s)) {
+        Some(i) => under.get((i + 1) % under.len()).cloned(),
+        None => under.first().cloned(),
     }
+}
+
+/// `r` (in `from`) where it is in `to`, as `from` became `to`: moved and
+/// scaled with it.
+fn mapped(r: Rect, from: Rect, to: Rect) -> Rect {
+    let sx = to.width() / from.width().max(1e-6);
+    let sy = to.height() / from.height().max(1e-6);
+    let p = |q: Pos2| Pos2::new(to.min.x + (q.x - from.min.x) * sx, to.min.y + (q.y - from.min.y) * sy);
+    Rect::from_min_max(p(r.min), p(r.max))
 }
 
 /// Words in a dark pill along the top of the preview (`frame`): what the
@@ -520,6 +560,7 @@ impl App {
             webcams: self.settings.webcams.clone(),
             visuals: self.settings.visuals.clone(),
             order: self.settings.layer_order(),
+            groups: self.settings.groups.clone(),
         }
     }
 
@@ -562,14 +603,25 @@ impl App {
         self.settings.webcams = a.webcams;
         self.settings.visuals = a.visuals;
         self.settings.layer_order = a.order;
+        self.settings.groups = a.groups;
         // A source no scene has any more (one deleted meanwhile) goes.
         self.settings.tidy_pool();
-        // What's selected may be gone.
-        if let Some(Selected::Layer(l)) = self.canvas.selected
-            && !self.settings.layer_order().contains(&l)
-        {
+        self.settings.pack_groups();
+        self.forget_gone_selection();
+    }
+
+    /// What's selected, if it's gone: nothing.
+    pub(crate) fn forget_gone_selection(&mut self) {
+        let gone = match self.canvas.selected {
+            Some(Selected::Layer(l)) => !self.settings.layer_order().contains(&l),
+            Some(Selected::Group(id)) => self.settings.group(id).is_none(),
+            None => false,
+        };
+        if gone {
             self.canvas.selected = None;
         }
+        let order = self.settings.layer_order();
+        self.canvas.picked.retain(|l| order.contains(l));
     }
 
     /// What belonged to the scene shown before a switch: its undo steps
@@ -583,6 +635,8 @@ impl App {
         self.canvas.menu = None;
         self.canvas.card_hover = None;
         self.canvas.crop_mode = None;
+        self.canvas.group_hold = None;
+        self.canvas.picked.clear();
     }
 
     /// The video source selected, if one is.
@@ -596,6 +650,32 @@ impl App {
     /// Select `layer` (on the preview and in its list; its settings beside them).
     pub(crate) fn select_layer(&mut self, layer: Layer) {
         self.canvas.selected = Some(Selected::Layer(layer));
+    }
+
+    /// The group selected, if one is.
+    pub(crate) fn selected_group(&self) -> Option<u64> {
+        match self.canvas.selected {
+            Some(Selected::Group(id)) => Some(id),
+            _ => None,
+        }
+    }
+
+    /// What a new group of `layer` takes: it and the others picked in the
+    /// list (with the one selected), if it's one of them; else it alone.
+    pub(crate) fn grouping(&self, layer: Layer) -> Vec<Layer> {
+        let mut set = self.canvas.picked.clone();
+        if let Some(s) = self.selected_layer().filter(|s| !set.is_empty() && !set.contains(s)) {
+            set.push(s);
+        }
+        if set.len() > 1 && set.contains(&layer) { set } else { vec![layer] }
+    }
+
+    /// `layers` in a new group, selected.
+    pub(crate) fn group_layers(&mut self, layers: &[Layer]) {
+        if let Some(id) = self.settings.make_group(layers) {
+            self.canvas.selected = Some(Selected::Group(id));
+            self.canvas.picked.clear();
+        }
     }
 
     /// The arrangement before the last change (Ctrl+Z on Sources).
@@ -655,6 +735,7 @@ impl App {
     /// The sources in this order, front first.
     pub(crate) fn set_layer_order(&mut self, order: &[Layer]) {
         self.settings.layer_order = order.to_vec();
+        self.settings.pack_groups();
     }
 
     /// The sources in the video, front first, and where each is (fractions
@@ -681,7 +762,9 @@ impl App {
     /// what's dragged where it is, under others too; any other can be
     /// dragged, which selects it. Others show their outline under the
     /// pointer, and right-click opens a source's menu. A locked source can't
-    /// be moved here, and clicks go through it.
+    /// be moved here, and clicks go through it. A source in a group: the
+    /// first click selects the group (moved and resized as one, its sources
+    /// with it), the next the source itself.
     pub(crate) fn canvas_on_preview(&mut self, ui: &mut egui::Ui, frame_rect: Rect, response: &egui::Response) {
         let aspect = frame_rect.width() / frame_rect.height().max(1.0);
         let at = move |p: Pos2| Pos2::new(frame_rect.left() + p.x * frame_rect.width(), frame_rect.top() + p.y * frame_rect.height());
@@ -702,30 +785,78 @@ impl App {
         }
         let crop_on = modifiers.alt || self.canvas.crop_mode.is_some();
 
-        // A click selects what's under it, in front, and again there the one
-        // under that, and so on; on nothing, nothing. On a handle, the one
-        // selected stays. Twice, the settings open of what the first click
-        // found selected (it went on to the next one).
-        if let Some(p) = response.interact_pointer_pos() {
-            let there = under(&free, &shown, p);
-            if response.double_clicked() {
-                let was = self.canvas.click_was.filter(|l| there.contains(l));
-                if let Some(l) = was.or(selected) {
-                    self.edit_layer(l);
-                }
-            } else if response.clicked() {
-                self.canvas.click_was = selected;
-                let on_handle = hit_at(p).is_some_and(|(l, h)| Some(l) == selected && h != Handle::Move);
-                if !on_handle {
-                    self.canvas.selected = clicked_through(&there, selected).map(Selected::Layer);
-                }
+        // The group selected, and its box: the boxes of its sources that can
+        // be taken hold of.
+        let group = self.selected_group().and_then(|id| {
+            let members = self.settings.group(id)?.members.clone();
+            let boxes: Vec<(Layer, Rect)> = free.iter().filter(|(l, _)| members.contains(l)).copied().collect();
+            let bx = boxes.iter().map(|(_, r)| *r).reduce(|a, b| a.union(b))?;
+            Some((id, bx, boxes))
+        });
+        let group_hit = |p: Pos2| -> Option<Handle> {
+            let (_, bx, _) = group.as_ref()?;
+            let b = shown(*bx);
+            Handle::ALL.into_iter().find(|h| h.pos(b).distance(p) <= HANDLE).or_else(|| b.expand(2.0).contains(p).then_some(Handle::Move))
+        };
+        // A click selects what's under it, in front (a group before its
+        // sources), and again there the one under that, and so on; on
+        // nothing, nothing. On a handle, what's selected stays.
+        if let Some(p) = response.interact_pointer_pos()
+            && response.clicked()
+        {
+            let there = picks_at(&free, &shown, p, &self.settings.groups);
+            let on_handle = hit_at(p).is_some_and(|(l, h)| Some(l) == selected && h != Handle::Move) || group_hit(p).is_some_and(|h| h != Handle::Move);
+            if !on_handle {
+                let now = self.canvas.selected.clone();
+                self.canvas.selected = clicked_through(&there, now.as_ref());
             }
+            self.canvas.picked.clear();
         }
         // A drag only starts once the pointer has moved a little, so what was
         // grabbed is judged by where the button went down, not where it is now.
+        // The group selected is what's dragged on it; a source in a group,
+        // not selected itself, takes its group along.
+        let origin = response.drag_started().then(|| ui.input(|i| i.pointer.press_origin()).or(response.interact_pointer_pos())).flatten();
+        let mut layer_hold = origin.and_then(|p| hit_at(p).map(|h| (h, p)));
+        let group_held = origin.and_then(|p| match group_hit(p) {
+            Some(h) => group.as_ref().map(|(id, _, _)| (*id, h, p)),
+            None => layer_hold.filter(|((l, _), _)| Some(*l) != selected).and_then(|((l, _), _)| self.settings.group_of(l).map(|g| (g.id, Handle::Move, p))),
+        });
+        if let Some((id, handle, from)) = group_held {
+            layer_hold = None;
+            let members = self.settings.group(id).map(|g| g.members.clone()).unwrap_or_default();
+            let boxes: Vec<(Layer, Rect)> = free.iter().filter(|(l, _)| members.contains(l)).copied().collect();
+            if let Some(start) = boxes.iter().map(|(_, r)| *r).reduce(|a, b| a.union(b)) {
+                self.canvas.selected = Some(Selected::Group(id));
+                let was = self.arrangement();
+                self.keep_for_undo(was);
+                self.canvas.group_hold = Some(GroupHold { handle, from, start, members: boxes });
+            }
+        }
+        let mut guides = Vec::new();
+        if let Some(hold) = self.canvas.group_hold.clone() {
+            if response.dragged()
+                && let Some(now) = response.interact_pointer_pos()
+            {
+                let snap = !modifiers.ctrl;
+                let (dx, dy) = ((now.x - hold.from.x) / frame_rect.width(), (now.y - hold.from.y) / frame_rect.height());
+                let others: Vec<(Layer, Rect)> = layers.iter().filter(|(l, _)| !hold.members.iter().any(|(m, _)| m == l)).copied().collect();
+                let lines = lines_of(&others, hold.members[0].0);
+                let to = screen_drag(hold.start, hold.handle, dx, dy, snap, modifiers.shift, &lines);
+                for (l, r) in &hold.members {
+                    self.set_layer_rect(*l, mapped(*r, hold.start, to), aspect);
+                }
+                if hold.handle == Handle::Move && snap {
+                    guides = snapped(to, &lines);
+                }
+                ui.ctx().set_cursor_icon(if hold.handle == Handle::Move { CursorIcon::Grabbing } else { hold.handle.cursor() });
+            }
+            if response.drag_stopped() || !response.dragged() && !ui.input(|i| i.pointer.any_down()) {
+                self.canvas.group_hold = None;
+            }
+        }
         if response.drag_started() {
-            let origin = ui.input(|i| i.pointer.press_origin()).or(response.interact_pointer_pos());
-            if let Some(((layer, handle), from)) = origin.and_then(|p| hit_at(p).map(|h| (h, p))) {
+            if let Some(((layer, handle), from)) = layer_hold {
                 self.select_layer(layer);
                 let was = self.arrangement();
                 let drag = match layer {
@@ -740,7 +871,6 @@ impl App {
                 self.canvas.drag = Some(drag);
             }
         }
-        let mut guides = Vec::new();
         if let Some(drag) = self.canvas.drag {
             if response.dragged()
                 && let Some(now) = response.interact_pointer_pos()
@@ -794,24 +924,35 @@ impl App {
             if response.drag_stopped() || !response.dragged() && !ui.input(|i| i.pointer.any_down()) {
                 self.canvas.drag = None;
             }
-        } else if let Some((l, h)) = pointer.and_then(hit_at) {
-            // A handle resizes only the one selected; anywhere else on a
+        } else if self.canvas.group_hold.is_none()
+            && let Some(h) = pointer.and_then(|p| group_hit(p).or_else(|| hit_at(p).map(|(_, h)| h)))
+        {
+            // A handle resizes only what's selected; anywhere else on a
             // source moves it.
-            let _ = l;
             ui.ctx().set_cursor_icon(h.cursor());
         }
 
         // Right-click on a source: it's selected, and its menu opens (tied
         // to the click that opened it).
         if response.secondary_clicked() {
-            self.canvas.menu = ui.input(|i| i.pointer.interact_pos()).and_then(hit_at).map(|(l, _)| l);
-            if let Some(l) = self.canvas.menu {
-                self.select_layer(l);
-            }
+            let p = ui.input(|i| i.pointer.interact_pos());
+            let on_group = p.and_then(group_hit).and(self.selected_group());
+            let target = match on_group {
+                Some(id) => Some(Selected::Group(id)),
+                None => p.and_then(hit_at).map(|(l, _)| match self.settings.group_of(l) {
+                    Some(g) if Some(l) != selected => Selected::Group(g.id),
+                    _ => Selected::Layer(l),
+                }),
+            };
+            self.canvas.selected = target.clone().or(self.canvas.selected.clone());
+            self.canvas.menu = target;
         }
-        if let Some(layer) = self.canvas.menu {
+        if let Some(target) = self.canvas.menu.clone() {
             let was = self.arrangement();
-            let open = crate::ui_kit::context_menu(response, 230.0, |ui| self.layer_menu(ui, layer, aspect));
+            let open = crate::ui_kit::context_menu(response, 230.0, |ui| match target {
+                Selected::Layer(layer) => self.layer_menu(ui, layer, aspect),
+                Selected::Group(id) => self.group_menu(ui, id),
+            });
             if self.arrangement() != was {
                 self.keep_for_undo(was);
             }
@@ -837,6 +978,42 @@ impl App {
         let hovered = held.is_none().then(|| over.map(|(l, _)| l).or(self.canvas.card_hover)).flatten().filter(|l| Some(*l) != selected);
         if let Some(r) = hovered.and_then(|l| layers.iter().find(|(x, _)| *x == l)).map(|(_, r)| shown(*r)).filter(|r| r.is_positive()) {
             painter.rect_stroke(r.shrink(0.5), 0.0, Stroke::new(1.0, ACCENT.gamma_multiply(0.6)), egui::StrokeKind::Middle);
+        }
+        // Picked in the list besides it (to group): a thin outline each.
+        for r in self.canvas.picked.iter().filter_map(|p| layers.iter().find(|(l, _)| l == p)).map(|(_, r)| shown(*r)) {
+            painter.rect_stroke(r.shrink(0.5), 0.0, Stroke::new(1.5, ACCENT.gamma_multiply(0.8)), egui::StrokeKind::Middle);
+        }
+        // The group selected (or held): each of its sources' outlines,
+        // thin, and its box's, with handles to resize it all.
+        if let Some(id) = self.selected_group() {
+            let members = self.settings.group(id).map(|g| g.members.clone()).unwrap_or_default();
+            let boxes: Vec<Rect> = layers.iter().filter(|(l, _)| members.contains(l)).map(|(_, r)| *r).collect();
+            let movable = free.iter().any(|(l, _)| members.contains(l));
+            if let Some(bx) = boxes.iter().copied().reduce(|a, b| a.union(b)) {
+                for r in &boxes {
+                    painter.rect_stroke(shown(*r).shrink(0.5), 0.0, Stroke::new(1.0, ACCENT.gamma_multiply(0.5)), egui::StrokeKind::Middle);
+                }
+                let b = shown(bx);
+                painter.rect_stroke(b.shrink(0.5), 0.0, Stroke::new(3.0, Color32::from_black_alpha(110)), egui::StrokeKind::Middle);
+                painter.rect_stroke(b.shrink(1.0), 0.0, Stroke::new(2.0, ACCENT), egui::StrokeKind::Middle);
+                let near = pointer.and_then(group_hit);
+                for h in Handle::ALL.into_iter().filter(|_| movable) {
+                    let r = if Some(h) == near.or(self.canvas.group_hold.as_ref().map(|g| g.handle)) { HANDLE * 0.65 } else { HANDLE * 0.5 };
+                    painter.circle(h.pos(b.shrink(1.0)), r, Color32::WHITE, Stroke::new(1.0, Color32::from_black_alpha(140)));
+                }
+            }
+            let guide = Stroke::new(1.0, ACCENT.gamma_multiply(0.6));
+            for (across, v) in guides {
+                let line = if across {
+                    let x = frame_rect.left() + v * frame_rect.width();
+                    [Pos2::new(x, frame_rect.top()), Pos2::new(x, frame_rect.bottom())]
+                } else {
+                    let y = frame_rect.top() + v * frame_rect.height();
+                    [Pos2::new(frame_rect.left(), y), Pos2::new(frame_rect.right(), y)]
+                };
+                painter.extend(egui::Shape::dashed_line(&line, guide, 5.0, 4.0));
+            }
+            return;
         }
         // The one held, else the one selected: its outline and handles.
         let active = held.or(selected.map(|l| (l, over.filter(|(o, _)| *o == l).map(|(_, h)| h))));
@@ -1153,6 +1330,34 @@ impl App {
             ui.close();
         }
         self.copy_menu(ui, layer);
+        // Groups: a new one of it (and the others picked in the list), into
+        // another, or out of its own.
+        let set = self.grouping(layer);
+        let label = if set.len() > 1 { format!("Group {} sources", set.len()) } else { "Group".to_owned() };
+        if Item::new(label).icon(icon::FOLDER_SIMPLE_PLUS).keys(keys(&[ctrl, "G"])).tip("Moved, resized, hidden and locked as one").show(ui).clicked() {
+            self.group_layers(&set);
+            ui.close();
+        }
+        let own = self.settings.group_of(layer).map(|g| g.id);
+        let others: Vec<(u64, String)> = self.settings.groups.iter().filter(|g| Some(g.id) != own).map(|g| (g.id, g.name.clone())).collect();
+        if !others.is_empty() {
+            let mut into = None;
+            crate::ui_kit::submenu(ui, Item::new("Move to group").icon(icon::FOLDER_SIMPLE), |ui| {
+                for (id, name) in &others {
+                    if Item::new(name.clone()).show(ui).clicked() {
+                        into = Some(*id);
+                    }
+                }
+            });
+            if let Some(id) = into {
+                self.settings.set_group(layer, Some(id));
+                ui.close();
+            }
+        }
+        if own.is_some() && Item::new("Take out of group").icon(icon::FOLDER_SIMPLE_MINUS).show(ui).clicked() {
+            self.settings.set_group(layer, None);
+            ui.close();
+        }
         let locked = self.settings.is_locked(layer);
         let lock = Item::new(if locked { "Unlock" } else { "Lock" }).icon(if locked { icon::LOCK_SIMPLE_OPEN } else { icon::LOCK_SIMPLE }).keys(keys(&[ctrl, "Shift", "L"]));
         let lock = lock.tip(if locked { "It moves on the preview again" } else { "It can't be moved on the preview, and clicks go through it" });
@@ -1291,12 +1496,23 @@ impl App {
         if redo {
             self.redo_arrangement();
         }
+        if let Some(id) = self.selected_group() {
+            self.group_keys(ctx, id, aspect);
+            return;
+        }
         let Some(layer) = self.selected_layer() else {
             if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
                 self.canvas.selected = None;
             }
             return;
         };
+        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::G)) {
+            let was = self.arrangement();
+            let set = self.grouping(layer);
+            self.group_layers(&set);
+            self.keep_for_undo(was);
+            return;
+        }
         // Cropping on the preview: Esc or Enter is done (it stays selected).
         if self.canvas.crop_mode.is_some() && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape) || i.consume_key(Modifiers::NONE, Key::Enter)) {
             self.canvas.crop_mode = None;
@@ -1614,15 +1830,20 @@ mod tests {
     fn clicks_go_down_through_the_sources() {
         let (a, b, c) = (Layer::Webcam(1), Layer::Visual(2), Layer::Screen);
         assert_eq!(clicked_through(&[a, b, c], None), Some(a));
-        assert_eq!(clicked_through(&[a, b, c], Some(a)), Some(b));
-        assert_eq!(clicked_through(&[a, b, c], Some(c)), Some(a));
-        assert_eq!(clicked_through(&[b, c], Some(a)), Some(b), "one selected elsewhere: the one in front");
-        assert_eq!(clicked_through(&[], Some(a)), None);
+        assert_eq!(clicked_through(&[a, b, c], Some(&a)), Some(b));
+        assert_eq!(clicked_through(&[a, b, c], Some(&c)), Some(a));
+        assert_eq!(clicked_through(&[b, c], Some(&a)), Some(b), "one selected elsewhere: the one in front");
+        assert_eq!(clicked_through::<Layer>(&[], Some(&a)), None);
         let layers = [(a, rect(0.5, 0.5, 0.3, 0.3)), (c, rect(0.0, 0.0, 1.0, 1.0))];
         let shown = |r: Rect| Rect::from_min_max((r.min.to_vec2() * 1000.0).to_pos2(), (r.max.to_vec2() * 1000.0).to_pos2());
         let p = Pos2::new(600.0, 600.0);
         assert_eq!(hit(&layers, &shown, p, None), Some((a, Handle::Move)));
         assert_eq!(hit(&layers, &shown, p, Some(c)), Some((c, Handle::Move)), "the screen, selected, under the webcam");
+        // In a group, the group first, then the source itself.
+        let groups = [crate::settings::GroupCfg { id: 7, name: "G".into(), members: vec![a], collapsed: false }];
+        assert_eq!(picks_at(&layers, &shown, p, &groups), vec![Selected::Group(7), Selected::Layer(a), Selected::Layer(c)]);
+        let moved = mapped(rect(0.5, 0.5, 0.2, 0.2), rect(0.5, 0.5, 0.4, 0.4), rect(0.0, 0.0, 0.8, 0.8));
+        assert!(close(moved, rect(0.0, 0.0, 0.4, 0.4)), "{moved:?}");
     }
 
     #[test]

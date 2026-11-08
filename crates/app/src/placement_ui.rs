@@ -158,20 +158,7 @@ impl App {
             self.layer_reset_size(layer, aspect);
         }
         if let Some(px) = moved {
-            let r = from_pixels(px, (vw, vh));
-            match layer {
-                Layer::Screen => self.place_or_frame(r, aspect),
-                Layer::Visual(key) => self.place_visual(key, r, aspect),
-                Layer::Webcam(key) => {
-                    if let Some(cam) = self.settings.webcam_mut(key) {
-                        let p: capture::webcam::Placement = cam.placement.into();
-                        // Another shape typed (unlinked): as much more stretched.
-                        let stretch = p.stretch * (r.width() / r.height().max(1e-6)) / (p.w / p.h.max(1e-6));
-                        let p = crate::webcam_ui::contain(capture::webcam::Placement { x: r.min.x, y: r.min.y, w: r.width(), h: r.height(), stretch, ..p });
-                        cam.placement = crate::settings::PlacementCfg::laid_out(p, aspect);
-                    }
-                }
-            }
+            self.set_layer_rect(layer, from_pixels(px, (vw, vh)), aspect);
         }
         if let Some(by) = turn {
             self.turn_layer(layer, by, aspect);
@@ -180,6 +167,25 @@ impl App {
             self.flip_layer(layer, true, aspect);
         } else if u != upside_down {
             self.flip_layer(layer, false, aspect);
+        }
+    }
+
+    /// A source put in the box `r` (fractions of a video of shape
+    /// `aspect`): the screen and boxed sources placed so; a webcam too, as
+    /// much more stretched as the box is another shape, and kept in the
+    /// video.
+    pub(crate) fn set_layer_rect(&mut self, layer: Layer, r: Rect, aspect: f32) {
+        match layer {
+            Layer::Screen => self.place_or_frame(r, aspect),
+            Layer::Visual(key) => self.place_visual(key, r, aspect),
+            Layer::Webcam(key) => {
+                if let Some(cam) = self.settings.webcam_mut(key) {
+                    let p: capture::webcam::Placement = cam.placement.into();
+                    let stretch = p.stretch * (r.width() / r.height().max(1e-6)) / (p.w / p.h.max(1e-6));
+                    let p = crate::webcam_ui::contain(capture::webcam::Placement { x: r.min.x, y: r.min.y, w: r.width(), h: r.height(), stretch, ..p });
+                    cam.placement = crate::settings::PlacementCfg::laid_out(p, aspect);
+                }
+            }
         }
     }
 

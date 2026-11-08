@@ -20,6 +20,7 @@ mod collections;
 mod crop_ui;
 mod demo;
 mod fonts;
+mod groups_ui;
 mod inspector_ui;
 mod scenes_ui;
 mod visuals_ui;
@@ -1328,11 +1329,7 @@ impl App {
         self.sources_view.crop_open = false;
         self.webcam_view.crop = None;
         self.camera_panel = None;
-        if let Some(canvas_ui::Selected::Layer(l)) = self.canvas.selected
-            && !self.settings.layer_order().contains(&l)
-        {
-            self.canvas.selected = None;
-        }
+        self.forget_gone_selection();
     }
 
     /// Another preset in the live settings (a switch, or the one in use

@@ -590,12 +590,30 @@ pub struct SceneCfg {
     /// go through them. Empty for the scene shown (see `locked`).
     #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "lenient_list")]
     pub locked: Vec<LayerKey>,
+    /// Its groups. Empty for the scene shown (see `groups`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "lenient_list")]
+    pub groups: Vec<GroupCfg>,
 }
 
 impl SceneCfg {
     pub fn new(id: u64, name: &str) -> Self {
-        Self { id, name: name.to_owned(), items: Vec::new(), locked: Vec::new() }
+        Self { id, name: name.to_owned(), items: Vec::new(), locked: Vec::new(), groups: Vec::new() }
     }
+}
+
+/// Sources of a scene kept together, as one: next to each other in its
+/// order, moved, resized, hidden and locked together, folded away in its
+/// list. Each scene's own, as where its sources are.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GroupCfg {
+    pub id: u64,
+    pub name: String,
+    /// Front first, as they are in the scene's order.
+    #[serde(default, deserialize_with = "lenient_list")]
+    pub members: Vec<LayerKey>,
+    /// Folded in the list: only its own row shows.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub collapsed: bool,
 }
 
 /// One of a stored scene's sources, and how it's placed there: what of the
@@ -701,6 +719,8 @@ pub struct PresetSetup {
     pub layer_order: Vec<LayerKey>,
     #[serde(deserialize_with = "lenient_list")]
     pub locked: Vec<LayerKey>,
+    #[serde(deserialize_with = "lenient_list")]
+    pub groups: Vec<GroupCfg>,
     #[serde(deserialize_with = "lenient_list")]
     pub scenes: Vec<SceneCfg>,
     pub active_scene: u64,
@@ -1405,6 +1425,9 @@ pub struct RecordSettings {
     /// preview, and clicks go through them to what's under them.
     #[serde(skip_serializing_if = "Vec::is_empty", deserialize_with = "lenient_list")]
     pub locked: Vec<LayerKey>,
+    /// The scene shown's groups (see [`GroupCfg`]).
+    #[serde(skip_serializing_if = "Vec::is_empty", deserialize_with = "lenient_list")]
+    pub groups: Vec<GroupCfg>,
     /// The screen as a source in the video: in front or behind, its box.
     pub screen: ScreenCfg,
     /// What you called the screen, if you did.
@@ -1582,6 +1605,7 @@ impl Default for RecordSettings {
             visuals: Vec::new(),
             layer_order: Vec::new(),
             locked: Vec::new(),
+            groups: Vec::new(),
             screen: ScreenCfg::default(),
             screen_title: None,
             scenes: vec![SceneCfg::new(1, "Scene 1")],
@@ -2128,11 +2152,14 @@ impl RecordSettings {
         let items = self.live_items();
         let shown = self.active_scene;
         let locked = std::mem::take(&mut self.locked);
+        let groups = std::mem::take(&mut self.groups);
         if let Some(from) = self.scenes.iter_mut().find(|s| s.id == shown) {
             from.items = items;
             from.locked = locked;
+            from.groups = groups;
         }
         self.locked = std::mem::take(&mut self.scenes[to].locked);
+        self.groups = std::mem::take(&mut self.scenes[to].groups);
         let items = std::mem::take(&mut self.scenes[to].items);
         self.active_scene = id;
         self.layer_order.clear();
@@ -2145,6 +2172,7 @@ impl RecordSettings {
             self.put_item(&SceneItem::screen(false));
             self.layer_order.push(LayerKey::Screen);
         }
+        self.pack_groups();
         true
     }
 
@@ -2152,23 +2180,27 @@ impl RecordSettings {
     /// Its id (it isn't shown yet).
     pub fn add_scene(&mut self, copy_of_shown: bool) -> u64 {
         let id = self.new_scene_id();
-        let (name, items, locked) = match self.scene().filter(|_| copy_of_shown) {
-            Some(s) => (format!("{} copy", s.name), self.live_items(), self.locked.clone()),
-            None => (format!("Scene {}", self.scenes.len() + 1), vec![SceneItem::screen(true)], Vec::new()),
+        let (name, items, locked, groups) = match self.scene().filter(|_| copy_of_shown) {
+            Some(s) => (format!("{} copy", s.name), self.live_items(), self.locked.clone(), self.groups.clone()),
+            None => (format!("Scene {}", self.scenes.len() + 1), vec![SceneItem::screen(true)], Vec::new(), Vec::new()),
         };
         let name = self.unused_scene_name(&name);
         let at = self.scenes.iter().position(|s| s.id == self.active_scene).map_or(self.scenes.len(), |i| i + 1);
-        self.scenes.insert(at, SceneCfg { id, name, items, locked });
+        self.scenes.insert(at, SceneCfg { id, name, items, locked, groups });
         id
     }
 
     /// A copy of scene `id`, after it: its id.
     pub fn duplicate_scene(&mut self, id: u64) -> Option<u64> {
         let at = self.scenes.iter().position(|s| s.id == id)?;
-        let (items, locked) = if id == self.active_scene { (self.live_items(), self.locked.clone()) } else { (self.scenes[at].items.clone(), self.scenes[at].locked.clone()) };
+        let (items, locked, groups) = if id == self.active_scene {
+            (self.live_items(), self.locked.clone(), self.groups.clone())
+        } else {
+            (self.scenes[at].items.clone(), self.scenes[at].locked.clone(), self.scenes[at].groups.clone())
+        };
         let name = self.unused_scene_name(&format!("{} copy", self.scenes[at].name));
         let new = self.new_scene_id();
-        self.scenes.insert(at + 1, SceneCfg { id: new, name, items, locked });
+        self.scenes.insert(at + 1, SceneCfg { id: new, name, items, locked, groups });
         Some(new)
     }
 
@@ -2232,6 +2264,7 @@ impl RecordSettings {
         }
         self.layer_order.retain(|l| *l != layer);
         self.locked.retain(|l| *l != layer);
+        self.pack_groups();
         let elsewhere = self.stored_scene_has(layer);
         if !elsewhere {
             self.remove_layer(layer);
@@ -2286,10 +2319,116 @@ impl RecordSettings {
         self.visuals.push(copy);
         order[at] = new;
         self.layer_order = order;
-        for l in self.locked.iter_mut().filter(|l| **l == layer) {
+        for l in self.locked.iter_mut().chain(self.groups.iter_mut().flat_map(|g| g.members.iter_mut())).filter(|l| **l == layer) {
             *l = new;
         }
         Some(new)
+    }
+
+    /// The group `layer` is in, in the scene shown.
+    pub fn group_of(&self, layer: LayerKey) -> Option<&GroupCfg> {
+        self.groups.iter().find(|g| g.members.contains(&layer))
+    }
+
+    /// Group `id` of the scene shown.
+    pub fn group(&self, id: u64) -> Option<&GroupCfg> {
+        self.groups.iter().find(|g| g.id == id)
+    }
+
+    pub fn group_mut(&mut self, id: u64) -> Option<&mut GroupCfg> {
+        self.groups.iter_mut().find(|g| g.id == id)
+    }
+
+    /// `layers` of the scene shown in a new group (out of any they were
+    /// in), together where the one in front of them is. Its id; `None`
+    /// with none of them in the scene.
+    pub fn make_group(&mut self, layers: &[LayerKey]) -> Option<u64> {
+        let order = self.layer_order();
+        let members: Vec<LayerKey> = order.iter().filter(|l| layers.contains(l)).copied().collect();
+        if members.is_empty() {
+            return None;
+        }
+        for g in &mut self.groups {
+            g.members.retain(|m| !members.contains(m));
+        }
+        let others = self.presets.iter().filter_map(|p| p.setup.as_deref()).flat_map(|s| s.groups.iter().chain(s.scenes.iter().flat_map(|c| c.groups.iter())));
+        let id = self.groups.iter().chain(self.scenes.iter().flat_map(|c| c.groups.iter())).chain(others).map(|g| g.id).max().unwrap_or(0) + 1;
+        let name = unused_name(&format!("Group {}", self.groups.len() + 1), |n| self.groups.iter().any(|g| g.name == n));
+        self.groups.push(GroupCfg { id, name, members, collapsed: false });
+        self.pack_groups();
+        Some(id)
+    }
+
+    /// Group `id`'s sources on their own again, where they are.
+    pub fn ungroup(&mut self, id: u64) {
+        self.groups.retain(|g| g.id != id);
+    }
+
+    /// `layer` into group `id` (out of the one it was in), after its
+    /// others; or out of any group, with `None`.
+    pub fn set_group(&mut self, layer: LayerKey, id: Option<u64>) {
+        for g in &mut self.groups {
+            g.members.retain(|m| *m != layer);
+        }
+        if let Some(g) = id.and_then(|id| self.group_mut(id)) {
+            g.members.push(layer);
+            // At the back of the group: just behind its last one.
+            if let Some(last) = g.members.iter().rev().nth(1).copied() {
+                let mut order = self.layer_order();
+                order.retain(|l| *l != layer);
+                let at = order.iter().position(|l| *l == last).map_or(order.len(), |i| i + 1);
+                order.insert(at, layer);
+                self.layer_order = order;
+            }
+        }
+        self.pack_groups();
+    }
+
+    /// Group `id` moved as one to `to` in the order of the rest (0: in
+    /// front).
+    pub fn move_group(&mut self, id: u64, to: usize) {
+        let Some(members) = self.group(id).map(|g| g.members.clone()) else { return };
+        let mut order = self.layer_order();
+        order.retain(|l| !members.contains(l));
+        let to = to.min(order.len());
+        order.splice(to..to, members);
+        self.layer_order = order;
+        self.pack_groups();
+    }
+
+    /// Each group's sources together in the scene shown's order (where its
+    /// one in front is), front first; what isn't in the scene out of them,
+    /// and a group left with none gone.
+    pub fn pack_groups(&mut self) {
+        let mut order = self.layer_order();
+        for g in &mut self.groups {
+            g.members.retain(|m| order.contains(m));
+        }
+        self.groups.retain(|g| !g.members.is_empty());
+        for g in &mut self.groups {
+            let Some(at) = order.iter().position(|l| g.members.contains(l)) else { continue };
+            let members: Vec<LayerKey> = order.iter().filter(|l| g.members.contains(l)).copied().collect();
+            order.retain(|l| !members.contains(l));
+            order.splice(at..at, members.iter().copied());
+            g.members = members;
+        }
+        self.layer_order = order;
+    }
+
+    /// Group `id` as it is in the scene shown into scene `to` too: each of
+    /// its sources placed as here, and the group (as here) there.
+    pub fn copy_group_to_scene(&mut self, id: u64, to: u64) -> bool {
+        let Some(group) = self.group(id).cloned() else { return false };
+        if !group.members.iter().all(|m| self.copy_to_scene(*m, to)) {
+            return false;
+        }
+        let Some(scene) = self.scenes.iter_mut().find(|s| s.id == to) else { return false };
+        for g in &mut scene.groups {
+            g.members.retain(|m| !group.members.contains(m));
+        }
+        scene.groups.retain(|g| g.id != id && !g.members.is_empty());
+        scene.groups.push(group);
+        true
     }
 
     /// Whether `layer` is locked in the scene shown.
@@ -2357,6 +2496,7 @@ impl RecordSettings {
             visuals: std::mem::take(&mut self.visuals),
             layer_order: std::mem::take(&mut self.layer_order),
             locked: std::mem::take(&mut self.locked),
+            groups: std::mem::take(&mut self.groups),
             scenes: std::mem::take(&mut self.scenes),
             active_scene: std::mem::take(&mut self.active_scene),
             audio_sources: std::mem::take(&mut self.audio_sources),
@@ -2376,6 +2516,7 @@ impl RecordSettings {
         self.visuals = s.visuals;
         self.layer_order = s.layer_order;
         self.locked = s.locked;
+        self.groups = s.groups;
         (self.scenes, self.active_scene) = (s.scenes, s.active_scene);
         self.audio_sources = s.audio_sources;
         self.limiter = s.limiter;
@@ -2433,7 +2574,13 @@ impl RecordSettings {
             *key = next;
         }
         let new_key = |k: u64| keys.iter().find(|(was, _)| *was == k).map_or(k, |(_, now)| *now);
-        for l in s.layer_order.iter_mut().chain(s.locked.iter_mut()).chain(s.scenes.iter_mut().flat_map(|c| c.locked.iter_mut())) {
+        let grouped = s.groups.iter_mut().chain(s.scenes.iter_mut().flat_map(|c| c.groups.iter_mut())).flat_map(|g| g.members.iter_mut());
+        for l in s.layer_order.iter_mut().chain(s.locked.iter_mut()).chain(grouped) {
+            if let LayerKey::Webcam(k) | LayerKey::Visual(k) = l {
+                *k = new_key(*k);
+            }
+        }
+        for l in s.scenes.iter_mut().flat_map(|c| c.locked.iter_mut()) {
             if let LayerKey::Webcam(k) | LayerKey::Visual(k) = l {
                 *k = new_key(*k);
             }
@@ -3538,6 +3685,36 @@ mod scene_tests {
         assert!(back.is_locked(LayerKey::Visual(2)));
         s.remove_from_scene(LayerKey::Visual(2));
         assert!(!s.is_locked(LayerKey::Visual(2)));
+    }
+
+    /// A group's sources are together where the one in front of them was,
+    /// stay so when one moves, and leave it when they leave the scene; the
+    /// group is each scene's, and copied to another scene with its sources.
+    #[test]
+    fn groups_keep_their_sources_together() {
+        let mut s = setup();
+        s.visuals.push(VisualCfg::new(3, Visual::Colour { rgba: [0, 0, 0, 255] }));
+        s.layer_order = vec![LayerKey::Webcam(1), LayerKey::Visual(2), LayerKey::Screen, LayerKey::Visual(3)];
+        let g = s.make_group(&[LayerKey::Webcam(1), LayerKey::Visual(3)]).unwrap();
+        assert_eq!(s.layer_order(), vec![LayerKey::Webcam(1), LayerKey::Visual(3), LayerKey::Visual(2), LayerKey::Screen]);
+        assert_eq!(s.group_of(LayerKey::Visual(3)).map(|x| x.id), Some(g));
+        s.move_group(g, 1);
+        assert_eq!(s.layer_order(), vec![LayerKey::Visual(2), LayerKey::Webcam(1), LayerKey::Visual(3), LayerKey::Screen]);
+        s.set_group(LayerKey::Visual(2), Some(g));
+        assert_eq!(s.group(g).map(|x| x.members.clone()), Some(vec![LayerKey::Webcam(1), LayerKey::Visual(3), LayerKey::Visual(2)]));
+        let a = s.active_scene;
+        let b = s.add_scene(false);
+        assert!(s.copy_group_to_scene(g, b));
+        s.remove_from_scene(LayerKey::Visual(3));
+        assert_eq!(s.group(g).map(|x| x.members.len()), Some(2));
+        s.switch_scene(b);
+        assert_eq!(s.group(g).map(|x| x.members.len()), Some(3), "there it has all three");
+        assert_eq!(&s.layer_order()[..3], &[LayerKey::Webcam(1), LayerKey::Visual(3), LayerKey::Visual(2)]);
+        s.switch_scene(a);
+        s.ungroup(g);
+        assert!(s.groups.is_empty());
+        let back = RecordSettings::from_saved(Some(s.to_json().as_bytes()));
+        assert_eq!(back.scenes, s.scenes);
     }
 
     #[test]

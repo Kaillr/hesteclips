@@ -6,7 +6,7 @@
 //! both, the preset's sound, the same in every scene: the clip's mix, then
 //! each source with its level, volume and mute. Each list's Add puts
 //! another source in. A source's settings are in a dialog (`inspector_ui`):
-//! double-click it, or its row's settings button, or Settings… in its menu.
+//! double-click its row, or its row's settings button, or Settings… in its menu.
 //!
 //! Deliberately says nothing about "tracks": a source is either part of what the
 //! clip sounds like ("In the clip"), kept separately for editing, or both.
@@ -86,9 +86,10 @@ pub(crate) struct SourcesView {
     /// held there.
     pub(crate) crop_open: bool,
     crop_drag: Option<(crate::webcam_ui::Handle, egui::Rect, egui::Pos2)>,
-    /// A row of the video's list dragged by its grip to put it in front or
-    /// behind, and how the sources were before (to undo it).
-    pub(crate) row_drag: Option<(crate::canvas_ui::Layer, crate::canvas_ui::Arrangement)>,
+    /// A row of the video's list (a source's or a group's) dragged by its
+    /// grip to put it in front or behind, and how the sources were before
+    /// (to undo it).
+    pub(crate) row_drag: Option<(crate::canvas_ui::Selected, crate::canvas_ui::Arrangement)>,
     /// Displays for the Add menu, refreshed when it opens.
     pub(crate) add_displays: Vec<capture::Device>,
     /// A dialog open (a preset made, renamed, deleted; a scene deleted).
@@ -358,10 +359,12 @@ impl App {
     }
 
     /// The video's sources, the one in front first: a row each, with its
-    /// symbol, name, what it shows and an eye to hide it. A click selects it
-    /// (on the preview too), twice or its settings button opens its
-    /// settings, its grip drags it in front or behind, a right-click opens
-    /// its menu; Add puts another in.
+    /// symbol, name, what it shows and an eye to hide it; a group's row over
+    /// its sources' (see `groups_ui`), theirs set in under it unless it's
+    /// folded. A click selects one (on the preview too; Ctrl or Shift picks
+    /// more, to group), twice or its settings button opens its settings,
+    /// its grip drags it in front or behind, a right-click opens its menu;
+    /// Add puts another in.
     fn video_list(&mut self, ui: &mut egui::Ui, frame: Option<&capture::preview::PreviewFrame>, aspect: f32) {
         use crate::theme::{self, W};
         let pal = theme::pal(ui);
@@ -376,25 +379,37 @@ impl App {
         ui.add_space(4.0);
         self.canvas.card_hover = None;
         let mut rows = Vec::new();
+        let groups = self.settings.groups.clone();
         egui::Frame::new().fill(pal.raise).corner_radius(8).inner_margin(egui::Margin::same(4)).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 2.0;
             for l in &order {
-                let r = self.video_row(ui, *l, frame, aspect);
-                rows.push((*l, r));
+                let group = groups.iter().find(|g| g.members.contains(l));
+                if let Some(g) = group {
+                    if g.members.first() == Some(l) {
+                        let r = self.group_row(ui, g.id);
+                        rows.push((crate::canvas_ui::Selected::Group(g.id), r));
+                    }
+                    if g.collapsed {
+                        continue;
+                    }
+                }
+                let r = self.video_row(ui, *l, frame, aspect, if group.is_some() { 18.0 } else { 0.0 });
+                rows.push((crate::canvas_ui::Selected::Layer(*l), r));
             }
         });
         self.reorder_rows(ui, &rows);
     }
 
-    /// One video source's row (see `video_list`): where it was drawn.
-    fn video_row(&mut self, ui: &mut egui::Ui, layer: crate::canvas_ui::Layer, frame: Option<&capture::preview::PreviewFrame>, aspect: f32) -> egui::Rect {
+    /// One video source's row (see `video_list`), set in by `indent` in its
+    /// group: where it was drawn.
+    fn video_row(&mut self, ui: &mut egui::Ui, layer: crate::canvas_ui::Layer, frame: Option<&capture::preview::PreviewFrame>, aspect: f32, indent: f32) -> egui::Rect {
         use crate::theme::{self, W};
         use egui::{Align2, FontId, pos2, vec2};
         use egui_phosphor::regular as icon;
         let pal = theme::pal(ui);
-        let selected = self.selected_layer() == Some(layer);
-        let held = self.sources_view.row_drag.as_ref().is_some_and(|(l, _)| *l == layer);
+        let selected = self.selected_layer() == Some(layer) || self.canvas.picked.contains(&layer);
+        let held = self.sources_view.row_drag.as_ref().is_some_and(|(s, _)| *s == crate::canvas_ui::Selected::Layer(layer));
         let on = self.layer_enabled(layer);
         let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
         crate::demo::mark(ui.ctx(), || format!("row:{}", self.settings.layer_title(layer)), rect);
@@ -415,7 +430,7 @@ impl App {
         }
         let grip = grip.on_hover_text("Drag up or down: the top one's in front").on_hover_cursor(egui::CursorIcon::Grab);
         if grip.drag_started() {
-            self.sources_view.row_drag = Some((layer, self.arrangement()));
+            self.sources_view.row_drag = Some((crate::canvas_ui::Selected::Layer(layer), self.arrangement()));
         }
         // Its eye: in your clips, or hidden.
         let eye_rect = egui::Rect::from_center_size(pos2(rect.right() - 18.0, cy), vec2(26.0, 26.0));
@@ -456,7 +471,7 @@ impl App {
             self.edit_layer(layer);
         }
         // Its symbol, name, and what it shows (or what's wrong with it).
-        let mut x = rect.left() + 24.0;
+        let mut x = rect.left() + 24.0 + indent;
         let dim = |c: Color32| if on { c } else { theme::fade(c, 0.5) };
         painter.text(pos2(x + 8.0, cy), Align2::CENTER_CENTER, crate::inspector_ui::layer_icon(self, layer), FontId::proportional(16.0), dim(pal.text2));
         x += 26.0;
@@ -474,7 +489,42 @@ impl App {
         };
         let g = painter.layout_job(crate::ui_kit::single_line_job(&line, theme::font(12.5, W::Regular), color, (right - x).max(10.0)));
         painter.galley(pos2(x, cy - g.size().y / 2.0), g, color);
-        if resp.clicked() || resp.secondary_clicked() {
+        // A click selects it; Ctrl-click picks it too (or not), Shift-click
+        // all from the one selected to it: to group them.
+        if resp.clicked() {
+            let mods = ui.input(|i| i.modifiers);
+            let anchor = self.selected_layer();
+            if mods.command || mods.shift {
+                let mut picked = std::mem::take(&mut self.canvas.picked);
+                if let Some(a) = anchor.filter(|a| !picked.contains(a)) {
+                    picked.push(a);
+                }
+                if mods.shift && let Some(a) = anchor {
+                    let order = self.layer_order();
+                    let (i, j) = (order.iter().position(|l| *l == a), order.iter().position(|l| *l == layer));
+                    if let (Some(i), Some(j)) = (i, j) {
+                        for l in &order[i.min(j)..=i.max(j)] {
+                            if !picked.contains(l) {
+                                picked.push(*l);
+                            }
+                        }
+                    }
+                } else if let Some(at) = picked.iter().position(|l| *l == layer) {
+                    picked.remove(at);
+                } else {
+                    picked.push(layer);
+                }
+                self.canvas.picked = picked;
+                if anchor.is_none() {
+                    self.select_layer(layer);
+                }
+            } else {
+                self.canvas.picked.clear();
+                self.select_layer(layer);
+            }
+        }
+        if resp.secondary_clicked() && !self.canvas.picked.contains(&layer) {
+            self.canvas.picked.clear();
             self.select_layer(layer);
         }
         if resp.double_clicked() {
@@ -503,15 +553,18 @@ impl App {
 
     /// A row dragged by its grip, live (the preview shows it): it goes to
     /// the place of the row the pointer's over. Let go, it can be undone.
-    fn reorder_rows(&mut self, ui: &egui::Ui, rows: &[(crate::canvas_ui::Layer, egui::Rect)]) {
-        let Some(held) = self.sources_view.row_drag.as_ref().map(|(l, _)| *l) else { return };
+    fn reorder_rows(&mut self, ui: &egui::Ui, rows: &[(crate::canvas_ui::Selected, egui::Rect)]) {
+        let Some(held) = self.sources_view.row_drag.as_ref().map(|(s, _)| s.clone()) else { return };
         let down = ui.input(|i| i.pointer.primary_down());
         if down && let Some(p) = ui.input(|i| i.pointer.interact_pos()) {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
             let to = rows.iter().position(|(_, r)| p.y < r.bottom()).unwrap_or(rows.len().saturating_sub(1));
-            let at = rows.iter().position(|(l, _)| *l == held);
-            if at.is_some_and(|at| at != to) {
-                self.move_layer(held, to);
+            let at = rows.iter().position(|(s, _)| *s == held);
+            if at.is_some_and(|at| at != to)
+                && let Some((target, _)) = rows.get(to)
+            {
+                let target = target.clone();
+                self.move_row(&held, &target);
             }
         }
         if !down
