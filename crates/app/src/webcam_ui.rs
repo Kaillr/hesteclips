@@ -25,6 +25,76 @@ const FIRST_WIDTH: f32 = 0.25;
 const MIN_SIZE: f32 = 0.03;
 /// Snap distance, as a fraction of the frame.
 const SNAP: f32 = 0.012;
+/// How much of a box (of the video, across and down) stays on the video
+/// however far it's moved past its edges, so it can always be taken hold
+/// of again.
+pub(crate) const SEEN: f32 = 0.03;
+
+/// Where a box `size` big, at `at`, goes along one axis to keep [`SEEN`]
+/// of it on the video.
+pub(crate) fn seen(at: f32, size: f32) -> f32 {
+    let s = SEEN.min(size);
+    at.clamp(s - size, 1.0 - s)
+}
+
+/// The nearest of the video's edges and middle and `lines` to `v`, if one
+/// is close enough to snap to.
+fn snap_to(v: f32, lines: &[f32]) -> Option<f32> {
+    [0.0, 0.5, 1.0].iter().chain(lines).copied().filter(|l| (l - v).abs() < SNAP).min_by(|a, b| (a - v).abs().total_cmp(&(b - v).abs()))
+}
+
+/// `r`, resized with its moving sides `[left, top, right, bottom]`, one of
+/// them on a line near it (the video's edges and middle, `lines`): each on
+/// its own, or (`keep`, its shape kept) the box scaled from its other sides
+/// (its middle, across an axis not resized) so the nearest one is.
+pub(crate) fn snap_sides(r: Rect, [l, t, rt, b]: [bool; 4], keep: bool, lines: &Lines) -> Rect {
+    if !keep {
+        let mut s = r;
+        if l && let Some(v) = snap_to(s.min.x, &lines.xs).filter(|v| *v < s.max.x) {
+            s.min.x = v;
+        }
+        if rt && let Some(v) = snap_to(s.max.x, &lines.xs).filter(|v| *v > s.min.x) {
+            s.max.x = v;
+        }
+        if t && let Some(v) = snap_to(s.min.y, &lines.ys).filter(|v| *v < s.max.y) {
+            s.min.y = v;
+        }
+        if b && let Some(v) = snap_to(s.max.y, &lines.ys).filter(|v| *v > s.min.y) {
+            s.max.y = v;
+        }
+        return s;
+    }
+    let (w, h) = (r.width().max(1e-6), r.height().max(1e-6));
+    let ax = if l { r.max.x } else if rt { r.min.x } else { r.center().x };
+    let ay = if t { r.max.y } else if b { r.min.y } else { r.center().y };
+    // Each moving side's nearest line: how far, and the scale it takes.
+    let mut best: Option<(f32, f32)> = None;
+    let mut consider = |edge: f32, ls: &[f32], k: &dyn Fn(f32) -> f32| {
+        if let Some(v) = snap_to(edge, ls) {
+            let d = (v - edge).abs();
+            if best.is_none_or(|(bd, _)| d < bd) {
+                best = Some((d, k(v)));
+            }
+        }
+    };
+    if l {
+        consider(r.min.x, &lines.xs, &|v| (ax - v) / w);
+    }
+    if rt {
+        consider(r.max.x, &lines.xs, &|v| (v - ax) / w);
+    }
+    if t {
+        consider(r.min.y, &lines.ys, &|v| (ay - v) / h);
+    }
+    if b {
+        consider(r.max.y, &lines.ys, &|v| (v - ay) / h);
+    }
+    let Some((_, k)) = best.filter(|(_, k)| *k > 0.01) else { return r };
+    let (nw, nh) = (w * k, h * k);
+    let x = if l { ax - nw } else if rt { ax } else { ax - nw / 2.0 };
+    let y = if t { ay - nh } else if b { ay } else { ay - nh / 2.0 };
+    Rect::from_min_size(Pos2::new(x, y), vec2(nw, nh))
+}
 
 #[derive(Default)]
 pub(crate) struct WebcamView {
@@ -136,8 +206,8 @@ pub(crate) struct Lines {
 /// as the screen's do. Dragging past that opposite side flips the picture
 /// on that axis.
 ///
-/// The box stays inside the frame: moving stops at its edges, and so does
-/// growing (what's not wanted of the picture is cropped instead).
+/// The box goes past the frame's edges as far as it's dragged, [`SEEN`]
+/// of it staying on; its moving sides snap, as a move does (`mods.snap`).
 pub(crate) fn drag(start: Placement, handle: Handle, dx: f32, dy: f32, mods: Mods, lines: &Lines) -> Placement {
     let mut p = start;
     if handle == Handle::Move {
@@ -147,13 +217,13 @@ pub(crate) fn drag(start: Placement, handle: Handle, dx: f32, dy: f32, mods: Mod
             p.x += snap_offset(&[p.x, p.x + p.w], p.x + p.w / 2.0, &lines.xs);
             p.y += snap_offset(&[p.y, p.y + p.h], p.y + p.h / 2.0, &lines.ys);
         }
-        p.x = p.x.clamp(0.0, (1.0 - p.w).max(0.0));
-        p.y = p.y.clamp(0.0, (1.0 - p.h).max(0.0));
+        p.x = seen(p.x, p.w);
+        p.y = seen(p.y, p.h);
         return p;
     }
     let [l, t, r, b] = handle.sides();
     if mods.crop {
-        return crop(start, [l, t, r, b], dx, dy, mods.keep);
+        return crop(start, [l, t, r, b], dx, dy, mods.keep, mods.snap.then_some(lines));
     }
     // Per axis: the fixed side (anchor), and how far the dragged side is from
     // it, signed, before and after. A sign change means it crossed: a flip.
@@ -178,20 +248,9 @@ pub(crate) fn drag(start: Placement, handle: Handle, dx: f32, dy: f32, mods: Mod
         (Some((_, a)), None) | (None, Some((_, a))) => a.abs(),
         (None, None) => 1.0,
     };
-    // No bigger than fits between its anchor and the frame's edge it grows
-    // toward (both edges, for an axis kept centred).
-    let room = |near: bool, ka: Option<(f32, f32)>, pos: f32, size: f32| -> f32 {
-        match ka {
-            Some((anchor, k)) => {
-                if near != (k < 0.0) { anchor } else { 1.0 - anchor }
-            }
-            None => {
-                let c = pos + size / 2.0;
-                2.0 * c.min(1.0 - c)
-            }
-        }
-    };
-    let (most_x, most_y) = (room(l, kx, start.x, start.w) / start.w, room(t, ky, start.y, start.h) / start.h);
+    // As big as it's dragged, past the video's edges too (up to a few
+    // times the video).
+    let (most_x, most_y) = (GROW_MOST / start.w, GROW_MOST / start.h);
     // Shift: each axis as far as it's dragged (one not dragged stays), and
     // the picture as much more stretched.
     let (ax, ay) = if mods.keep {
@@ -224,14 +283,31 @@ pub(crate) fn drag(start: Placement, handle: Handle, dx: f32, dy: f32, mods: Mod
     p.h = h;
     p.flip_h = start.flip_h ^ fx;
     p.flip_v = start.flip_v ^ fy;
+    // Its moving sides snap to the video's edges and middle and the other
+    // sources (but with Ctrl): which sides moved, as it's ended up.
+    if mods.snap {
+        let r0 = Rect::from_min_size(Pos2::new(p.x, p.y), vec2(p.w, p.h));
+        let moving = |ka: Option<(f32, f32)>, pos: f32| ka.map_or((false, false), |(anchor, _)| if (pos - anchor).abs() < 1e-6 { (false, true) } else { (true, false) });
+        let ((ml, mr), (mt, mb)) = (moving(kx, p.x), moving(ky, p.y));
+        let r1 = snap_sides(r0, [ml, mt, mr, mb], !mods.keep, lines);
+        if r1.width() > MIN_SIZE && r1.height() > MIN_SIZE {
+            if mods.keep {
+                p.stretch *= (r1.width() / r0.width()) / (r1.height() / r0.height());
+            }
+            (p.x, p.y, p.w, p.h) = (r1.min.x, r1.min.y, r1.width(), r1.height());
+        }
+    }
     p
 }
+
+/// How big a box can be dragged, in videos (across and down).
+const GROW_MOST: f32 = 8.0;
 
 /// Crop the sides in `sides` (as seen: a flipped picture's left side is the
 /// camera's right) as they're dragged: the picture keeps its scale, the box
 /// shrinks (or grows back) with the crop, like OBS's Alt-drag. With `keep`,
 /// the box keeps its shape.
-fn crop(start: Placement, sides: [bool; 4], dx: f32, dy: f32, keep: bool) -> Placement {
+fn crop(start: Placement, sides: [bool; 4], dx: f32, dy: f32, keep: bool, lines: Option<&Lines>) -> Placement {
     let mut p = start;
     let c = start.crop;
     // Which camera side each visible side is.
@@ -243,9 +319,8 @@ fn crop(start: Placement, sides: [bool; 4], dx: f32, dy: f32, keep: bool) -> Pla
     // The whole camera picture, on the frame: the box stays inside it (it
     // can't uncrop past it) and inside the frame, showing at least 5% of it.
     let whole = Rect::from_min_max(Pos2::new(start.x - c[left] * sx, start.y - c[top] * sy), Pos2::new(start.x + start.w + c[right] * sx, start.y + start.h + c[bottom] * sy));
-    let bounds = whole.intersect(Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)));
     let from = Rect::from_min_size(Pos2::new(start.x, start.y), vec2(start.w, start.h));
-    let to = resize_within(from, sides, vec2(dx, dy), keep, bounds, vec2(0.05 * sx, 0.05 * sy));
+    let to = resize_within(from, sides, vec2(dx, dy), keep, whole, vec2(0.05 * sx, 0.05 * sy), lines);
     p.crop[left] = (to.min.x - whole.min.x) / sx;
     p.crop[right] = (whole.max.x - to.max.x) / sx;
     p.crop[top] = (to.min.y - whole.min.y) / sy;
@@ -259,8 +334,18 @@ fn crop(start: Placement, sides: [bool; 4], dx: f32, dy: f32, keep: bool) -> Pla
 /// `start` with the sides in `sides` dragged by `d`, inside `bounds`, at
 /// least `least` across and down. With `keep`, its shape is kept: scaled
 /// from the opposite corner or side (centred on an axis not dragged), a
-/// corner following the pointer's place along the diagonal.
-pub(crate) fn resize_within(start: Rect, [l, t, r, b]: [bool; 4], d: egui::Vec2, keep: bool, bounds: Rect, least: egui::Vec2) -> Rect {
+/// corner following the pointer's place along the diagonal. With `lines`,
+/// a side dragged snaps to one near it (or the video's edges or middle).
+pub(crate) fn resize_within(start: Rect, sides: [bool; 4], d: egui::Vec2, keep: bool, bounds: Rect, least: egui::Vec2, lines: Option<&Lines>) -> Rect {
+    let to = resize_free(start, sides, d, keep, bounds, least);
+    let Some(lines) = lines else { return to };
+    let snapped = snap_sides(to, sides, keep, lines);
+    let inside = bounds.expand(1e-5).contains_rect(snapped) && snapped.width() >= least.x - 1e-5 && snapped.height() >= least.y - 1e-5;
+    if inside { snapped } else { to }
+}
+
+/// [`resize_within`], without snapping.
+fn resize_free(start: Rect, [l, t, r, b]: [bool; 4], d: egui::Vec2, keep: bool, bounds: Rect, least: egui::Vec2) -> Rect {
     if !keep {
         let mut s = start;
         if l {
@@ -316,6 +401,14 @@ pub(crate) fn uncrop(p: Placement) -> Placement {
     let left = if p.flip_h { c[2] } else { c[0] };
     let top = if p.flip_v { c[3] } else { c[1] };
     contain(Placement { x: p.x - left * sx, y: p.y - top * sy, w: sx, h: sy, crop: [0.0; 4], ..p })
+}
+
+/// The box with [`SEEN`] of it on the video at least (moved, not shrunk):
+/// where a box typed, or a group's, may go.
+pub(crate) fn on_video(mut p: Placement) -> Placement {
+    p.x = seen(p.x, p.w);
+    p.y = seen(p.y, p.h);
+    p
 }
 
 /// The box inside the frame: shrunk about its centre if it's bigger than the
@@ -595,24 +688,24 @@ mod tests {
     /// The box stays in the frame: moving stops at the edge, growing stops at
     /// it (shape kept), uncropping stops at it, and a turned box is put back.
     #[test]
-    fn stays_inside_the_frame() {
+    fn goes_past_the_frame() {
         let in_frame = |p: Placement| p.x >= -1e-4 && p.y >= -1e-4 && p.x + p.w <= 1.0 + 1e-4 && p.y + p.h <= 1.0 + 1e-4;
+        // Moved out, a sliver of it stays on.
         let p = drag(at(0.7, 0.7, 0.2, 0.2), Handle::Move, 0.5, -0.9, PLAIN, &Lines::default());
-        assert!(in_frame(p) && close(p.x, 0.8) && close(p.y, 0.0));
-        // From the top-left, the bottom-right corner can only grow to the frame's corner.
+        assert!(close(p.x, 0.97) && close(p.y, -0.17), "{p:?}");
+        // From the top-left, the bottom-right corner grows as far as it's dragged.
         let p = drag(at(0.6, 0.7, 0.2, 0.1), Handle::SE, 0.9, 0.9, PLAIN, &Lines::default());
-        assert!(in_frame(p) && close(p.x, 0.6) && close(p.y, 0.7) && close(p.w / p.h, 2.0));
-        assert!(close(p.x + p.w, 1.0) || close(p.y + p.h, 1.0));
-        // An edge handle grows both ways about the middle, as far as the nearer edge.
-        let p = drag(at(0.1, 0.4, 0.2, 0.2), Handle::E, 0.9, 0.0, PLAIN, &Lines::default());
-        assert!(in_frame(p), "{p:?}");
-        // Flipped past its anchor, toward the left edge: only as far as it.
+        assert!(close(p.x, 0.6) && close(p.y, 0.7) && close(p.w / p.h, 2.0) && p.x + p.w > 1.0, "{p:?}");
+        // Its corner snaps onto the frame's, with snapping on.
+        let p = drag(at(0.6, 0.7, 0.2, 0.1), Handle::SE, 0.195, 0.0975, Mods { snap: true, ..PLAIN }, &Lines::default());
+        assert!(close(p.x + p.w, 1.0), "{p:?}");
+        // Flipped past its anchor: still flipped.
         let p = drag(at(0.3, 0.3, 0.2, 0.2), Handle::E, -0.9, 0.0, PLAIN, &Lines::default());
-        assert!(in_frame(p) && p.flip_h, "{p:?}");
-        // Uncropping the left side stops at the frame's left edge.
+        assert!(p.flip_h, "{p:?}");
+        // Uncropping the left side goes past the frame's edge, as far as the picture.
         let cropped = Placement { crop: [0.5, 0.0, 0.0, 0.0], ..at(0.05, 0.5, 0.2, 0.2) };
         let p = drag(cropped, Handle::W, -0.5, 0.0, Mods { crop: true, ..PLAIN }, &Lines::default());
-        assert!(in_frame(p) && close(p.x, 0.0) && p.crop[0] > 0.0, "{p:?}");
+        assert!(close(p.x, -0.15) && p.crop[0] == 0.0, "{p:?}");
         // Turned near the edge, a tall box is moved back in.
         let p = contain(at(0.8, 0.0, 0.3, 1.2));
         assert!(in_frame(p) && close(p.w / p.h, 0.25), "{p:?}");
@@ -1568,7 +1661,7 @@ pub(crate) fn crop_editor(ui: &egui::Ui, resp: &egui::Response, area: Rect, boun
             start.translate(vec2(d.x.clamp(bounds.min.x - start.min.x, bounds.max.x - start.max.x), d.y.clamp(bounds.min.y - start.min.y, bounds.max.y - start.max.y)))
         } else {
             // Shift keeps its shape.
-            resize_within(start, g.sides(), d, keep || ui.input(|i| i.modifiers.shift), bounds, least)
+            resize_within(start, g.sides(), d, keep || ui.input(|i| i.modifiers.shift), bounds, least, None)
         });
     }
     if resp.drag_stopped() {

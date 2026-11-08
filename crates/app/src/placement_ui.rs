@@ -68,8 +68,8 @@ impl App {
             ui.label(theme::text("Its place shows once the video's size is known.", 12.5, W::Regular).color(pal.text3));
             return;
         };
-        // The screen and other boxed sources can reach past the video's edges.
-        let past_edges = matches!(layer, Layer::Screen | Layer::Visual(_));
+        // Any source can reach past the video's edges.
+        let past_edges = true;
         let [x, y, w, h] = to_pixels(rect, (vw, vh));
         let (can_place, can_size) = self.layer_resettable(layer, aspect);
         let turns = self.layer_turns(layer);
@@ -172,8 +172,8 @@ impl App {
 
     /// A source put in the box `r` (fractions of a video of shape
     /// `aspect`): the screen and boxed sources placed so; a webcam too, as
-    /// much more stretched as the box is another shape, and kept in the
-    /// video.
+    /// much more stretched as the box is another shape. Some of it stays on
+    /// the video (see `webcam_ui::SEEN`).
     pub(crate) fn set_layer_rect(&mut self, layer: Layer, r: Rect, aspect: f32) {
         match layer {
             Layer::Screen => self.place_or_frame(r, aspect),
@@ -182,7 +182,7 @@ impl App {
                 if let Some(cam) = self.settings.webcam_mut(key) {
                     let p: capture::webcam::Placement = cam.placement.into();
                     let stretch = p.stretch * (r.width() / r.height().max(1e-6)) / (p.w / p.h.max(1e-6));
-                    let p = crate::webcam_ui::contain(capture::webcam::Placement { x: r.min.x, y: r.min.y, w: r.width(), h: r.height(), stretch, ..p });
+                    let p = crate::webcam_ui::on_video(capture::webcam::Placement { x: r.min.x, y: r.min.y, w: r.width(), h: r.height(), stretch, ..p });
                     cam.placement = crate::settings::PlacementCfg::laid_out(p, aspect);
                 }
             }
