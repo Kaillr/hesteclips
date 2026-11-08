@@ -1,17 +1,18 @@
-//! The Sources page: what goes into your clips. The picture: a live preview
-//! of the video, its sources placed on it (`canvas_ui`), and under it a card
-//! for each (the screen or your games and apps, each webcam, each other
-//! display), the one in front first, opened for its settings and dragged to
-//! put it in front or behind.
-//! The sound: your mic, everything the computer plays, or single apps, each
-//! with a live meter and a volume fader, plus the clip's mix meter.
+//! The Sources page: what goes into your clips, laid out as an editor. The
+//! preview of the video as big as there's room for, its sources placed on it
+//! (`canvas_ui`: click one to select it, drag it, Alt-crop it). Under it two
+//! lists: the video's sources, the one in front first (each with an eye to
+//! hide it, a grip to drag it in front or behind), and the sound's (the
+//! clip's mix, then each source with its level, volume and mute). Beside
+//! them, the settings of what's selected (`inspector_ui`), laid out the same
+//! way for every source. Each list's Add puts another source in.
 //!
 //! Deliberately says nothing about "tracks": a source is either part of what the
 //! clip sounds like ("In the clip"), kept separately for editing, or both.
 
 use std::time::{Duration, Instant};
 
-use capture::mixer::{Channel, SourceStatus};
+use capture::mixer::SourceStatus;
 use egui::{Color32, Sense};
 
 use crate::App;
@@ -23,7 +24,16 @@ const FADER_MIN_DB: f32 = -60.0;
 const FADER_MAX_DB: f32 = 12.0;
 /// How long the "limiting" note stays after the limiter last worked.
 const LIMIT_HOLD: Duration = Duration::from_secs(3);
-/// Picture and sound side by side from this page width.
+/// The selected source's settings beside the preview from this page width;
+/// narrower, under it.
+const WIDE: f32 = 980.0;
+/// Between the page's columns.
+const COLUMN_GAP: f32 = 20.0;
+/// A row in the video's or the sound's list.
+const ROW_H: f32 = 36.0;
+/// A sound source's name, in its row, before its fader.
+const NAME_W: f32 = 120.0;
+/// Two columns from this width on the camera's and the crop's pages.
 pub(crate) const TWO_COLUMNS: f32 = 860.0;
 
 /// Meters for one source: what it delivers (before volume) and what goes into
@@ -58,9 +68,6 @@ pub(crate) struct SourcesView {
     preview_rate: (u32, Option<Instant>, u32),
     /// When the open apps were last checked, for the games-and-apps statuses.
     apps_checked: Option<Instant>,
-    renaming: Option<String>,
-    /// The clip mix's note last shown (too loud, limiting), kept while it fades out.
-    last_note: Option<(egui::Color32, &'static str)>,
     /// The last preview frame and what it was of (picture, size, rate,
     /// webcam): shown again at once when the page opens on the same, while
     /// the preview's capture starts (that takes a moment).
@@ -69,37 +76,25 @@ pub(crate) struct SourcesView {
     /// held there.
     pub(crate) crop_open: bool,
     crop_drag: Option<(crate::webcam_ui::Handle, egui::Rect, egui::Pos2)>,
-    /// The picture's sources whose cards are open, showing their settings.
-    pub(crate) open_cards: Vec<crate::canvas_ui::Layer>,
-    /// The sources whose Placement numbers are open, under that row of
-    /// their cards; and one to bring into view (opened from its menu).
-    pub(crate) placement_open: Vec<crate::canvas_ui::Layer>,
-    pub(crate) placement_shown: Option<crate::canvas_ui::Layer>,
-    /// A card dragged by its handle to put it in front or behind: which,
-    /// how far below its top it was taken hold of, and how the sources were
-    /// before (to undo it).
-    reorder: Option<(crate::canvas_ui::Layer, f32, crate::canvas_ui::Arrangement)>,
+    /// A row of the video's list dragged by its grip to put it in front or
+    /// behind, and how the sources were before (to undo it).
+    row_drag: Option<(crate::canvas_ui::Layer, crate::canvas_ui::Arrangement)>,
     /// Displays for the Add menu, refreshed when it opens.
     pub(crate) add_displays: Vec<capture::Device>,
-    /// The cards' order as last shown, and when it last changed: they slide
-    /// to their new places for a moment after.
-    card_order: (Vec<crate::canvas_ui::Layer>, Option<Instant>),
 }
 
-impl SourcesView {
-    /// Dev aid: the cards named open (`screen`, `webcam`: the first one's),
-    /// their Placement numbers (`placement`), or the crop's page (`crop`).
-    pub(crate) fn open_dev(&mut self, names: &str, first_webcam: Option<u64>) {
-        use crate::canvas_ui::Layer;
-        let webcam = first_webcam.map(Layer::Webcam);
-        for name in names.split(',').map(str::trim) {
-            match name {
-                "screen" => self.open_cards.push(Layer::Screen),
-                "webcam" => self.open_cards.extend(webcam),
-                "placement" => self.placement_open.extend(std::iter::once(Layer::Screen).chain(webcam)),
-                "crop" => self.crop_open = true,
-                _ => {}
-            }
+/// Dev aid: `HASTECLIP_OPEN_SOURCES` names what's selected (`screen`,
+/// `webcam`: the first one, `mix`) or the crop's page (`crop`).
+pub(crate) fn open_dev(app: &mut App, names: &str) {
+    use crate::canvas_ui::{Layer, Selected};
+    let webcam = app.settings.first_webcam().map(|w| w.key);
+    for name in names.split(',').map(str::trim) {
+        match name {
+            "screen" => app.canvas.selected = Some(Selected::Layer(Layer::Screen)),
+            "webcam" => app.canvas.selected = webcam.map(|k| Selected::Layer(Layer::Webcam(k))),
+            "mix" => app.canvas.selected = Some(Selected::Mix),
+            "crop" => app.sources_view.crop_open = true,
+            _ => {}
         }
     }
 }
@@ -108,20 +103,39 @@ impl SourcesView {
 /// the webcam, and whether it's all of the screen, uncropped (to crop on).
 pub(crate) type PreviewSetup = (capture::VideoSource, capture::VideoSize, u32, Option<capture::webcam::Webcam>, bool);
 
+/// A sound source's symbol.
+fn sound_icon(s: &AudioSourceCfg) -> &'static str {
+    use egui_phosphor::regular as icon;
+    match &s.kind {
+        SourceKind::Microphone { .. } => icon::MICROPHONE,
+        SourceKind::Desktop { .. } => icon::SPEAKER_HIFI,
+        SourceKind::App { app_name, .. } if app_name.to_lowercase().contains("discord") => icon::DISCORD_LOGO,
+        SourceKind::App { .. } => icon::APP_WINDOW,
+    }
+}
+
+/// Mute: lit while it's muted.
+fn mute_button(ui: &mut egui::Ui, muted: &mut bool) {
+    use crate::theme::{self, W};
+    let pal = theme::pal(ui);
+    let (r, resp) = ui.allocate_exact_size(egui::vec2(26.0, 24.0), Sense::click());
+    let hv = theme::toggle(ui.ctx(), resp.id.with("hv"), resp.hovered(), theme::FAST);
+    let on = theme::toggle(ui.ctx(), resp.id.with("on"), *muted, theme::FAST);
+    ui.painter().rect_filled(r, 4, theme::mix(theme::mix(pal.control, pal.control_h, hv), pal.warn, on));
+    ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, "M", theme::font(11.0, W::Bold), theme::mix(pal.text2, Color32::from_rgb(20, 21, 24), on));
+    if resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(if *muted { "Unmute" } else { "Mute: keep the source but record silence" }).clicked() {
+        *muted = !*muted;
+    }
+}
 
 impl App {
-    /// Sources, with the screen's card open (its own page, not a crop's):
-    /// where it's put in the video.
+    /// Sources, with the screen selected (its settings beside the preview).
     pub(crate) fn show_screen_card(&mut self) {
-        use crate::canvas_ui::Layer;
         self.page = crate::Page::Sources;
         self.sources_view.crop_open = false;
         self.webcam_view.crop = None;
-        if !self.sources_view.open_cards.contains(&Layer::Screen) {
-            self.sources_view.open_cards.push(Layer::Screen);
-        }
+        self.select_layer(crate::canvas_ui::Layer::Screen);
     }
-
     pub(crate) fn sources_page(&mut self, ui: &mut egui::Ui) {
         let now = Instant::now();
         // Opening the page: start the meters from silence. Their last state is
@@ -147,7 +161,8 @@ impl App {
         let every = if capture::preview::AVAILABLE { Duration::from_secs_f64(0.5 / self.settings.fps.max(1) as f64) } else { Duration::from_millis(16) };
         crate::ui_kit::repaint_after(ui.ctx(), every);
 
-        // Adjusting the camera, or a crop: its own page, in Sources' place.
+        // Adjusting the camera, or a crop on all of a picture: a page of its
+        // own, in Sources' place.
         if self.camera_panel.is_some() {
             self.camera_page(ui);
             return;
@@ -160,59 +175,43 @@ impl App {
             self.screen_crop_page(ui);
             return;
         }
-        // Where the sources are, undone and done again from the keyboard (not
-        // while typing, or with a menu open).
-        if !ui.ctx().egui_wants_keyboard_input() && !crate::ui_kit::overlay_open(ui.ctx()) {
-            let (redo, undo) = ui.input_mut(|i| (i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::Z), i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z)));
-            if undo {
-                self.undo_arrangement();
-            }
-            if redo {
-                self.redo_arrangement();
-            }
-        }
+        let aspect = self.frame_aspect().unwrap_or(16.0 / 9.0);
+        // The keys: undo, redo, and what's done to the source selected.
+        self.source_keys(ui.ctx(), aspect);
         self.page_head(ui, "Sources", |_, _| {});
-        // The preview stays in view: what's under it scrolls (each column on
-        // its own), so the cards' settings show on it as they change.
         crate::ui_kit::arrive(ui, |ui| {
-            // The headings' tops level with the other pages' first heading
-            // (these are bigger, in a taller row).
             ui.add_space(4.0);
             let (w, h) = (ui.available_width(), ui.available_height());
-            // Picture on the left, sound on the right, when there's room;
-            // one above the other when there isn't.
-            if w >= TWO_COLUMNS && capture::preview::AVAILABLE {
-                let col = (w - 28.0) / 2.0;
+            let mut frame = None;
+            // The preview as big as there's room for, the lists under it, and
+            // what's selected beside them; on a narrow page, one above the other.
+            if w >= WIDE {
+                let left = w - crate::inspector_ui::INSPECTOR_W - COLUMN_GAP;
                 ui.horizontal_top(|ui| {
-                    ui.spacing_mut().item_spacing.x = 28.0;
-                    ui.allocate_ui_with_layout(egui::vec2(col, h), egui::Layout::top_down(egui::Align::Min), |ui| {
-                        ui.set_width(col);
-                        let frame = self.picture_top(ui);
-                        crate::ui_kit::scroll(ui, "sources_cards", |ui| {
-                            self.layer_cards(ui, frame.as_deref());
+                    ui.spacing_mut().item_spacing.x = COLUMN_GAP;
+                    ui.allocate_ui_with_layout(egui::vec2(left, h), egui::Layout::top_down(egui::Align::Min), |ui| {
+                        ui.set_width(left);
+                        frame = self.picture_column(ui, h * 0.62);
+                        crate::ui_kit::scroll(ui, "sources_lists", |ui| {
+                            self.lists(ui, frame.as_deref(), aspect, now, dt);
                             ui.add_space(28.0);
                         });
                     });
-                    ui.allocate_ui_with_layout(egui::vec2(col, h), egui::Layout::top_down(egui::Align::Min), |ui| {
-                        ui.set_width(col);
-                        self.sound_head(ui);
-                        crate::ui_kit::scroll(ui, "sources_sound", |ui| {
-                            self.sound_column(ui, now, dt);
-                            ui.add_space(28.0);
-                        });
+                    ui.allocate_ui_with_layout(egui::vec2(crate::inspector_ui::INSPECTOR_W, h), egui::Layout::top_down(egui::Align::Min), |ui| {
+                        ui.set_width(crate::inspector_ui::INSPECTOR_W);
+                        crate::ui_kit::scroll(ui, "sources_inspector", |ui| self.inspector(ui, frame.as_deref(), aspect));
                     });
                 });
             } else {
                 ui.vertical(|ui| {
                     ui.set_width(w);
-                    let frame = capture::preview::AVAILABLE.then(|| self.picture_top(ui)).flatten();
+                    frame = self.picture_column(ui, h * 0.45);
                     crate::ui_kit::scroll(ui, "sources_page", |ui| {
-                        if capture::preview::AVAILABLE {
-                            self.layer_cards(ui, frame.as_deref());
-                            ui.add_space(24.0);
-                        }
-                        self.sound_head(ui);
-                        self.sound_column(ui, now, dt);
+                        self.video_list(ui, frame.as_deref(), aspect);
+                        crate::ui_kit::gap(ui, crate::ui_kit::STACK_GAP);
+                        self.inspector(ui, frame.as_deref(), aspect);
+                        crate::ui_kit::gap(ui, crate::ui_kit::STACK_GAP);
+                        self.sound_list(ui, now, dt);
                         ui.add_space(28.0);
                     });
                 });
@@ -221,9 +220,33 @@ impl App {
         self.live_audio.set_limiter(self.settings.limiter);
     }
 
-    /// What you see: the preview of the video, under its heading (its
-    /// sources' cards go under it, see `layer_cards`). The frame shown.
-    fn picture_top(&mut self, ui: &mut egui::Ui) -> Option<std::sync::Arc<capture::preview::PreviewFrame>> {
+    /// The video's sources and the sound's, side by side under the preview
+    /// when there's room for both, else one above the other.
+    fn lists(&mut self, ui: &mut egui::Ui, frame: Option<&capture::preview::PreviewFrame>, aspect: f32, now: Instant, dt: f32) {
+        let w = ui.available_width();
+        if w >= 640.0 {
+            let col = (w - COLUMN_GAP) / 2.0;
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = COLUMN_GAP;
+                ui.allocate_ui_with_layout(egui::vec2(col, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                    ui.set_width(col);
+                    self.video_list(ui, frame, aspect);
+                });
+                ui.allocate_ui_with_layout(egui::vec2(col, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                    ui.set_width(col);
+                    self.sound_list(ui, now, dt);
+                });
+            });
+        } else {
+            self.video_list(ui, frame, aspect);
+            crate::ui_kit::gap(ui, crate::ui_kit::STACK_GAP);
+            self.sound_list(ui, now, dt);
+        }
+    }
+
+    /// Over the preview: undo, redo and the video's size; then the preview
+    /// itself, at most `max_h` tall. The frame shown.
+    fn picture_column(&mut self, ui: &mut egui::Ui, max_h: f32) -> Option<std::sync::Arc<capture::preview::PreviewFrame>> {
         capture::preview::request();
         // The capture's newest frame; while it's starting, the last one of the
         // same picture (the page looks as it did straight away).
@@ -248,76 +271,296 @@ impl App {
         // it will be (the button stays, and its choices stay open).
         let size = frame.as_ref().map(|f| f.recorded).or_else(|| capture::frame_size(&self.video_source(), self.settings.video_size()));
         let size_text = size.map_or_else(|| format!("{} fps", self.settings.fps), |(w, h)| format!("{w}×{h} at {} fps", self.settings.fps));
-        column_head(ui, "Picture", |ui| {
-            self.size_button(ui, &size_text);
-        });
-        self.preview_picture(ui, frame.as_deref());
-        crate::ui_kit::gap(ui, crate::ui_kit::STACK_GAP);
+        if capture::preview::AVAILABLE {
+            ui.horizontal(|ui| {
+                ui.set_min_height(crate::ui_kit::SMALL_H);
+                ui.spacing_mut().item_spacing.x = 2.0;
+                self.undo_buttons(ui);
+                ui.add_space(8.0);
+                self.size_button(ui, &size_text);
+            });
+            ui.add_space(6.0);
+            self.preview_picture(ui, frame.as_deref(), max_h);
+            crate::ui_kit::gap(ui, crate::ui_kit::STACK_GAP);
+        }
         frame
     }
 
-    /// What you hear's heading, with Refresh.
-    fn sound_head(&mut self, ui: &mut egui::Ui) {
-        use crate::ui_kit::Btn;
-        column_head(ui, "Sound", |ui| {
-            if Btn::ghost("Refresh").with_icon(egui_phosphor::regular::ARROWS_CLOCKWISE).small().tip("Look again for microphones you've plugged in").show(ui).clicked() {
-                self.refresh_audio_devices();
-                self.toast_icon(egui_phosphor::regular::ARROWS_CLOCKWISE, "Looked for microphones again");
+    /// The video's sources, the one in front first: a row each, with its
+    /// symbol, name, what it shows and an eye to hide it. A click selects it
+    /// (its settings beside the preview), its grip drags it in front or
+    /// behind, a right-click opens its menu; Add puts another in.
+    fn video_list(&mut self, ui: &mut egui::Ui, frame: Option<&capture::preview::PreviewFrame>, aspect: f32) {
+        use crate::theme::{self, W};
+        let pal = theme::pal(ui);
+        self.webcam_fit_pending(ui.ctx(), aspect);
+        let order = self.layer_order();
+        ui.horizontal(|ui| {
+            ui.set_min_height(30.0);
+            ui.spacing_mut().item_spacing.x = 8.0;
+            ui.label(theme::text("Video", 15.0, W::Semibold).color(pal.text));
+            if order.len() > 1 {
+                ui.label(theme::text("the top one's in front", 12.5, W::Regular).color(pal.text3));
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| self.video_add_menu(ui, aspect));
+        });
+        ui.add_space(4.0);
+        self.canvas.card_hover = None;
+        let mut rows = Vec::new();
+        egui::Frame::new().fill(pal.raise).corner_radius(8).inner_margin(egui::Margin::same(4)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 2.0;
+            for l in &order {
+                let r = self.video_row(ui, *l, frame, aspect);
+                rows.push((*l, r));
             }
         });
+        self.reorder_rows(ui, &rows);
     }
 
-    /// What you hear (under `sound_head`): the clip's mix, then each
-    /// source, then adding one.
-    fn sound_column(&mut self, ui: &mut egui::Ui, now: Instant, dt: f32) {
-        let pal = crate::theme::pal(ui);
-        // The mix first: it's what people hear, and where it gets too loud.
-        self.master_strip(ui, now, dt);
-        crate::ui_kit::gap(ui, crate::ui_kit::STACK_GAP);
+    /// One video source's row (see `video_list`): where it was drawn.
+    fn video_row(&mut self, ui: &mut egui::Ui, layer: crate::canvas_ui::Layer, frame: Option<&capture::preview::PreviewFrame>, aspect: f32) -> egui::Rect {
+        use crate::theme::{self, W};
+        use egui::{Align2, FontId, pos2, vec2};
+        use egui_phosphor::regular as icon;
+        let pal = theme::pal(ui);
+        let selected = self.selected_layer() == Some(layer);
+        let held = self.sources_view.row_drag.as_ref().is_some_and(|(l, _)| *l == layer);
+        let on = self.layer_enabled(layer);
+        let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
+        crate::demo::mark(ui.ctx(), || format!("row:{}", self.settings.layer_title(layer)), rect);
+        let hv = theme::toggle(ui.ctx(), resp.id.with("hv"), resp.hovered() || held, theme::FAST);
+        let fill = if selected { pal.sel } else { theme::fade(pal.control, hv) };
+        ui.painter().rect_filled(rect, 6, fill);
+        if resp.hovered() {
+            self.canvas.card_hover = Some(layer);
+        }
+        let painter = ui.painter().clone();
+        let cy = rect.center().y;
+        // Its grip, while the pointer's on the row: drag it up or down.
+        let grip_rect = egui::Rect::from_min_max(pos2(rect.left(), rect.top()), pos2(rect.left() + 20.0, rect.bottom()));
+        let grip = ui.interact(grip_rect, resp.id.with("grip"), Sense::drag());
+        if hv > 0.0 || grip.hovered() {
+            let ink = theme::fade(if grip.hovered() || held { pal.text } else { pal.text3 }, hv.max(f32::from(u8::from(grip.hovered()))));
+            painter.text(pos2(rect.left() + 10.0, cy), Align2::CENTER_CENTER, icon::DOTS_SIX_VERTICAL, FontId::proportional(14.0), ink);
+        }
+        let grip = grip.on_hover_text("Drag up or down: the top one's in front").on_hover_cursor(egui::CursorIcon::Grab);
+        if grip.drag_started() {
+            self.sources_view.row_drag = Some((layer, self.arrangement()));
+        }
+        // Its eye: in your clips, or hidden.
+        let eye_rect = egui::Rect::from_center_size(pos2(rect.right() - 18.0, cy), vec2(26.0, 26.0));
+        let eye = ui.interact(eye_rect, resp.id.with("eye"), Sense::click());
+        if eye.hovered() {
+            painter.rect_filled(eye_rect, 5, pal.control_h);
+        }
+        painter.text(eye_rect.center(), Align2::CENTER_CENTER, if on { icon::EYE } else { icon::EYE_SLASH }, FontId::proportional(15.0), if on { pal.text2 } else { pal.text3 });
+        let eye = eye.on_hover_text(if on { "Hide it: out of your clips, its settings kept  (H)" } else { "Show it: back in your clips  (H)" }).on_hover_cursor(egui::CursorIcon::PointingHand);
+        if eye.clicked() {
+            let was = self.arrangement();
+            self.set_layer_enabled(layer, !on);
+            self.keep_for_undo(was);
+        }
+        // Its symbol, name, and what it shows (or what's wrong with it).
+        let mut x = rect.left() + 24.0;
+        let dim = |c: Color32| if on { c } else { theme::fade(c, 0.5) };
+        painter.text(pos2(x + 8.0, cy), Align2::CENTER_CENTER, crate::inspector_ui::layer_icon(self, layer), FontId::proportional(16.0), dim(pal.text2));
+        x += 26.0;
+        let right = eye_rect.left() - 8.0;
+        let name = self.settings.layer_title(layer);
+        let g = painter.layout_job(crate::ui_kit::single_line_job(&name, theme::font(13.5, W::Medium), dim(pal.text), (right - x).max(10.0) * 0.6));
+        let name_w = g.size().x;
+        painter.galley(pos2(x, cy - g.size().y / 2.0), g, pal.text);
+        x += name_w + 8.0;
+        let (line, warn) = self.layer_line(layer, frame);
+        let (line, color) = match (warn, on) {
+            (Some(_), true) => (self.layer_problem(layer).unwrap_or(line), pal.warn),
+            (_, false) => ("Hidden".to_owned(), pal.text3),
+            _ => (line, pal.text3),
+        };
+        let g = painter.layout_job(crate::ui_kit::single_line_job(&line, theme::font(12.5, W::Regular), color, (right - x).max(10.0)));
+        painter.galley(pos2(x, cy - g.size().y / 2.0), g, color);
+        if resp.clicked() {
+            self.select_layer(layer);
+        }
+        if resp.secondary_clicked() {
+            self.select_layer(layer);
+        }
+        let was = self.arrangement();
+        crate::ui_kit::context_menu(&resp, 240.0, |ui| self.layer_menu(ui, layer, aspect));
+        if self.arrangement() != was {
+            self.keep_for_undo(was);
+        }
+        rect
+    }
 
-        let mut remove = None;
-        let mut move_up = None;
-        let n = self.settings.audio_sources.len();
-        let has_app_sources = self.settings.audio_sources.iter().any(|s| matches!(s.kind, SourceKind::App { .. }));
-        let locked = (!self.rec_state.idle()).then(|| self.stop_first());
-        for i in 0..n {
-            let channel = self.live_audio.channel(&self.settings.audio_sources[i].id);
-            let id = self.settings.audio_sources[i].id.clone();
-            let id_for_listen = id.clone();
-            let note = self.added_note(&self.settings.audio_sources[i]);
-            let meters = self.sources_view.meters.entry(id).or_default();
-            meters.input.update(channel.input.take(), now, dt);
-            meters.output.update(channel.meter.take(), now, dt);
-            let listening = self.listening.as_ref().filter(|l| l.source == id_for_listen).map(|l| l.monitor.latency_ms());
-            let action = source_card(ui, &mut self.settings.audio_sources[i], &channel, meters, &self.audio, has_app_sources, &mut self.sources_view.renaming, listening, locked.as_deref(), note, i == 0, &mut self.app_icons);
-            match action {
-                CardAction::Remove => remove = Some(i),
-                CardAction::MoveUp if i > 0 => move_up = Some(i),
-                CardAction::Listen => self.toggle_listening(i),
-                CardAction::Locked => self.toast_icon(egui_phosphor::regular::LOCK_SIMPLE, locked.as_deref().unwrap_or_default().trim_end_matches('.').to_owned()),
-                _ => {}
+    /// A source's problem in a few words, for its row (its full words are
+    /// over its settings).
+    fn layer_problem(&self, layer: crate::canvas_ui::Layer) -> Option<String> {
+        match layer {
+            crate::canvas_ui::Layer::Webcam(key) => {
+                let w = self.settings.webcam(key)?;
+                matches!(capture::webcam::status_of(&w.id), capture::webcam::Status::Unavailable(_)).then(|| "Not working".to_owned())
             }
-            // Volume applies live, even mid-recording.
-            let s = &self.settings.audio_sources[i];
-            channel.set_volume(from_db(s.volume_db), s.muted);
-            channel.set_denoise(s.noise_reduction.into());
-            channel.set_mono(s.mono);
-            crate::ui_kit::gap(ui, crate::ui_kit::STACK_GAP);
+            crate::canvas_ui::Layer::Visual(key) => self.visual_state(key).map(str::to_owned),
+            crate::canvas_ui::Layer::Screen => None,
         }
-        if let Some(i) = remove {
-            let name = self.settings.audio_sources.remove(i).name;
-            self.toast_icon(egui_phosphor::regular::TRASH, format!("Removed {name}"));
-        }
-        if let Some(i) = move_up {
-            self.settings.audio_sources.swap(i, i - 1);
-        }
+    }
 
+    /// A row dragged by its grip, live (the preview shows it): it goes to
+    /// the place of the row the pointer's over. Let go, it can be undone.
+    fn reorder_rows(&mut self, ui: &egui::Ui, rows: &[(crate::canvas_ui::Layer, egui::Rect)]) {
+        let Some(held) = self.sources_view.row_drag.as_ref().map(|(l, _)| *l) else { return };
+        let down = ui.input(|i| i.pointer.primary_down());
+        if down && let Some(p) = ui.input(|i| i.pointer.interact_pos()) {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            let to = rows.iter().position(|(_, r)| p.y < r.bottom()).unwrap_or(rows.len().saturating_sub(1));
+            let at = rows.iter().position(|(l, _)| *l == held);
+            if at.is_some_and(|at| at != to) {
+                self.move_layer(held, to);
+            }
+        }
+        if !down
+            && let Some((_, was)) = self.sources_view.row_drag.take()
+            && self.arrangement() != was
+        {
+            self.keep_for_undo(was);
+        }
+    }
+
+    /// Add, over the video's list: a webcam (each camera found), and where
+    /// every source is drawn another display, a window, an image, a colour,
+    /// words or a web page. What's added is selected.
+    fn video_add_menu(&mut self, ui: &mut egui::Ui, aspect: f32) {
+        use crate::settings::{TextStyle, Visual};
+        use crate::ui_kit::{Btn, Item};
+        use egui_phosphor::regular as icon;
+        let webcam = capture::webcam::AVAILABLE && (capture::layers::MANY || self.settings.webcams.is_empty());
+        if !webcam && !capture::layers::MANY {
+            return;
+        }
+        let b = Btn::normal("Add").with_icon(icon::PLUS).trail(icon::CARET_DOWN).small().id("add_video").tip("Put a source in your video").show(ui);
+        if b.clicked() {
+            self.refresh_cameras();
+            if capture::layers::MANY {
+                self.sources_view.add_displays = capture::list_screens();
+                self.windowed_apps = capture::list_windowed_apps();
+            }
+        }
+        let mut added: Option<crate::canvas_ui::Layer> = None;
+        let mut pick_image = false;
+        crate::ui_kit::menu_popup(&b, false, 230.0, |ui| {
+            if webcam {
+                crate::ui_kit::submenu(ui, Item::new("Webcam").icon(icon::WEBCAM), |ui| {
+                    for c in self.cameras().to_vec() {
+                        // A camera opens once: in your clips once.
+                        let shown = self.settings.webcam_of(&c.id).is_some();
+                        let item = Item::new(c.name.clone()).enabled(!shown);
+                        let item = if shown { item.tip("Already in your clips") } else { item };
+                        if item.show(ui).clicked() {
+                            added = Some(crate::canvas_ui::Layer::Webcam(self.add_webcam(c, aspect)));
+                        }
+                    }
+                    if self.cameras().is_empty() {
+                        crate::ui_kit::menu_head(ui, "No cameras found.");
+                    }
+                });
+            }
+            if !capture::layers::MANY {
+                return;
+            }
+            if capture::screens_listed() {
+                crate::ui_kit::submenu(ui, Item::new("Display").icon(icon::MONITOR), |ui| {
+                    for d in self.sources_view.add_displays.clone() {
+                        if Item::new(d.name.clone()).show(ui).clicked() {
+                            added = Some(crate::canvas_ui::Layer::Visual(self.add_visual(Visual::Display { id: d.id, name: d.name })));
+                        }
+                    }
+                    if self.sources_view.add_displays.is_empty() {
+                        crate::ui_kit::menu_head(ui, "No displays found.");
+                    }
+                });
+            }
+            if capture::layers::WINDOWS {
+                crate::ui_kit::submenu(ui, Item::new("Window").icon(icon::APP_WINDOW), |ui| {
+                    egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                        for app in self.windowed_apps.clone() {
+                            let tex = self.app_icons.get(ui.ctx(), &app.id).map(|t| t.id());
+                            if Item::new(app.name.clone()).image(tex).show(ui).clicked() {
+                                added = Some(crate::canvas_ui::Layer::Visual(self.add_visual(Visual::Window { app: app.id, name: app.name })));
+                            }
+                        }
+                    });
+                    if self.windowed_apps.is_empty() {
+                        crate::ui_kit::menu_head(ui, "No windows found.");
+                    }
+                });
+            }
+            crate::ui_kit::menu_sep(ui);
+            if Item::new("Image…").icon(icon::IMAGE).tip("A logo or a frame, its transparency kept").show(ui).clicked() {
+                pick_image = true;
+            }
+            if Item::new("Text").icon(icon::TEXT_T).tip("Your name, a title").show(ui).clicked() {
+                added = Some(crate::canvas_ui::Layer::Visual(self.add_visual(Visual::Text(TextStyle::default()))));
+            }
+            if Item::new("Colour").icon(icon::PAINT_BUCKET).tip("All of the video one colour, at the back: a background").show(ui).clicked() {
+                let key = self.add_visual(Visual::Colour { rgba: [24, 24, 28, 255] });
+                let last = self.layer_order().len().saturating_sub(1);
+                self.move_layer(crate::canvas_ui::Layer::Visual(key), last);
+                added = Some(crate::canvas_ui::Layer::Visual(key));
+            }
+            if capture::layers::BROWSER && Item::new("Web page").icon(icon::GLOBE).tip("Alerts, a chat overlay, a widget (its transparency kept)").show(ui).clicked() {
+                added = Some(crate::canvas_ui::Layer::Visual(self.add_visual(Visual::Browser { url: "https://".into(), width: 800, height: 600, reload: 0 })));
+            }
+        });
+        // Picked after the menu's closed: the file dialog waits for you.
+        if pick_image && let Some(path) = rfd::FileDialog::new().add_filter("Images", &crate::inspector_ui::IMAGE_EXTS).pick_file() {
+            added = Some(crate::canvas_ui::Layer::Visual(self.add_visual(Visual::Image { path })));
+        }
+        if let Some(l) = added {
+            self.select_layer(l);
+        }
+    }
+
+    /// The sound: the clip's mix first, then each source, a row each with
+    /// its level and volume as one control, its volume as a number, and
+    /// mute. A click selects one (its settings beside the preview); Add puts
+    /// another in.
+    fn sound_list(&mut self, ui: &mut egui::Ui, now: Instant, dt: f32) {
+        use crate::theme::{self, W};
+        let pal = theme::pal(ui);
+        ui.horizontal(|ui| {
+            ui.set_min_height(30.0);
+            ui.label(theme::text("Sound", 15.0, W::Semibold).color(pal.text));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| self.sound_add_menu(ui));
+        });
+        ui.add_space(4.0);
+        let mut menu_action = None;
+        egui::Frame::new().fill(pal.raise).corner_radius(8).inner_margin(egui::Margin::same(4)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 2.0;
+            self.mix_row(ui, now, dt);
+            for i in 0..self.settings.audio_sources.len() {
+                if let Some(a) = self.sound_row(ui, i, now, dt) {
+                    menu_action = Some((i, a));
+                }
+            }
+            if self.settings.audio_sources.is_empty() {
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(10.0);
+                    ui.label(theme::text("No sound yet: add your microphone, or what your computer plays.", 12.5, W::Regular).color(pal.text3));
+                });
+                ui.add_space(8.0);
+            }
+        });
+        if let Some((i, a)) = menu_action {
+            self.sound_action(i, a);
+        }
         self.keep_listening();
-        self.add_source_buttons(ui);
-
         let capturing = !self.rec_state.idle();
         crate::ui_kit::reveal(ui, "sources_locked", capturing, |ui| {
-            ui.add_space(12.0);
+            ui.add_space(10.0);
             let mic = if cfg!(target_os = "linux") { ", noise removal" } else { ", noise removal and which microphone" };
             let stop = format!("Stop {}", self.rec_state.words());
             let note = if capture::SOURCES_WHILE_CAPTURING {
@@ -327,10 +570,517 @@ impl App {
             };
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
-                ui.label(crate::theme::ic(egui_phosphor::regular::LOCK_SIMPLE, 12.0).color(pal.text3));
-                ui.add(egui::Label::new(crate::theme::text(note, 12.5, crate::theme::W::Regular).color(pal.text3)).wrap());
+                ui.label(theme::ic(egui_phosphor::regular::LOCK_SIMPLE, 12.0).color(pal.text3));
+                ui.add(egui::Label::new(theme::text(note, 12.0, W::Regular).color(pal.text3)).wrap());
             });
         });
+    }
+
+    /// The clip's mix, first in the sound's list: its level (both sides),
+    /// and its peak. Selected, its limiter is beside the preview.
+    fn mix_row(&mut self, ui: &mut egui::Ui, now: Instant, dt: f32) {
+        use crate::theme::{self, W};
+        use egui::{Align2, FontId, pos2, vec2};
+        let pal = theme::pal(ui);
+        let view = &mut self.sources_view;
+        view.master.update(self.live_audio.master.take(), now, dt);
+        let reduction = self.live_audio.take_reduction_db();
+        view.reduction_db = if reduction > view.reduction_db { reduction } else { (view.reduction_db - 12.0 * dt).max(reduction) };
+        if reduction > 0.5 {
+            view.limiting_at = Some(now);
+        }
+        let selected = self.canvas.selected == Some(crate::canvas_ui::Selected::Mix);
+        let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H + 4.0), Sense::click());
+        let hv = theme::toggle(ui.ctx(), resp.id.with("hv"), resp.hovered(), theme::FAST);
+        ui.painter().rect_filled(rect, 6, if selected { pal.sel } else { theme::fade(pal.control, hv) });
+        let cy = rect.center().y;
+        ui.painter().text(pos2(rect.left() + 18.0, cy), Align2::CENTER_CENTER, egui_phosphor::regular::WAVEFORM, FontId::proportional(16.0), pal.text2);
+        ui.painter().text(pos2(rect.left() + 36.0, cy), Align2::LEFT_CENTER, "Clip mix", theme::font(13.5, W::Medium), pal.text);
+        let view = &self.sources_view;
+        let readout = format!("{} dB", view.master.readout().replace('-', "−"));
+        let peak_w = 64.0;
+        ui.painter().text(pos2(rect.right() - 10.0, cy), Align2::RIGHT_CENTER, readout, theme::font(12.5, W::Medium), view.master.readout_color(ui.visuals()));
+        let meter_rect = egui::Rect::from_min_max(pos2(rect.left() + 36.0 + NAME_W, cy - 7.0), pos2(rect.right() - 10.0 - peak_w, cy + 7.0));
+        if meter_rect.width() > 20.0 {
+            let mut mui = ui.new_child(egui::UiBuilder::new().max_rect(meter_rect).layout(egui::Layout::top_down(egui::Align::Min)));
+            let style = meter::Style { bar_h: 5.0, gap: 2.0, scale: false, dimmed: false };
+            meter::stereo(&mut mui, egui::Id::new("mix_row_meter"), &view.master, &style);
+        }
+        if resp.on_hover_text("Every source in the clip's sound, mixed: what people hear").clicked() {
+            self.canvas.selected = Some(crate::canvas_ui::Selected::Mix);
+        }
+    }
+
+    /// One sound source's row (see `sound_list`): a menu's action, if one
+    /// was picked on its right-click.
+    fn sound_row(&mut self, ui: &mut egui::Ui, i: usize, now: Instant, dt: f32) -> Option<CardAction> {
+        use crate::theme::{self, W};
+        use egui::{Align2, FontId, pos2, vec2};
+        let pal = theme::pal(ui);
+        let id = self.settings.audio_sources[i].id.clone();
+        let channel = self.live_audio.channel(&id);
+        let meters = self.sources_view.meters.entry(id.clone()).or_default();
+        meters.input.update(channel.input.take(), now, dt);
+        meters.output.update(channel.meter.take(), now, dt);
+        let meters = meters.clone();
+        let selected = self.canvas.selected == Some(crate::canvas_ui::Selected::Sound(id.clone()));
+        let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H + 4.0), Sense::click());
+        let hv = theme::toggle(ui.ctx(), resp.id.with("hv"), resp.hovered(), theme::FAST);
+        ui.painter().rect_filled(rect, 6, if selected { pal.sel } else { theme::fade(pal.control, hv) });
+        let s = &self.settings.audio_sources[i];
+        let on = s.enabled;
+        let dim = |c: Color32| if on { c } else { theme::fade(c, 0.5) };
+        let cy = rect.center().y;
+        let glyph = sound_icon(s);
+        let lead = egui::Rect::from_center_size(pos2(rect.left() + 18.0, cy), vec2(17.0, 17.0));
+        let own = match &s.kind {
+            SourceKind::App { bundle_id, .. } => crate::app_icons::paint(ui, &mut self.app_icons, &bundle_id.clone(), lead),
+            _ => false,
+        };
+        let s = &self.settings.audio_sources[i];
+        if !own {
+            ui.painter().text(lead.center(), Align2::CENTER_CENTER, glyph, FontId::proportional(16.0), dim(pal.text2));
+        }
+        let name_job = crate::ui_kit::single_line_job(&s.name, theme::font(13.5, W::Medium), dim(if s.muted { pal.text2 } else { pal.text }), NAME_W - 8.0);
+        let g = ui.painter().layout_job(name_job);
+        ui.painter().galley(pos2(rect.left() + 36.0, cy - g.size().y / 2.0), g, pal.text);
+        // What's wrong with it, on its row: a mark (its words on hover).
+        let problem = status_text(channel.status()).filter(|_| on);
+        // The fader, its value and mute, in what's left of the row.
+        let controls = egui::Rect::from_min_max(pos2(rect.left() + 36.0 + NAME_W, rect.top()), pos2(rect.right() - 6.0, rect.bottom()));
+        let mut action = None;
+        if on {
+            let mut cui = ui.new_child(egui::UiBuilder::new().max_rect(controls).layout(egui::Layout::left_to_right(egui::Align::Center)));
+            cui.spacing_mut().item_spacing.x = 6.0;
+            let source = &mut self.settings.audio_sources[i];
+            let fader_w = (controls.width() - 66.0 - 26.0 - 12.0 - if problem.is_some() { 22.0 } else { 0.0 }).max(40.0);
+            if let Some((text, color)) = problem {
+                let (r, warn) = cui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
+                cui.painter().text(r.center(), Align2::CENTER_CENTER, egui_phosphor::regular::WARNING, FontId::proportional(14.0), color(pal));
+                warn.on_hover_text(text);
+            }
+            let state = if source.muted { &meters.input } else { &meters.output };
+            let fresp = fader(&mut cui, &mut source.volume_db, state, source.muted, fader_w, &source.id);
+            volume_value(&mut cui, &mut source.volume_db, fresp.secondary_clicked(), &source.id);
+            mute_button(&mut cui, &mut source.muted);
+        } else {
+            ui.painter().text(pos2(rect.right() - 12.0, cy), Align2::RIGHT_CENTER, "Off", theme::font(12.5, W::Regular), pal.text3);
+        }
+        // Volume applies live, even mid-recording.
+        let s = &self.settings.audio_sources[i];
+        channel.set_volume(from_db(s.volume_db), s.muted);
+        channel.set_denoise(s.noise_reduction.into());
+        channel.set_mono(s.mono);
+        if resp.clicked() || resp.secondary_clicked() {
+            self.canvas.selected = Some(crate::canvas_ui::Selected::Sound(id.clone()));
+        }
+        crate::ui_kit::context_menu(&resp, 220.0, |ui| {
+            if let Some(a) = self.sound_menu(ui, i) {
+                action = Some(a);
+            }
+        });
+        action
+    }
+
+    /// A sound source's menu (right-click its row, or the ⋯ over its
+    /// settings): move it, mute it, turn it off, remove it.
+    fn sound_menu(&mut self, ui: &mut egui::Ui, i: usize) -> Option<CardAction> {
+        use crate::ui_kit::Item;
+        use egui_phosphor::regular as icon;
+        let locked = (!self.rec_state.idle()).then(|| self.stop_first());
+        let fixed = locked.as_ref().filter(|_| !capture::SOURCES_WHILE_CAPTURING);
+        let has_app_sources = self.settings.audio_sources.iter().any(|s| matches!(s.kind, SourceKind::App { .. }));
+        let n = self.settings.audio_sources.len();
+        let mut action = None;
+        if Item::new("Move up").icon(icon::CARET_UP).enabled(i > 0 && locked.is_none()).show(ui).clicked() {
+            action = Some(CardAction::MoveUp);
+        }
+        if Item::new("Move down").icon(icon::CARET_DOWN).enabled(i + 1 < n && locked.is_none()).show(ui).clicked() {
+            action = Some(CardAction::MoveDown);
+        }
+        crate::ui_kit::menu_sep(ui);
+        let source = &mut self.settings.audio_sources[i];
+        if Item::new(if source.muted { "Unmute" } else { "Mute" }).icon(icon::SPEAKER_X).show(ui).clicked() {
+            source.muted = !source.muted;
+        }
+        if Item::new(if source.enabled { "Turn off" } else { "Turn on" }).icon(icon::POWER).enabled(fixed.is_none()).show(ui).clicked() {
+            source.enabled = !source.enabled;
+        }
+        if let SourceKind::Desktop { exclude_apps } = &mut source.kind {
+            crate::ui_kit::menu_sep(ui);
+            let item = Item::new("Leave out apps added below").check(*exclude_apps).enabled(has_app_sources && locked.is_none());
+            if item.tip("Apps you add as their own source won't also be heard here, so nothing plays twice").show(ui).clicked() {
+                *exclude_apps = !*exclude_apps;
+            }
+        }
+        crate::ui_kit::menu_sep(ui);
+        if Item::new("Remove").icon(icon::TRASH).danger().show(ui).clicked() {
+            action = Some(if fixed.is_some() { CardAction::Locked } else { CardAction::Remove });
+        }
+        action
+    }
+
+    /// Do what a sound source's menu asked.
+    fn sound_action(&mut self, i: usize, a: CardAction) {
+        match a {
+            CardAction::Remove => {
+                let s = self.settings.audio_sources.remove(i);
+                if self.canvas.selected == Some(crate::canvas_ui::Selected::Sound(s.id.clone())) {
+                    self.canvas.selected = None;
+                }
+                self.toast_icon(egui_phosphor::regular::TRASH, format!("Removed {}", s.name));
+            }
+            CardAction::MoveUp if i > 0 => self.settings.audio_sources.swap(i, i - 1),
+            CardAction::MoveDown if i + 1 < self.settings.audio_sources.len() => self.settings.audio_sources.swap(i, i + 1),
+            CardAction::Listen => self.toggle_listening(i),
+            CardAction::Locked => {
+                let why = self.stop_first();
+                self.toast_icon(egui_phosphor::regular::LOCK_SIMPLE, why.trim_end_matches('.').to_owned());
+            }
+            _ => {}
+        }
+    }
+
+    /// Add, over the sound's list: a microphone, one app on its own, or
+    /// everything the computer plays; and looking for microphones again.
+    fn sound_add_menu(&mut self, ui: &mut egui::Ui) {
+        use crate::ui_kit::{Btn, Item};
+        use egui_phosphor::regular as icon;
+        // Which sources are recorded is set when capture starts, but where
+        // one can be added to it as it runs (`capture::SOURCES_WHILE_CAPTURING`).
+        let idle = self.rec_state.idle();
+        let can_add = idle || capture::SOURCES_WHILE_CAPTURING;
+        let stop_first = self.stop_first();
+        let b = Btn::normal("Add").with_icon(icon::PLUS).trail(icon::CARET_DOWN).small().id("add_sound").tip(if can_add { "Put a sound in your clips" } else { stop_first.as_str() }).show(ui);
+        if b.clicked() {
+            if can_add {
+                self.sources_view.apps = capture::list_apps();
+            } else {
+                self.toast_icon(icon::LOCK_SIMPLE, stop_first.trim_end_matches('.'));
+                egui::Popup::close_id(ui.ctx(), b.id.with("menu"));
+            }
+        }
+        if !can_add {
+            return;
+        }
+        let mut added: Option<String> = None;
+        let mut refresh = false;
+        crate::ui_kit::menu_popup(&b, false, 230.0, |ui| {
+            if Item::new("Microphone").icon(icon::MICROPHONE).tip("A microphone or audio interface").show(ui).clicked() {
+                // Captured at once: the default microphone as it is now
+                // (the list is looked at again when capturing starts).
+                if !idle {
+                    self.refresh_audio_devices();
+                }
+                let n = self.settings.audio_sources.iter().filter(|s| matches!(s.kind, SourceKind::Microphone { .. })).count();
+                let name = if n == 0 { "Microphone".to_owned() } else { format!("Microphone {}", n + 1) };
+                let s = AudioSourceCfg::new(&name, SourceKind::Microphone { device: capture::audio::DEFAULT_DEVICE.into() });
+                added = Some(s.id.clone());
+                self.settings.audio_sources.push(s);
+            }
+            crate::ui_kit::submenu(ui, Item::new("App").icon(icon::APP_WINDOW), |ui| {
+                crate::ui_kit::menu_head(ui, "One app on its own: a game, Discord, music");
+                let taken: Vec<String> = self.settings.audio_sources.iter().filter_map(|s| match &s.kind {
+                    SourceKind::App { bundle_id, .. } => Some(bundle_id.clone()),
+                    _ => None,
+                }).collect();
+                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                    for app in self.sources_view.apps.clone() {
+                        let already = taken.contains(&app.id);
+                        let tex = self.app_icons.get(ui.ctx(), &app.id).map(|t| t.id());
+                        let item = Item::new(app.name.clone()).image(tex).enabled(!already);
+                        let item = if already { item.tip("Already added") } else { item };
+                        if item.show(ui).clicked() {
+                            let s = AudioSourceCfg::new(&app.name, SourceKind::App { bundle_id: app.id.clone(), app_name: app.name.clone() });
+                            added = Some(s.id.clone());
+                            self.settings.audio_sources.push(s);
+                        }
+                    }
+                });
+                if self.sources_view.apps.is_empty() {
+                    // PipeWire only knows apps by their sound.
+                    crate::ui_kit::menu_head(ui, if cfg!(target_os = "linux") { "No apps are playing sound. Start one, then look again." } else { "No apps found." });
+                }
+            });
+            let has_desktop = self.settings.audio_sources.iter().any(|s| matches!(s.kind, SourceKind::Desktop { .. }));
+            let item = Item::new("Desktop sound").icon(icon::SPEAKER_HIFI).enabled(!has_desktop);
+            let item = if has_desktop { item.tip("Already added") } else { item.tip("Everything your computer plays") };
+            if item.show(ui).clicked() {
+                let s = AudioSourceCfg::new("Desktop sound", SourceKind::Desktop { exclude_apps: true });
+                added = Some(s.id.clone());
+                self.settings.audio_sources.push(s);
+            }
+            crate::ui_kit::menu_sep(ui);
+            if Item::new("Look for microphones again").icon(icon::ARROWS_CLOCKWISE).tip("After you've plugged one in").show(ui).clicked() {
+                refresh = true;
+            }
+        });
+        if refresh {
+            self.refresh_audio_devices();
+            self.toast_icon(icon::ARROWS_CLOCKWISE, "Looked for microphones again");
+        }
+        if let Some(id) = added {
+            self.canvas.selected = Some(crate::canvas_ui::Selected::Sound(id));
+        }
+    }
+
+    /// A sound source's settings, beside the preview: its name, switch and
+    /// menu; its volume; what it takes in; where it goes; a microphone's
+    /// clean-up, and listening to it.
+    pub(crate) fn sound_inspector(&mut self, ui: &mut egui::Ui, id: &str) {
+        use crate::theme::{self, W};
+        use crate::ui_kit::{Btn, Item, Kind, Row};
+        use egui_phosphor::regular as icon;
+        let pal = theme::pal(ui);
+        let Some(i) = self.settings.audio_sources.iter().position(|s| s.id == id) else {
+            self.canvas.selected = None;
+            return;
+        };
+        let locked = (!self.rec_state.idle()).then(|| self.stop_first());
+        let fixed = locked.clone().filter(|_| !capture::SOURCES_WHILE_CAPTURING);
+        let picker_locked = locked.clone().filter(|_| !matches!(self.settings.audio_sources[i].kind, SourceKind::Microphone { .. }));
+        let note = self.added_note(&self.settings.audio_sources[i]);
+        let has_app_sources = self.settings.audio_sources.iter().any(|s| matches!(s.kind, SourceKind::App { .. }));
+        let channel = self.live_audio.channel(id);
+        let listening = self.listening.as_ref().filter(|l| l.source == id).map(|l| l.monitor.latency_ms());
+        let meters = self.sources_view.meters.get(id).cloned().unwrap_or_default();
+        let mut action: Option<CardAction> = None;
+        // Its head: symbol, name (click to rename), switch, menu.
+        let rename_id = egui::Id::new(("rename_sound", id));
+        let draft_id = rename_id.with("draft");
+        let renaming = ui.data(|d| d.get_temp::<String>(draft_id));
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.set_min_height(34.0);
+            ui.spacing_mut().item_spacing.x = 8.0;
+            ui.label(theme::ic(sound_icon(&self.settings.audio_sources[i]), 18.0).color(pal.text2));
+            let name_w = (ui.available_width() - 90.0).max(60.0);
+            ui.allocate_ui_with_layout(egui::vec2(name_w, 30.0), egui::Layout::left_to_right(egui::Align::Center), |ui| match renaming {
+                Some(mut draft) => {
+                    if name_field(ui, rename_id, &mut draft, theme::font(16.0, W::Semibold), name_w - 8.0) {
+                        self.settings.audio_sources[i].name = draft;
+                        ui.data_mut(|d| d.remove::<String>(draft_id));
+                    } else {
+                        ui.data_mut(|d| d.insert_temp(draft_id, draft));
+                    }
+                }
+                None => {
+                    forget_name_field(ui, rename_id);
+                    let name = self.settings.audio_sources[i].name.clone();
+                    let r = ui.add(egui::Label::new(theme::text(&name, 16.0, W::Semibold).color(pal.text)).truncate().sense(Sense::click()));
+                    if r.on_hover_text("Click to rename it").on_hover_cursor(egui::CursorIcon::Text).clicked() {
+                        ui.data_mut(|d| d.insert_temp(draft_id, name.clone()));
+                    }
+                }
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                let more = Btn::icon(Kind::Ghost, icon::DOTS_THREE).small().tip("Move, mute, turn off, remove").show(ui);
+                crate::ui_kit::menu_popup(&more, false, 220.0, |ui| {
+                    if let Some(a) = self.sound_menu(ui, i) {
+                        action = Some(a);
+                    }
+                });
+                let source = &mut self.settings.audio_sources[i];
+                let mut on = source.enabled;
+                let sw = crate::ui_kit::switch(ui, &mut on).on_hover_text(if on { "On: off keeps its settings, and records nothing from it" } else { "Off: on records it again" });
+                if sw.changed() {
+                    if fixed.is_some() {
+                        action = Some(CardAction::Locked);
+                    } else {
+                        source.enabled = on;
+                    }
+                }
+            });
+        });
+        let source = &self.settings.audio_sources[i];
+        let what = match &source.kind {
+            SourceKind::Desktop { exclude_apps: true } if has_app_sources => "Everything except apps added as their own source".to_owned(),
+            SourceKind::Desktop { .. } => "Everything your computer plays".to_owned(),
+            SourceKind::App { app_name, .. } => format!("Only {app_name}"),
+            SourceKind::Microphone { .. } => "Microphone".to_owned(),
+        };
+        ui.horizontal(|ui| {
+            ui.add_space(26.0);
+            ui.label(theme::text(what, 12.5, W::Regular).color(pal.text3));
+        });
+        if let Some((t, c)) = status_text(channel.status()).filter(|_| source.enabled) {
+            ui.horizontal(|ui| {
+                ui.add_space(26.0);
+                ui.add(egui::Label::new(theme::text(t, 12.5, W::Regular).color(c(pal))).wrap());
+            });
+        }
+        if let Some((n, leaves_out)) = &note {
+            ui.horizontal(|ui| {
+                ui.add_space(26.0);
+                ui.add(egui::Label::new(theme::text(n, 12.5, W::Regular).color(if *leaves_out { pal.warn } else { pal.text3 })).wrap());
+            });
+        }
+        // Its volume: the level and volume as one control, its value, mute.
+        crate::ui_kit::section_head(ui, "Volume", true, |_| {});
+        crate::ui_kit::list(ui, ("sound_volume", id), |l| {
+            egui::Frame::new().inner_margin(egui::Margin::symmetric(14, 12)).show(l.ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    let source = &mut self.settings.audio_sources[i];
+                    let w = (ui.available_width() - 66.0 - 26.0 - 16.0).max(60.0);
+                    let state = if source.muted { &meters.input } else { &meters.output };
+                    let fresp = fader(ui, &mut source.volume_db, state, source.muted, w, &format!("insp_{}", source.id));
+                    volume_value(ui, &mut source.volume_db, fresp.secondary_clicked(), &format!("insp_{}", source.id));
+                    mute_button(ui, &mut source.muted);
+                });
+            });
+        });
+        // What it takes in, and where it goes.
+        crate::ui_kit::section_head(ui, "Source", false, |_| {});
+        crate::ui_kit::list(ui, ("sound_source", id), |l| {
+            let audio = self.audio.clone();
+            match self.settings.audio_sources[i].kind.clone() {
+                SourceKind::Microphone { .. } => {
+                    let (a, _) = l.row(Row::new("Microphone"), |ui| mic_picker(ui, &mut self.settings.audio_sources[i], &audio, picker_locked.is_some()));
+                    if let Some(a) = a {
+                        action = Some(a);
+                    }
+                }
+                SourceKind::Desktop { exclude_apps } => {
+                    let note = if has_app_sources { "Apps added as their own source aren't heard here too" } else { "Once you add an app on its own" };
+                    let row = Row::new("Leave out apps added on their own").note(note).locked(locked.clone().filter(|_| has_app_sources));
+                    let (_, clicked_locked) = l.row(row, |ui| {
+                        let mut on = exclude_apps;
+                        if crate::ui_kit::switch(ui, &mut on).changed()
+                            && let SourceKind::Desktop { exclude_apps } = &mut self.settings.audio_sources[i].kind
+                        {
+                            *exclude_apps = on;
+                        }
+                    });
+                    if clicked_locked {
+                        action = Some(CardAction::Locked);
+                    }
+                }
+                SourceKind::App { app_name, bundle_id } => {
+                    l.row(Row::new("App").note(bundle_id), |ui| {
+                        ui.label(theme::text(app_name, 13.0, W::Regular).color(pal.text2));
+                    });
+                }
+            }
+            let route = Route::of(&self.settings.audio_sources[i]);
+            let row = Row::new("Goes into").tip("Where it goes", "Clip sound: part of what everyone hears when you play or share a clip. Own track: also kept on its own, so you can change its volume later in the editor.").locked(locked.clone());
+            let (_, clicked_locked) = l.row(row, |ui| {
+                let r = crate::ui_kit::select(ui, route.label(), 190.0);
+                crate::ui_kit::menu_popup(&r, false, 260.0, |ui| {
+                    for r in [Route::Both, Route::Mix, Route::Track] {
+                        if Item::new(r.label()).check(route == r).tip(r.tip()).show(ui).clicked() {
+                            let s = &mut self.settings.audio_sources[i];
+                            (s.in_mix, s.own_track) = match r {
+                                Route::Both => (true, true),
+                                Route::Mix => (true, false),
+                                Route::Track => (false, true),
+                            };
+                        }
+                    }
+                });
+            });
+            if clicked_locked {
+                action = Some(CardAction::Locked);
+            }
+        });
+        // A microphone's clean-up, and hearing it.
+        if matches!(self.settings.audio_sources[i].kind, SourceKind::Microphone { .. }) {
+            use crate::settings::NoiseReduction;
+            use crate::ui_kit::Seg;
+            crate::ui_kit::section_head(ui, "Microphone", false, |_| {});
+            crate::ui_kit::list(ui, ("sound_mic", id), |l| {
+                const MODES: [NoiseReduction; 3] = [NoiseReduction::Off, NoiseReduction::Light, NoiseReduction::Strong];
+                let opts = [
+                    Seg::from("Off"),
+                    Seg { icon: None, label: "Light", tip: Some("Takes out steady noise: fans, hum, hiss. Your keyboard stays") },
+                    Seg { icon: None, label: "Strong", tip: Some("Takes out everything but your voice") },
+                ];
+                let row = Row::new("Noise reduction").tip("Noise reduction", "Light takes out steady noise behind your voice, like a fan, hum or hiss, and keeps sounds that come and go, like your keyboard. Strong takes out everything but your voice. Changes apply straight away.");
+                let chosen = MODES.iter().position(|m| *m == self.settings.audio_sources[i].noise_reduction).unwrap_or(0);
+                let (picked, _) = l.row(row, |ui| crate::ui_kit::segmented_opts(ui, ("noise_reduction", id), &opts, chosen, None, true));
+                if let Some(k) = picked {
+                    self.settings.audio_sources[i].noise_reduction = MODES[k];
+                }
+                let row = Row::new("Mono").tip("Mono", "For a mic heard on one side only, like one in an audio interface's first input (its left): you're heard in the middle, on both sides, as loud as before.");
+                l.row(row, |ui| {
+                    crate::ui_kit::switch(ui, &mut self.settings.audio_sources[i].mono);
+                });
+                let note = match listening {
+                    Some(latency) => format!("Listening{}. Use headphones, or it feeds back.", latency.map_or(String::new(), |ms| format!(", {ms:.0} ms behind"))),
+                    None => "Hear it through your headphones, to check it works and how it sounds".to_owned(),
+                };
+                let row = Row::new("Listen").note(note).warn(listening.is_some());
+                l.row(row, |ui| {
+                    let on = listening.is_some();
+                    let btn = if on { Btn::new(Kind::On, "Listening") } else { Btn::normal("Listen") };
+                    if btn.with_icon(icon::HEADPHONES).small().id(("listen", id)).show(ui).clicked() {
+                        action = Some(CardAction::Listen);
+                    }
+                });
+            });
+        }
+        ui.add_space(28.0);
+        if let Some(a) = action {
+            self.sound_action(i, a);
+        }
+    }
+
+    /// The clip's mix, beside the preview: its level with its scale and
+    /// peak, and the limiter, with how much it's turning the mix down.
+    pub(crate) fn mix_inspector(&mut self, ui: &mut egui::Ui) {
+        use crate::theme::{self, W};
+        use crate::ui_kit::Row;
+        let pal = theme::pal(ui);
+        let now = Instant::now();
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.set_min_height(34.0);
+            ui.spacing_mut().item_spacing.x = 8.0;
+            ui.label(theme::ic(egui_phosphor::regular::WAVEFORM, 18.0).color(pal.text2));
+            ui.label(theme::text("Clip mix", 16.0, W::Semibold).color(pal.text));
+        });
+        ui.horizontal(|ui| {
+            ui.add_space(26.0);
+            ui.add(egui::Label::new(theme::text("Every source in the clip's sound, mixed: what people hear when you share a clip.", 12.5, W::Regular).color(pal.text3)).wrap());
+        });
+        let view = &self.sources_view;
+        let limiting = self.settings.limiter && view.limiting_at.is_some_and(|t| now - t < LIMIT_HOLD);
+        crate::ui_kit::section_head(ui, "Level", true, |ui| {
+            let readout = view.master.readout().replace('-', "−");
+            ui.label(theme::text(format!("peak {readout} dB"), 12.5, W::Regular).color(view.master.readout_color(ui.visuals())));
+        });
+        crate::ui_kit::list(ui, "mix_level", |l| {
+            egui::Frame::new().inner_margin(egui::Margin::symmetric(14, 12)).show(l.ui, |ui| {
+                let style = meter::Style { bar_h: 7.0, gap: 3.0, scale: true, dimmed: false };
+                meter::stereo(ui, egui::Id::new("master_meter"), &view.master, &style);
+                ui.add_space(6.0);
+                ui.add(egui::Label::new(theme::text("Aim for speech peaking around −12 dB, out of the red.", 12.0, W::Regular).color(pal.text3)).wrap());
+            });
+        });
+        crate::ui_kit::section_head(ui, "Limiter", false, |_| {});
+        let reduction = view.reduction_db;
+        let clipped = view.master.clipped();
+        crate::ui_kit::list(ui, "mix_limiter", |l| {
+            let note = if clipped {
+                "Too loud: it distorted. Turn some sources down."
+            } else if limiting {
+                "Working: turn sources down a little for the cleanest sound."
+            } else {
+                "When sources add up too loud, the mix is turned down for a moment instead of distorting. Ceiling −1 dB."
+            };
+            l.row(Row::new("Limiter").note(note).warn(clipped || limiting), |ui| {
+                crate::ui_kit::switch(ui, &mut self.settings.limiter);
+            });
+            if self.settings.limiter {
+                l.row(Row::new("Turning down"), |ui| {
+                    let gr = if reduction >= 0.1 { format!("−{reduction:.1} dB") } else { "0.0 dB".to_owned() };
+                    ui.label(theme::text(gr, 12.5, W::Medium).color(pal.text2));
+                    meter::reduction(ui, reduction, 80.0).on_hover_text("How much the limiter is turning the mix down right now (0–12 dB)");
+                });
+            }
+        });
+        ui.add_space(28.0);
     }
 
     /// "Listen" on source `i`: hear it live, or stop.
@@ -377,76 +1127,6 @@ impl App {
         }
     }
 
-    fn add_source_buttons(&mut self, ui: &mut egui::Ui) {
-        use crate::ui_kit::{Btn, Item};
-        use egui_phosphor::regular as icon;
-        // Which sources are recorded is set when capture starts, but where
-        // one can be added to it as it runs (`capture::SOURCES_WHILE_CAPTURING`).
-        let idle = self.rec_state.idle();
-        let can_add = idle || capture::SOURCES_WHILE_CAPTURING;
-        let stop_first = self.stop_first();
-        let stop_first = stop_first.as_str();
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
-            let mic = Btn::normal("Microphone").with_icon(icon::PLUS).small().tip(if can_add { "Add a microphone or audio interface" } else { stop_first }).show(ui);
-            if mic.clicked() {
-                if can_add {
-                    // Captured at once: the default microphone as it is now
-                    // (the list is looked at again when capturing starts).
-                    if !idle {
-                        self.refresh_audio_devices();
-                    }
-                    let n = self.settings.audio_sources.iter().filter(|s| matches!(s.kind, SourceKind::Microphone { .. })).count();
-                    let name = if n == 0 { "Microphone".to_owned() } else { format!("Microphone {}", n + 1) };
-                    self.settings.audio_sources.push(AudioSourceCfg::new(&name, SourceKind::Microphone { device: capture::audio::DEFAULT_DEVICE.into() }));
-                } else {
-                    self.toast_icon(icon::LOCK_SIMPLE, stop_first.trim_end_matches('.'));
-                }
-            }
-            let app = Btn::normal("App").with_icon(icon::PLUS).trail(icon::CARET_DOWN).small().id("add_app_source").tip(if can_add { "Record one app on its own: a game, Discord, music" } else { stop_first }).show(ui);
-            if app.clicked() {
-                if can_add {
-                    self.sources_view.apps = capture::list_apps();
-                } else {
-                    self.toast_icon(icon::LOCK_SIMPLE, stop_first.trim_end_matches('.'));
-                    egui::Popup::close_id(ui.ctx(), app.id.with("menu"));
-                }
-            }
-            if can_add {
-                crate::ui_kit::menu_popup(&app, true, 260.0, |ui| {
-                    crate::ui_kit::menu_head(ui, "Record one app on its own");
-                    let taken: Vec<String> = self.settings.audio_sources.iter().filter_map(|s| match &s.kind {
-                        SourceKind::App { bundle_id, .. } => Some(bundle_id.clone()),
-                        _ => None,
-                    }).collect();
-                    egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-                        for app in self.sources_view.apps.clone() {
-                            let added = taken.contains(&app.id);
-                            let tex = self.app_icons.get(ui.ctx(), &app.id).map(|t| t.id());
-                            let item = Item::new(app.name.clone()).image(tex).enabled(!added);
-                            let item = if added { item.tip("Already added") } else { item };
-                            if item.show(ui).clicked() {
-                                self.settings.audio_sources.push(AudioSourceCfg::new(&app.name, SourceKind::App { bundle_id: app.id.clone(), app_name: app.name.clone() }));
-                            }
-                        }
-                    });
-                    if self.sources_view.apps.is_empty() {
-                        // PipeWire only knows apps by their sound.
-                        crate::ui_kit::menu_head(ui, if cfg!(target_os = "linux") { "No apps are playing sound. Start one, then look again." } else { "No apps found." });
-                    }
-                });
-            }
-            let has_desktop = self.settings.audio_sources.iter().any(|s| matches!(s.kind, SourceKind::Desktop { .. }));
-            if !has_desktop && Btn::normal("Desktop sound").with_icon(icon::PLUS).small().show(ui).clicked() {
-                if can_add {
-                    self.settings.audio_sources.push(AudioSourceCfg::new("Desktop sound", SourceKind::Desktop { exclude_apps: true }));
-                } else {
-                    self.toast_icon(icon::LOCK_SIMPLE, stop_first.trim_end_matches('.'));
-                }
-            }
-        });
-    }
-
     /// Why something that's set when capture starts is locked now.
     pub(crate) fn stop_first(&self) -> String {
         format!("Stop {} to change this.", if self.rec_state.idle() { "clipping".to_owned() } else { self.rec_state.words() })
@@ -469,450 +1149,6 @@ impl App {
             return None;
         }
         added_source_note(self.rec_state, &self.started_sources, source)
-    }
-
-    /// The video's sources, one card each, the one in front first: a card's
-    /// line says what it is, clicking it opens its settings, and dragging it
-    /// by its handle puts it in front of or behind the others. Each card is
-    /// laid out in a place of its own (its switch and menus stay its own as
-    /// cards change places) and slides to its new place when the order
-    /// changes; the one dragged follows the pointer, over the others.
-    fn layer_cards(&mut self, ui: &mut egui::Ui, frame: Option<&capture::preview::PreviewFrame>) {
-        use crate::canvas_ui::Layer;
-        use crate::theme::{self, W};
-        use egui::{pos2, vec2};
-        let pal = theme::pal(ui);
-        let aspect = frame.map_or(16.0 / 9.0, |f| f.width as f32 / f.height.max(1) as f32);
-        self.webcam_fit_pending(ui.ctx(), aspect);
-        // Over the cards: undo and redo on the left (where the sources are),
-        // which is in front on the right. Its height is kept while the
-        // buttons come and go, so the cards don't move.
-        let order = self.layer_order();
-        if order.len() > 1 || self.arrangement_history() {
-            ui.horizontal(|ui| {
-                ui.set_min_height(crate::ui_kit::SMALL_H);
-                ui.spacing_mut().item_spacing.x = 2.0;
-                self.undo_buttons(ui);
-                if order.len() > 1 {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(theme::text("The top one's in front", 12.5, W::Regular).color(pal.text3));
-                    });
-                }
-            });
-            ui.add_space(2.0);
-        }
-        if self.sources_view.card_order.0 != order {
-            let moved = !self.sources_view.card_order.0.is_empty();
-            self.sources_view.card_order = (order.clone(), moved.then(Instant::now));
-        }
-        // Slides for a moment after the order changed (dragged, or put in
-        // front from a menu); else a card's place follows the ones above it
-        // at once (one opening pushes the others down as it opens).
-        let held = self.sources_view.reorder.as_ref().map(|(l, grab, _)| (*l, *grab));
-        let sliding = held.is_some() || self.sources_view.card_order.1.is_some_and(|t| t.elapsed() < Duration::from_millis(400));
-        const GAP: f32 = 8.0;
-        let w = ui.available_width();
-        let ctx = ui.ctx().clone();
-        let height = |l: Layer| ctx.data(|d| d.get_temp::<f32>(egui::Id::new(("layer_card_h", l)))).unwrap_or(CARD_HEAD_H + 12.0);
-        let heights: Vec<f32> = order.iter().map(|l| height(*l)).collect();
-        let total = heights.iter().sum::<f32>() + GAP * order.len().saturating_sub(1) as f32;
-        let (area, _) = ui.allocate_exact_size(vec2(w, total), Sense::hover());
-        let pointer = ui.input(|i| i.pointer.latest_pos());
-        // Each card's place in the order, and where it's drawn now.
-        let mut slots = Vec::new();
-        let mut top = area.top();
-        for (layer, h) in order.iter().zip(&heights) {
-            let slot = egui::Rect::from_min_size(pos2(area.left(), top), vec2(w, *h));
-            top += h + GAP;
-            let id = egui::Id::new(("layer_card_y", *layer));
-            let y = match (held, pointer) {
-                // Held: where the pointer has it, and from there to its place once let go.
-                (Some((l, grab)), Some(p)) if l == *layer => {
-                    let y = (p.y - grab).clamp(area.top(), (area.bottom() - h).max(area.top()));
-                    theme::value(ui.ctx(), id, y - area.top(), 0.0);
-                    y
-                }
-                _ => area.top() + theme::value(ui.ctx(), id, slot.top() - area.top(), if sliding { theme::NORMAL } else { 0.0 }),
-            };
-            slots.push((*layer, slot, y));
-        }
-        // The one held last, over the others.
-        self.canvas.card_hover = None;
-        let mut drawn = slots.clone();
-        drawn.sort_by_key(|(l, ..)| held.is_some_and(|(h, _)| h == *l));
-        for (layer, _, y) in drawn {
-            let lifted = held.is_some_and(|(h, _)| h == layer);
-            let layer_id = if lifted { egui::LayerId::new(egui::Order::Foreground, egui::Id::new("layer_card_held")) } else { ui.layer_id() };
-            let at = egui::Rect::from_min_size(pos2(area.left(), y), vec2(w, 10_000.0));
-            let mut cui = ui.new_child(egui::UiBuilder::new().max_rect(at).layout(egui::Layout::top_down(egui::Align::Min)).id_salt(("layer_card", layer)).layer_id(layer_id));
-            if lifted {
-                let shadow = egui::Shadow { offset: [0, 6], blur: 18, spread: 0, color: Color32::from_black_alpha(90) };
-                let r = egui::Rect::from_min_size(at.min, vec2(w, height(layer)));
-                cui.painter().add(shadow.as_shape(r, 8));
-            }
-            self.layer_card(&mut cui, layer, order.len() > 1, frame, aspect, y);
-            let shown = egui::Rect::from_min_size(at.min, vec2(w, cui.min_rect().height()));
-            ui.data_mut(|d| d.insert_temp(egui::Id::new(("layer_card_h", layer)), shown.height()));
-            if held.map_or_else(|| ui.rect_contains_pointer(shown), |(h, _)| h == layer) {
-                self.canvas.card_hover = Some(layer);
-            }
-        }
-        self.reorder_cards(ui, &slots);
-        self.add_layer_buttons(ui, aspect);
-    }
-
-    /// Adding a webcam (one more where several are drawn, `capture::layers::MANY`;
-    /// else while there's none), and where several are, another display, a
-    /// window, an image, a colour or words.
-    fn add_layer_buttons(&mut self, ui: &mut egui::Ui, aspect: f32) {
-        use crate::canvas_ui::Layer;
-        use crate::ui_kit::{Btn, Item};
-        use egui_phosphor::regular as icon;
-        let webcam = capture::webcam::AVAILABLE && (capture::layers::MANY || self.settings.webcams.is_empty());
-        let display = capture::layers::MANY && capture::screens_listed();
-        if !webcam && !capture::layers::MANY {
-            return;
-        }
-        ui.add_space(12.0);
-        let mut added = None;
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
-            if webcam {
-                let b = Btn::normal("Webcam").with_icon(icon::PLUS).trail(icon::CARET_DOWN).small().id("add_webcam").tip("Put a camera or capture card in your clips, placed and sized on the preview").show(ui);
-                if b.clicked() {
-                    self.refresh_cameras();
-                }
-                crate::ui_kit::menu_popup(&b, true, 260.0, |ui| {
-                    crate::ui_kit::menu_head(ui, "Put a camera in your clips");
-                    for c in self.cameras().to_vec() {
-                        // A camera opens once: in your clips once.
-                        let shown = self.settings.webcam_of(&c.id).is_some();
-                        let item = Item::new(c.name.clone()).enabled(!shown);
-                        let item = if shown { item.tip("Already in your clips") } else { item };
-                        if item.show(ui).clicked() {
-                            added = Some(Layer::Webcam(self.add_webcam(c, aspect)));
-                        }
-                    }
-                    if self.cameras().is_empty() {
-                        crate::ui_kit::menu_head(ui, "No cameras found.");
-                    }
-                });
-            }
-            if display {
-                let b = Btn::normal("Display").with_icon(icon::PLUS).trail(icon::CARET_DOWN).small().id("add_display").tip("Put another display in your clips too, in a box of its own").show(ui);
-                if b.clicked() {
-                    self.sources_view.add_displays = capture::list_screens();
-                }
-                crate::ui_kit::menu_popup(&b, true, 260.0, |ui| {
-                    crate::ui_kit::menu_head(ui, "Put another display in your clips");
-                    for d in self.sources_view.add_displays.clone() {
-                        if Item::new(d.name.clone()).show(ui).clicked() {
-                            added = Some(Layer::Visual(self.add_display(d)));
-                        }
-                    }
-                    if self.sources_view.add_displays.is_empty() {
-                        crate::ui_kit::menu_head(ui, "No displays found.");
-                    }
-                });
-            }
-            if capture::layers::MANY
-                && let Some(l) = self.add_visual_buttons(ui)
-            {
-                added = Some(l);
-            }
-        });
-        if let Some(layer) = added
-            && !self.sources_view.open_cards.contains(&layer)
-        {
-            self.sources_view.open_cards.push(layer);
-        }
-    }
-
-    /// Put display `d` in the video too, in front of the rest, fitted in the
-    /// middle until it's placed. Its key.
-    fn add_display(&mut self, d: capture::Device) -> u64 {
-        self.add_visual(crate::settings::Visual::Display { id: d.id, name: d.name })
-    }
-
-    /// Dragging a card by its handle, live (the preview shows it): it goes
-    /// above a card once its top (following the pointer) is past that
-    /// card's middle, below one once its bottom is. Let go, it can be undone.
-    fn reorder_cards(&mut self, ui: &egui::Ui, slots: &[(crate::canvas_ui::Layer, egui::Rect, f32)]) {
-        let Some((held, grab)) = self.sources_view.reorder.as_ref().map(|(l, g, _)| (*l, *g)) else { return };
-        let down = ui.input(|i| i.pointer.primary_down());
-        if down
-            && let Some(p) = ui.input(|i| i.pointer.interact_pos())
-            && let Some((_, me, _)) = slots.iter().find(|(l, ..)| *l == held)
-        {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
-            let (top, bottom) = (p.y - grab, p.y - grab + me.height());
-            let above = |r: &egui::Rect| if r.center().y < me.center().y { top >= r.center().y } else { bottom > r.center().y };
-            let mut order: Vec<_> = slots.iter().map(|(l, ..)| *l).filter(|l| *l != held).collect();
-            let at = slots.iter().filter(|(l, r, _)| *l != held && above(r)).count();
-            order.insert(at.min(order.len()), held);
-            self.set_layer_order(&order);
-        }
-        if !down {
-            if let Some((_, _, was)) = self.sources_view.reorder.take()
-                && self.arrangement() != was
-            {
-                self.keep_for_undo(was);
-            }
-            // Let go: it slides from there into its place.
-            self.sources_view.card_order.1 = Some(Instant::now());
-        }
-    }
-
-    /// One source's card, its top at `top`: its handle (`movable`: with
-    /// others to go in front of or behind), what it is and its state on one
-    /// line (with its switch), its settings below when it's open.
-    fn layer_card(&mut self, ui: &mut egui::Ui, layer: crate::canvas_ui::Layer, movable: bool, frame: Option<&capture::preview::PreviewFrame>, aspect: f32, top: f32) {
-        use crate::canvas_ui::Layer;
-        use crate::theme::{self, W};
-        use egui::{Align2, FontId, pos2, vec2};
-        use egui_phosphor::regular as icon;
-        let pal = theme::pal(ui);
-        let open = self.sources_view.open_cards.contains(&layer);
-        let held = self.sources_view.reorder.as_ref().is_some_and(|(l, ..)| *l == layer);
-        // Its line: what it is, then what's wrong with it, if anything.
-        let (glyph, name, line, state, on) = match layer {
-            Layer::Screen => {
-                let apps = matches!(self.settings.capture, CaptureTarget::Apps { .. }) && capture::app_capture();
-                let line = if apps {
-                    match frame.filter(|f| !f.waiting).and_then(|f| f.app.clone()) {
-                        Some(app) => format!("Following {app}"),
-                        None => "None of them showing".to_owned(),
-                    }
-                } else {
-                    let display = self.screens.get(self.display_at()).map_or_else(|| "Main display".to_owned(), |d| d.name.clone());
-                    // Open, its rows say how it's cropped.
-                    let cropped = self.crop_whole().zip(self.settings.screen_crop.filter(|c| !c.is_none() && !open)).map(|((w, h), c)| capture::Crop::from(c).rect(w, h));
-                    match cropped {
-                        Some([_, _, w, h]) => format!("{display} · cropped to {w}×{h}"),
-                        None => display,
-                    }
-                };
-                (if apps { icon::APP_WINDOW } else { icon::MONITOR }, if apps { "Games and apps" } else { "Screen" }, line, None, self.settings.screen.enabled)
-            }
-            Layer::Webcam(key) => {
-                let (state, warn) = self.webcam_state(key);
-                let cam = self.settings.webcam(key);
-                let state = (!state.is_empty()).then_some((state, if warn { pal.warn } else { pal.text3 }));
-                (icon::WEBCAM, "Webcam", cam.map(|w| w.name.clone()).unwrap_or_default(), state, cam.is_some_and(|w| w.enabled))
-            }
-            Layer::Visual(key) => {
-                let d = self.settings.visual(key);
-                let state = self.visual_state(key).map(|s| (s, pal.warn));
-                let glyph = match d.map(|d| &d.visual) {
-                    Some(crate::settings::Visual::Window { .. }) => icon::APP_WINDOW,
-                    Some(crate::settings::Visual::Image { .. }) => icon::IMAGE,
-                    Some(crate::settings::Visual::Colour { .. }) => icon::PAINT_BUCKET,
-                    Some(crate::settings::Visual::Text { .. }) => icon::TEXT_T,
-                    Some(crate::settings::Visual::Browser { .. }) => icon::GLOBE,
-                    _ => icon::MONITOR,
-                };
-                (glyph, d.map_or("Display", |d| d.visual.kind_name()), self.visual_line(key), state, d.is_some_and(|d| d.enabled))
-            }
-        };
-        let state = state.or_else(|| (!on).then_some(("Off", pal.text3)));
-        group_rows(ui, ("layer_card", layer), |ui| {
-            ui.spacing_mut().item_spacing.y = 0.0;
-            // All of its line opens and closes it, but for its handle and switch.
-            let (head, resp) = ui.allocate_exact_size(vec2(ui.available_width(), CARD_HEAD_H), Sense::click());
-            let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
-            crate::demo::mark(ui.ctx(), || format!("card:{name}"), head);
-            let painter = ui.painter().clone();
-            let cy = head.center().y;
-            let mut x = head.left();
-            if movable {
-                let grip_rect = egui::Rect::from_min_max(pos2(x - 6.0, head.top()), pos2(x + 16.0, head.bottom()));
-                let grip = ui.interact(grip_rect, resp.id.with("grip"), Sense::drag());
-                crate::demo::mark(ui.ctx(), || format!("grip:{name}"), grip_rect);
-                let grip = if held { grip } else { grip.on_hover_text("Drag up or down: the top one's in front").on_hover_cursor(egui::CursorIcon::Grab) };
-                let ink = if held || grip.hovered() { pal.text } else { pal.text3 };
-                painter.text(pos2(x + 5.0, cy), Align2::CENTER_CENTER, icon::DOTS_SIX_VERTICAL, FontId::proportional(16.0), ink);
-                if grip.drag_started() {
-                    let grab = ui.input(|i| i.pointer.press_origin()).map_or(0.0, |p| p.y - top);
-                    self.sources_view.reorder = Some((layer, grab, self.arrangement()));
-                }
-                x += 20.0;
-            }
-            // What it is: its icon and name (dimmer while it's off), then its line.
-            let mut put = |text: &str, font: FontId, color: egui::Color32, gap: f32| {
-                let g = painter.layout_no_wrap(text.to_owned(), font, color);
-                let w = g.size().x;
-                painter.galley(pos2(x, cy - g.size().y / 2.0), g, color);
-                x += w + gap;
-            };
-            put(glyph, FontId::proportional(16.0), if on { pal.text2 } else { pal.text3 }, 8.0);
-            put(name, theme::font(13.5, W::Medium), if on { pal.text } else { pal.text2 }, 10.0);
-            // On the right: which way it opens, the webcam's switch, and its
-            // menu (the preview's right-click one; right-clicking here too).
-            let mut rui = ui.new_child(egui::UiBuilder::new().max_rect(head).layout(egui::Layout::right_to_left(egui::Align::Center)));
-            rui.spacing_mut().item_spacing.x = 10.0;
-            let (c, _) = rui.allocate_exact_size(vec2(12.0, 12.0), Sense::hover());
-            let turn = theme::toggle(ui.ctx(), resp.id.with("turn"), open, theme::NORMAL);
-            crate::ui_kit::chevron(&painter, c.center(), 3.5, turn, if resp.hovered() { pal.text } else { pal.text3 });
-            if let Layer::Webcam(key) = layer
-                && let Some(w) = self.settings.webcam_mut(key)
-            {
-                let tip = if w.enabled { "Turn the webcam off: it leaves your clips, and its place, size, crop and format are kept" } else { "Put your webcam back in your clips" };
-                crate::ui_kit::switch(&mut rui, &mut w.enabled).on_hover_text(tip);
-            }
-            if let Layer::Visual(key) = layer
-                && let Some(d) = self.settings.visual_mut(key)
-            {
-                let tip = if d.enabled { "Turn it off: it leaves your clips, and its place is kept" } else { "Put it back in your clips" };
-                crate::ui_kit::switch(&mut rui, &mut d.enabled).on_hover_text(tip);
-            }
-            if layer == Layer::Screen {
-                let what = if name == "Screen" { "your screen" } else { "your games and apps" };
-                let tip = if self.settings.screen.enabled { format!("Turn {what} off: it leaves your clips, and its place and crop are kept") } else { format!("Put {what} back in your clips") };
-                crate::ui_kit::switch(&mut rui, &mut self.settings.screen.enabled).on_hover_text(tip);
-            }
-            rui.add_space(-4.0);
-            let more = crate::ui_kit::Btn::icon(crate::ui_kit::Kind::Ghost, icon::DOTS_THREE).small().tip(if layer == Layer::Screen { "Fill or fit, reset, turn, flip, put in front or behind" } else { "Reset, turn, flip, put in front or behind, remove" }).show(&mut rui);
-            let was = self.arrangement();
-            crate::ui_kit::menu_popup(&more, false, 230.0, |ui| self.layer_menu(ui, layer, aspect));
-            crate::ui_kit::context_menu(&resp, 230.0, |ui| self.layer_menu(ui, layer, aspect));
-            if self.arrangement() != was {
-                self.keep_for_undo(was);
-            }
-            let right = rui.min_rect().left() - 10.0;
-            let mut job = crate::ui_kit::single_line_job(&line, theme::font(12.5, W::Regular), pal.text3, (right - x).max(0.0));
-            if let Some((state, color)) = state {
-                job.append(&format!(" · {state}"), 0.0, egui::TextFormat::simple(theme::font(12.5, W::Regular), color));
-            }
-            let g = ui.fonts_mut(|f| f.layout_job(job));
-            painter.galley(pos2(x, cy - g.size().y / 2.0), g, pal.text3);
-            if resp.clicked() {
-                if open {
-                    self.sources_view.open_cards.retain(|l| *l != layer);
-                } else {
-                    self.sources_view.open_cards.push(layer);
-                }
-            }
-            if open {
-                crate::ui_kit::divider(ui, 0.0);
-                // Off, its settings are kept (and can be changed): dimmed.
-                ui.scope(|ui| {
-                    if !on {
-                        ui.multiply_opacity(0.55);
-                    }
-                    match layer {
-                        Layer::Screen => self.screen_rows(ui, frame),
-                        Layer::Webcam(key) => self.webcam_rows(ui, key),
-                        Layer::Visual(key) => self.visual_rows(ui, key),
-                    }
-                });
-            }
-        });
-    }
-
-    /// The screen's settings, in its card: what to record (the whole screen
-    /// or your games and apps), which display and how much of it, and where
-    /// it sits.
-    fn screen_rows(&mut self, ui: &mut egui::Ui, frame: Option<&capture::preview::PreviewFrame>) {
-        let idle = self.rec_state.idle();
-        let pal = crate::theme::pal(ui);
-        let apps_mode = matches!(self.settings.capture, CaptureTarget::Apps { .. });
-        let row = |ui: &mut egui::Ui, add: &mut dyn FnMut(&mut egui::Ui)| {
-            ui.horizontal(|ui| {
-                ui.set_min_height(GROUP_ROW_H);
-                ui.spacing_mut().item_spacing.x = 5.0;
-                add(ui);
-            });
-        };
-        // What to record: changes right away, while capturing too (the clip
-        // switches mid-way; nothing restarts), but for a display that would
-        // make the video another size (see below; where the desktop's dialog
-        // picks the screen, that waits too).
-        if capture::app_capture() {
-            let opts = [
-                crate::ui_kit::Seg { icon: Some(egui_phosphor::regular::MONITOR), label: "Whole screen", tip: Some("Everything on one display") },
-                crate::ui_kit::Seg { icon: Some(egui_phosphor::regular::APP_WINDOW), label: "Games and apps", tip: Some("Only the games and apps you pick, following whichever you're using") },
-            ];
-            let mut picked = None;
-            row(ui, &mut |ui| {
-                ui.label(crate::theme::text("Record", 13.5, crate::theme::W::Regular).color(pal.text));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    picked = crate::ui_kit::segmented_opts(ui, "capture_kind", &opts, usize::from(apps_mode), None, true);
-                });
-            });
-            if let Some(i) = picked {
-                if i == 0 && apps_mode {
-                    let apps = std::mem::replace(&mut self.settings.capture, CaptureTarget::Screen);
-                    if matches!(apps, CaptureTarget::Apps { .. }) {
-                        self.settings.idle_apps = Some(apps);
-                    }
-                } else if i == 1 && !apps_mode {
-                    self.settings.capture = self.settings.idle_apps.take().unwrap_or(CaptureTarget::Apps { apps: Vec::new(), away_screen: true });
-                    self.windowed_apps = capture::list_windowed_apps();
-                }
-            }
-            crate::ui_kit::divider(ui, 0.0);
-        }
-        match self.settings.capture.clone() {
-            CaptureTarget::Apps { apps, away_screen } if capture::app_capture() => self.app_rows(ui, apps, away_screen, frame),
-            // Linux on Wayland: the desktop's own dialog picks the screen (once; it's remembered).
-            _ if cfg!(target_os = "linux") && !capture::screens_listed() => {
-                row(ui, &mut |ui| {
-                    ui.label(crate::theme::text("Display", 13.5, crate::theme::W::Regular).color(pal.text));
-                    ui.label(crate::theme::text("picked in your desktop's sharing dialog", 12.5, crate::theme::W::Regular).color(pal.text3));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let b = crate::ui_kit::Btn::normal("Choose another…").small().tip("Your desktop asks again which screen to record").locked((!idle).then(|| "Stop capturing to switch screens".to_owned()));
-                        if b.show(ui).clicked() {
-                            capture::choose_screen_again();
-                            self.video_preview = None; // restarts, and asks
-                        }
-                    });
-                });
-            }
-            _ => {
-                let names: Vec<String> = self.screens.iter().map(|d| d.name.clone()).collect();
-                let at = self.display_at();
-                // While clipping, the video stays the size it started at: a
-                // display that would make it another size (it's the size of
-                // the display, in p or Native) waits until clipping stops.
-                // Any other is shown in it as the one before was.
-                let recording = frame.map(|f| f.recorded).filter(|_| !idle);
-                let sized: Vec<Option<(u32, u32)>> = match recording {
-                    Some(_) => self.screens.iter().map(|d| capture::frame_size(&self.display_source(&d.id), self.settings.video_size())).collect(),
-                    None => Vec::new(),
-                };
-                let waits = |i: usize| recording.is_some_and(|now| sized.get(i).copied().flatten().is_some_and(|size| size != now));
-                let stop = format!("Stop {}", self.rec_state.words());
-                let stop = stop.as_str();
-                row(ui, &mut |ui| {
-                    ui.label(crate::theme::text("Display", 13.5, crate::theme::W::Regular).color(pal.text));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let current = names.get(at).cloned().unwrap_or_else(|| "Main display".to_owned());
-                        let r = crate::ui_kit::select(ui, &current, 180.0);
-                        crate::ui_kit::menu_popup(&r, false, 240.0, |ui| {
-                            for (i, name) in names.iter().enumerate() {
-                                let mut item = crate::ui_kit::Item::new(name.clone()).check(at == i);
-                                if waits(i) {
-                                    let (w, h) = sized[i].unwrap_or_default();
-                                    item = item.enabled(false).value("Stop clipping first").tip(format!("It would make your video {w}×{h}, and its size is set when clipping starts. {stop} to switch, or give your video a size of its own."));
-                                }
-                                if item.show(ui).clicked() {
-                                    self.settings.display_id = Some(self.screens[i].id.clone());
-                                    self.settings.display_index = i;
-                                }
-                            }
-                        });
-                    });
-                });
-                if capture::SCREEN_CROP {
-                    crate::ui_kit::divider(ui, 0.0);
-                    self.crop_row(ui);
-                }
-            }
-        }
-        // Where it is in the video, in a few words (and how the video puts
-        // it in, in a shape of its own); its numbers under it.
-        crate::ui_kit::divider(ui, 0.0);
-        self.placement_row(ui, crate::canvas_ui::Layer::Screen);
     }
 
     /// The video's size, as recorded, over the preview: a button opening the
@@ -1046,27 +1282,6 @@ impl App {
                     self.open_settings(crate::settings_ui::Pane::Video);
                     ui.close();
                 }
-            });
-        });
-    }
-
-    /// The Crop row: what's kept of the screen, and a way to its page.
-    fn crop_row(&mut self, ui: &mut egui::Ui) {
-        use crate::ui_kit::Btn;
-        let pal = crate::theme::pal(ui);
-        let kept = self.crop_whole().zip(self.settings.screen_crop.filter(|c| !c.is_none())).map(|((w, h), c)| capture::Crop::from(c).rect(w, h));
-        ui.horizontal(|ui| {
-            ui.set_min_height(GROUP_ROW_H);
-            ui.spacing_mut().item_spacing.x = 5.0;
-            ui.label(crate::theme::text("Crop", 13.5, crate::theme::W::Regular).color(pal.text));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.spacing_mut().item_spacing.x = 10.0;
-                let b = Btn::normal("Adjust").trail(egui_phosphor::regular::CARET_RIGHT).small().tip("Show only part of your screen: a game at a lower resolution than your display, with black around it");
-                if b.show(ui).clicked() {
-                    self.sources_view.crop_open = true;
-                }
-                let text = kept.map_or("Off".to_owned(), |[_, _, w, h]| format!("{w}×{h}"));
-                ui.label(crate::theme::text(text, 12.5, crate::theme::W::Regular).color(pal.text3));
             });
         });
     }
@@ -1394,16 +1609,15 @@ impl App {
         }
     }
 
-    /// The preview itself: as wide as the card, never taller than a third of
-    /// the window so the rest stays in view.
-    fn preview_picture(&mut self, ui: &mut egui::Ui, frame: Option<&capture::preview::PreviewFrame>) {
+    /// The preview itself: as wide as there's room for, at most `max_h`
+    /// tall, the sources placed on it (see `canvas_ui`).
+    fn preview_picture(&mut self, ui: &mut egui::Ui, frame: Option<&capture::preview::PreviewFrame>, max_h: f32) {
         // The frame's shape; between captures (none has a frame for a moment,
         // starting to clip) the shape of the picture still shown, so it isn't
         // drawn stretched.
         let shown = self.preview_size().map(|(w, h)| w as f32 / h.max(1) as f32);
-        let aspect = frame.map(|f| f.width as f32 / f.height.max(1) as f32).or(shown).unwrap_or(16.0 / 10.0);
-        let max_h = (ui.ctx().content_rect().height() * 0.45).max(140.0);
-        let w = ui.available_width().min(max_h * aspect);
+        let aspect = frame.map(|f| f.width as f32 / f.height.max(1) as f32).or(shown).unwrap_or(16.0 / 9.0);
+        let w = ui.available_width().min(max_h.max(160.0) * aspect);
         ui.vertical_centered(|ui| {
             let (rect, response) = ui.allocate_exact_size(egui::vec2(w, w / aspect), Sense::click_and_drag());
             crate::demo::mark(ui.ctx(), || "preview".into(), rect);
@@ -1416,11 +1630,11 @@ impl App {
             // While a new preview starts (another frame rate, size, webcam)
             // the last picture stays up; the message is only for when there's
             // none to show. With every source off, the video is black: said.
-            let webcam_on = self.settings.webcams.iter().any(|w| w.enabled) || (capture::layers::MANY && self.settings.visuals.iter().any(|d| d.enabled));
+            let any_on = self.layer_order().into_iter().any(|l| self.layer_enabled(l));
             match self.video_preview.as_ref().and_then(|(_, p)| p.error()) {
                 Some(e) => message(&format!("No preview: {e}")),
                 None if !drawn => message("Starting preview…"),
-                None if !self.settings.screen.enabled && !webcam_on => message("Nothing's in your video: turn a source on below"),
+                None if !any_on => message("Nothing's in your video: show a source in the list below"),
                 None => {}
             }
             if frame.is_some() {
@@ -1433,7 +1647,7 @@ impl App {
     /// it's open (and which is being recorded) and a remove button, then a
     /// way to add more, and the Tabbed out switch. Changes apply right away,
     /// even while capturing.
-    fn app_rows(&mut self, ui: &mut egui::Ui, apps: Vec<CaptureApp>, away_screen: bool, frame: Option<&capture::preview::PreviewFrame>) {
+    pub(crate) fn app_rows(&mut self, ui: &mut egui::Ui, apps: Vec<CaptureApp>, away_screen: bool, frame: Option<&capture::preview::PreviewFrame>) {
         use crate::theme::{self, W};
         use crate::ui_kit::{Btn, Item, Kind};
         use egui_phosphor::regular as icon;
@@ -1546,71 +1760,6 @@ impl App {
         if list != apps || away != away_screen {
             self.settings.capture = CaptureTarget::Apps { apps: list, away_screen: away };
         }
-    }
-
-    /// The clip's mix: a stereo meter with its scale and peak, and the
-    /// limiter with how much it's turning the mix down.
-    fn master_strip(&mut self, ui: &mut egui::Ui, now: Instant, dt: f32) {
-        use crate::theme::{self, W};
-        let pal = theme::pal(ui);
-        let view = &mut self.sources_view;
-        view.master.update(self.live_audio.master.take(), now, dt);
-        let reduction = self.live_audio.take_reduction_db();
-        view.reduction_db = if reduction > view.reduction_db { reduction } else { (view.reduction_db - 12.0 * dt).max(reduction) };
-        if reduction > 0.5 {
-            view.limiting_at = Some(now);
-        }
-        let limiting = self.settings.limiter && view.limiting_at.is_some_and(|t| now - t < LIMIT_HOLD);
-        group(ui, "clip_mix", |ui| {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                ui.label(theme::text("Clip mix", 14.0, W::Semibold).color(pal.text));
-                crate::ui_kit::info(ui, "Clip mix", "Every source that's part of the clip sound, mixed. This is what people hear when you share a clip. Aim for speech peaking around −12 dB, out of the red.");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let readout = view.master.readout().replace('-', "−");
-                    meter::fixed_label(ui, 52.0, &format!("{readout} dB"), view.master.readout_color(ui.visuals()), "The highest peak in the last 3 seconds (dBFS)");
-                    ui.label(theme::text("Peak", 12.5, W::Regular).color(pal.text3));
-                });
-            });
-            ui.add_space(8.0);
-            let style = meter::Style { bar_h: 7.0, gap: 3.0, scale: true, dimmed: false };
-            meter::stereo(ui, egui::Id::new("master_meter"), &view.master, &style);
-            ui.add_space(10.0);
-            crate::ui_kit::divider(ui, 0.0);
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                labelled_switch(ui, &mut self.settings.limiter, "Limiter", "");
-                crate::ui_kit::info(ui, "Limiter", "When sources add up too loud, the mix is turned down for a moment instead of distorting. Ceiling −1 dB.");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let shown = theme::toggle(ui.ctx(), egui::Id::new("limiter_shown"), self.settings.limiter, theme::NORMAL);
-                    if shown > 0.0 {
-                        ui.multiply_opacity(shown);
-                        let gr = if view.reduction_db >= 0.1 { format!("−{:.1} dB", view.reduction_db) } else { "0.0 dB".to_owned() };
-                        ui.label(theme::text(gr, 12.5, W::Medium).color(pal.text2));
-                        meter::reduction(ui, view.reduction_db, 60.0).on_hover_text("How much the limiter is turning the mix down right now (0–12 dB)");
-                        ui.label(theme::text("Turning down", 12.0, W::Regular).color(pal.text3));
-                    }
-                });
-            });
-            // Comes and goes with the sound: slides in and out, not jumping.
-            let note = if view.master.clipped() {
-                Some((pal.meter_r, "Too loud: it distorted. Turn some sources down."))
-            } else if limiting {
-                Some((pal.warn, "The limiter is working: turn sources down a little for the cleanest sound."))
-            } else {
-                None
-            };
-            if note.is_some() {
-                view.last_note = note;
-            }
-            let shown = view.last_note;
-            crate::ui_kit::reveal(ui, "clip_mix_note", note.is_some(), |ui| {
-                if let Some((color, text)) = shown {
-                    ui.add_space(6.0);
-                    ui.add(egui::Label::new(theme::text(text, 12.5, W::Regular).color(color)).wrap());
-                }
-            });
-        });
     }
 
     /// Run a level-only capture while this page is open and nothing is recording,
@@ -1757,9 +1906,9 @@ impl Drop for Background {
 }
 
 enum CardAction {
-    None,
     Remove,
     MoveUp,
+    MoveDown,
     /// "Listen" on a microphone: hear it live, or stop.
     Listen,
     /// Something locked while capturing was clicked: say why.
@@ -1809,7 +1958,7 @@ impl Route {
 /// back every frame left no way out of it). Enter or clicking away keeps
 /// what's typed, trimmed; Esc, or leaving it empty, puts back what it was.
 /// Returns whether editing is over.
-fn name_field(ui: &mut egui::Ui, id: egui::Id, name: &mut String, font: egui::FontId, width: f32) -> bool {
+pub(crate) fn name_field(ui: &mut egui::Ui, id: egui::Id, name: &mut String, font: egui::FontId, width: f32) -> bool {
     let was_id = id.with("was");
     let was = ui.data(|d| d.get_temp::<String>(was_id));
     let opening = was.is_none();
@@ -1837,7 +1986,7 @@ fn name_field(ui: &mut egui::Ui, id: egui::Id, name: &mut String, font: egui::Fo
 }
 
 /// A [`name_field`] that isn't open: the next one starts afresh.
-fn forget_name_field(ui: &egui::Ui, id: egui::Id) {
+pub(crate) fn forget_name_field(ui: &egui::Ui, id: egui::Id) {
     ui.data_mut(|d| d.remove::<String>(id.with("was")));
 }
 
@@ -1872,255 +2021,6 @@ fn added_source_note(state: crate::RecState, started: &[capture::sources::AudioS
         (false, true) => None,
         (false, false) => Some((format!("In the clip's sound now, but until {again}, changing track volumes in the editor leaves it out."), true)),
     }
-}
-
-/// One source: its icon, name and device; its level and volume as one
-/// control (the meter runs along the fader's track, the knob sits on it); the
-/// number to type a value; mute; where it goes; and for a microphone, noise
-/// removal and Listen.
-#[allow(clippy::too_many_arguments)]
-fn source_card(
-    ui: &mut egui::Ui,
-    source: &mut AudioSourceCfg,
-    channel: &Channel,
-    meters: &mut SourceMeters,
-    devices: &capture::audio::AudioDevices,
-    has_app_sources: bool,
-    renaming: &mut Option<String>,
-    // A microphone's "Listen": `Some(latency in ms, if known)` while on.
-    listening: Option<Option<f32>>,
-    // While capturing: why what's recorded can't change (it's set at the start).
-    locked: Option<&str>,
-    // Added while capturing: what it doesn't have yet, and whether that
-    // leaves something out (see `App::added_note`).
-    note: Option<(String, bool)>,
-    first: bool,
-    app_icons: &mut crate::app_icons::AppIcons,
-) -> CardAction {
-    use crate::theme::{self, W};
-    use crate::ui_kit::{Btn, Item, Kind};
-    use egui_phosphor::regular as icon;
-    let pal = theme::pal(ui);
-    let mut action = CardAction::None;
-    // A mic can switch device while capturing (its track stays).
-    let picker_locked = locked.filter(|_| !matches!(source.kind, SourceKind::Microphone { .. }));
-    // And where the capture can take it, a source can be turned off or
-    // removed (its tracks going silent), and on again.
-    let fixed = locked.filter(|_| !capture::SOURCES_WHILE_CAPTURING);
-    let card_id = source.id.clone();
-    group(ui, ("source", card_id), |ui| {
-        ui.multiply_opacity(if source.enabled { 1.0 } else { 0.6 });
-        // --- Its icon, name, what it is; device; ⋯ ---
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 10.0;
-            let (r, _) = ui.allocate_exact_size(egui::vec2(30.0, 30.0), Sense::hover());
-            // An app's own icon, where there is one, in place of a symbol.
-            let own = match &source.kind {
-                SourceKind::App { bundle_id, .. } => crate::app_icons::paint(ui, app_icons, bundle_id, r.shrink(1.0)),
-                _ => false,
-            };
-            if !own {
-                ui.painter().rect_filled(r, 6, pal.control);
-                let glyph = match &source.kind {
-                    SourceKind::Microphone { .. } => icon::MICROPHONE,
-                    SourceKind::Desktop { .. } => icon::SPEAKER_HIFI,
-                    SourceKind::App { app_name, .. } if app_name.to_lowercase().contains("discord") => icon::DISCORD_LOGO,
-                    SourceKind::App { .. } => icon::APP_WINDOW,
-                };
-                ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, glyph, egui::FontId::proportional(16.0), pal.text2);
-            }
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = 1.0;
-                let name_id = egui::Id::new(("source_name", &source.id));
-                if renaming.as_deref() == Some(source.id.as_str()) {
-                    if name_field(ui, name_id, &mut source.name, theme::font(14.0, W::Medium), 170.0) {
-                        *renaming = None;
-                    }
-                } else {
-                    forget_name_field(ui, name_id);
-                    let r = ui.add(egui::Label::new(theme::text(&source.name, 14.0, W::Medium).color(if source.muted { pal.text2 } else { pal.text })).truncate().sense(Sense::click()));
-                    if r.on_hover_text("Double-click to rename").double_clicked() {
-                        *renaming = Some(source.id.clone());
-                    }
-                }
-                let what = match &source.kind {
-                    SourceKind::Desktop { exclude_apps: true } if has_app_sources => Some("Everything except apps added below".to_owned()),
-                    SourceKind::Desktop { .. } => Some("Everything your computer plays".to_owned()),
-                    SourceKind::App { .. } => Some("Only this app".to_owned()),
-                    SourceKind::Microphone { .. } => None,
-                };
-                let status = status_text(channel.status());
-                match (status, what) {
-                    (Some((t, c)), _) => {
-                        ui.label(theme::text(t, 12.5, W::Regular).color(c(pal)));
-                    }
-                    (None, Some(w)) => {
-                        ui.label(theme::text(w, 12.5, W::Regular).color(pal.text3));
-                    }
-                    _ => {}
-                }
-            });
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                let more = Btn::icon(Kind::Ghost, icon::DOTS_THREE).small().tip("Rename, move or remove").show(ui);
-                crate::ui_kit::menu_popup(&more, false, 200.0, |ui| {
-                    if Item::new("Rename…").icon(icon::PENCIL_SIMPLE).show(ui).clicked() {
-                        *renaming = Some(source.id.clone());
-                    }
-                    if Item::new("Move up").icon(icon::CARET_UP).enabled(!first && locked.is_none()).show(ui).clicked() {
-                        action = CardAction::MoveUp;
-                    }
-                    if Item::new(if source.muted { "Unmute" } else { "Mute" }).icon(icon::SPEAKER_X).show(ui).clicked() {
-                        source.muted = !source.muted;
-                    }
-                    let on = Item::new(if source.enabled { "Turn off" } else { "Turn on" }).icon(icon::POWER).enabled(fixed.is_none());
-                    if on.show(ui).clicked() {
-                        source.enabled = !source.enabled;
-                    }
-                    if let SourceKind::Desktop { exclude_apps } = &mut source.kind {
-                        crate::ui_kit::menu_sep(ui);
-                        let item = Item::new("Leave out apps added below").check(*exclude_apps).enabled(has_app_sources && locked.is_none());
-                        let item = item.tip("Apps you add as their own source won't also be heard here, so nothing plays twice");
-                        if item.show(ui).clicked() {
-                            *exclude_apps = !*exclude_apps;
-                        }
-                    }
-                    crate::ui_kit::menu_sep(ui);
-                    let rm = Item::new("Remove").icon(icon::TRASH).danger();
-                    if rm.show(ui).clicked() {
-                        action = if fixed.is_some() { CardAction::Locked } else { CardAction::Remove };
-                    }
-                });
-                if matches!(source.kind, SourceKind::Microphone { .. }) {
-                    if let Some(a) = mic_picker(ui, source, devices, picker_locked.is_some()) {
-                        action = a;
-                    }
-                }
-            });
-        });
-        if !source.enabled {
-            return;
-        }
-        ui.add_space(10.0);
-
-        // --- Level and volume, as one control; the value; mute ---
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 10.0;
-            let w = ui.available_width() - 66.0 - 26.0 - 2.0 * 10.0;
-            // Muted: what the source delivers, dimmed, so you see the mic is
-            // live without it being recorded. Otherwise what goes into the clip.
-            let state = if source.muted { &meters.input } else { &meters.output };
-            let fresp = fader(ui, &mut source.volume_db, state, source.muted, w.max(80.0), &source.id);
-            volume_value(ui, &mut source.volume_db, fresp.secondary_clicked(), &source.id);
-            let (r, resp) = ui.allocate_exact_size(egui::vec2(26.0, 24.0), Sense::click());
-            let hv = theme::toggle(ui.ctx(), resp.id.with("hv"), resp.hovered(), theme::FAST);
-            let on = theme::toggle(ui.ctx(), resp.id.with("on"), source.muted, theme::FAST);
-            ui.painter().rect_filled(r, 4, theme::mix(theme::mix(pal.control, pal.control_h, hv), pal.warn, on));
-            ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, "M", theme::font(11.0, W::Bold), theme::mix(pal.text2, Color32::from_rgb(20, 21, 24), on));
-            if resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(if source.muted { "Unmute" } else { "Mute: keep the source but record silence" }).clicked() {
-                source.muted = !source.muted;
-            }
-        });
-
-        // --- Where it goes; mic tools ---
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
-            let route = Route::of(source);
-            let chip = Btn::normal(route.label()).trail(icon::CARET_DOWN).small().id(("route", source.id.as_str())).tip(locked.unwrap_or("Where this source goes")).show(ui);
-            if chip.clicked() && locked.is_some() {
-                action = CardAction::Locked;
-                egui::Popup::close_id(ui.ctx(), chip.id.with("menu"));
-            }
-            if locked.is_none() {
-                crate::ui_kit::menu_popup(&chip, true, 260.0, |ui| {
-                    for r in [Route::Both, Route::Mix, Route::Track] {
-                        if Item::new(r.label()).check(route == r).tip(r.tip()).show(ui).clicked() {
-                            (source.in_mix, source.own_track) = match r {
-                                Route::Both => (true, true),
-                                Route::Mix => (true, false),
-                                Route::Track => (false, true),
-                            };
-                        }
-                    }
-                });
-            }
-            crate::ui_kit::info(ui, "Where it goes", "Clip sound: part of what everyone hears when you play or share a clip. Own track: also kept on its own, so you can change its volume later in the editor.");
-            if matches!(source.kind, SourceKind::Microphone { .. }) {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // Listen: something you do for a moment, so a button, with
-                    // its word; lit while you're listening.
-                    let on = listening.is_some();
-                    let tip = if on { "Stop listening" } else { "Listen through your headphones, to check it works and how it sounds" };
-                    let btn = if on { Btn::new(Kind::On, "Listening") } else { Btn::ghost("Listen") };
-                    if btn.with_icon(icon::HEADPHONES).small().id(("listen", source.id.as_str())).tip(tip).show(ui).clicked() {
-                        action = CardAction::Listen;
-                    }
-                });
-            }
-        });
-        // Added while capturing: where its sound is until it starts again.
-        if let Some((note, leaves_out)) = &note {
-            ui.add_space(6.0);
-            ui.add(egui::Label::new(theme::text(note, 12.0, W::Regular).color(if *leaves_out { pal.warn } else { pal.text3 })).wrap());
-        }
-        // Noise reduction: a setting of the mic that stays as set, of three,
-        // so a segmented control, right after its name, not across the card
-        // from it: there, among the card's other controls, the two read as
-        // unrelated things.
-        if matches!(source.kind, SourceKind::Microphone { .. }) {
-            use crate::settings::NoiseReduction;
-            use crate::ui_kit::Seg;
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 10.0;
-                ui.label(theme::text("Noise reduction", 13.5, W::Regular).color(pal.text));
-                const MODES: [NoiseReduction; 3] = [NoiseReduction::Off, NoiseReduction::Light, NoiseReduction::Strong];
-                let opts = [
-                    Seg::from("Off"),
-                    Seg { icon: None, label: "Light", tip: Some("Takes out steady noise: fans, hum, hiss. Your keyboard stays") },
-                    Seg { icon: None, label: "Strong", tip: Some("Takes out everything but your voice") },
-                ];
-                let chosen = MODES.iter().position(|m| *m == source.noise_reduction).unwrap_or(0);
-                if let Some(i) = crate::ui_kit::segmented_opts(ui, ("noise_reduction", source.id.as_str()), &opts, chosen, None, true) {
-                    source.noise_reduction = MODES[i];
-                }
-                ui.spacing_mut().item_spacing.x = 6.0;
-                crate::ui_kit::info(ui, "Noise reduction", "Light takes out steady noise behind your voice, like a fan, hum or hiss, and keeps sounds that come and go, like your keyboard. Strong takes out everything but your voice. Changes apply straight away.");
-            });
-            // Mono: on or off, so a switch, right before its name (as the
-            // Limiter's).
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                let tip = if source.mono { "On: you're heard in the middle" } else { "Off: as the mic gives it" };
-                labelled_switch(ui, &mut source.mono, "Mono", tip);
-                crate::ui_kit::info(ui, "Mono", "For a mic heard on one side only, like one in an audio interface's first input (its left): you're heard in the middle, on both sides, as loud as before.");
-            });
-        }
-        if let Some(latency) = listening {
-            ui.add_space(6.0);
-            let ms = latency.map_or(String::new(), |ms| format!(", {ms:.0} ms delay"));
-            ui.label(theme::text(format!("Listening{ms}. Use headphones, or it feeds back."), 12.0, W::Regular).color(pal.warn));
-        }
-    });
-    action
-}
-
-/// A switch with its name right after it, in a row laid out left to right:
-/// clicking the name switches it too. `tip`: on the switch, if any.
-/// Returns whether it was switched.
-fn labelled_switch(ui: &mut egui::Ui, on: &mut bool, label: &str, tip: &str) -> bool {
-    use crate::theme::{self, W};
-    let pal = theme::pal(ui);
-    ui.spacing_mut().item_spacing.x = 10.0;
-    let sw = crate::ui_kit::switch(ui, on);
-    let sw = if tip.is_empty() { sw } else { sw.on_hover_text(tip) };
-    let name = ui.add(egui::Label::new(theme::text(label, 13.5, W::Regular).color(pal.text)).sense(Sense::click())).on_hover_cursor(egui::CursorIcon::PointingHand);
-    if name.clicked() {
-        *on = !*on;
-    }
-    ui.spacing_mut().item_spacing.x = 6.0;
-    sw.clicked() || name.clicked()
 }
 
 /// A source's volume and level as one control: the meter runs along the
@@ -2318,49 +2218,8 @@ fn status_text(status: SourceStatus) -> Option<(&'static str, fn(&crate::theme::
     }
 }
 
-/// A group on the page: the raised surface, padded.
-/// A group on the Sources page: its height eases when what's in it changes
-/// (see [`crate::ui_kit::eased_frame`]); `id` names it on the page.
-pub(crate) fn group(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::Debug, add: impl FnOnce(&mut egui::Ui)) {
-    framed(ui, id, egui::Margin::same(GROUP_PAD as i8), add);
-}
-
-/// Space between a group's edge and what's in it.
-pub(crate) const GROUP_PAD: f32 = 12.0;
-/// How tall a row in a group of rows is (`group_rows`).
+/// How tall a row of the games and apps' list is.
 pub(crate) const GROUP_ROW_H: f32 = 42.0;
-
-/// A picture source's card's line: as tall as its menu button and a little
-/// room (its settings below are rows of `GROUP_ROW_H`).
-const CARD_HEAD_H: f32 = 34.0;
-
-/// A group of rows (`GROUP_ROW_H` tall, their control centred): less above
-/// and below, so the controls are as far from its edges as from its sides.
-pub(crate) fn group_rows(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::Debug, add: impl FnOnce(&mut egui::Ui)) {
-    let y = (GROUP_PAD - (GROUP_ROW_H - crate::ui_kit::CONTROL_H) / 2.0).max(0.0) as i8;
-    framed(ui, id, egui::Margin { left: GROUP_PAD as i8, right: GROUP_PAD as i8, top: y, bottom: y }, add);
-}
-
-fn framed(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::Debug, margin: egui::Margin, add: impl FnOnce(&mut egui::Ui)) {
-    let pal = crate::theme::pal(ui);
-    let frame = egui::Frame::new().fill(pal.raise).corner_radius(8).inner_margin(margin);
-    crate::ui_kit::eased_frame(ui, egui::Id::new(("sources_group", id)), frame, |ui| {
-        ui.set_width(ui.available_width());
-        add(ui);
-    });
-}
-
-/// A column's heading ("Picture", "Sound"), with whatever goes on its right.
-pub(crate) fn column_head(ui: &mut egui::Ui, title: &str, right: impl FnOnce(&mut egui::Ui)) {
-    let pal = crate::theme::pal(ui);
-    ui.horizontal(|ui| {
-        ui.set_min_height(30.0);
-        ui.label(crate::theme::text(title, 15.0, crate::theme::W::Semibold).color(pal.text));
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), right);
-    });
-    // As far below as Settings' headings are from their groups.
-    ui.add_space(4.0);
-}
 
 pub(crate) fn from_db(db: f32) -> f32 {
     if db <= FADER_MIN_DB + 0.05 { 0.0 } else { 10f32.powf(db / 20.0) }

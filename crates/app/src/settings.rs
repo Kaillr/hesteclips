@@ -432,11 +432,81 @@ pub enum Visual {
     Image { path: PathBuf },
     /// All of its box one colour (R, G, B, A).
     Colour { rgba: [u8; 4] },
-    /// Words, one line each, drawn `size` pixels tall (in the video's pixels
-    /// at 1080p) in `rgba`, with a soft shadow under them or not.
-    Text { text: String, size: u32, rgba: [u8; 4], shadow: bool },
+    /// Words, drawn as their style says.
+    Text(TextStyle),
     /// A web page (alerts, a chat overlay), drawn `width`×`height` big.
-    Browser { url: String, width: u32, height: u32 },
+    /// `reload` goes up to load it again.
+    Browser {
+        url: String,
+        width: u32,
+        height: u32,
+        #[serde(default, skip_serializing)]
+        reload: u32,
+    },
+}
+
+/// How a line of words lines up with the others.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextAlign {
+    Left,
+    #[default]
+    Centre,
+    Right,
+}
+
+/// Words in the video, and how they look: a line for each line, in a font
+/// installed on the computer (or the app's own), `size` pixels tall in a
+/// 1080p video, with an outline round the letters and a shadow under them
+/// if wanted. All colours are R, G, B, A.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TextStyle {
+    pub text: String,
+    /// A font family's name; empty: the app's own (Hanken Grotesk).
+    pub font: String,
+    /// 100 (thin) to 900 (black); 400 is regular, 700 bold.
+    pub weight: u16,
+    pub italic: bool,
+    pub size: u32,
+    pub rgba: [u8; 4],
+    pub align: TextAlign,
+    /// Between lines, in percent of the font's own spacing.
+    pub line_spacing: u32,
+    pub outline: bool,
+    /// How thick the outline is, in pixels at 1080p.
+    pub outline_width: u32,
+    pub outline_rgba: [u8; 4],
+    pub shadow: bool,
+    /// How far the shadow falls, right and down, in pixels at 1080p.
+    pub shadow_x: i32,
+    pub shadow_y: i32,
+    /// How soft its edge is, in pixels at 1080p.
+    pub shadow_blur: u32,
+    pub shadow_rgba: [u8; 4],
+}
+
+impl Default for TextStyle {
+    fn default() -> Self {
+        Self {
+            text: "Your text".to_owned(),
+            font: String::new(),
+            weight: 700,
+            italic: false,
+            size: 72,
+            rgba: [255, 255, 255, 255],
+            align: TextAlign::Centre,
+            line_spacing: 100,
+            outline: false,
+            outline_width: 4,
+            outline_rgba: [0, 0, 0, 255],
+            shadow: true,
+            shadow_x: 3,
+            shadow_y: 4,
+            shadow_blur: 6,
+            shadow_rgba: [0, 0, 0, 160],
+        }
+    }
 }
 
 impl Visual {
@@ -448,13 +518,19 @@ impl Visual {
             Visual::Image { .. } => "Image",
             Visual::Colour { .. } => "Colour",
             Visual::Text { .. } => "Text",
-            Visual::Browser { .. } => "Browser",
+            Visual::Browser { .. } => "Web page",
         }
     }
 
     /// Whether its box takes any shape (a colour has none of its own).
     pub fn shapeless(&self) -> bool {
         matches!(self, Visual::Colour { .. })
+    }
+
+    /// Whether part of its picture can be cut off (not a colour or words:
+    /// their box is all there is).
+    pub fn croppable(&self) -> bool {
+        !matches!(self, Visual::Colour { .. } | Visual::Text(_))
     }
 }
 
@@ -467,6 +543,9 @@ impl Visual {
 pub struct VisualCfg {
     /// Its own, for the video's order; never another source's.
     pub key: u64,
+    /// What you called it, if you did (else its kind's name).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     #[serde(flatten)]
     pub visual: Visual,
     /// In the clips. Off keeps its place for later.
@@ -481,12 +560,15 @@ pub struct VisualCfg {
     pub flip_h: bool,
     #[serde(default)]
     pub flip_v: bool,
+    /// The part of its picture shown, in its own pixels, if not all of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crop: Option<ScreenCrop>,
 }
 
 impl VisualCfg {
     /// `visual`, on, where it goes at first.
     pub fn new(key: u64, visual: Visual) -> Self {
-        Self { key, visual, enabled: true, placed: None, turns: 0, flip_h: false, flip_v: false }
+        Self { key, title: None, visual, enabled: true, placed: None, turns: 0, flip_h: false, flip_v: false, crop: None }
     }
 }
 
@@ -501,6 +583,9 @@ pub struct WebcamCfg {
     pub id: String,
     /// What to call it while it isn't connected.
     pub name: String,
+    /// What you called it, if you did (else "Webcam").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     /// The format to open it in; `None` picks the best.
     #[serde(default)]
     pub format: Option<FormatCfg>,
@@ -1107,6 +1192,9 @@ pub struct RecordSettings {
     pub layer_order: Vec<LayerKey>,
     /// The screen as a source in the video: in front or behind, its box.
     pub screen: ScreenCfg,
+    /// What you called the screen, if you did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub screen_title: Option<String>,
     /// Each camera's settings changed from its defaults (control id, as
     /// V4L2 numbers them, to value), by camera id: put back each time it's
     /// opened, as cameras forget them when unplugged.
@@ -1267,6 +1355,7 @@ impl Default for RecordSettings {
             visuals: Vec::new(),
             layer_order: Vec::new(),
             screen: ScreenCfg::default(),
+            screen_title: None,
             camera_controls: Default::default(),
             display_id: None,
             display_index: 0,
@@ -1684,7 +1773,36 @@ impl RecordSettings {
             Some(b) => ([b.x, b.y, b.w, b.h], if b.stretched() || d.visual.shapeless() { capture::Framing::Stretch } else { capture::Framing::Fit }),
             None => ([0.0, 0.0, 1.0, 1.0], if d.visual.shapeless() { capture::Framing::Stretch } else { capture::Framing::Fit }),
         };
-        capture::ScreenPlacement { rect, framing, in_front: false, hidden: !d.enabled, crop: None, turns: d.turns % 4, flip_h: d.flip_h, flip_v: d.flip_v }
+        let crop = d.crop.filter(|c| !c.is_none() && d.visual.croppable()).map(Into::into);
+        capture::ScreenPlacement { rect, framing, in_front: false, hidden: !d.enabled, crop, turns: d.turns % 4, flip_h: d.flip_h, flip_v: d.flip_v }
+    }
+
+    /// What a source is called: what you called it, else its kind's name.
+    pub fn layer_title(&self, layer: LayerKey) -> String {
+        match layer {
+            LayerKey::Screen => self.screen_title.clone().unwrap_or_else(|| if matches!(self.capture, CaptureTarget::Apps { .. }) { "Games and apps".to_owned() } else { "Screen".to_owned() }),
+            LayerKey::Webcam(key) => self.webcam(key).and_then(|w| w.title.clone()).unwrap_or_else(|| "Webcam".to_owned()),
+            LayerKey::Visual(key) => self.visual(key).map(|v| v.title.clone().unwrap_or_else(|| v.visual.kind_name().to_owned())).unwrap_or_default(),
+        }
+    }
+
+    /// Call a source `title` (empty: its kind's name again).
+    pub fn set_layer_title(&mut self, layer: LayerKey, title: &str) {
+        let title = title.trim();
+        let title = (!title.is_empty()).then(|| title.to_owned());
+        match layer {
+            LayerKey::Screen => self.screen_title = title,
+            LayerKey::Webcam(key) => {
+                if let Some(w) = self.webcam_mut(key) {
+                    w.title = title;
+                }
+            }
+            LayerKey::Visual(key) => {
+                if let Some(v) = self.visual_mut(key) {
+                    v.title = title;
+                }
+            }
+        }
     }
 
     /// A built-in sound that's gone (Silverfish) becomes the default, so the

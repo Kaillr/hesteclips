@@ -19,6 +19,8 @@ mod clips;
 mod collections;
 mod crop_ui;
 mod demo;
+mod fonts;
+mod inspector_ui;
 mod visuals_ui;
 mod webcam_ui;
 mod discord;
@@ -1014,8 +1016,7 @@ impl App {
         let open_sources = std::env::var_os("HASTECLIP_OPEN_SOURCES").is_some();
         if let Some(v) = std::env::var_os("HASTECLIP_OPEN_SOURCES") {
             app.page = Page::Sources;
-            let first_webcam = app.settings.first_webcam().map(|w| w.key);
-            app.sources_view.open_dev(&v.to_string_lossy(), first_webcam);
+            sources_ui::open_dev(&mut app, &v.to_string_lossy());
         }
         // `HASTECLIP_OPEN_VOICE_REVIEW=1` opens the voice samples review.
         let open_review = std::env::var_os("HASTECLIP_OPEN_VOICE_REVIEW").is_some();
@@ -1223,7 +1224,7 @@ impl App {
                         Visual::Display { id, .. } => LayerSource::Display { id: id.clone(), placement },
                         Visual::Window { app, .. } => LayerSource::Window { app: app.clone(), placement },
                         Visual::Colour { rgba } => LayerSource::Colour { rgba: *rgba, placement },
-                        Visual::Browser { url, width, height } if capture::layers::BROWSER && url.len() > "https://".len() => LayerSource::Browser { url: url.clone(), width: *width, height: *height, placement },
+                        Visual::Browser { url, width, height, .. } if capture::layers::BROWSER && url.len() > "https://".len() => LayerSource::Browser { url: url.clone(), width: *width, height: *height, placement },
                         Visual::Browser { .. } => continue,
                         // Its picture, once it's made (`refresh_visual_pictures`).
                         Visual::Image { .. } | Visual::Text { .. } => match self.visual_picture(key) {
@@ -1231,7 +1232,13 @@ impl App {
                             None => continue,
                         },
                     };
-                    layers.push(Layer { id: 2 << 32 | key, source });
+                    // Loaded again (a web page's Reload): another layer, so
+                    // the capture makes it afresh.
+                    let again = match &d.visual {
+                        Visual::Browser { reload, .. } => u64::from(*reload) << 48,
+                        _ => 0,
+                    };
+                    layers.push(Layer { id: (2 << 32 | key) ^ again, source });
                 }
                 LayerKey::Visual(_) => {}
                 LayerKey::Webcam(_) => {}

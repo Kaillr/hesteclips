@@ -406,14 +406,6 @@ pub fn to_db(x: f32) -> f32 {
     if x <= 1e-6 { SILENCE_DB } else { 20.0 * x.log10() }
 }
 
-/// Paint a label right-aligned in a fixed-width slot, so changing digits don't
-/// shift anything.
-pub fn fixed_label(ui: &mut egui::Ui, width: f32, text: &str, color: Color32, tip: &str) {
-    let (rect, resp) = ui.allocate_exact_size(vec2(width, 18.0), Sense::hover());
-    ui.painter().text(rect.right_center(), Align2::RIGHT_CENTER, text, crate::theme::font(12.5, crate::theme::W::Medium), color);
-    resp.on_hover_text(tip);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
