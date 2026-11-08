@@ -51,7 +51,7 @@ pub(crate) use loopback::SystemAudio;
 pub(crate) use system::host_now;
 pub use camera::{keep_open as keep_camera_open, list_cameras, open_camera_settings};
 pub(crate) use camera::{controls as camera_controls, picture as camera_picture, set_control as set_camera_control};
-pub use system::{app_window_size, cover_display, cursor_state, display_bounds, foreground_app_path, foreground_exe, list_apps, list_screens, list_windowed_apps};
+pub use system::{app_window_size, cursor_state, display_bounds, foreground_app_path, foreground_exe, list_apps, list_screens, list_windowed_apps};
 pub(crate) use system::display_pixels;
 
 use crate::mixer::{self, Clock, LiveAudio, MixChange, MixInput};

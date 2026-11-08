@@ -193,38 +193,6 @@ pub fn display_bounds(id: &str) -> Option<[i32; 4]> {
     Some([r.left, r.top, r.right - r.left, r.bottom - r.top])
 }
 
-/// This process's window called `title` over all of display `[x, y, w, h]`
-/// (in the desktop's pixels, as [`display_bounds`] gives them), with no
-/// frame or border (a popup), and left out of whatever captures the screen
-/// (Windows 10 2004 and later: what's behind it is captured instead), so a
-/// preview of the screen shown on that screen doesn't capture itself.
-/// Whether it's there now (else it's been put there: call again).
-pub fn cover_display(title: &str, [x, y, w, h]: [i32; 4]) -> bool {
-    use windows::Win32::UI::WindowsAndMessaging::{
-        FindWindowW, GWL_STYLE, GetWindowLongPtrW, HWND_TOP, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_SHOWWINDOW, SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPos, WDA_EXCLUDEFROMCAPTURE, WS_POPUP,
-        WS_VISIBLE,
-    };
-    let Ok(hwnd) = (unsafe { FindWindowW(PCWSTR::null(), &windows::core::HSTRING::from(title)) }) else { return false };
-    let mut pid = 0u32;
-    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
-    if pid != std::process::id() {
-        return false;
-    }
-    let _ = unsafe { SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) };
-    let popup = (WS_POPUP | WS_VISIBLE).0 as isize;
-    let framed = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } != popup;
-    if framed {
-        unsafe { SetWindowLongPtrW(hwnd, GWL_STYLE, popup) };
-    }
-    let mut r = RECT::default();
-    let _ = unsafe { GetWindowRect(hwnd, &mut r) };
-    if !framed && (r.left, r.top, r.right - r.left, r.bottom - r.top) == (x, y, w, h) {
-        return true;
-    }
-    let _ = unsafe { SetWindowPos(hwnd, Some(HWND_TOP), x, y, w, h, SWP_FRAMECHANGED | SWP_SHOWWINDOW | SWP_NOACTIVATE) };
-    false
-}
-
 // ---------------------------------------------------------------------------
 // Processes
 // ---------------------------------------------------------------------------

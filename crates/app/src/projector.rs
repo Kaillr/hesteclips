@@ -22,20 +22,18 @@ pub(crate) struct Projector {
     opened: Instant,
     /// Fullscreen on its display (put there first, where its place is known).
     placed: bool,
+    /// Frames it's been trying to get there.
+    tries: u32,
 }
 
-impl Projector {
-    /// Its window's title (Windows finds it by this, to put it over its
-    /// display and leave it out of screen capture).
-    fn title(&self) -> String {
-        format!("HasteClip preview: {}", self.name)
-    }
-}
+/// Frames to try to put the window on its display before it's made
+/// fullscreen wherever it is.
+const TRIES: u32 = 60;
 
 impl App {
     /// Preview on display `d`, instead of where it was.
     pub(crate) fn open_projector(&mut self, d: &capture::Device) {
-        self.projector = Some(Projector { display: d.id.clone(), name: d.name.clone(), opened: Instant::now(), placed: false });
+        self.projector = Some(Projector { display: d.id.clone(), name: d.name.clone(), opened: Instant::now(), placed: false, tries: 0 });
     }
 
     /// The displays to preview on, one an item each (the one it's on
@@ -71,16 +69,16 @@ impl App {
         let Some(p) = self.projector.as_ref() else { return };
         let bounds = capture::display_bounds(&p.display);
         let id = egui::ViewportId::from_hash_of(("hasteclip_projector", &p.display));
-        let title = p.title();
-        let mut builder = egui::ViewportBuilder::default().with_title(title.clone()).with_decorations(false).with_resizable(false).with_inner_size([960.0, 540.0]);
-        // Opened on its display (as near as points go), made fullscreen once
-        // it's there; where that isn't known, fullscreen where it opens.
-        builder = match bounds {
-            Some(b) => builder.with_position(inside(b, ctx.pixels_per_point())),
-            None => builder.with_fullscreen(true),
-        };
+        // A window with a frame, hidden till it's fullscreen: winit draws a
+        // frameless one a pixel down (its drop shadow's room), a light line
+        // along its top, and fullscreen takes the frame off by itself.
+        // Opened on its display (as near as points go).
+        let mut builder = egui::ViewportBuilder::default().with_title(format!("HasteClip preview: {}", p.name)).with_visible(false).with_inner_size([960.0, 540.0]);
+        if let Some(b) = bounds {
+            builder = builder.with_position(inside(b, ctx.pixels_per_point()));
+        }
         let mut close = false;
-        ctx.show_viewport_immediate(id, builder, |ui, _| close = self.projector_frame(ui, bounds, &title));
+        ctx.show_viewport_immediate(id, builder, |ui, _| close = self.projector_frame(ui, bounds));
         if close {
             self.projector = None;
         }
@@ -89,34 +87,27 @@ impl App {
 
     /// One frame of the preview's window: put on its display, then the
     /// video in the middle, as big as fits. Whether it's to close.
-    fn projector_frame(&mut self, ui: &mut egui::Ui, bounds: Option<[i32; 4]>, title: &str) -> bool {
+    fn projector_frame(&mut self, ui: &mut egui::Ui, bounds: Option<[i32; 4]>) -> bool {
         let ctx = ui.ctx().clone();
         let ctx = &ctx;
-        // Windows: over all of its display exactly, frameless, and out of
-        // screen capture (on the display it previews, it captured itself:
-        // each frame the last one, a pixel lower, smeared down the screen).
-        // Checked every frame: it's cheap, and a change of display or scale
-        // puts it back.
-        if cfg!(windows)
-            && let Some(b) = bounds
-        {
-            let there = capture::cover_display(title, b);
-            if let Some(p) = self.projector.as_mut() {
-                p.placed = there;
-            }
-        } else if let Some(p) = self.projector.as_mut().filter(|p| !p.placed) {
-            match bounds {
-                Some(b) => {
-                    let ppp = ctx.pixels_per_point();
-                    let there = ctx.input(|i| i.viewport().outer_rect).is_some_and(|r| on_display(r.center(), ppp, b));
-                    if there {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
-                        p.placed = true;
-                    } else {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(inside(b, ppp)));
-                    }
-                }
-                None => p.placed = true,
+        // On its display (moved there till it is: points don't map onto a
+        // display of another scale exactly), then fullscreen there, shown.
+        // Where its display isn't known, or it can't be got there, fullscreen
+        // where it is.
+        if let Some(p) = self.projector.as_mut().filter(|p| !p.placed) {
+            p.tries += 1;
+            let ppp = ctx.pixels_per_point();
+            let there = match bounds {
+                Some(b) => ctx.input(|i| i.viewport().outer_rect).is_some_and(|r| on_display(r.center(), ppp, b)),
+                None => true,
+            };
+            if there || p.tries > TRIES {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                p.placed = true;
+            } else if let Some(b) = bounds {
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(inside(b, ppp)));
             }
         }
         let _ = self.pull_preview(ctx);
