@@ -17,7 +17,6 @@ use egui_phosphor::regular as icon;
 
 use crate::App;
 use crate::canvas_ui::Layer;
-use crate::scenes_ui::Part;
 use crate::settings::{CaptureTarget, TextAlign, TextStyle, Visual};
 use crate::theme::{self, W};
 use crate::ui_kit::{self, Btn, Dismissed, Item, Kind, Row, Seg};
@@ -79,12 +78,10 @@ impl App {
     /// page (removed, or not in the scene shown). `frame`: the preview's.
     pub(crate) fn settings_dialog(&mut self, ctx: &egui::Context, frame: Option<&capture::preview::PreviewFrame>, aspect: f32) {
         let Some(editing) = self.sources_view.editing.clone() else { return };
-        let part = self.sources_view.part;
         let there = match &editing {
-            Editing::Layer { layer, .. } => part == Part::Scene && self.layer_order().contains(layer),
-            Editing::Sound(id) => part == Part::Sound && self.settings.audio_sources.iter().any(|s| s.id == *id),
-            Editing::Mix => part == Part::Sound,
-            Editing::Video => part == Part::Scene,
+            Editing::Layer { layer, .. } => self.layer_order().contains(layer),
+            Editing::Sound(id) => self.settings.audio_sources.iter().any(|s| s.id == *id),
+            Editing::Mix | Editing::Video => true,
         };
         if !there {
             self.sources_view.editing = None;

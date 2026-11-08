@@ -1,12 +1,12 @@
 //! The Sources page: what goes into your clips. Beside the panel of the
-//! preset's scenes and sound (`scenes_ui`), a scene's page has its layers,
-//! the one in front first (each with an eye to hide it, a grip to drag it
-//! in front or behind), and the preview as big as there's room for, its
-//! sources placed on it (`canvas_ui`: click one to select it, drag it,
-//! crop it). The sound's page has the mixer: the clip's mix, then each
-//! source with its level, volume and mute. Each list's Add puts another
-//! source in. A source's settings are in a dialog (`inspector_ui`): double-
-//! click it, or its row's settings button, or Settings… in its menu.
+//! preset's scenes (`scenes_ui`), a scene's page has its layers, the one in
+//! front first (each with an eye to hide it, a grip to drag it in front or
+//! behind), and the preview as big as there's room for, its sources placed
+//! on it (`canvas_ui`: click one to select it, drag it, crop it). Under
+//! both, the preset's sound, the same in every scene: the clip's mix, then
+//! each source with its level, volume and mute. Each list's Add puts
+//! another source in. A source's settings are in a dialog (`inspector_ui`):
+//! double-click it, or its row's settings button, or Settings… in its menu.
 //!
 //! Deliberately says nothing about "tracks": a source is either part of what the
 //! clip sounds like ("In the clip"), kept separately for editing, or both.
@@ -25,16 +25,17 @@ const FADER_MIN_DB: f32 = -60.0;
 const FADER_MAX_DB: f32 = 12.0;
 /// How long the "limiting" note stays after the limiter last worked.
 const LIMIT_HOLD: Duration = Duration::from_secs(3);
-/// Under this page width, a scene's layers go under its preview (else
-/// beside it, on its left).
+/// Under this page width, a scene's layers and its sound go under its
+/// preview (else the layers are beside it, on its left, and the sound under
+/// both).
 const ONE_COLUMN: f32 = 700.0;
 /// The layers' column, beside the preview.
 const LAYERS_W: f32 = 260.0;
 /// Between the page's columns.
 const COLUMN_GAP: f32 = 20.0;
-/// The mixer at its widest: its faders long enough to set a level by, not
-/// the page's width.
-const MIXER_W: f32 = 860.0;
+/// The sound under the layers and the preview takes this much of the
+/// page's height at most (its rows scroll past it).
+const SOUND_SHARE: f32 = 0.4;
 /// A row in the video's or the sound's list.
 const ROW_H: f32 = 36.0;
 /// A sound source's name, in its row, before its fader (less in a row too
@@ -90,8 +91,6 @@ pub(crate) struct SourcesView {
     pub(crate) row_drag: Option<(crate::canvas_ui::Layer, crate::canvas_ui::Arrangement)>,
     /// Displays for the Add menu, refreshed when it opens.
     pub(crate) add_displays: Vec<capture::Device>,
-    /// What the page beside the panel shows: the scene, or the sound.
-    pub(crate) part: crate::scenes_ui::Part,
     /// A dialog open (a preset made, renamed, deleted; a scene deleted).
     pub(crate) dialog: Option<crate::scenes_ui::Dialog>,
     /// A settings dialog open: a source's, the clip mix's or the video's.
@@ -113,10 +112,7 @@ pub(crate) fn open_dev(app: &mut App, names: &str) {
                     app.edit_layer(Layer::Webcam(k));
                 }
             }
-            "mix" => {
-                app.sources_view.part = crate::scenes_ui::Part::Sound;
-                app.sources_view.editing = Some(Editing::Mix);
-            }
+            "mix" => app.sources_view.editing = Some(Editing::Mix),
             "video" => app.sources_view.editing = Some(Editing::Video),
             "crop" => app.sources_view.crop_open = true,
             _ => {}
@@ -186,7 +182,6 @@ impl App {
     /// Sources, with the screen's settings open.
     pub(crate) fn show_screen_card(&mut self) {
         self.page = crate::Page::Sources;
-        self.sources_view.part = crate::scenes_ui::Part::Scene;
         self.sources_view.crop_open = false;
         self.webcam_view.crop = None;
         self.camera_panel = None;
@@ -241,20 +236,10 @@ impl App {
         let panel = egui::Rect::from_min_max(egui::pos2(edge, full.top()), egui::pos2(edge + crate::library_view::PANEL_W, full.bottom()));
         let page = egui::Rect::from_min_max(egui::pos2(if wide { panel.right() + 24.0 } else { full.left() }, full.top()), full.max);
         let mut page_ui = ui.new_child(egui::UiBuilder::new().max_rect(page).layout(egui::Layout::top_down(egui::Align::Min)));
-        let part = self.sources_view.part;
-        // The keys (undo, redo, and what's done to the source selected) are
-        // the scene editor's.
-        if part == crate::scenes_ui::Part::Scene {
-            self.source_keys(page_ui.ctx(), aspect);
-        }
+        // The keys: undo, redo, and what's done to the source selected.
+        self.source_keys(page_ui.ctx(), aspect);
         self.sources_head(&mut page_ui, wide);
-        let frame = crate::ui_kit::arrive(&mut page_ui, |ui| match part {
-            crate::scenes_ui::Part::Scene => self.scene_editor(ui, aspect),
-            crate::scenes_ui::Part::Sound => {
-                self.sound_page(ui, now, dt);
-                None
-            }
-        });
+        let frame = crate::ui_kit::arrive(&mut page_ui, |ui| self.scene_editor(ui, aspect, now, dt));
         if wide {
             let mut panel_ui = ui.new_child(egui::UiBuilder::new().max_rect(panel).layout(egui::Layout::top_down(egui::Align::Min)));
             self.sources_panel(&mut panel_ui);
@@ -263,32 +248,36 @@ impl App {
         self.live_audio.set_limiter(self.settings.limiter);
     }
 
-    /// The scene shown, in two places of its own: its layers, and the
-    /// preview beside them, as big as there's room for; narrow, the layers
-    /// under the preview. A source's settings are in a dialog (see
-    /// `inspector_ui`). The frame shown.
-    fn scene_editor(&mut self, ui: &mut egui::Ui, aspect: f32) -> Option<std::sync::Arc<capture::preview::PreviewFrame>> {
+    /// The scene shown, in three places of its own: its layers, the preview
+    /// beside them as big as there's room for, and under both the preset's
+    /// sound (the same in every scene), as tall as its rows. Narrow, the
+    /// preview's on top, the layers and the sound under it. A source's
+    /// settings are in a dialog (see `inspector_ui`). The frame shown.
+    fn scene_editor(&mut self, ui: &mut egui::Ui, aspect: f32, now: Instant, dt: f32) -> Option<std::sync::Arc<capture::preview::PreviewFrame>> {
         use egui::{Rect, pos2, vec2};
         ui.add_space(4.0);
         let area = ui.available_rect_before_wrap();
         let (w, h) = (area.width(), area.height());
         let place = |ui: &mut egui::Ui, r: Rect| ui.new_child(egui::UiBuilder::new().max_rect(r).layout(egui::Layout::top_down(egui::Align::Min)));
         let frame = if w >= ONE_COLUMN {
-            let layers = Rect::from_min_size(area.min, vec2(LAYERS_W, h));
-            let picture = Rect::from_min_max(pos2(layers.right() + COLUMN_GAP, area.top()), area.max);
+            let sound_h = self.sound_height().min(h * SOUND_SHARE);
+            let top = Rect::from_min_max(area.min, pos2(area.right(), area.bottom() - sound_h - crate::ui_kit::STACK_GAP));
+            let layers = Rect::from_min_size(top.min, vec2(LAYERS_W, top.height()));
+            let picture = Rect::from_min_max(pos2(layers.right() + COLUMN_GAP, top.top()), top.max);
             // The toolbar's over it.
-            let frame = self.picture_column(&mut place(ui, picture), (h - 40.0).max(120.0));
-            crate::ui_kit::scroll(&mut place(ui, layers), "scene_layers", |ui| {
-                self.video_list(ui, frame.as_deref(), aspect);
-                ui.add_space(28.0);
-            });
+            let frame = self.picture_column(&mut place(ui, picture), (top.height() - 40.0).max(120.0));
+            crate::ui_kit::scroll(&mut place(ui, layers), "scene_layers", |ui| self.video_list(ui, frame.as_deref(), aspect));
+            let sound = Rect::from_min_max(pos2(area.left(), area.bottom() - sound_h), area.max);
+            crate::ui_kit::scroll(&mut place(ui, sound), "scene_sound", |ui| self.sound_list(ui, now, dt));
             frame
         } else {
             let mut top = place(ui, area);
-            let frame = self.picture_column(&mut top, h * 0.55);
+            let frame = self.picture_column(&mut top, h * 0.45);
             let below = Rect::from_min_max(pos2(area.left(), top.min_rect().bottom()), area.max);
-            crate::ui_kit::scroll(&mut place(ui, below), "scene_layers", |ui| {
+            crate::ui_kit::scroll(&mut place(ui, below), "scene_lists", |ui| {
                 self.video_list(ui, frame.as_deref(), aspect);
+                crate::ui_kit::gap(ui, crate::ui_kit::STACK_GAP);
+                self.sound_list(ui, now, dt);
                 ui.add_space(28.0);
             });
             frame
@@ -297,17 +286,11 @@ impl App {
         frame
     }
 
-    /// The preset's sound: its mixer, as wide as is useful. Each source's
-    /// settings, and the clip mix's, are in a dialog.
-    fn sound_page(&mut self, ui: &mut egui::Ui, now: Instant, dt: f32) {
-        ui.add_space(4.0);
-        crate::ui_kit::scroll(ui, "sound_mixer", |ui| {
-            ui.vertical(|ui| {
-                ui.set_width(ui.available_width().min(MIXER_W));
-                self.sound_list(ui, now, dt);
-                ui.add_space(28.0);
-            });
-        });
+    /// How tall the sound is with all of it showing: its head, then the
+    /// clip mix's row and each source's (or the line saying there's none).
+    fn sound_height(&self) -> f32 {
+        let rows = 1 + self.settings.audio_sources.len().max(1);
+        50.0 + rows as f32 * (ROW_H + 6.0)
     }
 
     /// Over the preview: undo, redo and the video's size; then the preview
@@ -634,16 +617,28 @@ impl App {
         }
     }
 
-    /// The sound: the clip's mix first, then each source, a row each with
-    /// its level and volume as one control, its volume as a number, and
-    /// mute. Twice on a row, or its settings button, opens its settings; Add
-    /// puts another in.
+    /// The preset's sound, the same in every scene: the clip's mix first,
+    /// then each source, a row each with its level and volume as one
+    /// control, its volume as a number, and mute. Twice on a row, or its
+    /// settings button, opens its settings; Add puts another in. While
+    /// capturing, a lock by its name says what changes now and what waits.
     fn sound_list(&mut self, ui: &mut egui::Ui, now: Instant, dt: f32) {
         use crate::theme::{self, W};
         let pal = theme::pal(ui);
         ui.horizontal(|ui| {
             ui.set_min_height(30.0);
-            ui.label(theme::text("Mixer", 15.0, W::Semibold).color(pal.text));
+            ui.spacing_mut().item_spacing.x = 8.0;
+            ui.add(egui::Label::new(theme::text("Sound", 15.0, W::Semibold).color(pal.text)).sense(Sense::hover())).on_hover_text("The preset's sound: the same in every scene");
+            if !self.rec_state.idle() {
+                let mic = if cfg!(target_os = "linux") { ", noise removal" } else { ", noise removal and which microphone" };
+                let stop = format!("Stop {}", self.rec_state.words());
+                let note = if capture::SOURCES_WHILE_CAPTURING {
+                    format!("Volume, mute{mic} change right away, as do sources added, turned off or removed. {stop} to move one or change where it goes.")
+                } else {
+                    format!("Volume, mute{mic} change right away. {stop} to add or remove sources.")
+                };
+                ui.add(egui::Label::new(theme::ic(egui_phosphor::regular::LOCK_SIMPLE, 12.0).color(pal.text3)).sense(Sense::hover())).on_hover_text(note);
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| self.sound_add_menu(ui));
         });
         ui.add_space(4.0);
@@ -670,22 +665,6 @@ impl App {
             self.sound_action(i, a);
         }
         self.keep_listening();
-        let capturing = !self.rec_state.idle();
-        crate::ui_kit::reveal(ui, "sources_locked", capturing, |ui| {
-            ui.add_space(10.0);
-            let mic = if cfg!(target_os = "linux") { ", noise removal" } else { ", noise removal and which microphone" };
-            let stop = format!("Stop {}", self.rec_state.words());
-            let note = if capture::SOURCES_WHILE_CAPTURING {
-                format!("Volume, mute{mic} change right away, as do sources added, turned off or removed. {stop} to move one or change where it goes.")
-            } else {
-                format!("Volume, mute{mic} change right away. {stop} to add or remove sources.")
-            };
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                ui.label(theme::ic(egui_phosphor::regular::LOCK_SIMPLE, 12.0).color(pal.text3));
-                ui.add(egui::Label::new(theme::text(note, 12.0, W::Regular).color(pal.text3)).wrap());
-            });
-        });
     }
 
     /// The clip's mix, first in the sound's list: its level (both sides),
@@ -819,10 +798,20 @@ impl App {
             }
             crate::ui_kit::menu_sep(ui);
         }
-        if Item::new("Move up").icon(icon::CARET_UP).enabled(i > 0 && locked.is_none()).show(ui).clicked() {
+        let up = Item::new("Move up").icon(icon::CARET_UP).enabled(i > 0 && locked.is_none());
+        let up = match &locked {
+            Some(why) => up.tip(why.clone()),
+            None => up,
+        };
+        if up.show(ui).clicked() {
             action = Some(CardAction::MoveUp);
         }
-        if Item::new("Move down").icon(icon::CARET_DOWN).enabled(i + 1 < n && locked.is_none()).show(ui).clicked() {
+        let down = Item::new("Move down").icon(icon::CARET_DOWN).enabled(i + 1 < n && locked.is_none());
+        let down = match &locked {
+            Some(why) => down.tip(why.clone()),
+            None => down,
+        };
+        if down.show(ui).clicked() {
             action = Some(CardAction::MoveDown);
         }
         crate::ui_kit::menu_sep(ui);

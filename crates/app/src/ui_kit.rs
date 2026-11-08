@@ -269,37 +269,6 @@ fn eased_now(e: &Eased, now: f64) -> f32 {
     e.from + (e.to - e.from) * theme::ease_out(t)
 }
 
-/// Something that comes and goes (a note, a warning): while `shown` it's
-/// there; it fades and its height slides as it changes, so what's below
-/// moves smoothly. Keeps the last content to fade it out with when `add`
-/// isn't given (pass the same `id`).
-pub fn reveal(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::Debug, shown: bool, add: impl FnOnce(&mut egui::Ui)) {
-    let id = egui::Id::new(id).with("reveal");
-    let t = theme::toggle(ui.ctx(), id, shown, theme::NORMAL);
-    if t <= 0.0 {
-        return;
-    }
-    if t < 1.0 {
-        moving(ui.ctx());
-    }
-    let full = ui.data(|d| d.get_temp::<f32>(id.with("h")));
-    let top = ui.cursor().min;
-    let width = ui.available_width();
-    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_size(top, vec2(width, 100_000.0))).layout(egui::Layout::top_down(egui::Align::Min)));
-    let h = full.map(|f| f * theme::ease_out(t));
-    if let Some(h) = h.filter(|_| t < 1.0) {
-        child.set_clip_rect(Rect::from_min_size(top, vec2(width, h)).intersect(ui.clip_rect()));
-    }
-    child.multiply_opacity(t);
-    add(&mut child);
-    let real = child.min_rect().height();
-    if shown {
-        ui.data_mut(|d| d.insert_temp(id.with("h"), real));
-    }
-    let h = if t >= 1.0 { real } else { full.unwrap_or(real) * theme::ease_out(t) };
-    ui.allocate_space(vec2(width, h));
-}
-
 /// A group: content on the raised surface, padded. Its height eases when
 /// what's in it changes (see [`eased_frame`]); `id` names it on its page.
 pub fn card<R>(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::Debug, add: impl FnOnce(&mut egui::Ui) -> R) -> R {

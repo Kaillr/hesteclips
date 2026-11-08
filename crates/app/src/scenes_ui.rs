@@ -1,9 +1,9 @@
 //! The Sources page's frame, as Clips and Settings have theirs: the panel
-//! with the preset in use, its scenes and its sound; the page beside it
-//! shows what's picked there (`sources_ui`: the scene editor, the sound's
-//! page). Presets and scenes are made, renamed, put in order and deleted
-//! here. A scene picked is shown, live while capturing; a preset picked is
-//! used (see `App::apply_switch`).
+//! with the preset in use and its scenes; the page beside it shows the
+//! scene picked (`sources_ui`: its layers and preview, and the preset's
+//! sound under them). Presets and scenes are made, renamed, put in order
+//! and deleted here. A scene picked is shown, live while capturing; a
+//! preset picked is used (see `App::apply_switch`).
 
 use egui::{Align2, Pos2, Rect, Sense, vec2};
 use egui_phosphor::regular as icon;
@@ -11,16 +11,6 @@ use egui_phosphor::regular as icon;
 use crate::App;
 use crate::theme::{self, W};
 use crate::ui_kit::{self, Btn, Dismissed, Item, Kind, Seg};
-
-/// What the page beside the panel shows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum Part {
-    /// The scene shown: its layers and its preview.
-    #[default]
-    Scene,
-    /// The preset's sound: its mixer.
-    Sound,
-}
 
 /// One of the Sources page's dialogs, open.
 #[derive(Debug, Clone, PartialEq)]
@@ -36,23 +26,11 @@ pub(crate) enum Dialog {
 }
 
 impl App {
-    /// Show scene `id`, and its page.
-    pub(crate) fn pick_scene(&mut self, id: u64) {
-        self.sources_view.part = Part::Scene;
-        self.show_scene(id);
-    }
-
-    /// The preset's sound, on its page.
-    pub(crate) fn pick_sound(&mut self) {
-        self.sources_view.part = Part::Sound;
-        self.canvas.selected = None;
-    }
-
     /// A new scene, after the one shown (a copy of it, or just the screen),
     /// shown at once.
     pub(crate) fn new_scene(&mut self, copy: bool) {
         let id = self.settings.add_scene(copy);
-        self.pick_scene(id);
+        self.show_scene(id);
     }
 
     /// Use preset `id` when it can be: now while nothing runs; while only
@@ -78,7 +56,7 @@ impl App {
     }
 
     /// The panel, where Clips and Settings have theirs: the title, the
-    /// preset in use, then the card of its scenes and its sound.
+    /// preset in use, then the card of its scenes.
     pub(crate) fn sources_panel(&mut self, ui: &mut egui::Ui) {
         let p = theme::pal(ui);
         let rect = ui.max_rect();
@@ -104,7 +82,7 @@ impl App {
         });
     }
 
-    /// The card's rows: the scenes (+ adds one), then the sound.
+    /// The card's rows: the scenes (+ adds one).
     fn panel_rows(&mut self, ui: &mut egui::Ui) {
         let p = theme::pal(ui);
         ui.horizontal(|ui| {
@@ -120,10 +98,6 @@ impl App {
         for id in ids {
             self.scene_row(ui, id);
         }
-        ui.add_space(4.0);
-        ui_kit::divider(ui, 8.0);
-        ui.add_space(4.0);
-        self.panel_sound_row(ui);
     }
 
     /// New scene, and a copy of the one shown: under + and in menus.
@@ -144,7 +118,6 @@ impl App {
         let p = theme::pal(ui);
         let Some(name) = self.settings.scenes.iter().find(|s| s.id == id).map(|s| s.name.clone()) else { return };
         let shown = id == self.settings.active_scene;
-        let chosen = shown && self.sources_view.part == Part::Scene;
         let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::hover());
         let rename_id = egui::Id::new(("rename_scene", id));
         let draft_id = rename_id.with("draft");
@@ -163,8 +136,8 @@ impl App {
         // Hovered as a whole, its menu button too (that takes the hover).
         let over = ui.rect_contains_pointer(rect);
         let hv = theme::toggle(ui.ctx(), resp.id.with("hv"), over, theme::FAST);
-        let on = theme::toggle(ui.ctx(), resp.id.with("on"), chosen, theme::NORMAL);
-        if hv > 0.0 && !chosen {
+        let on = theme::toggle(ui.ctx(), resp.id.with("on"), shown, theme::NORMAL);
+        if hv > 0.0 && !shown {
             ui.painter().rect_filled(rect, ui_kit::RADIUS, theme::fade(p.sb_hover, hv));
         }
         if on > 0.0 {
@@ -181,14 +154,14 @@ impl App {
             ui.painter().circle_filled(Pos2::new(rect.left() + 13.0, rect.center().y), 3.5, color);
         }
         let text = theme::mix(theme::mix(p.text2, p.text, hv), p.text, on);
-        let job = ui_kit::single_line_job(&name, theme::font(13.5, if chosen { W::Medium } else { W::Regular }), text, rect.width() - 26.0 - 34.0);
+        let job = ui_kit::single_line_job(&name, theme::font(13.5, if shown { W::Medium } else { W::Regular }), text, rect.width() - 26.0 - 34.0);
         let g = ui.painter().layout_job(job);
         ui.painter().galley(Pos2::new(rect.left() + 26.0, rect.center().y - g.size().y / 2.0), g, text);
         // Its menu's button: on hover (and the one shown), and while its menu
         // is open (the pointer's in the menu then, off the row).
         let open_key = egui::Id::new(("scene_menu_open", id));
         let menu_open = ui.data(|d| d.get_temp::<bool>(open_key)).unwrap_or(false);
-        if over || chosen || menu_open {
+        if over || shown || menu_open {
             let more = Rect::from_center_size(Pos2::new(rect.right() - 16.0, rect.center().y), vec2(24.0, 24.0));
             let mut mui = ui.new_child(egui::UiBuilder::new().id_salt(("scene_more", id)).max_rect(more).layout(egui::Layout::left_to_right(egui::Align::Center)));
             let b = Btn::icon(Kind::Ghost, icon::DOTS_THREE).small().tip("Rename, duplicate, move, delete").show(&mut mui);
@@ -201,7 +174,7 @@ impl App {
         if resp.double_clicked() {
             ui.data_mut(|d| d.insert_temp(draft_id, name));
         } else if resp.clicked() {
-            self.pick_scene(id);
+            self.show_scene(id);
         }
     }
 
@@ -217,7 +190,7 @@ impl App {
         if Item::new("Duplicate").icon(icon::COPY).show(ui).clicked()
             && let Some(new) = self.settings.duplicate_scene(id)
         {
-            self.pick_scene(new);
+            self.show_scene(new);
         }
         ui_kit::menu_sep(ui);
         if Item::new("Move up").icon(icon::ARROW_UP).enabled(at > 0).show(ui).clicked() {
@@ -231,36 +204,6 @@ impl App {
         let delete = if count > 1 { delete } else { delete.tip("A preset has one scene at least") };
         if delete.show(ui).clicked() {
             self.sources_view.dialog = Some(Dialog::DeleteScene(id));
-        }
-    }
-
-    /// The sound's row: what's on, in a few words. A click shows its page.
-    fn panel_sound_row(&mut self, ui: &mut egui::Ui) {
-        let p = theme::pal(ui);
-        let chosen = self.sources_view.part == Part::Sound;
-        let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 36.0), Sense::click());
-        let hv = theme::toggle(ui.ctx(), resp.id.with("hv"), resp.hovered(), theme::FAST);
-        let on = theme::toggle(ui.ctx(), resp.id.with("on"), chosen, theme::NORMAL);
-        if hv > 0.0 && !chosen {
-            ui.painter().rect_filled(rect, ui_kit::RADIUS, theme::fade(p.sb_hover, hv));
-        }
-        if on > 0.0 {
-            ui.painter().rect_filled(rect, ui_kit::RADIUS, theme::fade(p.sb_sel, on));
-        }
-        let text = theme::mix(theme::mix(p.text2, p.text, hv), p.text, on);
-        let lead = Pos2::new(rect.left() + 13.0, rect.center().y);
-        ui.painter().text(lead, Align2::CENTER_CENTER, egui_phosphor::fill::SPEAKER_HIGH, egui::FontId::new(15.0, theme::fill_family()), text);
-        let label = ui.painter().text(Pos2::new(rect.left() + 26.0, rect.center().y), Align2::LEFT_CENTER, "Sound", theme::font(13.5, if chosen { W::Medium } else { W::Regular }), text);
-        let names: Vec<&str> = self.settings.audio_sources.iter().filter(|s| s.enabled).map(|s| s.name.as_str()).collect();
-        let summary = if names.is_empty() { "None".to_owned() } else { names.join(", ") };
-        let room = rect.right() - 10.0 - (label.right() + 12.0);
-        if room > 30.0 {
-            let job = ui_kit::single_line_job(&summary, theme::font(12.0, W::Regular), p.text3, room);
-            let g = ui.painter().layout_job(job);
-            ui.painter().galley(Pos2::new(rect.right() - 10.0 - g.size().x, rect.center().y - g.size().y / 2.0), g, p.text3);
-        }
-        if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-            self.pick_sound();
         }
     }
 
@@ -322,44 +265,35 @@ impl App {
         }
     }
 
-    /// The heading's left side: the scene's name, or Sound; with the panel
-    /// folded away (a narrow window), the preset and a menu of the scenes
-    /// and the sound instead.
+    /// The heading's left side: the scene's name; with the panel folded
+    /// away (a narrow window), the preset and a menu of the scenes instead.
     pub(crate) fn sources_head(&mut self, ui: &mut egui::Ui, wide: bool) {
         self.page_head_folding(ui, "", |app, ui, _| {
             let p = theme::pal(ui);
-            let title = match app.sources_view.part {
-                Part::Scene => app.settings.scene().map(|s| s.name.clone()).unwrap_or_default(),
-                Part::Sound => "Sound".to_owned(),
-            };
+            let title = app.settings.scene().map(|s| s.name.clone()).unwrap_or_default();
             if wide {
                 ui.label(theme::text(&title, 15.0, W::Semibold).color(p.text));
             } else {
                 app.preset_picker(ui, 150.0_f32.min(ui.available_width() * 0.45));
                 ui.add_space(4.0);
-                app.part_menu(ui, &title);
+                app.scenes_menu(ui, &title);
             }
         });
     }
 
-    /// The scenes and the sound in a menu on the heading, when the window's
-    /// too narrow for the panel.
-    fn part_menu(&mut self, ui: &mut egui::Ui, title: &str) {
-        let r = Btn::ghost(title).trail(icon::CARET_DOWN).id("sources_part_menu").show(ui);
+    /// The scenes in a menu on the heading, when the window's too narrow
+    /// for the panel.
+    fn scenes_menu(&mut self, ui: &mut egui::Ui, title: &str) {
+        let r = Btn::ghost(title).trail(icon::CARET_DOWN).id("sources_scenes_menu").show(ui);
         ui_kit::menu_popup(&r, true, 230.0, |ui| {
             let scenes: Vec<(u64, String)> = self.settings.scenes.iter().map(|s| (s.id, s.name.clone())).collect();
             for (id, name) in scenes {
-                let on = self.sources_view.part == Part::Scene && id == self.settings.active_scene;
-                if Item::new(name).check(on).show(ui).clicked() {
-                    self.pick_scene(id);
+                if Item::new(name).check(id == self.settings.active_scene).show(ui).clicked() {
+                    self.show_scene(id);
                 }
             }
             ui_kit::menu_sep(ui);
             self.add_scene_items(ui);
-            ui_kit::menu_sep(ui);
-            if Item::new("Sound").icon(icon::SPEAKER_HIGH).check(self.sources_view.part == Part::Sound).show(ui).clicked() {
-                self.pick_sound();
-            }
         });
     }
 
