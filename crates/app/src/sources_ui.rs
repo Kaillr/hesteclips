@@ -125,12 +125,13 @@ pub(crate) fn open_dev(app: &mut App, names: &str) {
 pub(crate) type PreviewSetup = (capture::VideoSource, capture::VideoSize, u32, Option<capture::webcam::Webcam>, bool);
 
 /// How wide a sound source's name is in a row `row_w` wide: [`NAME_W`], less
-/// in a row too narrow for it beside the controls (a problem's mark, the
-/// fader at [`MIN_FADER`], the volume, mute and the settings button; see
-/// `sound_row`), so they never run past the row's edge. The clip's mix's
-/// meter starts there too.
+/// in a row too narrow for it beside the controls (the fader at
+/// [`MIN_FADER`], the volume, mute and the settings button; see
+/// `sound_row`), so they never run past the row's edge. A problem's mark
+/// goes after the name, in its room. The clip's mix's meter starts there
+/// too.
 fn name_width(row_w: f32) -> f32 {
-    (row_w - 36.0 - GEAR_ROOM - 22.0 - MIN_FADER - 66.0 - 26.0 - 12.0).clamp(48.0, NAME_W)
+    (row_w - 36.0 - GEAR_ROOM - MIN_FADER - 66.0 - 26.0 - 12.0).clamp(48.0, NAME_W)
 }
 
 /// What a row keeps at its right end for its settings button.
@@ -735,11 +736,20 @@ impl App {
             ui.painter().text(lead.center(), Align2::CENTER_CENTER, glyph, FontId::proportional(16.0), dim(pal.text2));
         }
         let name_w = name_width(rect.width());
-        let name_job = crate::ui_kit::single_line_job(&s.name, theme::font(13.5, W::Medium), dim(if s.muted { pal.text2 } else { pal.text }), name_w - 8.0);
-        let g = ui.painter().layout_job(name_job);
-        ui.painter().galley(pos2(rect.left() + 36.0, cy - g.size().y / 2.0), g, pal.text);
-        // What's wrong with it, on its row: a mark (its words on hover).
+        // What's wrong with it, on its row: a mark after its name (its words
+        // on hover), the name a little shorter for it; the fader keeps its
+        // length.
         let problem = status_text(channel.status()).filter(|_| on);
+        let mark_room = if problem.is_some() { 22.0 } else { 0.0 };
+        let name_job = crate::ui_kit::single_line_job(&s.name, theme::font(13.5, W::Medium), dim(if s.muted { pal.text2 } else { pal.text }), name_w - 8.0 - mark_room);
+        let g = ui.painter().layout_job(name_job);
+        let name_end = rect.left() + 36.0 + g.size().x;
+        ui.painter().galley(pos2(rect.left() + 36.0, cy - g.size().y / 2.0), g, pal.text);
+        if let Some((text, color)) = problem {
+            let r = egui::Rect::from_center_size(pos2(name_end + 13.0, cy), vec2(16.0, 16.0));
+            ui.painter().text(r.center(), Align2::CENTER_CENTER, egui_phosphor::regular::WARNING, FontId::proportional(14.0), color(pal));
+            ui.interact(r, resp.id.with("problem"), Sense::hover()).on_hover_text(text);
+        }
         // The fader, its value and mute, in what's left of the row (but its
         // settings button's room).
         let controls = egui::Rect::from_min_max(pos2(rect.left() + 36.0 + name_w, rect.top()), pos2(rect.right() - GEAR_ROOM, rect.bottom()));
@@ -748,12 +758,7 @@ impl App {
             let mut cui = ui.new_child(egui::UiBuilder::new().max_rect(controls).layout(egui::Layout::left_to_right(egui::Align::Center)));
             cui.spacing_mut().item_spacing.x = 6.0;
             let source = &mut self.settings.audio_sources[i];
-            let fader_w = (controls.width() - 66.0 - 26.0 - 12.0 - if problem.is_some() { 22.0 } else { 0.0 }).max(40.0);
-            if let Some((text, color)) = problem {
-                let (r, warn) = cui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
-                cui.painter().text(r.center(), Align2::CENTER_CENTER, egui_phosphor::regular::WARNING, FontId::proportional(14.0), color(pal));
-                warn.on_hover_text(text);
-            }
+            let fader_w = (controls.width() - 66.0 - 26.0 - 12.0).max(40.0);
             let state = if source.muted { &meters.input } else { &meters.output };
             let fresp = fader(&mut cui, &mut source.volume_db, state, source.muted, fader_w, &source.id);
             volume_value(&mut cui, &mut source.volume_db, fresp.secondary_clicked(), &source.id);

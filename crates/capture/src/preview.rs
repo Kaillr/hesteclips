@@ -30,8 +30,9 @@ pub const AVAILABLE: bool = cfg!(any(target_os = "windows", target_os = "macos",
 pub struct PreviewFrame {
     pub width: u32,
     pub height: u32,
-    /// The size being recorded: the picture's own, except on Linux and
-    /// Windows, where it's shrunk to about the size it's shown at.
+    /// The size being recorded: the picture's own, except on Linux, where
+    /// it's shrunk to 720p at most, and on Windows past 1440p (a 4K
+    /// recording's is halved).
     pub recorded: (u32, u32),
     pub rgba: Vec<u8>,
     #[cfg(target_os = "macos")]

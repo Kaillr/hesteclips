@@ -1389,9 +1389,11 @@ impl Drop for Previewer {
 }
 
 /// The preview's size for a recording of `width`×`height`: the same, at most
-/// [`PREVIEW_MAX_WIDTH`] wide. The Sources page shows it under 900 points
-/// wide; at a 1440p recording's size every frame was 15 MB to read back from
-/// the graphics card, copy and upload, 60 times a second.
+/// [`PREVIEW_MAX_WIDTH`] wide. It's full size up to 1440p: the Sources page
+/// shows it big, and things are lined up on it to the pixel (shrunk to
+/// 1280, a 1080p picture was drawn soft, its pixels guessed back). A 4K
+/// one is halved: every frame is read back from the graphics card, copied
+/// and uploaded, 60 times a second.
 fn preview_size(width: u32, height: u32) -> (u32, u32) {
     if width <= PREVIEW_MAX_WIDTH {
         return (width, height);
@@ -1399,7 +1401,7 @@ fn preview_size(width: u32, height: u32) -> (u32, u32) {
     (PREVIEW_MAX_WIDTH, ((height as u64 * PREVIEW_MAX_WIDTH as u64 / width as u64) as u32 / 2 * 2).max(2))
 }
 
-const PREVIEW_MAX_WIDTH: u32 = 1280;
+const PREVIEW_MAX_WIDTH: u32 = 2560;
 
 #[cfg(test)]
 mod priority_tests {
