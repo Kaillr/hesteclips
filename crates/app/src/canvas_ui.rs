@@ -165,6 +165,8 @@ pub(crate) struct CanvasView {
     /// `visuals_ui`.
     pub(crate) sizes: std::collections::HashMap<u64, (Option<(u32, u32)>, std::time::Instant)>,
     pub(crate) pictures: std::collections::HashMap<u64, (crate::settings::Visual, Option<std::sync::Arc<capture::StillImage>>)>,
+    /// Words being drawn, by key: as what they were, the picture to come.
+    pub(crate) drawing: std::collections::HashMap<u64, (crate::settings::Visual, std::sync::mpsc::Receiver<capture::StillImage>)>,
     /// Whether the computer's fonts were found when words were last drawn.
     pub(crate) fonts_found: bool,
     /// Arrangements to go back to (Ctrl+Z), and forward again.

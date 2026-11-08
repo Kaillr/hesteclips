@@ -18,6 +18,10 @@ impl App {
     /// Each image's and words' picture, made again when what it shows
     /// changes (its file, its words, their look; words again once the
     /// computer's fonts are found). Every frame: unchanged, it's kept.
+    /// Words are drawn on a thread of their own, the picture they had
+    /// showing till the new one's done: drawing them (an outline, a shadow)
+    /// can take longer than a frame, and a colour being picked changes
+    /// them every frame.
     pub(crate) fn refresh_visual_pictures(&mut self) {
         let wanted: Vec<(u64, Visual)> = self.settings.visuals.iter().filter(|v| matches!(v.visual, Visual::Image { .. } | Visual::Text(_))).map(|v| (v.key, v.visual.clone())).collect();
         self.canvas.pictures.retain(|k, _| wanted.iter().any(|(w, _)| w == k));
@@ -27,8 +31,40 @@ impl App {
             self.canvas.fonts_found = fonts;
             self.canvas.pictures.retain(|_, (v, _)| !matches!(v, Visual::Text(s) if !s.font.is_empty()));
         }
+        self.canvas.drawing.retain(|k, _| wanted.iter().any(|(w, _)| w == k));
         for (key, visual) in wanted {
             if self.canvas.pictures.get(&key).is_some_and(|(was, _)| *was == visual) {
+                continue;
+            }
+            if let Visual::Text(style) = &visual {
+                let done = match self.canvas.drawing.get(&key).map(|(_, rx)| rx.try_recv()) {
+                    Some(Ok(p)) => self.canvas.drawing.remove(&key).map(|(drawn, _)| (drawn, p)),
+                    Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                        self.canvas.drawing.remove(&key);
+                        None
+                    }
+                    _ => None,
+                };
+                if let Some((drawn, p)) = done {
+                    let before = self.visual_picture(key).map(|p| (p.width, p.height));
+                    let size = (p.width, p.height);
+                    let current = drawn == visual;
+                    self.canvas.pictures.insert(key, (drawn, Some(Arc::new(p))));
+                    self.fit_words_box(key, before, size);
+                    if current {
+                        continue;
+                    }
+                }
+                // Drawing them as they are now, unless they're being drawn
+                // (as they were): the next frame after that one's done.
+                if !self.canvas.drawing.contains_key(&key) {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    let style = style.clone();
+                    std::thread::spawn(move || {
+                        let _ = tx.send(render_text(&style));
+                    });
+                    self.canvas.drawing.insert(key, (visual.clone(), rx));
+                }
                 continue;
             }
             let picture = match &visual {
@@ -39,14 +75,9 @@ impl App {
                         None
                     }
                 },
-                Visual::Text(style) => Some(Arc::new(render_text(style))),
                 _ => None,
             };
-            let before = self.visual_picture(key).map(|p| (p.width, p.height));
-            self.canvas.pictures.insert(key, (visual.clone(), picture.clone()));
-            if let (Visual::Text(_), Some(p)) = (&visual, picture) {
-                self.fit_words_box(key, before, (p.width, p.height));
-            }
+            self.canvas.pictures.insert(key, (visual.clone(), picture));
         }
         // Words not placed yet (the video's shape wasn't known): now.
         let unplaced: Vec<u64> = self.settings.visuals.iter().filter(|v| v.placed.is_none() && matches!(v.visual, Visual::Text(_))).map(|v| v.key).collect();

@@ -25,7 +25,7 @@ use crate::ui_kit::{self, Btn, Dismissed, Item, Kind, Row, Seg};
 /// camera's or a display's name beside its label, and Size's two boxes
 /// beside theirs (a row puts its control under its label when the two don't
 /// fit side by side).
-const DIALOG_W: f32 = 440.0;
+const DIALOG_W: f32 = 540.0;
 /// The look at the video in a video source's dialog, at its tallest.
 const PICTURE_H: f32 = 220.0;
 
@@ -90,7 +90,25 @@ impl App {
         // What scrolls in the dialog is at most this tall: the window's
         // height, the dialog's margins, head and buttons aside.
         let room = (ctx.content_rect().height() - 190.0).max(200.0);
-        let typing = ctx.memory(|m| m.focused().is_some());
+        // Opening, the keys are the dialog's: what had them on the page
+        // lets go (words get theirs at once, to type).
+        let shown = egui::Id::new("source_settings_shown");
+        let pass = ctx.cumulative_pass_nr();
+        let opening = ctx.data(|d| d.get_temp::<u64>(shown)).is_none_or(|last| last + 1 < pass);
+        ctx.data_mut(|d| d.insert_temp(shown, pass));
+        if opening {
+            ctx.memory_mut(|m| {
+                if let Some(f) = m.focused() {
+                    m.surrender_focus(f);
+                }
+            });
+            if let Editing::Layer { layer: Layer::Visual(key), .. } = &editing
+                && matches!(self.settings.visual(*key).map(|v| &v.visual), Some(Visual::Text(_)))
+            {
+                ctx.memory_mut(|m| m.request_focus(egui::Id::new(("text_words", *key))));
+            }
+        }
+        let typing = !opening && ctx.memory(|m| m.focused().is_some());
         let was = self.arrangement();
         let modal = ui_kit::dialog(ctx, "source_settings", DIALOG_W, |ui| {
             match &editing {
@@ -633,7 +651,7 @@ impl App {
             wide_row(l, "Words", &mut |ui| {
                 // Free text: the words a text source shows, a line each.
                 #[allow(clippy::disallowed_methods)]
-                let edit = egui::TextEdit::multiline(&mut s.text).desired_rows(2).desired_width(f32::INFINITY).font(theme::font(14.0, W::Regular));
+                let edit = egui::TextEdit::multiline(&mut s.text).id(egui::Id::new(("text_words", key))).desired_rows(2).desired_width(f32::INFINITY).font(theme::font(14.0, W::Regular));
                 let pal = theme::pal(ui);
                 egui::Frame::new().fill(pal.control).corner_radius(ui_kit::RADIUS).inner_margin(egui::Margin::symmetric(10, 7)).show(ui, |ui| ui.add(edit));
             });

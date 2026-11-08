@@ -1338,6 +1338,7 @@ impl App {
     pub(crate) fn after_preset_switch(&mut self) {
         push_live_audio(&self.live_audio, &self.settings);
         self.canvas.pictures.clear();
+        self.canvas.drawing.clear();
         self.canvas.sizes.clear();
         self.listening = None;
         self.canvas.selected = None;
