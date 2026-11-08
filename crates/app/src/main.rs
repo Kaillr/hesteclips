@@ -1503,6 +1503,7 @@ impl eframe::App for App {
         {
             let t = theme::toggle(&ctx, egui::Id::new("title_bar_page"), full, theme::NORMAL);
             shell::tint_title_bar(frame, theme::mix(p.ground, p.base, t), p.dark);
+            shell::keep_drawing_while_held(frame);
         }
         let framed = !full && shell::framed_page();
         let page_rect = ui.available_rect_before_wrap();

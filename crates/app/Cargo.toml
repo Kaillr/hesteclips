@@ -106,6 +106,7 @@ windows = { version = "0.62", features = [
     "Storage",
     "Storage_Streams",
     "Win32_Foundation",
+    "Win32_Graphics_Gdi",
     "Win32_Storage_FileSystem",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
