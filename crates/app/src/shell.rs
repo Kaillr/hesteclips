@@ -696,6 +696,7 @@ impl App {
                 crate::settings::SourceKind::Microphone { .. } => "mic".into(),
                 crate::settings::SourceKind::Desktop { .. } => "desktop".into(),
                 crate::settings::SourceKind::App { app_name, .. } => app_name.clone(),
+                crate::settings::SourceKind::Video { .. } => "video".into(),
             });
         }
         parts.dedup();

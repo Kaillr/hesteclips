@@ -178,6 +178,7 @@ fn sound_icon(s: &AudioSourceCfg) -> &'static str {
         SourceKind::Desktop { .. } => icon::SPEAKER_HIFI,
         SourceKind::App { app_name, .. } if app_name.to_lowercase().contains("discord") => icon::DISCORD_LOGO,
         SourceKind::App { .. } => icon::APP_WINDOW,
+        SourceKind::Video { .. } => icon::FILM_STRIP,
     }
 }
 
@@ -822,7 +823,7 @@ impl App {
             added = Some(crate::canvas_ui::Layer::Visual(self.add_visual(Visual::Image { path })));
         }
         if pick_video && let Some(path) = rfd::FileDialog::new().add_filter("Videos", &crate::inspector_ui::VIDEO_EXTS).pick_file() {
-            added = Some(crate::canvas_ui::Layer::Visual(self.add_visual(Visual::Video { path, looped: true, restart: true })));
+            added = Some(crate::canvas_ui::Layer::Visual(self.add_visual(Visual::Video { path, looped: true, restart: true, sound: true })));
         }
         match added {
             Some(l) if fill_in => self.edit_layer(l),
@@ -1063,6 +1064,12 @@ impl App {
         match a {
             CardAction::Remove => {
                 let s = self.settings.audio_sources.remove(i);
+                // A video's: its sound off (its settings turn it on again).
+                if let SourceKind::Video { key } = s.kind
+                    && let Some(crate::settings::Visual::Video { sound, .. }) = self.settings.visual_mut(key).map(|v| &mut v.visual)
+                {
+                    *sound = false;
+                }
                 self.toast_icon(egui_phosphor::regular::TRASH, format!("Removed {}", s.name));
             }
             CardAction::Settings => self.sources_view.editing = Some(crate::inspector_ui::Editing::Sound(self.settings.audio_sources[i].id.clone())),
@@ -1234,6 +1241,7 @@ impl App {
             SourceKind::Desktop { .. } => "Everything your computer plays".to_owned(),
             SourceKind::App { app_name, .. } => format!("Only {app_name}"),
             SourceKind::Microphone { .. } => "Microphone".to_owned(),
+            SourceKind::Video { .. } => "A video's sound, as it plays".to_owned(),
         };
         ui.horizontal(|ui| {
             ui.add_space(26.0);
@@ -1297,6 +1305,7 @@ impl App {
                         ui.label(theme::text(app_name, 13.0, W::Regular).color(pal.text2));
                     });
                 }
+                SourceKind::Video { .. } => {}
             }
             let route = Route::of(&self.settings.audio_sources[i]);
             let row = Row::new("Goes into").tip("Where it goes", "Clip sound: part of what everyone hears when you play or share a clip. Own track: also kept on its own, so you can change its volume later in the editor.").locked(locked.clone());

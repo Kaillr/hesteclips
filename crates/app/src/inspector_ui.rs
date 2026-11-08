@@ -591,28 +591,38 @@ impl App {
                     }
                 });
             }
-            Visual::Video { path, looped, restart } => {
+            Visual::Video { path, looped, restart, sound } => {
                 let name = path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+                let video = |path: &std::path::Path, looped: bool, restart: bool, sound: bool| Visual::Video { path: path.to_owned(), looped, restart, sound };
                 l.row(Row::new("File").note(name), |ui| {
                     if Btn::normal("Choose…").small().tip("Another video").show(ui).clicked()
                         && let Some(p) = rfd::FileDialog::new().add_filter("Videos", &VIDEO_EXTS).pick_file()
                     {
-                        set = Some(Visual::Video { path: p, looped: *looped, restart: *restart });
+                        set = Some(video(&p, *looped, *restart, *sound));
                     }
                 });
                 l.row(Row::new("Loop").note("From the start again when it ends; off, its last picture stays"), |ui| {
                     let mut on = *looped;
                     if ui_kit::switch(ui, &mut on).changed() {
-                        set = Some(Visual::Video { path: path.clone(), looped: on, restart: *restart });
+                        set = Some(video(path, on, *restart, *sound));
                     }
                 });
                 l.row(Row::new("Restart when shown").note("From the start each time its scene is shown, or it's shown again; off, it goes on where it was"), |ui| {
                     let mut on = *restart;
                     if ui_kit::switch(ui, &mut on).changed() {
-                        set = Some(Visual::Video { path: path.clone(), looped: *looped, restart: on });
+                        set = Some(video(path, *looped, on, *sound));
                     }
                 });
-                l.row(Row::new("Sound").note("Its picture only: its sound isn't in your clips"), |_| {});
+                // Its sound: a source of its own under Sound, its volume
+                // there; one without has nothing to turn on.
+                let has = self.canvas.video_sizes.get(path).copied().flatten().is_none_or(|i| i.3);
+                let note = if !has { "This video has none" } else if *sound { "In your clips, as it plays: its volume is under Sound" } else { "Off: it plays without" };
+                l.row(Row::new("Sound").note(note).locked((!has).then(|| "This video has no sound".to_owned())), |ui| {
+                    let mut on = *sound && has;
+                    if ui_kit::switch(ui, &mut on).changed() && has {
+                        set = Some(video(path, *looped, *restart, on));
+                    }
+                });
             }
             Visual::Browser { url, width, height, reload, css } => {
                 // Typed in full, then taken when it's done (Enter, or

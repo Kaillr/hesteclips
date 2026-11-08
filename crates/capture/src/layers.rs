@@ -55,9 +55,10 @@ pub enum LayerSource {
     /// (as its index says: the decoder's own can be far off): played from
     /// the start again at its end (`looped`; else its last picture stays),
     /// waiting while it's hidden and going on when it's shown again, or
-    /// starting over (`restart`). Placed as a display is (Windows: see
-    /// [`VIDEO`]).
-    Video { path: std::path::PathBuf, width: u32, height: u32, fps: f64, looped: bool, restart: bool, placement: ScreenPlacement },
+    /// starting over (`restart`). Its sound plays into the audio source
+    /// `sound` names, if it does (`sources::SourceKind::Video`). Placed as
+    /// a display is (Windows: see [`VIDEO`]).
+    Video { path: std::path::PathBuf, width: u32, height: u32, fps: f64, looped: bool, restart: bool, sound: Option<String>, placement: ScreenPlacement },
 }
 
 /// Whether this platform can show a web page as a layer.

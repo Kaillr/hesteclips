@@ -163,21 +163,37 @@ impl App {
             Visual::Window { app, .. } => asked(self, &|| capture::layers::app_window_size(app)),
             Visual::Image { .. } | Visual::Text(_) => self.visual_picture(key).map(|p| (p.width, p.height)),
             Visual::Browser { width, height, .. } => Some((*width, *height)),
-            Visual::Video { path, .. } => self.video_info(path).map(|(w, h, _)| (w, h)),
+            Visual::Video { path, .. } => self.video_info(path).map(|(w, h, _, _)| (w, h)),
             Visual::Colour { .. } => None,
         }
     }
 
-    /// A video file's size and frame rate (as its index says: what the
-    /// decoder says can be far off; 0 when it isn't known), asked for once
-    /// (opening it to find out takes a moment): `None` if it can't be
-    /// played.
-    pub(crate) fn video_info(&mut self, path: &std::path::Path) -> Option<(u32, u32, f64)> {
+    /// A video file's size, frame rate (as its index says: what the decoder
+    /// says can be far off; 0 when it isn't known) and whether it has sound,
+    /// asked for once (opening it to find out takes a moment): `None` if it
+    /// can't be played.
+    pub(crate) fn video_info(&mut self, path: &std::path::Path) -> Option<(u32, u32, f64, bool)> {
         *self.canvas.video_sizes.entry(path.to_owned()).or_insert_with(|| {
             let (w, h) = capture::layers::video_size(path)?;
-            let fps = media::probe(path).ok().map(|i| i.fps).filter(|f| f.is_finite() && *f > 0.0).unwrap_or(0.0);
-            Some((w, h, fps))
+            let info = media::probe(path).ok();
+            let fps = info.as_ref().map(|i| i.fps).filter(|f| f.is_finite() && *f > 0.0).unwrap_or(0.0);
+            // Not known (it couldn't be read for it): as if it has, to try.
+            let sound = info.is_none_or(|i| !i.audio.is_empty());
+            Some((w, h, fps, sound))
         })
+    }
+
+    /// Each video's sound source kept with it (see
+    /// `RecordSettings::sync_video_sounds`), by what its file has. Every
+    /// frame: anything can bring a video or take it away (added, pasted, an
+    /// undo, another preset).
+    pub(crate) fn sync_video_sounds(&mut self) {
+        let paths: Vec<std::path::PathBuf> = self.settings.visuals.iter().filter_map(|v| if let Visual::Video { path, sound: true, .. } = &v.visual { Some(path.clone()) } else { None }).collect();
+        for p in &paths {
+            self.video_info(p);
+        }
+        let known = &self.canvas.video_sizes;
+        self.settings.sync_video_sounds(|p| known.get(p).copied().flatten().is_some_and(|i| i.3));
     }
 
     /// A boxed source's picture's size as it shows: cropped, then turned.

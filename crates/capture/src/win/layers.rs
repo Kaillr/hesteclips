@@ -45,8 +45,8 @@ enum Feed {
     /// started) uploaded as it changes. `None` showing: too big to upload
     /// as it is, its first frame stays (shrunk).
     Animated { of: crate::layers::Animation, latest: Arc<Latest>, start: std::time::Instant, showing: Option<usize> },
-    /// A video file playing.
-    Video { path: std::path::PathBuf, size: (u32, u32), video: VideoFeed },
+    /// A video file playing (its sound into the source `sound`, if any).
+    Video { path: std::path::PathBuf, size: (u32, u32), sound: Option<String>, video: VideoFeed },
 }
 
 /// What a still layer's picture was made from.
@@ -76,7 +76,7 @@ impl Feed {
             (Feed::Still { of: Still::Picture(p), .. }, LayerSource::Picture { picture, .. }) => p == picture,
             (Feed::Still { of: Still::Colour(c), .. }, LayerSource::Colour { rgba, .. }) => c == rgba,
             (Feed::Animated { of, .. }, LayerSource::Animation { animation, .. }) => of == animation,
-            (Feed::Video { path, size, .. }, LayerSource::Video { path: p, width, height, .. }) => path == p && *size == (*width, *height),
+            (Feed::Video { path, size, sound, .. }, LayerSource::Video { path: p, width, height, sound: s, .. }) => path == p && *size == (*width, *height) && sound == s,
             _ => false,
         }
     }
@@ -207,8 +207,8 @@ impl Feeds {
                         }
                     }
                 }
-                LayerSource::Video { path, width, height, fps, looped, placement, .. } => match VideoFeed::start(&self.gpu, path, (*width, *height), *fps, *looped, !placement.hidden) {
-                    Ok(video) => Feed::Video { path: path.clone(), size: (*width, *height), video },
+                LayerSource::Video { path, width, height, fps, looped, sound, placement, .. } => match VideoFeed::start(&self.gpu, path, (*width, *height), *fps, *looped, sound.clone(), !placement.hidden) {
+                    Ok(video) => Feed::Video { path: path.clone(), size: (*width, *height), sound: sound.clone(), video },
                     Err(e) => {
                         eprintln!("video layer {}: {e:#}", path.display());
                         continue;
@@ -309,7 +309,7 @@ struct VideoState {
 const MAX_VIDEO: (u32, u32) = (3840, 2160);
 
 impl VideoFeed {
-    fn start(gpu: &Gpu, path: &std::path::Path, size: (u32, u32), fps: f64, looped: bool, shown: bool) -> anyhow::Result<Self> {
+    fn start(gpu: &Gpu, path: &std::path::Path, size: (u32, u32), fps: f64, looped: bool, sound: Option<String>, shown: bool) -> anyhow::Result<Self> {
         let (w, h) = super::quad::fit_within(size.0.max(2), size.1.max(2), MAX_VIDEO.0, MAX_VIDEO.1);
         let latest = Latest::new(gpu, w, h)?;
         let state = Arc::new(VideoState::default());
@@ -318,7 +318,7 @@ impl VideoFeed {
         let (latest2, state2, path) = (latest.clone(), state.clone(), path.to_owned());
         thread::spawn(move || {
             system::com_init();
-            if let Err(e) = play_video(&path, w, fps, &latest2, &state2) {
+            if let Err(e) = play_video(&path, w, fps, sound, &latest2, &state2) {
                 eprintln!("video layer {}: {e:#}", path.display());
             }
         });
@@ -344,9 +344,17 @@ impl Drop for VideoFeed {
 
 /// Play `path` into `latest` at `width` wide, at `fps` (none: as the
 /// decoder says), till it's stopped (see [`VideoFeed`]), each frame when
-/// its time comes.
-fn play_video(path: &std::path::Path, width: u32, fps: f64, latest: &Latest, state: &VideoState) -> anyhow::Result<()> {
+/// its time comes; its sound into the audio source `sound`, if it has one.
+fn play_video(path: &std::path::Path, width: u32, fps: f64, sound: Option<String>, latest: &Latest, state: &VideoState) -> anyhow::Result<()> {
     let mut decoder = crate::decode::Decoder::open_rgba(path, width)?;
+    // Its first sound goes with its first picture.
+    let mut sound = sound.and_then(|id| match Sound::open(path, &id) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            eprintln!("video layer {}: no sound ({e:#})", path.display());
+            None
+        }
+    });
     // Frames are numbered by their time at this rate.
     decoder.set_fps(fps);
     let fps = if decoder.fps.is_finite() && decoder.fps > 1.0 { decoder.fps } else { 30.0 };
@@ -373,10 +381,16 @@ fn play_video(path: &std::path::Path, width: u32, fps: f64, latest: &Latest, sta
             ended = false;
             origin = std::time::Instant::now();
             last_due = Some(origin);
+            if let Some(s) = sound.as_mut() {
+                s.rewind();
+            }
             if let Some(f) = decoder.frame(0)? {
                 put_rgba(latest, &f, &mut bgra);
             }
             continue;
+        }
+        if let Some(s) = sound.as_mut() {
+            s.feed(origin);
         }
         if ended {
             thread::sleep(Duration::from_millis(20));
@@ -396,6 +410,9 @@ fn play_video(path: &std::path::Path, width: u32, fps: f64, latest: &Latest, sta
             if now >= due || state.stop.load(Ordering::Relaxed) || state.again.load(Ordering::Relaxed) || !state.shown.load(Ordering::Relaxed) {
                 break;
             }
+            if let Some(s) = sound.as_mut() {
+                s.feed(origin);
+            }
             thread::sleep((due - now).min(Duration::from_millis(10)));
         }
         // Far behind (the computer busy): its time is from now on.
@@ -406,6 +423,72 @@ fn play_video(path: &std::path::Path, width: u32, fps: f64, latest: &Latest, sta
         put_rgba(latest, &frame, &mut bgra);
     }
     Ok(())
+}
+
+/// A video layer's sound: read from its file as it plays, each block handed
+/// to the mix a moment before it's heard.
+struct Sound {
+    reader: super::sound_file::SoundReader,
+    playing: crate::sources::video_sound::Playing,
+    /// A block read whose time hasn't come yet.
+    held: Option<(f64, Vec<f32>)>,
+    /// All of it's been handed over (or it can't be read further).
+    ended: bool,
+}
+
+/// How far ahead of being heard a video's sound goes to the mix (which runs
+/// behind real time): little enough that what's gone when it starts over
+/// is done in a moment.
+const SOUND_AHEAD: f64 = 0.05;
+
+impl Sound {
+    fn open(path: &std::path::Path, id: &str) -> anyhow::Result<Self> {
+        let reader = super::sound_file::SoundReader::open(path)?;
+        let playing = crate::sources::video_sound::Playing::new(id, reader.rate);
+        Ok(Self { reader, playing, held: None, ended: false })
+    }
+
+    /// Back to its start, with the picture.
+    fn rewind(&mut self) {
+        self.held = None;
+        self.ended = false;
+        if let Err(e) = self.reader.rewind() {
+            eprintln!("video sound: {e:#}");
+            self.ended = true;
+        }
+    }
+
+    /// What's heard up to a moment from now handed to the mix, each block
+    /// at its time after `origin` (when the video's start was up).
+    fn feed(&mut self, origin: std::time::Instant) {
+        if self.ended {
+            return;
+        }
+        let played = origin.elapsed().as_secs_f64();
+        let host_origin = crate::sources::host_now() - played;
+        loop {
+            let block = match self.held.take() {
+                Some(b) => b,
+                None => match self.reader.next() {
+                    Ok(Some(b)) => b,
+                    Ok(None) => {
+                        self.ended = true;
+                        return;
+                    }
+                    Err(e) => {
+                        eprintln!("video sound: {e:#}");
+                        self.ended = true;
+                        return;
+                    }
+                },
+            };
+            if block.0 > played + SOUND_AHEAD {
+                self.held = Some(block);
+                return;
+            }
+            self.playing.push_at(host_origin + block.0, &block.1, self.reader.channels as usize);
+        }
+    }
 }
 
 /// A decoded frame (RGBA) into a layer's texture (BGRA).
@@ -547,5 +630,21 @@ mod tests {
         assert_eq!(d.frame(0).unwrap().map(|f| f.index), Some(0));
         let on = d.next().unwrap().map(|f| f.index);
         assert!(on.is_some_and(|i| (1..5).contains(&i)), "{on:?}");
+        // Its sound: in order to its end, as long as its picture, then from
+        // its start again.
+        let mut sound = super::super::sound_file::SoundReader::open(path).unwrap();
+        assert!(sound.rate >= 8000 && (1..=8).contains(&sound.channels), "{} Hz, {} channels", sound.rate, sound.channels);
+        let (mut at, mut frames) = (-1.0, 0usize);
+        while let Some((t, samples)) = sound.next().unwrap() {
+            assert!(t > at, "in order: {t} after {at}");
+            at = t;
+            frames += samples.len() / sound.channels as usize;
+        }
+        let secs = frames as f64 / f64::from(sound.rate);
+        let fps: f64 = std::env::var("HASTECLIP_TEST_VIDEO_FPS").ok().and_then(|f| f.parse().ok()).unwrap_or(d.fps);
+        let picture = n as f64 / fps;
+        assert!((secs - picture).abs() < 0.5, "sound {secs:.2} s, picture {picture:.2} s");
+        sound.rewind().unwrap();
+        assert_eq!(sound.next().unwrap().map(|(t, _)| t), Some(0.0));
     }
 }

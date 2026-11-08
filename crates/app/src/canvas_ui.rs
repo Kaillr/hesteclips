@@ -192,9 +192,9 @@ pub(crate) struct CanvasView {
     pub(crate) clipboard: Option<crate::settings::CopiedSources>,
     /// Each animated image's frames, by key (its first is in `pictures`).
     pub(crate) animations: std::collections::HashMap<u64, capture::layers::Animation>,
-    /// Each video file's size and frame rate, once asked for (`None`: it
-    /// can't be played).
-    pub(crate) video_sizes: std::collections::HashMap<std::path::PathBuf, Option<(u32, u32, f64)>>,
+    /// Each video file's size, frame rate and whether it has sound, once
+    /// asked for (`None`: it can't be played).
+    pub(crate) video_sizes: std::collections::HashMap<std::path::PathBuf, Option<(u32, u32, f64, bool)>>,
 }
 
 /// The video's sources as undo keeps them: the screen (its box or how it

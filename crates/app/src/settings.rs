@@ -446,15 +446,18 @@ pub enum Visual {
         #[serde(default, skip_serializing_if = "String::is_empty")]
         css: String,
     },
-    /// A video file, its picture: from the start again when it ends
-    /// (`looped`; else its last picture stays), and each time it's shown
-    /// again (`restart`; else it goes on where it was).
+    /// A video file: from the start again when it ends (`looped`; else its
+    /// last picture stays), and each time it's shown again (`restart`; else
+    /// it goes on where it was); its sound in the clip (`sound`: a source of
+    /// its own in the sound's list, its volume there).
     Video {
         path: PathBuf,
         #[serde(default = "yes")]
         looped: bool,
         #[serde(default = "yes")]
         restart: bool,
+        #[serde(default = "yes")]
+        sound: bool,
     },
 }
 
@@ -1077,6 +1080,9 @@ pub enum SourceKind {
     /// One application, by bundle id (macOS) / executable (Windows). `app_name`
     /// is what to call it while it isn't running.
     App { bundle_id: String, app_name: String },
+    /// A video source's sound (the source `key`): there while the video is,
+    /// and its sound's on (see `App::sync_video_sounds`).
+    Video { key: u64 },
 }
 
 /// The order the library shows clips in.
@@ -2584,6 +2590,39 @@ impl RecordSettings {
         out
     }
 
+    /// Each video source whose sound is on (and whose file has some, as
+    /// `has_sound` says) has a source of its own in the sound's list (its
+    /// volume, mute, track), named as the video is; one whose video is gone,
+    /// or its sound off, goes.
+    pub fn sync_video_sounds(&mut self, has_sound: impl Fn(&std::path::Path) -> bool) {
+        let wanted: Vec<(u64, String)> = self
+            .visuals
+            .iter()
+            .filter_map(|v| match &v.visual {
+                Visual::Video { path, sound: true, .. } if has_sound(path) => {
+                    let name = v.title.clone().unwrap_or_else(|| path.file_stem().map_or_else(|| "Video".to_owned(), |n| n.to_string_lossy().into_owned()));
+                    Some((v.key, name))
+                }
+                _ => None,
+            })
+            .collect();
+        self.audio_sources.retain(|s| !matches!(s.kind, SourceKind::Video { key } if !wanted.iter().any(|(k, _)| *k == key)));
+        for (key, name) in wanted {
+            match self.audio_sources.iter_mut().find(|s| s.kind == SourceKind::Video { key }) {
+                Some(s) => {
+                    if s.name != name {
+                        s.name = name;
+                    }
+                }
+                None => {
+                    let mut s = AudioSourceCfg::new(&name, SourceKind::Video { key });
+                    s.id = format!("video-{key}");
+                    self.audio_sources.push(s);
+                }
+            }
+        }
+    }
+
     /// Whether `layer` is locked in the scene shown.
     pub fn is_locked(&self, layer: LayerKey) -> bool {
         self.locked.contains(&layer)
@@ -2751,7 +2790,14 @@ impl RecordSettings {
             }
         }
         for a in &mut s.audio_sources {
-            a.id = new_source_id();
+            // A video's sound goes with its copy (its volume kept).
+            a.id = match &mut a.kind {
+                SourceKind::Video { key } => {
+                    *key = new_key(*key);
+                    format!("video-{key}")
+                }
+                _ => new_source_id(),
+            };
         }
         s
     }
@@ -3973,6 +4019,52 @@ mod scene_tests {
         assert_ne!(id, h);
         assert_eq!(s.group(id).map(|x| (x.name.clone(), x.members.clone())), Some(("Cam and logo".to_owned(), vec![LayerKey::Webcam(1), LayerKey::Visual(2)])));
         assert_eq!(s.layer_order(), vec![LayerKey::Webcam(1), LayerKey::Visual(2), LayerKey::Visual(3), LayerKey::Screen], "in front of the other group, all of it");
+    }
+
+    /// A video with sound has a sound source of its own, once, named as it
+    /// is; it goes with its video, with its sound turned off, and isn't
+    /// there for a video without sound.
+    #[test]
+    fn a_videos_sound_is_a_source_while_the_video_has_it() {
+        let mut s = setup();
+        s.visuals.push(VisualCfg::new(5, Visual::Video { path: "clips/intro.mp4".into(), looped: true, restart: true, sound: true }));
+        s.layer_order.insert(0, LayerKey::Visual(5));
+        let video = |s: &RecordSettings| s.audio_sources.iter().filter(|a| a.kind == SourceKind::Video { key: 5 }).map(|a| (a.id.clone(), a.name.clone())).collect::<Vec<_>>();
+        s.sync_video_sounds(|_| false);
+        assert!(video(&s).is_empty(), "its file has none");
+        s.sync_video_sounds(|_| true);
+        s.sync_video_sounds(|_| true);
+        assert_eq!(video(&s), vec![("video-5".to_owned(), "intro".to_owned())]);
+        if let Some(v) = s.visual_mut(5) {
+            v.title = Some("Intro".into());
+        }
+        s.sync_video_sounds(|_| true);
+        assert_eq!(video(&s)[0].1, "Intro");
+        if let Some(Visual::Video { sound, .. }) = s.visual_mut(5).map(|v| &mut v.visual) {
+            *sound = false;
+        }
+        s.sync_video_sounds(|_| true);
+        assert!(video(&s).is_empty(), "its sound off");
+        if let Some(Visual::Video { sound, .. }) = s.visual_mut(5).map(|v| &mut v.visual) {
+            *sound = true;
+        }
+        s.sync_video_sounds(|_| true);
+        // A copied preset's video has its sound, as it was set.
+        if let Some(a) = s.audio_sources.iter_mut().find(|a| a.kind == SourceKind::Video { key: 5 }) {
+            a.volume_db = -9.0;
+        }
+        let a = s.active_preset;
+        let p = s.add_preset("Copy", true);
+        s.switch_preset(p);
+        let copy = s.visuals.iter().find(|v| matches!(v.visual, Visual::Video { .. })).map(|v| v.key).unwrap();
+        s.sync_video_sounds(|_| true);
+        let sound = s.audio_sources.iter().find(|a| a.kind == SourceKind::Video { key: copy }).map(|a| (a.id.clone(), a.volume_db));
+        assert_eq!(sound, Some((format!("video-{copy}"), -9.0)));
+        assert_eq!(s.audio_sources.iter().filter(|a| matches!(a.kind, SourceKind::Video { .. })).count(), 1);
+        s.switch_preset(a);
+        assert!(s.remove_from_scene(LayerKey::Visual(5)));
+        s.sync_video_sounds(|_| true);
+        assert!(video(&s).is_empty(), "its video gone");
     }
 
     #[test]

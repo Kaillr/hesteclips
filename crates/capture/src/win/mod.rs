@@ -36,6 +36,7 @@ pub mod hook;
 mod layers;
 mod loopback;
 mod quad;
+mod sound_file;
 pub(crate) mod system;
 
 use std::path::{Path, PathBuf};

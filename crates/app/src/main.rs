@@ -1263,8 +1263,12 @@ impl App {
                         // Its frames, an animated image.
                         Visual::Image { .. } if self.canvas.animations.contains_key(&key) => LayerSource::Animation { animation: self.canvas.animations[&key].clone(), placement },
                         // Once its size is known (it can be played).
-                        Visual::Video { path, looped, restart } if capture::layers::VIDEO => match self.canvas.video_sizes.get(path).copied().flatten() {
-                            Some((width, height, fps)) => LayerSource::Video { path: path.clone(), width, height, fps, looped: *looped, restart: *restart, placement },
+                        Visual::Video { path, looped, restart, .. } if capture::layers::VIDEO => match self.canvas.video_sizes.get(path).copied().flatten() {
+                            Some((width, height, fps, _)) => {
+                                // Its sound into its source, while that's captured.
+                                let sound = self.settings.audio_sources.iter().find(|s| s.kind == settings::SourceKind::Video { key } && s.enabled && (s.in_mix || s.own_track)).map(|s| s.id.clone());
+                                LayerSource::Video { path: path.clone(), width, height, fps, looped: *looped, restart: *restart, sound, placement }
+                            }
                             None => continue,
                         },
                         Visual::Video { .. } => continue,
@@ -1410,6 +1414,8 @@ impl App {
                 },
                 SourceKind::Desktop { exclude_apps } => Cap::Desktop { exclude_app_sources: *exclude_apps },
                 SourceKind::App { bundle_id, .. } => Cap::App { bundle_id: bundle_id.clone() },
+                SourceKind::Video { .. } if capture::layers::VIDEO => Cap::Video { id: s.id.clone() },
+                SourceKind::Video { .. } => continue,
             };
             if out.iter().any(|o| o.kind == kind) {
                 continue;
@@ -1944,6 +1950,7 @@ impl App {
         self.sync_capture_blend();
         self.watch_stream();
         self.refit_boxes();
+        self.sync_video_sounds();
         // A locked button clicked anywhere: why, in a toast, as a locked
         // setting says it.
         if let Some(why) = ui_kit::take_locked_click(ctx) {
