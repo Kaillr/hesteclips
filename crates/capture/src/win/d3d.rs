@@ -1087,14 +1087,22 @@ impl Converter {
         let main = [crate::Layer { id: 0, source: crate::LayerSource::Main }];
         let drawn = self.drawn.borrow();
         let picture = |id: u64| drawn.1.iter().find(|(i, _)| *i == id).map(|(_, l)| l).filter(|l| l.source.has_frame());
+        let all = layers.as_deref().unwrap_or(&main);
+        // Anything blended over what's under it (a picture, words, a colour,
+        // a page) is drawn on a full-colour canvas, all of it then converted
+        // at once: there every layer goes on any pixel (words moved a pixel
+        // move a pixel). Drawn straight into the encoder's 4:2:0 colour, on
+        // even ones.
+        let on_canvas = all.iter().any(|l| l.source.blended() && l.shown() && picture(l.id).is_some());
+        let even = !on_canvas;
         // Each layer that shows, bottom first: the part of its picture used
         // and where it goes.
         let mut placed: Vec<Placed> = Vec::new();
-        for l in layers.as_deref().unwrap_or(&main) {
+        for l in all {
             match &l.source {
                 crate::LayerSource::Main => {
                     let p = *self.screen.lock().unwrap();
-                    let ([sx, sy, sw, sh], [dx, dy, dw, dh]) = p.place(self.base.source.content(), frame);
+                    let ([sx, sy, sw, sh], [dx, dy, dw, dh]) = p.place_on(self.base.source.content(), frame, even);
                     if sw > 0 && sh > 0 && dw > 0 && dh > 0 {
                         placed.push(Placed { id: 0, layer: &self.base, source: rect([sx, sy, sw, sh]), dest: rect([dx, dy, dw, dh]), turns: p.turns, mirror: (p.flip_h, p.flip_v), blend: false });
                     }
@@ -1112,14 +1120,14 @@ impl Converter {
                 | crate::LayerSource::Colour { placement: p, .. }
                 | crate::LayerSource::Browser { placement: p, .. } => {
                     let Some(layer) = picture(l.id) else { continue };
-                    let ([sx, sy, sw, sh], [dx, dy, dw, dh]) = p.place(layer.source.content(), frame);
+                    let ([sx, sy, sw, sh], [dx, dy, dw, dh]) = p.place_on(layer.source.content(), frame, even);
                     if sw > 0 && sh > 0 && dw > 0 && dh > 0 {
                         placed.push(Placed { id: l.id, layer, source: rect([sx, sy, sw, sh]), dest: rect([dx, dy, dw, dh]), turns: p.turns, mirror: (p.flip_h, p.flip_v), blend: l.source.blended() });
                     }
                 }
             }
         }
-        if placed.iter().any(|p| p.blend) {
+        if on_canvas {
             let result = self.convert_on_canvas(slot, &placed).context("couldn't convert a screen frame");
             unsafe { self.gpu.context.Flush() };
             return result;
