@@ -889,6 +889,21 @@ pub fn choose_screen_again() {
     linux::choose_screen_again();
 }
 
+/// Where a display (by its id, as [`list_screens`] gives it) is on the
+/// desktop: its left, top, width and height in pixels. Windows; elsewhere
+/// not known (`None`).
+pub fn display_bounds(id: &str) -> Option<[i32; 4]> {
+    #[cfg(target_os = "windows")]
+    {
+        win::display_bounds(id)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = id;
+        None
+    }
+}
+
 /// Screens the backend can capture; their ids go in [`VideoSource::Screen`].
 pub fn list_screens() -> Vec<Device> {
     #[cfg(target_os = "macos")]

@@ -22,6 +22,7 @@ mod demo;
 mod fonts;
 mod groups_ui;
 mod inspector_ui;
+mod projector;
 mod scenes_ui;
 mod visuals_ui;
 mod webcam_ui;
@@ -536,6 +537,8 @@ struct App {
     pub(crate) confirm_reset: bool,
     /// The camera panel (Linux), in place of the Sound column while it's open.
     pub(crate) camera_panel: Option<crate::webcam_ui::CameraPanel>,
+    /// Preview on monitor: the video fullscreen on a display, while it's open.
+    pub(crate) projector: Option<projector::Projector>,
     /// Scroll the library to this clip next time it's shown.
     pub(crate) reveal_clip: Option<PathBuf>,
     /// Days folded away in the library.
@@ -840,6 +843,7 @@ impl App {
             recording_shortcut: None,
             confirm_reset: false,
             camera_panel: None,
+            projector: None,
             reveal_clip: None,
             folded,
             permission: capture::screen_permission(),
@@ -1566,6 +1570,8 @@ impl eframe::App for App {
         self.go_live_dialog(&ctx);
         // Presets and scenes (the Sources page's, and the recorder's menu's).
         self.sources_dialogs(&ctx);
+        // The video, fullscreen on a monitor (Sources' Preview on monitor).
+        self.projector_window(&ctx);
         #[cfg(target_os = "macos")]
         self.setup_dialog(&ctx);
         ui_kit::pointer_cursor(&ctx);

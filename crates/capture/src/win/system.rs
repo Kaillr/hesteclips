@@ -183,6 +183,16 @@ pub(crate) fn find_monitor(id: &str) -> HMONITOR {
         .unwrap_or_else(|| unsafe { MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY) })
 }
 
+/// Where a display is on the desktop, by device name: its left, top, width
+/// and height, in the desktop's pixels. `None` if it isn't there.
+pub fn display_bounds(id: &str) -> Option<[i32; 4]> {
+    let m = monitors().into_iter().find(|m| m.device == id)?;
+    let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+    unsafe { GetMonitorInfoW(m.handle, &mut info) }.ok().ok()?;
+    let r = info.rcMonitor;
+    Some([r.left, r.top, r.right - r.left, r.bottom - r.top])
+}
+
 // ---------------------------------------------------------------------------
 // Processes
 // ---------------------------------------------------------------------------

@@ -45,8 +45,7 @@ impl App {
         }
         self.settings.ungroup(id);
         self.forget_gone_selection();
-        let ctrl = crate::shortcuts::ctrl_name();
-        self.toast_icon(icon::TRASH, format!("Took {} out of this scene · {ctrl}+Z puts it back", g.name));
+        self.toast_action(icon::TRASH, format!("Took {} out of this scene", g.name), "Undo", crate::shell::ToastAction::UndoSources);
     }
 
     /// A row dragged in the layers onto `target`'s place: a source to it

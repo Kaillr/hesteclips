@@ -155,6 +155,8 @@ pub(crate) struct CanvasView {
     menu: Option<Selected>,
     /// A group held on the preview, moved or resized as one.
     group_hold: Option<GroupHold>,
+    /// The preview's own menu is open (right-clicked where no source is).
+    canvas_menu: bool,
     /// Sources picked besides the one selected, Ctrl- or Shift-clicked in
     /// the list: to group them.
     pub(crate) picked: Vec<Layer>,
@@ -697,18 +699,29 @@ impl App {
         }
     }
 
-    /// Undo and redo, over the preview: dimmed while there's nothing to undo
-    /// (or redo).
-    pub(crate) fn undo_buttons(&mut self, ui: &mut egui::Ui) {
-        use crate::ui_kit::{Btn, Kind};
+    /// The preview's own menu (right-click it where no source is): undo,
+    /// redo, the video's size, and previewing it on a monitor.
+    fn canvas_menu(&mut self, ui: &mut egui::Ui) {
         let ctrl = crate::shortcuts::ctrl_name();
-        let undo = Btn::icon(Kind::Ghost, icon::ARROW_COUNTER_CLOCKWISE).small().enabled(!self.canvas.undo.is_empty()).tip(format!("Undo where your sources are  ({ctrl}+Z)"));
-        if undo.show(ui).clicked() {
+        let keys = |k: &[&str]| Some(k.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>());
+        if Item::new("Undo").icon(icon::ARROW_COUNTER_CLOCKWISE).enabled(!self.canvas.undo.is_empty()).keys(keys(&[ctrl, "Z"])).show(ui).clicked() {
             self.undo_arrangement();
+            ui.close();
         }
-        let redo = Btn::icon(Kind::Ghost, icon::ARROW_CLOCKWISE).small().enabled(!self.canvas.redo.is_empty()).tip(format!("Redo  ({ctrl}+Shift+Z)"));
-        if redo.show(ui).clicked() {
+        if Item::new("Redo").icon(icon::ARROW_CLOCKWISE).enabled(!self.canvas.redo.is_empty()).keys(keys(&[ctrl, "Shift", "Z"])).show(ui).clicked() {
             self.redo_arrangement();
+            ui.close();
+        }
+        crate::ui_kit::menu_sep(ui);
+        if Item::new("Video size and frame rate…").icon(icon::FRAME_CORNERS).show(ui).clicked() {
+            self.sources_view.editing = Some(crate::inspector_ui::Editing::Video);
+            ui.close();
+        }
+        let mut on = None;
+        crate::ui_kit::submenu(ui, Item::new("Preview on monitor").icon(icon::PROJECTOR_SCREEN), |ui| on = self.projector_items(ui));
+        if let Some(d) = on {
+            self.open_projector(&d);
+            ui.close();
         }
     }
 
@@ -951,7 +964,12 @@ impl App {
                 }),
             };
             self.canvas.selected = target.clone().or(self.canvas.selected.clone());
+            // Where no source is: the preview's own menu.
+            self.canvas.canvas_menu = target.is_none();
             self.canvas.menu = target;
+        }
+        if self.canvas.menu.is_none() && self.canvas.canvas_menu && crate::ui_kit::context_menu(response, 230.0, |ui| self.canvas_menu(ui)).is_none() {
+            self.canvas.canvas_menu = false;
         }
         if let Some(target) = self.canvas.menu.clone() {
             let was = self.arrangement();
@@ -1646,9 +1664,8 @@ impl App {
         if self.selected_layer() == Some(layer) {
             self.canvas.selected = None;
         }
-        let ctrl = crate::shortcuts::ctrl_name();
         let what = if gone { format!("Removed {name}") } else { format!("Took {name} out of this scene") };
-        self.toast_icon(icon::TRASH, format!("{what} · {ctrl}+Z puts it back"));
+        self.toast_action(icon::TRASH, what, "Undo", crate::shell::ToastAction::UndoSources);
     }
 
     /// A copy of a boxed source, in front of it, a little down and right,

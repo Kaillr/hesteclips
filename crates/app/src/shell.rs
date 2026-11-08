@@ -269,6 +269,8 @@ pub enum ToastAction {
     Undelete(crate::library::Binned),
     /// Copy the clip's share link.
     CopyLink(std::path::PathBuf),
+    /// Undo the last change to the Sources page's sources (one removed).
+    UndoSources,
 }
 
 #[derive(Clone)]
@@ -836,6 +838,7 @@ impl App {
                 }
                 ToastAction::Undelete(binned) => self.undelete(binned),
                 ToastAction::CopyLink(clip) => self.copy_link(&clip),
+                ToastAction::UndoSources => self.undo_arrangement(),
             }
         }
     }

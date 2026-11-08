@@ -179,7 +179,7 @@ impl App {
     }
 
     /// A scene's menu: rename (in the name field `rename_at`, where the menu
-    /// was opened), duplicate, move, delete.
+    /// was opened), duplicate, move, preview on a monitor (it shown), delete.
     pub(crate) fn scene_menu(&mut self, ui: &mut egui::Ui, id: u64, rename_at: egui::Id) {
         let Some(at) = self.settings.scenes.iter().position(|s| s.id == id) else { return };
         let count = self.settings.scenes.len();
@@ -198,6 +198,16 @@ impl App {
         }
         if Item::new("Move down").icon(icon::ARROW_DOWN).enabled(at + 1 < count).show(ui).clicked() {
             self.settings.move_scene(id, false);
+        }
+        ui_kit::menu_sep(ui);
+        // Fullscreen on a display, letterboxed: what the video shows, this
+        // scene shown.
+        let mut on = None;
+        ui_kit::submenu(ui, Item::new("Preview on monitor").icon(icon::PROJECTOR_SCREEN), |ui| on = self.projector_items(ui));
+        if let Some(d) = on {
+            self.show_scene(id);
+            self.open_projector(&d);
+            ui.close();
         }
         ui_kit::menu_sep(ui);
         let delete = Item::new("Delete…").icon(icon::TRASH).danger().enabled(count > 1);
@@ -265,14 +275,31 @@ impl App {
         }
     }
 
-    /// The heading's left side: the scene's name; with the panel folded
-    /// away (a narrow window), the preset and a menu of the scenes instead.
+    /// The heading's left side: the scene's name and the video's size (and
+    /// while cropping on the preview, Done); with the panel folded away (a
+    /// narrow window), the preset and a menu of the scenes instead.
     pub(crate) fn sources_head(&mut self, ui: &mut egui::Ui, wide: bool) {
-        self.page_head_folding(ui, "", |app, ui, _| {
+        self.page_head_folding(ui, "", |app, ui, tight| {
             let p = theme::pal(ui);
             let title = app.settings.scene().map(|s| s.name.clone()).unwrap_or_default();
             if wide {
                 ui.label(theme::text(&title, 15.0, W::Semibold).color(p.text));
+                // The video's size, then while cropping on the preview what's
+                // cropped and Done: the page's own, here rather than in a row
+                // over the preview of their own.
+                if !tight {
+                    ui.add_space(6.0);
+                    let size = app.video_size_text();
+                    app.size_button(ui, &size);
+                }
+                if let Some(l) = app.canvas.crop_mode {
+                    ui.add_space(10.0);
+                    ui.label(theme::text(format!("Cropping {}", app.settings.layer_title(l)), 12.5, W::Regular).color(p.text2));
+                    ui.add_space(4.0);
+                    if Btn::new(Kind::Primary, "Done").with_icon(icon::CHECK).small().tip("Stop cropping (Enter)").show(ui).clicked() {
+                        app.canvas.crop_mode = None;
+                    }
+                }
             } else {
                 app.preset_picker(ui, 150.0_f32.min(ui.available_width() * 0.45));
                 ui.add_space(4.0);
