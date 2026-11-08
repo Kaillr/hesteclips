@@ -1221,11 +1221,18 @@ pub fn menu_body<R>(ui: &mut egui::Ui, w: f32, add: impl FnOnce(&mut egui::Ui) -
         *m
     });
     ui.set_width(m.asked.max(m.widest));
+    // Never taller than the window (a long menu, a short window): what
+    // doesn't fit scrolls, a little in from its edges. The menu's moved up
+    // to end inside it, as it's moved left near the right edge.
+    let room = ui.ctx().content_rect().height() - 2.0 * MENU_EDGE;
     MENUS.with(|s| s.borrow_mut().push(key));
-    let r = add(ui);
+    let r = egui::ScrollArea::vertical().id_salt(key.with("scroll")).max_height(room.max(80.0)).auto_shrink([false, true]).show(ui, add).inner;
     MENUS.with(|s| s.borrow_mut().pop());
     r
 }
+
+/// How far a menu stays from the window's top and bottom (its frame too).
+const MENU_EDGE: f32 = 16.0;
 
 /// A row that opens a submenu to its right on hover.
 pub fn submenu<R>(ui: &mut egui::Ui, item: Item, content: impl FnOnce(&mut egui::Ui) -> R) -> Option<R> {

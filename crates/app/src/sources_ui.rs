@@ -727,6 +727,7 @@ impl App {
         let mut added: Option<crate::canvas_ui::Layer> = None;
         let mut fill_in = false;
         let mut pick_image = false;
+        let mut pick_video = false;
         crate::ui_kit::menu_popup(&b, false, 230.0, |ui| {
             if webcam {
                 crate::ui_kit::submenu(ui, Item::new("Webcam").icon(icon::WEBCAM), |ui| {
@@ -781,8 +782,11 @@ impl App {
                 });
             }
             crate::ui_kit::menu_sep(ui);
-            if Item::new("Image…").icon(icon::IMAGE).tip("A logo or a frame, its transparency kept").show(ui).clicked() {
+            if Item::new("Image…").icon(icon::IMAGE).tip("A logo or a frame, its transparency kept (a GIF moves)").show(ui).clicked() {
                 pick_image = true;
+            }
+            if capture::layers::VIDEO && Item::new("Video…").icon(icon::FILM_STRIP).tip("A video file, playing over and over").show(ui).clicked() {
+                pick_video = true;
             }
             if Item::new("Text").icon(icon::TEXT_T).tip("Your name, a title").show(ui).clicked() {
                 added = Some(crate::canvas_ui::Layer::Visual(self.add_visual(Visual::Text(TextStyle::default()))));
@@ -816,6 +820,9 @@ impl App {
         // Picked after the menu's closed: the file dialog waits for you.
         if pick_image && let Some(path) = rfd::FileDialog::new().add_filter("Images", &crate::inspector_ui::IMAGE_EXTS).pick_file() {
             added = Some(crate::canvas_ui::Layer::Visual(self.add_visual(Visual::Image { path })));
+        }
+        if pick_video && let Some(path) = rfd::FileDialog::new().add_filter("Videos", &crate::inspector_ui::VIDEO_EXTS).pick_file() {
+            added = Some(crate::canvas_ui::Layer::Visual(self.add_visual(Visual::Video { path, looped: true, restart: true })));
         }
         match added {
             Some(l) if fill_in => self.edit_layer(l),

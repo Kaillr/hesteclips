@@ -41,6 +41,12 @@ enum Feed {
     Browser { url: String, size: (u32, u32), css: String, page: CaptureFeed },
     /// A picture or a colour, uploaded once.
     Still { of: Still, latest: Arc<Latest> },
+    /// An animated picture: the frame showing (by the time since it
+    /// started) uploaded as it changes. `None` showing: too big to upload
+    /// as it is, its first frame stays (shrunk).
+    Animated { of: crate::layers::Animation, latest: Arc<Latest>, start: std::time::Instant, showing: Option<usize> },
+    /// A video file playing.
+    Video { path: std::path::PathBuf, size: (u32, u32), video: VideoFeed },
 }
 
 /// What a still layer's picture was made from.
@@ -55,7 +61,8 @@ impl Feed {
         match self {
             Feed::Camera { layer, .. } => &layer.latest,
             Feed::Display { display: c, .. } | Feed::Window { window: c, .. } | Feed::Browser { page: c, .. } => &c.latest,
-            Feed::Still { latest, .. } => latest,
+            Feed::Still { latest, .. } | Feed::Animated { latest, .. } => latest,
+            Feed::Video { video, .. } => &video.latest,
         }
     }
 
@@ -68,6 +75,8 @@ impl Feed {
             (Feed::Browser { url, size, css, .. }, LayerSource::Browser { url: u, width, height, css: c, .. }) => url == u && *size == (*width, *height) && css == c,
             (Feed::Still { of: Still::Picture(p), .. }, LayerSource::Picture { picture, .. }) => p == picture,
             (Feed::Still { of: Still::Colour(c), .. }, LayerSource::Colour { rgba, .. }) => c == rgba,
+            (Feed::Animated { of, .. }, LayerSource::Animation { animation, .. }) => of == animation,
+            (Feed::Video { path, size, .. }, LayerSource::Video { path: p, width, height, .. }) => path == p && *size == (*width, *height),
             _ => false,
         }
     }
@@ -179,6 +188,32 @@ impl Feeds {
                         continue;
                     }
                 },
+                LayerSource::Animation { animation, .. } => {
+                    let Some((first, _)) = animation.0.first() else { continue };
+                    // One too big to upload as it is: its first frame, still.
+                    let made = if first.width <= MAX_PICTURE && first.height <= MAX_PICTURE {
+                        Latest::new(&self.gpu, first.width.max(1), first.height.max(1)).map(|latest| {
+                            latest.upload_bgra(first.bgra.as_ptr(), first.width * 4, first.width, first.height);
+                            Feed::Animated { of: animation.clone(), latest, start: std::time::Instant::now(), showing: Some(0) }
+                        })
+                    } else {
+                        still_texture(&self.gpu, first).map(|latest| Feed::Animated { of: animation.clone(), latest, start: std::time::Instant::now(), showing: None })
+                    };
+                    match made {
+                        Ok(feed) => feed,
+                        Err(e) => {
+                            eprintln!("animated picture layer: {e:#}");
+                            continue;
+                        }
+                    }
+                }
+                LayerSource::Video { path, width, height, fps, looped, placement, .. } => match VideoFeed::start(&self.gpu, path, (*width, *height), *fps, *looped, !placement.hidden) {
+                    Ok(video) => Feed::Video { path: path.clone(), size: (*width, *height), video },
+                    Err(e) => {
+                        eprintln!("video layer {}: {e:#}", path.display());
+                        continue;
+                    }
+                },
                 LayerSource::Colour { rgba, .. } => {
                     let [r, g, b, a] = *rgba;
                     let image = crate::StillImage { width: 2, height: 2, bgra: [b, g, r, a].repeat(4) };
@@ -195,6 +230,25 @@ impl Feeds {
             changed = true;
         }
         for (id, feed) in feeds.iter_mut() {
+            // An animated picture's frame showing now, uploaded as it
+            // changes; a video told whether it shows (and how it plays).
+            match feed {
+                Feed::Animated { of, latest, start, showing: Some(showing) } => {
+                    let at = frame_at(&of.0, start.elapsed());
+                    if at != *showing
+                        && let Some((frame, _)) = of.0.get(at)
+                    {
+                        latest.upload_bgra(frame.bgra.as_ptr(), frame.width * 4, frame.width, frame.height);
+                        *showing = at;
+                    }
+                }
+                Feed::Video { video, .. } => {
+                    if let Some(LayerSource::Video { looped, restart, placement, .. }) = layers.iter().find(|l| l.id == *id).map(|l| &l.source) {
+                        video.set(!placement.hidden, *looped, *restart);
+                    }
+                }
+                _ => {}
+            }
             if let Feed::Camera { layer, .. } = feed {
                 let placement = layers.iter().find(|l| l.id == *id).and_then(|l| match &l.source {
                     LayerSource::Camera { placement, .. } => Some(placement),
@@ -213,6 +267,156 @@ impl Feeds {
             self.generation.fetch_add(1, Ordering::AcqRel);
         }
     }
+}
+
+/// Which of an animation's frames shows `t` after it started: each for its
+/// time, over and over.
+fn frame_at(frames: &[(crate::StillImage, Duration)], t: Duration) -> usize {
+    let total: Duration = frames.iter().map(|(_, d)| *d).sum();
+    if total.is_zero() || frames.len() < 2 {
+        return 0;
+    }
+    let mut left = Duration::from_nanos((t.as_nanos() % total.as_nanos()) as u64);
+    for (i, (_, d)) in frames.iter().enumerate() {
+        if left < *d {
+            return i;
+        }
+        left -= *d;
+    }
+    frames.len() - 1
+}
+
+/// A video file playing in a layer: decoded on a thread of its own (the
+/// playback decoder, `crate::decode`), each frame put up in the layer's
+/// texture when its time comes. At its end it starts over (`looped`), else
+/// its last picture stays; hidden it waits where it is, and shown again
+/// goes on, or starts over (`restart`).
+pub(crate) struct VideoFeed {
+    latest: Arc<Latest>,
+    state: Arc<VideoState>,
+}
+
+#[derive(Default)]
+struct VideoState {
+    stop: AtomicBool,
+    shown: AtomicBool,
+    looped: AtomicBool,
+    /// From the start: it's been shown again, with restart on.
+    again: AtomicBool,
+}
+
+/// The biggest a video layer's decoded at: a bigger one is shrunk.
+const MAX_VIDEO: (u32, u32) = (3840, 2160);
+
+impl VideoFeed {
+    fn start(gpu: &Gpu, path: &std::path::Path, size: (u32, u32), fps: f64, looped: bool, shown: bool) -> anyhow::Result<Self> {
+        let (w, h) = super::quad::fit_within(size.0.max(2), size.1.max(2), MAX_VIDEO.0, MAX_VIDEO.1);
+        let latest = Latest::new(gpu, w, h)?;
+        let state = Arc::new(VideoState::default());
+        state.shown.store(shown, Ordering::Relaxed);
+        state.looped.store(looped, Ordering::Relaxed);
+        let (latest2, state2, path) = (latest.clone(), state.clone(), path.to_owned());
+        thread::spawn(move || {
+            system::com_init();
+            if let Err(e) = play_video(&path, w, fps, &latest2, &state2) {
+                eprintln!("video layer {}: {e:#}", path.display());
+            }
+        });
+        Ok(Self { latest, state })
+    }
+
+    /// The layer as it is now: shown or hidden, looping or not, starting
+    /// over when it's shown again or not.
+    fn set(&self, shown: bool, looped: bool, restart: bool) {
+        let was = self.state.shown.swap(shown, Ordering::AcqRel);
+        if shown && !was && restart {
+            self.state.again.store(true, Ordering::Release);
+        }
+        self.state.looped.store(looped, Ordering::Relaxed);
+    }
+}
+
+impl Drop for VideoFeed {
+    fn drop(&mut self) {
+        self.state.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Play `path` into `latest` at `width` wide, at `fps` (none: as the
+/// decoder says), till it's stopped (see [`VideoFeed`]), each frame when
+/// its time comes.
+fn play_video(path: &std::path::Path, width: u32, fps: f64, latest: &Latest, state: &VideoState) -> anyhow::Result<()> {
+    let mut decoder = crate::decode::Decoder::open_rgba(path, width)?;
+    // Frames are numbered by their time at this rate.
+    decoder.set_fps(fps);
+    let fps = if decoder.fps.is_finite() && decoder.fps > 1.0 { decoder.fps } else { 30.0 };
+    let at = |index: u64| Duration::from_secs_f64(index as f64 / fps);
+    let mut bgra = Vec::new();
+    // When frame 0 was (or would have been) up: moved on by the time it's
+    // been hidden, so it goes on where it was.
+    let mut origin = std::time::Instant::now();
+    let mut hidden_since: Option<std::time::Instant> = None;
+    let mut ended = false;
+    // When the last frame went up: one numbered as it was (two close
+    // together in a video of an uneven rate) goes a frame after it.
+    let mut last_due = None::<std::time::Instant>;
+    while !state.stop.load(Ordering::Relaxed) {
+        if !state.shown.load(Ordering::Acquire) {
+            hidden_since.get_or_insert_with(std::time::Instant::now);
+            thread::sleep(Duration::from_millis(20));
+            continue;
+        }
+        if let Some(t) = hidden_since.take() {
+            origin += t.elapsed();
+        }
+        if state.again.swap(false, Ordering::AcqRel) || (ended && state.looped.load(Ordering::Relaxed)) {
+            ended = false;
+            origin = std::time::Instant::now();
+            last_due = Some(origin);
+            if let Some(f) = decoder.frame(0)? {
+                put_rgba(latest, &f, &mut bgra);
+            }
+            continue;
+        }
+        if ended {
+            thread::sleep(Duration::from_millis(20));
+            continue;
+        }
+        let Some(frame) = decoder.next()? else {
+            ended = true;
+            continue;
+        };
+        let due = match last_due {
+            Some(last) if origin + at(frame.index) <= last => last + at(1),
+            _ => origin + at(frame.index),
+        };
+        last_due = Some(due);
+        loop {
+            let now = std::time::Instant::now();
+            if now >= due || state.stop.load(Ordering::Relaxed) || state.again.load(Ordering::Relaxed) || !state.shown.load(Ordering::Relaxed) {
+                break;
+            }
+            thread::sleep((due - now).min(Duration::from_millis(10)));
+        }
+        // Far behind (the computer busy): its time is from now on.
+        let now = std::time::Instant::now();
+        if now > due + Duration::from_millis(500) {
+            origin = now.checked_sub(at(frame.index)).unwrap_or(now);
+        }
+        put_rgba(latest, &frame, &mut bgra);
+    }
+    Ok(())
+}
+
+/// A decoded frame (RGBA) into a layer's texture (BGRA).
+fn put_rgba(latest: &Latest, frame: &crate::decode::Picture, bgra: &mut Vec<u8>) {
+    let n = (frame.width * frame.height * 4) as usize;
+    if frame.rgba.len() < n {
+        return;
+    }
+    bgra.clear();
+    bgra.extend(frame.rgba[..n].chunks_exact(4).flat_map(|p| [p[2], p[1], p[0], p[3]]));
+    latest.upload_bgra(bgra.as_ptr(), frame.width * 4, frame.width, frame.height);
 }
 
 /// What a [`CaptureFeed`] captures: a display by id, an app's main window
@@ -300,5 +504,48 @@ impl Drop for CaptureFeed {
     /// Its thread stops the capture by itself.
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    /// Each frame shows for its time, then the next; after the last, the
+    /// first again.
+    #[test]
+    fn an_animation_shows_each_frame_for_its_time() {
+        let still = || crate::StillImage { width: 1, height: 1, bgra: vec![0; 4] };
+        let frames = [(still(), Duration::from_millis(100)), (still(), Duration::from_millis(50)), (still(), Duration::from_millis(200))];
+        let at = |ms: u64| super::frame_at(&frames, Duration::from_millis(ms));
+        assert_eq!([at(0), at(99), at(100), at(149), at(150), at(349), at(350), at(460)], [0, 0, 1, 1, 2, 2, 0, 1]);
+        assert_eq!(super::frame_at(&frames[..1], Duration::from_secs(9)), 0);
+    }
+
+    /// A video layer's decoding: to its end in order, then from frame 0
+    /// again and on (its loop). `HASTECLIP_TEST_VIDEO=<a video file>`, and
+    /// `HASTECLIP_TEST_VIDEO_FPS=<its rate>` where the decoder's is off (it
+    /// said 20 for a 60 fps recording, each number three frames).
+    #[test]
+    #[ignore]
+    fn a_video_plays_to_its_end_and_from_the_start_again() {
+        let Ok(path) = std::env::var("HASTECLIP_TEST_VIDEO") else { return };
+        let path = std::path::Path::new(&path);
+        assert!(crate::layers::video_size(path).is_some_and(|(w, h)| w > 0 && h > 0));
+        let mut d = crate::decode::Decoder::open_rgba(path, 640).unwrap();
+        if let Ok(fps) = std::env::var("HASTECLIP_TEST_VIDEO_FPS") {
+            d.set_fps(fps.parse().unwrap());
+        }
+        let (mut last, mut n) = (None::<u64>, 0);
+        while let Some(f) = d.next().unwrap() {
+            assert!(last.is_none_or(|l| f.index > l), "in order: {} after {last:?} (frame {n})", f.index);
+            assert!(f.rgba.len() >= (f.width * f.height * 4) as usize);
+            last = Some(f.index);
+            n += 1;
+        }
+        assert!(n > 10, "{n} frames");
+        assert_eq!(d.frame(0).unwrap().map(|f| f.index), Some(0));
+        let on = d.next().unwrap().map(|f| f.index);
+        assert!(on.is_some_and(|i| (1..5).contains(&i)), "{on:?}");
     }
 }

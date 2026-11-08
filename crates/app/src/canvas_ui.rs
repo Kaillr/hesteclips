@@ -190,6 +190,11 @@ pub(crate) struct CanvasView {
     /// What was copied (Ctrl+C) or cut, to paste (see `clipboard_ui`):
     /// kept across scenes and presets.
     pub(crate) clipboard: Option<crate::settings::CopiedSources>,
+    /// Each animated image's frames, by key (its first is in `pictures`).
+    pub(crate) animations: std::collections::HashMap<u64, capture::layers::Animation>,
+    /// Each video file's size and frame rate, once asked for (`None`: it
+    /// can't be played).
+    pub(crate) video_sizes: std::collections::HashMap<std::path::PathBuf, Option<(u32, u32, f64)>>,
 }
 
 /// The video's sources as undo keeps them: the screen (its box or how it
@@ -1301,103 +1306,7 @@ impl App {
             }
             crate::ui_kit::menu_sep(ui);
         }
-        // How the video puts the screen in: its position and size both. In
-        // the screen's own shape too, for when it changes (a game at a
-        // stretched resolution).
-        if screen && !many {
-            let now = self.settings.screen.placed.is_none().then_some(self.settings.framing);
-            for (framing, _, label, tip) in FRAMINGS {
-                if Item::new(label).check(now == Some(framing)).tip(tip).show(ui).clicked() {
-                    self.screen_framed(framing);
-                    ui.close();
-                }
-            }
-            crate::ui_kit::menu_sep(ui);
-        }
-        // Each on its own; both are its first place and size.
-        let resettable: Vec<(bool, bool)> = set.iter().map(|l| self.layer_resettable(*l, aspect)).collect();
-        let (position, size) = (resettable.iter().any(|r| r.0), resettable.iter().any(|r| r.1));
-        let (place_tip, size_tip) = match layer {
-            Layer::Screen if self.video_shaped() => ("Back in the middle of the video, its size kept", "Back to the size the video gives it, where it is"),
-            Layer::Screen => ("Back in the middle of the video, its size kept", "As big as the video again, where it is"),
-            Layer::Webcam(_) => ("Back to the bottom-right corner, its size kept", "A quarter of the video wide again, where it is"),
-            Layer::Visual(_) => ("Back in the middle of the video, its size kept", "Its own size again (a pixel of it a pixel of the video), where it is"),
-        };
-        if Item::new("Reset position").icon(icon::ARROWS_OUT_CARDINAL).enabled(position).tip(place_tip).show(ui).clicked() {
-            for l in &set {
-                self.layer_reset_position(*l, aspect);
-            }
-            ui.close();
-        }
-        if Item::new("Reset size").icon(icon::RESIZE).enabled(size).tip(size_tip).show(ui).clicked() {
-            for l in &set {
-                self.layer_reset_size(*l, aspect);
-            }
-            ui.close();
-        }
-        if let Some(cropped) = self.layer_cropped(layer).filter(|_| !many) {
-            // Its handles crop till Done or Enter, on the preview (the
-            // dialog closes for it).
-            let tip = format!("Drag its handles to cut its edges off, till Done or Enter ({} and a handle do it too)", crate::shortcuts::alt_name());
-            if Item::new("Crop").icon(icon::CROP).tip(tip).show(ui).clicked() {
-                self.select_layer(layer);
-                self.canvas.crop_mode = Some(layer);
-                self.sources_view.editing = None;
-                ui.close();
-            }
-            if Item::new("Reset crop").icon(icon::ARROWS_OUT).enabled(cropped).tip("All of its picture again").show(ui).clicked() {
-                self.layer_uncrop(layer, aspect);
-                ui.close();
-            }
-        }
-        crate::ui_kit::menu_sep(ui);
-        // Turned a quarter at a time, as it's seen.
-        for (label, ic, by) in [("Turn clockwise", icon::ARROW_CLOCKWISE, 1), ("Turn anticlockwise", icon::ARROW_COUNTER_CLOCKWISE, -1)] {
-            if Item::new(label).icon(ic).show(ui).clicked() {
-                for l in &set {
-                    self.turn_layer(*l, by, aspect);
-                }
-                ui.close();
-            }
-        }
-        let (mirrored, upside_down) = self.layer_flips(layer);
-        if Item::new("Mirror").icon(icon::FLIP_HORIZONTAL).check(mirrored).tip("Flip left to right").show(ui).clicked() {
-            for l in &set {
-                self.flip_layer(*l, true, aspect);
-            }
-            ui.close();
-        }
-        if Item::new("Flip upside down").icon(icon::FLIP_VERTICAL).check(upside_down).show(ui).clicked() {
-            for l in &set {
-                self.flip_layer(*l, false, aspect);
-            }
-            ui.close();
-        }
-        // Which is in front: with others to go in front of or behind.
-        let order = self.layer_order();
-        if order.len() > set.len() {
-            crate::ui_kit::menu_sep(ui);
-            let at = order.iter().position(|l| *l == layer).unwrap_or(0);
-            let (front, back) = if many { (true, true) } else { (at > 0, at + 1 < order.len()) };
-            let mut step = None;
-            if Item::new("Bring to front").icon(icon::SELECTION_FOREGROUND).enabled(front).keys(keys(&[ctrl, "Shift", "]"])).show(ui).clicked() {
-                step = Some(OrderStep::Front);
-            }
-            if order.len() > 2 && Item::new("Bring forward").icon(icon::ARROW_UP).enabled(front).keys(keys(&[ctrl, "]"])).show(ui).clicked() {
-                step = Some(OrderStep::Forward);
-            }
-            if order.len() > 2 && Item::new("Send backward").icon(icon::ARROW_DOWN).enabled(back).keys(keys(&[ctrl, "["])).show(ui).clicked() {
-                step = Some(OrderStep::Backward);
-            }
-            if Item::new("Send to back").icon(icon::SELECTION_BACKGROUND).enabled(back).keys(keys(&[ctrl, "Shift", "["])).show(ui).clicked() {
-                step = Some(OrderStep::Back);
-            }
-            if let Some(step) = step {
-                self.move_layers(&set, step);
-                ui.close();
-            }
-        }
-        crate::ui_kit::menu_sep(ui);
+        // Cut, copy, paste; a copy of it here, it into another scene.
         self.clipboard_items(ui, true, aspect);
         let visuals: Vec<Layer> = set.iter().copied().filter(|l| matches!(l, Layer::Visual(_))).collect();
         let label = if visuals.len() > 1 { format!("Duplicate {} sources", visuals.len()) } else { "Duplicate".to_owned() };
@@ -1408,6 +1317,117 @@ impl App {
         if !many {
             self.copy_menu(ui, layer);
         }
+        crate::ui_kit::menu_sep(ui);
+        // Where it is and how it's turned, in a menu of their own (all here,
+        // this one was taller than a short window): the screen's framings,
+        // the resets, turns and flips.
+        enum Act {
+            Framing(Framing),
+            ResetPosition,
+            ResetSize,
+            ResetCrop,
+            Turn(i8),
+            Flip(bool),
+        }
+        let resettable: Vec<(bool, bool)> = set.iter().map(|l| self.layer_resettable(*l, aspect)).collect();
+        let (position, size) = (resettable.iter().any(|r| r.0), resettable.iter().any(|r| r.1));
+        let (place_tip, size_tip) = match layer {
+            Layer::Screen if self.video_shaped() => ("Back in the middle of the video, its size kept", "Back to the size the video gives it, where it is"),
+            Layer::Screen => ("Back in the middle of the video, its size kept", "As big as the video again, where it is"),
+            Layer::Webcam(_) => ("Back to the bottom-right corner, its size kept", "A quarter of the video wide again, where it is"),
+            Layer::Visual(_) => ("Back in the middle of the video, its size kept", "Its own size again (a pixel of it a pixel of the video), where it is"),
+        };
+        let cropped = self.layer_cropped(layer).filter(|_| !many);
+        let (mirrored, upside_down) = self.layer_flips(layer);
+        // How the video puts the screen in: its position and size both. In
+        // the screen's own shape too, for when it changes (a game at a
+        // stretched resolution).
+        let framing = (screen && !many).then(|| self.settings.screen.placed.is_none().then_some(self.settings.framing));
+        let mut act = None;
+        crate::ui_kit::submenu(ui, Item::new("Transform").icon(icon::BOUNDING_BOX), |ui| {
+            if let Some(now) = framing {
+                for (f, _, label, tip) in FRAMINGS {
+                    if Item::new(label).check(now == Some(f)).tip(tip).show(ui).clicked() {
+                        act = Some(Act::Framing(f));
+                    }
+                }
+                crate::ui_kit::menu_sep(ui);
+            }
+            if Item::new("Reset position").icon(icon::ARROWS_OUT_CARDINAL).enabled(position).tip(place_tip).show(ui).clicked() {
+                act = Some(Act::ResetPosition);
+            }
+            if Item::new("Reset size").icon(icon::RESIZE).enabled(size).tip(size_tip).show(ui).clicked() {
+                act = Some(Act::ResetSize);
+            }
+            if let Some(cropped) = cropped
+                && Item::new("Reset crop").icon(icon::ARROWS_OUT).enabled(cropped).tip("All of its picture again").show(ui).clicked()
+            {
+                act = Some(Act::ResetCrop);
+            }
+            crate::ui_kit::menu_sep(ui);
+            // Turned a quarter at a time, as it's seen.
+            for (label, ic, by) in [("Turn clockwise", icon::ARROW_CLOCKWISE, 1), ("Turn anticlockwise", icon::ARROW_COUNTER_CLOCKWISE, -1)] {
+                if Item::new(label).icon(ic).show(ui).clicked() {
+                    act = Some(Act::Turn(by));
+                }
+            }
+            if Item::new("Mirror").icon(icon::FLIP_HORIZONTAL).check(mirrored).tip("Flip left to right").show(ui).clicked() {
+                act = Some(Act::Flip(true));
+            }
+            if Item::new("Flip upside down").icon(icon::FLIP_VERTICAL).check(upside_down).show(ui).clicked() {
+                act = Some(Act::Flip(false));
+            }
+        });
+        if let Some(act) = act {
+            for l in &set {
+                match act {
+                    Act::Framing(f) => self.screen_framed(f),
+                    Act::ResetPosition => self.layer_reset_position(*l, aspect),
+                    Act::ResetSize => self.layer_reset_size(*l, aspect),
+                    Act::ResetCrop => self.layer_uncrop(*l, aspect),
+                    Act::Turn(by) => self.turn_layer(*l, by, aspect),
+                    Act::Flip(across) => self.flip_layer(*l, across, aspect),
+                }
+            }
+            ui.close();
+        }
+        if cropped.is_some() {
+            // Its handles crop till Done or Enter, on the preview (the
+            // dialog closes for it).
+            let tip = format!("Drag its handles to cut its edges off, till Done or Enter ({} and a handle do it too)", crate::shortcuts::alt_name());
+            if Item::new("Crop").icon(icon::CROP).tip(tip).show(ui).clicked() {
+                self.select_layer(layer);
+                self.canvas.crop_mode = Some(layer);
+                self.sources_view.editing = None;
+                ui.close();
+            }
+        }
+        // Which is in front: with others to go in front of or behind.
+        let order = self.layer_order();
+        if order.len() > set.len() {
+            let at = order.iter().position(|l| *l == layer).unwrap_or(0);
+            let (front, back) = if many { (true, true) } else { (at > 0, at + 1 < order.len()) };
+            let mut step = None;
+            crate::ui_kit::submenu(ui, Item::new("Order").icon(icon::ARROWS_DOWN_UP), |ui| {
+                if Item::new("Bring to front").icon(icon::SELECTION_FOREGROUND).enabled(front).keys(keys(&[ctrl, "Shift", "]"])).show(ui).clicked() {
+                    step = Some(OrderStep::Front);
+                }
+                if order.len() > 2 && Item::new("Bring forward").icon(icon::ARROW_UP).enabled(front).keys(keys(&[ctrl, "]"])).show(ui).clicked() {
+                    step = Some(OrderStep::Forward);
+                }
+                if order.len() > 2 && Item::new("Send backward").icon(icon::ARROW_DOWN).enabled(back).keys(keys(&[ctrl, "["])).show(ui).clicked() {
+                    step = Some(OrderStep::Backward);
+                }
+                if Item::new("Send to back").icon(icon::SELECTION_BACKGROUND).enabled(back).keys(keys(&[ctrl, "Shift", "["])).show(ui).clicked() {
+                    step = Some(OrderStep::Back);
+                }
+            });
+            if let Some(step) = step {
+                self.move_layers(&set, step);
+                ui.close();
+            }
+        }
+        crate::ui_kit::menu_sep(ui);
         // Groups: a new one of it (and the others picked in the list), into
         // another, or out of its own.
         let set = self.grouping(layer);
@@ -1441,6 +1461,7 @@ impl App {
             }
             ui.close();
         }
+        crate::ui_kit::menu_sep(ui);
         let locked = set.iter().all(|l| self.settings.is_locked(*l));
         let lock = Item::new(counted(if locked { "Unlock" } else { "Lock" })).icon(if locked { icon::LOCK_SIMPLE_OPEN } else { icon::LOCK_SIMPLE }).keys(keys(&[ctrl, "Shift", "L"]));
         let lock = lock.tip(if locked { "It moves on the preview again" } else { "It can't be moved on the preview, and clicks go through it" });

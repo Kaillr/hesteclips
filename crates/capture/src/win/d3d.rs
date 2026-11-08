@@ -1118,7 +1118,9 @@ impl Converter {
                 | crate::LayerSource::Window { placement: p, .. }
                 | crate::LayerSource::Picture { placement: p, .. }
                 | crate::LayerSource::Colour { placement: p, .. }
-                | crate::LayerSource::Browser { placement: p, .. } => {
+                | crate::LayerSource::Browser { placement: p, .. }
+                | crate::LayerSource::Animation { placement: p, .. }
+                | crate::LayerSource::Video { placement: p, .. } => {
                     let Some(layer) = picture(l.id) else { continue };
                     let ([sx, sy, sw, sh], [dx, dy, dw, dh]) = p.place_on(layer.source.content(), frame, even);
                     if sw > 0 && sh > 0 && dw > 0 && dh > 0 {

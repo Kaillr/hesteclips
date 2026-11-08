@@ -25,6 +25,7 @@ impl App {
     pub(crate) fn refresh_visual_pictures(&mut self) {
         let wanted: Vec<(u64, Visual)> = self.settings.visuals.iter().filter(|v| matches!(v.visual, Visual::Image { .. } | Visual::Text(_))).map(|v| (v.key, v.visual.clone())).collect();
         self.canvas.pictures.retain(|k, _| wanted.iter().any(|(w, _)| w == k));
+        self.canvas.animations.retain(|k, _| wanted.iter().any(|(w, v)| w == k && matches!(v, Visual::Image { .. })));
         // Words in a font that wasn't found yet are drawn again once it is.
         let fonts = crate::fonts::families().is_some();
         if fonts != self.canvas.fonts_found {
@@ -67,9 +68,15 @@ impl App {
                 }
                 continue;
             }
+            self.canvas.animations.remove(&key);
             let picture = match &visual {
                 Visual::Image { path } => match load_image(path) {
-                    Ok(p) => Some(Arc::new(p)),
+                    Ok((p, frames)) => {
+                        if let Some(frames) = frames {
+                            self.canvas.animations.insert(key, frames);
+                        }
+                        Some(Arc::new(p))
+                    }
                     Err(e) => {
                         eprintln!("image source {}: {e:#}", path.display());
                         None
@@ -156,8 +163,21 @@ impl App {
             Visual::Window { app, .. } => asked(self, &|| capture::layers::app_window_size(app)),
             Visual::Image { .. } | Visual::Text(_) => self.visual_picture(key).map(|p| (p.width, p.height)),
             Visual::Browser { width, height, .. } => Some((*width, *height)),
+            Visual::Video { path, .. } => self.video_info(path).map(|(w, h, _)| (w, h)),
             Visual::Colour { .. } => None,
         }
+    }
+
+    /// A video file's size and frame rate (as its index says: what the
+    /// decoder says can be far off; 0 when it isn't known), asked for once
+    /// (opening it to find out takes a moment): `None` if it can't be
+    /// played.
+    pub(crate) fn video_info(&mut self, path: &std::path::Path) -> Option<(u32, u32, f64)> {
+        *self.canvas.video_sizes.entry(path.to_owned()).or_insert_with(|| {
+            let (w, h) = capture::layers::video_size(path)?;
+            let fps = media::probe(path).ok().map(|i| i.fps).filter(|f| f.is_finite() && *f > 0.0).unwrap_or(0.0);
+            Some((w, h, fps))
+        })
     }
 
     /// A boxed source's picture's size as it shows: cropped, then turned.
@@ -259,6 +279,7 @@ impl App {
             Visual::Display { id, .. } if !self.screens.is_empty() && !self.screens.iter().any(|s| s.id == *id) => Some("Not connected"),
             Visual::Window { .. } if self.canvas.sizes.get(&key).is_some_and(|(s, _)| s.is_none()) => Some("Not open"),
             Visual::Image { .. } if self.canvas.pictures.get(&key).is_some_and(|(_, p)| p.is_none()) => Some("Can't be read"),
+            Visual::Video { path, .. } if self.canvas.video_sizes.get(path).is_some_and(Option::is_none) => Some("Can't be played"),
             _ => None,
         }
     }
@@ -268,7 +289,7 @@ impl App {
         let Some(v) = self.settings.visual(key) else { return String::new() };
         match &v.visual {
             Visual::Display { name, .. } | Visual::Window { name, .. } => name.clone(),
-            Visual::Image { path } => path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned()),
+            Visual::Image { path } | Visual::Video { path, .. } => path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned()),
             Visual::Colour { rgba } => format!("#{:02X}{:02X}{:02X}", rgba[0], rgba[1], rgba[2]),
             Visual::Text(s) => s.text.lines().next().unwrap_or_default().to_owned(),
             Visual::Browser { url, .. } => url.clone(),
@@ -294,11 +315,52 @@ pub(crate) fn colour_button(ui: &mut egui::Ui, rgba: [u8; 4]) -> Option<[u8; 4]>
 }
 
 /// An image file as a picture, its transparency kept.
-fn load_image(path: &std::path::Path) -> anyhow::Result<capture::StillImage> {
-    let img = image::open(path)?.to_rgba8();
-    let (width, height) = img.dimensions();
-    let bgra = img.pixels().flat_map(|p| [p[2], p[1], p[0], p[3]]).collect();
-    Ok(capture::StillImage { width, height, bgra })
+fn load_image(path: &std::path::Path) -> anyhow::Result<(capture::StillImage, Option<capture::layers::Animation>)> {
+    let still = |img: &image::RgbaImage| {
+        let (width, height) = img.dimensions();
+        capture::StillImage { width, height, bgra: img.pixels().flat_map(|p| [p[2], p[1], p[0], p[3]]).collect() }
+    };
+    // An animated GIF: all its frames, each for its time (shrunk to fit
+    // MAX_ANIMATION in all: a big, long one would fill memory).
+    if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("gif")) {
+        use image::AnimationDecoder;
+        let file = std::io::BufReader::new(std::fs::File::open(path)?);
+        let frames = image::codecs::gif::GifDecoder::new(file)?.into_frames().collect_frames()?;
+        if frames.len() > 1 {
+            let (w, h) = frames[0].buffer().dimensions();
+            let bytes = u64::from(w) * u64::from(h) * 4 * frames.len() as u64;
+            // Within the capture's biggest picture too.
+            let side = 4096.0 / f64::from(w.max(h).max(1));
+            let fits = if bytes > MAX_ANIMATION { (MAX_ANIMATION as f64 / bytes as f64).sqrt() } else { 1.0 };
+            let scale = fits.min(side).min(1.0);
+            let (tw, th) = (((f64::from(w) * scale) as u32).max(1), ((f64::from(h) * scale) as u32).max(1));
+            let list: Vec<(capture::StillImage, std::time::Duration)> = frames
+                .iter()
+                .map(|f| {
+                    let picture = if scale < 1.0 { still(&image::imageops::resize(f.buffer(), tw, th, image::imageops::FilterType::Triangle)) } else { still(f.buffer()) };
+                    (picture, gif_delay(f.delay()))
+                })
+                .collect();
+            let first = list[0].0.clone();
+            return Ok((first, Some(capture::layers::Animation(Arc::new(list)))));
+        }
+        if let Some(f) = frames.first() {
+            return Ok((still(f.buffer()), None));
+        }
+    }
+    Ok((still(&image::open(path)?.to_rgba8()), None))
+}
+
+/// The most an animated image's frames take in all: a bigger one's shrunk.
+const MAX_ANIMATION: u64 = 192 << 20;
+
+/// How long a GIF's frame shows: as browsers have it, one said to show for
+/// almost no time (under 20 ms: often 0, meaning "as fast as you can")
+/// shows for 100 ms.
+fn gif_delay(d: image::Delay) -> std::time::Duration {
+    let (n, den) = d.numer_denom_ms();
+    let ms = n.checked_div(den).unwrap_or(0);
+    std::time::Duration::from_millis(u64::from(if ms < 20 { 100 } else { ms }))
 }
 
 /// Words drawn as `style` says, on nothing (transparent): a line for each
@@ -517,5 +579,34 @@ mod tests {
         };
         let (l, c, r) = (first_ink(TextAlign::Left), first_ink(TextAlign::Centre), first_ink(TextAlign::Right));
         assert!(l < c && c < r, "{l} {c} {r}");
+    }
+
+    /// A GIF is read (it couldn't be): one that moves has its frames, each
+    /// with its time, one said to take none 100 ms; a still one has none.
+    #[test]
+    fn gifs_are_read_and_move() {
+        use image::codecs::gif::GifEncoder;
+        use image::{Delay, Frame, Rgba, RgbaImage};
+        let dir = std::env::temp_dir().join(format!("hasteclip-gif-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let moving = dir.join("moving.gif");
+        {
+            let mut enc = GifEncoder::new(std::fs::File::create(&moving).unwrap());
+            let red = Frame::from_parts(RgbaImage::from_pixel(8, 6, Rgba([255, 0, 0, 255])), 0, 0, Delay::from_numer_denom_ms(50, 1));
+            let blue = Frame::from_parts(RgbaImage::from_pixel(8, 6, Rgba([0, 0, 255, 255])), 0, 0, Delay::from_numer_denom_ms(0, 1));
+            enc.encode_frames([red, blue]).unwrap();
+        }
+        let (first, frames) = super::load_image(&moving).unwrap();
+        assert_eq!((first.width, first.height), (8, 6));
+        assert_eq!(&first.bgra[..4], &[0, 0, 255, 255], "red, as B, G, R, A");
+        let frames = frames.expect("it moves");
+        let times: Vec<u128> = frames.0.iter().map(|(_, d)| d.as_millis()).collect();
+        assert_eq!(times, vec![50, 100]);
+        assert_eq!(&frames.0[1].0.bgra[..4], &[255, 0, 0, 255], "then blue");
+        let still = dir.join("still.gif");
+        RgbaImage::from_pixel(4, 4, Rgba([0, 255, 0, 255])).save(&still).unwrap();
+        let (p, none) = super::load_image(&still).unwrap();
+        assert!(none.is_none() && p.width == 4);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

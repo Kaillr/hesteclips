@@ -125,9 +125,11 @@ impl App {
                 ui.close();
             }
         }
+        // Paste, with nothing copied: there only in the preview's own menu,
+        // greyed (a source's and a group's are long enough).
         let copied = self.canvas.clipboard.clone();
         let tip = "The same source, placed as it was where it was copied (a copy of it, in a scene that has it)";
-        if Item::new("Paste").icon(icon::CLIPBOARD_TEXT).enabled(copied.is_some()).keys(keys(&[ctrl, "V"])).tip(tip).show(ui).clicked() {
+        if (copied.is_some() || !selection) && Item::new("Paste").icon(icon::CLIPBOARD_TEXT).enabled(copied.is_some()).keys(keys(&[ctrl, "V"])).tip(tip).show(ui).clicked() {
             self.paste_copied(false, aspect);
             ui.close();
         }

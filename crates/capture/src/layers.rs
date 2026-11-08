@@ -48,10 +48,47 @@ pub enum LayerSource {
     /// added to it, blended by its transparency, placed as a display is
     /// (Windows: see [`BROWSER`]).
     Browser { url: String, width: u32, height: u32, css: String, placement: ScreenPlacement },
+    /// A picture that moves (an animated GIF): each of its frames for its
+    /// time, over and over, blended as a picture is.
+    Animation { animation: Animation, placement: ScreenPlacement },
+    /// A video file, `width`×`height` its own size, `fps` its frame rate
+    /// (as its index says: the decoder's own can be far off): played from
+    /// the start again at its end (`looped`; else its last picture stays),
+    /// waiting while it's hidden and going on when it's shown again, or
+    /// starting over (`restart`). Placed as a display is (Windows: see
+    /// [`VIDEO`]).
+    Video { path: std::path::PathBuf, width: u32, height: u32, fps: f64, looped: bool, restart: bool, placement: ScreenPlacement },
 }
 
 /// Whether this platform can show a web page as a layer.
 pub const BROWSER: bool = cfg!(target_os = "windows");
+
+/// Whether this platform can play a video file as a layer.
+pub const VIDEO: bool = cfg!(target_os = "windows");
+
+/// A video file's picture size, if it can be played (see [`VIDEO`]).
+pub fn video_size(path: &std::path::Path) -> Option<(u32, u32)> {
+    #[cfg(target_os = "windows")]
+    {
+        crate::win::decode::Decoder::open_rgba(path, 64).ok().map(|d| d.source_size())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// An animated picture's frames, each with how long it shows, shared as
+/// a [`Picture`] is (the same animation is the same `Arc`).
+#[derive(Debug, Clone)]
+pub struct Animation(pub Arc<Vec<(crate::StillImage, std::time::Duration)>>);
+
+impl PartialEq for Animation {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
 
 /// A picture for a layer, shared: the same picture is the same `Arc`, so
 /// the list is compared every frame without comparing pixels.
@@ -68,7 +105,7 @@ impl LayerSource {
     /// Whether it's blended by alpha over what's under it, rather than
     /// covering its place.
     pub fn blended(&self) -> bool {
-        matches!(self, LayerSource::Picture { .. } | LayerSource::Colour { .. } | LayerSource::Browser { .. })
+        matches!(self, LayerSource::Picture { .. } | LayerSource::Colour { .. } | LayerSource::Browser { .. } | LayerSource::Animation { .. })
     }
 }
 
@@ -103,7 +140,13 @@ impl Layer {
         match &self.source {
             LayerSource::Main => true,
             LayerSource::Camera { placement, .. } => !placement.is_hidden(),
-            LayerSource::Display { placement, .. } | LayerSource::Window { placement, .. } | LayerSource::Picture { placement, .. } | LayerSource::Colour { placement, .. } | LayerSource::Browser { placement, .. } => !placement.hidden,
+            LayerSource::Display { placement, .. }
+            | LayerSource::Window { placement, .. }
+            | LayerSource::Picture { placement, .. }
+            | LayerSource::Colour { placement, .. }
+            | LayerSource::Browser { placement, .. }
+            | LayerSource::Animation { placement, .. }
+            | LayerSource::Video { placement, .. } => !placement.hidden,
         }
     }
 }

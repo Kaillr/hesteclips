@@ -446,6 +446,16 @@ pub enum Visual {
         #[serde(default, skip_serializing_if = "String::is_empty")]
         css: String,
     },
+    /// A video file, its picture: from the start again when it ends
+    /// (`looped`; else its last picture stays), and each time it's shown
+    /// again (`restart`; else it goes on where it was).
+    Video {
+        path: PathBuf,
+        #[serde(default = "yes")]
+        looped: bool,
+        #[serde(default = "yes")]
+        restart: bool,
+    },
 }
 
 /// How a line of words lines up with the others.
@@ -522,6 +532,7 @@ impl Visual {
             Visual::Colour { .. } => "Colour",
             Visual::Text { .. } => "Text",
             Visual::Browser { .. } => "Web page",
+            Visual::Video { .. } => "Video",
         }
     }
 

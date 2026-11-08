@@ -1260,6 +1260,14 @@ impl App {
                         Visual::Colour { rgba } => LayerSource::Colour { rgba: *rgba, placement },
                         Visual::Browser { url, width, height, css, .. } if capture::layers::BROWSER && url.len() > "https://".len() => LayerSource::Browser { url: url.clone(), width: *width, height: *height, css: css.clone(), placement },
                         Visual::Browser { .. } => continue,
+                        // Its frames, an animated image.
+                        Visual::Image { .. } if self.canvas.animations.contains_key(&key) => LayerSource::Animation { animation: self.canvas.animations[&key].clone(), placement },
+                        // Once its size is known (it can be played).
+                        Visual::Video { path, looped, restart } if capture::layers::VIDEO => match self.canvas.video_sizes.get(path).copied().flatten() {
+                            Some((width, height, fps)) => LayerSource::Video { path: path.clone(), width, height, fps, looped: *looped, restart: *restart, placement },
+                            None => continue,
+                        },
+                        Visual::Video { .. } => continue,
                         // Its picture, once it's made (`refresh_visual_pictures`).
                         Visual::Image { .. } | Visual::Text { .. } => match self.visual_picture(key) {
                             Some(p) => LayerSource::Picture { picture: capture::layers::Picture(p), placement },

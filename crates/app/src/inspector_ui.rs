@@ -47,6 +47,9 @@ const TEXT_SIZES: [u32; 8] = [24, 36, 48, 64, 72, 96, 144, 200];
 /// Image files offered.
 pub(crate) const IMAGE_EXTS: [&str; 6] = ["png", "jpg", "jpeg", "webp", "bmp", "gif"];
 
+/// The video files a video source plays (what Windows' own decoder reads).
+pub(crate) const VIDEO_EXTS: [&str; 8] = ["mp4", "m4v", "mov", "mkv", "webm", "avi", "wmv", "ts"];
+
 /// A source's symbol, in the list and over its settings.
 pub(crate) fn layer_icon(app: &App, layer: Layer) -> &'static str {
     match layer {
@@ -59,6 +62,7 @@ pub(crate) fn layer_icon(app: &App, layer: Layer) -> &'static str {
             Some(Visual::Colour { .. }) => icon::PAINT_BUCKET,
             Some(Visual::Text(_)) => icon::TEXT_T,
             Some(Visual::Browser { .. }) => icon::GLOBE,
+            Some(Visual::Video { .. }) => icon::FILM_STRIP,
             _ => icon::MONITOR,
         },
     }
@@ -587,6 +591,29 @@ impl App {
                     }
                 });
             }
+            Visual::Video { path, looped, restart } => {
+                let name = path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+                l.row(Row::new("File").note(name), |ui| {
+                    if Btn::normal("Choose…").small().tip("Another video").show(ui).clicked()
+                        && let Some(p) = rfd::FileDialog::new().add_filter("Videos", &VIDEO_EXTS).pick_file()
+                    {
+                        set = Some(Visual::Video { path: p, looped: *looped, restart: *restart });
+                    }
+                });
+                l.row(Row::new("Loop").note("From the start again when it ends; off, its last picture stays"), |ui| {
+                    let mut on = *looped;
+                    if ui_kit::switch(ui, &mut on).changed() {
+                        set = Some(Visual::Video { path: path.clone(), looped: on, restart: *restart });
+                    }
+                });
+                l.row(Row::new("Restart when shown").note("From the start each time its scene is shown, or it's shown again; off, it goes on where it was"), |ui| {
+                    let mut on = *restart;
+                    if ui_kit::switch(ui, &mut on).changed() {
+                        set = Some(Visual::Video { path: path.clone(), looped: *looped, restart: on });
+                    }
+                });
+                l.row(Row::new("Sound").note("Its picture only: its sound isn't in your clips"), |_| {});
+            }
             Visual::Browser { url, width, height, reload, css } => {
                 // Typed in full, then taken when it's done (Enter, or
                 // clicking away): each key would load the page again.
@@ -657,7 +684,8 @@ impl App {
         }
         if let Some(new) = set {
             // Another picture is another shape: it goes where it goes at first.
-            let reshaped = matches!(new, Visual::Display { .. } | Visual::Window { .. } | Visual::Image { .. });
+            let other_video = matches!((&new, &v.visual), (Visual::Video { path: a, .. }, Visual::Video { path: b, .. }) if a != b);
+            let reshaped = matches!(new, Visual::Display { .. } | Visual::Window { .. } | Visual::Image { .. }) || other_video;
             let page = matches!(new, Visual::Browser { .. });
             let before = self.visual_size(key);
             if let Some(d) = self.settings.visual_mut(key) {
