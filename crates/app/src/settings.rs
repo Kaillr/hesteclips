@@ -760,6 +760,37 @@ where
     })
 }
 
+/// Sources copied (Ctrl+C) or cut on Sources, each as it was then, to
+/// paste (Ctrl+V) into another scene or another preset's: front first.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CopiedSources {
+    pub sources: Vec<CopiedSource>,
+    /// The group they were, by its name, when a group was copied.
+    pub group: Option<String>,
+}
+
+/// One source copied: the screen as it was placed (each preset has its
+/// own: pasted, that one's placed so), a webcam or another source with all
+/// its settings, placed as it was.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CopiedSource {
+    Screen(SceneItem),
+    Webcam(WebcamCfg),
+    Visual(VisualCfg),
+}
+
+/// How a paste went: the sources put in the scene, and those that
+/// weren't (by name): ones it has already (a camera's in a scene once, as
+/// the screen is), webcams where a scene shows one and it has one.
+#[derive(Debug, Default, PartialEq)]
+pub struct Pasted {
+    pub layers: Vec<LayerKey>,
+    pub there: Vec<String>,
+    pub full: Vec<String>,
+    /// The group made of them, when a group was pasted.
+    pub group: Option<u64>,
+}
+
 /// `name`, or with a number after it (2, 3, …) if `taken` says it's used.
 fn unused_name(name: &str, taken: impl Fn(&str) -> bool) -> String {
     if !taken(name) {
@@ -2425,6 +2456,123 @@ impl RecordSettings {
         true
     }
 
+    /// `layers` of the scene shown as they are now (front first), to paste;
+    /// with group `group`'s name when they're its. `None` with none of them
+    /// in the scene.
+    pub fn copy_sources(&self, layers: &[LayerKey], group: Option<u64>) -> Option<CopiedSources> {
+        let sources: Vec<CopiedSource> = self
+            .layer_order()
+            .into_iter()
+            .filter(|l| layers.contains(l))
+            .filter_map(|l| match l {
+                LayerKey::Screen => self.item_of(l).map(CopiedSource::Screen),
+                LayerKey::Webcam(key) => self.webcam(key).cloned().map(CopiedSource::Webcam),
+                LayerKey::Visual(key) => self.visual(key).cloned().map(CopiedSource::Visual),
+            })
+            .collect();
+        let group = group.and_then(|id| self.group(id)).map(|g| g.name.clone());
+        (!sources.is_empty()).then_some(CopiedSources { sources, group })
+    }
+
+    /// What a copied source is called (see [`layer_title`](Self::layer_title)).
+    pub fn copied_title(&self, source: &CopiedSource) -> String {
+        match source {
+            CopiedSource::Screen(_) => self.layer_title(LayerKey::Screen),
+            CopiedSource::Webcam(w) => w.title.clone().unwrap_or_else(|| "Webcam".to_owned()),
+            CopiedSource::Visual(v) => v.title.clone().unwrap_or_else(|| v.visual.kind_name().to_owned()),
+        }
+    }
+
+    /// `copied` into the scene shown, in their order, in front of `before`
+    /// (all of its group, when it's in one), else in front of everything;
+    /// placed as they were. A source the preset has goes in as itself,
+    /// shared with the scenes that have it (a webcam: the preset's of the
+    /// same camera); one it hasn't (cut, or another preset's) as a source
+    /// of its own. With `own_copies`, or when the scene has it already,
+    /// another source (not a webcam, which opens once, nor the screen) is
+    /// its own copy: what it shows changes there alone, and one this scene
+    /// has goes a little down and right of it (`aspect`: the video's shape).
+    /// A webcam or the screen the scene has stays as it is, as does a
+    /// webcam where a scene shows one (`!many`) and it has another. A
+    /// group's go in a group of its name.
+    pub fn paste_sources(&mut self, copied: &CopiedSources, before: Option<LayerKey>, own_copies: bool, many: bool, aspect: f32) -> Pasted {
+        let mut out = Pasted::default();
+        let mut order = self.layer_order();
+        let anchor = before.map(|b| self.group_of(b).and_then(|g| g.members.first().copied()).unwrap_or(b));
+        let mut at = anchor.and_then(|a| order.iter().position(|l| *l == a)).unwrap_or(0);
+        for source in &copied.sources {
+            let title = self.copied_title(source);
+            let layer = match source {
+                CopiedSource::Screen(item) => {
+                    if order.contains(&LayerKey::Screen) {
+                        out.there.push(title);
+                        continue;
+                    }
+                    self.put_item(item);
+                    LayerKey::Screen
+                }
+                CopiedSource::Webcam(w) => {
+                    let same = self.webcam(w.key).or_else(|| self.webcam_of(&w.id)).map(|c| c.key);
+                    if same.is_some_and(|key| order.contains(&LayerKey::Webcam(key))) {
+                        out.there.push(title);
+                        continue;
+                    }
+                    if !many && order.iter().any(|l| matches!(l, LayerKey::Webcam(_))) {
+                        out.full.push(title);
+                        continue;
+                    }
+                    let key = match same {
+                        Some(key) => key,
+                        None => {
+                            let key = self.new_key();
+                            self.webcams.push(WebcamCfg { key, ..w.clone() });
+                            key
+                        }
+                    };
+                    self.put_item(&SceneItem::Webcam { key, enabled: w.enabled, placement: w.placement });
+                    LayerKey::Webcam(key)
+                }
+                CopiedSource::Visual(v) => {
+                    let here = order.contains(&LayerKey::Visual(v.key));
+                    let pooled = self.visual(v.key).cloned();
+                    if pooled.is_some() && !here && !own_copies {
+                        self.put_item(&SceneItem::Visual { key: v.key, enabled: v.enabled, placed: v.placed, turns: v.turns, flip_h: v.flip_h, flip_v: v.flip_v, crop: v.crop });
+                        LayerKey::Visual(v.key)
+                    } else {
+                        // What it shows as it is now, if the preset has it;
+                        // placed as it was copied.
+                        let mut own = pooled.unwrap_or_else(|| v.clone());
+                        (own.enabled, own.placed, own.turns, own.flip_h, own.flip_v, own.crop) = (v.enabled, v.placed, v.turns, v.flip_h, v.flip_v, v.crop);
+                        own.key = self.new_key();
+                        if here {
+                            own.title = own.title.map(|t| format!("{t} copy"));
+                            if let Some(b) = own.placed.as_mut() {
+                                b.x += 0.02;
+                                b.y += 0.02 * aspect;
+                            }
+                        }
+                        let key = own.key;
+                        self.visuals.push(own);
+                        LayerKey::Visual(key)
+                    }
+                }
+            };
+            order.insert(at.min(order.len()), layer);
+            at += 1;
+            out.layers.push(layer);
+        }
+        self.layer_order = order;
+        if let Some(name) = copied.group.as_deref().filter(|_| !out.layers.is_empty()) {
+            let name = unused_name(name, |n| self.groups.iter().any(|g| g.name == n));
+            out.group = self.make_group(&out.layers);
+            if let Some(g) = out.group.and_then(|id| self.group_mut(id)) {
+                g.name = name;
+            }
+        }
+        self.pack_groups();
+        out
+    }
+
     /// Whether `layer` is locked in the scene shown.
     pub fn is_locked(&self, layer: LayerKey) -> bool {
         self.locked.contains(&layer)
@@ -3733,6 +3881,87 @@ mod scene_tests {
         assert!(!back.layer_order().contains(&LayerKey::Screen));
         assert!(s.add_to_scene(LayerKey::Screen));
         assert!(!s.screen_placement().hidden);
+    }
+
+    /// Copied and pasted into another scene, sources are the same ones
+    /// there, front first, placed as they were; pasted where they are
+    /// already, a picture is a copy of its own, a little down and right, in
+    /// front of the source selected, and the camera stays once.
+    #[test]
+    fn pasted_sources_go_in_as_they_were_copied() {
+        let mut s = setup();
+        let a = s.active_scene;
+        if let Some(v) = s.visual_mut(2) {
+            v.placed = placed(0.4);
+        }
+        let copied = s.copy_sources(&[LayerKey::Visual(2), LayerKey::Webcam(1)], None).unwrap();
+        assert_eq!(copied.sources.len(), 2);
+        let b = s.add_scene(false);
+        s.switch_scene(b);
+        let pasted = s.paste_sources(&copied, None, false, true, 16.0 / 9.0);
+        assert_eq!(pasted.layers, vec![LayerKey::Webcam(1), LayerKey::Visual(2)]);
+        assert_eq!(s.layer_order(), vec![LayerKey::Webcam(1), LayerKey::Visual(2), LayerKey::Screen]);
+        assert_eq!(s.visual(2).and_then(|v| v.placed), placed(0.4));
+        assert_eq!((s.webcams.len(), s.visuals.len()), (1, 1), "the same sources, shared");
+        let again = s.paste_sources(&copied, Some(LayerKey::Screen), false, true, 16.0 / 9.0);
+        assert_eq!(again.there, vec!["Webcam".to_owned()]);
+        let [LayerKey::Visual(own)] = again.layers[..] else { panic!("{again:?}") };
+        assert_ne!(own, 2);
+        assert_eq!(s.layer_order(), vec![LayerKey::Webcam(1), LayerKey::Visual(2), LayerKey::Visual(own), LayerKey::Screen]);
+        assert!(s.visual(own).and_then(|v| v.placed).is_some_and(|b| (b.x - 0.42).abs() < 1e-4));
+        s.switch_scene(a);
+        assert_eq!(s.layer_order(), vec![LayerKey::Webcam(1), LayerKey::Visual(2), LayerKey::Screen], "where they were copied from, as they were");
+    }
+
+    /// Cut (gone from the preset) or another preset's, a pasted source is
+    /// one of its own, as it was; a webcam is the preset's of the same
+    /// camera where it has one, else one of its own; where a scene shows
+    /// one webcam, none goes beside another.
+    #[test]
+    fn a_source_cut_or_from_another_preset_pastes_as_its_own() {
+        let mut s = setup();
+        let copied = s.copy_sources(&[LayerKey::Webcam(1), LayerKey::Visual(2)], None).unwrap();
+        assert!(s.remove_from_scene(LayerKey::Visual(2)), "cut: in no other scene, it's gone");
+        let pasted = s.paste_sources(&copied, None, false, true, 16.0 / 9.0);
+        assert_eq!(pasted.there, vec!["Webcam".to_owned()]);
+        let [LayerKey::Visual(own)] = pasted.layers[..] else { panic!("{pasted:?}") };
+        assert_eq!(s.visual(own).map(|v| v.visual.clone()), Some(Visual::Image { path: "logo.png".into() }));
+        let p = s.add_preset("Copy", true);
+        s.switch_preset(p);
+        let cams = s.webcams.len();
+        let pasted = s.paste_sources(&copied, None, false, true, 16.0 / 9.0);
+        assert_eq!(pasted.there.len(), 1, "its own of that camera is in the scene");
+        assert_eq!(s.webcams.len(), cams);
+        let q = s.add_preset("Fresh", false);
+        s.switch_preset(q);
+        assert!(s.webcams.is_empty());
+        let pasted = s.paste_sources(&copied, None, false, true, 16.0 / 9.0);
+        assert_eq!(pasted.layers.len(), 2);
+        assert!(s.webcams.len() == 1 && s.webcams[0].key != 1 && s.webcams[0].id == "cam");
+        let other = CopiedSources { sources: vec![CopiedSource::Webcam(cam(1, "usb"))], group: None };
+        assert_eq!(s.paste_sources(&other, None, false, false, 16.0 / 9.0).full, vec!["Webcam".to_owned()]);
+    }
+
+    /// A copied group pastes as a group of its name, in front of the group
+    /// of the source selected.
+    #[test]
+    fn a_copied_group_pastes_as_a_group() {
+        let mut s = setup();
+        let g = s.make_group(&[LayerKey::Webcam(1), LayerKey::Visual(2)]).unwrap();
+        if let Some(x) = s.group_mut(g) {
+            x.name = "Cam and logo".into();
+        }
+        let copied = s.copy_sources(&[LayerKey::Webcam(1), LayerKey::Visual(2)], Some(g)).unwrap();
+        let b = s.add_scene(false);
+        s.switch_scene(b);
+        s.visuals.push(VisualCfg::new(3, Visual::Colour { rgba: [0, 0, 0, 255] }));
+        s.layer_order.insert(0, LayerKey::Visual(3));
+        let h = s.make_group(&[LayerKey::Visual(3), LayerKey::Screen]).unwrap();
+        let pasted = s.paste_sources(&copied, Some(LayerKey::Screen), false, true, 16.0 / 9.0);
+        let id = pasted.group.unwrap();
+        assert_ne!(id, h);
+        assert_eq!(s.group(id).map(|x| (x.name.clone(), x.members.clone())), Some(("Cam and logo".to_owned(), vec![LayerKey::Webcam(1), LayerKey::Visual(2)])));
+        assert_eq!(s.layer_order(), vec![LayerKey::Webcam(1), LayerKey::Visual(2), LayerKey::Visual(3), LayerKey::Screen], "in front of the other group, all of it");
     }
 
     #[test]

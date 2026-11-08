@@ -94,10 +94,9 @@ impl App {
                 ui_kit::menu_popup(&add, false, 230.0, |ui| self.add_scene_items(ui));
             });
         });
-        let ids: Vec<u64> = self.settings.scenes.iter().map(|s| s.id).collect();
-        for id in ids {
-            self.scene_row(ui, id);
-        }
+        // Sliding to their places as one's added, deleted or moved.
+        let ids: Vec<(u64, f32)> = self.settings.scenes.iter().map(|s| (s.id, 34.0)).collect();
+        ui_kit::sliding_rows(ui, egui::Id::new("scene_rows"), &ids, 2.0, None, |ui, i| self.scene_row(ui, ids[i].0));
     }
 
     /// New scene, and a copy of the one shown: under + and in menus.

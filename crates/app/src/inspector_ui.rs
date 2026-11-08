@@ -658,6 +658,8 @@ impl App {
         if let Some(new) = set {
             // Another picture is another shape: it goes where it goes at first.
             let reshaped = matches!(new, Visual::Display { .. } | Visual::Window { .. } | Visual::Image { .. });
+            let page = matches!(new, Visual::Browser { .. });
+            let before = self.visual_size(key);
             if let Some(d) = self.settings.visual_mut(key) {
                 d.visual = new;
                 if reshaped {
@@ -666,6 +668,19 @@ impl App {
                 }
             }
             self.canvas.sizes.remove(&key);
+            // A page made wider or taller: its box with it, at the scale it
+            // was drawn (a page at its own size stays so), its top-left
+            // corner kept. Kept as it was, the page would be fitted into it
+            // again, its other side shrinking.
+            if page
+                && let (Some(was), Some(now)) = (before, self.visual_size(key))
+                && was != now
+                && let Some(b) = self.settings.visual_mut(key).and_then(|d| d.placed.as_mut())
+            {
+                b.w *= now.0 as f32 / was.0.max(1) as f32;
+                b.h *= now.1 as f32 / was.1.max(1) as f32;
+                b.picture_aspect = Some(now.0 as f32 / now.1.max(1) as f32);
+            }
         }
     }
 
@@ -813,7 +828,7 @@ impl App {
 }
 
 /// Names in a sentence: "A", "A and B", "A, B and C".
-fn and_list(names: &[String]) -> String {
+pub(crate) fn and_list(names: &[String]) -> String {
     match names {
         [] => String::new(),
         [one] => one.clone(),

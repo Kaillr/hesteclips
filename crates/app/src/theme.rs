@@ -298,6 +298,11 @@ pub fn value(ctx: &egui::Context, id: Id, target: f32, secs: f32) -> f32 {
     v
 }
 
+/// Forget `id`'s [`value`]: asked about again, it's simply its target.
+pub fn forget_value(ctx: &egui::Context, id: Id) {
+    ctx.data_mut(|d| d.remove::<Tween>(id.with("tween")));
+}
+
 /// 0 to 1 as `on` turns on, back as it turns off, eased.
 pub fn toggle(ctx: &egui::Context, id: Id, on: bool, secs: f32) -> f32 {
     value(ctx, id, if on { 1.0 } else { 0.0 }, secs)

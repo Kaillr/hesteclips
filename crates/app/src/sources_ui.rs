@@ -17,6 +17,7 @@ use capture::mixer::SourceStatus;
 use egui::{Color32, Sense};
 
 use crate::App;
+use crate::canvas_ui::Selected;
 use crate::meter::{self, MeterState};
 use crate::settings::{AudioSourceCfg, CaptureApp, CaptureTarget, SourceKind};
 
@@ -27,6 +28,9 @@ const FADER_MAX_DB: f32 = 12.0;
 const LIMIT_HOLD: Duration = Duration::from_secs(3);
 /// Under this page width, a scene's layers and its sound go one under
 /// another, under its preview (else side by side).
+/// The margin round the preview, where a source past the video's edge
+/// shows its outline and handles.
+const OUTSIDE: f32 = 16.0;
 const ONE_COLUMN: f32 = 700.0;
 /// The layers beside the sound, under the preview: a third of the page,
 /// at least and at most these.
@@ -56,6 +60,17 @@ struct SourceMeters {
 }
 
 /// UI state for the Sources page.
+/// A row of the video's list dragged (see `reorder_rows`): the one taken
+/// hold of, the rows going with it (a group's sources, sources picked with
+/// it), how far down it the pointer took hold, and how the sources were
+/// before (to undo it).
+pub(crate) struct RowDrag {
+    pub(crate) held: Selected,
+    pub(crate) rows: Vec<Selected>,
+    pub(crate) grab: f32,
+    pub(crate) was: crate::canvas_ui::Arrangement,
+}
+
 #[derive(Default)]
 pub(crate) struct SourcesView {
     meters: std::collections::HashMap<String, SourceMeters>,
@@ -87,10 +102,9 @@ pub(crate) struct SourcesView {
     /// held there.
     pub(crate) crop_open: bool,
     crop_drag: Option<(crate::webcam_ui::Handle, egui::Rect, egui::Pos2)>,
-    /// A row of the video's list (a source's or a group's) dragged by its
-    /// grip to put it in front or behind, and how the sources were before
-    /// (to undo it).
-    pub(crate) row_drag: Option<(crate::canvas_ui::Selected, crate::canvas_ui::Arrangement)>,
+    /// A row of the video's list (a source's or a group's) dragged to put
+    /// it in front or behind (see `reorder_rows`).
+    pub(crate) row_drag: Option<RowDrag>,
     /// Displays for the Add menu, refreshed when it opens.
     pub(crate) add_displays: Vec<capture::Device>,
     /// A dialog open (a preset made, renamed, deleted; a scene deleted).
@@ -273,9 +287,11 @@ impl App {
         let (w, h) = (area.width(), area.height());
         let place = |ui: &mut egui::Ui, r: Rect| ui.new_child(egui::UiBuilder::new().max_rect(r).layout(egui::Layout::top_down(egui::Align::Min)));
         let frame = if w >= ONE_COLUMN {
-            let docks_h = self.layers_height().max(self.sound_height()).min(h * DOCKS_SHARE);
+            // Growing and shrinking as rows come and go (the preview with
+            // them), not at once.
+            let docks_h = crate::theme::value(ui.ctx(), egui::Id::new("scene_docks_h"), self.layers_height().max(self.sound_height()), crate::theme::NORMAL).min(h * DOCKS_SHARE);
             let top = Rect::from_min_max(area.min, pos2(area.right(), area.bottom() - docks_h - crate::ui_kit::STACK_GAP));
-            let frame = self.picture_column(&mut place(ui, top), top.height().max(120.0));
+            let frame = self.picture_column(&mut place(ui, top), top.height().max(120.0), true);
             let layers_w = (w * 0.3).clamp(LAYERS_MIN, LAYERS_MOST);
             let docks_top = area.bottom() - docks_h;
             let layers = Rect::from_min_max(pos2(area.left(), docks_top), pos2(area.left() + layers_w, area.bottom()));
@@ -285,7 +301,7 @@ impl App {
             frame
         } else {
             let mut top = place(ui, area);
-            let frame = self.picture_column(&mut top, h * 0.45);
+            let frame = self.picture_column(&mut top, h * 0.45, false);
             let below = Rect::from_min_max(pos2(area.left(), top.min_rect().bottom() + crate::ui_kit::STACK_GAP), area.max);
             crate::ui_kit::scroll(&mut place(ui, below), "scene_lists", |ui| {
                 self.video_list(ui, frame.as_deref(), aspect);
@@ -298,6 +314,7 @@ impl App {
         ui.allocate_rect(area, Sense::hover());
         if around.clicked() {
             self.canvas.selected = None;
+            self.canvas.picked.clear();
             self.canvas.crop_mode = None;
         }
         frame
@@ -345,9 +362,10 @@ impl App {
         frame
     }
 
-    /// The preview, at most `max_h` tall, in the middle of its room. The
-    /// frame shown.
-    fn picture_column(&mut self, ui: &mut egui::Ui, max_h: f32) -> Option<std::sync::Arc<capture::preview::PreviewFrame>> {
+    /// The preview, at most `max_h` tall with the margin round it, in the
+    /// middle of its room (`fill`: all of the room's height, else just what
+    /// it takes). The frame shown.
+    fn picture_column(&mut self, ui: &mut egui::Ui, max_h: f32, fill: bool) -> Option<std::sync::Arc<capture::preview::PreviewFrame>> {
         let frame = self.pull_preview(ui.ctx());
         // Which listed apps are open, for their status; cheap, so every 2 s.
         let apps_mode = matches!(self.settings.capture, CaptureTarget::Apps { .. });
@@ -359,9 +377,10 @@ impl App {
             // As wide as its room makes it (a tall window): in the middle of
             // its height, not at its top over a gap.
             let shape = frame.as_ref().map(|f| f.width as f32 / f.height.max(1) as f32).or_else(|| self.preview_size().map(|(w, h)| w as f32 / h.max(1) as f32)).unwrap_or(16.0 / 9.0);
-            let shown_h = (ui.available_width() / shape).min(max_h);
-            ui.add_space(((ui.available_height().min(max_h) - shown_h) / 2.0).max(0.0));
-            self.preview_picture(ui, frame.as_deref(), max_h);
+            let (w, h) = (ui.available_width(), ui.available_height().min(max_h));
+            let tall = ((w - 2.0 * OUTSIDE) / shape).min(h - 2.0 * OUTSIDE) + 2.0 * OUTSIDE;
+            let room = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(w, if fill { h } else { tall.min(h) }));
+            self.preview_picture(ui, frame.as_deref(), room);
         }
         frame
     }
@@ -393,27 +412,42 @@ impl App {
         });
         ui.add_space(4.0);
         self.canvas.card_hover = None;
-        let mut rows = Vec::new();
+        // The rows, top first: a group's over its sources' (set in, unless
+        // it's folded).
         let groups = self.settings.groups.clone();
+        let mut keys: Vec<(Selected, f32)> = Vec::new();
+        let mut indent = Vec::new();
+        for l in &order {
+            let group = groups.iter().find(|g| g.members.contains(l));
+            if let Some(g) = group {
+                if g.members.first() == Some(l) {
+                    keys.push((Selected::Group(g.id), ROW_H));
+                    indent.push(0.0);
+                }
+                if g.collapsed {
+                    continue;
+                }
+            }
+            keys.push((Selected::Layer(*l), ROW_H));
+            indent.push(if group.is_some() { 22.0 } else { 0.0 });
+        }
+        let mut places = Vec::new();
+        let mut lift = None;
         egui::Frame::new().fill(pal.raise).corner_radius(8).inner_margin(egui::Margin::same(4)).show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.spacing_mut().item_spacing.y = 2.0;
-            for l in &order {
-                let group = groups.iter().find(|g| g.members.contains(l));
-                if let Some(g) = group {
-                    if g.members.first() == Some(l) {
-                        let r = self.group_row(ui, g.id);
-                        rows.push((crate::canvas_ui::Selected::Group(g.id), r));
-                    }
-                    if g.collapsed {
-                        continue;
-                    }
+            let drag = self.sources_view.row_drag.as_ref().map(|d| (d.rows.clone(), d.held.clone(), d.grab));
+            let lifted = drag.as_ref().map(|(rows, held, grab)| crate::ui_kit::Lifted { rows, grabbed: held, grab: *grab });
+            (places, lift) = crate::ui_kit::sliding_rows(ui, egui::Id::new("layer_rows"), &keys, 2.0, lifted, |ui, i| match &keys[i].0 {
+                Selected::Group(id) => {
+                    self.group_row(ui, *id);
                 }
-                let r = self.video_row(ui, *l, frame, aspect, if group.is_some() { 18.0 } else { 0.0 });
-                rows.push((crate::canvas_ui::Selected::Layer(*l), r));
-            }
+                Selected::Layer(l) => {
+                    self.video_row(ui, *l, frame, aspect, indent[i]);
+                }
+            });
         });
-        self.reorder_rows(ui, &rows);
+        let rows: Vec<(Selected, egui::Rect)> = keys.into_iter().map(|(k, _)| k).zip(places).collect();
+        self.reorder_rows(ui, &rows, lift);
     }
 
     /// One video source's row (see `video_list`), set in by `indent` in its
@@ -424,9 +458,9 @@ impl App {
         use egui_phosphor::regular as icon;
         let pal = theme::pal(ui);
         let selected = self.selected_layer() == Some(layer) || self.canvas.picked.contains(&layer);
-        let held = self.sources_view.row_drag.as_ref().is_some_and(|(s, _)| *s == crate::canvas_ui::Selected::Layer(layer));
+        let held = self.sources_view.row_drag.as_ref().is_some_and(|d| d.rows.contains(&Selected::Layer(layer)));
         let on = self.layer_enabled(layer);
-        let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
+        let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click_and_drag());
         crate::demo::mark(ui.ctx(), || format!("row:{}", self.settings.layer_title(layer)), rect);
         let hv = theme::toggle(ui.ctx(), resp.id.with("hv"), resp.hovered() || held, theme::FAST);
         let fill = if selected { pal.sel } else { theme::fade(pal.control, hv) };
@@ -436,16 +470,10 @@ impl App {
         }
         let painter = ui.painter().clone();
         let cy = rect.center().y;
-        // Its grip, while the pointer's on the row: drag it up or down.
-        let grip_rect = egui::Rect::from_min_max(pos2(rect.left(), rect.top()), pos2(rect.left() + 20.0, rect.bottom()));
-        let grip = ui.interact(grip_rect, resp.id.with("grip"), Sense::drag());
-        if hv > 0.0 || grip.hovered() {
-            let ink = theme::fade(if grip.hovered() || held { pal.text } else { pal.text3 }, hv.max(f32::from(u8::from(grip.hovered()))));
-            painter.text(pos2(rect.left() + 10.0, cy), Align2::CENTER_CENTER, icon::DOTS_SIX_VERTICAL, FontId::proportional(14.0), ink);
-        }
-        let grip = grip.on_hover_text("Drag up or down: the top one's in front").on_hover_cursor(egui::CursorIcon::Grab);
-        if grip.drag_started() {
-            self.sources_view.row_drag = Some((crate::canvas_ui::Selected::Layer(layer), self.arrangement()));
+        // Dragged up or down (from anywhere on it): the top one's in front.
+        if resp.drag_started() {
+            let grab = ui.input(|i| i.pointer.press_origin()).map_or(ROW_H / 2.0, |p| p.y - rect.top());
+            self.start_row_drag(Selected::Layer(layer), grab);
         }
         // Its eye: in your clips, or hidden.
         let eye_rect = egui::Rect::from_center_size(pos2(rect.right() - 18.0, cy), vec2(26.0, 26.0));
@@ -486,7 +514,7 @@ impl App {
             self.edit_layer(layer);
         }
         // Its symbol, name, and what it shows (or what's wrong with it).
-        let mut x = rect.left() + 24.0 + indent;
+        let mut x = rect.left() + 6.0 + indent;
         let dim = |c: Color32| if on { c } else { theme::fade(c, 0.5) };
         painter.text(pos2(x + 8.0, cy), Align2::CENTER_CENTER, crate::inspector_ui::layer_icon(self, layer), FontId::proportional(16.0), dim(pal.text2));
         x += 26.0;
@@ -569,28 +597,109 @@ impl App {
         }
     }
 
-    /// A row dragged by its grip, live (the preview shows it): it goes to
-    /// the place of the row the pointer's over. Let go, it can be undone.
-    fn reorder_rows(&mut self, ui: &egui::Ui, rows: &[(crate::canvas_ui::Selected, egui::Rect)]) {
-        let Some(held) = self.sources_view.row_drag.as_ref().map(|(s, _)| s.clone()) else { return };
+    /// Take hold of a row (a source's, a group's) to drag it, `grab` down
+    /// it: a group's sources go with it, as do the sources picked with
+    /// one (when none of them is in a group). What's dragged is selected.
+    pub(crate) fn start_row_drag(&mut self, held: Selected, grab: f32) {
+        let rows = match &held {
+            Selected::Group(id) => {
+                if self.selected_group() != Some(*id) {
+                    self.canvas.selected = Some(held.clone());
+                    self.canvas.picked.clear();
+                }
+                let open = self.settings.group(*id).filter(|g| !g.collapsed).map(|g| g.members.clone()).unwrap_or_default();
+                std::iter::once(held.clone()).chain(open.into_iter().map(Selected::Layer)).collect()
+            }
+            Selected::Layer(l) => {
+                let set = self.chosen();
+                if !set.contains(l) {
+                    self.canvas.picked.clear();
+                    self.select_layer(*l);
+                }
+                if set.len() > 1 && set.contains(l) && set.iter().all(|m| self.settings.group_of(*m).is_none()) {
+                    set.into_iter().map(Selected::Layer).collect()
+                } else {
+                    vec![held.clone()]
+                }
+            }
+        };
+        self.sources_view.row_drag = Some(RowDrag { held, was: self.arrangement(), grab, rows });
+    }
+
+    /// The rows dragged, live (the preview shows it): past the middle of
+    /// the row (or group) next to them, they go to its other side. A
+    /// source of a group moves among its group's; anything else among the
+    /// scene's own, a group all one. `lift`: how far they're drawn from
+    /// their places. Let go, it can be undone.
+    fn reorder_rows(&mut self, ui: &egui::Ui, rows: &[(Selected, egui::Rect)], lift: Option<f32>) {
+        let Some(drag) = self.sources_view.row_drag.as_ref() else { return };
+        let (held, lifted) = (drag.held.clone(), drag.rows.clone());
         let down = ui.input(|i| i.pointer.primary_down());
-        if down && let Some(p) = ui.input(|i| i.pointer.interact_pos()) {
+        if down && let Some(by) = lift {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
-            let to = rows.iter().position(|(_, r)| p.y < r.bottom()).unwrap_or(rows.len().saturating_sub(1));
-            let at = rows.iter().position(|(s, _)| *s == held);
-            if at.is_some_and(|at| at != to)
-                && let Some((target, _)) = rows.get(to)
-            {
-                let target = target.clone();
-                self.move_row(&held, &target);
+            let span = rows.iter().filter(|(s, _)| lifted.contains(s)).map(|(_, r)| *r).reduce(|a, b| a.union(b));
+            let in_group = match &held {
+                Selected::Layer(l) if lifted.len() == 1 => self.settings.group_of(*l).map(|g| g.members.clone()),
+                _ => None,
+            };
+            // What it moves past: each with where it is.
+            let mut units: Vec<(Selected, egui::Rect)> = Vec::new();
+            for (s, r) in rows.iter().filter(|(s, _)| !lifted.contains(s)) {
+                match (s, &in_group) {
+                    (Selected::Layer(l), Some(members)) if members.contains(l) => units.push((s.clone(), *r)),
+                    (_, Some(_)) => {}
+                    (Selected::Group(_), None) => units.push((s.clone(), *r)),
+                    (Selected::Layer(l), None) => match self.settings.group_of(*l).map(|g| g.id) {
+                        Some(g) => {
+                            if let Some(u) = units.iter_mut().find(|(u, _)| *u == Selected::Group(g)) {
+                                u.1 = u.1.union(*r);
+                            }
+                        }
+                        None => units.push((s.clone(), *r)),
+                    },
+                }
+            }
+            if let Some(span) = span {
+                let shown = span.translate(egui::vec2(0.0, by));
+                let below = units.iter().find(|(_, r)| r.top() >= span.bottom() - 0.5);
+                let above = units.iter().rev().find(|(_, r)| r.bottom() <= span.top() + 0.5);
+                let to = match (below, above) {
+                    (Some((t, r)), _) if shown.bottom() > r.center().y => Some((t.clone(), true)),
+                    (_, Some((t, r))) if shown.top() < r.center().y => Some((t.clone(), false)),
+                    _ => None,
+                };
+                if let Some((target, later)) = to {
+                    if lifted.len() > 1 && matches!(held, Selected::Layer(_)) {
+                        let set: Vec<crate::canvas_ui::Layer> = lifted.iter().filter_map(|s| if let Selected::Layer(l) = s { Some(*l) } else { None }).collect();
+                        self.move_set_past(&set, &target, later);
+                    } else {
+                        self.move_row(&held, &target);
+                    }
+                }
             }
         }
         if !down
-            && let Some((_, was)) = self.sources_view.row_drag.take()
-            && self.arrangement() != was
+            && let Some(d) = self.sources_view.row_drag.take()
+            && self.arrangement() != d.was
         {
-            self.keep_for_undo(was);
+            self.keep_for_undo(d.was);
         }
+    }
+
+    /// Sources dragged together past `target` (a source or a group): just
+    /// after it (`later`) or just before it, in their order.
+    fn move_set_past(&mut self, set: &[crate::canvas_ui::Layer], target: &Selected, later: bool) {
+        let over: Vec<crate::canvas_ui::Layer> = match target {
+            Selected::Layer(t) => vec![*t],
+            Selected::Group(g) => self.settings.group(*g).map(|g| g.members.clone()).unwrap_or_default(),
+        };
+        let order = self.layer_order();
+        let moving: Vec<crate::canvas_ui::Layer> = order.iter().copied().filter(|l| set.contains(l)).collect();
+        let mut rest: Vec<crate::canvas_ui::Layer> = order.iter().copied().filter(|l| !set.contains(l)).collect();
+        let (Some(first), Some(last)) = (over.first().and_then(|t| rest.iter().position(|x| x == t)), over.last().and_then(|t| rest.iter().position(|x| x == t))) else { return };
+        let at = if later { last + 1 } else { first };
+        rest.splice(at..at, moving);
+        self.set_layer_order(&rest);
     }
 
     /// Add, over the video's list: a webcam (each camera found), and where
@@ -744,12 +853,16 @@ impl App {
         egui::Frame::new().fill(pal.raise).corner_radius(8).inner_margin(egui::Margin::same(4)).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 2.0;
-            self.mix_row(ui, now, dt);
-            for i in 0..self.settings.audio_sources.len() {
-                if let Some(a) = self.sound_row(ui, i, now, dt) {
-                    menu_action = Some((i, a));
+            // The clip's mix, then each source: sliding to their places as
+            // one's added, taken out or moved.
+            let keys: Vec<(Option<String>, f32)> = std::iter::once((None, ROW_H + 4.0)).chain(self.settings.audio_sources.iter().map(|s| (Some(s.id.clone()), ROW_H + 4.0))).collect();
+            crate::ui_kit::sliding_rows(ui, egui::Id::new("sound_rows"), &keys, 2.0, None, |ui, i| {
+                if i == 0 {
+                    self.mix_row(ui, now, dt);
+                } else if let Some(a) = self.sound_row(ui, i - 1, now, dt) {
+                    menu_action = Some((i - 1, a));
                 }
-            }
+            });
             if self.settings.audio_sources.is_empty() {
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
@@ -1733,24 +1846,34 @@ impl App {
         }
     }
 
-    /// The preview itself: as wide as there's room for, at most `max_h`
-    /// tall, the sources placed on it (see `canvas_ui`).
-    fn preview_picture(&mut self, ui: &mut egui::Ui, frame: Option<&capture::preview::PreviewFrame>, max_h: f32) {
+    /// The preview itself: as big as its `room` has space for, a margin
+    /// round it (a source past the video's edge has its outline and handles
+    /// there), the sources placed on it (see `canvas_ui`).
+    fn preview_picture(&mut self, ui: &mut egui::Ui, frame: Option<&capture::preview::PreviewFrame>, room: egui::Rect) {
         // The frame's shape; between captures (none has a frame for a moment,
         // starting to clip) the shape of the picture still shown, so it isn't
         // drawn stretched.
         let shown = self.preview_size().map(|(w, h)| w as f32 / h.max(1) as f32);
         let aspect = frame.map(|f| f.width as f32 / f.height.max(1) as f32).or(shown).unwrap_or(16.0 / 9.0);
-        let w = ui.available_width().min(max_h.max(160.0) * aspect);
-        ui.vertical_centered(|ui| {
-            let (rect, response) = ui.allocate_exact_size(egui::vec2(w, w / aspect), Sense::click_and_drag());
+        let inner = room.shrink(OUTSIDE);
+        let w = inner.width().min(inner.height().max(90.0) * aspect).max(1.0);
+        let rect = egui::Rect::from_center_size(inner.center(), egui::vec2(w, w / aspect));
+        ui.allocate_rect(room, Sense::hover());
+        // Taken hold of anywhere in the room: a source's handles can be past
+        // the video's edge.
+        let response = ui.interact(room, ui.id().with("preview_room"), Sense::click_and_drag());
+        {
             crate::demo::mark(ui.ctx(), || "preview".into(), rect);
             let p = ui.painter();
-            p.rect_filled(rect, 6.0, crate::theme::pal(ui).stage);
+            let pal = crate::theme::pal(ui);
+            p.rect_filled(rect, 6.0, pal.stage);
             let message = |text: &str| {
                 p.text(rect.center(), egui::Align2::CENTER_CENTER, text, egui::FontId::proportional(13.0), Color32::from_gray(170));
             };
             let drawn = self.paint_preview(p, rect);
+            // Its edge, so it's clear where the video ends (a dark picture
+            // on the dark page).
+            p.rect_stroke(rect, 0.0, egui::Stroke::new(1.0, pal.line2), egui::StrokeKind::Outside);
             // While a new preview starts (another frame rate, size, webcam)
             // the last picture stays up; the message is only for when there's
             // none to show. With every source off, the video is black: said.
@@ -1762,9 +1885,9 @@ impl App {
                 None => {}
             }
             if frame.is_some() {
-                self.canvas_on_preview(ui, rect, &response);
+                self.canvas_on_preview(ui, rect, room, &response);
             }
-        });
+        }
     }
 
     /// The games and apps to record, in the screen's card: each with whether

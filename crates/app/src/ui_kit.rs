@@ -2067,6 +2067,19 @@ impl ValueField<'_> {
         self.presets.iter().position(|p| (p.value - self.value).abs() < near)
     }
 
+    /// The widest a number it takes can be, as a sample of wide digits
+    /// (a minus, all its places), and how many letters that is.
+    fn longest(&self) -> (String, usize) {
+        let whole = |v: f64| number_text(v.trunc(), 0);
+        let mut t = [*self.range.start(), *self.range.end()].map(whole).into_iter().max_by_key(String::len).unwrap_or_default();
+        if self.decimals > 0 {
+            t = format!("{t}.{}", "0".repeat(self.decimals));
+        }
+        let t: String = t.chars().map(|c| if c.is_ascii_digit() { '8' } else { c }).collect();
+        let n = t.chars().count();
+        (t, n)
+    }
+
     /// `v` as it can be: to its places, within its range.
     fn kept(&self, v: f64) -> f64 {
         let scale = 10f64.powi(self.decimals as i32);
@@ -2081,7 +2094,17 @@ impl ValueField<'_> {
         let edit_id = self.id.with("text");
         let editing_key = self.id.with("editing");
         let mut editing: Option<String> = ui.data(|d| d.get_temp(editing_key));
-        let (rect, _) = ui.allocate_exact_size(vec2(self.width, CONTROL_H), Sense::hover());
+        // Room for its longest number and its unit, whatever it was given
+        // (a box made for "64 px" cut "144 px" off under its unit).
+        let (longest, longest_chars) = self.longest();
+        let width = if time {
+            self.width
+        } else {
+            let measure = |t: &str| ui.painter().layout_no_wrap(t.to_owned(), theme::font(13.0, W::Medium), p.text).size().x;
+            let unit_w = if self.unit.is_empty() { 0.0 } else { measure(self.unit) + 4.0 };
+            self.width.max(10.0 + measure(&longest) + 2.0 + unit_w + 26.0 + 4.0)
+        };
+        let (rect, _) = ui.allocate_exact_size(vec2(width, CONTROL_H), Sense::hover());
         let focused = ui.memory(|m| m.has_focus(edit_id));
         let hovered = ui.rect_contains_pointer(rect);
         let menu_open = egui::Popup::is_id_open(ui.ctx(), self.id.with("dd").with("menu"));
@@ -2122,6 +2145,7 @@ impl ValueField<'_> {
                 .font(font.clone())
                 .text_color(p.text)
                 .desired_width(input_w)
+                .char_limit(longest_chars)
                 .margin(Margin::ZERO)
                 .show(&mut fui);
             text = number_typing(&text, point, minus);
@@ -2187,7 +2211,7 @@ impl ValueField<'_> {
             format!("{}–{} {}", number_text(lo, self.decimals), number_text(hi, self.decimals), self.unit).trim_end().to_owned()
         };
         // As wide as the field (wider when a value's note needs it).
-        menu_popup(&ddr, false, self.width, |ui| {
+        menu_popup(&ddr, false, width, |ui| {
             for (i, preset) in self.presets.iter().enumerate() {
                 let mut item = Item::new(preset.label.clone()).check(current == Some(i));
                 if !preset.note.is_empty() {
@@ -2494,6 +2518,92 @@ pub fn set_size_field_keeps(ctx: &egui::Context, id: &str, keep: Option<f64>) {
 /// just been shown, from a menu).
 pub fn type_in_size(ctx: &egui::Context, id: &str) {
     ctx.data_mut(|d| d.insert_temp(egui::Id::new((id, "type_in")), true));
+}
+
+/// Rows being dragged in a [`sliding_rows`] list: those that go with the
+/// pointer (a group's with it, or several picked), the one taken hold of,
+/// and how far down it the pointer took hold.
+pub struct Lifted<'a, K> {
+    pub rows: &'a [K],
+    pub grabbed: &'a K,
+    pub grab: f32,
+}
+
+/// A list's rows, top first (each `K` with its height, `gap` between),
+/// each drawn by `row` (given its index) in a box of its own that slides
+/// to its place when the list changes (one moved, put in, taken out), a
+/// new one fading in; those `lifted` drawn where the pointer has them,
+/// over the rest, a shadow under them. Each row's place, and how far the
+/// lifted ones are from theirs.
+pub fn sliding_rows<K: std::hash::Hash + PartialEq + std::fmt::Debug>(ui: &mut egui::Ui, id: egui::Id, rows: &[(K, f32)], gap: f32, lifted: Option<Lifted<'_, K>>, mut row: impl FnMut(&mut egui::Ui, usize)) -> (Vec<Rect>, Option<f32>) {
+    let total = rows.iter().map(|(_, h)| *h).sum::<f32>() + gap * rows.len().saturating_sub(1) as f32;
+    let (area, _) = ui.allocate_exact_size(vec2(ui.available_width(), total), Sense::hover());
+    let ctx = ui.ctx().clone();
+    let now = ctx.input(|i| i.time);
+    let mut places = Vec::with_capacity(rows.len());
+    let mut top = area.top();
+    for (_, h) in rows {
+        places.push(Rect::from_min_size(Pos2::new(area.left(), top), vec2(area.width(), *h)));
+        top += h + gap;
+    }
+    // The lifted ones, all as far from their places as the one taken hold
+    // of is from where the pointer has it (kept within the list).
+    let pointer = ctx.input(|i| i.pointer.interact_pos().or(i.pointer.hover_pos()));
+    let lift = lifted.as_ref().and_then(|l| {
+        let at = rows.iter().position(|(k, _)| k == l.grabbed)?;
+        let held: Vec<usize> = rows.iter().enumerate().filter(|(_, (k, _))| l.rows.contains(k)).map(|(i, _)| i).collect();
+        let (first, last) = (places[*held.first()?], places[*held.last()?]);
+        let by = pointer?.y - l.grab - places[at].top();
+        Some(by.clamp(area.top() - first.top(), area.bottom() - last.bottom()))
+    });
+    let is_lifted = |k: &K| lift.is_some() && lifted.as_ref().is_some_and(|l| l.rows.contains(k));
+    // The list seen for the first time: its rows are there, not fading in.
+    let first = ctx.data(|d| d.get_temp::<Vec<egui::Id>>(id.with("rows")).is_none());
+    let mut seen = Vec::with_capacity(rows.len());
+    let mut drawn_last = Vec::new();
+    for (i, (key, _)) in rows.iter().enumerate() {
+        let rid = id.with(key);
+        seen.push(rid);
+        let place = places[i];
+        let y = if is_lifted(key) {
+            let y = place.top() + lift.unwrap_or(0.0);
+            // At once, so it slides from where it's let go.
+            theme::value(&ctx, rid.with("y"), y - area.top(), 0.0);
+            y
+        } else {
+            area.top() + theme::value(&ctx, rid.with("y"), place.top() - area.top(), theme::NORMAL)
+        };
+        let born = ctx.data_mut(|d| *d.get_temp_mut_or_insert_with(rid.with("born"), || if first { now - 10.0 } else { now }));
+        let fade = theme::since(&ctx, born, theme::NORMAL);
+        let r = Rect::from_min_size(Pos2::new(area.left(), y), place.size());
+        if is_lifted(key) {
+            drawn_last.push((i, r, rid));
+            continue;
+        }
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(r).id_salt(rid).layout(egui::Layout::top_down(egui::Align::Min)));
+        if fade < 1.0 {
+            child.multiply_opacity(fade);
+        }
+        row(&mut child, i);
+    }
+    let layer = egui::LayerId::new(egui::Order::Foreground, id.with("lifted"));
+    for (i, r, rid) in drawn_last {
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(r).id_salt(rid).layer_id(layer).layout(egui::Layout::top_down(egui::Align::Min)));
+        let shadow = egui::Shadow { offset: [0, 4], blur: 14, spread: 0, color: Color32::from_black_alpha(80) };
+        child.painter().add(shadow.as_shape(r, 6));
+        child.painter().rect_filled(r, 6, theme::pal(ui).pop);
+        row(&mut child, i);
+    }
+    // Rows gone: forgotten, so one put back fades in where it goes.
+    let was: Vec<egui::Id> = ctx.data(|d| d.get_temp(id.with("rows"))).unwrap_or_default();
+    for gone in was.iter().filter(|r| !seen.contains(r)) {
+        ctx.data_mut(|d| {
+            d.remove::<f64>(gone.with("born"));
+        });
+        theme::forget_value(&ctx, gone.with("y"));
+    }
+    ctx.data_mut(|d| d.insert_temp(id.with("rows"), seen));
+    (places, lift)
 }
 
 /// The common aspect ratios, width and height, and what each is for: every

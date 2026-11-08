@@ -15,6 +15,7 @@ mod archive;
 mod autostart;
 mod away;
 mod canvas_ui;
+mod clipboard_ui;
 mod clips;
 mod collections;
 mod crop_ui;

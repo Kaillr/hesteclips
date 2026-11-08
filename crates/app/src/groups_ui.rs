@@ -90,24 +90,20 @@ impl App {
         let pal = theme::pal(ui);
         let Some(g) = self.settings.group(id).cloned() else { return egui::Rect::NOTHING };
         let selected = self.selected_group() == Some(id);
-        let held = self.sources_view.row_drag.as_ref().is_some_and(|(s, _)| *s == Selected::Group(id));
-        let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 36.0), Sense::click());
+        let held = self.sources_view.row_drag.as_ref().is_some_and(|d| d.rows.contains(&Selected::Group(id)));
+        let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 36.0), Sense::click_and_drag());
         let hv = theme::toggle(ui.ctx(), resp.id.with("hv"), resp.hovered() || held, theme::FAST);
         ui.painter().rect_filled(rect, 6, if selected { pal.sel } else { theme::fade(pal.control, hv) });
         let painter = ui.painter().clone();
         let cy = rect.center().y;
         let over_row = ui.rect_contains_pointer(rect);
-        // Its grip.
-        let grip_rect = egui::Rect::from_min_max(rect.min, pos2(rect.left() + 20.0, rect.bottom()));
-        let grip = ui.interact(grip_rect, resp.id.with("grip"), Sense::drag());
-        if over_row || held {
-            painter.text(pos2(rect.left() + 10.0, cy), Align2::CENTER_CENTER, icon::DOTS_SIX_VERTICAL, FontId::proportional(14.0), if grip.hovered() || held { pal.text } else { pal.text3 });
-        }
-        if grip.on_hover_text("Drag up or down, its sources with it").on_hover_cursor(egui::CursorIcon::Grab).drag_started() {
-            self.sources_view.row_drag = Some((Selected::Group(id), self.arrangement()));
+        // Dragged up or down (from anywhere on it), its sources with it.
+        if resp.drag_started() {
+            let grab = ui.input(|i| i.pointer.press_origin()).map_or(18.0, |p| p.y - rect.top());
+            self.start_row_drag(Selected::Group(id), grab);
         }
         // Its fold.
-        let fold_rect = egui::Rect::from_center_size(pos2(rect.left() + 32.0, cy), vec2(20.0, 24.0));
+        let fold_rect = egui::Rect::from_center_size(pos2(rect.left() + 14.0, cy), vec2(20.0, 24.0));
         let fold = ui.interact(fold_rect, resp.id.with("fold"), Sense::click());
         // Pointing right while folded, down while open.
         let (c, s) = (fold_rect.center(), 3.5);
@@ -146,7 +142,7 @@ impl App {
             }
         }
         // Its symbol, its name (or the box renaming it), how many it has.
-        let x = rect.left() + 46.0;
+        let x = rect.left() + 28.0;
         painter.text(pos2(x + 8.0, cy), Align2::CENTER_CENTER, if g.collapsed { icon::FOLDER_SIMPLE } else { icon::FOLDER_OPEN }, FontId::proportional(16.0), pal.text2);
         let right = lock_rect.left() - 6.0;
         let rename_id = egui::Id::new(("rename_group", id));
@@ -227,6 +223,9 @@ impl App {
                 ui.close();
             }
         }
+        ui_kit::menu_sep(ui);
+        let aspect = self.frame_aspect().unwrap_or(16.0 / 9.0);
+        self.clipboard_items(ui, true, aspect);
         ui_kit::menu_sep(ui);
         let locked = self.group_locked(id);
         if Item::new(if locked { "Unlock" } else { "Lock" }).icon(if locked { icon::LOCK_SIMPLE_OPEN } else { icon::LOCK_SIMPLE }).keys(keys(&[ctrl, "Shift", "L"])).show(ui).clicked() {

@@ -59,10 +59,20 @@ pub(crate) use crate::settings::LayerKey as Layer;
 /// of them (by its id), on the preview or in the layers. It's outlined,
 /// with handles, and the keys act on it; a source's settings are in a
 /// dialog (see `inspector_ui`).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum Selected {
     Layer(Layer),
     Group(u64),
+}
+
+/// Where sources go in the order (see `move_layers`): all to the front or
+/// the back, or a place forward or back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OrderStep {
+    Front,
+    Forward,
+    Backward,
+    Back,
 }
 
 /// A group held on the preview: by what, where, its box then, and each of
@@ -177,6 +187,9 @@ pub(crate) struct CanvasView {
     /// The source whose card (under the preview) the pointer is on: it's
     /// outlined on the preview, so it's clear which it is.
     pub(crate) card_hover: Option<Layer>,
+    /// What was copied (Ctrl+C) or cut, to paste (see `clipboard_ui`):
+    /// kept across scenes and presets.
+    pub(crate) clipboard: Option<crate::settings::CopiedSources>,
 }
 
 /// The video's sources as undo keeps them: the screen (its box or how it
@@ -194,8 +207,8 @@ pub(crate) struct Arrangement {
     groups: Vec<crate::settings::GroupCfg>,
 }
 
-/// What's at `p` on the preview (`shown` puts a box there, as much of it as
-/// is on the preview: its handles are on that): a handle of the source
+/// What's at `p` on the preview (`shown` puts a box there, past the video's
+/// edge too: its handles are on that): a handle of the source
 /// selected, else that source if it's there (under others too: it's the
 /// one dragged), else the source in front there.
 fn hit(layers: &[(Layer, Rect)], shown: &dyn Fn(Rect) -> Rect, p: Pos2, selected: Option<Layer>) -> Option<(Layer, Handle)> {
@@ -663,6 +676,25 @@ impl App {
         }
     }
 
+    /// What's moved and resized as one on the preview: the group selected
+    /// (its id), else the sources selected when there's more than one.
+    pub(crate) fn held_together(&self) -> Option<(Option<u64>, Vec<Layer>)> {
+        match self.selected_group() {
+            Some(id) => self.settings.group(id).map(|g| (Some(id), g.members.clone())),
+            None => Some(self.chosen()).filter(|c| c.len() > 1).map(|c| (None, c)),
+        }
+    }
+
+    /// The sources selected, front first: the one selected and those picked
+    /// with it (Ctrl- or Shift-clicked in the list).
+    pub(crate) fn chosen(&self) -> Vec<Layer> {
+        let mut set = self.canvas.picked.clone();
+        if let Some(s) = self.selected_layer().filter(|s| !set.contains(s)) {
+            set.push(s);
+        }
+        self.layer_order().into_iter().filter(|l| set.contains(l)).collect()
+    }
+
     /// What a new group of `layer` takes: it and the others picked in the
     /// list (with the one selected), if it's one of them; else it alone.
     pub(crate) fn grouping(&self, layer: Layer) -> Vec<Layer> {
@@ -712,6 +744,9 @@ impl App {
             self.redo_arrangement();
             ui.close();
         }
+        crate::ui_kit::menu_sep(ui);
+        let aspect = self.frame_aspect().unwrap_or(16.0 / 9.0);
+        self.clipboard_items(ui, false, aspect);
         crate::ui_kit::menu_sep(ui);
         if Item::new("Video size and frame rate…").icon(icon::FRAME_CORNERS).show(ui).clicked() {
             self.sources_view.editing = Some(crate::inspector_ui::Editing::Video);
@@ -779,19 +814,20 @@ impl App {
     /// be moved here, and clicks go through it. A source in a group: the
     /// first click selects the group (moved and resized as one, its sources
     /// with it), the next the source itself.
-    pub(crate) fn canvas_on_preview(&mut self, ui: &mut egui::Ui, frame_rect: Rect, response: &egui::Response) {
+    pub(crate) fn canvas_on_preview(&mut self, ui: &mut egui::Ui, frame_rect: Rect, room: Rect, response: &egui::Response) {
         let aspect = frame_rect.width() / frame_rect.height().max(1.0);
         let at = move |p: Pos2| Pos2::new(frame_rect.left() + p.x * frame_rect.width(), frame_rect.top() + p.y * frame_rect.height());
         let to_screen = move |r: Rect| Rect::from_min_max(at(r.min), at(r.max));
         let layers = self.layers(aspect);
-        // As much of a box as is on the preview: a screen bigger than the
-        // video reaches past it, and its outline and handles stay on it.
-        let shown = move |r: Rect| to_screen(r).intersect(frame_rect);
+        // A box where it is, past the video's edge too (what's past it
+        // isn't in the video: its outline and handles say where it goes),
+        // as far as the preview's room round it.
+        let shown = to_screen;
         let modifiers = ui.input(|i| i.modifiers);
-        // On the preview itself: not on a dialog or menu over it (its
+        // On the preview or its room: not on a dialog or menu over it (its
         // cursors and outlines aren't theirs).
-        let on_preview = ui.rect_contains_pointer(frame_rect.expand(HANDLE));
-        let pointer = ui.input(|i| i.pointer.hover_pos()).filter(|p| on_preview && frame_rect.expand(HANDLE).contains(*p));
+        let on_preview = ui.rect_contains_pointer(room);
+        let pointer = ui.input(|i| i.pointer.hover_pos()).filter(|p| on_preview && room.contains(*p));
         // What can be taken hold of: not what's locked.
         let free: Vec<(Layer, Rect)> = layers.iter().filter(|(l, _)| !self.settings.is_locked(*l)).copied().collect();
         let selected = self.selected_layer().filter(|l| free.iter().any(|(x, _)| x == l));
@@ -802,10 +838,9 @@ impl App {
         }
         let crop_on = modifiers.alt || self.canvas.crop_mode.is_some();
 
-        // The group selected, and its box: the boxes of its sources that can
-        // be taken hold of.
-        let group = self.selected_group().and_then(|id| {
-            let members = self.settings.group(id)?.members.clone();
+        // The group selected (or the sources picked together), and its box:
+        // the boxes of its sources that can be taken hold of.
+        let group = self.held_together().and_then(|(id, members)| {
             let boxes: Vec<(Layer, Rect)> = free.iter().filter(|(l, _)| members.contains(l)).copied().collect();
             let bx = boxes.iter().map(|(_, r)| *r).reduce(|a, b| a.union(b))?;
             Some((id, bx, boxes))
@@ -826,8 +861,8 @@ impl App {
             if !on_handle {
                 let now = self.canvas.selected.clone();
                 self.canvas.selected = clicked_through(&there, now.as_ref());
+                self.canvas.picked.clear();
             }
-            self.canvas.picked.clear();
         }
         // A drag only starts once the pointer has moved a little, so what was
         // grabbed is judged by where the button went down, not where it is now.
@@ -836,15 +871,16 @@ impl App {
         let origin = response.drag_started().then(|| ui.input(|i| i.pointer.press_origin()).or(response.interact_pointer_pos())).flatten();
         let mut layer_hold = origin.and_then(|p| hit_at(p).map(|h| (h, p)));
         let group_held = origin.and_then(|p| match group_hit(p) {
-            Some(h) => group.as_ref().map(|(id, _, _)| (*id, h, p)),
-            None => layer_hold.filter(|((l, _), _)| Some(*l) != selected).and_then(|((l, _), _)| self.settings.group_of(l).map(|g| (g.id, Handle::Move, p))),
+            Some(h) => group.as_ref().map(|(id, _, boxes)| (*id, h, p, boxes.iter().map(|(l, _)| *l).collect::<Vec<_>>())),
+            None => layer_hold.filter(|((l, _), _)| Some(*l) != selected).and_then(|((l, _), _)| self.settings.group_of(l).map(|g| (Some(g.id), Handle::Move, p, g.members.clone()))),
         });
-        if let Some((id, handle, from)) = group_held {
+        if let Some((id, handle, from, members)) = group_held {
             layer_hold = None;
-            let members = self.settings.group(id).map(|g| g.members.clone()).unwrap_or_default();
             let boxes: Vec<(Layer, Rect)> = free.iter().filter(|(l, _)| members.contains(l)).copied().collect();
             if let Some(start) = boxes.iter().map(|(_, r)| *r).reduce(|a, b| a.union(b)) {
-                self.canvas.selected = Some(Selected::Group(id));
+                if let Some(id) = id {
+                    self.canvas.selected = Some(Selected::Group(id));
+                }
                 let was = self.arrangement();
                 self.keep_for_undo(was);
                 self.canvas.group_hold = Some(GroupHold { handle, from, start, members: boxes });
@@ -875,6 +911,9 @@ impl App {
         }
         if response.drag_started() {
             if let Some(((layer, handle), from)) = layer_hold {
+                if !self.canvas.picked.contains(&layer) {
+                    self.canvas.picked.clear();
+                }
                 self.select_layer(layer);
                 let was = self.arrangement();
                 let drag = match layer {
@@ -995,7 +1034,7 @@ impl App {
             Drag::Screen(h) => (Layer::Screen, Some(h.handle)),
             Drag::Stuck(l) => (l, None),
         });
-        let painter = ui.painter().clone();
+        let painter = ui.painter().with_clip_rect(room.intersect(ui.clip_rect()));
         let over = pointer.and_then(|p| hit(&free, &shown, p, selected.filter(|_| !locked)));
         // Under the pointer (or its row in the list), not selected: a thin
         // outline, so it's clear what a click would pick.
@@ -1007,10 +1046,10 @@ impl App {
         for r in self.canvas.picked.iter().filter_map(|p| layers.iter().find(|(l, _)| l == p)).map(|(_, r)| shown(*r)) {
             painter.rect_stroke(r.shrink(0.5), 0.0, Stroke::new(1.5, ACCENT.gamma_multiply(0.8)), egui::StrokeKind::Middle);
         }
-        // The group selected (or held): each of its sources' outlines,
-        // thin, and its box's, with handles to resize it all.
-        if let Some(id) = self.selected_group() {
-            let members = self.settings.group(id).map(|g| g.members.clone()).unwrap_or_default();
+        // The group selected (or held, or the sources picked together):
+        // each of its sources' outlines, thin, and its box's, with handles
+        // to resize it all.
+        if let Some((_, members)) = self.held_together() {
             let boxes: Vec<Rect> = layers.iter().filter(|(l, _)| members.contains(l)).map(|(_, r)| *r).collect();
             let movable = free.iter().any(|(l, _)| members.contains(l));
             if let Some(bx) = boxes.iter().copied().reduce(|a, b| a.union(b)) {
@@ -1081,10 +1120,10 @@ impl App {
             _ => None,
         };
         if let Some(whole) = whole.filter(|w| cropping && *w != bx) {
-            // Kept to the preview: all of a display can be far bigger than it.
+            // Kept to the preview's room: all of a display can be far bigger.
             let ghost = Stroke::new(1.0, CROP.gamma_multiply(0.8));
             let c = [whole.left_top(), whole.right_top(), whole.right_bottom(), whole.left_bottom(), whole.left_top()];
-            painter.with_clip_rect(frame_rect.expand(1.0)).extend(egui::Shape::dashed_line(&c, ghost, 4.0, 3.0));
+            painter.extend(egui::Shape::dashed_line(&c, ghost, 4.0, 3.0));
         }
 
         // Moved onto the video's middle, or another source's edge: a guide.
@@ -1102,8 +1141,7 @@ impl App {
 
         // The outline, just inside the box, over a soft dark edge so it shows
         // on a bright picture. A cropped side (as it shows: a mirrored
-        // picture's left is its right) is green (not one past the video:
-        // the video's edge is drawn there).
+        // picture's left is its right) is green, where it is.
         let [cl, ct, cr, cb] = match (webcam, boxed.map(|(_, part, (dw, dh))| (part, (dw, dh)))) {
             (Some(p), _) => p.crop.map(|c| c > 0.0),
             (None, Some(_)) => {
@@ -1119,8 +1157,6 @@ impl App {
         let (flip_h, flip_v) = webcam.map_or((false, false), |p| (p.flip_h, p.flip_v));
         let (left, right) = if flip_h { (cr, cl) } else { (cl, cr) };
         let (top, bottom) = if flip_v { (cb, ct) } else { (ct, cb) };
-        let (left, top) = (left && rect.min.x >= -1e-4, top && rect.min.y >= -1e-4);
-        let (right, bottom) = (right && rect.max.x <= 1.0 + 1e-4, bottom && rect.max.y <= 1.0 + 1e-4);
         let line = bx.shrink(1.0);
         painter.rect_stroke(bx.shrink(0.5), 0.0, Stroke::new(3.0, Color32::from_black_alpha(110)), egui::StrokeKind::Middle);
         let side = |cropped: bool| Stroke::new(2.0, if cropped || cropping { CROP } else { ACCENT });
@@ -1252,6 +1288,10 @@ impl App {
         let screen = layer == Layer::Screen;
         let ctrl = crate::shortcuts::ctrl_name();
         let keys = |k: &[&str]| Some(k.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>());
+        // What it does, it does to each source picked with it in the list.
+        let set = self.grouping(layer);
+        let many = set.len() > 1;
+        let counted = |one: &str| if many { format!("{one} {} sources", set.len()) } else { one.to_owned() };
         // Its settings, but in their dialog (whose ⋯ this is).
         let in_dialog = self.sources_view.editing.is_some();
         if !in_dialog {
@@ -1264,7 +1304,7 @@ impl App {
         // How the video puts the screen in: its position and size both. In
         // the screen's own shape too, for when it changes (a game at a
         // stretched resolution).
-        if screen {
+        if screen && !many {
             let now = self.settings.screen.placed.is_none().then_some(self.settings.framing);
             for (framing, _, label, tip) in FRAMINGS {
                 if Item::new(label).check(now == Some(framing)).tip(tip).show(ui).clicked() {
@@ -1275,7 +1315,8 @@ impl App {
             crate::ui_kit::menu_sep(ui);
         }
         // Each on its own; both are its first place and size.
-        let (position, size) = self.layer_resettable(layer, aspect);
+        let resettable: Vec<(bool, bool)> = set.iter().map(|l| self.layer_resettable(*l, aspect)).collect();
+        let (position, size) = (resettable.iter().any(|r| r.0), resettable.iter().any(|r| r.1));
         let (place_tip, size_tip) = match layer {
             Layer::Screen if self.video_shaped() => ("Back in the middle of the video, its size kept", "Back to the size the video gives it, where it is"),
             Layer::Screen => ("Back in the middle of the video, its size kept", "As big as the video again, where it is"),
@@ -1283,14 +1324,18 @@ impl App {
             Layer::Visual(_) => ("Back in the middle of the video, its size kept", "Its own size again (a pixel of it a pixel of the video), where it is"),
         };
         if Item::new("Reset position").icon(icon::ARROWS_OUT_CARDINAL).enabled(position).tip(place_tip).show(ui).clicked() {
-            self.layer_reset_position(layer, aspect);
+            for l in &set {
+                self.layer_reset_position(*l, aspect);
+            }
             ui.close();
         }
         if Item::new("Reset size").icon(icon::RESIZE).enabled(size).tip(size_tip).show(ui).clicked() {
-            self.layer_reset_size(layer, aspect);
+            for l in &set {
+                self.layer_reset_size(*l, aspect);
+            }
             ui.close();
         }
-        if let Some(cropped) = self.layer_cropped(layer) {
+        if let Some(cropped) = self.layer_cropped(layer).filter(|_| !many) {
             // Its handles crop till Done or Enter, on the preview (the
             // dialog closes for it).
             let tip = format!("Drag its handles to cut its edges off, till Done or Enter ({} and a handle do it too)", crate::shortcuts::alt_name());
@@ -1309,51 +1354,60 @@ impl App {
         // Turned a quarter at a time, as it's seen.
         for (label, ic, by) in [("Turn clockwise", icon::ARROW_CLOCKWISE, 1), ("Turn anticlockwise", icon::ARROW_COUNTER_CLOCKWISE, -1)] {
             if Item::new(label).icon(ic).show(ui).clicked() {
-                self.turn_layer(layer, by, aspect);
+                for l in &set {
+                    self.turn_layer(*l, by, aspect);
+                }
                 ui.close();
             }
         }
         let (mirrored, upside_down) = self.layer_flips(layer);
         if Item::new("Mirror").icon(icon::FLIP_HORIZONTAL).check(mirrored).tip("Flip left to right").show(ui).clicked() {
-            self.flip_layer(layer, true, aspect);
+            for l in &set {
+                self.flip_layer(*l, true, aspect);
+            }
             ui.close();
         }
         if Item::new("Flip upside down").icon(icon::FLIP_VERTICAL).check(upside_down).show(ui).clicked() {
-            self.flip_layer(layer, false, aspect);
+            for l in &set {
+                self.flip_layer(*l, false, aspect);
+            }
             ui.close();
         }
         // Which is in front: with others to go in front of or behind.
         let order = self.layer_order();
-        if order.len() > 1 {
+        if order.len() > set.len() {
             crate::ui_kit::menu_sep(ui);
             let at = order.iter().position(|l| *l == layer).unwrap_or(0);
-            let last = order.len() - 1;
-            let mut to = None;
-            if Item::new("Bring to front").icon(icon::SELECTION_FOREGROUND).enabled(at > 0).keys(keys(&[ctrl, "Shift", "]"])).show(ui).clicked() {
-                to = Some(0);
+            let (front, back) = if many { (true, true) } else { (at > 0, at + 1 < order.len()) };
+            let mut step = None;
+            if Item::new("Bring to front").icon(icon::SELECTION_FOREGROUND).enabled(front).keys(keys(&[ctrl, "Shift", "]"])).show(ui).clicked() {
+                step = Some(OrderStep::Front);
             }
-            if order.len() > 2 && Item::new("Bring forward").icon(icon::ARROW_UP).enabled(at > 0).keys(keys(&[ctrl, "]"])).show(ui).clicked() {
-                to = Some(at.saturating_sub(1));
+            if order.len() > 2 && Item::new("Bring forward").icon(icon::ARROW_UP).enabled(front).keys(keys(&[ctrl, "]"])).show(ui).clicked() {
+                step = Some(OrderStep::Forward);
             }
-            if order.len() > 2 && Item::new("Send backward").icon(icon::ARROW_DOWN).enabled(at < last).keys(keys(&[ctrl, "["])).show(ui).clicked() {
-                to = Some(at + 1);
+            if order.len() > 2 && Item::new("Send backward").icon(icon::ARROW_DOWN).enabled(back).keys(keys(&[ctrl, "["])).show(ui).clicked() {
+                step = Some(OrderStep::Backward);
             }
-            if Item::new("Send to back").icon(icon::SELECTION_BACKGROUND).enabled(at < last).keys(keys(&[ctrl, "Shift", "["])).show(ui).clicked() {
-                to = Some(last);
+            if Item::new("Send to back").icon(icon::SELECTION_BACKGROUND).enabled(back).keys(keys(&[ctrl, "Shift", "["])).show(ui).clicked() {
+                step = Some(OrderStep::Back);
             }
-            if let Some(to) = to {
-                self.move_layer(layer, to);
+            if let Some(step) = step {
+                self.move_layers(&set, step);
                 ui.close();
             }
         }
         crate::ui_kit::menu_sep(ui);
-        if let Layer::Visual(_) = layer
-            && Item::new("Duplicate").icon(icon::COPY).keys(keys(&[ctrl, "D"])).show(ui).clicked()
-        {
-            self.duplicate_layer(layer, aspect);
+        self.clipboard_items(ui, true, aspect);
+        let visuals: Vec<Layer> = set.iter().copied().filter(|l| matches!(l, Layer::Visual(_))).collect();
+        let label = if visuals.len() > 1 { format!("Duplicate {} sources", visuals.len()) } else { "Duplicate".to_owned() };
+        if !visuals.is_empty() && Item::new(label).icon(icon::STACK_PLUS).keys(keys(&[ctrl, "D"])).tip("A copy of its own, in this scene").show(ui).clicked() {
+            self.duplicate_layers(&visuals, aspect);
             ui.close();
         }
-        self.copy_menu(ui, layer);
+        if !many {
+            self.copy_menu(ui, layer);
+        }
         // Groups: a new one of it (and the others picked in the list), into
         // another, or out of its own.
         let set = self.grouping(layer);
@@ -1374,28 +1428,38 @@ impl App {
                 }
             });
             if let Some(id) = into {
-                self.settings.set_group(layer, Some(id));
+                for l in &set {
+                    self.settings.set_group(*l, Some(id));
+                }
                 ui.close();
             }
         }
-        if own.is_some() && Item::new("Take out of group").icon(icon::FOLDER_SIMPLE_MINUS).show(ui).clicked() {
-            self.settings.set_group(layer, None);
+        let grouped = set.iter().any(|l| self.settings.group_of(*l).is_some());
+        if grouped && Item::new("Take out of group").icon(icon::FOLDER_SIMPLE_MINUS).show(ui).clicked() {
+            for l in &set {
+                self.settings.set_group(*l, None);
+            }
             ui.close();
         }
-        let locked = self.settings.is_locked(layer);
-        let lock = Item::new(if locked { "Unlock" } else { "Lock" }).icon(if locked { icon::LOCK_SIMPLE_OPEN } else { icon::LOCK_SIMPLE }).keys(keys(&[ctrl, "Shift", "L"]));
+        let locked = set.iter().all(|l| self.settings.is_locked(*l));
+        let lock = Item::new(counted(if locked { "Unlock" } else { "Lock" })).icon(if locked { icon::LOCK_SIMPLE_OPEN } else { icon::LOCK_SIMPLE }).keys(keys(&[ctrl, "Shift", "L"]));
         let lock = lock.tip(if locked { "It moves on the preview again" } else { "It can't be moved on the preview, and clicks go through it" });
         if lock.show(ui).clicked() {
-            self.settings.set_locked(layer, !locked);
+            for l in &set {
+                self.settings.set_locked(*l, !locked);
+            }
             ui.close();
         }
-        let on = self.layer_enabled(layer);
-        if Item::new(if on { "Hide" } else { "Show" }).icon(if on { icon::EYE_SLASH } else { icon::EYE }).keys(keys(&["H"])).tip(if on { "Out of your clips, its settings kept" } else { "Back in your clips" }).show(ui).clicked() {
-            self.set_layer_enabled(layer, !on);
+        // Any showing: Hide hides them all; else Show shows them.
+        let on = set.iter().any(|l| self.layer_enabled(*l));
+        if Item::new(counted(if on { "Hide" } else { "Show" })).icon(if on { icon::EYE_SLASH } else { icon::EYE }).keys(keys(&["H"])).tip(if on { "Out of your clips, its settings kept" } else { "Back in your clips" }).show(ui).clicked() {
+            for l in &set {
+                self.set_layer_enabled(*l, !on);
+            }
             ui.close();
         }
-        if Item::new("Remove").icon(icon::TRASH).danger().keys(keys(&["Del"])).tip("Take it out of this scene").show(ui).clicked() {
-            self.remove_layer(layer);
+        if Item::new(counted("Remove")).icon(icon::TRASH).danger().keys(keys(&["Del"])).tip("Take it out of this scene").show(ui).clicked() {
+            self.remove_layers(&set);
             ui.close();
         }
     }
@@ -1520,19 +1584,23 @@ impl App {
         if redo {
             self.redo_arrangement();
         }
+        self.clipboard_keys(ctx, aspect);
         if let Some(id) = self.selected_group() {
             self.group_keys(ctx, id, aspect);
             return;
         }
-        let Some(layer) = self.selected_layer() else {
+        if self.selected_layer().is_none() {
             if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
                 self.canvas.selected = None;
+                self.canvas.picked.clear();
             }
             return;
-        };
+        }
+        // What the keys do, they do to each source selected (the one
+        // selected and those picked with it in the list).
+        let set = self.chosen();
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::G)) {
             let was = self.arrangement();
-            let set = self.grouping(layer);
             self.group_layers(&set);
             self.keep_for_undo(was);
             return;
@@ -1544,8 +1612,10 @@ impl App {
         }
         let was = self.arrangement();
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::L)) {
-            let locked = self.settings.is_locked(layer);
-            self.settings.set_locked(layer, !locked);
+            let lock = !set.iter().all(|l| self.settings.is_locked(*l));
+            for l in &set {
+                self.settings.set_locked(*l, lock);
+            }
         }
         let (remove, hide, dup, esc, back, forward, mods) = ctx.input_mut(|i| {
             (
@@ -1579,40 +1649,46 @@ impl App {
         });
         if esc {
             self.canvas.selected = None;
+            self.canvas.picked.clear();
             return;
         }
         if remove {
-            self.remove_layer(layer);
+            self.remove_layers(&set);
         }
         if hide {
-            let on = self.layer_enabled(layer);
-            self.set_layer_enabled(layer, !on);
+            // Any showing: all hidden; else all shown.
+            let on = !set.iter().any(|l| self.layer_enabled(*l));
+            for l in &set {
+                self.set_layer_enabled(*l, on);
+            }
         }
         if dup {
-            match layer {
-                Layer::Visual(_) => self.duplicate_layer(layer, aspect),
-                Layer::Webcam(_) => self.toast_icon(icon::INFO, "A camera can be in a scene once"),
-                Layer::Screen => {}
+            let visuals: Vec<Layer> = set.iter().copied().filter(|l| matches!(l, Layer::Visual(_))).collect();
+            if !visuals.is_empty() {
+                self.duplicate_layers(&visuals, aspect);
+            } else if set.iter().any(|l| matches!(l, Layer::Webcam(_))) {
+                self.toast_icon(icon::INFO, "A camera can be in a scene once");
             }
         }
         if back || forward {
-            let order = self.layer_order();
-            let at = order.iter().position(|l| *l == layer).unwrap_or(0);
-            let to = match (forward, mods.shift) {
-                (true, true) => 0,
-                (true, false) => at.saturating_sub(1),
-                (false, true) => order.len().saturating_sub(1),
-                (false, false) => (at + 1).min(order.len().saturating_sub(1)),
+            let step = match (forward, mods.shift) {
+                (true, true) => OrderStep::Front,
+                (true, false) => OrderStep::Forward,
+                (false, true) => OrderStep::Back,
+                (false, false) => OrderStep::Backward,
             };
-            self.move_layer(layer, to);
+            self.move_layers(&set, step);
         }
-        if nudge != vec2(0.0, 0.0) && !self.settings.is_locked(layer) {
-            self.nudge_layer(layer, nudge, aspect);
+        if nudge != vec2(0.0, 0.0) {
+            let free: Vec<Layer> = set.iter().copied().filter(|l| !self.settings.is_locked(*l)).collect();
+            for l in free {
+                self.nudge_layer(l, nudge, aspect);
+            }
         }
         if self.arrangement() != was {
             // Nudges in a row are one step.
             if nudge != vec2(0.0, 0.0) && !remove && !hide && !dup {
-                self.keep_for_undo_as(was, format!("nudge {layer:?}"));
+                self.keep_for_undo_as(was, format!("nudge {set:?}"));
             } else {
                 self.keep_for_undo(was);
             }
@@ -1655,17 +1731,63 @@ impl App {
         self.set_layer_order(&order);
     }
 
-    /// A source taken out of the scene shown; gone for good once no other
-    /// scene has it (but the screen, the preset's own: Add › From other
-    /// scenes puts it back). Ctrl+Z puts it back too.
-    pub(crate) fn remove_layer(&mut self, layer: Layer) {
-        let name = self.settings.layer_title(layer);
-        let gone = self.settings.remove_from_scene(layer);
-        if self.selected_layer() == Some(layer) {
-            self.canvas.selected = None;
+    /// Sources moved in the order together, each keeping its place among
+    /// them: all to the front or the back, or each a place forward or back
+    /// (past one that isn't moving).
+    pub(crate) fn move_layers(&mut self, set: &[Layer], step: OrderStep) {
+        let mut order = self.layer_order();
+        let moving: Vec<Layer> = order.iter().copied().filter(|l| set.contains(l)).collect();
+        match step {
+            OrderStep::Front | OrderStep::Back => {
+                order.retain(|l| !set.contains(l));
+                let at = if step == OrderStep::Front { 0 } else { order.len() };
+                order.splice(at..at, moving);
+            }
+            OrderStep::Forward => {
+                for i in 1..order.len() {
+                    if set.contains(&order[i]) && !set.contains(&order[i - 1]) {
+                        order.swap(i, i - 1);
+                    }
+                }
+            }
+            OrderStep::Backward => {
+                for i in (0..order.len().saturating_sub(1)).rev() {
+                    if set.contains(&order[i]) && !set.contains(&order[i + 1]) {
+                        order.swap(i, i + 1);
+                    }
+                }
+            }
         }
+        self.set_layer_order(&order);
+    }
+
+    /// Sources taken out of the scene shown, each gone for good once no
+    /// other scene has it (but the screen, the preset's own: Add › From
+    /// other scenes puts it back). Ctrl+Z puts them back too.
+    pub(crate) fn remove_layers(&mut self, layers: &[Layer]) {
+        let name = match layers {
+            [] => return,
+            [one] => self.settings.layer_title(*one),
+            many => format!("{} sources", many.len()),
+        };
+        let mut gone = false;
+        for l in layers {
+            gone |= self.settings.remove_from_scene(*l);
+        }
+        self.forget_gone_selection();
         let what = if gone { format!("Removed {name}") } else { format!("Took {name} out of this scene") };
         self.toast_action(icon::TRASH, what, "Undo", crate::shell::ToastAction::UndoSources);
+    }
+
+    /// A copy of each of these boxed sources (see `duplicate_layer`), all
+    /// selected.
+    pub(crate) fn duplicate_layers(&mut self, layers: &[Layer], aspect: f32) {
+        let mut copies = Vec::new();
+        for l in layers {
+            self.duplicate_layer(*l, aspect);
+            copies.extend(self.selected_layer().filter(|s| s != l));
+        }
+        self.canvas.picked = if copies.len() > 1 { copies } else { Vec::new() };
     }
 
     /// A copy of a boxed source, in front of it, a little down and right,
