@@ -143,7 +143,7 @@ impl App {
         self.inspector_head(ui, layer, frame, aspect);
         ui.add_space(10.0);
         let picture_h = PICTURE_H.min(room * 0.35);
-        self.dialog_picture(ui, layer, aspect, picture_h);
+        self.dialog_picture(ui, layer, aspect, picture_h, transform);
         ui.add_space(12.0);
         let own = self.own_half(layer);
         let halves = [Seg::from(own.as_str()), Seg::from("Transform")];
@@ -181,13 +181,20 @@ impl App {
         }
     }
 
-    /// A look at the video in a source's dialog, `max_h` tall at most, the
-    /// source outlined (dashed while it's hidden): what its settings change
-    /// shows here at once, the page's preview being behind the dialog.
-    fn dialog_picture(&mut self, ui: &mut egui::Ui, layer: Layer, aspect: f32, max_h: f32) {
+    /// A look at the source in its dialog, `max_h` tall at most, the page's
+    /// preview being behind the dialog. With what it shows open: its part
+    /// of the video, as big as it goes (a little round it, dimmed), so what
+    /// its settings change shows as it will look (words a few pixels tall
+    /// in all of the video didn't). With Transform (`whole`), or while it's
+    /// hidden: all of the video, it outlined (dashed while it's hidden), as
+    /// that's where it's put.
+    fn dialog_picture(&mut self, ui: &mut egui::Ui, layer: Layer, aspect: f32, max_h: f32, whole: bool) {
         use egui::{Color32, Rect, Stroke, pos2, vec2};
         let pal = theme::pal(ui);
         let shape = self.preview_size().map_or(aspect, |(w, h)| w as f32 / h.max(1) as f32);
+        if !whole && self.layer_enabled(layer) && self.dialog_close_up(ui, layer, aspect, shape, max_h) {
+            return;
+        }
         let w = ui.available_width().min(max_h * shape);
         let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), w / shape), egui::Sense::hover());
         let rect = Rect::from_center_size(row.center(), vec2(w, w / shape));
@@ -211,6 +218,57 @@ impl App {
             let c = [line.left_top(), line.right_top(), line.right_bottom(), line.left_bottom(), line.left_top()];
             painter.extend(egui::Shape::dashed_line(&c, Stroke::new(1.5, Color32::WHITE), 4.0, 3.0));
         }
+    }
+
+    /// [`dialog_picture`](Self::dialog_picture)'s close look: the source's
+    /// box in the video (`shape`: the preview's) and a little round it,
+    /// fitted in the dialog's width and `max_h`, no bigger than twice the
+    /// preview's pixels; outside the box dimmed. False if there's nothing
+    /// of it in the video (all past its edges), or no preview yet.
+    fn dialog_close_up(&mut self, ui: &mut egui::Ui, layer: Layer, aspect: f32, shape: f32, max_h: f32) -> bool {
+        use egui::{Color32, Rect, Stroke, pos2, vec2};
+        let whole = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+        let Some(b) = self.layer_box(layer, aspect) else { return false };
+        let Some((pw, ph)) = self.preview_size() else { return false };
+        let inside = b.intersect(whole);
+        let (pw, ph) = (pw as f32, ph as f32);
+        if !inside.is_positive() || inside.width() * pw < 4.0 || inside.height() * ph < 4.0 {
+            return false;
+        }
+        // A little round it, as far as the video goes.
+        let margin = 0.06 * (inside.width() * shape).max(inside.height());
+        let seen = inside.expand2(vec2(margin / shape, margin)).intersect(whole);
+        // Its shape in pixels; fitted, and not blown up past twice the
+        // preview's own pixels (a small one would be a blur).
+        let seen_shape = seen.width() * shape / seen.height();
+        let most_w = seen.width() * pw * 2.0 / ui.ctx().pixels_per_point();
+        let w = ui.available_width().min(max_h * seen_shape).min(most_w).max(1.0);
+        let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), w / seen_shape), egui::Sense::hover());
+        let rect = Rect::from_center_size(row.center(), vec2(w, w / seen_shape));
+        // All of the preview drawn so `seen` lands on `rect`, cut to it.
+        let full_size = vec2(rect.width() / seen.width(), rect.height() / seen.height());
+        let full = Rect::from_min_size(rect.min - vec2(seen.min.x * full_size.x, seen.min.y * full_size.y), full_size);
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 6.0, theme::pal(ui).stage);
+        if !self.paint_preview(&painter, full) {
+            return false;
+        }
+        let at = |p: egui::Pos2| pos2(full.left() + p.x * full.width(), full.top() + p.y * full.height());
+        let bx = Rect::from_min_max(at(inside.min), at(inside.max));
+        // Outside its box, dimmed.
+        let dim = Color32::from_black_alpha(130);
+        for r in [
+            Rect::from_min_max(rect.min, pos2(rect.right(), bx.top())),
+            Rect::from_min_max(pos2(rect.left(), bx.bottom()), rect.max),
+            Rect::from_min_max(pos2(rect.left(), bx.top()), pos2(bx.left(), bx.bottom())),
+            Rect::from_min_max(pos2(bx.right(), bx.top()), pos2(rect.right(), bx.bottom())),
+        ] {
+            if r.is_positive() {
+                painter.rect_filled(r, 0.0, dim);
+            }
+        }
+        painter.rect_stroke(bx, 0.0, Stroke::new(1.0, Color32::from_white_alpha(200)), egui::StrokeKind::Outside);
+        true
     }
 
     /// The video's dialog: its size and frame rate (Settings' own rows,
