@@ -4,8 +4,9 @@
 //! lists: the video's sources, the one in front first (each with an eye to
 //! hide it, a grip to drag it in front or behind), and the sound's (the
 //! clip's mix, then each source with its level, volume and mute). Beside
-//! them, the settings of what's selected (`inspector_ui`), laid out the same
-//! way for every source. Each list's Add puts another source in.
+//! them (under them, on a narrow page), the settings of what's selected
+//! (`inspector_ui`), laid out the same way for every source. Each list's Add
+//! puts another source in.
 //!
 //! Deliberately says nothing about "tracks": a source is either part of what the
 //! clip sounds like ("In the clip"), kept separately for editing, or both.
@@ -25,14 +26,21 @@ const FADER_MAX_DB: f32 = 12.0;
 /// How long the "limiting" note stays after the limiter last worked.
 const LIMIT_HOLD: Duration = Duration::from_secs(3);
 /// The selected source's settings beside the preview from this page width;
-/// narrower, under it.
+/// narrower, under the lists.
 const WIDE: f32 = 980.0;
 /// Between the page's columns.
 const COLUMN_GAP: f32 = 20.0;
+/// The video's list and the sound's side by side from this width, each then
+/// wide enough for a sound source's name and a fader to use; narrower, the
+/// sound's under the video's, each as wide as the preview.
+const LISTS_SIDE_BY_SIDE: f32 = 1000.0;
 /// A row in the video's or the sound's list.
 const ROW_H: f32 = 36.0;
-/// A sound source's name, in its row, before its fader.
+/// A sound source's name, in its row, before its fader (less in a row too
+/// narrow for both: see `name_width`).
 const NAME_W: f32 = 120.0;
+/// A sound source's fader at its narrowest before its name gives way.
+const MIN_FADER: f32 = 80.0;
 /// Two columns from this width on the camera's and the crop's pages.
 pub(crate) const TWO_COLUMNS: f32 = 860.0;
 
@@ -102,6 +110,14 @@ pub(crate) fn open_dev(app: &mut App, names: &str) {
 /// What a preview shows: the picture, its height and shape, the frame rate,
 /// the webcam, and whether it's all of the screen, uncropped (to crop on).
 pub(crate) type PreviewSetup = (capture::VideoSource, capture::VideoSize, u32, Option<capture::webcam::Webcam>, bool);
+
+/// How wide a sound source's name is in a row `row_w` wide: [`NAME_W`], less
+/// in a row too narrow for it beside the controls (a problem's mark, the
+/// fader at [`MIN_FADER`], the volume and mute; see `sound_row`), so they
+/// never run past the row's edge. The clip's mix's meter starts there too.
+fn name_width(row_w: f32) -> f32 {
+    (row_w - 36.0 - 6.0 - 22.0 - MIN_FADER - 66.0 - 26.0 - 12.0).clamp(48.0, NAME_W)
+}
 
 /// A sound source's symbol.
 fn sound_icon(s: &AudioSourceCfg) -> &'static str {
@@ -184,7 +200,10 @@ impl App {
             let (w, h) = (ui.available_width(), ui.available_height());
             let mut frame = None;
             // The preview as big as there's room for, the lists under it, and
-            // what's selected beside them; on a narrow page, one above the other.
+            // what's selected beside them; on a narrow page, all in a column,
+            // what's selected after both lists (its settings, a camera's
+            // above all, are long: before the sound's list, they pushed it
+            // out of sight).
             if w >= WIDE {
                 let left = w - crate::inspector_ui::INSPECTOR_W - COLUMN_GAP;
                 ui.horizontal_top(|ui| {
@@ -209,9 +228,9 @@ impl App {
                     crate::ui_kit::scroll(ui, "sources_page", |ui| {
                         self.video_list(ui, frame.as_deref(), aspect);
                         crate::ui_kit::gap(ui, crate::ui_kit::STACK_GAP);
-                        self.inspector(ui, frame.as_deref(), aspect);
-                        crate::ui_kit::gap(ui, crate::ui_kit::STACK_GAP);
                         self.sound_list(ui, now, dt);
+                        crate::ui_kit::gap(ui, crate::ui_kit::STACK_GAP);
+                        self.inspector(ui, frame.as_deref(), aspect);
                         ui.add_space(28.0);
                     });
                 });
@@ -221,10 +240,11 @@ impl App {
     }
 
     /// The video's sources and the sound's, side by side under the preview
-    /// when there's room for both, else one above the other.
+    /// when there's room for both (see [`LISTS_SIDE_BY_SIDE`]), else the
+    /// sound's under the video's.
     fn lists(&mut self, ui: &mut egui::Ui, frame: Option<&capture::preview::PreviewFrame>, aspect: f32, now: Instant, dt: f32) {
         let w = ui.available_width();
-        if w >= 640.0 {
+        if w >= LISTS_SIDE_BY_SIDE {
             let col = (w - COLUMN_GAP) / 2.0;
             ui.horizontal_top(|ui| {
                 ui.spacing_mut().item_spacing.x = COLUMN_GAP;
@@ -600,7 +620,7 @@ impl App {
         let readout = format!("{} dB", view.master.readout().replace('-', "−"));
         let peak_w = 64.0;
         ui.painter().text(pos2(rect.right() - 10.0, cy), Align2::RIGHT_CENTER, readout, theme::font(12.5, W::Medium), view.master.readout_color(ui.visuals()));
-        let meter_rect = egui::Rect::from_min_max(pos2(rect.left() + 36.0 + NAME_W, cy - 7.0), pos2(rect.right() - 10.0 - peak_w, cy + 7.0));
+        let meter_rect = egui::Rect::from_min_max(pos2(rect.left() + 36.0 + name_width(rect.width()), cy - 7.0), pos2(rect.right() - 10.0 - peak_w, cy + 7.0));
         if meter_rect.width() > 20.0 {
             let mut mui = ui.new_child(egui::UiBuilder::new().max_rect(meter_rect).layout(egui::Layout::top_down(egui::Align::Min)));
             let style = meter::Style { bar_h: 5.0, gap: 2.0, scale: false, dimmed: false };
@@ -641,13 +661,14 @@ impl App {
         if !own {
             ui.painter().text(lead.center(), Align2::CENTER_CENTER, glyph, FontId::proportional(16.0), dim(pal.text2));
         }
-        let name_job = crate::ui_kit::single_line_job(&s.name, theme::font(13.5, W::Medium), dim(if s.muted { pal.text2 } else { pal.text }), NAME_W - 8.0);
+        let name_w = name_width(rect.width());
+        let name_job = crate::ui_kit::single_line_job(&s.name, theme::font(13.5, W::Medium), dim(if s.muted { pal.text2 } else { pal.text }), name_w - 8.0);
         let g = ui.painter().layout_job(name_job);
         ui.painter().galley(pos2(rect.left() + 36.0, cy - g.size().y / 2.0), g, pal.text);
         // What's wrong with it, on its row: a mark (its words on hover).
         let problem = status_text(channel.status()).filter(|_| on);
         // The fader, its value and mute, in what's left of the row.
-        let controls = egui::Rect::from_min_max(pos2(rect.left() + 36.0 + NAME_W, rect.top()), pos2(rect.right() - 6.0, rect.bottom()));
+        let controls = egui::Rect::from_min_max(pos2(rect.left() + 36.0 + name_w, rect.top()), pos2(rect.right() - 6.0, rect.bottom()));
         let mut action = None;
         if on {
             let mut cui = ui.new_child(egui::UiBuilder::new().max_rect(controls).layout(egui::Layout::left_to_right(egui::Align::Center)));

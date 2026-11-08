@@ -14,8 +14,11 @@ use crate::settings::{CaptureTarget, TextAlign, TextStyle, Visual};
 use crate::theme::{self, W};
 use crate::ui_kit::{self, Btn, Item, Kind, Row};
 
-/// The panel's width, beside the preview on a page wide enough for both.
-pub(crate) const INSPECTOR_W: f32 = 360.0;
+/// The panel's width, beside the preview on a page wide enough for both:
+/// enough for a menu with a camera's or a display's name beside its label,
+/// and Size's two boxes beside theirs (a row puts its control under its
+/// label when the two don't fit side by side).
+pub(crate) const INSPECTOR_W: f32 = 420.0;
 
 /// The sizes offered for words.
 const TEXT_SIZES: [u32; 8] = [24, 36, 48, 64, 72, 96, 144, 200];
