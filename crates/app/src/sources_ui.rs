@@ -258,6 +258,10 @@ impl App {
         use egui::{Rect, pos2, vec2};
         ui.add_space(4.0);
         let area = ui.available_rect_before_wrap();
+        // A click on the page around the preview and the lists (under
+        // them all, so only where none of them is) lets go of what's
+        // selected.
+        let around = ui.interact(area, ui.id().with("scene_around"), Sense::click());
         let (w, h) = (area.width(), area.height());
         let place = |ui: &mut egui::Ui, r: Rect| ui.new_child(egui::UiBuilder::new().max_rect(r).layout(egui::Layout::top_down(egui::Align::Min)));
         let frame = if w >= ONE_COLUMN {
@@ -284,6 +288,10 @@ impl App {
             frame
         };
         ui.allocate_rect(area, Sense::hover());
+        if around.clicked() {
+            self.canvas.selected = None;
+            self.canvas.crop_mode = None;
+        }
         frame
     }
 
@@ -422,10 +430,28 @@ impl App {
             self.set_layer_enabled(layer, !on);
             self.keep_for_undo(was);
         }
-        // Its settings button, beside the eye, while the pointer's on the
+        // Its lock, beside the eye: there while it's locked, and while the
+        // pointer's on the row.
+        let over_row = ui.rect_contains_pointer(rect);
+        let locked = self.settings.is_locked(layer);
+        let lock_rect = egui::Rect::from_center_size(pos2(eye_rect.left() - 16.0, cy), vec2(26.0, 26.0));
+        if (locked || over_row) && !held {
+            let lock = ui.interact(lock_rect, resp.id.with("lock"), Sense::click());
+            if lock.hovered() {
+                painter.rect_filled(lock_rect, 5, pal.control_h);
+            }
+            let glyph = if locked { icon::LOCK_SIMPLE } else { icon::LOCK_SIMPLE_OPEN };
+            painter.text(lock_rect.center(), Align2::CENTER_CENTER, glyph, FontId::proportional(14.0), if locked { pal.text2 } else { pal.text3 });
+            let ctrl = crate::shortcuts::ctrl_name();
+            let tip = if locked { format!("Unlock it: it moves on the preview again  ({ctrl}+Shift+L)") } else { format!("Lock it: it can't be moved on the preview, and clicks go through it  ({ctrl}+Shift+L)") };
+            if lock.on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                self.settings.set_locked(layer, !locked);
+            }
+        }
+        // Its settings button, beside the lock, while the pointer's on the
         // row or it's selected.
-        let gear_rect = egui::Rect::from_center_size(pos2(eye_rect.left() - 16.0, cy), vec2(26.0, 26.0));
-        let gear_shown = ui.rect_contains_pointer(rect) || selected;
+        let gear_rect = egui::Rect::from_center_size(pos2(lock_rect.left() - 16.0, cy), vec2(26.0, 26.0));
+        let gear_shown = over_row || selected;
         if settings_button(ui, resp.id.with("gear"), gear_rect, gear_shown && !held, "Its settings  (double-click it)") {
             self.edit_layer(layer);
         }

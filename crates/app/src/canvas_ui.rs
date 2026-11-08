@@ -140,6 +140,9 @@ pub(crate) struct CanvasView {
     drag: Option<Drag>,
     /// The right-click menu is open, on this source.
     menu: Option<Layer>,
+    /// What was selected before the last click on the preview (which may
+    /// have gone on to the source under it): a double-click's for that.
+    click_was: Option<Layer>,
     /// The screen's picture size (what's kept of it), asked for now and then.
     picture: Option<(capture::VideoSource, Option<(u32, u32)>, std::time::Instant)>,
     /// Each boxed source's size, by key, asked for now and then, and its
@@ -172,8 +175,9 @@ pub(crate) struct Arrangement {
 }
 
 /// What's at `p` on the preview (`shown` puts a box there, as much of it as
-/// is on the preview: its handles are on that): a handle of a source (front
-/// first), else the source in front there.
+/// is on the preview: its handles are on that): a handle of the source
+/// selected, else that source if it's there (under others too: it's the
+/// one dragged), else the source in front there.
 fn hit(layers: &[(Layer, Rect)], shown: &dyn Fn(Rect) -> Rect, p: Pos2, selected: Option<Layer>) -> Option<(Layer, Handle)> {
     // Only the one selected has handles.
     if let Some((l, r)) = layers.iter().find(|(l, _)| Some(*l) == selected) {
@@ -181,8 +185,26 @@ fn hit(layers: &[(Layer, Rect)], shown: &dyn Fn(Rect) -> Rect, p: Pos2, selected
         if let Some(h) = Handle::ALL.into_iter().find(|h| h.pos(bx).distance(p) <= HANDLE) {
             return Some((*l, h));
         }
+        if bx.expand(2.0).contains(p) {
+            return Some((*l, Handle::Move));
+        }
     }
-    layers.iter().find(|(_, r)| shown(*r).expand(2.0).contains(p)).map(|(l, _)| (*l, Handle::Move))
+    under(layers, shown, p).first().map(|l| (*l, Handle::Move))
+}
+
+/// The sources at `p` on the preview, the one in front first.
+fn under(layers: &[(Layer, Rect)], shown: &dyn Fn(Rect) -> Rect, p: Pos2) -> Vec<Layer> {
+    layers.iter().filter(|(_, r)| shown(*r).expand(2.0).contains(p)).map(|(l, _)| *l).collect()
+}
+
+/// What a click at a place on the preview selects, of `under` (the sources
+/// there, front first): the one in front, or, with one of them selected,
+/// the next one down (round to the front again from the back).
+fn clicked_through(under: &[Layer], selected: Option<Layer>) -> Option<Layer> {
+    match selected.and_then(|s| under.iter().position(|l| *l == s)) {
+        Some(i) => under.get((i + 1) % under.len()).copied(),
+        None => under.first().copied(),
+    }
 }
 
 /// Words in a dark pill along the top of the preview (`frame`): what the
@@ -654,9 +676,12 @@ impl App {
 
     /// The sources on the preview (`frame_rect`, whose `response` takes the
     /// pointer): a click selects the one in front under it (or nothing), and
-    /// the one selected has its outline and handles, to move, resize and
-    /// (Alt) crop it; any can be dragged, which selects it. Others show
-    /// their outline under the pointer, and right-click opens a source's menu.
+    /// clicks again there the ones under it in turn; the one selected has
+    /// its outline and handles, to move, resize and (Alt) crop it, and it's
+    /// what's dragged where it is, under others too; any other can be
+    /// dragged, which selects it. Others show their outline under the
+    /// pointer, and right-click opens a source's menu. A locked source can't
+    /// be moved here, and clicks go through it.
     pub(crate) fn canvas_on_preview(&mut self, ui: &mut egui::Ui, frame_rect: Rect, response: &egui::Response) {
         let aspect = frame_rect.width() / frame_rect.height().max(1.0);
         let at = move |p: Pos2| Pos2::new(frame_rect.left() + p.x * frame_rect.width(), frame_rect.top() + p.y * frame_rect.height());
@@ -667,24 +692,34 @@ impl App {
         let shown = move |r: Rect| to_screen(r).intersect(frame_rect);
         let modifiers = ui.input(|i| i.modifiers);
         let pointer = ui.input(|i| i.pointer.hover_pos()).filter(|p| frame_rect.expand(HANDLE).contains(*p));
-        let selected = self.selected_layer().filter(|l| layers.iter().any(|(x, _)| x == l));
-        let hit_at = |p: Pos2| hit(&layers, &shown, p, selected);
+        // What can be taken hold of: not what's locked.
+        let free: Vec<(Layer, Rect)> = layers.iter().filter(|(l, _)| !self.settings.is_locked(*l)).copied().collect();
+        let selected = self.selected_layer().filter(|l| free.iter().any(|(x, _)| x == l));
+        let hit_at = |p: Pos2| hit(&free, &shown, p, selected);
         // Its handles crop: Alt held, or its Crop button on (that one only).
         if self.canvas.crop_mode.is_some() && self.canvas.crop_mode != selected {
             self.canvas.crop_mode = None;
         }
         let crop_on = modifiers.alt || self.canvas.crop_mode.is_some();
 
-        // A click selects what's under it, in front; on nothing, nothing.
-        // Twice, its settings open.
-        if response.clicked() {
-            let picked = response.interact_pointer_pos().and_then(hit_at).map(|(l, _)| l);
-            self.canvas.selected = picked.map(Selected::Layer);
-        }
-        if response.double_clicked()
-            && let Some((l, _)) = response.interact_pointer_pos().and_then(hit_at)
-        {
-            self.edit_layer(l);
+        // A click selects what's under it, in front, and again there the one
+        // under that, and so on; on nothing, nothing. On a handle, the one
+        // selected stays. Twice, the settings open of what the first click
+        // found selected (it went on to the next one).
+        if let Some(p) = response.interact_pointer_pos() {
+            let there = under(&free, &shown, p);
+            if response.double_clicked() {
+                let was = self.canvas.click_was.filter(|l| there.contains(l));
+                if let Some(l) = was.or(selected) {
+                    self.edit_layer(l);
+                }
+            } else if response.clicked() {
+                self.canvas.click_was = selected;
+                let on_handle = hit_at(p).is_some_and(|(l, h)| Some(l) == selected && h != Handle::Move);
+                if !on_handle {
+                    self.canvas.selected = clicked_through(&there, selected).map(Selected::Layer);
+                }
+            }
         }
         // A drag only starts once the pointer has moved a little, so what was
         // grabbed is judged by where the button went down, not where it is now.
@@ -786,7 +821,9 @@ impl App {
         }
 
         let layers = self.layers(aspect);
+        let free: Vec<(Layer, Rect)> = layers.iter().filter(|(l, _)| !self.settings.is_locked(*l)).copied().collect();
         let selected = self.selected_layer().filter(|l| layers.iter().any(|(x, _)| x == l));
+        let locked = selected.is_some_and(|l| self.settings.is_locked(l));
         let held = self.canvas.drag.map(|d| match d {
             Drag::Webcam(key, h, ..) => (Layer::Webcam(key), Some(h)),
             Drag::Visual(key, h) => (Layer::Visual(key), Some(h.handle)),
@@ -794,7 +831,7 @@ impl App {
             Drag::Stuck(l) => (l, None),
         });
         let painter = ui.painter().clone();
-        let over = pointer.and_then(|p| hit(&layers, &shown, p, selected));
+        let over = pointer.and_then(|p| hit(&free, &shown, p, selected.filter(|_| !locked)));
         // Under the pointer (or its row in the list), not selected: a thin
         // outline, so it's clear what a click would pick.
         let hovered = held.is_none().then(|| over.map(|(l, _)| l).or(self.canvas.card_hover)).flatten().filter(|l| Some(*l) != selected);
@@ -893,7 +930,8 @@ impl App {
 
         // Handles: round, white, green while Alt is held on something that
         // crops (they'll crop); the one held or under the pointer a little bigger.
-        for h in Handle::ALL {
+        // Locked: its outline, no handles.
+        for h in Handle::ALL.into_iter().filter(|_| !locked) {
             let r = if Some(h) == handle { HANDLE * 0.65 } else { HANDLE * 0.5 };
             let fill = if crop_on && croppable || cropping { CROP } else { Color32::WHITE };
             painter.circle(h.pos(line), r, fill, Stroke::new(1.0, Color32::from_black_alpha(140)));
@@ -1115,6 +1153,13 @@ impl App {
             ui.close();
         }
         self.copy_menu(ui, layer);
+        let locked = self.settings.is_locked(layer);
+        let lock = Item::new(if locked { "Unlock" } else { "Lock" }).icon(if locked { icon::LOCK_SIMPLE_OPEN } else { icon::LOCK_SIMPLE }).keys(keys(&[ctrl, "Shift", "L"]));
+        let lock = lock.tip(if locked { "It moves on the preview again" } else { "It can't be moved on the preview, and clicks go through it" });
+        if lock.show(ui).clicked() {
+            self.settings.set_locked(layer, !locked);
+            ui.close();
+        }
         let on = self.layer_enabled(layer);
         if Item::new(if on { "Hide" } else { "Show" }).icon(if on { icon::EYE_SLASH } else { icon::EYE }).keys(keys(&["H"])).tip(if on { "Out of your clips, its settings kept" } else { "Back in your clips" }).show(ui).clicked() {
             self.set_layer_enabled(layer, !on);
@@ -1258,6 +1303,10 @@ impl App {
             return;
         }
         let was = self.arrangement();
+        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::L)) {
+            let locked = self.settings.is_locked(layer);
+            self.settings.set_locked(layer, !locked);
+        }
         let (remove, hide, dup, esc, back, forward, mods) = ctx.input_mut(|i| {
             (
                 i.consume_key(Modifiers::NONE, Key::Delete) || i.consume_key(Modifiers::NONE, Key::Backspace),
@@ -1321,7 +1370,7 @@ impl App {
             };
             self.move_layer(layer, to);
         }
-        if nudge != vec2(0.0, 0.0) {
+        if nudge != vec2(0.0, 0.0) && !self.settings.is_locked(layer) {
             self.nudge_layer(layer, nudge, aspect);
         }
         if self.arrangement() != was {
@@ -1559,6 +1608,23 @@ mod tests {
     /// The screen's box moves inside the video, snapping to its middle and
     /// to the webcam's edges; a corner scales it from the opposite one,
     /// keeping its shape, no smaller than the least.
+    /// Clicks at one place select the sources there in turn, front first,
+    /// round again from the back; the one selected is what's dragged there.
+    #[test]
+    fn clicks_go_down_through_the_sources() {
+        let (a, b, c) = (Layer::Webcam(1), Layer::Visual(2), Layer::Screen);
+        assert_eq!(clicked_through(&[a, b, c], None), Some(a));
+        assert_eq!(clicked_through(&[a, b, c], Some(a)), Some(b));
+        assert_eq!(clicked_through(&[a, b, c], Some(c)), Some(a));
+        assert_eq!(clicked_through(&[b, c], Some(a)), Some(b), "one selected elsewhere: the one in front");
+        assert_eq!(clicked_through(&[], Some(a)), None);
+        let layers = [(a, rect(0.5, 0.5, 0.3, 0.3)), (c, rect(0.0, 0.0, 1.0, 1.0))];
+        let shown = |r: Rect| Rect::from_min_max((r.min.to_vec2() * 1000.0).to_pos2(), (r.max.to_vec2() * 1000.0).to_pos2());
+        let p = Pos2::new(600.0, 600.0);
+        assert_eq!(hit(&layers, &shown, p, None), Some((a, Handle::Move)));
+        assert_eq!(hit(&layers, &shown, p, Some(c)), Some((c, Handle::Move)), "the screen, selected, under the webcam");
+    }
+
     #[test]
     fn the_screens_box() {
         let none = Lines::default();

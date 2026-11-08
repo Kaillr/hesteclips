@@ -586,11 +586,15 @@ pub struct SceneCfg {
     pub name: String,
     #[serde(default, deserialize_with = "lenient_list")]
     pub items: Vec<SceneItem>,
+    /// Its sources locked: they can't be moved on the preview, and clicks
+    /// go through them. Empty for the scene shown (see `locked`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "lenient_list")]
+    pub locked: Vec<LayerKey>,
 }
 
 impl SceneCfg {
     pub fn new(id: u64, name: &str) -> Self {
-        Self { id, name: name.to_owned(), items: Vec::new() }
+        Self { id, name: name.to_owned(), items: Vec::new(), locked: Vec::new() }
     }
 }
 
@@ -695,6 +699,8 @@ pub struct PresetSetup {
     pub webcams: Vec<WebcamCfg>,
     pub visuals: Vec<VisualCfg>,
     pub layer_order: Vec<LayerKey>,
+    #[serde(deserialize_with = "lenient_list")]
+    pub locked: Vec<LayerKey>,
     #[serde(deserialize_with = "lenient_list")]
     pub scenes: Vec<SceneCfg>,
     pub active_scene: u64,
@@ -1395,6 +1401,10 @@ pub struct RecordSettings {
     /// Empty in settings from before it was kept: the screen's `in_front`
     /// says then.
     pub layer_order: Vec<LayerKey>,
+    /// The scene shown's sources locked: they can't be moved on the
+    /// preview, and clicks go through them to what's under them.
+    #[serde(skip_serializing_if = "Vec::is_empty", deserialize_with = "lenient_list")]
+    pub locked: Vec<LayerKey>,
     /// The screen as a source in the video: in front or behind, its box.
     pub screen: ScreenCfg,
     /// What you called the screen, if you did.
@@ -1571,6 +1581,7 @@ impl Default for RecordSettings {
             webcams: Vec::new(),
             visuals: Vec::new(),
             layer_order: Vec::new(),
+            locked: Vec::new(),
             screen: ScreenCfg::default(),
             screen_title: None,
             scenes: vec![SceneCfg::new(1, "Scene 1")],
@@ -2116,9 +2127,12 @@ impl RecordSettings {
         let Some(to) = self.scenes.iter().position(|s| s.id == id) else { return false };
         let items = self.live_items();
         let shown = self.active_scene;
+        let locked = std::mem::take(&mut self.locked);
         if let Some(from) = self.scenes.iter_mut().find(|s| s.id == shown) {
             from.items = items;
+            from.locked = locked;
         }
+        self.locked = std::mem::take(&mut self.scenes[to].locked);
         let items = std::mem::take(&mut self.scenes[to].items);
         self.active_scene = id;
         self.layer_order.clear();
@@ -2138,23 +2152,23 @@ impl RecordSettings {
     /// Its id (it isn't shown yet).
     pub fn add_scene(&mut self, copy_of_shown: bool) -> u64 {
         let id = self.new_scene_id();
-        let (name, items) = match self.scene().filter(|_| copy_of_shown) {
-            Some(s) => (format!("{} copy", s.name), self.live_items()),
-            None => (format!("Scene {}", self.scenes.len() + 1), vec![SceneItem::screen(true)]),
+        let (name, items, locked) = match self.scene().filter(|_| copy_of_shown) {
+            Some(s) => (format!("{} copy", s.name), self.live_items(), self.locked.clone()),
+            None => (format!("Scene {}", self.scenes.len() + 1), vec![SceneItem::screen(true)], Vec::new()),
         };
         let name = self.unused_scene_name(&name);
         let at = self.scenes.iter().position(|s| s.id == self.active_scene).map_or(self.scenes.len(), |i| i + 1);
-        self.scenes.insert(at, SceneCfg { id, name, items });
+        self.scenes.insert(at, SceneCfg { id, name, items, locked });
         id
     }
 
     /// A copy of scene `id`, after it: its id.
     pub fn duplicate_scene(&mut self, id: u64) -> Option<u64> {
         let at = self.scenes.iter().position(|s| s.id == id)?;
-        let items = if id == self.active_scene { self.live_items() } else { self.scenes[at].items.clone() };
+        let (items, locked) = if id == self.active_scene { (self.live_items(), self.locked.clone()) } else { (self.scenes[at].items.clone(), self.scenes[at].locked.clone()) };
         let name = self.unused_scene_name(&format!("{} copy", self.scenes[at].name));
         let new = self.new_scene_id();
-        self.scenes.insert(at + 1, SceneCfg { id: new, name, items });
+        self.scenes.insert(at + 1, SceneCfg { id: new, name, items, locked });
         Some(new)
     }
 
@@ -2217,6 +2231,7 @@ impl RecordSettings {
             return false;
         }
         self.layer_order.retain(|l| *l != layer);
+        self.locked.retain(|l| *l != layer);
         let elsewhere = self.stored_scene_has(layer);
         if !elsewhere {
             self.remove_layer(layer);
@@ -2271,7 +2286,23 @@ impl RecordSettings {
         self.visuals.push(copy);
         order[at] = new;
         self.layer_order = order;
+        for l in self.locked.iter_mut().filter(|l| **l == layer) {
+            *l = new;
+        }
         Some(new)
+    }
+
+    /// Whether `layer` is locked in the scene shown.
+    pub fn is_locked(&self, layer: LayerKey) -> bool {
+        self.locked.contains(&layer)
+    }
+
+    /// Lock `layer` in the scene shown, or unlock it.
+    pub fn set_locked(&mut self, layer: LayerKey, on: bool) {
+        self.locked.retain(|l| *l != layer);
+        if on {
+            self.locked.push(layer);
+        }
     }
 
     /// Sources no scene has any more (one deleted, an undo) go.
@@ -2325,6 +2356,7 @@ impl RecordSettings {
             webcams: std::mem::take(&mut self.webcams),
             visuals: std::mem::take(&mut self.visuals),
             layer_order: std::mem::take(&mut self.layer_order),
+            locked: std::mem::take(&mut self.locked),
             scenes: std::mem::take(&mut self.scenes),
             active_scene: std::mem::take(&mut self.active_scene),
             audio_sources: std::mem::take(&mut self.audio_sources),
@@ -2343,6 +2375,7 @@ impl RecordSettings {
         self.webcams = s.webcams;
         self.visuals = s.visuals;
         self.layer_order = s.layer_order;
+        self.locked = s.locked;
         (self.scenes, self.active_scene) = (s.scenes, s.active_scene);
         self.audio_sources = s.audio_sources;
         self.limiter = s.limiter;
@@ -2400,7 +2433,7 @@ impl RecordSettings {
             *key = next;
         }
         let new_key = |k: u64| keys.iter().find(|(was, _)| *was == k).map_or(k, |(_, now)| *now);
-        for l in &mut s.layer_order {
+        for l in s.layer_order.iter_mut().chain(s.locked.iter_mut()).chain(s.scenes.iter_mut().flat_map(|c| c.locked.iter_mut())) {
             if let LayerKey::Webcam(k) | LayerKey::Visual(k) = l {
                 *k = new_key(*k);
             }
@@ -3483,6 +3516,28 @@ mod scene_tests {
         assert_eq!(s.visual(2).map(|v| v.visual.clone()), Some(Visual::Image { path: "logo.png".into() }));
         s.switch_scene(a);
         assert_eq!(s.visual(own).map(|v| v.visual.clone()), Some(Visual::Image { path: "other.png".into() }));
+    }
+
+    /// Locks are each scene's: switching away and back keeps them, a
+    /// copied scene has them, one taken out is unlocked.
+    #[test]
+    fn locks_are_each_scenes_own() {
+        let mut s = setup();
+        let a = s.active_scene;
+        s.set_locked(LayerKey::Visual(2), true);
+        let b = s.add_scene(true);
+        let c = s.add_scene(false);
+        s.switch_scene(b);
+        assert!(s.is_locked(LayerKey::Visual(2)), "the copy's locked too");
+        s.set_locked(LayerKey::Visual(2), false);
+        s.switch_scene(c);
+        assert!(!s.is_locked(LayerKey::Visual(2)));
+        s.switch_scene(a);
+        assert!(s.is_locked(LayerKey::Visual(2)));
+        let back = RecordSettings::from_saved(Some(s.to_json().as_bytes()));
+        assert!(back.is_locked(LayerKey::Visual(2)));
+        s.remove_from_scene(LayerKey::Visual(2));
+        assert!(!s.is_locked(LayerKey::Visual(2)));
     }
 
     #[test]
