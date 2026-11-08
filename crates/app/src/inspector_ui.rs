@@ -50,49 +50,68 @@ impl App {
         let was = self.arrangement();
         let what = format!("{:?}", self.canvas.selected);
         match self.canvas.selected.clone() {
-            None => self.inspector_empty(ui),
             Some(Selected::Layer(l)) if self.layer_order().contains(&l) => self.layer_inspector(ui, l, frame, aspect),
-            Some(Selected::Layer(_)) => self.canvas.selected = None,
-            Some(Selected::Sound(id)) => self.sound_inspector(ui, &id),
-            Some(Selected::Mix) => self.mix_inspector(ui),
+            Some(Selected::Layer(_)) => {
+                self.canvas.selected = None;
+                self.scene_properties(ui);
+            }
+            _ => self.scene_properties(ui),
         }
         if self.arrangement() != was {
             self.keep_for_undo_as(was, what);
         }
     }
 
-    /// Nothing selected: how to select something, and the keys.
-    fn inspector_empty(&mut self, ui: &mut egui::Ui) {
+    /// With nothing selected: the scene and the video, as an editor shows
+    /// the document's settings. The scene's name (click to rename) and its
+    /// menu, then the video's size and frame rate (Settings' own rows), and
+    /// a way to make the video the size of the screen's crop.
+    fn scene_properties(&mut self, ui: &mut egui::Ui) {
         let pal = theme::pal(ui);
-        ui.add_space(36.0);
-        ui.vertical_centered(|ui| {
-            ui.label(theme::ic(icon::CURSOR_CLICK, 26.0).color(pal.text3));
-            ui.add_space(8.0);
-            ui.label(theme::text("Nothing selected", 15.0, W::Semibold).color(pal.text));
-            ui.add_space(4.0);
-            ui.add(egui::Label::new(theme::text("Click a source on the preview, or in a list under it, to change it here.", 13.0, W::Regular).color(pal.text3)).wrap());
+        let Some((id, name)) = self.settings.scene().map(|s| (s.id, s.name.clone())) else { return };
+        let rename_id = egui::Id::new(("rename_scene_head", id));
+        let draft_id = rename_id.with("draft");
+        let renaming = ui.data(|d| d.get_temp::<String>(draft_id));
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.set_min_height(34.0);
+            ui.spacing_mut().item_spacing.x = 8.0;
+            ui.label(theme::ic(icon::MONITOR_PLAY, 18.0).color(pal.text2));
+            let name_w = (ui.available_width() - 44.0).max(60.0);
+            ui.allocate_ui_with_layout(egui::vec2(name_w, 30.0), egui::Layout::left_to_right(egui::Align::Center), |ui| match renaming {
+                Some(mut draft) => {
+                    if crate::sources_ui::name_field(ui, rename_id, &mut draft, theme::font(16.0, W::Semibold), name_w - 8.0) {
+                        self.settings.rename_scene(id, &draft);
+                        ui.data_mut(|d| d.remove::<String>(draft_id));
+                    } else {
+                        ui.data_mut(|d| d.insert_temp(draft_id, draft));
+                    }
+                }
+                None => {
+                    crate::sources_ui::forget_name_field(ui, rename_id);
+                    let r = ui.add(egui::Label::new(theme::text(&name, 16.0, W::Semibold).color(pal.text)).truncate().sense(egui::Sense::click()));
+                    if r.on_hover_text("Click to rename it").on_hover_cursor(egui::CursorIcon::Text).clicked() {
+                        ui.data_mut(|d| d.insert_temp(draft_id, name.clone()));
+                    }
+                }
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let more = Btn::icon(Kind::Ghost, icon::DOTS_THREE).small().tip("Rename, duplicate, move, delete").show(ui);
+                ui_kit::menu_popup(&more, false, 220.0, |ui| self.scene_menu(ui, id, rename_id));
+            });
         });
-        ui_kit::section_head(ui, "Keys", false, |_| {});
-        let ctrl = crate::shortcuts::ctrl_name();
-        let keys: [(&str, Vec<&str>); 7] = [
-            ("Remove", vec!["Del"]),
-            ("Nudge (Shift: 10 px)", vec!["←", "↑", "→", "↓"]),
-            ("Hide or show", vec!["H"]),
-            ("Duplicate", vec![ctrl, "D"]),
-            ("Back, forward", vec![ctrl, "[", "]"]),
-            ("Undo, redo", vec![ctrl, "Z"]),
-            ("Let go", vec!["Esc"]),
-        ];
-        ui_kit::list(ui, "inspector_keys", |l| {
-            for (what, k) in keys {
-                let k: Vec<String> = k.into_iter().map(str::to_owned).collect();
-                l.row(Row::new(what), |ui| {
-                    let w = ui_kit::key_hint_width(ui, &k, 12.0);
-                    let (r, _) = ui.allocate_exact_size(egui::vec2(w, 20.0), egui::Sense::hover());
-                    ui_kit::key_hint(ui.painter(), egui::pos2(r.left(), r.center().y), &k, 12.0, pal.text2);
-                });
+        ui_kit::section_head(ui, "Video", true, |_| {});
+        self.video_size_rows(ui);
+        self.crop_match(ui);
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.add_space(-9.0);
+            let more = Btn::ghost("Quality and more in Settings").trail(icon::CARET_RIGHT).small().tip("The bitrate, the encoder, frame blending: every preset's");
+            if more.show(ui).clicked() {
+                self.open_settings(crate::settings_ui::Pane::Video);
             }
         });
+        ui.add_space(28.0);
     }
 
     /// A video source's settings: its head, its own section, Transform and

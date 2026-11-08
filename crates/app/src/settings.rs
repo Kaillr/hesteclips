@@ -2343,12 +2343,11 @@ impl RecordSettings {
     fn copied_setup(&self) -> PresetSetup {
         let mut s = self.clone().take_setup();
         // Webcams and sources share one key space: old key → new.
-        let mut next = self.new_key();
         let mut keys: Vec<(u64, u64)> = Vec::new();
-        for key in s.webcams.iter_mut().map(|w| &mut w.key).chain(s.visuals.iter_mut().map(|v| &mut v.key)) {
+        let olds = s.webcams.iter_mut().map(|w| &mut w.key).chain(s.visuals.iter_mut().map(|v| &mut v.key));
+        for (next, key) in (self.new_key()..).zip(olds) {
             keys.push((*key, next));
             *key = next;
-            next += 1;
         }
         let new_key = |k: u64| keys.iter().find(|(was, _)| *was == k).map_or(k, |(_, now)| *now);
         for l in &mut s.layer_order {
@@ -2357,13 +2356,11 @@ impl RecordSettings {
             }
         }
         let shown = s.active_scene;
-        let mut id = self.new_scene_id();
-        for scene in &mut s.scenes {
+        for (id, scene) in (self.new_scene_id()..).zip(s.scenes.iter_mut()) {
             if scene.id == shown {
                 s.active_scene = id;
             }
             scene.id = id;
-            id += 1;
             for item in &mut scene.items {
                 if let SceneItem::Webcam { key, .. } | SceneItem::Visual { key, .. } = item {
                     *key = new_key(*key);

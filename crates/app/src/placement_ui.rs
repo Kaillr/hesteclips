@@ -244,8 +244,16 @@ impl App {
         let mut reset = false;
         ui.add_space(4.0);
         ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            // On the preview: its handles crop till Done (as Alt and a
+            // handle do, now and then).
+            let on = self.canvas.crop_mode == Some(layer);
             let alt = crate::shortcuts::alt_name();
-            ui.label(theme::text(format!("Or {alt} + a handle on the preview"), 12.5, W::Regular).color(pal.text3));
+            let b = if on { Btn::normal("Done").with_icon(egui_phosphor::regular::CHECK) } else { Btn::normal("Crop").with_icon(egui_phosphor::regular::CROP) };
+            let tip = if on { "Stop cropping (Enter)".to_owned() } else { format!("Drag its handles on the preview to cut its edges off ({alt} and a handle do it too)") };
+            if b.small().tip(tip).show(ui).clicked() {
+                self.canvas.crop_mode = if on { None } else { Some(layer) };
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 reset = Btn::ghost("Reset").small().enabled(cropped).tip("All of its picture again").show(ui).clicked();

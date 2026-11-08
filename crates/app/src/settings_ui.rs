@@ -419,6 +419,22 @@ impl App {
         self.say_locked(locked_click, lock);
     }
 
+    /// The video's size and frame rate, as this page's Video pane has them:
+    /// the Sources page's scene settings show them (nothing selected there).
+    /// Frame blending stays here.
+    pub(crate) fn video_size_rows(&mut self, ui: &mut egui::Ui) {
+        let all = Filter { q: String::new() };
+        self.video_group(ui, &all);
+        ui_kit::gap(ui, 8.0);
+        let lock = self.lock();
+        let mut locked_click = false;
+        ui_kit::list(ui, "scene_fps", |l| {
+            let (_, c) = l.row(Row::new("Frame rate").locked(lock.clone()), |ui| self.fps_field(ui));
+            locked_click |= c;
+        });
+        self.say_locked(locked_click, lock);
+    }
+
     /// Video's motion: the frame rate, and frame blending's motion blur
     /// made from faster captures than it.
     fn motion_group(&mut self, ui: &mut egui::Ui, f: &Filter) {

@@ -607,6 +607,49 @@ impl App {
         if Item::new("Sources").icon(icon::FADERS).value(self.sources_summary()).show(ui).clicked() {
             self.page = Page::Sources;
         }
+        // The scene shown, switched from anywhere (live while capturing),
+        // and the preset in use (another needs a fresh capture: clipping
+        // starts again, once asked; never while recording or streaming).
+        if self.settings.scenes.len() > 1 {
+            let shown = self.settings.active_scene;
+            let scenes: Vec<(u64, String)> = self.settings.scenes.iter().map(|s| (s.id, s.name.clone())).collect();
+            let now = self.settings.scene().map(|s| s.name.clone()).unwrap_or_default();
+            let mut picked = None;
+            ui_kit::submenu(ui, Item::new("Scene").icon(icon::MONITOR_PLAY).value(now), |ui| {
+                for (id, name) in scenes {
+                    if Item::new(name).check(id == shown).show(ui).clicked() {
+                        picked = Some(id);
+                    }
+                }
+            });
+            if let Some(id) = picked {
+                self.show_scene(id);
+                ui.close();
+            }
+        }
+        if self.settings.presets.len() > 1 {
+            let using = self.settings.active_preset;
+            let presets: Vec<(u64, String)> = self.settings.presets.iter().map(|p| (p.id, p.name.clone())).collect();
+            let now = self.settings.preset().map(|p| p.name.clone()).unwrap_or_default();
+            let locked = self.presets_locked();
+            let mut picked = None;
+            ui_kit::submenu(ui, Item::new("Preset").icon(icon::STACK).value(now), |ui| {
+                for (id, name) in presets {
+                    let item = Item::new(name).check(id == using);
+                    let item = match &locked {
+                        Some(why) if id != using => item.enabled(false).tip(why.clone()),
+                        _ => item,
+                    };
+                    if item.show(ui).clicked() {
+                        picked = Some(id);
+                    }
+                }
+            });
+            if let Some(id) = picked {
+                self.pick_preset(id);
+                ui.close();
+            }
+        }
         if state.streaming && Item::new("Streaming settings").icon(icon::GEAR).show(ui).clicked() {
             self.open_settings(crate::settings_ui::Pane::Streaming);
         }

@@ -133,6 +133,9 @@ impl ScreenHold {
 pub(crate) struct CanvasView {
     /// What's selected (see [`Selected`]).
     pub(crate) selected: Option<Selected>,
+    /// Cropping this source on the preview (its Crop button): its handles
+    /// crop, as with Alt held, till Done, Enter or Esc.
+    pub(crate) crop_mode: Option<Layer>,
     /// When the last undo step was kept, and what for: changes to the same
     /// thing in quick succession (typing, a number stepped) are one step.
     last_step: Option<(String, std::time::Instant)>,
@@ -559,6 +562,7 @@ impl App {
         self.canvas.drag = None;
         self.canvas.menu = None;
         self.canvas.card_hover = None;
+        self.canvas.crop_mode = None;
     }
 
     /// The video source selected, if one is.
@@ -657,6 +661,11 @@ impl App {
         let pointer = ui.input(|i| i.pointer.hover_pos()).filter(|p| frame_rect.expand(HANDLE).contains(*p));
         let selected = self.selected_layer().filter(|l| layers.iter().any(|(x, _)| x == l));
         let hit_at = |p: Pos2| hit(&layers, &shown, p, selected);
+        // Its handles crop: Alt held, or its Crop button on (that one only).
+        if self.canvas.crop_mode.is_some() && self.canvas.crop_mode != selected {
+            self.canvas.crop_mode = None;
+        }
+        let crop_on = modifiers.alt || self.canvas.crop_mode.is_some();
 
         // A click selects what's under it, in front; on nothing, nothing.
         if response.clicked() {
@@ -693,7 +702,7 @@ impl App {
                     Drag::Webcam(key, handle, from, start) => {
                         let lines = lines_of(&layers, Layer::Webcam(key));
                         let (dx, dy) = d(from);
-                        let moved = webcam_ui::drag(start, handle, dx, dy, Mods { crop: modifiers.alt, snap, keep: modifiers.shift }, &lines);
+                        let moved = webcam_ui::drag(start, handle, dx, dy, Mods { crop: crop_on, snap, keep: modifiers.shift }, &lines);
                         if let Some(w) = self.settings.webcam_mut(key) {
                             w.placement = PlacementCfg::laid_out(moved, aspect);
                         }
@@ -706,7 +715,7 @@ impl App {
                         let lines = lines_of(&layers, Layer::Visual(key));
                         // A colour has no shape of its own to keep.
                         let shapeless = self.settings.visual(key).is_some_and(|v| v.visual.shapeless());
-                        let (r, crop, picture) = h.dragged(dx, dy, Mods { crop: modifiers.alt, snap, keep: modifiers.shift || shapeless }, &lines);
+                        let (r, crop, picture) = h.dragged(dx, dy, Mods { crop: crop_on, snap, keep: modifiers.shift || shapeless }, &lines);
                         if let Some(v) = self.settings.visual_mut(key) {
                             v.placed = Some(BoxCfg::new([r.min.x, r.min.y, r.width(), r.height()], aspect, if shapeless { None } else { picture }));
                             v.crop = crop;
@@ -718,7 +727,7 @@ impl App {
                     Drag::Screen(h) => {
                         let (dx, dy) = d(h.from);
                         let lines = lines_of(&layers, Layer::Screen);
-                        let (r, crop, picture) = h.dragged(dx, dy, Mods { crop: modifiers.alt, snap, keep: modifiers.shift }, &lines);
+                        let (r, crop, picture) = h.dragged(dx, dy, Mods { crop: crop_on, snap, keep: modifiers.shift }, &lines);
                         self.settings.screen.placed = Some(BoxCfg::new([r.min.x, r.min.y, r.width(), r.height()], aspect, picture));
                         self.settings.screen_crop = crop;
                         if h.handle == Handle::Move && snap {
@@ -780,17 +789,7 @@ impl App {
         }
         // The one held, else the one selected: its outline and handles.
         let active = held.or(selected.map(|l| (l, over.filter(|(o, _)| *o == l).map(|(_, h)| h))));
-        let hint_none = || {
-            if pointer.is_some() && !layers.is_empty() {
-                Some("Click a source to select it".to_owned())
-            } else {
-                None
-            }
-        };
         let Some((active, handle)) = active else {
-            if let Some(hint) = hint_none() {
-                pill(&painter, frame_rect, hint);
-            }
             return;
         };
         let Some(rect) = layers.iter().find(|(l, _)| *l == active).map(|(_, r)| *r) else { return };
@@ -811,7 +810,7 @@ impl App {
             Layer::Webcam(_) => None,
         };
         let croppable = webcam.is_some() || boxed.is_some();
-        let cropping = modifiers.alt && croppable && handle.is_some_and(|h| h != Handle::Move);
+        let cropping = crop_on && croppable && handle.is_some_and(|h| h != Handle::Move);
 
         // Cropping: where the whole camera picture (or display) would be,
         // dashed, so it's clear what's cut off and how far it can grow back.
@@ -882,28 +881,15 @@ impl App {
         // crops (they'll crop); the one held or under the pointer a little bigger.
         for h in Handle::ALL {
             let r = if Some(h) == handle { HANDLE * 0.65 } else { HANDLE * 0.5 };
-            let fill = if modifiers.alt && croppable || cropping { CROP } else { Color32::WHITE };
+            let fill = if crop_on && croppable || cropping { CROP } else { Color32::WHITE };
             painter.circle(h.pos(line), r, fill, Stroke::new(1.0, Color32::from_black_alpha(140)));
         }
 
-        // What the keys do, along the picture's top: always there, so it
-        // doesn't jump about as the box is dragged past the middle. (Alt is
-        // Option on a Mac, Ctrl Control: the keys as they're named there.)
-        let (alt, ctrl) = (crate::shortcuts::alt_name(), crate::shortcuts::ctrl_name());
-        // All of the video exactly, it has nowhere to move.
-        let moves = !stuck(rect);
-        let crop_words = if croppable { format!(" · {alt} + handle crops") } else { String::new() };
-        let hint = match self.canvas.drag {
-            Some(Drag::Stuck(_)) => "It fills the video: drag a corner to make it smaller".to_owned(),
-            Some(Drag::Webcam(_, Handle::Move, ..) | Drag::Visual(_, ScreenHold { handle: Handle::Move, .. }) | Drag::Screen(ScreenHold { handle: Handle::Move, .. })) => format!("{ctrl}: place freely"),
-            Some(_) if cropping && modifiers.shift => "Cropping, keeping the shape".to_owned(),
-            Some(_) if cropping => "Cropping · Shift keeps the shape".to_owned(),
-            Some(_) if modifiers.shift => format!("Stretching{crop_words}"),
-            Some(_) => format!("Shift: stretch{crop_words}"),
-            None if moves => format!("Drag to move · a handle resizes{crop_words}"),
-            None => format!("Drag a handle to make it smaller{crop_words}"),
-        };
-        pill(&painter, frame_rect, hint);
+        // No keys said over the picture (they're in the menus, and the
+        // tooltips): only why a drag that can't move doesn't, while it's held.
+        if matches!(self.canvas.drag, Some(Drag::Stuck(_))) {
+            pill(&painter, frame_rect, "It fills the video: drag a corner to make it smaller".to_owned());
+        }
     }
     /// Take hold of the screen: in its box as it is; put in by Fill, Fit or
     /// Stretch, into a box of its own where it shows, so nothing jumps
@@ -1154,6 +1140,11 @@ impl App {
             }
             return;
         };
+        // Cropping on the preview: Esc or Enter is done (it stays selected).
+        if self.canvas.crop_mode.is_some() && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape) || i.consume_key(Modifiers::NONE, Key::Enter)) {
+            self.canvas.crop_mode = None;
+            return;
+        }
         let was = self.arrangement();
         let (remove, hide, dup, esc, back, forward, mods) = ctx.input_mut(|i| {
             (
@@ -1203,7 +1194,7 @@ impl App {
         if dup {
             match layer {
                 Layer::Visual(_) => self.duplicate_layer(layer, aspect),
-                Layer::Webcam(_) => self.toast_icon(icon::INFO, "A camera can be in your clips once"),
+                Layer::Webcam(_) => self.toast_icon(icon::INFO, "A camera can be in a scene once"),
                 Layer::Screen => {}
             }
         }

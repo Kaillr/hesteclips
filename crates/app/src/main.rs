@@ -21,6 +21,7 @@ mod crop_ui;
 mod demo;
 mod fonts;
 mod inspector_ui;
+mod scenes_ui;
 mod visuals_ui;
 mod webcam_ui;
 mod discord;
@@ -1307,23 +1308,21 @@ impl App {
                 }
                 let switched = self.settings.switch_preset(id);
                 if switched {
-                    push_live_audio(&self.live_audio, &self.settings);
-                    self.canvas.pictures.clear();
-                    self.canvas.sizes.clear();
-                    self.listening = None;
-                    eprintln!("preset: {}", self.settings.preset().map_or("?", |p| p.name.as_str()));
+                    self.after_preset_switch();
                 }
                 if restart {
                     self.start_mode(capture::Mode::ReplayBuffer);
                 }
-                if !switched {
-                    return;
-                }
+                return;
             }
         }
-        // What belonged to the scene before: its undo steps (they'd put its
-        // places into this one), a drag, the crop's and camera's pages, and
-        // the selection if it isn't here.
+        self.after_scene_switch();
+    }
+
+    /// What belonged to the scene before a switch let go: its undo steps
+    /// (they'd put its places into this one), a drag, the crop's and the
+    /// camera's pages, and the selection if it isn't here.
+    fn after_scene_switch(&mut self) {
         self.forget_canvas_steps();
         self.sources_view.row_drag = None;
         self.sources_view.crop_open = false;
@@ -1334,6 +1333,19 @@ impl App {
         {
             self.canvas.selected = None;
         }
+    }
+
+    /// Another preset in the live settings (a switch, or the one in use
+    /// deleted): its sound into the live audio, the pictures drawn for the
+    /// other's sources forgotten, and what a scene switch lets go.
+    pub(crate) fn after_preset_switch(&mut self) {
+        push_live_audio(&self.live_audio, &self.settings);
+        self.canvas.pictures.clear();
+        self.canvas.sizes.clear();
+        self.listening = None;
+        self.canvas.selected = None;
+        eprintln!("preset: {}", self.settings.preset().map_or("?", |p| p.name.as_str()));
+        self.after_scene_switch();
     }
 
     /// Where the chosen display is in `screens`: found by its id, by its
@@ -1553,6 +1565,8 @@ impl eframe::App for App {
         self.close_dialog(&ctx);
         self.keys_dialog(&ctx);
         self.go_live_dialog(&ctx);
+        // Presets and scenes (the Sources page's, and the recorder's menu's).
+        self.sources_dialogs(&ctx);
         #[cfg(target_os = "macos")]
         self.setup_dialog(&ctx);
         ui_kit::pointer_cursor(&ctx);
