@@ -36,16 +36,12 @@ impl App {
         }
     }
 
-    /// Group `id`'s sources taken out of the scene shown (the screen stays,
-    /// out of the group), and so the group. Ctrl+Z puts them back.
+    /// Group `id`'s sources taken out of the scene shown, and so the group.
+    /// Ctrl+Z puts them back.
     pub(crate) fn remove_group(&mut self, id: u64) {
         let Some(g) = self.settings.group(id).cloned() else { return };
         for m in &g.members {
-            if *m == Layer::Screen {
-                self.settings.set_group(*m, None);
-            } else {
-                self.settings.remove_from_scene(*m);
-            }
+            self.settings.remove_from_scene(*m);
         }
         self.settings.ungroup(id);
         self.forget_gone_selection();

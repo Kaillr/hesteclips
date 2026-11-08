@@ -774,7 +774,10 @@ impl App {
         // video reaches past it, and its outline and handles stay on it.
         let shown = move |r: Rect| to_screen(r).intersect(frame_rect);
         let modifiers = ui.input(|i| i.modifiers);
-        let pointer = ui.input(|i| i.pointer.hover_pos()).filter(|p| frame_rect.expand(HANDLE).contains(*p));
+        // On the preview itself: not on a dialog or menu over it (its
+        // cursors and outlines aren't theirs).
+        let on_preview = ui.rect_contains_pointer(frame_rect.expand(HANDLE));
+        let pointer = ui.input(|i| i.pointer.hover_pos()).filter(|p| on_preview && frame_rect.expand(HANDLE).contains(*p));
         // What can be taken hold of: not what's locked.
         let free: Vec<(Layer, Rect)> = layers.iter().filter(|(l, _)| !self.settings.is_locked(*l)).copied().collect();
         let selected = self.selected_layer().filter(|l| free.iter().any(|(x, _)| x == l));
@@ -1370,7 +1373,7 @@ impl App {
             self.set_layer_enabled(layer, !on);
             ui.close();
         }
-        if !screen && Item::new("Remove").icon(icon::TRASH).danger().keys(keys(&["Del"])).tip("Take it out of your clips").show(ui).clicked() {
+        if Item::new("Remove").icon(icon::TRASH).danger().keys(keys(&["Del"])).tip("Take it out of this scene").show(ui).clicked() {
             self.remove_layer(layer);
             ui.close();
         }
@@ -1558,11 +1561,7 @@ impl App {
             return;
         }
         if remove {
-            if layer == Layer::Screen {
-                self.toast_icon(icon::INFO, "The screen stays in the list: H hides it");
-            } else {
-                self.remove_layer(layer);
-            }
+            self.remove_layer(layer);
         }
         if hide {
             let on = self.layer_enabled(layer);
@@ -1635,13 +1634,10 @@ impl App {
         self.set_layer_order(&order);
     }
 
-    /// A webcam or boxed source taken out of the scene shown (the screen
-    /// stays: it's hidden instead); gone for good once no other scene has
-    /// it. Ctrl+Z puts it back.
+    /// A source taken out of the scene shown; gone for good once no other
+    /// scene has it (but the screen, the preset's own: Add › From other
+    /// scenes puts it back). Ctrl+Z puts it back too.
     pub(crate) fn remove_layer(&mut self, layer: Layer) {
-        if layer == Layer::Screen {
-            return;
-        }
         let name = self.settings.layer_title(layer);
         let gone = self.settings.remove_from_scene(layer);
         if self.selected_layer() == Some(layer) {

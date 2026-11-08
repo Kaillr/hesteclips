@@ -796,9 +796,6 @@ fn check_scenes(scenes: &mut Vec<SceneCfg>, active: &mut u64, pool: &[LayerKey])
                 items.push(i);
             }
         }
-        if !items.iter().any(|i| i.layer() == LayerKey::Screen) {
-            items.push(SceneItem::screen(false));
-        }
         s.items = items;
     }
 }
@@ -1816,7 +1813,10 @@ impl RecordSettings {
             None => ([0.0, 0.0, 1.0, 1.0], self.framing.into()),
         };
         let crop = self.screen_crop.filter(|c| capture::SCREEN_CROP && !apps && !c.is_none()).map(Into::into);
-        capture::ScreenPlacement { rect, framing, in_front: self.screen_in_front(), hidden: !s.enabled, crop, turns: s.turns % 4, flip_h: s.flip_h, flip_v: s.flip_v }
+        // A scene without the screen: it's captured on, hidden (switching
+        // to one with it shows it at once).
+        let hidden = !s.enabled || !self.layer_order().contains(&LayerKey::Screen);
+        capture::ScreenPlacement { rect, framing, in_front: self.screen_in_front(), hidden, crop, turns: s.turns % 4, flip_h: s.flip_h, flip_v: s.flip_v }
     }
 
     pub fn blend_samples(&self) -> u32 {
@@ -1952,9 +1952,9 @@ impl RecordSettings {
     }
 
     /// The scene shown's sources, the one in front first: each once, those
-    /// gone left out, and the screen (every scene has it; at the back if
-    /// it's missing). A source of the preset's the scene doesn't have isn't
-    /// in it (see `outside_scene`).
+    /// gone left out. A source of the preset's the scene doesn't have
+    /// (the screen too: a scene can do without it) isn't in it (see
+    /// `outside_scene`).
     pub fn layer_order(&self) -> Vec<LayerKey> {
         let exists = |k: &LayerKey| match k {
             LayerKey::Screen => true,
@@ -1966,9 +1966,6 @@ impl RecordSettings {
             if exists(k) && !order.contains(k) {
                 order.push(*k);
             }
-        }
-        if !order.contains(&LayerKey::Screen) {
-            order.push(LayerKey::Screen);
         }
         order
     }
@@ -2168,10 +2165,6 @@ impl RecordSettings {
                 self.layer_order.push(item.layer());
             }
         }
-        if !self.layer_order.contains(&LayerKey::Screen) {
-            self.put_item(&SceneItem::screen(false));
-            self.layer_order.push(LayerKey::Screen);
-        }
         self.pack_groups();
         true
     }
@@ -2248,7 +2241,7 @@ impl RecordSettings {
         match layer {
             LayerKey::Webcam(key) => self.webcam_mut(key).into_iter().for_each(|w| w.enabled = true),
             LayerKey::Visual(key) => self.visual_mut(key).into_iter().for_each(|v| v.enabled = true),
-            LayerKey::Screen => {}
+            LayerKey::Screen => self.screen.enabled = true,
         }
         self.layer_order = self.layer_order();
         self.layer_order.insert(0, layer);
@@ -2259,13 +2252,11 @@ impl RecordSettings {
     /// scene has): gone for good once no other scene has it. Whether it went
     /// for good.
     pub fn remove_from_scene(&mut self, layer: LayerKey) -> bool {
-        if layer == LayerKey::Screen {
-            return false;
-        }
         self.layer_order.retain(|l| *l != layer);
         self.locked.retain(|l| *l != layer);
         self.pack_groups();
-        let elsewhere = self.stored_scene_has(layer);
+        // The screen is the preset's own: never gone, only out of scenes.
+        let elsewhere = self.stored_scene_has(layer) || layer == LayerKey::Screen;
         if !elsewhere {
             self.remove_layer(layer);
         }
@@ -2303,8 +2294,8 @@ impl RecordSettings {
 
     /// Make `layer`, in the scene shown, its own: a copy of the source (what
     /// it shows too, changed here only from now on) in its place, the other
-    /// scenes keeping the one they share. Not the screen, which every scene
-    /// has, nor a webcam: a camera opens once, in one format. The copy, or
+    /// scenes keeping the one they share. Not the screen, the preset's one
+    /// capture, nor a webcam: a camera opens once, in one format. The copy, or
     /// `None` if it can't be or no other scene has it.
     pub fn unlink(&mut self, layer: LayerKey) -> Option<LayerKey> {
         let LayerKey::Visual(key) = layer else { return None };
@@ -3306,15 +3297,15 @@ mod tests {
         assert_eq!(again.layer_order(), two.layer_order());
     }
 
-    /// The order is the scene shown's: each source once, gone ones left out,
-    /// the screen always there. One of the preset's the scene doesn't have
-    /// isn't in it.
+    /// The order is the scene shown's: each source once, gone ones left out.
+    /// New settings start with the screen; one of the preset's the scene
+    /// doesn't have (the screen too) isn't in it.
     #[test]
     fn the_order_keeps_up_with_the_sources() {
-        let mut s = RecordSettings::default();
+        let mut s = RecordSettings::from_saved(None);
         assert_eq!(s.layer_order(), vec![LayerKey::Screen]);
         s.visuals.push(VisualCfg::new(3, Visual::Display { id: "d".into(), name: "D".into() }));
-        s.layer_order = vec![LayerKey::Webcam(7)];
+        s.layer_order = vec![LayerKey::Webcam(7), LayerKey::Screen];
         assert_eq!(s.layer_order(), vec![LayerKey::Screen]);
         assert_eq!(s.outside_scene(), vec![LayerKey::Visual(3)]);
         assert_eq!(s.new_key(), 4);
@@ -3464,9 +3455,10 @@ mod scene_tests {
         s.switch_scene(b);
         assert!(s.remove_from_scene(LayerKey::Visual(2)));
         assert!(s.visual(2).is_none());
-        // Never the screen.
+        // The screen: out of the scene, never gone.
         assert!(!s.remove_from_scene(LayerKey::Screen));
-        assert!(s.layer_order().contains(&LayerKey::Screen));
+        assert!(!s.layer_order().contains(&LayerKey::Screen));
+        assert_eq!(s.outside_scene(), vec![LayerKey::Screen]);
     }
 
     #[test]
@@ -3715,6 +3707,29 @@ mod scene_tests {
         assert!(s.groups.is_empty());
         let back = RecordSettings::from_saved(Some(s.to_json().as_bytes()));
         assert_eq!(back.scenes, s.scenes);
+    }
+
+    /// A scene can do without the screen (a webcam alone, say): taken out
+    /// it's hidden in the capture, never gone, and comes back from another
+    /// scene; switching keeps a scene without it so.
+    #[test]
+    fn a_scene_can_do_without_the_screen() {
+        let mut s = setup();
+        let a = s.active_scene;
+        let b = s.add_scene(true);
+        assert!(!s.remove_from_scene(LayerKey::Screen), "never gone for good");
+        assert_eq!(s.layer_order(), vec![LayerKey::Webcam(1), LayerKey::Visual(2)]);
+        assert!(s.screen_placement().hidden);
+        assert_eq!(s.outside_scene(), vec![LayerKey::Screen]);
+        s.switch_scene(b);
+        assert!(s.layer_order().contains(&LayerKey::Screen));
+        assert!(!s.screen_placement().hidden);
+        s.switch_scene(a);
+        assert!(!s.layer_order().contains(&LayerKey::Screen), "still without it");
+        let back = RecordSettings::from_saved(Some(s.to_json().as_bytes()));
+        assert!(!back.layer_order().contains(&LayerKey::Screen));
+        assert!(s.add_to_scene(LayerKey::Screen));
+        assert!(!s.screen_placement().hidden);
     }
 
     #[test]
