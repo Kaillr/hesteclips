@@ -31,6 +31,9 @@ const LIMIT_HOLD: Duration = Duration::from_secs(3);
 const ONE_COLUMN: f32 = 700.0;
 /// The layers' column, beside the preview.
 const LAYERS_W: f32 = 260.0;
+/// The layers' and the sound's column, beside the preview, in a window too
+/// short for the sound under it (see `scene_editor`).
+const SIDE_W: f32 = 400.0;
 /// Between the page's columns.
 const COLUMN_GAP: f32 = 20.0;
 /// The sound under the layers and the preview takes this much of the
@@ -252,21 +255,43 @@ impl App {
 
     /// The scene shown, in three places of its own: its layers, the preview
     /// beside them as big as there's room for, and under both the preset's
-    /// sound (the same in every scene), as tall as its rows. Narrow, the
-    /// preview's on top, the layers and the sound under it. A source's
-    /// settings are in a dialog (see `inspector_ui`). The frame shown.
+    /// sound (the same in every scene), as tall as its rows; in a window
+    /// wide and short, the layers and the sound in a column, the preview
+    /// all of the height beside it. Narrow, the preview's on top, the
+    /// layers and the sound under it. A source's settings are in a dialog
+    /// (see `inspector_ui`). The frame shown.
     fn scene_editor(&mut self, ui: &mut egui::Ui, aspect: f32, now: Instant, dt: f32) -> Option<std::sync::Arc<capture::preview::PreviewFrame>> {
         use egui::{Rect, pos2, vec2};
         ui.add_space(4.0);
-        let area = ui.available_rect_before_wrap();
+        let full = ui.available_rect_before_wrap();
+        // The page's margin under it, as the panel's beside it: what's in
+        // it ends where the panel's card does.
+        let area = Rect::from_min_max(full.min, pos2(full.right(), full.bottom() - (crate::ui_kit::PAGE_MARGIN as f32 - 10.0)));
         // A click on the page around the preview and the lists (under
         // them all, so only where none of them is) lets go of what's
         // selected.
-        let around = ui.interact(area, ui.id().with("scene_around"), Sense::click());
+        let around = ui.interact(full, ui.id().with("scene_around"), Sense::click());
         let (w, h) = (area.width(), area.height());
         let place = |ui: &mut egui::Ui, r: Rect| ui.new_child(egui::UiBuilder::new().max_rect(r).layout(egui::Layout::top_down(egui::Align::Min)));
-        let frame = if w >= ONE_COLUMN {
-            let sound_h = self.sound_height().min(h * SOUND_SHARE);
+        // The preview's width with the sound under it, and with the sound
+        // in a column with the layers beside it (a wide, short window, where
+        // the sound under it leaves it small, with room either side): the
+        // one where it's bigger.
+        let sound_h = self.sound_height().min(h * SOUND_SHARE);
+        let under_w = (w - LAYERS_W - COLUMN_GAP).min((h - sound_h - crate::ui_kit::STACK_GAP - 40.0).max(120.0) * aspect);
+        let beside_w = (w - SIDE_W - COLUMN_GAP).min((h - 40.0).max(120.0) * aspect);
+        let frame = if w >= ONE_COLUMN && beside_w > under_w * 1.15 {
+            let side = Rect::from_min_size(area.min, vec2(SIDE_W, h));
+            let picture = Rect::from_min_max(pos2(side.right() + COLUMN_GAP, area.top()), area.max);
+            // The toolbar's over it.
+            let frame = self.picture_column(&mut place(ui, picture), (h - 40.0).max(120.0));
+            crate::ui_kit::scroll(&mut place(ui, side), "scene_side", |ui| {
+                self.video_list(ui, frame.as_deref(), aspect);
+                crate::ui_kit::gap(ui, 24.0);
+                self.sound_list(ui, now, dt);
+            });
+            frame
+        } else if w >= ONE_COLUMN {
             let top = Rect::from_min_max(area.min, pos2(area.right(), area.bottom() - sound_h - crate::ui_kit::STACK_GAP));
             let layers = Rect::from_min_size(top.min, vec2(LAYERS_W, top.height()));
             let picture = Rect::from_min_max(pos2(layers.right() + COLUMN_GAP, top.top()), top.max);
@@ -300,7 +325,7 @@ impl App {
     /// clip mix's row and each source's (or the line saying there's none).
     fn sound_height(&self) -> f32 {
         let rows = 1 + self.settings.audio_sources.len().max(1);
-        50.0 + rows as f32 * (ROW_H + 6.0)
+        56.0 + rows as f32 * (ROW_H + 6.0)
     }
 
     /// Over the preview: undo, redo and the video's size; then the preview
