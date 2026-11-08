@@ -212,7 +212,8 @@ impl App {
     }
 
     /// Its symbol, its name (click to rename), its switch and its menu;
-    /// under them what it is now, and what's wrong with it.
+    /// under them what it is now, what's wrong with it, and which other
+    /// scenes have it (the same source).
     fn inspector_head(&mut self, ui: &mut egui::Ui, layer: Layer, frame: Option<&capture::preview::PreviewFrame>, aspect: f32) {
         let pal = theme::pal(ui);
         let rename_id = egui::Id::new(("rename_layer", layer));
@@ -264,6 +265,22 @@ impl App {
             ui.horizontal(|ui| {
                 ui.add_space(pad);
                 ui.add(egui::Label::new(theme::text(w, 12.5, W::Regular).color(pal.warn)).wrap());
+            });
+        }
+        // In other scenes too: the same source there, so what it shows
+        // changes there too (where it is doesn't).
+        let also: Vec<String> = self.settings.scenes_with(layer).into_iter().map(|(_, name)| name).collect();
+        if !also.is_empty() {
+            let tip = match layer {
+                Layer::Visual(_) => "The same source: what it shows changes in each, where it is in this one alone. Unlink from other scenes, in its menu, makes it this scene's own",
+                _ => "The same source: what it shows changes in each, where it is and its crop in this one alone",
+            };
+            ui.horizontal(|ui| {
+                ui.add_space(pad);
+                ui.spacing_mut().item_spacing.x = 5.0;
+                ui.label(theme::ic(icon::LINK_SIMPLE, 12.0).color(pal.text3));
+                let line = egui::Label::new(theme::text(format!("Also in {}", and_list(&also)), 12.5, W::Regular).color(pal.text3)).truncate().sense(egui::Sense::hover());
+                ui.add(line).on_hover_text(tip);
             });
         }
     }
@@ -746,6 +763,15 @@ impl App {
         {
             v.visual = Visual::Text(s);
         }
+    }
+}
+
+/// Names in a sentence: "A", "A and B", "A, B and C".
+fn and_list(names: &[String]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
     }
 }
 

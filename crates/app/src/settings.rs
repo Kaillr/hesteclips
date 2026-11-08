@@ -2224,6 +2224,56 @@ impl RecordSettings {
         !elsewhere
     }
 
+    /// The other scenes that have `layer`, in their order: by id and name.
+    pub fn scenes_with(&self, layer: LayerKey) -> Vec<(u64, String)> {
+        self.scenes.iter().filter(|s| s.id != self.active_scene && s.items.iter().any(|i| i.layer() == layer)).map(|s| (s.id, s.name.clone())).collect()
+    }
+
+    /// `layer` as it is in the scene shown (where it is, its size, crop and
+    /// turn, shown or hidden) into scene `id` as well: the same source,
+    /// shared, put in front of what's behind it here (else at the back);
+    /// one `id` has already is placed as here. False if `id` is the scene
+    /// shown or isn't there, or the scene shown hasn't `layer`.
+    pub fn copy_to_scene(&mut self, layer: LayerKey, id: u64) -> bool {
+        if id == self.active_scene {
+            return false;
+        }
+        let order = self.layer_order();
+        let Some(at) = order.iter().position(|l| *l == layer) else { return false };
+        let Some(item) = self.item_of(layer) else { return false };
+        let Some(scene) = self.scenes.iter_mut().find(|s| s.id == id) else { return false };
+        match scene.items.iter().position(|i| i.layer() == layer) {
+            Some(i) => scene.items[i] = item,
+            None => {
+                let behind = &order[at + 1..];
+                let to = scene.items.iter().position(|i| behind.contains(&i.layer())).unwrap_or(scene.items.len());
+                scene.items.insert(to, item);
+            }
+        }
+        true
+    }
+
+    /// Make `layer`, in the scene shown, its own: a copy of the source (what
+    /// it shows too, changed here only from now on) in its place, the other
+    /// scenes keeping the one they share. Not the screen, which every scene
+    /// has, nor a webcam: a camera opens once, in one format. The copy, or
+    /// `None` if it can't be or no other scene has it.
+    pub fn unlink(&mut self, layer: LayerKey) -> Option<LayerKey> {
+        let LayerKey::Visual(key) = layer else { return None };
+        if !self.stored_scene_has(layer) {
+            return None;
+        }
+        let mut order = self.layer_order();
+        let at = order.iter().position(|l| *l == layer)?;
+        let mut copy = self.visual(key)?.clone();
+        copy.key = self.new_key();
+        let new = LayerKey::Visual(copy.key);
+        self.visuals.push(copy);
+        order[at] = new;
+        self.layer_order = order;
+        Some(new)
+    }
+
     /// Sources no scene has any more (one deleted, an undo) go.
     pub fn tidy_pool(&mut self) {
         let order = self.layer_order();
@@ -3360,6 +3410,79 @@ mod scene_tests {
         }
         assert_eq!(fixed.presets.len(), 1);
         assert!(fixed.preset().is_some_and(|p| p.setup.is_none()));
+    }
+
+    /// Copied to another scene, a webcam's there as it's here (its crop
+    /// too), in front of what's behind it here; then each scene's place is
+    /// its own, and the camera's settings are shared.
+    #[test]
+    fn a_source_copied_to_another_scene_is_placed_as_here() {
+        let mut s = setup();
+        let a = s.active_scene;
+        if let Some(w) = s.webcam_mut(1) {
+            w.placement.crop = [0.1, 0.0, 0.2, 0.05];
+            w.placement.x = 0.05;
+        }
+        let b = s.add_scene(false);
+        assert!(s.copy_to_scene(LayerKey::Webcam(1), b));
+        assert!(!s.copy_to_scene(LayerKey::Webcam(1), a), "not into the scene shown");
+        assert_eq!(s.scenes_with(LayerKey::Webcam(1)), vec![(b, s.scenes[1].name.clone())]);
+        let here = s.webcam(1).map(|w| w.placement);
+        s.switch_scene(b);
+        assert_eq!(s.layer_order(), vec![LayerKey::Webcam(1), LayerKey::Screen], "in front of the screen, as there");
+        assert_eq!(s.webcam(1).map(|w| w.placement), here);
+        // Moved here, it stays where it was there; another resolution is both's.
+        if let Some(w) = s.webcam_mut(1) {
+            w.placement.x = 0.6;
+            w.format = Some(FormatCfg { width: 1280, height: 720, fps_num: 30, fps_den: 1 });
+        }
+        s.switch_scene(a);
+        assert_eq!(s.webcam(1).map(|w| w.placement), here);
+        assert!(s.webcam(1).is_some_and(|w| w.format.is_some()));
+    }
+
+    /// Copied to a scene that has it, it's placed there as here, where it
+    /// was in that scene's order; one at the back here goes to the back.
+    #[test]
+    fn copying_to_a_scene_that_has_it_places_it_as_here() {
+        let mut s = setup();
+        let b = s.add_scene(true);
+        s.visuals.push(VisualCfg::new(3, Visual::Colour { rgba: [0, 0, 0, 255] }));
+        s.layer_order.push(LayerKey::Visual(3));
+        if let Some(v) = s.visual_mut(2) {
+            v.placed = placed(0.4);
+        }
+        assert!(s.copy_to_scene(LayerKey::Visual(2), b));
+        assert!(s.copy_to_scene(LayerKey::Visual(3), b));
+        s.switch_scene(b);
+        assert_eq!(s.layer_order(), vec![LayerKey::Webcam(1), LayerKey::Visual(2), LayerKey::Screen, LayerKey::Visual(3)]);
+        assert_eq!(s.visual(2).and_then(|v| v.placed), placed(0.4));
+    }
+
+    /// Unlinked, a source's the scene's own: a copy in its place, changed
+    /// there alone; the other scenes keep the one they share. The screen
+    /// and a webcam stay linked, and one in no other scene has nothing to
+    /// unlink from.
+    #[test]
+    fn an_unlinked_source_is_the_scenes_own() {
+        let mut s = setup();
+        let a = s.active_scene;
+        assert_eq!(s.unlink(LayerKey::Visual(2)), None, "in no other scene");
+        let b = s.add_scene(true);
+        assert_eq!(s.unlink(LayerKey::Screen), None);
+        assert_eq!(s.unlink(LayerKey::Webcam(1)), None);
+        let Some(LayerKey::Visual(own)) = s.unlink(LayerKey::Visual(2)) else { panic!("unlinked") };
+        assert_ne!(own, 2);
+        assert_eq!(s.layer_order(), vec![LayerKey::Webcam(1), LayerKey::Visual(own), LayerKey::Screen]);
+        if let Some(v) = s.visual_mut(own) {
+            v.visual = Visual::Image { path: "other.png".into() };
+        }
+        assert!(s.scenes_with(LayerKey::Visual(own)).is_empty());
+        s.switch_scene(b);
+        assert_eq!(s.layer_order(), vec![LayerKey::Webcam(1), LayerKey::Visual(2), LayerKey::Screen]);
+        assert_eq!(s.visual(2).map(|v| v.visual.clone()), Some(Visual::Image { path: "logo.png".into() }));
+        s.switch_scene(a);
+        assert_eq!(s.visual(own).map(|v| v.visual.clone()), Some(Visual::Image { path: "other.png".into() }));
     }
 
     #[test]

@@ -1006,8 +1006,9 @@ impl App {
     /// ⋯ in its settings' dialog), the same for each as far as each goes:
     /// its settings, how the video puts the screen in, cropping it on the
     /// preview, its position, size and crop back, turning, mirroring and
-    /// flipping it, which is in front, and duplicating, hiding and removing
-    /// it, with the keys that do the same.
+    /// flipping it, which is in front, duplicating it, copying it to other
+    /// scenes (placed as here) or unlinking it from them, hiding and
+    /// removing it, with the keys that do the same.
     pub(crate) fn layer_menu(&mut self, ui: &mut egui::Ui, layer: Layer, aspect: f32) {
         let screen = layer == Layer::Screen;
         let ctrl = crate::shortcuts::ctrl_name();
@@ -1113,6 +1114,7 @@ impl App {
             self.duplicate_layer(layer, aspect);
             ui.close();
         }
+        self.copy_menu(ui, layer);
         let on = self.layer_enabled(layer);
         if Item::new(if on { "Hide" } else { "Show" }).icon(if on { icon::EYE_SLASH } else { icon::EYE }).keys(keys(&["H"])).tip(if on { "Out of your clips, its settings kept" } else { "Back in your clips" }).show(ui).clicked() {
             self.set_layer_enabled(layer, !on);
@@ -1120,6 +1122,83 @@ impl App {
         }
         if !screen && Item::new("Remove").icon(icon::TRASH).danger().keys(keys(&["Del"])).tip("Take it out of your clips").show(ui).clicked() {
             self.remove_layer(layer);
+            ui.close();
+        }
+    }
+
+    /// Copy to scene (the same source into another scene, or every one,
+    /// placed as here: one that has it already is placed so), and Unlink
+    /// from other scenes (a copy of its own here; never a webcam, a camera
+    /// opening once, nor the screen).
+    fn copy_menu(&mut self, ui: &mut egui::Ui, layer: Layer) {
+        let title = self.settings.layer_title(layer);
+        // Each other scene: whether it has it, and whether it can't take it
+        // (where a scene draws one webcam, one that has another).
+        let others: Vec<(u64, String, bool, bool)> = self
+            .settings
+            .scenes
+            .iter()
+            .filter(|s| s.id != self.settings.active_scene)
+            .map(|s| {
+                let has = s.items.iter().any(|i| i.layer() == layer);
+                let full = !capture::layers::MANY && matches!(layer, Layer::Webcam(_)) && s.items.iter().any(|i| matches!(i.layer(), Layer::Webcam(_)) && i.layer() != layer);
+                (s.id, s.name.clone(), has, full)
+            })
+            .collect();
+        if !others.is_empty() {
+            let mut to: Vec<(u64, String)> = Vec::new();
+            crate::ui_kit::submenu(ui, Item::new("Copy to scene").icon(icon::COPY_SIMPLE), |ui| {
+                for (id, name, has, full) in &others {
+                    let item = Item::new(name.clone()).check(*has).enabled(!*full);
+                    let item = if *full {
+                        item.tip("It has a webcam: a scene shows one here")
+                    } else if *has {
+                        item.tip("It's there: placed as here (where it is, its size and crop)")
+                    } else {
+                        item.tip("The same source, placed as here")
+                    };
+                    if item.show(ui).clicked() {
+                        to = vec![(*id, name.clone())];
+                    }
+                }
+                if others.len() > 1 {
+                    crate::ui_kit::menu_sep(ui);
+                    if Item::new("Every scene").tip("In each, placed as here").show(ui).clicked() {
+                        to = others.iter().filter(|o| !o.3).map(|o| (o.0, o.1.clone())).collect();
+                    }
+                }
+            });
+            if !to.is_empty() {
+                for (id, _) in &to {
+                    self.settings.copy_to_scene(layer, *id);
+                }
+                let where_ = if to.len() == 1 { to[0].1.clone() } else { "every scene".to_owned() };
+                self.toast_icon(icon::COPY_SIMPLE, format!("Copied {title} to {where_}"));
+                ui.close();
+            }
+        }
+        if layer == Layer::Screen || self.settings.scenes_with(layer).is_empty() {
+            return;
+        }
+        let cam = matches!(layer, Layer::Webcam(_));
+        let item = Item::new("Unlink from other scenes").icon(icon::LINK_BREAK).enabled(!cam);
+        let item = if cam {
+            item.tip("A camera opens once, in one format: what it shows is the same in every scene. Where it is, and its crop, are each scene's own")
+        } else {
+            item.tip("A copy of its own here: what it shows changes in this scene alone")
+        };
+        if item.show(ui).clicked()
+            && let Some(new) = self.settings.unlink(layer)
+        {
+            if self.selected_layer() == Some(layer) {
+                self.select_layer(new);
+            }
+            if let Some(crate::inspector_ui::Editing::Layer { layer: open, .. }) = &mut self.sources_view.editing
+                && *open == layer
+            {
+                *open = new;
+            }
+            self.toast_icon(icon::LINK_BREAK, format!("{title} is this scene's own now"));
             ui.close();
         }
     }
