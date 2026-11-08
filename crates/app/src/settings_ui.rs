@@ -420,7 +420,8 @@ impl App {
     }
 
     /// The video's size and frame rate, as this page's Video pane has them:
-    /// the Sources page's scene settings show them (nothing selected there).
+    /// the Sources page's video dialog shows them (the size over its
+    /// preview opens it).
     /// Frame blending stays here.
     pub(crate) fn video_size_rows(&mut self, ui: &mut egui::Ui) {
         let all = Filter { q: String::new() };

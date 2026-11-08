@@ -1,12 +1,12 @@
-//! The Sources page: what goes into your clips, laid out as an editor. The
-//! preview of the video as big as there's room for, its sources placed on it
-//! (`canvas_ui`: click one to select it, drag it, Alt-crop it). Under it two
-//! lists: the video's sources, the one in front first (each with an eye to
-//! hide it, a grip to drag it in front or behind), and the sound's (the
-//! clip's mix, then each source with its level, volume and mute). Beside
-//! them (under them, on a narrow page), the settings of what's selected
-//! (`inspector_ui`), laid out the same way for every source. Each list's Add
-//! puts another source in.
+//! The Sources page: what goes into your clips. Beside the panel of the
+//! preset's scenes and sound (`scenes_ui`), a scene's page has its layers,
+//! the one in front first (each with an eye to hide it, a grip to drag it
+//! in front or behind), and the preview as big as there's room for, its
+//! sources placed on it (`canvas_ui`: click one to select it, drag it,
+//! crop it). The sound's page has the mixer: the clip's mix, then each
+//! source with its level, volume and mute. Each list's Add puts another
+//! source in. A source's settings are in a dialog (`inspector_ui`): double-
+//! click it, or its row's settings button, or Settings… in its menu.
 //!
 //! Deliberately says nothing about "tracks": a source is either part of what the
 //! clip sounds like ("In the clip"), kept separately for editing, or both.
@@ -25,20 +25,16 @@ const FADER_MIN_DB: f32 = -60.0;
 const FADER_MAX_DB: f32 = 12.0;
 /// How long the "limiting" note stays after the limiter last worked.
 const LIMIT_HOLD: Duration = Duration::from_secs(3);
-/// The scene editor in three columns (the layers, the preview, the settings
-/// of what's selected) from this page width; narrower, the preview over the
-/// other two.
-const THREE_COLUMNS: f32 = 1180.0;
-/// Under this page width, the scene editor's and the sound's places go one
-/// under another.
+/// Under this page width, a scene's layers go under its preview (else
+/// beside it, on its left).
 const ONE_COLUMN: f32 = 700.0;
-/// The sound's page has its mixer and the settings beside each other from
-/// this width.
-const SOUND_BESIDE: f32 = 900.0;
-/// The layers' column, in three columns.
-const LAYERS_W: f32 = 232.0;
+/// The layers' column, beside the preview.
+const LAYERS_W: f32 = 260.0;
 /// Between the page's columns.
 const COLUMN_GAP: f32 = 20.0;
+/// The mixer at its widest: its faders long enough to set a level by, not
+/// the page's width.
+const MIXER_W: f32 = 860.0;
 /// A row in the video's or the sound's list.
 const ROW_H: f32 = 36.0;
 /// A sound source's name, in its row, before its fader (less in a row too
@@ -98,21 +94,30 @@ pub(crate) struct SourcesView {
     pub(crate) part: crate::scenes_ui::Part,
     /// A dialog open (a preset made, renamed, deleted; a scene deleted).
     pub(crate) dialog: Option<crate::scenes_ui::Dialog>,
+    /// A settings dialog open: a source's, the clip mix's or the video's.
+    pub(crate) editing: Option<crate::inspector_ui::Editing>,
 }
 
-/// Dev aid: `HASTECLIP_OPEN_SOURCES` names what's selected (`screen`,
-/// `webcam`: the first one, `mix`) or the crop's page (`crop`).
+/// Dev aid: `HASTECLIP_OPEN_SOURCES` names whose settings are open
+/// (`screen`, `webcam`: the first one, `mix`, `video`) or the crop's page
+/// (`crop`).
 pub(crate) fn open_dev(app: &mut App, names: &str) {
-    use crate::canvas_ui::{Layer, Selected};
+    use crate::canvas_ui::Layer;
+    use crate::inspector_ui::Editing;
     let webcam = app.settings.first_webcam().map(|w| w.key);
     for name in names.split(',').map(str::trim) {
         match name {
-            "screen" => app.canvas.selected = Some(Selected::Layer(Layer::Screen)),
-            "webcam" => app.canvas.selected = webcam.map(|k| Selected::Layer(Layer::Webcam(k))),
+            "screen" => app.edit_layer(Layer::Screen),
+            "webcam" => {
+                if let Some(k) = webcam {
+                    app.edit_layer(Layer::Webcam(k));
+                }
+            }
             "mix" => {
                 app.sources_view.part = crate::scenes_ui::Part::Sound;
-                app.canvas.selected = Some(Selected::Mix);
+                app.sources_view.editing = Some(Editing::Mix);
             }
+            "video" => app.sources_view.editing = Some(Editing::Video),
             "crop" => app.sources_view.crop_open = true,
             _ => {}
         }
@@ -125,10 +130,31 @@ pub(crate) type PreviewSetup = (capture::VideoSource, capture::VideoSize, u32, O
 
 /// How wide a sound source's name is in a row `row_w` wide: [`NAME_W`], less
 /// in a row too narrow for it beside the controls (a problem's mark, the
-/// fader at [`MIN_FADER`], the volume and mute; see `sound_row`), so they
-/// never run past the row's edge. The clip's mix's meter starts there too.
+/// fader at [`MIN_FADER`], the volume, mute and the settings button; see
+/// `sound_row`), so they never run past the row's edge. The clip's mix's
+/// meter starts there too.
 fn name_width(row_w: f32) -> f32 {
-    (row_w - 36.0 - 6.0 - 22.0 - MIN_FADER - 66.0 - 26.0 - 12.0).clamp(48.0, NAME_W)
+    (row_w - 36.0 - GEAR_ROOM - 22.0 - MIN_FADER - 66.0 - 26.0 - 12.0).clamp(48.0, NAME_W)
+}
+
+/// What a row keeps at its right end for its settings button.
+const GEAR_ROOM: f32 = 36.0;
+
+/// A row's settings button, in `rect` (drawn while `shown`): whether it was
+/// clicked. Hidden, it takes no clicks (the row has them).
+fn settings_button(ui: &mut egui::Ui, id: egui::Id, rect: egui::Rect, shown: bool, tip: &str) -> bool {
+    use crate::theme;
+    if !shown {
+        return false;
+    }
+    let pal = theme::pal(ui);
+    let r = ui.interact(rect, id, Sense::click());
+    if r.hovered() {
+        ui.painter().rect_filled(rect, 5, pal.control_h);
+    }
+    let ink = if r.hovered() { pal.text } else { pal.text2 };
+    ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, egui_phosphor::regular::SLIDERS_HORIZONTAL, egui::FontId::proportional(15.0), ink);
+    r.on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
 }
 
 /// A sound source's symbol.
@@ -157,13 +183,14 @@ fn mute_button(ui: &mut egui::Ui, muted: &mut bool) {
 }
 
 impl App {
-    /// Sources, with the screen selected (its settings beside the preview).
+    /// Sources, with the screen's settings open.
     pub(crate) fn show_screen_card(&mut self) {
         self.page = crate::Page::Sources;
         self.sources_view.part = crate::scenes_ui::Part::Scene;
         self.sources_view.crop_open = false;
         self.webcam_view.crop = None;
-        self.select_layer(crate::canvas_ui::Layer::Screen);
+        self.camera_panel = None;
+        self.edit_layer(crate::canvas_ui::Layer::Screen);
     }
     pub(crate) fn sources_page(&mut self, ui: &mut egui::Ui) {
         let now = Instant::now();
@@ -221,99 +248,66 @@ impl App {
             self.source_keys(page_ui.ctx(), aspect);
         }
         self.sources_head(&mut page_ui, wide);
-        crate::ui_kit::arrive(&mut page_ui, |ui| match part {
+        let frame = crate::ui_kit::arrive(&mut page_ui, |ui| match part {
             crate::scenes_ui::Part::Scene => self.scene_editor(ui, aspect),
-            crate::scenes_ui::Part::Sound => self.sound_page(ui, now, dt),
+            crate::scenes_ui::Part::Sound => {
+                self.sound_page(ui, now, dt);
+                None
+            }
         });
         if wide {
             let mut panel_ui = ui.new_child(egui::UiBuilder::new().max_rect(panel).layout(egui::Layout::top_down(egui::Align::Min)));
             self.sources_panel(&mut panel_ui);
         }
+        self.settings_dialog(ui.ctx(), frame.as_deref(), aspect);
         self.live_audio.set_limiter(self.settings.limiter);
     }
 
-    /// The scene shown, in three places of its own: the preview, its layers,
-    /// and the settings of what's selected (the scene's and the video's with
-    /// nothing selected). On a very wide page they're three columns; else
-    /// the preview's over the other two, side by side; narrow, one's under
-    /// another, the preview staying on top.
-    fn scene_editor(&mut self, ui: &mut egui::Ui, aspect: f32) {
-        use crate::inspector_ui::INSPECTOR_W;
+    /// The scene shown, in two places of its own: its layers, and the
+    /// preview beside them, as big as there's room for; narrow, the layers
+    /// under the preview. A source's settings are in a dialog (see
+    /// `inspector_ui`). The frame shown.
+    fn scene_editor(&mut self, ui: &mut egui::Ui, aspect: f32) -> Option<std::sync::Arc<capture::preview::PreviewFrame>> {
         use egui::{Rect, pos2, vec2};
         ui.add_space(4.0);
         let area = ui.available_rect_before_wrap();
         let (w, h) = (area.width(), area.height());
         let place = |ui: &mut egui::Ui, r: Rect| ui.new_child(egui::UiBuilder::new().max_rect(r).layout(egui::Layout::top_down(egui::Align::Min)));
-        if w >= THREE_COLUMNS {
+        let frame = if w >= ONE_COLUMN {
             let layers = Rect::from_min_size(area.min, vec2(LAYERS_W, h));
-            let props = Rect::from_min_max(pos2(area.right() - INSPECTOR_W, area.top()), area.max);
-            let mid = Rect::from_min_max(pos2(layers.right() + COLUMN_GAP, area.top()), pos2(props.left() - COLUMN_GAP, area.bottom()));
+            let picture = Rect::from_min_max(pos2(layers.right() + COLUMN_GAP, area.top()), area.max);
             // The toolbar's over it.
-            let frame = self.picture_column(&mut place(ui, mid), (h - 40.0).max(120.0));
+            let frame = self.picture_column(&mut place(ui, picture), (h - 40.0).max(120.0));
             crate::ui_kit::scroll(&mut place(ui, layers), "scene_layers", |ui| {
                 self.video_list(ui, frame.as_deref(), aspect);
                 ui.add_space(28.0);
             });
-            crate::ui_kit::scroll(&mut place(ui, props), "scene_props", |ui| self.inspector(ui, frame.as_deref(), aspect));
+            frame
         } else {
             let mut top = place(ui, area);
-            let frame = self.picture_column(&mut top, h * if w >= ONE_COLUMN { 0.5 } else { 0.45 });
+            let frame = self.picture_column(&mut top, h * 0.55);
             let below = Rect::from_min_max(pos2(area.left(), top.min_rect().bottom()), area.max);
-            if w >= ONE_COLUMN {
-                let layers_w = ((below.width() - COLUMN_GAP) * 0.4).max(220.0);
-                let layers = Rect::from_min_size(below.min, vec2(layers_w, below.height()));
-                let props = Rect::from_min_max(pos2(layers.right() + COLUMN_GAP, below.top()), below.max);
-                crate::ui_kit::scroll(&mut place(ui, layers), "scene_layers", |ui| {
-                    self.video_list(ui, frame.as_deref(), aspect);
-                    ui.add_space(28.0);
-                });
-                crate::ui_kit::scroll(&mut place(ui, props), "scene_props", |ui| self.inspector(ui, frame.as_deref(), aspect));
-            } else {
-                crate::ui_kit::scroll(&mut place(ui, below), "scene_page", |ui| {
-                    self.video_list(ui, frame.as_deref(), aspect);
-                    crate::ui_kit::gap(ui, crate::ui_kit::STACK_GAP);
-                    self.inspector(ui, frame.as_deref(), aspect);
-                    ui.add_space(28.0);
-                });
-            }
-        }
+            crate::ui_kit::scroll(&mut place(ui, below), "scene_layers", |ui| {
+                self.video_list(ui, frame.as_deref(), aspect);
+                ui.add_space(28.0);
+            });
+            frame
+        };
         ui.allocate_rect(area, Sense::hover());
+        frame
     }
 
-    /// The preset's sound, in two places of its own: the mixer, and the
-    /// settings of what's selected in it (the clip mix's with nothing
-    /// selected), side by side; narrow, the settings under the mixer.
+    /// The preset's sound: its mixer, as wide as is useful. Each source's
+    /// settings, and the clip mix's, are in a dialog.
     fn sound_page(&mut self, ui: &mut egui::Ui, now: Instant, dt: f32) {
-        use egui::{Rect, pos2};
         ui.add_space(4.0);
-        let area = ui.available_rect_before_wrap();
-        let place = |ui: &mut egui::Ui, r: Rect| ui.new_child(egui::UiBuilder::new().max_rect(r).layout(egui::Layout::top_down(egui::Align::Min)));
-        if area.width() >= SOUND_BESIDE {
-            let props = Rect::from_min_max(pos2(area.right() - crate::inspector_ui::INSPECTOR_W, area.top()), area.max);
-            let mixer = Rect::from_min_max(area.min, pos2(props.left() - COLUMN_GAP, area.bottom()));
-            crate::ui_kit::scroll(&mut place(ui, mixer), "sound_mixer", |ui| {
+        crate::ui_kit::scroll(ui, "sound_mixer", |ui| {
+            ui.vertical(|ui| {
+                ui.set_width(ui.available_width().min(MIXER_W));
                 self.sound_list(ui, now, dt);
                 ui.add_space(28.0);
             });
-            crate::ui_kit::scroll(&mut place(ui, props), "sound_props", |ui| self.sound_properties(ui));
-        } else {
-            crate::ui_kit::scroll(&mut place(ui, area), "sound_page", |ui| {
-                self.sound_list(ui, now, dt);
-                crate::ui_kit::gap(ui, crate::ui_kit::STACK_GAP);
-                self.sound_properties(ui);
-                ui.add_space(28.0);
-            });
-        }
-        ui.allocate_rect(area, Sense::hover());
-    }
-
-    /// The settings of the sound source selected; with nothing selected (or
-    /// the clip mix), the clip mix's.
-    fn sound_properties(&mut self, ui: &mut egui::Ui) {
-        match self.canvas.selected.clone() {
-            Some(crate::canvas_ui::Selected::Sound(id)) => self.sound_inspector(ui, &id),
-            _ => self.mix_inspector(ui),
-        }
+        });
     }
 
     /// Over the preview: undo, redo and the video's size; then the preview
@@ -350,6 +344,19 @@ impl App {
                 self.undo_buttons(ui);
                 ui.add_space(8.0);
                 self.size_button(ui, &size_text);
+                // Cropping on the preview: which, and Done, while it lasts.
+                if let Some(l) = self.canvas.crop_mode {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        let done = crate::ui_kit::Btn::new(crate::ui_kit::Kind::Primary, "Done").with_icon(egui_phosphor::regular::CHECK).small().tip("Stop cropping (Enter)");
+                        if done.show(ui).clicked() {
+                            self.canvas.crop_mode = None;
+                        }
+                        let pal = crate::theme::pal(ui);
+                        let what = format!("Cropping {}", self.settings.layer_title(l));
+                        ui.add(egui::Label::new(crate::theme::text(what, 12.5, crate::theme::W::Regular).color(pal.text2)).truncate());
+                    });
+                }
             });
             ui.add_space(6.0);
             self.preview_picture(ui, frame.as_deref(), max_h);
@@ -360,8 +367,9 @@ impl App {
 
     /// The video's sources, the one in front first: a row each, with its
     /// symbol, name, what it shows and an eye to hide it. A click selects it
-    /// (its settings beside the preview), its grip drags it in front or
-    /// behind, a right-click opens its menu; Add puts another in.
+    /// (on the preview too), twice or its settings button opens its
+    /// settings, its grip drags it in front or behind, a right-click opens
+    /// its menu; Add puts another in.
     fn video_list(&mut self, ui: &mut egui::Ui, frame: Option<&capture::preview::PreviewFrame>, aspect: f32) {
         use crate::theme::{self, W};
         let pal = theme::pal(ui);
@@ -430,12 +438,19 @@ impl App {
             self.set_layer_enabled(layer, !on);
             self.keep_for_undo(was);
         }
+        // Its settings button, beside the eye, while the pointer's on the
+        // row or it's selected.
+        let gear_rect = egui::Rect::from_center_size(pos2(eye_rect.left() - 16.0, cy), vec2(26.0, 26.0));
+        let gear_shown = ui.rect_contains_pointer(rect) || selected;
+        if settings_button(ui, resp.id.with("gear"), gear_rect, gear_shown && !held, "Its settings  (double-click it)") {
+            self.edit_layer(layer);
+        }
         // Its symbol, name, and what it shows (or what's wrong with it).
         let mut x = rect.left() + 24.0;
         let dim = |c: Color32| if on { c } else { theme::fade(c, 0.5) };
         painter.text(pos2(x + 8.0, cy), Align2::CENTER_CENTER, crate::inspector_ui::layer_icon(self, layer), FontId::proportional(16.0), dim(pal.text2));
         x += 26.0;
-        let right = eye_rect.left() - 8.0;
+        let right = gear_rect.left() - 6.0;
         let name = self.settings.layer_title(layer);
         let g = painter.layout_job(crate::ui_kit::single_line_job(&name, theme::font(13.5, W::Medium), dim(pal.text), (right - x).max(10.0) * 0.6));
         let name_w = g.size().x;
@@ -449,11 +464,11 @@ impl App {
         };
         let g = painter.layout_job(crate::ui_kit::single_line_job(&line, theme::font(12.5, W::Regular), color, (right - x).max(10.0)));
         painter.galley(pos2(x, cy - g.size().y / 2.0), g, color);
-        if resp.clicked() {
+        if resp.clicked() || resp.secondary_clicked() {
             self.select_layer(layer);
         }
-        if resp.secondary_clicked() {
-            self.select_layer(layer);
+        if resp.double_clicked() {
+            self.edit_layer(layer);
         }
         let was = self.arrangement();
         crate::ui_kit::context_menu(&resp, 240.0, |ui| self.layer_menu(ui, layer, aspect));
@@ -499,7 +514,8 @@ impl App {
 
     /// Add, over the video's list: a webcam (each camera found), and where
     /// every source is drawn another display, a window, an image, a colour,
-    /// words or a web page. What's added is selected.
+    /// words or a web page. What's added is selected; words and a web page,
+    /// which have nothing to show yet, open their settings.
     fn video_add_menu(&mut self, ui: &mut egui::Ui, aspect: f32) {
         use crate::settings::{TextStyle, Visual};
         use crate::ui_kit::{Btn, Item};
@@ -519,6 +535,7 @@ impl App {
             }
         }
         let mut added: Option<crate::canvas_ui::Layer> = None;
+        let mut fill_in = false;
         let mut pick_image = false;
         crate::ui_kit::menu_popup(&b, false, 230.0, |ui| {
             if webcam {
@@ -579,6 +596,7 @@ impl App {
             }
             if Item::new("Text").icon(icon::TEXT_T).tip("Your name, a title").show(ui).clicked() {
                 added = Some(crate::canvas_ui::Layer::Visual(self.add_visual(Visual::Text(TextStyle::default()))));
+                fill_in = true;
             }
             if Item::new("Colour").icon(icon::PAINT_BUCKET).tip("All of the video one colour, at the back: a background").show(ui).clicked() {
                 let key = self.add_visual(Visual::Colour { rgba: [24, 24, 28, 255] });
@@ -588,6 +606,7 @@ impl App {
             }
             if capture::layers::BROWSER && Item::new("Web page").icon(icon::GLOBE).tip("Alerts, a chat overlay, a widget (its transparency kept)").show(ui).clicked() {
                 added = Some(crate::canvas_ui::Layer::Visual(self.add_visual(Visual::Browser { url: "https://".into(), width: 800, height: 600, reload: 0 })));
+                fill_in = true;
             }
             // The preset's sources this scene doesn't have: the same source
             // (its settings shared), where it was last placed.
@@ -608,15 +627,17 @@ impl App {
         if pick_image && let Some(path) = rfd::FileDialog::new().add_filter("Images", &crate::inspector_ui::IMAGE_EXTS).pick_file() {
             added = Some(crate::canvas_ui::Layer::Visual(self.add_visual(Visual::Image { path })));
         }
-        if let Some(l) = added {
-            self.select_layer(l);
+        match added {
+            Some(l) if fill_in => self.edit_layer(l),
+            Some(l) => self.select_layer(l),
+            None => {}
         }
     }
 
     /// The sound: the clip's mix first, then each source, a row each with
     /// its level and volume as one control, its volume as a number, and
-    /// mute. A click selects one (its settings beside the preview); Add puts
-    /// another in.
+    /// mute. Twice on a row, or its settings button, opens its settings; Add
+    /// puts another in.
     fn sound_list(&mut self, ui: &mut egui::Ui, now: Instant, dt: f32) {
         use crate::theme::{self, W};
         let pal = theme::pal(ui);
@@ -668,7 +689,8 @@ impl App {
     }
 
     /// The clip's mix, first in the sound's list: its level (both sides),
-    /// and its peak. Selected, its limiter is beside the preview.
+    /// and its peak. Twice, or its settings button, opens its settings (the
+    /// limiter).
     fn mix_row(&mut self, ui: &mut egui::Ui, now: Instant, dt: f32) {
         use crate::theme::{self, W};
         use egui::{Align2, FontId, pos2, vec2};
@@ -680,25 +702,27 @@ impl App {
         if reduction > 0.5 {
             view.limiting_at = Some(now);
         }
-        let selected = self.canvas.selected == Some(crate::canvas_ui::Selected::Mix);
         let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H + 4.0), Sense::click());
         let hv = theme::toggle(ui.ctx(), resp.id.with("hv"), resp.hovered(), theme::FAST);
-        ui.painter().rect_filled(rect, 6, if selected { pal.sel } else { theme::fade(pal.control, hv) });
+        ui.painter().rect_filled(rect, 6, theme::fade(pal.control, hv));
         let cy = rect.center().y;
+        let right = rect.right() - GEAR_ROOM;
         ui.painter().text(pos2(rect.left() + 18.0, cy), Align2::CENTER_CENTER, egui_phosphor::regular::WAVEFORM, FontId::proportional(16.0), pal.text2);
         ui.painter().text(pos2(rect.left() + 36.0, cy), Align2::LEFT_CENTER, "Clip mix", theme::font(13.5, W::Medium), pal.text);
         let view = &self.sources_view;
         let readout = format!("{} dB", view.master.readout().replace('-', "−"));
         let peak_w = 64.0;
-        ui.painter().text(pos2(rect.right() - 10.0, cy), Align2::RIGHT_CENTER, readout, theme::font(12.5, W::Medium), view.master.readout_color(ui.visuals()));
-        let meter_rect = egui::Rect::from_min_max(pos2(rect.left() + 36.0 + name_width(rect.width()), cy - 7.0), pos2(rect.right() - 10.0 - peak_w, cy + 7.0));
+        ui.painter().text(pos2(right - 4.0, cy), Align2::RIGHT_CENTER, readout, theme::font(12.5, W::Medium), view.master.readout_color(ui.visuals()));
+        let meter_rect = egui::Rect::from_min_max(pos2(rect.left() + 36.0 + name_width(rect.width()), cy - 7.0), pos2(right - 4.0 - peak_w, cy + 7.0));
         if meter_rect.width() > 20.0 {
             let mut mui = ui.new_child(egui::UiBuilder::new().max_rect(meter_rect).layout(egui::Layout::top_down(egui::Align::Min)));
             let style = meter::Style { bar_h: 5.0, gap: 2.0, scale: false, dimmed: false };
             meter::stereo(&mut mui, egui::Id::new("mix_row_meter"), &view.master, &style);
         }
-        if resp.on_hover_text("Every source in the clip's sound, mixed: what people hear").clicked() {
-            self.canvas.selected = Some(crate::canvas_ui::Selected::Mix);
+        let gear_rect = egui::Rect::from_center_size(pos2(rect.right() - GEAR_ROOM / 2.0, cy), vec2(26.0, 26.0));
+        let gear = settings_button(ui, resp.id.with("gear"), gear_rect, ui.rect_contains_pointer(rect), "Its settings: the limiter  (double-click it)");
+        if resp.on_hover_text("Every source in the clip's sound, mixed: what people hear").double_clicked() || gear {
+            self.sources_view.editing = Some(crate::inspector_ui::Editing::Mix);
         }
     }
 
@@ -714,10 +738,9 @@ impl App {
         meters.input.update(channel.input.take(), now, dt);
         meters.output.update(channel.meter.take(), now, dt);
         let meters = meters.clone();
-        let selected = self.canvas.selected == Some(crate::canvas_ui::Selected::Sound(id.clone()));
         let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H + 4.0), Sense::click());
         let hv = theme::toggle(ui.ctx(), resp.id.with("hv"), resp.hovered(), theme::FAST);
-        ui.painter().rect_filled(rect, 6, if selected { pal.sel } else { theme::fade(pal.control, hv) });
+        ui.painter().rect_filled(rect, 6, theme::fade(pal.control, hv));
         let s = &self.settings.audio_sources[i];
         let on = s.enabled;
         let dim = |c: Color32| if on { c } else { theme::fade(c, 0.5) };
@@ -738,8 +761,9 @@ impl App {
         ui.painter().galley(pos2(rect.left() + 36.0, cy - g.size().y / 2.0), g, pal.text);
         // What's wrong with it, on its row: a mark (its words on hover).
         let problem = status_text(channel.status()).filter(|_| on);
-        // The fader, its value and mute, in what's left of the row.
-        let controls = egui::Rect::from_min_max(pos2(rect.left() + 36.0 + name_w, rect.top()), pos2(rect.right() - 6.0, rect.bottom()));
+        // The fader, its value and mute, in what's left of the row (but its
+        // settings button's room).
+        let controls = egui::Rect::from_min_max(pos2(rect.left() + 36.0 + name_w, rect.top()), pos2(rect.right() - GEAR_ROOM, rect.bottom()));
         let mut action = None;
         if on {
             let mut cui = ui.new_child(egui::UiBuilder::new().max_rect(controls).layout(egui::Layout::left_to_right(egui::Align::Center)));
@@ -756,15 +780,18 @@ impl App {
             volume_value(&mut cui, &mut source.volume_db, fresp.secondary_clicked(), &source.id);
             mute_button(&mut cui, &mut source.muted);
         } else {
-            ui.painter().text(pos2(rect.right() - 12.0, cy), Align2::RIGHT_CENTER, "Off", theme::font(12.5, W::Regular), pal.text3);
+            ui.painter().text(pos2(rect.right() - GEAR_ROOM - 6.0, cy), Align2::RIGHT_CENTER, "Off", theme::font(12.5, W::Regular), pal.text3);
         }
         // Volume applies live, even mid-recording.
         let s = &self.settings.audio_sources[i];
         channel.set_volume(from_db(s.volume_db), s.muted);
         channel.set_denoise(s.noise_reduction.into());
         channel.set_mono(s.mono);
-        if resp.clicked() || resp.secondary_clicked() {
-            self.canvas.selected = Some(crate::canvas_ui::Selected::Sound(id.clone()));
+        // Its settings: its button (while the pointer's on the row), or
+        // twice on the row.
+        let gear_rect = egui::Rect::from_center_size(pos2(rect.right() - GEAR_ROOM / 2.0, cy), vec2(26.0, 26.0));
+        if settings_button(ui, resp.id.with("gear"), gear_rect, ui.rect_contains_pointer(rect), "Its settings  (double-click it)") || resp.double_clicked() {
+            action = Some(CardAction::Settings);
         }
         crate::ui_kit::context_menu(&resp, 220.0, |ui| {
             if let Some(a) = self.sound_menu(ui, i) {
@@ -774,8 +801,9 @@ impl App {
         action
     }
 
-    /// A sound source's menu (right-click its row, or the ⋯ over its
-    /// settings): move it, mute it, turn it off, remove it.
+    /// A sound source's menu (right-click its row, or the ⋯ in its
+    /// settings' dialog): its settings, move it, mute it, turn it off,
+    /// remove it.
     fn sound_menu(&mut self, ui: &mut egui::Ui, i: usize) -> Option<CardAction> {
         use crate::ui_kit::Item;
         use egui_phosphor::regular as icon;
@@ -784,6 +812,13 @@ impl App {
         let has_app_sources = self.settings.audio_sources.iter().any(|s| matches!(s.kind, SourceKind::App { .. }));
         let n = self.settings.audio_sources.len();
         let mut action = None;
+        // Its settings, but in their dialog (whose ⋯ this is).
+        if self.sources_view.editing.is_none() {
+            if Item::new("Settings…").icon(icon::SLIDERS_HORIZONTAL).show(ui).clicked() {
+                action = Some(CardAction::Settings);
+            }
+            crate::ui_kit::menu_sep(ui);
+        }
         if Item::new("Move up").icon(icon::CARET_UP).enabled(i > 0 && locked.is_none()).show(ui).clicked() {
             action = Some(CardAction::MoveUp);
         }
@@ -817,11 +852,9 @@ impl App {
         match a {
             CardAction::Remove => {
                 let s = self.settings.audio_sources.remove(i);
-                if self.canvas.selected == Some(crate::canvas_ui::Selected::Sound(s.id.clone())) {
-                    self.canvas.selected = None;
-                }
                 self.toast_icon(egui_phosphor::regular::TRASH, format!("Removed {}", s.name));
             }
+            CardAction::Settings => self.sources_view.editing = Some(crate::inspector_ui::Editing::Sound(self.settings.audio_sources[i].id.clone())),
             CardAction::MoveUp if i > 0 => self.settings.audio_sources.swap(i, i - 1),
             CardAction::MoveDown if i + 1 < self.settings.audio_sources.len() => self.settings.audio_sources.swap(i, i + 1),
             CardAction::Listen => self.toggle_listening(i),
@@ -833,8 +866,9 @@ impl App {
         }
     }
 
-    /// Add, over the sound's list: a microphone, one app on its own, or
-    /// everything the computer plays; and looking for microphones again.
+    /// Add, over the sound's list: a microphone (its settings open, to pick
+    /// which), one app on its own, or everything the computer plays; and
+    /// looking for microphones again.
     fn sound_add_menu(&mut self, ui: &mut egui::Ui) {
         use crate::ui_kit::{Btn, Item};
         use egui_phosphor::regular as icon;
@@ -855,7 +889,7 @@ impl App {
         if !can_add {
             return;
         }
-        let mut added: Option<String> = None;
+        let mut new_mic: Option<String> = None;
         let mut refresh = false;
         crate::ui_kit::menu_popup(&b, false, 230.0, |ui| {
             if Item::new("Microphone").icon(icon::MICROPHONE).tip("A microphone or audio interface").show(ui).clicked() {
@@ -867,7 +901,7 @@ impl App {
                 let n = self.settings.audio_sources.iter().filter(|s| matches!(s.kind, SourceKind::Microphone { .. })).count();
                 let name = if n == 0 { "Microphone".to_owned() } else { format!("Microphone {}", n + 1) };
                 let s = AudioSourceCfg::new(&name, SourceKind::Microphone { device: capture::audio::DEFAULT_DEVICE.into() });
-                added = Some(s.id.clone());
+                new_mic = Some(s.id.clone());
                 self.settings.audio_sources.push(s);
             }
             crate::ui_kit::submenu(ui, Item::new("App").icon(icon::APP_WINDOW), |ui| {
@@ -884,7 +918,6 @@ impl App {
                         let item = if already { item.tip("Already added") } else { item };
                         if item.show(ui).clicked() {
                             let s = AudioSourceCfg::new(&app.name, SourceKind::App { bundle_id: app.id.clone(), app_name: app.name.clone() });
-                            added = Some(s.id.clone());
                             self.settings.audio_sources.push(s);
                         }
                     }
@@ -899,7 +932,6 @@ impl App {
             let item = if has_desktop { item.tip("Already added") } else { item.tip("Everything your computer plays") };
             if item.show(ui).clicked() {
                 let s = AudioSourceCfg::new("Desktop sound", SourceKind::Desktop { exclude_apps: true });
-                added = Some(s.id.clone());
                 self.settings.audio_sources.push(s);
             }
             crate::ui_kit::menu_sep(ui);
@@ -911,21 +943,21 @@ impl App {
             self.refresh_audio_devices();
             self.toast_icon(icon::ARROWS_CLOCKWISE, "Looked for microphones again");
         }
-        if let Some(id) = added {
-            self.canvas.selected = Some(crate::canvas_ui::Selected::Sound(id));
+        if let Some(id) = new_mic {
+            self.sources_view.editing = Some(crate::inspector_ui::Editing::Sound(id));
         }
     }
 
-    /// A sound source's settings, beside the preview: its name, switch and
-    /// menu; its volume; what it takes in; where it goes; a microphone's
-    /// clean-up, and listening to it.
+    /// A sound source's settings, in its dialog: its name, switch and menu;
+    /// its volume; what it takes in; where it goes; a microphone's clean-up,
+    /// and listening to it.
     pub(crate) fn sound_inspector(&mut self, ui: &mut egui::Ui, id: &str) {
         use crate::theme::{self, W};
         use crate::ui_kit::{Btn, Item, Kind, Row};
         use egui_phosphor::regular as icon;
         let pal = theme::pal(ui);
         let Some(i) = self.settings.audio_sources.iter().position(|s| s.id == id) else {
-            self.canvas.selected = None;
+            self.sources_view.editing = None;
             return;
         };
         let locked = (!self.rec_state.idle()).then(|| self.stop_first());
@@ -1112,14 +1144,13 @@ impl App {
                 });
             });
         }
-        ui.add_space(28.0);
         if let Some(a) = action {
             self.sound_action(i, a);
         }
     }
 
-    /// The clip's mix, beside the preview: its level with its scale and
-    /// peak, and the limiter, with how much it's turning the mix down.
+    /// The clip's mix, in its dialog: its level with its scale and peak,
+    /// and the limiter, with how much it's turning the mix down.
     pub(crate) fn mix_inspector(&mut self, ui: &mut egui::Ui) {
         use crate::theme::{self, W};
         use crate::ui_kit::Row;
@@ -1172,7 +1203,6 @@ impl App {
                 });
             }
         });
-        ui.add_space(28.0);
     }
 
     /// "Listen" on source `i`: hear it live, or stop.
@@ -1244,8 +1274,8 @@ impl App {
     }
 
     /// The video's size and frame rate, as recorded, over the preview: a
-    /// click shows their settings beside it (the scene's, with nothing
-    /// selected), so the video can change shape while it's arranged.
+    /// click opens their dialog, so the video can change shape while it's
+    /// arranged.
     fn size_button(&mut self, ui: &mut egui::Ui, text: &str) {
         use crate::theme::{self, W};
         let pal = theme::pal(ui);
@@ -1263,16 +1293,15 @@ impl App {
             let mark = egui::pos2(rect.right() - 11.0, rect.center().y);
             ui.painter().text(mark, egui::Align2::CENTER_CENTER, egui_phosphor::regular::LOCK_SIMPLE, egui::FontId::proportional(12.0), ink);
         }
-        let tip = if locked { format!("Locked while {}: the video's size is set when the capture starts", self.rec_state.words()) } else { "The video's size and frame rate: their settings beside the preview".to_owned() };
-        // Its settings are the scene's, shown with nothing selected.
+        let tip = if locked { format!("Locked while {}: the video's size is set when the capture starts", self.rec_state.words()) } else { "The video's size and frame rate: click to change them".to_owned() };
         if resp.on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-            self.canvas.selected = None;
+            self.sources_view.editing = Some(crate::inspector_ui::Editing::Video);
         }
     }
 
     /// The screen's cropped and fills the video, at another size than the
     /// crop's: a note, and a button to make the video the crop's size (every
-    /// pixel of it as it is). In the scene's settings, under the video's.
+    /// pixel of it as it is). In the video's dialog, under its size.
     pub(crate) fn crop_match(&mut self, ui: &mut egui::Ui) {
         use crate::theme::{self, W};
         let pal = theme::pal(ui);
@@ -1574,7 +1603,7 @@ impl App {
 
     /// Draw the preview picture held (macOS: the frame on the GPU; else the
     /// texture) into `rect`. False if there's none yet.
-    fn paint_preview(&self, p: &egui::Painter, rect: egui::Rect) -> bool {
+    pub(crate) fn paint_preview(&self, p: &egui::Painter, rect: egui::Rect) -> bool {
         #[cfg(target_os = "macos")]
         if let Some((shown, _)) = &self.sources_view.preview_gpu {
             shown.paint(p, rect);
@@ -1590,7 +1619,7 @@ impl App {
     }
 
     /// The size of the preview picture held, in pixels.
-    fn preview_size(&self) -> Option<(u32, u32)> {
+    pub(crate) fn preview_size(&self) -> Option<(u32, u32)> {
         #[cfg(target_os = "macos")]
         if let Some((shown, _)) = &self.sources_view.preview_gpu {
             return Some(shown.size());
@@ -1917,6 +1946,8 @@ enum CardAction {
     Listen,
     /// Something locked while capturing was clicked: say why.
     Locked,
+    /// Its settings, in their dialog.
+    Settings,
 }
 
 /// Hearing a microphone live: which source, from which device.

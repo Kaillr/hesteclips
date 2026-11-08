@@ -1344,6 +1344,7 @@ impl App {
         self.canvas.sizes.clear();
         self.listening = None;
         self.canvas.selected = None;
+        self.sources_view.editing = None;
         eprintln!("preset: {}", self.settings.preset().map_or("?", |p| p.name.as_str()));
         self.after_scene_switch();
     }

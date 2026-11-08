@@ -1,10 +1,10 @@
 //! Where a source is in the video, as numbers, and what of it shows: the
-//! Transform and Crop sections of its settings (beside the preview, see
-//! `inspector_ui`), the same for every source. Its position and size in the
-//! video's pixels, how it's turned and flipped, and how much of its picture
-//! is cut off each side, in the picture's own pixels. What's typed shows on
-//! the preview at once, and what's dragged there shows here: the preview's
-//! drags, its menu and these are three ways to the same place.
+//! Transform half of its settings' dialog, with Crop (see `inspector_ui`),
+//! the same for every source. Its position and size in the video's pixels,
+//! how it's turned and flipped, and how much of its picture is cut off each
+//! side, in the picture's own pixels. What's typed shows at once (in the
+//! dialog's look at the video, and on the preview behind it): the
+//! preview's drags, its menu and these are three ways to the same place.
 
 use egui::{Pos2, Rect, vec2};
 
@@ -62,7 +62,8 @@ impl App {
     /// it's turned and flipped, and putting its position and size back.
     pub(crate) fn transform_section(&mut self, ui: &mut egui::Ui, layer: Layer) {
         let pal = theme::pal(ui);
-        ui_kit::section_head(ui, "Transform", false, |_| {});
+        // The half of the dialog it's in is called Transform.
+        ui_kit::gap(ui, 10.0);
         let Some(((vw, vh), aspect, rect)) = self.placed_in(layer) else {
             ui.label(theme::text("Its place shows once the video's size is known.", 12.5, W::Regular).color(pal.text3));
             return;
@@ -245,14 +246,13 @@ impl App {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
-            // On the preview: its handles crop till Done (as Alt and a
-            // handle do, now and then).
-            let on = self.canvas.crop_mode == Some(layer);
+            // On the preview, the dialog closed: its handles crop till
+            // Done (as Alt and a handle do, now and then).
             let alt = crate::shortcuts::alt_name();
-            let b = if on { Btn::normal("Done").with_icon(egui_phosphor::regular::CHECK) } else { Btn::normal("Crop").with_icon(egui_phosphor::regular::CROP) };
-            let tip = if on { "Stop cropping (Enter)".to_owned() } else { format!("Drag its handles on the preview to cut its edges off ({alt} and a handle do it too)") };
-            if b.small().tip(tip).show(ui).clicked() {
-                self.canvas.crop_mode = if on { None } else { Some(layer) };
+            let b = Btn::normal("Crop on the preview").with_icon(egui_phosphor::regular::CROP).small();
+            if b.tip(format!("Drag its handles to cut its edges off, till Done or Enter ({alt} and a handle do it too)")).show(ui).clicked() {
+                self.canvas.crop_mode = Some(layer);
+                self.sources_view.editing = None;
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
@@ -268,6 +268,7 @@ impl App {
             self.layer_uncrop(layer, aspect);
         }
         if whole_page {
+            self.sources_view.editing = None;
             match layer {
                 Layer::Screen => self.sources_view.crop_open = true,
                 Layer::Webcam(key) => {

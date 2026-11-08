@@ -9,17 +9,16 @@ use egui::{Align2, Pos2, Rect, Sense, vec2};
 use egui_phosphor::regular as icon;
 
 use crate::App;
-use crate::canvas_ui::Selected;
 use crate::theme::{self, W};
 use crate::ui_kit::{self, Btn, Dismissed, Item, Kind, Seg};
 
 /// What the page beside the panel shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum Part {
-    /// The scene shown: its preview, its layers and their settings.
+    /// The scene shown: its layers and its preview.
     #[default]
     Scene,
-    /// The preset's sound: its mixer, and each source's settings.
+    /// The preset's sound: its mixer.
     Sound,
 }
 
@@ -41,17 +40,12 @@ impl App {
     pub(crate) fn pick_scene(&mut self, id: u64) {
         self.sources_view.part = Part::Scene;
         self.show_scene(id);
-        if !matches!(self.canvas.selected, Some(Selected::Layer(_))) {
-            self.canvas.selected = None;
-        }
     }
 
     /// The preset's sound, on its page.
     pub(crate) fn pick_sound(&mut self) {
         self.sources_view.part = Part::Sound;
-        if matches!(self.canvas.selected, Some(Selected::Layer(_))) {
-            self.canvas.selected = None;
-        }
+        self.canvas.selected = None;
     }
 
     /// A new scene, after the one shown (a copy of it, or just the screen),

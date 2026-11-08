@@ -1,24 +1,47 @@
-//! The panel beside the preview on the Sources page: the settings of what's
-//! selected (on the preview, or in a list under it), laid out the same way
-//! for every source in the video: its name, its switch and its menu; then
-//! what it shows (its own section: which camera, display or window, the
-//! picture, the words); then where it is (Transform), and what of it shows
-//! (Crop, for what has a picture to cut). A sound source, or the clip's mix,
-//! shows its own settings here too (see `sources_ui`).
+//! A source's settings, in a dialog of its own, as OBS has its Properties:
+//! double-click the source on the preview or in the layers, or click its
+//! row's settings button, or Settings… in its menu. They're set once and
+//! looked at now and then, so they don't take the page's room.
+//!
+//! A video source's dialog has its name, its switch and its menu, then a
+//! look at the video with it outlined (the page's preview is behind the
+//! dialog: what's changed shows here as it changes), then one of two
+//! halves: what it shows (which camera, display or window, the picture,
+//! the words; a webcam's camera settings), and Transform: where it is, and
+//! what of it shows (Crop, for what has a picture to cut). A sound source,
+//! the clip's mix and the video's size have dialogs too (see `sources_ui`).
+//! What's done to the video's sources in one can be undone, as on the
+//! preview.
 
 use egui_phosphor::regular as icon;
 
 use crate::App;
-use crate::canvas_ui::{Layer, Selected};
+use crate::canvas_ui::Layer;
+use crate::scenes_ui::Part;
 use crate::settings::{CaptureTarget, TextAlign, TextStyle, Visual};
 use crate::theme::{self, W};
-use crate::ui_kit::{self, Btn, Item, Kind, Row};
+use crate::ui_kit::{self, Btn, Dismissed, Item, Kind, Row, Seg};
 
-/// The panel's width, beside the preview on a page wide enough for both:
-/// enough for a menu with a camera's or a display's name beside its label,
-/// and Size's two boxes beside theirs (a row puts its control under its
-/// label when the two don't fit side by side).
-pub(crate) const INSPECTOR_W: f32 = 420.0;
+/// A settings dialog's width, inside its margins: enough for a menu with a
+/// camera's or a display's name beside its label, and Size's two boxes
+/// beside theirs (a row puts its control under its label when the two don't
+/// fit side by side).
+const DIALOG_W: f32 = 440.0;
+/// The look at the video in a video source's dialog, at its tallest.
+const PICTURE_H: f32 = 220.0;
+
+/// A settings dialog open on the Sources page: what it's for.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Editing {
+    /// A video source's: what it shows, or (`transform`) where it is.
+    Layer { layer: Layer, transform: bool },
+    /// A sound source's, by its id.
+    Sound(String),
+    /// The clip mix's: its level and its limiter.
+    Mix,
+    /// The video's size and frame rate (every preset's).
+    Video,
+}
 
 /// The sizes offered for words.
 const TEXT_SIZES: [u32; 8] = [24, 36, 48, 64, 72, 96, 144, 200];
@@ -43,94 +66,152 @@ pub(crate) fn layer_icon(app: &App, layer: Layer) -> &'static str {
 }
 
 impl App {
-    /// The panel's content for what's selected; a change to the video's
-    /// sources made here can be undone (typing a word, or stepping a
-    /// number, as one step).
-    pub(crate) fn inspector(&mut self, ui: &mut egui::Ui, frame: Option<&capture::preview::PreviewFrame>, aspect: f32) {
-        let was = self.arrangement();
-        let what = format!("{:?}", self.canvas.selected);
-        match self.canvas.selected.clone() {
-            Some(Selected::Layer(l)) if self.layer_order().contains(&l) => self.layer_inspector(ui, l, frame, aspect),
-            Some(Selected::Layer(_)) => {
-                self.canvas.selected = None;
-                self.scene_properties(ui);
-            }
-            _ => self.scene_properties(ui),
+    /// Open `layer`'s settings, at what it shows; it's selected too.
+    pub(crate) fn edit_layer(&mut self, layer: Layer) {
+        self.select_layer(layer);
+        self.canvas.crop_mode = None;
+        self.sources_view.editing = Some(Editing::Layer { layer, transform: false });
+    }
+
+    /// The settings dialog open on the Sources page, if one is. It closes
+    /// with Done, Esc (not while a value's being typed: Esc is the value's)
+    /// or a click outside it; and by itself once what it's for isn't on the
+    /// page (removed, or not in the scene shown). `frame`: the preview's.
+    pub(crate) fn settings_dialog(&mut self, ctx: &egui::Context, frame: Option<&capture::preview::PreviewFrame>, aspect: f32) {
+        let Some(editing) = self.sources_view.editing.clone() else { return };
+        let part = self.sources_view.part;
+        let there = match &editing {
+            Editing::Layer { layer, .. } => part == Part::Scene && self.layer_order().contains(layer),
+            Editing::Sound(id) => part == Part::Sound && self.settings.audio_sources.iter().any(|s| s.id == *id),
+            Editing::Mix => part == Part::Sound,
+            Editing::Video => part == Part::Scene,
+        };
+        if !there {
+            self.sources_view.editing = None;
+            return;
         }
+        // What scrolls in the dialog is at most this tall: the window's
+        // height, the dialog's margins, head and buttons aside.
+        let room = (ctx.content_rect().height() - 190.0).max(200.0);
+        let typing = ctx.memory(|m| m.focused().is_some());
+        let was = self.arrangement();
+        let modal = ui_kit::dialog(ctx, "source_settings", DIALOG_W, |ui| {
+            match &editing {
+                Editing::Layer { layer, transform } => self.layer_settings(ui, *layer, *transform, frame, aspect, room),
+                Editing::Sound(id) => {
+                    dialog_scroll(ui, ("sound_settings", id), room, |ui| self.sound_inspector(ui, id));
+                }
+                Editing::Mix => self.mix_inspector(ui),
+                Editing::Video => self.video_settings(ui),
+            }
+            let mut done = false;
+            ui_kit::dialog_buttons(ui, |ui| done = ui.add(ui_kit::button("Done", true)).clicked());
+            done
+        });
+        // Typing a word, or stepping a number, is one step.
         if self.arrangement() != was {
-            self.keep_for_undo_as(was, what);
+            self.keep_for_undo_as(was, format!("{editing:?}"));
+        }
+        if modal.inner || (modal.dismissed() && !typing) {
+            self.sources_view.editing = None;
         }
     }
 
-    /// With nothing selected: the scene and the video, as an editor shows
-    /// the document's settings. The scene's name (click to rename) and its
-    /// menu, then the video's size and frame rate (Settings' own rows), and
-    /// a way to make the video the size of the screen's crop.
-    fn scene_properties(&mut self, ui: &mut egui::Ui) {
-        let pal = theme::pal(ui);
-        let Some((id, name)) = self.settings.scene().map(|s| (s.id, s.name.clone())) else { return };
-        let rename_id = egui::Id::new(("rename_scene_head", id));
-        let draft_id = rename_id.with("draft");
-        let renaming = ui.data(|d| d.get_temp::<String>(draft_id));
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.set_min_height(34.0);
-            ui.spacing_mut().item_spacing.x = 8.0;
-            ui.label(theme::ic(icon::MONITOR_PLAY, 18.0).color(pal.text2));
-            let name_w = (ui.available_width() - 44.0).max(60.0);
-            ui.allocate_ui_with_layout(egui::vec2(name_w, 30.0), egui::Layout::left_to_right(egui::Align::Center), |ui| match renaming {
-                Some(mut draft) => {
-                    if crate::sources_ui::name_field(ui, rename_id, &mut draft, theme::font(16.0, W::Semibold), name_w - 8.0) {
-                        self.settings.rename_scene(id, &draft);
-                        ui.data_mut(|d| d.remove::<String>(draft_id));
-                    } else {
-                        ui.data_mut(|d| d.insert_temp(draft_id, draft));
-                    }
+    /// A video source's dialog: its head, a look at the video with it
+    /// outlined, then one of its halves, what it shows or Transform (with
+    /// Crop, for what has a picture to cut).
+    fn layer_settings(&mut self, ui: &mut egui::Ui, layer: Layer, transform: bool, frame: Option<&capture::preview::PreviewFrame>, aspect: f32, room: f32) {
+        self.inspector_head(ui, layer, frame, aspect);
+        ui.add_space(10.0);
+        let picture_h = PICTURE_H.min(room * 0.35);
+        self.dialog_picture(ui, layer, aspect, picture_h);
+        ui.add_space(12.0);
+        let own = self.own_half(layer);
+        let halves = [Seg::from(own.as_str()), Seg::from("Transform")];
+        if let Some(i) = ui_kit::segmented_opts(ui, ("source_half", layer), &halves, usize::from(transform), Some(ui.available_width()), true) {
+            self.sources_view.editing = Some(Editing::Layer { layer, transform: i == 1 });
+        }
+        let room = (room - picture_h - 110.0).max(160.0);
+        dialog_scroll(ui, ("source_settings", layer, transform), room, |ui| {
+            if transform {
+                self.transform_section(ui, layer);
+                if self.layer_cropped(layer).is_some() {
+                    self.crop_section(ui, layer, aspect);
                 }
-                None => {
-                    crate::sources_ui::forget_name_field(ui, rename_id);
-                    let r = ui.add(egui::Label::new(theme::text(&name, 16.0, W::Semibold).color(pal.text)).truncate().sense(egui::Sense::click()));
-                    if r.on_hover_text("Click to rename it").on_hover_cursor(egui::CursorIcon::Text).clicked() {
-                        ui.data_mut(|d| d.insert_temp(draft_id, name.clone()));
+            } else {
+                match layer {
+                    Layer::Screen => self.screen_section(ui, frame),
+                    Layer::Webcam(key) => {
+                        self.webcam_section(ui, key);
+                        self.camera_settings_sections(ui, key);
                     }
+                    Layer::Visual(key) => self.visual_section(ui, key),
                 }
-            });
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let more = Btn::icon(Kind::Ghost, icon::DOTS_THREE).small().tip("Rename, duplicate, move, delete").show(ui);
-                ui_kit::menu_popup(&more, false, 220.0, |ui| self.scene_menu(ui, id, rename_id));
-            });
+            }
         });
-        ui_kit::section_head(ui, "Video", true, |_| {});
+    }
+
+    /// The name of a video source's own half of its dialog, beside
+    /// Transform: what it is.
+    fn own_half(&self, layer: Layer) -> String {
+        match layer {
+            Layer::Screen if matches!(self.settings.capture, CaptureTarget::Apps { .. }) && capture::app_capture() => "Games and apps".to_owned(),
+            Layer::Screen => "Screen".to_owned(),
+            Layer::Webcam(_) => "Camera".to_owned(),
+            Layer::Visual(key) => self.settings.visual(key).map_or("Source", |v| v.visual.kind_name()).to_owned(),
+        }
+    }
+
+    /// A look at the video in a source's dialog, `max_h` tall at most, the
+    /// source outlined (dashed while it's hidden): what its settings change
+    /// shows here at once, the page's preview being behind the dialog.
+    fn dialog_picture(&mut self, ui: &mut egui::Ui, layer: Layer, aspect: f32, max_h: f32) {
+        use egui::{Color32, Rect, Stroke, pos2, vec2};
+        let pal = theme::pal(ui);
+        let shape = self.preview_size().map_or(aspect, |(w, h)| w as f32 / h.max(1) as f32);
+        let w = ui.available_width().min(max_h * shape);
+        let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), w / shape), egui::Sense::hover());
+        let rect = Rect::from_center_size(row.center(), vec2(w, w / shape));
+        let painter = ui.painter_at(rect.expand(2.0));
+        painter.rect_filled(rect, 6.0, pal.stage);
+        if !self.paint_preview(&painter, rect) {
+            painter.text(rect.center(), egui::Align2::CENTER_CENTER, "Starting preview…", egui::FontId::proportional(12.5), Color32::from_gray(170));
+            return;
+        }
+        let Some(b) = self.layer_box(layer, aspect) else { return };
+        let at = |p: egui::Pos2| pos2(rect.left() + p.x * rect.width(), rect.top() + p.y * rect.height());
+        let bx = Rect::from_min_max(at(b.min), at(b.max)).intersect(rect);
+        if !bx.is_positive() {
+            return;
+        }
+        painter.rect_stroke(bx.shrink(0.5), 0.0, Stroke::new(3.0, Color32::from_black_alpha(110)), egui::StrokeKind::Middle);
+        let line = bx.shrink(1.0);
+        if self.layer_enabled(layer) {
+            painter.rect_stroke(line, 0.0, Stroke::new(1.5, Color32::WHITE), egui::StrokeKind::Middle);
+        } else {
+            let c = [line.left_top(), line.right_top(), line.right_bottom(), line.left_bottom(), line.left_top()];
+            painter.extend(egui::Shape::dashed_line(&c, Stroke::new(1.5, Color32::WHITE), 4.0, 3.0));
+        }
+    }
+
+    /// The video's dialog: its size and frame rate (Settings' own rows,
+    /// every preset's), making it the size of the screen's crop, and the
+    /// way to the rest of its settings.
+    fn video_settings(&mut self, ui: &mut egui::Ui) {
+        ui_kit::dialog_title(ui, "Video");
+        ui_kit::dialog_text(ui, "Its size and frame rate, for every preset.");
+        ui.add_space(4.0);
         self.video_size_rows(ui);
         self.crop_match(ui);
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             ui.add_space(-9.0);
-            let more = Btn::ghost("Quality and more in Settings").trail(icon::CARET_RIGHT).small().tip("The bitrate, the encoder, frame blending: every preset's");
+            let more = Btn::ghost("Quality and more in Settings").trail(icon::CARET_RIGHT).small().tip("The bitrate, the encoder, frame blending");
             if more.show(ui).clicked() {
+                self.sources_view.editing = None;
                 self.open_settings(crate::settings_ui::Pane::Video);
             }
         });
-        ui.add_space(28.0);
-    }
-
-    /// A video source's settings: its head, its own section, Transform and
-    /// Crop; a webcam's camera settings after those.
-    fn layer_inspector(&mut self, ui: &mut egui::Ui, layer: Layer, frame: Option<&capture::preview::PreviewFrame>, aspect: f32) {
-        self.inspector_head(ui, layer, frame, aspect);
-        match layer {
-            Layer::Screen => self.screen_section(ui, frame),
-            Layer::Webcam(key) => self.webcam_section(ui, key),
-            Layer::Visual(key) => self.visual_section(ui, key),
-        }
-        self.transform_section(ui, layer);
-        if self.layer_cropped(layer).is_some() {
-            self.crop_section(ui, layer, aspect);
-        }
-        if let Layer::Webcam(key) = layer {
-            self.camera_settings_sections(ui, key);
-        }
-        ui.add_space(28.0);
     }
 
     /// Its symbol, its name (click to rename), its switch and its menu;
@@ -242,7 +323,7 @@ impl App {
     fn screen_section(&mut self, ui: &mut egui::Ui, frame: Option<&capture::preview::PreviewFrame>) {
         let idle = self.rec_state.idle();
         let apps_mode = matches!(self.settings.capture, CaptureTarget::Apps { .. });
-        ui_kit::section_head(ui, if apps_mode && capture::app_capture() { "Games and apps" } else { "Screen" }, true, |_| {});
+        ui_kit::gap(ui, 10.0);
         ui_kit::list(ui, "inspector_screen", |l| {
             // What to record: changes right away, while capturing too (the
             // clip switches mid-way; nothing restarts).
@@ -327,7 +408,7 @@ impl App {
     /// A webcam: which camera, and in what size and frame rate.
     fn webcam_section(&mut self, ui: &mut egui::Ui, key: u64) {
         let Some(cam) = self.settings.webcam(key).cloned() else { return };
-        ui_kit::section_head(ui, "Camera", true, |_| {});
+        ui_kit::gap(ui, 10.0);
         let mut camera_pick: Option<capture::Device> = None;
         let mut format_pick: Option<Option<capture::webcam::Format>> = None;
         let formats = capture::webcam::formats(&cam.id);
@@ -415,7 +496,7 @@ impl App {
             self.text_section(ui, key, style.clone());
             return;
         }
-        ui_kit::section_head(ui, v.visual.kind_name(), true, |_| {});
+        ui_kit::gap(ui, 10.0);
         let mut set: Option<Visual> = None;
         let mut refresh_displays = false;
         let mut refresh_windows = false;
@@ -532,7 +613,7 @@ impl App {
     /// up; an outline round them, a shadow under them.
     fn text_section(&mut self, ui: &mut egui::Ui, key: u64, style: TextStyle) {
         let mut s = style.clone();
-        ui_kit::section_head(ui, "Text", true, |_| {});
+        ui_kit::gap(ui, 10.0);
         let families = crate::fonts::families();
         ui_kit::list(ui, ("inspector_text", key), |l| {
             wide_row(l, "Words", &mut |ui| {
@@ -669,6 +750,14 @@ impl App {
             v.visual = Visual::Text(s);
         }
     }
+}
+
+/// What scrolls in a settings dialog: as tall as it is, `max_h` at most.
+fn dialog_scroll(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::Debug, max_h: f32, add: impl FnOnce(&mut egui::Ui)) {
+    egui::ScrollArea::vertical().id_salt(id).max_height(max_h).auto_shrink([false, true]).show(ui, |ui| {
+        add(ui);
+        ui.add_space(4.0);
+    });
 }
 
 /// A row whose control is as wide as the row, under its name (an address,

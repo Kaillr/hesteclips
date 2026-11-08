@@ -55,14 +55,12 @@ const MIN_SIZE: f32 = 0.05;
 /// One of the picture's sources.
 pub(crate) use crate::settings::LayerKey as Layer;
 
-/// What's selected on the Sources page: a source in the video (on the
-/// preview or in its list), a sound source, or the clip's mix. Its settings
-/// are in the panel beside the preview; the keys act on it.
+/// What's selected on the Sources page: a source in the video, on the
+/// preview or in the layers. It's outlined, with handles, and the keys act
+/// on it; its settings are in a dialog (see `inspector_ui`).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Selected {
     Layer(Layer),
-    Sound(String),
-    Mix,
 }
 
 /// A drag on the preview.
@@ -616,6 +614,16 @@ impl App {
         self.settings.webcam(key).map(|w| w.placement.into())
     }
 
+    /// Where a source is in a video of shape `frame_aspect` (fractions of
+    /// it), hidden or not.
+    pub(crate) fn layer_box(&mut self, layer: Layer, frame_aspect: f32) -> Option<Rect> {
+        match layer {
+            Layer::Screen => Some(self.screen_rect(frame_aspect)),
+            Layer::Webcam(key) => self.webcam_placement(key).map(|p| Rect::from_min_size(Pos2::new(p.x, p.y), vec2(p.w, p.h))),
+            Layer::Visual(key) => self.settings.visual(key).is_some().then(|| self.visual_rect(key, frame_aspect)),
+        }
+    }
+
     /// The picture's sources, front first, for their cards: the screen, and
     /// each webcam and other display (off too).
     pub(crate) fn layer_order(&self) -> Vec<Layer> {
@@ -668,9 +676,15 @@ impl App {
         let crop_on = modifiers.alt || self.canvas.crop_mode.is_some();
 
         // A click selects what's under it, in front; on nothing, nothing.
+        // Twice, its settings open.
         if response.clicked() {
             let picked = response.interact_pointer_pos().and_then(hit_at).map(|(l, _)| l);
             self.canvas.selected = picked.map(Selected::Layer);
+        }
+        if response.double_clicked()
+            && let Some((l, _)) = response.interact_pointer_pos().and_then(hit_at)
+        {
+            self.edit_layer(l);
         }
         // A drag only starts once the pointer has moved a little, so what was
         // grabbed is judged by where the button went down, not where it is now.
@@ -989,14 +1003,24 @@ impl App {
     }
 
     /// A source's menu (right-click it on the preview or in the list, or the
-    /// ⋯ over its settings), the same for each as far as each goes: how the
-    /// video puts the screen in, its position, size and crop back, turning,
-    /// mirroring and flipping it, which is in front, and duplicating, hiding
-    /// and removing it, with the keys that do the same.
+    /// ⋯ in its settings' dialog), the same for each as far as each goes:
+    /// its settings, how the video puts the screen in, cropping it on the
+    /// preview, its position, size and crop back, turning, mirroring and
+    /// flipping it, which is in front, and duplicating, hiding and removing
+    /// it, with the keys that do the same.
     pub(crate) fn layer_menu(&mut self, ui: &mut egui::Ui, layer: Layer, aspect: f32) {
         let screen = layer == Layer::Screen;
         let ctrl = crate::shortcuts::ctrl_name();
         let keys = |k: &[&str]| Some(k.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>());
+        // Its settings, but in their dialog (whose ⋯ this is).
+        let in_dialog = self.sources_view.editing.is_some();
+        if !in_dialog {
+            if Item::new("Settings…").icon(icon::SLIDERS_HORIZONTAL).tip("What it shows, and where: in a dialog").show(ui).clicked() {
+                self.edit_layer(layer);
+                ui.close();
+            }
+            crate::ui_kit::menu_sep(ui);
+        }
         // How the video puts the screen in: its position and size both. In
         // the screen's own shape too, for when it changes (a game at a
         // stretched resolution).
@@ -1026,11 +1050,20 @@ impl App {
             self.layer_reset_size(layer, aspect);
             ui.close();
         }
-        if let Some(cropped) = self.layer_cropped(layer)
-            && Item::new("Reset crop").icon(icon::CROP).enabled(cropped).tip("All of its picture again").show(ui).clicked()
-        {
-            self.layer_uncrop(layer, aspect);
-            ui.close();
+        if let Some(cropped) = self.layer_cropped(layer) {
+            // Its handles crop till Done or Enter, on the preview (the
+            // dialog closes for it).
+            let tip = format!("Drag its handles to cut its edges off, till Done or Enter ({} and a handle do it too)", crate::shortcuts::alt_name());
+            if Item::new("Crop").icon(icon::CROP).tip(tip).show(ui).clicked() {
+                self.select_layer(layer);
+                self.canvas.crop_mode = Some(layer);
+                self.sources_view.editing = None;
+                ui.close();
+            }
+            if Item::new("Reset crop").icon(icon::ARROWS_OUT).enabled(cropped).tip("All of its picture again").show(ui).clicked() {
+                self.layer_uncrop(layer, aspect);
+                ui.close();
+            }
         }
         crate::ui_kit::menu_sep(ui);
         // Turned a quarter at a time, as it's seen.
