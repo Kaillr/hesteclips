@@ -86,6 +86,20 @@ impl App {
                 self.fit_words_box(key, None, (p.width, p.height));
             }
         }
+        // The rest not placed yet, once their size is known: their own size
+        // in the video (as `visual_first_rect` says), in a box of their own,
+        // the capture drawing them there too (unplaced, it fills the video).
+        let Some(aspect) = self.frame_aspect() else { return };
+        let unplaced: Vec<u64> = self.settings.visuals.iter().filter(|v| v.placed.is_none() && !v.visual.shapeless() && !matches!(v.visual, Visual::Text(_))).map(|v| v.key).collect();
+        for key in unplaced {
+            let Some((w, h)) = self.visual_size(key) else { continue };
+            let r = self.visual_first_rect(key, aspect);
+            if !crate::canvas_ui::fills(r)
+                && let Some(d) = self.settings.visual_mut(key)
+            {
+                d.placed = Some(BoxCfg::new([r.min.x, r.min.y, r.width(), r.height()], aspect, Some(w as f32 / h.max(1) as f32)));
+            }
+        }
     }
 
     /// Words' box, for their new picture (`now`, its size; `before`, the
@@ -204,21 +218,25 @@ impl App {
         self.visual_first_rect(key, frame_aspect)
     }
 
-    /// Where a boxed source goes before it's placed: a colour all of the
-    /// video; words their own size (as at 1080p), in the middle; the rest
-    /// as big as fits.
+    /// Where a boxed source goes before it's placed, and what Reset size
+    /// gives it: a colour all of the video; words their own size (as at
+    /// 1080p), the rest their own size in the video's pixels (a 600×800 web
+    /// page is 600×800 of a 1080p video), in the middle, made smaller to
+    /// fit if it's bigger than the video.
     pub(crate) fn visual_first_rect(&mut self, key: u64, frame_aspect: f32) -> Rect {
         let whole = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
         let text = self.settings.visual(key).is_some_and(|v| matches!(v.visual, Visual::Text(_)));
-        match self.visual_size(key) {
-            Some((w, h)) if text => {
-                let size = vec2(w as f32 / (1080.0 * frame_aspect), h as f32 / 1080.0);
-                let fit = (1.0 / size.x).min(1.0 / size.y).min(1.0);
-                Rect::from_center_size(Pos2::new(0.5, 0.5), size * fit)
+        let Some((w, h)) = self.visual_size(key) else { return whole };
+        let size = if text {
+            vec2(w as f32 / (1080.0 * frame_aspect), h as f32 / 1080.0)
+        } else {
+            match capture::frame_size(&self.video_source(), self.settings.video_size()) {
+                Some((vw, vh)) => vec2(w as f32 / vw.max(1) as f32, h as f32 / vh.max(1) as f32),
+                None => return crate::canvas_ui::fitted(w as f32 / h.max(1) as f32, frame_aspect),
             }
-            Some((w, h)) => crate::canvas_ui::fitted(w as f32 / h.max(1) as f32, frame_aspect),
-            None => whole,
-        }
+        };
+        let fit = (1.0 / size.x).min(1.0 / size.y).min(1.0);
+        Rect::from_center_size(Pos2::new(0.5, 0.5), size * fit)
     }
 
     /// A boxed source in the box `r` (fractions of a video of shape `aspect`).
@@ -226,7 +244,9 @@ impl App {
         let shapeless = self.settings.visual(key).is_some_and(|v| v.visual.shapeless());
         let picture = if shapeless { None } else { self.settings.visual(key).and_then(|d| d.placed).and_then(|b| b.picture_aspect).or_else(|| self.visual_size(key).map(|(w, h)| w as f32 / h.max(1) as f32)) };
         let first = self.visual_first_rect(key, aspect);
-        let same = (r.min - first.min).length() < 1e-3 && (r.max - first.max).length() < 1e-3;
+        // Unplaced is all of the video (to the capture): only a source whose
+        // first box that is goes back to it.
+        let same = crate::canvas_ui::fills(first) && (r.min - first.min).length() < 1e-3 && (r.max - first.max).length() < 1e-3;
         if let Some(d) = self.settings.visual_mut(key) {
             d.placed = (!same).then(|| BoxCfg::new([r.min.x, r.min.y, r.width(), r.height()], aspect, picture));
         }

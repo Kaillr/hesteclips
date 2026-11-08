@@ -275,7 +275,7 @@ fn lines_of(layers: &[(Layer, Rect)], me: Layer) -> Lines {
 }
 
 /// Whether a box covers all of the video (all of it, or past its edges).
-fn fills(r: Rect) -> bool {
+pub(crate) fn fills(r: Rect) -> bool {
     r.min.x <= 1e-4 && r.min.y <= 1e-4 && r.max.x >= 1.0 - 1e-4 && r.max.y >= 1.0 - 1e-4
 }
 
@@ -1261,7 +1261,7 @@ impl App {
             Layer::Screen if self.video_shaped() => ("Back in the middle of the video, its size kept", "Back to the size the video gives it, where it is"),
             Layer::Screen => ("Back in the middle of the video, its size kept", "As big as the video again, where it is"),
             Layer::Webcam(_) => ("Back to the bottom-right corner, its size kept", "A quarter of the video wide again, where it is"),
-            Layer::Visual(_) => ("Back in the middle of the video, its size kept", "Its first size again, where it is"),
+            Layer::Visual(_) => ("Back in the middle of the video, its size kept", "Its own size again (a pixel of it a pixel of the video), where it is"),
         };
         if Item::new("Reset position").icon(icon::ARROWS_OUT_CARDINAL).enabled(position).tip(place_tip).show(ui).clicked() {
             self.layer_reset_position(layer, aspect);

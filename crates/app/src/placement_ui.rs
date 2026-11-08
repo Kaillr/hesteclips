@@ -144,7 +144,7 @@ impl App {
                     Layer::Screen if self.video_shaped() => "Back to the size the video gives it, where it is",
                     Layer::Screen => "As big as the video again, where it is",
                     Layer::Webcam(_) => "A quarter of the video wide again, unstretched, where it is",
-                    Layer::Visual(_) => "Its first size again, unstretched, where it is",
+                    Layer::Visual(_) => "Its own size again, unstretched (a pixel of it a pixel of the video), where it is",
                 };
                 reset_size = Btn::ghost("Reset size").small().enabled(can_size).tip(size_tip).show(ui).clicked();
                 let place_tip = if matches!(layer, Layer::Webcam(_)) { "Back to the bottom-right corner, its size kept" } else { "Back in the middle of the video, its size kept" };
