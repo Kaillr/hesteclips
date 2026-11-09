@@ -1442,11 +1442,7 @@ impl App {
                     Some(device) => Cap::Microphone { device },
                     None => continue,
                 },
-                SourceKind::Desktop { exclude_apps, leave_out } => Cap::Desktop {
-                    exclude_app_sources: *exclude_apps,
-                    leave_out: if capture::DESKTOP_PROGRAMS { leave_out.iter().map(|l| l.exe.clone()).collect() } else { Vec::new() },
-                },
-                SourceKind::Output { device } => Cap::Output { device: device.clone() },
+                SourceKind::Desktop { exclude_apps } => Cap::Desktop { exclude_app_sources: *exclude_apps },
                 SourceKind::App { bundle_id, .. } => Cap::App { bundle_id: bundle_id.clone() },
                 SourceKind::Video { .. } if capture::layers::VIDEO => Cap::Video { id: s.id.clone() },
                 SourceKind::Video { .. } => continue,

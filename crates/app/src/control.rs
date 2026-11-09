@@ -516,7 +516,6 @@ fn sound_kind(kind: &SourceKind) -> &'static str {
     match kind {
         SourceKind::Microphone { .. } => "microphone",
         SourceKind::Desktop { .. } => "desktop",
-        SourceKind::Output { .. } => "output",
         SourceKind::App { .. } => "app",
         SourceKind::Video { .. } => "video",
     }

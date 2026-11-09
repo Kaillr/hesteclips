@@ -29,8 +29,8 @@ default: {:?}", d.inputs.iter().map(|i| &i.name).collect::<Vec<_>>(), d.default_
             let kind = match spec.split_once(':') {
                 Some(("mic", d)) => SourceKind::Microphone { device: d.into() },
                 Some(("app", b)) => SourceKind::App { bundle_id: b.into() },
-                _ if spec == "desktop-excl" => SourceKind::Desktop { exclude_app_sources: true, leave_out: Vec::new() },
-                _ => SourceKind::Desktop { exclude_app_sources: false, leave_out: Vec::new() },
+                _ if spec == "desktop-excl" => SourceKind::Desktop { exclude_app_sources: true },
+                _ => SourceKind::Desktop { exclude_app_sources: false },
             };
             AudioSource {
                 id: format!("s{i}"),

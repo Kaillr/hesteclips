@@ -737,7 +737,6 @@ impl App {
             parts.push(match &s.kind {
                 crate::settings::SourceKind::Microphone { .. } => "mic".into(),
                 crate::settings::SourceKind::Desktop { .. } => "desktop".into(),
-                crate::settings::SourceKind::Output { .. } => "output".into(),
                 crate::settings::SourceKind::App { app_name, .. } => app_name.clone(),
                 crate::settings::SourceKind::Video { .. } => "video".into(),
             });
