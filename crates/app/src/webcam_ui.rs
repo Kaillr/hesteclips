@@ -951,7 +951,7 @@ fn control_widget(ui: &mut egui::Ui, c: &CameraControl, set: &mut Vec<(u32, i64)
                     set.push((c.id, stepped));
                 }
             }
-            if let Some(d) = arrow_steps(ui, &slider) {
+            if let Some(d) = crate::transport::arrow_steps(ui, &slider) {
                 let to = (c.value + d * step).clamp(*min, *max);
                 if to != c.value {
                     set.push((c.id, to));
@@ -1336,30 +1336,6 @@ fn exposure_step(value: i64, up: bool, step: i64, min: i64, max: i64) -> i64 {
     (value + if up { step } else { -step }).clamp(min, max)
 }
 
-/// Arrow keys on a camera slider: clicking or dragging it gives it the keys,
-/// then ← and → step it, ten at a time with Shift (↑ and ↓ move between the
-/// page's controls, as egui has them). How many steps, if any were pressed.
-fn arrow_steps(ui: &egui::Ui, slider: &egui::Response) -> Option<i64> {
-    if slider.clicked() || slider.drag_started() {
-        slider.request_focus();
-    }
-    if !slider.has_focus() {
-        return None;
-    }
-    let mut d = 0;
-    ui.input_mut(|i| {
-        let shift = i.modifiers.shift;
-        let by = if shift { 10 } else { 1 };
-        let mods = if shift { egui::Modifiers::SHIFT } else { egui::Modifiers::NONE };
-        for (key, sign) in [(egui::Key::ArrowLeft, -1), (egui::Key::ArrowRight, 1)] {
-            while i.consume_key(mods, key) {
-                d += sign * by;
-            }
-        }
-    });
-    (d != 0).then_some(d)
-}
-
 /// Film's guides for an exposure time at `fps`, in V4L2's units of 100 µs:
 /// the 180° shutter (half a frame, for motion blur that looks natural), and
 /// the whole frame (longer, and the frame rate drops).
@@ -1396,7 +1372,7 @@ fn exposure_widget(ui: &mut egui::Ui, c: &CameraControl, set: &mut Vec<(u32, i64
             set.push((c.id, to));
         }
     }
-    if let Some(d) = arrow_steps(ui, &slider) {
+    if let Some(d) = crate::transport::arrow_steps(ui, &slider) {
         let to = (c.value + d * step).clamp(min, max);
         if to != c.value {
             set.push((c.id, to));
@@ -1435,7 +1411,7 @@ fn exposure_steps(ui: &mut egui::Ui, c: &CameraControl, times: &[(i64, String)],
     if slider.changed() {
         go((v * last as f32).round() as usize);
     }
-    if let Some(d) = arrow_steps(ui, &slider) {
+    if let Some(d) = crate::transport::arrow_steps(ui, &slider) {
         go((i as i64 + d).clamp(0, last as i64) as usize);
     }
     if crate::ui_kit::Btn::icon(crate::ui_kit::Kind::Ghost, egui_phosphor::regular::MINUS).small().enabled(i > 0).tip("Shorter").show(ui).clicked() {
