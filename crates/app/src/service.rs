@@ -170,11 +170,20 @@ impl QuickSave {
     }
 
     /// Mark this moment in the recording, if one runs (`sound`: saying so).
-    fn mark(&self, sound: bool) {
-        let Some(said) = self.marking.lock().ok().and_then(|s| s.clone()) else { return };
-        if self.games.mark() && sound {
+    /// Whether it was marked.
+    fn mark(&self, sound: bool) -> bool {
+        let Some(said) = self.marking.lock().ok().and_then(|s| s.clone()) else { return false };
+        let marked = self.games.mark();
+        if marked && sound {
             crate::sound::play_saved(&said);
         }
+        marked
+    }
+
+    /// Mark this moment in the recording, saying so (a Stream Deck's Mark
+    /// moment). Whether a recording runs to mark.
+    pub fn mark_moment(&self) -> bool {
+        self.mark(true)
     }
 }
 

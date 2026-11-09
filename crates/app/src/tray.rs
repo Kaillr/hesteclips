@@ -379,8 +379,9 @@ fn take_over(mut running: std::net::TcpStream, port: u16) -> Option<Option<std::
 }
 
 /// Answer later launches: each asks this one to show itself, or (a build of
-/// your own, see [`take_over`]) to quit.
-pub fn serve(listener: std::net::TcpListener, ctx: &egui::Context, tx: mpsc::Sender<Cmd>) {
+/// your own, see [`take_over`]) to quit. And a control (a Stream Deck)
+/// that says `ctrl` goes to `control`, to be served on its own thread.
+pub fn serve(listener: std::net::TcpListener, ctx: &egui::Context, tx: mpsc::Sender<Cmd>, control: Option<crate::control::Door>) {
     use std::io::{Read, Write};
     let ctx = ctx.clone();
     let _ = std::thread::Builder::new().name("single instance".into()).spawn(move || {
@@ -392,6 +393,12 @@ pub fn serve(listener: std::net::TcpListener, ctx: &egui::Context, tx: mpsc::Sen
                 continue;
             }
             match &word {
+                b"ctrl" => {
+                    if let Some(door) = &control {
+                        door.open(stream);
+                    }
+                    continue;
+                }
                 b"show" => {
                     // Hidden (KDE under Wayland): the UI doesn't run to hear it.
                     #[cfg(target_os = "linux")]
@@ -434,7 +441,7 @@ mod tests {
     fn answers_show_and_quit() {
         let port = spare_port();
         let (tx, rx) = mpsc::channel();
-        serve(TcpListener::bind(("127.0.0.1", port)).unwrap(), &egui::Context::default(), tx);
+        serve(TcpListener::bind(("127.0.0.1", port)).unwrap(), &egui::Context::default(), tx, None);
         let mut show = TcpStream::connect(("127.0.0.1", port)).unwrap();
         show.write_all(b"show").unwrap();
         assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(Cmd::Open));

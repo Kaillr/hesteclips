@@ -22,8 +22,8 @@ use crate::meter::{self, MeterState};
 use crate::settings::{AudioSourceCfg, CaptureApp, CaptureTarget, SourceKind};
 
 /// Fader range in dB.
-const FADER_MIN_DB: f32 = -60.0;
-const FADER_MAX_DB: f32 = 12.0;
+pub(crate) const FADER_MIN_DB: f32 = -60.0;
+pub(crate) const FADER_MAX_DB: f32 = 12.0;
 /// How long the "limiting" note stays after the limiter last worked.
 const LIMIT_HOLD: Duration = Duration::from_secs(3);
 /// Under this page width, a scene's layers and its sound go one under
