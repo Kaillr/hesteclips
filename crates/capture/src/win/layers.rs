@@ -548,7 +548,7 @@ impl CaptureFeed {
                     Target::Browser(host) => host
                         .window()
                         .ok_or_else(|| anyhow::anyhow!("the page isn't up yet"))
-                        .and_then(|hwnd| d3d::window_item(hwnd).and_then(|item| d3d::Capture::start(&gpu, &item, &latest2, d3d::Of::Window(hwnd), fps)).map(|c| (c, Some(hwnd)))),
+                        .and_then(|hwnd| d3d::window_item(hwnd).and_then(|item| d3d::Capture::start(&gpu, &item, &latest2, d3d::Of::Page(hwnd), fps)).map(|c| (c, Some(hwnd)))),
                 };
                 match started {
                     Ok((capture, window)) => {

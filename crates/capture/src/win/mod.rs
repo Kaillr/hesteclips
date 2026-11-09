@@ -2740,4 +2740,55 @@ mod tests {
             drop((dupl, wgc));
         }
     }
+
+    /// Issue #33: Windows' capture leaves the cursor out, and it's drawn on
+    /// here, so a cursor moving over a still picture brings no picture from
+    /// Windows. It's put up again with the cursor where it moved: pictures
+    /// keep coming while it moves, near the frame rate. Moves the cursor
+    /// about the middle of `SCREEN=<id>` for a second, then puts it back.
+    /// Nothing of the screen is kept.
+    #[test]
+    #[ignore = "moves the cursor on a display: SCREEN=\\\\.\\DISPLAY2 cargo test -p capture cursor_over_windows_capture -- --ignored --nocapture"]
+    fn cursor_over_windows_capture() {
+        use windows::Win32::Foundation::POINT;
+        use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, SetCursorPos};
+        let Ok(id) = std::env::var("SCREEN") else {
+            eprintln!("SCREEN not set: skipped");
+            return;
+        };
+        assert!(system::list_screens().iter().any(|s| s.id == id), "no display {id}");
+        unsafe { windows::Win32::UI::HiDpi::SetThreadDpiAwarenessContext(windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+        let monitor = system::find_monitor(&id);
+        let (w, h) = system::display_pixels(Some(&id)).expect("its size");
+        let mut info = windows::Win32::Graphics::Gdi::MONITORINFO { cbSize: std::mem::size_of::<windows::Win32::Graphics::Gdi::MONITORINFO>() as u32, ..Default::default() };
+        unsafe { windows::Win32::Graphics::Gdi::GetMonitorInfoW(monitor, &mut info) }.ok().unwrap();
+        let r = info.rcMonitor;
+        let (cx, cy) = ((r.left + r.right) / 2, (r.top + r.bottom) / 2);
+        let gpu = d3d::Gpu::new().unwrap();
+        let latest = d3d::Latest::new(&gpu, w, h).unwrap();
+        let capture = d3d::Capture::start(&gpu, &d3d::monitor_item(monitor).unwrap(), &latest, d3d::Of::Display(monitor), 30).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !latest.has_frame() {
+            assert!(Instant::now() < deadline, "no picture");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let mut was = POINT::default();
+        unsafe { GetCursorPos(&mut was) }.unwrap();
+        unsafe { SetCursorPos(cx, cy) }.unwrap();
+        thread::sleep(Duration::from_millis(300));
+        let before = latest.arrivals().0;
+        thread::sleep(Duration::from_secs(1));
+        let still = latest.arrivals().0 - before;
+        let before = latest.arrivals().0;
+        for i in 0..60 {
+            let a = i as f64 / 60.0 * std::f64::consts::TAU;
+            let _ = unsafe { SetCursorPos(cx + (80.0 * a.cos()) as i32, cy + (80.0 * a.sin()) as i32) };
+            thread::sleep(Duration::from_millis(16));
+        }
+        let moving = latest.arrivals().0 - before;
+        let _ = unsafe { SetCursorPos(was.x, was.y) };
+        drop(capture);
+        eprintln!("pictures in a second at 30 fps: {still} with the cursor still, {moving} with it moving");
+        assert!(moving >= 15, "the cursor moving brought {moving} pictures");
+    }
 }

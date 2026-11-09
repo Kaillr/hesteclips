@@ -608,6 +608,9 @@ pub(crate) enum Of {
     /// A window (`item` made by [`window_item`]), its client area only (no
     /// title bar or borders).
     Window(HWND),
+    /// A web page's window (see `browser`), as a window, but never with the
+    /// cursor: it's drawn off every display, where the cursor never is.
+    Page(HWND),
 }
 
 /// The cursor, drawn by us over Windows' capture, which leaves it out.
@@ -638,7 +641,7 @@ unsafe impl Send for Overlay {}
 impl Overlay {
     fn new(gpu: &Gpu, latest: &Latest, of: Of) -> Result<Self> {
         let pid = match of {
-            Of::Window(window) => {
+            Of::Window(window) | Of::Page(window) => {
                 let mut pid = 0u32;
                 unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(window, Some(&mut pid)) };
                 Some(pid)
@@ -661,7 +664,13 @@ impl Overlay {
     /// The cursor isn't as it was last drawn: moved, another, or shown or
     /// hidden since.
     fn moved(&self) -> bool {
-        super::cursor::showing(self.pid) != self.drawn
+        physical(|| super::cursor::showing(self.pid)) != self.drawn
+    }
+
+    /// The window is hidden (tabbed out, minimized): the away screen goes up
+    /// over its picture then, and nothing may cover that.
+    fn hidden(&self) -> bool {
+        matches!(self.of, Of::Window(window) if super::system::window_hidden(window))
     }
 
     /// `clean` up into `latest`, with the cursor drawn on it.
@@ -673,21 +682,31 @@ impl Overlay {
         let _held = gpu.exclusive();
         let region = D3D11_BOX { left: 0, top: 0, front: 0, right: w, bottom: h, back: 1 };
         unsafe { gpu.context.CopySubresourceRegion(&latest.texture, 0, 0, 0, 0, &self.clean, 0, Some(&region)) };
-        // Physical pixels, as the picture is, whatever this thread was.
-        use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetThreadDpiAwarenessContext};
-        let previous = unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
-        self.drawn = super::cursor::showing(self.pid);
-        match self.of {
-            Of::Window(window) => self.layer.draw(gpu, &self.quad, latest, &self.target, window, self.pid.unwrap_or(0), self.size),
-            Of::Display(monitor) => {
-                if let Some((origin, display)) = monitor_rect(monitor) {
-                    self.layer.draw_on_screen(gpu, &self.quad, latest, &self.target, origin, display, self.size);
+        physical(|| {
+            self.drawn = super::cursor::showing(self.pid);
+            match self.of {
+                Of::Window(window) => self.layer.draw(gpu, &self.quad, latest, &self.target, window, self.pid.unwrap_or(0), self.size),
+                Of::Display(monitor) => {
+                    if let Some((origin, display)) = monitor_rect(monitor) {
+                        self.layer.draw_on_screen(gpu, &self.quad, latest, &self.target, origin, display, self.size);
+                    }
                 }
+                Of::Page(_) => {}
             }
-        }
-        unsafe { SetThreadDpiAwarenessContext(previous) };
+        });
         unsafe { gpu.context.Flush() };
     }
+}
+
+/// `f` run in physical pixels (per-monitor DPI aware), as the picture is,
+/// whatever this thread was: where the cursor is drawn and where it was last
+/// drawn are told in the same pixels.
+fn physical<T>(f: impl FnOnce() -> T) -> T {
+    use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetThreadDpiAwarenessContext};
+    let previous = unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+    let out = f();
+    unsafe { SetThreadDpiAwarenessContext(previous) };
+    out
 }
 
 /// Where a display is on the desktop and how big, in physical pixels (asked
@@ -727,7 +746,7 @@ impl Capture {
     /// borders).
     pub(crate) fn start(gpu: &Gpu, item: &GraphicsCaptureItem, latest: &Arc<Latest>, of: Of, fps: u32) -> Result<Self> {
         let window = match of {
-            Of::Window(window) => Some(window),
+            Of::Window(window) | Of::Page(window) => Some(window),
             Of::Display(_) => None,
         };
         let size = item.Size()?;
@@ -739,9 +758,11 @@ impl Capture {
         let session = pool.CreateCaptureSession(item)?;
         // The cursor is drawn by us (see `Overlay`), not by Windows.
         // `HASTECLIP_CURSOR_CAPTURE=1` has Windows draw it, as it used to.
+        // Before Windows 10 2004 it can't be left out: Windows draws it then,
+        // and a second one isn't drawn over it.
         let by_windows = std::env::var_os("HASTECLIP_CURSOR_CAPTURE").is_some_and(|v| v == "1");
-        let _ = session.SetIsCursorCaptureEnabled(by_windows);
-        let overlay = if by_windows { None } else { Some(Arc::new(Mutex::new(Overlay::new(gpu, latest, of)?))) };
+        let by_windows = session.SetIsCursorCaptureEnabled(by_windows).is_err() || by_windows;
+        let overlay = if by_windows || matches!(of, Of::Page(_)) { None } else { Some(Arc::new(Mutex::new(Overlay::new(gpu, latest, of)?))) };
         let overlay2 = overlay.clone();
         // Windows 11: no yellow "being captured" border.
         let _ = session.SetIsBorderRequired(false);
@@ -865,20 +886,32 @@ impl Capture {
             // As often as the recording's frames: a cursor that moved within
             // a frame goes up with the next anyway.
             let every = std::time::Duration::from_secs_f64(1.0 / fps.max(1) as f64);
+            // The same picture with the cursor moved counts as a new one for
+            // frame blending only once nothing else has come for a while (a
+            // still screen), as with Desktop Duplication: else a moving cursor
+            // would add a picture between the game's own.
+            let quiet = 2 * every;
             std::thread::spawn(move || {
+                // The last time a picture with only the cursor moved counted.
+                let mut counted: Option<std::time::Instant> = None;
                 while !stop.load(Ordering::Relaxed) {
                     std::thread::sleep(every);
-                    if last_frame.lock().unwrap().elapsed() < every {
+                    let since = last_frame.lock().unwrap().elapsed();
+                    if since < every {
                         continue;
                     }
                     let mut o = overlay.lock().unwrap();
-                    // Not over a still (the away screen) or black.
-                    if o.size.0 == 0 || latest.waiting() || !o.moved() {
+                    // Not over a still (the away screen) or black, nor over a
+                    // window that's hidden, which the away screen covers.
+                    if o.size.0 == 0 || latest.waiting() || o.hidden() || !o.moved() {
                         continue;
                     }
                     o.put_up(&gpu, &latest);
-                    // As a frame of Windows' with the cursor moved was.
-                    latest.mark_frame(o.size);
+                    let counts = since > quiet && counted.is_none_or(|t| t.elapsed() > quiet);
+                    if counts {
+                        counted = Some(std::time::Instant::now());
+                    }
+                    latest.mark(o.size, super::system::host_now(), counts);
                 }
             })
         });
