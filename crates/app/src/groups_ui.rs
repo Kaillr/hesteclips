@@ -48,44 +48,29 @@ impl App {
         self.toast_action(icon::TRASH, format!("Took {} out of this scene", g.name), "Undo", crate::shell::ToastAction::UndoSources);
     }
 
-    /// A row dragged in the layers onto `target`'s place: a source to it
-    /// (it stays in its group, if it's in one), a group as one, past what
-    /// it was dragged over.
-    pub(crate) fn move_row(&mut self, held: &Selected, target: &Selected) {
+    /// Group `id`'s row dragged in the layers past `target` (a source on
+    /// its own, or another group): to its other side, as one.
+    pub(crate) fn move_group_past(&mut self, id: u64, target: &Selected) {
         let order = self.layer_order();
-        let first_of = |s: &Selected| -> Option<Layer> {
-            match s {
-                Selected::Layer(l) => Some(*l),
-                Selected::Group(id) => self.settings.group(*id).and_then(|g| g.members.first().copied()),
-            }
+        let Some(members) = self.settings.group(id).map(|g| g.members.clone()) else { return };
+        let over: Vec<Layer> = match target {
+            Selected::Layer(t) => vec![*t],
+            Selected::Group(t) => self.settings.group(*t).map(|g| g.members.clone()).unwrap_or_default(),
         };
-        match held {
-            Selected::Layer(l) => {
-                if let Some(to) = first_of(target).and_then(|t| order.iter().position(|x| *x == t)) {
-                    self.move_layer(*l, to);
-                }
-            }
-            Selected::Group(id) => {
-                let Some(members) = self.settings.group(*id).map(|g| g.members.clone()) else { return };
-                let over: Vec<Layer> = match target {
-                    Selected::Layer(t) => vec![*t],
-                    Selected::Group(t) => self.settings.group(*t).map(|g| g.members.clone()).unwrap_or_default(),
-                };
-                if over.iter().any(|t| members.contains(t)) {
-                    return;
-                }
-                let rest: Vec<Layer> = order.iter().filter(|l| !members.contains(l)).copied().collect();
-                let now = order.iter().take_while(|l| !members.contains(l)).count();
-                let (Some(first), Some(last)) = (over.first().and_then(|t| rest.iter().position(|x| x == t)), over.last().and_then(|t| rest.iter().position(|x| x == t))) else { return };
-                self.settings.move_group(*id, if first >= now { last + 1 } else { first });
-            }
+        if over.iter().any(|t| members.contains(t)) {
+            return;
         }
+        let rest: Vec<Layer> = order.iter().filter(|l| !members.contains(l)).copied().collect();
+        let now = order.iter().take_while(|l| !members.contains(l)).count();
+        let (Some(first), Some(last)) = (over.first().and_then(|t| rest.iter().position(|x| x == t)), over.last().and_then(|t| rest.iter().position(|x| x == t))) else { return };
+        self.settings.move_group(id, if first >= now { last + 1 } else { first });
     }
 
-    /// Group `id`'s row in the layers, over its sources': its grip (drag it
-    /// up or down, its sources with it), a fold, its name (double-click to
-    /// rename), how many it has, its lock and eye for all of them. A click
-    /// selects it; a right-click opens its menu. Where it was drawn.
+    /// Group `id`'s row in the layers, over its sources' (dragged up or
+    /// down from anywhere on it, they go with it): a fold, its name
+    /// (double-click to rename), how many it has, its lock and eye for all
+    /// of them. A click selects it; a right-click opens its menu. Where it
+    /// was drawn.
     pub(crate) fn group_row(&mut self, ui: &mut egui::Ui, id: u64) -> egui::Rect {
         let pal = theme::pal(ui);
         let Some(g) = self.settings.group(id).cloned() else { return egui::Rect::NOTHING };

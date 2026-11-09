@@ -2438,6 +2438,26 @@ impl RecordSettings {
         self.pack_groups();
     }
 
+    /// `layers` moved together, in their order, to `to` in the order of the
+    /// scene's other sources (0: in front of them all), in group `group`
+    /// (`None`: in none): dragged in the layers, past others, into a group
+    /// or out of one. A group left with none of its sources is gone.
+    pub fn move_layers_to(&mut self, layers: &[LayerKey], to: usize, group: Option<u64>) {
+        let order = self.layer_order();
+        let moving: Vec<LayerKey> = order.iter().copied().filter(|l| layers.contains(l)).collect();
+        let mut rest: Vec<LayerKey> = order.into_iter().filter(|l| !layers.contains(l)).collect();
+        let to = to.min(rest.len());
+        rest.splice(to..to, moving.iter().copied());
+        self.layer_order = rest;
+        for g in &mut self.groups {
+            g.members.retain(|m| !moving.contains(m));
+        }
+        if let Some(g) = group.and_then(|id| self.group_mut(id)) {
+            g.members.extend(moving.iter().copied());
+        }
+        self.pack_groups();
+    }
+
     /// Each group's sources together in the scene shown's order (where its
     /// one in front is), front first; what isn't in the scene out of them,
     /// and a group left with none gone.
@@ -3915,6 +3935,29 @@ mod scene_tests {
         assert!(s.groups.is_empty());
         let back = RecordSettings::from_saved(Some(s.to_json().as_bytes()));
         assert_eq!(back.scenes, s.scenes);
+    }
+
+    /// Sources moved in the scene's order go into a group, or out of one,
+    /// with it; the group they were all of is gone.
+    #[test]
+    fn sources_move_into_a_group_and_out() {
+        let mut s = setup();
+        s.visuals.push(VisualCfg::new(3, Visual::Colour { rgba: [0, 0, 0, 255] }));
+        s.layer_order = vec![LayerKey::Visual(3), LayerKey::Webcam(1), LayerKey::Visual(2), LayerKey::Screen];
+        let g = s.make_group(&[LayerKey::Webcam(1), LayerKey::Visual(2)]).unwrap();
+        let members = |s: &RecordSettings| s.group(g).map(|x| x.members.clone()).unwrap_or_default();
+        // Into it, between its two (the others: webcam, logo, screen).
+        s.move_layers_to(&[LayerKey::Visual(3)], 1, Some(g));
+        assert_eq!(s.layer_order(), vec![LayerKey::Webcam(1), LayerKey::Visual(3), LayerKey::Visual(2), LayerKey::Screen]);
+        assert_eq!(members(&s), vec![LayerKey::Webcam(1), LayerKey::Visual(3), LayerKey::Visual(2)]);
+        // Out, behind it.
+        s.move_layers_to(&[LayerKey::Webcam(1)], 2, None);
+        assert_eq!(s.layer_order(), vec![LayerKey::Visual(3), LayerKey::Visual(2), LayerKey::Webcam(1), LayerKey::Screen]);
+        assert_eq!(members(&s), vec![LayerKey::Visual(3), LayerKey::Visual(2)]);
+        // Both out, where they are: the group's gone.
+        s.move_layers_to(&[LayerKey::Visual(3), LayerKey::Visual(2)], 0, None);
+        assert!(s.groups.is_empty());
+        assert_eq!(s.layer_order(), vec![LayerKey::Visual(3), LayerKey::Visual(2), LayerKey::Webcam(1), LayerKey::Screen]);
     }
 
     /// A scene can do without the screen (a webcam alone, say): taken out
