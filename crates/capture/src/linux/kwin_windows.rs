@@ -1,5 +1,6 @@
 //! KWin's window list (`org_kde_plasma_window_management`): every window's
-//! process, title and state (which is active, which minimized), native
+//! process, title, state (which is active, which minimized) and where it is
+//! (its frame, and its inside without title bar and borders), native
 //! Wayland windows included, and the id KWin's screencast streams a window
 //! by. Followed by a background thread from the first time it's asked, so
 //! asking is instant.
@@ -37,8 +38,21 @@ pub(crate) struct Window {
     pub minimized: bool,
     /// Not in the taskbar: a panel, a popup, a tooltip.
     pub skip_taskbar: bool,
-    /// Its size on screen, frame and all, as KWin says.
-    pub size: Option<(u32, u32)>,
+    /// Where it is on the desktop, title bar and borders and all.
+    pub frame: Option<Rect>,
+    /// Where its inside is (the frame without title bar and borders), where
+    /// KWin says (version 18 of its window list).
+    pub inside: Option<Rect>,
+}
+
+/// A rectangle on the desktop, in its coordinates (logical pixels: a
+/// window's picture is these times its display's scale).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct Rect {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
 }
 
 /// What's known: each window, by its object.
@@ -67,9 +81,21 @@ pub(crate) fn windows() -> Option<Vec<Window>> {
     Some(known.as_ref()?.windows.values().cloned().collect())
 }
 
-/// Window `uuid`'s size, as KWin says.
+/// Window `uuid`'s size, as KWin says: its inside's, where it says that.
 pub(crate) fn size(uuid: &str) -> Option<(u32, u32)> {
-    windows()?.into_iter().find(|w| w.uuid == uuid)?.size
+    let (frame, inside) = geometry(uuid)?;
+    inside.or(frame).map(|r| (r.width, r.height))
+}
+
+/// Where window `uuid` is, title bar and borders and all, and where its
+/// inside is, as far as KWin has said.
+pub(crate) fn geometry(uuid: &str) -> Option<(Option<Rect>, Option<Rect>)> {
+    if !following() {
+        return None;
+    }
+    let known = KNOWN.lock().unwrap();
+    let w = known.as_ref()?.windows.values().find(|w| w.uuid == uuid)?;
+    Some((w.frame, w.inside))
 }
 
 /// The active window's process, if KWin lets us follow its windows.
@@ -82,7 +108,7 @@ fn start() -> bool {
     let Ok(conn) = Connection::connect_to_env() else { return false };
     let Ok((globals, mut queue)) = registry_queue_init::<State>(&conn) else { return false };
     let qh = queue.handle();
-    let Ok(_manager) = globals.bind::<management::OrgKdePlasmaWindowManagement, _, _>(&qh, 12..=16, ()) else { return false };
+    let Ok(_manager) = globals.bind::<management::OrgKdePlasmaWindowManagement, _, _>(&qh, 12..=18, ()) else { return false };
     *KNOWN.lock().unwrap() = Some(Known::default());
     let mut state = State;
     // The first answer lists the windows; the second, what each one is.
@@ -135,7 +161,8 @@ impl Dispatch<window::OrgKdePlasmaWindow, ()> for State {
             window::Event::PidChanged { pid } => k.windows.entry(w.id()).or_default().pid = Some(pid),
             window::Event::TitleChanged { title } => k.windows.entry(w.id()).or_default().title = title,
             window::Event::AppIdChanged { app_id } => k.windows.entry(w.id()).or_default().app_id = app_id,
-            window::Event::Geometry { width, height, .. } => k.windows.entry(w.id()).or_default().size = Some((width, height)),
+            window::Event::Geometry { x, y, width, height } => k.windows.entry(w.id()).or_default().frame = Some(Rect { x, y, width, height }),
+            window::Event::ClientGeometry { x, y, width, height } => k.windows.entry(w.id()).or_default().inside = Some(Rect { x, y, width, height }),
             window::Event::StateChanged { flags } => {
                 let win = k.windows.entry(w.id()).or_default();
                 win.active = flags & ACTIVE != 0;
