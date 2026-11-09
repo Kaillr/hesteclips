@@ -1122,6 +1122,12 @@ pub const OUTPUT_SOURCES: bool = cfg!(target_os = "windows");
 /// some out ([`sources::SourceKind::Desktop`]'s `leave_out`): on Windows.
 pub const DESKTOP_PROGRAMS: bool = cfg!(target_os = "windows");
 
+/// Whether what a desktop source leaves out (apps with their own source,
+/// programs), and which device an output source records, change in a
+/// running capture ([`Recorder::set_sources`]): its track goes on, other
+/// streams fill it. On Windows; elsewhere they wait for the next start.
+pub const DESKTOP_CHANGES_WHILE_CAPTURING: bool = cfg!(target_os = "windows");
+
 /// A capture device (screen, app, or audio device) as seen by the backend.
 #[derive(Debug, Clone)]
 pub struct Device {

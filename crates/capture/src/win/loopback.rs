@@ -255,6 +255,10 @@ enum TapChange {
     Add(AudioSource, Arc<SourceFeed>, Arc<Channel>),
     /// By its id.
     Remove(String),
+    /// One running, set up anew (by its id): a desktop leaving out other
+    /// programs, an output device's source given another device. Its feed
+    /// stays; its streams follow at once.
+    Update(AudioSource),
 }
 
 /// One desktop/app source and its streams, owned by the `SystemAudio` thread.
@@ -359,6 +363,13 @@ impl SystemAudio {
     /// once (not waited for).
     pub(crate) fn remove(&self, id: &str) {
         let _ = self.changes.send(TapChange::Remove(id.to_owned()));
+    }
+
+    /// Capture `source` (one running, by its id) as it's set up now: which
+    /// programs a desktop leaves out, which device an output source records.
+    /// Into the same feed, so its track goes on; by its thread, at once.
+    pub(crate) fn update(&self, source: AudioSource) {
+        let _ = self.changes.send(TapChange::Update(source));
     }
 
     pub(crate) fn stop(mut self) {
@@ -546,6 +557,12 @@ fn change_taps(taps: &mut Vec<Tap>, change: TapChange) {
                 let mut tap = taps.remove(at);
                 tap.stop();
                 log_change(&mut tap, "taken out".to_owned());
+            }
+        }
+        // Its streams are brought in line by the rescan that follows.
+        TapChange::Update(source) => {
+            if let Some(tap) = taps.iter_mut().find(|t| t.source.id == source.id) {
+                tap.source = source;
             }
         }
     }
@@ -766,6 +783,29 @@ mod tests {
         assert_eq!(live.channel("discord").status(), SourceStatus::Off);
         child.push(1000.01, &[0.5; 960], 2);
         assert_eq!(feed.arrived(), Some(480), "what came before, and nothing after");
+    }
+
+    /// A source set up anew while capturing (a desktop leaving a program
+    /// out) keeps its feed and the streams it has until the rescan that
+    /// follows decides which it still wants.
+    #[test]
+    fn a_source_set_up_anew_keeps_its_feed() {
+        let live = crate::mixer::LiveAudio::new();
+        let clock = Arc::new(Clock::default());
+        clock.set(1000.0);
+        let feed = SourceFeed::new(RATE, clock);
+        let desktop = |leave_out: Vec<String>| AudioSource { id: "desk".into(), name: "Desktop".into(), kind: SourceKind::Desktop { exclude_app_sources: true, leave_out }, in_mix: true, own_track: false };
+        let mut taps = Vec::new();
+        change_taps(&mut taps, TapChange::Add(desktop(Vec::new()), feed.clone(), live.channel("desk")));
+        let child = feed.add_child(RATE);
+        let stream = Stream { stop: Arc::new(AtomicBool::new(false)), alive: Arc::new(AtomicBool::new(true)), thread: None };
+        taps[0].streams.insert(Target::Exclude(1), (stream, child));
+        change_taps(&mut taps, TapChange::Update(desktop(vec!["FXSound.exe".into()])));
+        change_taps(&mut taps, TapChange::Update(AudioSource { id: "other".into(), ..desktop(Vec::new()) }));
+        assert_eq!(taps.len(), 1, "one not there isn't added");
+        assert_eq!(taps[0].source.kind, SourceKind::Desktop { exclude_app_sources: true, leave_out: vec!["FXSound.exe".into()] });
+        assert!(Arc::ptr_eq(&taps[0].feed, &feed));
+        assert_eq!(taps[0].streams.len(), 1);
     }
 
     /// Sources added to and taken out of a running capture of desktop and

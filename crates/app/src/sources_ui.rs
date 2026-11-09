@@ -1063,7 +1063,8 @@ impl App {
         }
         if let SourceKind::Desktop { exclude_apps, .. } = &mut source.kind {
             crate::ui_kit::menu_sep(ui);
-            let item = Item::new("Leave out apps added below").check(*exclude_apps).enabled(has_app_sources && locked.is_none());
+            let live = locked.is_none() || capture::DESKTOP_CHANGES_WHILE_CAPTURING;
+            let item = Item::new("Leave out apps added below").check(*exclude_apps).enabled(has_app_sources && live);
             if item.tip("Apps you add as their own source won't also be heard here, so nothing plays twice").show(ui).clicked() {
                 *exclude_apps = !*exclude_apps;
             }
@@ -1210,7 +1211,15 @@ impl App {
         };
         let locked = (!self.rec_state.idle()).then(|| self.stop_first());
         let fixed = locked.clone().filter(|_| !capture::SOURCES_WHILE_CAPTURING);
-        let picker_locked = locked.clone().filter(|_| !matches!(self.settings.audio_sources[i].kind, SourceKind::Microphone { .. }));
+        // Changed as it runs: a microphone's device, and (where it can be) an
+        // output source's, and what a desktop leaves out.
+        let live_kind = capture::DESKTOP_CHANGES_WHILE_CAPTURING;
+        let picker_locked = locked.clone().filter(|_| match self.settings.audio_sources[i].kind {
+            SourceKind::Microphone { .. } => false,
+            SourceKind::Output { .. } => !live_kind,
+            _ => true,
+        });
+        let leave_out_locked = locked.clone().filter(|_| !live_kind);
         let note = self.added_note(&self.settings.audio_sources[i]);
         let has_app_sources = self.settings.audio_sources.iter().any(|s| matches!(s.kind, SourceKind::App { .. }));
         let channel = self.live_audio.channel(id);
@@ -1339,7 +1348,7 @@ impl App {
                 }
                 SourceKind::Desktop { exclude_apps, .. } => {
                     let note = if has_app_sources { "Apps added as their own source aren't heard here too" } else { "Once you add an app on its own" };
-                    let row = Row::new("Leave out apps added on their own").note(note).locked(locked.clone().filter(|_| has_app_sources));
+                    let row = Row::new("Leave out apps added on their own").note(note).locked(leave_out_locked.clone().filter(|_| has_app_sources));
                     let (_, clicked_locked) = l.row(row, |ui| {
                         let mut on = exclude_apps;
                         if crate::ui_kit::switch(ui, &mut on).changed()
@@ -1392,7 +1401,7 @@ impl App {
                 });
                 crate::ui_kit::list(ui, ("sound_programs", id), |l| {
                     for row in rows {
-                        let r = Row::new(&row.name).note(row.exe.clone()).locked(locked.clone());
+                        let r = Row::new(&row.name).note(row.exe.clone()).locked(leave_out_locked.clone());
                         let (_, clicked_locked) = l.row(r, |ui| {
                             let mut on = row.recorded;
                             let tip = if on { "Recorded here. Off leaves it out" } else { "Left out. On records it again" };

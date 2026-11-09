@@ -653,6 +653,8 @@ impl AudioCapture {
             self.stop_one(source, feed);
         }
         let mut added = Vec::new();
+        #[cfg_attr(not(target_os = "windows"), allow(unused_mut))]
+        let mut set_anew = false;
         for source in sources {
             match self.captured.iter().position(|(s, _)| s.id == source.id) {
                 None => added.push((source.clone(), self.start_one(source, live))),
@@ -663,10 +665,26 @@ impl AudioCapture {
                     {
                         self.captured[at].0.kind = source.kind.clone();
                     }
+                    // A desktop leaving out other apps or programs, an
+                    // output source given another device: the same track,
+                    // other streams into it.
+                    #[cfg(target_os = "windows")]
+                    if crate::DESKTOP_CHANGES_WHILE_CAPTURING
+                        && self.captured[at].0.kind != source.kind
+                        && matches!(
+                            (&self.captured[at].0.kind, &source.kind),
+                            (SourceKind::Desktop { .. }, SourceKind::Desktop { .. }) | (SourceKind::Output { .. }, SourceKind::Output { .. })
+                        )
+                        && let Some(system) = self.system.as_ref()
+                    {
+                        system.update(source.clone());
+                        self.captured[at].0.kind = source.kind.clone();
+                        set_anew = true;
+                    }
                 }
             }
         }
-        if !gone.is_empty() || !added.is_empty() {
+        if !gone.is_empty() || !added.is_empty() || set_anew {
             self.route_own_sound();
         }
         (added, gone.into_iter().map(|(s, _)| s).collect())
