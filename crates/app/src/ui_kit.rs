@@ -1278,10 +1278,18 @@ pub fn menu_body<R>(ui: &mut egui::Ui, w: f32, add: impl FnOnce(&mut egui::Ui) -
     // doesn't fit scrolls, a little in from its edges. The menu's moved up
     // to end inside it, as it's moved left near the right edge.
     let room = ui.ctx().content_rect().height() - 2.0 * MENU_EDGE;
+    // As tall as its rows were last frame (up to the room there is): egui
+    // sizes a menu by its first frame and keeps that size, and rows can
+    // measure shorter then (a heading) or arrive later (a list being found).
+    let tall = key.with("tall");
+    if let Some(h) = ui.data(|d| d.get_temp::<f32>(tall)) {
+        ui.set_min_height(h.min(room.max(80.0)));
+    }
     MENUS.with(|s| s.borrow_mut().push(key));
-    let r = egui::ScrollArea::vertical().id_salt(key.with("scroll")).max_height(room.max(80.0)).auto_shrink([false, true]).show(ui, add).inner;
+    let out = egui::ScrollArea::vertical().id_salt(key.with("scroll")).max_height(room.max(80.0)).auto_shrink([false, true]).show(ui, add);
     MENUS.with(|s| s.borrow_mut().pop());
-    r
+    ui.data_mut(|d| d.insert_temp(tall, out.content_size.y));
+    out.inner
 }
 
 /// How far a menu stays from the window's top and bottom (its frame too).
@@ -3401,5 +3409,47 @@ mod tests {
             assert_eq!(k(&["Option", "F10"]), format!("{}F10", icon::OPTION));
         }
         assert_eq!(k(&["F8"]), "F8");
+    }
+    /// A menu with a heading shows all of its rows. egui sizes a menu by its
+    /// first frame, in which the heading measured shorter than it is: its
+    /// last row was left half under a scroll bar.
+    #[test]
+    fn a_menu_with_a_heading_shows_its_last_row() {
+        fn row(shape: &egui::Shape, clip: Rect) -> Option<(Rect, Rect)> {
+            match shape {
+                egui::Shape::Text(t) if t.galley.text() == "Ideas others asked for" => Some((t.galley.rect.translate(t.pos.to_vec2()), clip)),
+                egui::Shape::Vec(v) => v.iter().find_map(|s| row(s, clip)),
+                _ => None,
+            }
+        }
+        let ctx = egui::Context::default();
+        apply(&ctx);
+        let button = Rect::from_min_size(Pos2::new(20.0, 20.0), vec2(80.0, 24.0));
+        let frame = |events: Vec<egui::Event>, time: f64| {
+            let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(900.0, 600.0))), max_texture_side: Some(8192), time: Some(time), events, ..Default::default() };
+            let mut out = ctx.run_ui(raw, |ui| {
+                let resp = ui.interact(button, egui::Id::new("a_menu"), egui::Sense::click());
+                menu_popup(&resp, true, 240.0, |ui| {
+                    menu_head(ui, "On GitHub, with a free account");
+                    Item::new("Report a bug").show(ui);
+                    Item::new("Suggest an idea").show(ui);
+                    menu_sep(ui);
+                    Item::new("Ideas others asked for").show(ui);
+                });
+            });
+            out.textures_delta.clear();
+            // The last row's words, and the part of the menu that shows.
+            out.shapes.iter().find_map(|c| row(&c.shape, c.clip_rect))
+        };
+        let at = button.center();
+        let click = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+        frame(vec![], 0.0);
+        frame(vec![egui::Event::PointerMoved(at), click(true), click(false)], 0.1);
+        let mut last = None;
+        for i in 2..8 {
+            last = frame(vec![], 0.1 * f64::from(i));
+        }
+        let (words, shown) = last.expect("the menu's last row");
+        assert!(shown.contains_rect(words), "its last row is cut off: {words:?}, of which {shown:?} shows");
     }
 }
