@@ -30,12 +30,14 @@ pub enum SourceKind {
     Microphone { device: String },
     /// Everything the computer plays. With `exclude_app_sources`, apps that are
     /// also added as their own source are left out, so they aren't heard twice.
-    /// `leave_out`: programs, by executable (`FXSound.exe`), never recorded
-    /// here, e.g. an audio router that plays every app's sound again (Windows;
-    /// what it records shows in its [`Channel::programs`](crate::mixer::Channel::programs)).
+    /// `leave_out`: programs, by executable (`FXSound.exe`; on Linux the
+    /// program's name, as an app source's), never recorded here, e.g. an
+    /// audio router that plays every app's sound again (where
+    /// [`crate::DESKTOP_PROGRAMS`]; what it records shows in its
+    /// [`Channel::programs`](crate::mixer::Channel::programs)).
     Desktop { exclude_app_sources: bool, leave_out: Vec<String> },
-    /// What one output device plays, mixed, as you hear it (Windows,
-    /// [`crate::OUTPUT_SOURCES`]): by device name, or
+    /// What one output device plays, mixed, as you hear it (where
+    /// [`crate::OUTPUT_SOURCES`]): by device name (on Linux its node name), or
     /// [`crate::audio::DEFAULT_DEVICE`] to follow the default one. HasteClip's
     /// own sounds on it are in it too, as played (none are added to it).
     Output { device: String },
@@ -587,8 +589,8 @@ impl AudioCapture {
                     video_sound::listen(&source.id, feed);
                     channel.set_status(crate::mixer::SourceStatus::Live);
                 }
-                // Recorded from its device on Windows only (`OUTPUT_SOURCES`).
-                #[cfg(not(target_os = "windows"))]
+                // Recorded from its device on Windows and Linux (`OUTPUT_SOURCES`).
+                #[cfg(not(any(target_os = "windows", target_os = "linux")))]
                 SourceKind::Output { .. } => channel.set_status(crate::mixer::SourceStatus::Unavailable),
                 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
                 _ => system_sources.push((source.clone(), feed.clone(), channel)),
@@ -653,7 +655,7 @@ impl AudioCapture {
             self.stop_one(source, feed);
         }
         let mut added = Vec::new();
-        #[cfg_attr(not(target_os = "windows"), allow(unused_mut))]
+        #[cfg_attr(not(any(target_os = "windows", target_os = "linux")), allow(unused_mut))]
         let mut set_anew = false;
         for source in sources {
             match self.captured.iter().position(|(s, _)| s.id == source.id) {
@@ -668,7 +670,7 @@ impl AudioCapture {
                     // A desktop leaving out other apps or programs, an
                     // output source given another device: the same track,
                     // other streams into it.
-                    #[cfg(target_os = "windows")]
+                    #[cfg(any(target_os = "windows", target_os = "linux"))]
                     if crate::DESKTOP_CHANGES_WHILE_CAPTURING
                         && self.captured[at].0.kind != source.kind
                         && matches!(
@@ -702,7 +704,7 @@ impl AudioCapture {
                 video_sound::listen(&source.id, &feed);
                 channel.set_status(crate::mixer::SourceStatus::Live);
             }
-            #[cfg(not(target_os = "windows"))]
+            #[cfg(not(any(target_os = "windows", target_os = "linux")))]
             SourceKind::Output { .. } => channel.set_status(crate::mixer::SourceStatus::Unavailable),
             // Desktop or app sound (on Linux a mic too: a PipeWire stream
             // as they are), to a capture of it started now if there's none

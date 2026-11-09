@@ -210,7 +210,7 @@ impl Channel {
         }
     }
 
-    /// The programs a desktop source records right now, by name (Windows,
+    /// The programs a desktop source records right now, by name (where
     /// [`crate::DESKTOP_PROGRAMS`]; empty while it isn't recording).
     pub fn programs(&self) -> Vec<Program> {
         self.programs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()

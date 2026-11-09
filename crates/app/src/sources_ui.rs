@@ -1395,7 +1395,7 @@ impl App {
         {
             let rows = program_rows(&channel.programs(), leave_out);
             if !rows.is_empty() {
-                let tip = "Every program playing sound is recorded here. Leave one out when its sound is heard twice: an audio router or sound enhancer (FXSound, Voicemeeter) plays every other app's sound again, and both are recorded.";
+                let tip = "Every program playing sound is recorded here. Leave one out when its sound is heard twice: an audio router or sound enhancer (FXSound, Voicemeeter, EasyEffects) plays every other app's sound again, and both are recorded.";
                 crate::ui_kit::section_head(ui, "Programs", false, |ui| {
                     crate::ui_kit::info(ui, "Programs", tip);
                 });
