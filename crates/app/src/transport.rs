@@ -518,6 +518,12 @@ pub fn stepped_slider(ui: &mut egui::Ui, value: &mut f32, width: f32, stops: u32
 /// and Esc go on through the page as before). How many steps, if any were
 /// pressed. Not for the players' bars, whose arrows go through the video.
 pub fn arrow_steps(ui: &egui::Ui, slider: &egui::Response) -> Option<i64> {
+    arrow_keys(ui, slider).map(|(d, shift)| if shift { d * 10 } else { d })
+}
+
+/// [`arrow_steps`]' presses, one each, and whether Shift was held: for a
+/// slider whose Shift is its own (a sound's fader's, finer).
+pub fn arrow_keys(ui: &egui::Ui, slider: &egui::Response) -> Option<(i64, bool)> {
     if (slider.clicked() || slider.drag_started()) && !slider.has_focus() {
         slider.request_focus();
     }
@@ -532,17 +538,17 @@ pub fn arrow_steps(ui: &egui::Ui, slider: &egui::Response) -> Option<i64> {
         ui.ctx().request_repaint();
     }
     let mut d = 0;
-    ui.input_mut(|i| {
+    let shift = ui.input_mut(|i| {
         let shift = i.modifiers.shift;
-        let by = if shift { 10 } else { 1 };
         let mods = if shift { egui::Modifiers::SHIFT } else { egui::Modifiers::NONE };
         for (key, sign) in [(egui::Key::ArrowLeft, -1), (egui::Key::ArrowRight, 1)] {
             while i.consume_key(mods, key) {
-                d += sign * by;
+                d += sign;
             }
         }
+        shift
     });
-    (d != 0).then_some(d)
+    (d != 0).then_some((d, shift))
 }
 
 #[cfg(test)]

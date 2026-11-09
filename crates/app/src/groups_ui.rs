@@ -153,7 +153,7 @@ impl App {
             let line = painter.layout_job(ui_kit::single_line_job(&count, theme::font(12.5, W::Regular), pal.text3, (right - x - 32.0 - name_w).max(10.0)));
             painter.galley(pos2(x + 32.0 + name_w, cy - line.size().y / 2.0), line, pal.text3);
         }
-        if crate::ui_kit::opened(&resp) {
+        if crate::ui_kit::double_clicked(&resp) {
             ui.data_mut(|d| d.insert_temp(draft_id, g.name.clone()));
         } else if resp.clicked() || resp.secondary_clicked() {
             self.canvas.selected = Some(Selected::Group(id));

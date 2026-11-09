@@ -121,10 +121,12 @@ fn double_click_time() -> f64 {
     0.5
 }
 
-/// Whether `resp` was double-clicked, to open what it is: a click quickly
-/// before it (selecting it first) makes egui count three, which is no
-/// double-click to it, and it was missed.
-pub fn opened(resp: &Response) -> bool {
+/// Whether `resp` was double-clicked: to open what it is, or put a slider
+/// back as it was. A click a moment before it (selecting it, moving the
+/// slider) makes egui count three, which is no double-click to it, and it
+/// was missed. A third click straight after counts again too: only for
+/// what's the same done twice.
+pub fn double_clicked(resp: &Response) -> bool {
     resp.clicked() && resp.ctx.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary) || i.pointer.button_triple_clicked(egui::PointerButton::Primary))
 }
 
@@ -3035,6 +3037,33 @@ mod tests {
         assert_eq!(following_side(607.5, &r), 608);
         assert_eq!(following_side(9000.0, &r), 4096);
         assert_eq!(following_side(64.0, &(64..=3600)), 64);
+    }
+
+    /// A double-click a moment after a click (one moving a slider, say):
+    /// egui counts its clicks three, no double-click to it; it's one.
+    #[test]
+    fn a_double_click_just_after_a_click_counts() {
+        let ctx = egui::Context::default();
+        ctx.options_mut(|o| o.input_options.max_double_click_delay = 0.5);
+        let at = egui::pos2(50.0, 20.0);
+        let (mut egui_said, mut we_said) = (0, 0);
+        let mut frame = |time: f64, events: Vec<egui::Event>| {
+            let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 200.0))), time: Some(time), events, ..Default::default() };
+            let mut out = ctx.run_ui(raw, |ui| {
+                let resp = ui.allocate_rect(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 40.0)), egui::Sense::click_and_drag());
+                egui_said += i32::from(resp.double_clicked());
+                we_said += i32::from(double_clicked(&resp));
+            });
+            out.textures_delta.clear();
+        };
+        let button = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+        frame(0.0, vec![egui::Event::PointerMoved(at)]);
+        // A click; then a double-click, its clicks 0.15 s apart.
+        for (t, pressed) in [(0.02, true), (0.05, false), (0.68, true), (0.70, false), (0.83, true), (0.85, false)] {
+            frame(t, vec![button(pressed)]);
+        }
+        assert_eq!(egui_said, 0, "egui counted three");
+        assert_eq!(we_said, 1);
     }
 
     /// A click outside a dialog closes it without clicking the page behind.

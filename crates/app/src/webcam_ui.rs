@@ -957,7 +957,7 @@ fn control_widget(ui: &mut egui::Ui, c: &CameraControl, set: &mut Vec<(u32, i64)
                     set.push((c.id, to));
                 }
             }
-            if slider.double_clicked() {
+            if crate::ui_kit::double_clicked(&slider) {
                 set.push((c.id, c.default));
             }
             slider.on_hover_text("Double-click for the camera's default");
@@ -1378,6 +1378,11 @@ fn exposure_widget(ui: &mut egui::Ui, c: &CameraControl, set: &mut Vec<(u32, i64
             set.push((c.id, to));
         }
     }
+    // As the camera's other sliders.
+    if crate::ui_kit::double_clicked(&slider) {
+        set.push((c.id, c.default.clamp(min, max)));
+    }
+    slider.on_hover_text("Double-click for the camera's default");
     if crate::ui_kit::Btn::icon(crate::ui_kit::Kind::Ghost, egui_phosphor::regular::MINUS).small().tip("Shorter").show(ui).clicked()
         && let Some(v) = next(false)
     {
@@ -1414,10 +1419,15 @@ fn exposure_steps(ui: &mut egui::Ui, c: &CameraControl, times: &[(i64, String)],
     if let Some(d) = crate::transport::arrow_steps(ui, &slider) {
         go((i as i64 + d).clamp(0, last as i64) as usize);
     }
+    if crate::ui_kit::double_clicked(&slider)
+        && let Some(d) = times.iter().position(|(v, _)| *v == c.default)
+    {
+        go(d);
+    }
     if crate::ui_kit::Btn::icon(crate::ui_kit::Kind::Ghost, egui_phosphor::regular::MINUS).small().enabled(i > 0).tip("Shorter").show(ui).clicked() {
         go(i.saturating_sub(1));
     }
-    slider.on_hover_text("Each step doubles the time");
+    slider.on_hover_text("Each step doubles the time. Double-click for the camera's default");
 }
 
 /// How steep the exposure slider's curve is: near linear at the bottom (the

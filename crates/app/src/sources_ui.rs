@@ -583,7 +583,7 @@ impl App {
             self.canvas.picked.clear();
             self.select_layer(layer);
         }
-        if crate::ui_kit::opened(&resp) {
+        if crate::ui_kit::double_clicked(&resp) {
             self.edit_layer(layer);
         }
         let was = self.arrangement();
@@ -922,7 +922,7 @@ impl App {
         }
         let gear_rect = egui::Rect::from_center_size(pos2(rect.right() - GEAR_ROOM / 2.0, cy), vec2(26.0, 26.0));
         let gear = settings_button(ui, resp.id.with("gear"), gear_rect, ui.rect_contains_pointer(rect), "Its settings: the limiter  (double-click it)");
-        if crate::ui_kit::opened(&resp.on_hover_text("Every source in the clip's sound, mixed: what people hear")) || gear {
+        if crate::ui_kit::double_clicked(&resp.on_hover_text("Every source in the clip's sound, mixed: what people hear")) || gear {
             self.sources_view.editing = Some(crate::inspector_ui::Editing::Mix);
         }
     }
@@ -995,7 +995,7 @@ impl App {
         // Its settings: its button (while the pointer's on the row), or
         // twice on the row.
         let gear_rect = egui::Rect::from_center_size(pos2(rect.right() - GEAR_ROOM / 2.0, cy), vec2(26.0, 26.0));
-        if settings_button(ui, resp.id.with("gear"), gear_rect, ui.rect_contains_pointer(rect), "Its settings  (double-click it)") || crate::ui_kit::opened(&resp) {
+        if settings_button(ui, resp.id.with("gear"), gear_rect, ui.rect_contains_pointer(rect), "Its settings  (double-click it)") || crate::ui_kit::double_clicked(&resp) {
             action = Some(CardAction::Settings);
         }
         crate::ui_kit::context_menu(&resp, 220.0, |ui| {
@@ -2374,11 +2374,21 @@ fn source_step(s: &crate::settings::RecordSettings, rows: &[(Selected, egui::Rec
     down.or(up)
 }
 
+/// `db` a whole dB on for each of `steps` (back, below 0; tenths with
+/// `fine`), the first to the next whole one: a fader's arrow keys. Within
+/// the fader's range.
+fn db_step(db: f32, steps: i64, fine: bool) -> f32 {
+    let unit = if fine { 0.1 } else { 1.0 };
+    let q = db / unit;
+    let to = if steps > 0 { (q + 1e-3).floor() } else { (q - 1e-3).ceil() } + steps as f32;
+    ((to * unit).clamp(FADER_MIN_DB, FADER_MAX_DB) * 10.0).round() / 10.0
+}
+
 /// A source's volume and level as one control: the meter runs along the
 /// track (green, yellow from −18, red from −6), the knob sits at the volume,
 /// and a tick marks 0 dB. Drag the knob, or anywhere on the track (Shift:
-/// finer); double-click for 0 dB. A right-click on it types one (see
-/// [`volume_value`]).
+/// finer); clicked, ← and → step it a dB (Shift: a tenth); double-click for
+/// 0 dB. A right-click on it types one (see [`volume_value`]).
 fn fader(ui: &mut egui::Ui, db: &mut f32, state: &MeterState, dimmed: bool, width: f32, id: &str) -> egui::Response {
     let pal = crate::theme::pal(ui);
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 22.0), Sense::click_and_drag());
@@ -2411,16 +2421,22 @@ fn fader(ui: &mut egui::Ui, db: &mut f32, state: &MeterState, dimmed: bool, widt
         }
         *db = (v * 10.0).round() / 10.0;
     }
-    if resp.double_clicked() {
+    if crate::ui_kit::double_clicked(&resp) {
         *db = 0.0;
     }
-    let hv = crate::theme::toggle(ui.ctx(), egui::Id::new(("fader_hv", id)), resp.hovered() || resp.dragged(), crate::theme::FAST);
+    // Clicked, it has ← and →: to the next whole dB each, a tenth with
+    // Shift (finer, as dragging with it is).
+    if let Some((steps, fine)) = crate::transport::arrow_keys(ui, &resp) {
+        *db = db_step(*db, steps, fine);
+    }
+    // Lit while it has the keys too.
+    let hv = crate::theme::toggle(ui.ctx(), egui::Id::new(("fader_hv", id)), resp.hovered() || resp.dragged() || resp.has_focus(), crate::theme::FAST);
     let x = crate::theme::value(ui.ctx(), egui::Id::new(("fader_x", id)), track.left() + track.width() * pos(*db) - rect.left(), if resp.dragged() { 0.0 } else { crate::theme::FAST }) + rect.left();
     let knob = egui::Rect::from_center_size(egui::pos2(x, rect.center().y), egui::vec2(8.0 + 2.0 * hv, 20.0));
     let shadow = egui::Shadow { offset: [0, 1], blur: 4, spread: 0, color: Color32::from_black_alpha(110) };
     ui.painter().add(shadow.as_shape(knob, 3));
     ui.painter().rect_filled(knob, 3, Color32::WHITE);
-    resp.on_hover_cursor(egui::CursorIcon::ResizeHorizontal).on_hover_text("Volume: drag the knob (Shift: finer). Double-click for 0 dB, right-click to type one")
+    resp.on_hover_cursor(egui::CursorIcon::ResizeHorizontal).on_hover_text("Volume: drag the knob, or click it and use ← → (Shift: finer). Double-click for 0 dB, right-click to type one")
 }
 
 /// A source's volume, shown, and typed over on a click (or a right-click,
@@ -2802,5 +2818,57 @@ mod tests {
         drag_row(&mut s, Visual(3), 280.0);
         assert_eq!(members(&s), vec![Visual(2)]);
         assert_eq!(s.layer_order(), vec![Visual(1), Visual(4), Visual(2), Visual(3)]);
+    }
+
+    /// A fader's arrows go to the next whole dB (a tenth with Shift),
+    /// within its range.
+    #[test]
+    fn a_fader_steps_by_whole_db() {
+        assert_eq!(db_step(-3.7, 1, false), -3.0);
+        assert_eq!(db_step(-3.0, 1, false), -2.0);
+        assert_eq!(db_step(-3.7, -1, false), -4.0);
+        assert_eq!(db_step(-3.7, 2, false), -2.0);
+        assert_eq!(db_step(-3.7, 1, true), -3.6);
+        assert_eq!(db_step(-3.7, -1, true), -3.8);
+        assert_eq!(db_step(FADER_MIN_DB, 1, false), FADER_MIN_DB + 1.0);
+        assert_eq!(db_step(-59.5, -1, false), FADER_MIN_DB);
+        assert_eq!(db_step(11.5, 3, false), FADER_MAX_DB);
+    }
+
+    /// Clicked, a fader keeps ← and → (the one beside it doesn't get the
+    /// second); double-clicked a moment after that click, it's at 0 dB.
+    #[test]
+    fn a_fader_has_the_arrows_once_clicked() {
+        let ctx = egui::Context::default();
+        let mut dbs = [-3.7f32, 0.0];
+        let frame = |t: f64, events: Vec<egui::Event>, dbs: &mut [f32; 2]| {
+            let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 200.0))), time: Some(t), events, ..Default::default() };
+            let mut rects = [egui::Rect::NOTHING; 2];
+            let state = MeterState::default();
+            let mut out = ctx.run_ui(raw, |ui| {
+                ui.horizontal(|ui| {
+                    for (i, db) in dbs.iter_mut().enumerate() {
+                        rects[i] = fader(ui, db, &state, false, 200.0, &format!("f{i}")).rect;
+                    }
+                });
+            });
+            out.textures_delta.clear();
+            rects
+        };
+        let at = frame(0.0, vec![], &mut dbs)[0].center();
+        let button = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+        let right = || egui::Event::Key { key: egui::Key::ArrowRight, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
+        // A click (it doesn't move it: dragging does), the frame it asks
+        // for, then → twice.
+        for (t, events) in [(0.01, vec![egui::Event::PointerMoved(at)]), (0.10, vec![button(true)]), (0.15, vec![button(false)]), (0.16, vec![]), (0.20, vec![right()]), (0.22, vec![right()])] {
+            frame(t, events, &mut dbs);
+        }
+        assert_eq!(dbs, [-2.0, 0.0]);
+        // A double-click 0.3 s on (egui's own window, here): egui counts
+        // its second click three.
+        for (t, pressed) in [(0.45, true), (0.50, false), (0.55, true), (0.60, false)] {
+            frame(t, vec![button(pressed)], &mut dbs);
+        }
+        assert_eq!(dbs, [0.0, 0.0]);
     }
 }
