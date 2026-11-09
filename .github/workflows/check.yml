@@ -1,0 +1,74 @@
+# Every pull request, and main, built and tested on Windows, macOS and Linux:
+# a change is usually made on one of them, and this says how it fares on the
+# other two (CLAUDE.md, "Platforms"). Clippy builds everything, the tests
+# too; then the tests run. Free for a public repo, like the release.
+
+name: Check
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to the same branch replaces a run still going.
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    # 24.04, not older: the pipewire crate needs PipeWire 1.0's headers (as
+    # the release). Without libavcodec's headers the playback shim is built
+    # to use ffmpeg processes, which is enough to check.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - run: sudo apt-get update && sudo apt-get install -y build-essential libclang-dev libpipewire-0.3-dev libdbus-1-dev libasound2-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo clippy --workspace --all-targets
+
+      - run: cargo test --workspace
+
+  mac:
+    # Apple Silicon, built for the macOS the release supports.
+    runs-on: macos-15
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo clippy --workspace --all-targets
+
+      - run: cargo test --workspace
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo clippy --workspace --all-targets
+
+      - run: cargo test --workspace
