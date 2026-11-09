@@ -2758,6 +2758,90 @@ mod tests {
         assert_eq!((during_in_use, back_in_use), (own, own), "not captured the way it was asked to be");
     }
 
+    /// Issue #34: Windows turning the displays off to save power, and on
+    /// again, froze a display's recording on its last picture until it was
+    /// started again (Windows' capture went on at 4 pictures a second, all
+    /// the same). A changing square's pictures must keep coming once the
+    /// displays are back. Turns every display off for `OFF=<s>` (30), then
+    /// on again. `SCREEN=<id>`; `METHOD=wgc|dupl` (wgc, as on Windows 11).
+    #[test]
+    #[ignore = "turns every display off for a while: SCREEN=\\\\.\\DISPLAY1 OFF=30 cargo test -p capture display_sleep -- --ignored --nocapture"]
+    fn display_sleep() {
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
+        use windows::Win32::System::Power::{ES_DISPLAY_REQUIRED, SetThreadExecutionState};
+        use windows::Win32::UI::WindowsAndMessaging::{HWND_BROADCAST, PostMessageW, SC_MONITORPOWER, WM_SYSCOMMAND};
+        let env = |k: &str| std::env::var(k).ok();
+        let Some(id) = env("SCREEN") else {
+            eprintln!("SCREEN not set: skipped");
+            return;
+        };
+        assert!(system::list_screens().iter().any(|s| s.id == id), "no display {id}");
+        let off = Duration::from_secs_f64(env("OFF").and_then(|s| s.parse().ok()).unwrap_or(30.0));
+        let duplication = env("METHOD").as_deref() == Some("dupl");
+        let method = if duplication { crate::ScreenCapture::Duplication } else { crate::ScreenCapture::Wgc };
+        let settings = EncodeSettings {
+            output_dir: std::env::temp_dir().join("hc-sleep-test"),
+            container_ext: "mp4".into(),
+            fps: 30,
+            blend_samples: 1,
+            blend_shape: crate::BlendShape::Even,
+            video_bitrate_kbps: 2000,
+            size: crate::VideoSize { short_side: Some(360), shape: None, exact: None },
+            use_hardware: true,
+            replay_seconds: 5,
+            video: VideoSource::Screen { id: id.clone(), hook: crate::GameHook { auto: false, allowed: Vec::new() }, method },
+            away_screen: None,
+            webcam: None,
+            layers: crate::layers::main_only(),
+            screen: Arc::new(std::sync::Mutex::new(crate::ScreenPlacement::whole(crate::Framing::Fit))),
+            sources: Vec::new(),
+            stream: None,
+        };
+        unsafe { windows::Win32::UI::HiDpi::SetThreadDpiAwarenessContext(windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+        let mut info = windows::Win32::Graphics::Gdi::MONITORINFO { cbSize: std::mem::size_of::<windows::Win32::Graphics::Gdi::MONITORINFO>() as u32, ..Default::default() };
+        unsafe { windows::Win32::Graphics::Gdi::GetMonitorInfoW(system::find_monitor(&id), &mut info) }.ok().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let square = changing_square(info.rcMonitor.left + 40, info.rcMonitor.top + 40, stop.clone());
+
+        let mut rec = WinRecorder::new(Arc::new(LiveAudio::default()));
+        rec.start(Mode::ReplayBuffer, &settings).unwrap();
+        let latest = rec.outputs.session.as_ref().unwrap().switch.as_ref().unwrap().latest.clone();
+        let t0 = Instant::now();
+        let mut seen = latest.arrivals().0;
+        // Pictures a second, over each half second for `for_`.
+        let mut watch = |phase: &str, for_: Duration| {
+            let mut rates = Vec::new();
+            let end = Instant::now() + for_;
+            while Instant::now() < end {
+                thread::sleep(Duration::from_millis(500));
+                let n = latest.arrivals().0;
+                rates.push((n - seen) * 2);
+                eprintln!("{:5.1} s {phase}: {:3} pictures/s, {:?}", t0.elapsed().as_secs_f64(), (n - seen) * 2, crate::screen_capture_in_use());
+                seen = n;
+            }
+            rates
+        };
+        let before = watch("before", Duration::from_secs(3));
+        // Every display off, as Windows does after the power plan's time.
+        unsafe { PostMessageW(Some(HWND_BROADCAST), WM_SYSCOMMAND, WPARAM(SC_MONITORPOWER as usize), LPARAM(2)) }.unwrap();
+        watch("off", off);
+        // On again, as at a nudge of the mouse.
+        unsafe {
+            SetThreadExecutionState(ES_DISPLAY_REQUIRED);
+            let _ = PostMessageW(Some(HWND_BROADCAST), WM_SYSCOMMAND, WPARAM(SC_MONITORPOWER as usize), LPARAM(-1));
+        }
+        let back = watch("back on", Duration::from_secs(15));
+        rec.stop(Mode::ReplayBuffer, None).unwrap();
+        stop.store(true, Ordering::Relaxed);
+        let _ = square.join();
+
+        // The last 5 s of each.
+        let rate = |v: &[u64]| v[v.len().saturating_sub(10)..].iter().sum::<u64>() as f64 / v.len().clamp(1, 10) as f64;
+        eprintln!("pictures/s: before {:.0}, back on {:.0}", rate(&before), rate(&back));
+        assert!(rate(&before) > 10.0, "the square's pictures didn't come before the displays went off");
+        assert!(rate(&back) > 10.0, "the picture froze once the displays were back on");
+    }
+
     /// The pixel at `x`, `y`, as BGRA.
     fn pixel(gpu: &d3d::Gpu, latest: &d3d::Latest, x: u32, y: u32) -> [u8; 4] {
         let staging = gpu.texture(1, 1, DXGI_FORMAT_B8G8R8A8_UNORM, 0, D3D11_USAGE_STAGING, D3D11_CPU_ACCESS_READ.0 as u32).unwrap();
