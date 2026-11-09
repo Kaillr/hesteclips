@@ -856,9 +856,11 @@ impl Picture {
     }
 }
 
-/// The largest the preview is made: it's shown in a box a third of the
-/// window tall, so more is only more to convert and upload every frame.
-const PREVIEW_MAX: (u32, u32) = (1280, 720);
+/// The largest the preview is made: full size up to 1440p, as Windows', so
+/// things can be lined up on it to the pixel (shrunk, a 1080p picture was
+/// drawn soft); a 4K one is shrunk to 1440p, as every frame is read back,
+/// copied and uploaded, 60 times a second.
+const PREVIEW_MAX: (u32, u32) = (2560, 2560);
 
 /// What's been sent to the preview.
 struct Previewed {
