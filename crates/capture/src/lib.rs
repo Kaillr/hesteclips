@@ -322,7 +322,6 @@ impl ScreenPlacement {
 
     /// [`place`](Self::place), where it's drawn on even pixels (`even`: into
     /// the encoder's 4:2:0 colour) or on any (a full-colour canvas).
-    #[cfg_attr(not(any(target_os = "windows", target_os = "linux", test)), allow(dead_code))]
     pub(crate) fn place_on(&self, content: (u32, u32), frame: (u32, u32), even: bool) -> ([u32; 4], [u32; 4]) {
         if self.hidden {
             return ([0; 4], [0; 4]);
@@ -939,18 +938,24 @@ pub fn choose_screen_again() {
 }
 
 /// Where a display (by its id, as [`list_screens`] gives it) is on the
-/// desktop: its left, top, width and height in pixels. Windows and X11;
-/// elsewhere not known (`None`: see [`display_monitor`]).
+/// desktop: its left, top, width and height, in the units windows are
+/// placed in: pixels on Windows and X11, points on macOS (where windows are
+/// placed in points, a display of any scale). Elsewhere not known (`None`:
+/// see [`display_monitor`]).
 pub fn display_bounds(id: &str) -> Option<[i32; 4]> {
     #[cfg(target_os = "windows")]
     {
         win::display_bounds(id)
     }
+    #[cfg(target_os = "macos")]
+    {
+        mac::display_bounds(id)
+    }
     #[cfg(target_os = "linux")]
     {
         linux::display_bounds(id)
     }
-    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     {
         let _ = id;
         None
@@ -1105,9 +1110,9 @@ pub const STREAMING: bool = cfg!(any(target_os = "windows", target_os = "macos",
 pub const BLEND_WHILE_CAPTURING: bool = cfg!(any(target_os = "windows", target_os = "macos", target_os = "linux"));
 
 /// Whether audio sources can be added to and taken out of a running capture
-/// ([`Recorder::set_sources`]): on Windows and Linux so far; on macOS
-/// they're set when the capture starts.
-pub const SOURCES_WHILE_CAPTURING: bool = cfg!(any(target_os = "windows", target_os = "linux"));
+/// ([`Recorder::set_sources`]): on Windows, macOS and Linux. Where it
+/// can't be, they're set when the capture starts.
+pub const SOURCES_WHILE_CAPTURING: bool = cfg!(any(target_os = "windows", target_os = "macos", target_os = "linux"));
 
 /// A capture device (screen, app, or audio device) as seen by the backend.
 #[derive(Debug, Clone)]
@@ -1474,8 +1479,8 @@ impl PendingClip {
     }
 }
 
-/// Whether [`Recorder::screenshot`] can take one here (Windows and Linux, so far).
-pub const SCREENSHOTS: bool = cfg!(any(target_os = "windows", target_os = "linux"));
+/// Whether [`Recorder::screenshot`] can take one here.
+pub const SCREENSHOTS: bool = cfg!(any(target_os = "windows", target_os = "linux", target_os = "macos"));
 
 /// A screenshot being taken: its picture is the one up when it was asked
 /// for, copied aside on the graphics card; [`PendingShot::finish`] reads it
@@ -1483,7 +1488,7 @@ pub const SCREENSHOTS: bool = cfg!(any(target_os = "windows", target_os = "linux
 pub struct PendingShot(Box<dyn FnOnce() -> anyhow::Result<StillImage> + Send>);
 
 impl PendingShot {
-    #[cfg_attr(not(any(target_os = "windows", target_os = "linux")), allow(dead_code))]
+    #[cfg_attr(not(any(target_os = "windows", target_os = "linux", target_os = "macos")), allow(dead_code))]
     pub(crate) fn new(finish: impl FnOnce() -> anyhow::Result<StillImage> + Send + 'static) -> Self {
         Self(Box::new(finish))
     }

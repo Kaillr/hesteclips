@@ -442,7 +442,7 @@ impl SourceFeed {
     /// it takes no more sound, nor do the feeds it sums, now or added
     /// later. What they've sent is still taken: the mixer runs behind, and
     /// mixes it to its end.
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    #[cfg_attr(not(any(target_os = "windows", target_os = "macos")), allow(dead_code))]
     pub(crate) fn close(&self) {
         // Held while its feeds are closed: none is added meanwhile.
         let mut st = self.st.lock().unwrap();
@@ -955,7 +955,7 @@ pub(crate) struct MixInput {
 /// A change to the sources of a mixer that's running (see
 /// [`spawn_changing_mixer`]). The tracks stay as they are: a file's are set
 /// once it's started.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "windows", target_os = "macos")), allow(dead_code))]
 pub(crate) enum MixChange {
     /// Mix this source in from now on. One taken out before (by its id)
     /// gets its own track back, if it had one. Any other has none: in the

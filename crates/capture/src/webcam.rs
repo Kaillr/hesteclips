@@ -300,9 +300,9 @@ pub(crate) fn set_formats(device: &str, formats: Vec<Format>) {
     FORMATS.lock().unwrap().get_or_insert_with(Default::default).insert(device.to_owned(), formats);
 }
 
-/// Whether several cameras can be open (and drawn) at once: on Windows and
-/// Linux. On macOS one is, the first asked for ([`keep_open`]).
-pub const MANY: bool = cfg!(any(target_os = "windows", target_os = "linux"));
+/// Whether several cameras can be open (and drawn) at once: on Windows,
+/// macOS and Linux.
+pub const MANY: bool = cfg!(any(target_os = "windows", target_os = "macos", target_os = "linux"));
 
 /// Whether cameras have their own settings window ([`open_settings`]): on
 /// Windows, from the driver. macOS has none (its controls are in Control
@@ -407,25 +407,18 @@ pub fn camera_picture(device: &str, max_width: u32, newer_than: u64) -> Option<C
     {
         crate::win::camera_picture(device, max_width, newer_than)
     }
+    #[cfg(target_os = "macos")]
+    {
+        crate::mac::camera::picture(device, max_width, newer_than)
+    }
     #[cfg(target_os = "linux")]
     {
         crate::linux::camera_picture(device, max_width, newer_than)
     }
-    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     {
-        // One camera's open: it, if it's `device`.
-        if SINGLE.lock().unwrap().as_deref() != Some(device) {
-            return None;
-        }
-        #[cfg(target_os = "macos")]
-        {
-            crate::mac::camera::picture(max_width, newer_than)
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = (max_width, newer_than);
-            None
-        }
+        let _ = (device, max_width, newer_than);
+        None
     }
 }
 
@@ -519,41 +512,25 @@ pub fn open_settings(device: &str, name: &str) {
 /// Keep these cameras (device, format) open, and close the rest. Call it
 /// whenever the webcams set up change: a webcam stays open for as long as
 /// it's set up, previewed and recorded or not, because closing a camera can
-/// reset what was set in its own settings window. Doesn't wait. Where only
-/// one can be open ([`MANY`]), the first is.
+/// reset what was set in its own settings window. Doesn't wait.
 pub fn keep_open(want: Vec<(String, Option<Format>)>) {
     #[cfg(target_os = "windows")]
     {
         crate::win::keep_camera_open(want);
     }
+    #[cfg(target_os = "macos")]
+    {
+        crate::mac::camera::keep_open(want);
+    }
     #[cfg(target_os = "linux")]
     {
         crate::linux::keep_camera_open(want);
     }
-    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     {
-        let first = want.into_iter().next();
-        let mut single = SINGLE.lock().unwrap();
-        if *single != first.as_ref().map(|(d, _)| d.clone()) {
-            // Another camera: what was said of the last isn't of this one.
-            *single = first.as_ref().map(|(d, _)| d.clone());
-            STATUS.lock().unwrap().take();
-        }
-        drop(single);
-        #[cfg(target_os = "macos")]
-        {
-            crate::mac::camera::keep_open(first);
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = first;
-        }
+        let _ = want;
     }
 }
-
-/// The one camera kept open, where only one can be ([`MANY`]).
-#[cfg(not(any(target_os = "windows", target_os = "linux")))]
-static SINGLE: Mutex<Option<String>> = Mutex::new(None);
 
 /// Cameras on this machine.
 pub fn list_cameras() -> Vec<Device> {
@@ -602,7 +579,7 @@ pub fn status() -> Status {
 }
 
 /// Camera `device` is in state `s` now; off forgets it.
-#[cfg_attr(not(any(target_os = "windows", target_os = "linux")), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "windows", target_os = "macos", target_os = "linux")), allow(dead_code))]
 pub(crate) fn set_status_of(device: &str, s: Status) {
     let mut all = STATUS.lock().unwrap();
     let all = all.get_or_insert_with(Default::default);
@@ -613,27 +590,16 @@ pub(crate) fn set_status_of(device: &str, s: Status) {
     }
 }
 
-/// The one camera open is in state `s` now (macOS: see [`MANY`]).
-#[cfg(not(any(target_os = "windows", target_os = "linux")))]
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub(crate) fn set_status(s: Status) {
-    let single = SINGLE.lock().unwrap().clone();
-    let mut all = STATUS.lock().unwrap();
-    let all = all.get_or_insert_with(Default::default);
-    all.clear();
-    if let Some(device) = single.filter(|_| s != Status::Off) {
-        all.insert(device, s);
-    }
-}
-
-/// For checks: the size of the newest picture the open camera delivered.
-pub fn frame_size() -> Option<(usize, usize)> {
+/// For checks: the size of the newest picture camera `device` delivered,
+/// if it's open (macOS).
+pub fn frame_size(device: &str) -> Option<(usize, usize)> {
     #[cfg(target_os = "macos")]
     {
-        crate::mac::camera::frame_size()
+        crate::mac::camera::frame_size(device)
     }
     #[cfg(not(target_os = "macos"))]
     {
+        let _ = device;
         None
     }
 }

@@ -84,7 +84,7 @@ objc2 = "0.6.4"
 objc2-io-surface = { version = "0.3.2", default-features = false, features = ["std", "IOSurfaceRef", "objc2"] }
 objc2-metal = { version = "0.3.2", default-features = false, features = ["std", "MTLAllocation", "MTLDevice", "MTLPixelFormat", "MTLResource", "MTLTexture", "objc2-io-surface"] }
 objc2-foundation = { version = "0.3.2", features = ["NSArray", "NSString", "NSURL", "NSGeometry", "NSFileManager", "NSError"] }
-objc2-app-kit = { version = "0.3.2", features = ["NSSharingService", "NSView", "NSResponder", "NSWindow", "NSToolbar", "NSButton", "NSControl"] }
+objc2-app-kit = { version = "0.3.2", features = ["NSSharingService", "NSView", "NSResponder", "NSWindow", "NSToolbar", "NSButton", "NSControl", "NSEvent"] }
 # Checking a downloaded update (update_mac.rs).
 sha2 = "0.11"
 # Shortcuts while a game holds the screen: a listen-only key tap (key_tap.rs).

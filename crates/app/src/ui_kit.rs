@@ -104,7 +104,8 @@ pub fn apply(ctx: &egui::Context) {
         ctx.style_mut_of(theme, |style| style_for(style, p));
     }
     // Two clicks are a double-click as far apart as the system has it
-    // (Windows' is half a second): egui's own 0.3 s missed many.
+    // (Windows' is half a second, as is macOS's unless it's changed in
+    // System Settings): egui's own 0.3 s missed many.
     ctx.options_mut(|o| o.input_options.max_double_click_delay = double_click_time());
 }
 
@@ -116,6 +117,13 @@ fn double_click_time() -> f64 {
         let ms = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime() };
         if ms > 0 {
             return f64::from(ms) / 1000.0;
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let secs = objc2_app_kit::NSEvent::doubleClickInterval();
+        if secs > 0.0 {
+            return secs;
         }
     }
     0.5

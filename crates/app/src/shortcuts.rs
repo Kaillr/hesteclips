@@ -317,11 +317,6 @@ pub fn alt_name() -> &'static str {
     if cfg!(target_os = "macos") { "Option" } else { "Alt" }
 }
 
-/// Ctrl (egui's `ctrl`): Control on a Mac, where Cmd is the command key.
-pub fn ctrl_name() -> &'static str {
-    if cfg!(target_os = "macos") { "Control" } else { "Ctrl" }
-}
-
 fn key_name(code: Code) -> String {
     let raw = code.to_string();
     let name = raw.strip_prefix("Key").or_else(|| raw.strip_prefix("Digit")).unwrap_or(&raw);

@@ -752,7 +752,7 @@ impl App {
     /// The preview's own menu (right-click it where no source is): undo,
     /// redo, the video's size, and previewing it on a monitor.
     fn canvas_menu(&mut self, ui: &mut egui::Ui) {
-        let ctrl = crate::shortcuts::ctrl_name();
+        let ctrl = crate::shortcuts::cmd_name();
         let keys = |k: &[&str]| Some(k.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>());
         if Item::new("Undo").icon(icon::ARROW_COUNTER_CLOCKWISE).enabled(!self.canvas.undo.is_empty()).keys(keys(&[ctrl, "Z"])).show(ui).clicked() {
             self.undo_arrangement();
@@ -1304,7 +1304,7 @@ impl App {
     /// removing it, with the keys that do the same.
     pub(crate) fn layer_menu(&mut self, ui: &mut egui::Ui, layer: Layer, aspect: f32) {
         let screen = layer == Layer::Screen;
-        let ctrl = crate::shortcuts::ctrl_name();
+        let ctrl = crate::shortcuts::cmd_name();
         let keys = |k: &[&str]| Some(k.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>());
         // What it does, it does to each source picked with it in the list.
         let set = self.grouping(layer);

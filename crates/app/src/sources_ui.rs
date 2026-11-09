@@ -488,7 +488,7 @@ impl App {
             }
             let glyph = if locked { icon::LOCK_SIMPLE } else { icon::LOCK_SIMPLE_OPEN };
             painter.text(lock_rect.center(), Align2::CENTER_CENTER, glyph, FontId::proportional(14.0), if locked { pal.text2 } else { pal.text3 });
-            let ctrl = crate::shortcuts::ctrl_name();
+            let ctrl = crate::shortcuts::cmd_name();
             let tip = if locked { format!("Unlock it: it moves on the preview again  ({ctrl}+Shift+L)") } else { format!("Lock it: it can't be moved on the preview, and clicks go through it  ({ctrl}+Shift+L)") };
             if lock.on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                 self.settings.set_locked(layer, !locked);

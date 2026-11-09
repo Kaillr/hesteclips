@@ -113,7 +113,7 @@ impl App {
     /// when `selection`), and Paste as a copy when what's copied has a
     /// source that can be one.
     pub(crate) fn clipboard_items(&mut self, ui: &mut egui::Ui, selection: bool, aspect: f32) {
-        let ctrl = crate::shortcuts::ctrl_name();
+        let ctrl = crate::shortcuts::cmd_name();
         let keys = |k: &[&str]| Some(k.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>());
         if selection {
             if Item::new("Cut").icon(icon::SCISSORS).keys(keys(&[ctrl, "X"])).tip("Out of this scene, to paste into another").show(ui).clicked() {

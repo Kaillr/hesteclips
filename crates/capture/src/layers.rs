@@ -9,9 +9,10 @@
 //! a capture keeps what it opened for it (a camera, a display's capture) for
 //! as long as it's there.
 //!
-//! Windows and Linux draw every layer ([`MANY`]). macOS draws the recording's
-//! own picture and one webcam (`EncodeSettings::webcam`), in front or behind
-//! as `ScreenPlacement::in_front` says.
+//! Windows, macOS and Linux draw every layer ([`MANY`]). Where it can't be
+//! done, the recording's own picture and one webcam
+//! (`EncodeSettings::webcam`) are drawn, in front or behind as
+//! `ScreenPlacement::in_front` says.
 
 use std::sync::{Arc, Mutex};
 
@@ -20,7 +21,7 @@ use crate::webcam::{Format, Placement};
 
 /// Whether this platform draws more than the recording's own picture and
 /// one webcam: several webcams, other displays, in any order.
-pub const MANY: bool = cfg!(any(target_os = "windows", target_os = "linux"));
+pub const MANY: bool = cfg!(any(target_os = "windows", target_os = "macos", target_os = "linux"));
 
 /// What a layer shows, and where.
 #[derive(Debug, Clone, PartialEq)]
@@ -46,7 +47,7 @@ pub enum LayerSource {
     Colour { rgba: [u8; 4], placement: ScreenPlacement },
     /// A web page (alerts, a chat overlay), `width`×`height` big, `css`
     /// added to it, blended by its transparency, placed as a display is
-    /// (Windows: see [`BROWSER`]).
+    /// (see [`BROWSER`]).
     Browser { url: String, width: u32, height: u32, css: String, placement: ScreenPlacement },
     /// A picture that moves (an animated GIF): each of its frames for its
     /// time, over and over, blended as a picture is.
@@ -57,15 +58,16 @@ pub enum LayerSource {
     /// waiting while it's hidden and going on when it's shown again, or
     /// starting over (`restart`). Its sound plays into the audio source
     /// `sound` names, if it does (`sources::SourceKind::Video`). Placed as
-    /// a display is (Windows: see [`VIDEO`]).
+    /// a display is (see [`VIDEO`]).
     Video { path: std::path::PathBuf, width: u32, height: u32, fps: f64, looped: bool, restart: bool, sound: Option<String>, placement: ScreenPlacement },
 }
 
-/// Whether this platform can show a web page as a layer.
-pub const BROWSER: bool = cfg!(target_os = "windows");
+/// Whether this platform can show a web page as a layer: WebView2 on
+/// Windows, WebKit on macOS.
+pub const BROWSER: bool = cfg!(any(target_os = "windows", target_os = "macos"));
 
 /// Whether this platform can play a video file as a layer.
-pub const VIDEO: bool = cfg!(any(target_os = "windows", target_os = "linux"));
+pub const VIDEO: bool = cfg!(any(target_os = "windows", target_os = "macos", target_os = "linux"));
 
 /// A video file's picture size, if it can be played (see [`VIDEO`]).
 pub fn video_size(path: &std::path::Path) -> Option<(u32, u32)> {
@@ -73,11 +75,15 @@ pub fn video_size(path: &std::path::Path) -> Option<(u32, u32)> {
     {
         crate::win::decode::Decoder::open_rgba(path, 64).ok().map(|d| d.source_size())
     }
+    #[cfg(target_os = "macos")]
+    {
+        crate::mac::layers::video_size(path)
+    }
     #[cfg(target_os = "linux")]
     {
         crate::linux::video_size(path)
     }
-    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     {
         let _ = path;
         None
@@ -117,20 +123,25 @@ impl LayerSource {
 /// Whether this platform can capture one app's window as a layer (on
 /// Linux where its games and apps can be recorded: `list_windowed_apps`
 /// lists none elsewhere).
-pub const WINDOWS: bool = cfg!(any(target_os = "windows", target_os = "linux"));
+pub const WINDOWS: bool = cfg!(any(target_os = "windows", target_os = "macos", target_os = "linux"));
 
-/// App `exe`'s main window's inside, in pixels, if it's open (Windows;
-/// Linux as its layer last captured it, or as KDE Plasma says).
+/// App `exe`'s main window's inside, in pixels, if it's open (Windows; on
+/// macOS an app by its bundle id: its frontmost window; Linux as its layer
+/// last captured it, or as KDE Plasma says).
 pub fn app_window_size(exe: &str) -> Option<(u32, u32)> {
     #[cfg(target_os = "windows")]
     {
         crate::win::app_window_size(exe)
     }
+    #[cfg(target_os = "macos")]
+    {
+        crate::mac::layers::app_window_size(exe)
+    }
     #[cfg(target_os = "linux")]
     {
         crate::linux::app_window_size(exe)
     }
-    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     {
         let _ = exe;
         None

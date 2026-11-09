@@ -97,7 +97,7 @@ pub(crate) struct AudioCapture {
     /// and those added since ([`Self::set_sources`]), less those taken out.
     captured: Vec<(AudioSource, Arc<SourceFeed>)>,
     /// What every source's sound is placed by.
-    #[cfg_attr(not(any(target_os = "windows", target_os = "linux")), allow(dead_code))]
+    #[cfg_attr(not(any(target_os = "windows", target_os = "macos", target_os = "linux")), allow(dead_code))]
     clock: Arc<Clock>,
     #[cfg(not(target_os = "linux"))]
     mics: Mics,
@@ -355,7 +355,7 @@ impl Mics {
     /// Capture `mic` too, while capturing: the watch opens it, woken now.
     /// Not here: an open can take seconds (a Bluetooth headset), and
     /// whoever adds it would wait.
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    #[cfg_attr(not(any(target_os = "windows", target_os = "macos")), allow(dead_code))]
     fn add(&mut self, mic: Mic) {
         locked(&self.list).push(mic);
         self.watch();
@@ -366,7 +366,7 @@ impl Mics {
 
     /// Stop capturing the mic of the source `id`, while capturing: it's
     /// closed, and Off. False if there's no such mic.
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    #[cfg_attr(not(any(target_os = "windows", target_os = "macos")), allow(dead_code))]
     fn remove(&self, id: &str) -> bool {
         let mut list = locked(&self.list);
         let Some(at) = list.iter().position(|m| m.id == id) else { return false };
@@ -626,7 +626,7 @@ impl AudioCapture {
     /// [`Self::set_mic`]). Anything else about one captured already (where
     /// it goes, which apps it leaves out) stays as it started. The sources
     /// added, with their feeds, and those taken out, for the mixer.
-    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
     pub(crate) fn set_sources(&mut self, sources: &[AudioSource], live: &LiveAudio) -> (Vec<(AudioSource, Arc<SourceFeed>)>, Vec<AudioSource>) {
         let mut gone = Vec::new();
         self.captured.retain(|(s, feed)| {
@@ -660,12 +660,12 @@ impl AudioCapture {
     }
 
     /// Start capturing `source` too, while capturing: its feed.
-    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
     fn start_one(&mut self, source: &AudioSource, live: &LiveAudio) -> Arc<SourceFeed> {
         let feed = SourceFeed::new(crate::mixer::RATE, self.clock.clone());
         let channel = live.channel(&source.id);
         match &source.kind {
-            #[cfg(target_os = "windows")]
+            #[cfg(not(target_os = "linux"))]
             SourceKind::Microphone { device } => self.mics.add(Mic::new(&source.id, device, feed.clone(), channel)),
             SourceKind::Video { .. } => {
                 video_sound::listen(&source.id, &feed);
@@ -698,12 +698,12 @@ impl AudioCapture {
 
     /// Stop capturing `source`, whose feed is `feed`, while capturing: what
     /// its feed has is still there to mix.
-    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
     fn stop_one(&mut self, source: &AudioSource, feed: &Arc<SourceFeed>) {
         feed.close();
         own_sound::forget(feed);
         match source.kind {
-            #[cfg(target_os = "windows")]
+            #[cfg(not(target_os = "linux"))]
             SourceKind::Microphone { .. } => {
                 self.mics.remove(&source.id);
             }

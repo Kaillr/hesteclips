@@ -163,14 +163,14 @@ HasteClip is in beta (versions 0.x). It works day to day, but not every feature 
 | Replay buffer, recording, editor, library | ✅ | ✅ | ✅ |
 | Share links, copy, export and import | ✅ | ✅ | ✅ |
 | Voice saving, named clips, per-app sound, webcam | ✅ | ✅ | ✅ |
-| Several webcams, other displays, windows, images, text and videos in the video | — | ✅ | ✅ |
-| A web page in the video (alerts, chat) | — | ✅ | — |
+| Several webcams, other displays, windows, images, text and videos in the video | ✅ | ✅ | ✅ |
+| A web page in the video (alerts, chat) | ✅ | ✅ | — |
 | Record a single game or app window | ✅ | ✅ | ✅ (see below) |
 | Drag clips out, system share sheet | ✅ | ✅ | Drag out on Wayland (no share sheet) |
 | Frame blending | ✅ | ✅ | ✅ |
 | Go live (streaming) | ✅ | ✅ | ✅ |
 | Automatic updates | ✅ | ✅ | ✅ |
-| Screenshots | — | ✅ | ✅ |
+| Screenshots | ✅ | ✅ | ✅ |
 | Game capture for fullscreen games | — | ✅ | — |
 
 **Games and apps on Linux:** every window on KDE Plasma, on X11 desktops, and on Sway and other desktops with the ext window capture protocols (Sway 1.11 and later). On GNOME, the windows of X11 apps, which includes games run through Proton or Wine; GNOME doesn't let apps follow its native Wayland windows, so record the whole screen for those.
