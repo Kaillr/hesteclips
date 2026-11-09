@@ -175,6 +175,59 @@ pub fn tint_title_bar(window: &impl raw_window_handle::HasWindowHandle, caption:
     DONE.store(now, Ordering::Relaxed);
 }
 
+/// Windows: the window goes on drawing while it's held to move or resize
+/// it. Windows runs a loop of its own then, till the mouse is let go, and
+/// the app's own loop (which says when to draw next: the preview, the
+/// meters) waits, so the window stood still the whole time; a timer on it
+/// asks for a picture every 15 ms meanwhile. Once (every frame, it's seen
+/// it's done).
+#[cfg(target_os = "windows")]
+pub fn keep_drawing_while_held(window: &impl raw_window_handle::HasWindowHandle) {
+    use raw_window_handle::RawWindowHandle;
+    use std::sync::atomic::{AtomicIsize, Ordering};
+    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+    use windows::Win32::Graphics::Gdi::{RDW_INTERNALPAINT, RedrawWindow};
+    use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
+    use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_TIMER};
+    /// The timer's id on the window ("HC").
+    const TIMER: usize = 0x4843;
+    /// The window it's done for.
+    static DONE: AtomicIsize = AtomicIsize::new(0);
+    // Its messages first: the timer started and stopped with the loop,
+    // each tick a picture asked for (Windows sends the window a paint, which
+    // the app draws on).
+    unsafe extern "system" fn held(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM, _id: usize, _data: usize) -> LRESULT {
+        // SAFETY: Windows calls this on the window's own thread, for the
+        // window it was set on.
+        unsafe {
+            match msg {
+                WM_ENTERSIZEMOVE => {
+                    SetTimer(Some(hwnd), TIMER, 15, None);
+                }
+                WM_EXITSIZEMOVE => {
+                    let _ = KillTimer(Some(hwnd), TIMER);
+                }
+                WM_TIMER if wparam.0 == TIMER => {
+                    let _ = RedrawWindow(Some(hwnd), None, None, RDW_INTERNALPAINT);
+                    return LRESULT(0);
+                }
+                _ => {}
+            }
+            DefSubclassProc(hwnd, msg, wparam, lparam)
+        }
+    }
+    let Ok(handle) = window.window_handle() else { return };
+    let RawWindowHandle::Win32(h) = handle.as_raw() else { return };
+    let raw = h.hwnd.get();
+    if DONE.load(Ordering::Relaxed) == raw {
+        return;
+    }
+    // SAFETY: our live top-level window, on its own thread (this one).
+    if unsafe { SetWindowSubclass(HWND(raw as *mut _), Some(held), 1, 0) }.as_bool() {
+        DONE.store(raw, Ordering::Relaxed);
+    }
+}
+
 /// Windows: the window cloaked (`on`), or not: the desktop's compositor
 /// keeps a cloaked window off the screen (and out of the taskbar) while it's
 /// shown and drawn. See `App::start_in_tray`.
@@ -269,6 +322,8 @@ pub enum ToastAction {
     Undelete(crate::library::Binned),
     /// Copy the clip's share link.
     CopyLink(std::path::PathBuf),
+    /// Undo the last change to the Sources page's sources (one removed).
+    UndoSources,
 }
 
 #[derive(Clone)]
@@ -607,6 +662,49 @@ impl App {
         if Item::new("Sources").icon(icon::FADERS).value(self.sources_summary()).show(ui).clicked() {
             self.page = Page::Sources;
         }
+        // The scene shown, switched from anywhere (live while capturing),
+        // and the preset in use (another needs a fresh capture: clipping
+        // starts again, once asked; never while recording or streaming).
+        if self.settings.scenes.len() > 1 {
+            let shown = self.settings.active_scene;
+            let scenes: Vec<(u64, String)> = self.settings.scenes.iter().map(|s| (s.id, s.name.clone())).collect();
+            let now = self.settings.scene().map(|s| s.name.clone()).unwrap_or_default();
+            let mut picked = None;
+            ui_kit::submenu(ui, Item::new("Scene").icon(icon::MONITOR_PLAY).value(now), |ui| {
+                for (id, name) in scenes {
+                    if Item::new(name).check(id == shown).show(ui).clicked() {
+                        picked = Some(id);
+                    }
+                }
+            });
+            if let Some(id) = picked {
+                self.show_scene(id);
+                ui.close();
+            }
+        }
+        if self.settings.presets.len() > 1 {
+            let using = self.settings.active_preset;
+            let presets: Vec<(u64, String)> = self.settings.presets.iter().map(|p| (p.id, p.name.clone())).collect();
+            let now = self.settings.preset().map(|p| p.name.clone()).unwrap_or_default();
+            let locked = self.presets_locked();
+            let mut picked = None;
+            ui_kit::submenu(ui, Item::new("Preset").icon(icon::STACK).value(now), |ui| {
+                for (id, name) in presets {
+                    let item = Item::new(name).check(id == using);
+                    let item = match &locked {
+                        Some(why) if id != using => item.enabled(false).tip(why.clone()),
+                        _ => item,
+                    };
+                    if item.show(ui).clicked() {
+                        picked = Some(id);
+                    }
+                }
+            });
+            if let Some(id) = picked {
+                self.pick_preset(id);
+                ui.close();
+            }
+        }
         if state.streaming && Item::new("Streaming settings").icon(icon::GEAR).show(ui).clicked() {
             self.open_settings(crate::settings_ui::Pane::Streaming);
         }
@@ -651,6 +749,7 @@ impl App {
                 crate::settings::SourceKind::Microphone { .. } => "mic".into(),
                 crate::settings::SourceKind::Desktop { .. } => "desktop".into(),
                 crate::settings::SourceKind::App { app_name, .. } => app_name.clone(),
+                crate::settings::SourceKind::Video { .. } => "video".into(),
             });
         }
         parts.dedup();
@@ -793,6 +892,7 @@ impl App {
                 }
                 ToastAction::Undelete(binned) => self.undelete(binned),
                 ToastAction::CopyLink(clip) => self.copy_link(&clip),
+                ToastAction::UndoSources => self.undo_arrangement(),
             }
         }
     }

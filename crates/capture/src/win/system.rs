@@ -170,12 +170,27 @@ pub(crate) fn display_pixels(id: Option<&str>) -> Option<(u32, u32)> {
 }
 
 /// The monitor with this device name, else the main one.
+/// Display `id`, if it's connected.
+pub(crate) fn connected_monitor(id: &str) -> Option<HMONITOR> {
+    monitors().into_iter().find(|m| m.device == id).map(|m| m.handle)
+}
+
 pub(crate) fn find_monitor(id: &str) -> HMONITOR {
     monitors()
         .into_iter()
         .find(|m| m.device == id)
         .map(|m| m.handle)
         .unwrap_or_else(|| unsafe { MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY) })
+}
+
+/// Where a display is on the desktop, by device name: its left, top, width
+/// and height, in the desktop's pixels. `None` if it isn't there.
+pub fn display_bounds(id: &str) -> Option<[i32; 4]> {
+    let m = monitors().into_iter().find(|m| m.device == id)?;
+    let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+    unsafe { GetMonitorInfoW(m.handle, &mut info) }.ok().ok()?;
+    let r = info.rcMonitor;
+    Some([r.left, r.top, r.right - r.left, r.bottom - r.top])
 }
 
 // ---------------------------------------------------------------------------
@@ -547,6 +562,14 @@ pub(crate) fn client_area_in_capture(hwnd: HWND) -> Option<(u32, u32, u32, u32)>
         SetThreadDpiAwarenessContext(previous);
         result
     }
+}
+
+/// App `exe`'s main window's inside (see [`find_app_window`]), in pixels,
+/// if it's open and not minimized.
+pub fn app_window_size(exe: &str) -> Option<(u32, u32)> {
+    let hwnd = find_app_window(exe).filter(|h| !window_minimized(*h))?;
+    let (_, _, w, h) = client_area_in_capture(hwnd)?;
+    (w >= 2 && h >= 2).then_some((w, h))
 }
 
 /// The full path of a running app, by executable name.

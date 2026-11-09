@@ -442,7 +442,7 @@ fn relink(core: &pw::core::CoreRc, g: &Graph, c: &mut Capture, app_ids: &[String
         match &c.source.kind {
             SourceKind::App { bundle_id } => app.is(bundle_id),
             SourceKind::Desktop { exclude_app_sources } => !*exclude_app_sources || !app_ids.iter().any(|a| app.is(a)),
-            SourceKind::Microphone { .. } => false,
+            SourceKind::Microphone { .. } | SourceKind::Video { .. } => false,
         }
     };
     let sources: Vec<u32> = g.playback().filter(|(_, n)| wanted_node(n)).map(|(id, _)| id).collect();

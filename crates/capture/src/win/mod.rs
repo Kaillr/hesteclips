@@ -21,6 +21,7 @@
 
 mod aac;
 pub mod anticheat;
+mod browser;
 mod camera;
 mod changes;
 mod cursor;
@@ -32,8 +33,10 @@ pub(crate) mod direct;
 pub mod gpu;
 mod h264;
 pub mod hook;
+mod layers;
 mod loopback;
 mod quad;
+mod sound_file;
 pub(crate) mod system;
 
 use std::path::{Path, PathBuf};
@@ -49,7 +52,7 @@ pub(crate) use loopback::SystemAudio;
 pub(crate) use system::host_now;
 pub use camera::{keep_open as keep_camera_open, list_cameras, open_camera_settings};
 pub(crate) use camera::{controls as camera_controls, picture as camera_picture, set_control as set_camera_control};
-pub use system::{cursor_state, foreground_app_path, foreground_exe, list_apps, list_screens, list_windowed_apps};
+pub use system::{app_window_size, cursor_state, display_bounds, foreground_app_path, foreground_exe, list_apps, list_screens, list_windowed_apps};
 pub(crate) use system::display_pixels;
 
 use crate::mixer::{self, Clock, LiveAudio, MixChange, MixInput};
@@ -199,12 +202,12 @@ struct Session {
 }
 
 /// What the stream's own pictures are made from: the frame the pacer
-/// makes (its average), with the webcam over it and the screen placed, as
-/// the recording's.
+/// makes (its average), with the other layers over it or under it and the
+/// screen placed, as the recording's.
 struct StreamFrom {
     gpu: d3d::Gpu,
     average: Arc<d3d::Latest>,
-    camera: Option<(Arc<d3d::Latest>, crate::webcam::SharedPlacement)>,
+    feeds: Arc<layers::Feeds>,
     screen: crate::SharedScreen,
     hardware: bool,
 }
@@ -333,7 +336,7 @@ impl Capture for Session {
             return Ok(());
         };
         let from = self.stream_from.as_ref().context("the capture can't stream")?;
-        let camera = || from.camera.as_ref().map(|(latest, placement)| (latest, placement.clone()));
+        let camera = || Some(from.feeds.clone());
         let (renditions, _) = crate::stream::renditions(st, self.fps);
         let mut outs = Vec::with_capacity(renditions.len());
         for (i, r) in renditions.iter().enumerate() {
@@ -437,16 +440,11 @@ impl Session {
             let latest = picture.latest.clone();
             session.video = Some(picture.video);
             session.switch = Some(Switch { gpu: gpu.clone(), latest: latest.clone(), fps: looks_per_second, away: s.away_screen.clone(), source: s.video.clone() });
-            // A webcam that can't open doesn't stop the recording: its status
-            // says why, and the picture goes on without it.
-            let camera = s.webcam.as_ref().and_then(|w| match camera::CameraLayer::new(&gpu, w) {
-                Ok(c) => Some(c),
-                Err(e) => {
-                    eprintln!("webcam: {e:#}");
-                    None
-                }
-            });
-            let overlay = camera.as_ref().zip(s.webcam.as_ref()).map(|(c, w)| (&c.latest, w.placement.clone()));
+            // The other layers: a webcam or display that can't open doesn't
+            // stop the recording (its status says why), the picture goes on
+            // without it.
+            let feeds = layers::Feeds::new(&gpu, s.layers.clone(), looks_per_second);
+            let overlay = Some(feeds.clone());
             // Each frame comes from the pictures shown during it, timed by
             // when each came up (see `FrameBlend`): with blending their
             // average, without it the one up at the frame's time. Taking the
@@ -463,12 +461,12 @@ impl Session {
             session.stream_from = Some(StreamFrom {
                 gpu: gpu.clone(),
                 average: blend.average.clone(),
-                camera: camera.as_ref().zip(s.webcam.as_ref()).map(|(c, w)| (c.latest.clone(), w.placement.clone())),
+                feeds: feeds.clone(),
                 screen: s.screen.clone(),
                 hardware: s.use_hardware,
             });
             let ctl = PacerCtl { blend: session.blend_ctl.clone(), stream: session.stream_ctl.clone() };
-            session.pacer = Some(spawn_blend_pacer(s.fps, looks, shutter, latest, blend, converter, encoder, preview, camera, clock, ctl));
+            session.pacer = Some(spawn_blend_pacer(s.fps, looks, shutter, latest, blend, converter, encoder, preview, Some(feeds), clock, ctl));
             Ok(())
         })();
         if let Err(e) = started {
@@ -774,7 +772,7 @@ impl PreviewCapture {
         size: crate::VideoSize,
         fps: u32,
         away: Option<Arc<crate::StillImage>>,
-        webcam: Option<crate::webcam::Webcam>,
+        layers: crate::SharedLayers,
         screen: crate::SharedScreen,
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
@@ -785,7 +783,7 @@ impl PreviewCapture {
         let apps2 = apps.clone();
         thread::spawn(move || {
             system::com_init();
-            let opened = (|| -> Result<(Picture, d3d::Previewer, Option<camera::CameraLayer>)> {
+            let opened = (|| -> Result<(Picture, d3d::Previewer, Arc<layers::Feeds>)> {
                 let gpu = d3d::Gpu::for_capture()?;
                 let (mut source, (w, h)) = PictureSource::plan(&source)?;
                 if let (PictureSource::Apps(list), Some(shared)) = (&mut source, apps2) {
@@ -793,12 +791,11 @@ impl PreviewCapture {
                 }
                 let picture = source.open(&gpu, w, h, fps, away)?;
                 let (width, height) = size.of(w, h);
-                let cam = webcam.as_ref().and_then(|wc| camera::CameraLayer::new(&gpu, wc).ok());
-                let overlay = cam.as_ref().zip(webcam.as_ref()).map(|(c, wc)| (&c.latest, wc.placement.clone()));
-                let preview = d3d::Previewer::new(&gpu, &picture.latest, overlay, width, height, fps, screen, generation)?;
-                Ok((picture, preview, cam))
+                let feeds = layers::Feeds::new(&gpu, layers, fps);
+                let preview = d3d::Previewer::new(&gpu, &picture.latest, Some(feeds.clone()), width, height, fps, screen, generation)?;
+                Ok((picture, preview, feeds))
             })();
-            let (picture, preview, mut cam) = match opened {
+            let (picture, preview, feeds) = match opened {
                 Ok(p) => p,
                 Err(e) => {
                     *error2.lock().unwrap() = Some(format!("{e:#}"));
@@ -811,9 +808,7 @@ impl PreviewCapture {
             let t0 = host_now();
             let mut n = 0u64;
             while !stop2.load(Ordering::Relaxed) {
-                if let Some(c) = cam.as_mut() {
-                    c.pull();
-                }
+                feeds.update();
                 if let Err(e) = preview.submit() {
                     eprintln!("preview: {e:#}");
                 }
@@ -826,7 +821,7 @@ impl PreviewCapture {
                 }
             }
             drop(preview);
-            drop(cam);
+            drop(feeds);
             picture.video.stop();
         });
         Self { stop, error, apps }
@@ -1748,7 +1743,8 @@ struct BlendPacer {
     converter: d3d::Converter,
     encoder: h264::Encoder,
     preview: d3d::Previewer,
-    camera: Option<camera::CameraLayer>,
+    /// The other layers' pictures, followed each frame.
+    feeds: Option<Arc<layers::Feeds>>,
     /// The stream's own pictures, while it streams (one per rendition).
     stream: Vec<StreamOut>,
     dropped: u64,
@@ -2044,8 +2040,8 @@ impl BlendPacer {
             lap = now;
             d
         };
-        if let Some(c) = self.camera.as_mut() {
-            c.pull();
+        if let Some(f) = &self.feeds {
+            f.update();
         }
         steps.webcam = took();
         self.diag.free_min = self.diag.free_min.min(self.encoder.pool.free_count());
@@ -2196,7 +2192,7 @@ fn spawn_blend_pacer(
     converter: d3d::Converter,
     encoder: h264::Encoder,
     preview: d3d::Previewer,
-    camera: Option<camera::CameraLayer>,
+    feeds: Option<Arc<layers::Feeds>>,
     clock: Arc<Clock>,
     ctl: PacerCtl,
 ) -> (Arc<AtomicBool>, JoinHandle<()>) {
@@ -2226,7 +2222,7 @@ fn spawn_blend_pacer(
             converter,
             encoder,
             preview,
-            camera,
+            feeds,
             stream: Vec::new(),
             dropped: 0,
             stats: BlendStats::new(),
@@ -2430,6 +2426,7 @@ mod tests {
             video: VideoSource::Screen { id: screen.id.clone(), hook: crate::GameHook { auto: false, allowed: Vec::new() }, method: Default::default() },
             away_screen: None,
             webcam: None,
+            layers: crate::layers::main_only(),
             screen: Arc::new(std::sync::Mutex::new(crate::ScreenPlacement::whole(crate::Framing::Fit))),
             sources: Vec::new(),
             stream: None,
@@ -2505,6 +2502,7 @@ mod tests {
             video: video.clone(),
             away_screen: None,
             webcam: None,
+            layers: crate::layers::main_only(),
             screen: Arc::new(std::sync::Mutex::new(crate::ScreenPlacement::whole(crate::Framing::Fill))),
             sources: Vec::new(),
             stream: None,
@@ -2639,6 +2637,7 @@ mod tests {
             video: VideoSource::Screen { id: id.clone(), hook: crate::GameHook { auto: false, allowed: Vec::new() }, method },
             away_screen: None,
             webcam: None,
+            layers: crate::layers::main_only(),
             screen: Arc::new(std::sync::Mutex::new(crate::ScreenPlacement::whole(crate::Framing::Fit))),
             sources: Vec::new(),
             stream: None,

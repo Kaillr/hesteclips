@@ -22,6 +22,7 @@ fn main() -> anyhow::Result<()> {
         video: capture::VideoSource::Screen { id: String::new(), hook: capture::GameHook { auto: false, allowed: Vec::new() }, method: Default::default() },
         away_screen: None,
         webcam: None,
+        layers: capture::layers::main_only(),
         screen: std::sync::Arc::new(std::sync::Mutex::new(capture::ScreenPlacement::whole(capture::Framing::Fill))),
         sources: Vec::new(),
         stream: None,

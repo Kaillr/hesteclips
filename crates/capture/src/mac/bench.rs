@@ -38,6 +38,7 @@ fn settings(fps: u32, kbps: u32) -> EncodeSettings {
         video: VideoSource::Screen { id: String::new(), hook: Default::default(), method: Default::default() },
         away_screen: None,
         webcam: None,
+        layers: crate::layers::main_only(),
         screen: Arc::new(Mutex::new(crate::ScreenPlacement::whole(crate::Framing::Fit))),
         sources: Vec::new(),
         stream: None,

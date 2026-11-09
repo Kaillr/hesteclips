@@ -492,7 +492,8 @@ pub fn stepped_slider(ui: &mut egui::Ui, value: &mut f32, width: f32, stops: u32
             resp.mark_changed();
         }
     }
-    let hv = theme::toggle(ui.ctx(), resp.id.with("hv"), resp.hovered() || resp.dragged(), theme::FAST);
+    // Lit while it has the keys too (see `arrow_steps`).
+    let hv = theme::toggle(ui.ctx(), resp.id.with("hv"), resp.hovered() || resp.dragged() || resp.has_focus(), theme::FAST);
     let track = Rect::from_min_max(Pos2::new(rect.left() + 7.0, rect.center().y - 2.0), Pos2::new(rect.right() - 7.0, rect.center().y + 2.0));
     ui.painter().rect_filled(track, 2, p.control_h);
     let x = track.left() + track.width() * value.clamp(0.0, 1.0);
@@ -512,9 +513,89 @@ pub fn stepped_slider(ui: &mut egui::Ui, value: &mut f32, width: f32, stops: u32
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
+/// Arrow keys on a slider: clicking or dragging it gives it the keys, then
+/// ← and → step it, ten at a time with Shift, and stay with it (↑, ↓, Tab
+/// and Esc go on through the page as before). How many steps, if any were
+/// pressed. Not for the players' bars, whose arrows go through the video.
+pub fn arrow_steps(ui: &egui::Ui, slider: &egui::Response) -> Option<i64> {
+    arrow_keys(ui, slider).map(|(d, shift)| if shift { d * 10 } else { d })
+}
+
+/// [`arrow_steps`]' presses, one each, and whether Shift was held: for a
+/// slider whose Shift is its own (a sound's fader's, finer).
+pub fn arrow_keys(ui: &egui::Ui, slider: &egui::Response) -> Option<(i64, bool)> {
+    if (slider.clicked() || slider.drag_started()) && !slider.has_focus() {
+        slider.request_focus();
+    }
+    if !slider.has_focus() {
+        return None;
+    }
+    // Without this egui took ← and → to the next control (the slider
+    // stepping once on the way). It's only taken from the frame after the
+    // slider got the keys, so that one's drawn at once, before an arrow.
+    ui.memory_mut(|m| m.set_focus_lock_filter(slider.id, egui::EventFilter { horizontal_arrows: true, ..Default::default() }));
+    if !ui.memory(|m| m.had_focus_last_frame(slider.id)) {
+        ui.ctx().request_repaint();
+    }
+    let mut d = 0;
+    let shift = ui.input_mut(|i| {
+        let shift = i.modifiers.shift;
+        let mods = if shift { egui::Modifiers::SHIFT } else { egui::Modifiers::NONE };
+        for (key, sign) in [(egui::Key::ArrowLeft, -1), (egui::Key::ArrowRight, 1)] {
+            while i.consume_key(mods, key) {
+                d += sign;
+            }
+        }
+        shift
+    });
+    (d != 0).then_some((d, shift))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Clicked, a slider has ← and →: each steps it and they stay with it
+    /// (egui took them on to the next slider, this one stepping once). Tab
+    /// still goes on.
+    #[test]
+    fn arrows_stay_with_a_slider() {
+        let ctx = egui::Context::default();
+        // Each slider's steps, place and id.
+        let mut seen = [(0i64, Rect::NOTHING, egui::Id::NULL); 3];
+        let mut frame = |events: Vec<egui::Event>| {
+            let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(800.0, 200.0))), events, ..Default::default() };
+            let mut out = ctx.run_ui(raw, |ui| {
+                ui.horizontal(|ui| {
+                    for s in &mut seen {
+                        let mut v = 0.5;
+                        let r = slider(ui, &mut v, 150.0);
+                        if let Some(d) = arrow_steps(ui, &r) {
+                            s.0 += d;
+                        }
+                        (s.1, s.2) = (r.rect, r.id);
+                    }
+                });
+            });
+            out.textures_delta.clear();
+            seen
+        };
+        let middle = frame(vec![])[1].1.center();
+        let button = |pressed| egui::Event::PointerButton { pos: middle, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+        let key = |key| egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
+        // The click, then the frame it asks for.
+        for events in [vec![egui::Event::PointerMoved(middle)], vec![button(true)], vec![button(false)], vec![]] {
+            frame(events);
+        }
+        frame(vec![key(egui::Key::ArrowRight)]);
+        let s = frame(vec![key(egui::Key::ArrowRight)]);
+        assert_eq!(s.map(|s| s.0), [0, 2, 0]);
+        assert_eq!(ctx.memory(|m| m.focused()), Some(s[1].2), "the keys stay with it");
+        let s = frame(vec![key(egui::Key::ArrowLeft)]);
+        assert_eq!(s.map(|s| s.0), [0, 1, 0]);
+        frame(vec![key(egui::Key::Tab)]);
+        assert_eq!(ctx.memory(|m| m.focused()), Some(s[2].2), "Tab goes on");
+    }
 
     #[test]
     fn clock_reads_naturally() {

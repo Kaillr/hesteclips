@@ -15,10 +15,17 @@ mod archive;
 mod autostart;
 mod away;
 mod canvas_ui;
+mod clipboard_ui;
 mod clips;
 mod collections;
 mod crop_ui;
 mod demo;
+mod fonts;
+mod groups_ui;
+mod inspector_ui;
+mod projector;
+mod scenes_ui;
+mod visuals_ui;
 mod webcam_ui;
 mod discord;
 mod editor;
@@ -377,6 +384,29 @@ impl RecState {
     }
 }
 
+/// A scene or preset to show: done at the top of a frame's background work
+/// (see `App::apply_switch`), never while a page draws or mid-change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Switch {
+    Scene(u64),
+    /// A preset. `restart`: clipping (all that runs) stops first and starts
+    /// again with it.
+    Preset { id: u64, restart: bool },
+}
+
+/// Each sound source's volume, mute, noise reduction and mono, and the
+/// limiter, into the live audio: at launch and on a preset switch, all at
+/// once (the Sources page keeps them in step while it's drawn).
+fn push_live_audio(live_audio: &capture::mixer::LiveAudio, settings: &settings::RecordSettings) {
+    live_audio.set_limiter(settings.limiter);
+    for s in &settings.audio_sources {
+        let channel = live_audio.channel(&s.id);
+        channel.set_volume(sources_ui::from_db(s.volume_db), s.muted);
+        channel.set_denoise(s.noise_reduction.into());
+        channel.set_mono(s.mono);
+    }
+}
+
 /// Quit from outside the UI's loop (a signal; the tray while the window's
 /// hidden, when the loop doesn't run): stop capturing, finish the file, and
 /// exit.
@@ -508,6 +538,8 @@ struct App {
     pub(crate) confirm_reset: bool,
     /// The camera panel (Linux), in place of the Sound column while it's open.
     pub(crate) camera_panel: Option<crate::webcam_ui::CameraPanel>,
+    /// Preview on monitor: the video fullscreen on a display, while it's open.
+    pub(crate) projector: Option<projector::Projector>,
     /// Scroll the library to this clip next time it's shown.
     pub(crate) reveal_clip: Option<PathBuf>,
     /// Days folded away in the library.
@@ -546,18 +578,24 @@ struct App {
     capturing_blend: Option<(u32, capture::BlendShape)>,
     /// Shown instead of a game or app while you're tabbed out.
     pub(crate) away_screen: std::sync::Arc<capture::StillImage>,
-    /// Where the webcam sits, shared with a running capture so dragging it
-    /// takes effect at once. Mirrors `settings.webcam` every frame.
+    /// Where the first webcam sits (where only one is drawn:
+    /// `capture::layers::MANY`), shared with a running capture so dragging
+    /// it takes effect at once. Mirrors the settings every frame.
     webcam_placement: capture::webcam::SharedPlacement,
+    /// Every source in the video, in order, as placed: shared with the
+    /// capture like the placements (kept in step with the settings each frame).
+    pub(crate) capture_layers: capture::SharedLayers,
     /// Where the screen's picture goes in the video, shared with the capture
     /// like the webcam's placement (kept in step with the settings each frame).
     pub(crate) screen_placement: capture::SharedScreen,
     pub(crate) webcam_view: webcam_ui::WebcamView,
     /// The picture's sources on the Sources page's preview: dragging them.
     pub(crate) canvas: canvas_ui::CanvasView,
-    /// The camera last asked to stay open (it stays open while a webcam is set
-    /// up, so its own settings don't reset).
-    kept_camera: Option<(String, Option<capture::webcam::Format>)>,
+    /// The cameras last asked to stay open (each stays open while its
+    /// webcam is set up, so its own settings don't reset).
+    kept_cameras: Vec<(String, Option<capture::webcam::Format>)>,
+    /// A scene or preset to show next (see `apply_switch`).
+    pending_switch: Option<Switch>,
     /// System audio inputs/outputs (+ current OS defaults).
     audio: capture::audio::AudioDevices,
     /// Live per-source volume and meters, shared with the capture thread.
@@ -763,13 +801,7 @@ impl App {
         let (render_tx, render_rx) = std::sync::mpsc::channel();
         let (mp3_tx, mp3_rx) = std::sync::mpsc::channel();
         let (copy_tx, copy_rx) = std::sync::mpsc::channel();
-        live_audio.set_limiter(settings.limiter);
-        for s in &settings.audio_sources {
-            let channel = live_audio.channel(&s.id);
-            channel.set_volume(sources_ui::from_db(s.volume_db), s.muted);
-            channel.set_denoise(s.noise_reduction.into());
-            channel.set_mono(s.mono);
-        }
+        push_live_audio(&live_audio, &settings);
         // macOS: what it needs allowed is shown once, before clipping starts
         // (and once more when a release needs it allowed again).
         #[cfg(target_os = "macos")]
@@ -812,6 +844,7 @@ impl App {
             recording_shortcut: None,
             confirm_reset: false,
             camera_panel: None,
+            projector: None,
             reveal_clip: None,
             folded,
             permission: capture::screen_permission(),
@@ -838,10 +871,12 @@ impl App {
             capturing_blend: None,
             away_screen: away::screen(),
             webcam_placement: std::sync::Arc::new(std::sync::Mutex::new(capture::webcam::Placement::default_for(16.0 / 9.0, 16.0 / 9.0))),
+            capture_layers: capture::layers::main_only(),
             screen_placement,
             webcam_view: Default::default(),
             canvas: Default::default(),
-            kept_camera: None,
+            kept_cameras: Vec::new(),
+            pending_switch: None,
             audio: capture::audio::list_audio_devices(),
             live_audio,
             level_monitor: None,
@@ -1008,7 +1043,7 @@ impl App {
         let open_sources = std::env::var_os("HASTECLIP_OPEN_SOURCES").is_some();
         if let Some(v) = std::env::var_os("HASTECLIP_OPEN_SOURCES") {
             app.page = Page::Sources;
-            app.sources_view.open_dev(&v.to_string_lossy());
+            sources_ui::open_dev(&mut app, &v.to_string_lossy());
         }
         // `HASTECLIP_OPEN_VOICE_REVIEW=1` opens the voice samples review.
         let open_review = std::env::var_os("HASTECLIP_OPEN_VOICE_REVIEW").is_some();
@@ -1110,6 +1145,9 @@ impl App {
                 format: None,
                 placement: self.webcam_placement.clone(),
             })),
+            // Kept in step every frame: sources added, taken out, moved or
+            // reordered show while capturing.
+            layers: self.capture_layers.clone(),
             screen: self.screen_placement.clone(),
             sources: self.capture_sources(),
             stream: self.stream_settings(),
@@ -1134,7 +1172,7 @@ impl App {
     /// the frame, so switching to a display of another shape would stretch
     /// it into that shape (a strip on an ultrawide).
     fn refit_boxes(&mut self) {
-        if self.settings.webcam.is_none() && self.settings.screen.placed.is_none() {
+        if self.settings.webcams.is_empty() && self.settings.visuals.is_empty() && self.settings.screen.placed.is_none() {
             return;
         }
         let key = (self.video_source(), self.settings.video_size());
@@ -1151,9 +1189,17 @@ impl App {
         if let Some(b) = self.settings.screen.placed.as_mut() {
             b.refit(frame_aspect, screen_aspect);
         }
-        let camera_aspect = self.camera_size().map(|(w, h)| w as f32 / h.max(1) as f32);
-        if let Some(w) = self.settings.webcam.as_mut() {
-            w.placement.refit(frame_aspect, camera_aspect);
+        for key in self.settings.webcams.iter().map(|w| w.key).collect::<Vec<_>>() {
+            let camera_aspect = self.camera_size(key).map(|(w, h)| w as f32 / h.max(1) as f32);
+            if let Some(w) = self.settings.webcam_mut(key) {
+                w.placement.refit(frame_aspect, camera_aspect);
+            }
+        }
+        for key in self.settings.visuals.iter().map(|d| d.key).collect::<Vec<_>>() {
+            let aspect = self.visual_size(key).map(|(w, h)| w as f32 / h.max(1) as f32);
+            if let Some(b) = self.settings.visual_mut(key).and_then(|d| d.placed.as_mut()) {
+                b.refit(frame_aspect, aspect);
+            }
         }
     }
 
@@ -1164,19 +1210,158 @@ impl App {
         size.map(|(w, h)| w as f32 / h.max(1) as f32)
     }
 
-    /// The webcam's picture size as it's turned, once it's live.
-    pub(crate) fn camera_size(&self) -> Option<(u32, u32)> {
-        let turned = self.settings.webcam.as_ref().is_some_and(|w| w.placement.turns % 2 == 1);
-        match capture::webcam::status() {
+    /// Webcam `key`'s picture size as it's turned, once it's live.
+    pub(crate) fn camera_size(&self, key: u64) -> Option<(u32, u32)> {
+        let w = self.settings.webcam(key)?;
+        let turned = w.placement.turns % 2 == 1;
+        match capture::webcam::status_of(&w.id) {
             capture::webcam::Status::Live { width, height } if turned => Some((height, width)),
             capture::webcam::Status::Live { width, height } => Some((width, height)),
             _ => None,
         }
     }
 
+    /// The first webcam, for where only one is drawn (`capture::layers::MANY`):
+    /// the scene shown's, else one another scene shows (hidden here, but
+    /// kept, so switching scenes doesn't start the preview again).
     pub(crate) fn webcam_source(&self) -> Option<capture::webcam::Webcam> {
-        let w = self.settings.webcam.as_ref().filter(|_| capture::webcam::AVAILABLE)?;
+        let w = self.settings.first_webcam().or_else(|| self.settings.cameras_in_use().first().copied()).filter(|_| capture::webcam::AVAILABLE)?;
         Some(capture::webcam::Webcam { device: w.id.clone(), format: w.format.map(Into::into), placement: self.webcam_placement.clone() })
+    }
+
+    /// The video's sources for the capture, bottom first, as they're placed
+    /// now (see `capture::layers`): the screen, each webcam (hidden while
+    /// it's off), each other display. Under them, hidden, the preset's
+    /// sources the scene shown doesn't have: they keep going, so switching
+    /// to a scene with them shows them at once (taken out, a window's
+    /// capture would start again, a page load again, a camera reopen).
+    fn layers_for_capture(&self) -> Vec<capture::Layer> {
+        use capture::{Layer, LayerSource};
+        use settings::LayerKey;
+        let mut layers = Vec::new();
+        let outside = self.settings.outside_scene().into_iter().map(|l| (l, true));
+        for (l, out) in outside.chain(self.settings.layer_order().into_iter().rev().map(|l| (l, false))) {
+            match l {
+                LayerKey::Screen => layers.push(Layer { id: 0, source: LayerSource::Main }),
+                LayerKey::Webcam(key) if capture::webcam::AVAILABLE => {
+                    if let Some(w) = self.settings.webcam(key) {
+                        let placement = if w.enabled && !out { w.placement.into() } else { capture::webcam::Placement::hidden() };
+                        layers.push(Layer { id: 1 << 32 | key, source: LayerSource::Camera { device: w.id.clone(), format: w.format.map(Into::into), placement } });
+                    }
+                }
+                LayerKey::Visual(key) if capture::layers::MANY => {
+                    use settings::Visual;
+                    let Some(d) = self.settings.visual(key) else { continue };
+                    let mut placement = self.settings.visual_placement(d);
+                    placement.hidden |= out;
+                    let source = match &d.visual {
+                        Visual::Display { id, .. } => LayerSource::Display { id: id.clone(), placement },
+                        Visual::Window { app, .. } => LayerSource::Window { app: app.clone(), placement },
+                        Visual::Colour { rgba } => LayerSource::Colour { rgba: *rgba, placement },
+                        Visual::Browser { url, width, height, css, .. } if capture::layers::BROWSER && url.len() > "https://".len() => LayerSource::Browser { url: url.clone(), width: *width, height: *height, css: css.clone(), placement },
+                        Visual::Browser { .. } => continue,
+                        // Its frames, an animated image.
+                        Visual::Image { .. } if self.canvas.animations.contains_key(&key) => LayerSource::Animation { animation: self.canvas.animations[&key].clone(), placement },
+                        // Once its size is known (it can be played).
+                        Visual::Video { path, looped, restart, .. } if capture::layers::VIDEO => match self.canvas.video_sizes.get(path).copied().flatten() {
+                            Some((width, height, fps, _)) => {
+                                // Its sound into its source, while that's captured.
+                                let sound = self.settings.audio_sources.iter().find(|s| s.kind == settings::SourceKind::Video { key } && s.enabled && (s.in_mix || s.own_track)).map(|s| s.id.clone());
+                                LayerSource::Video { path: path.clone(), width, height, fps, looped: *looped, restart: *restart, sound, placement }
+                            }
+                            None => continue,
+                        },
+                        Visual::Video { .. } => continue,
+                        // Its picture, once it's made (`refresh_visual_pictures`).
+                        Visual::Image { .. } | Visual::Text { .. } => match self.visual_picture(key) {
+                            Some(p) => LayerSource::Picture { picture: capture::layers::Picture(p), placement },
+                            None => continue,
+                        },
+                    };
+                    // Loaded again (a web page's Reload): another layer, so
+                    // the capture makes it afresh.
+                    let again = match &d.visual {
+                        Visual::Browser { reload, .. } => u64::from(*reload) << 48,
+                        _ => 0,
+                    };
+                    layers.push(Layer { id: (2 << 32 | key) ^ again, source });
+                }
+                LayerKey::Visual(_) => {}
+                LayerKey::Webcam(_) => {}
+            }
+        }
+        layers
+    }
+
+    /// Show scene `id` (see `apply_switch`): live while capturing too.
+    pub(crate) fn show_scene(&mut self, id: u64) {
+        self.pending_switch = Some(Switch::Scene(id));
+    }
+
+    /// Use preset `id` (see `apply_switch`). `restart`: clipping, all that
+    /// runs, stops first and starts again with it; a capture keeps what it
+    /// started with, so otherwise it's only done while nothing runs.
+    pub(crate) fn use_preset(&mut self, id: u64, restart: bool) {
+        self.pending_switch = Some(Switch::Preset { id, restart });
+    }
+
+    /// The scene or preset asked for, into the live settings, and what
+    /// belonged to the one before let go.
+    fn apply_switch(&mut self) {
+        let Some(switch) = self.pending_switch.take() else { return };
+        match switch {
+            Switch::Scene(id) => {
+                if !self.settings.switch_scene(id) {
+                    return;
+                }
+                eprintln!("scene: {}", self.settings.scene().map_or("?", |s| s.name.as_str()));
+            }
+            Switch::Preset { id, restart } => {
+                let restart = restart && self.rec_state == RecState { clipping: true, ..Default::default() };
+                if !self.rec_state.idle() && !restart {
+                    return;
+                }
+                if restart {
+                    self.stop_clipping();
+                }
+                let switched = self.settings.switch_preset(id);
+                if switched {
+                    self.after_preset_switch();
+                }
+                if restart {
+                    self.start_mode(capture::Mode::ReplayBuffer);
+                }
+                return;
+            }
+        }
+        self.after_scene_switch();
+    }
+
+    /// What belonged to the scene before a switch let go: its undo steps
+    /// (they'd put its places into this one), a drag, the crop's and the
+    /// camera's pages, and the selection if it isn't here.
+    fn after_scene_switch(&mut self) {
+        self.forget_canvas_steps();
+        self.sources_view.row_drag = None;
+        self.sources_view.crop_open = false;
+        self.webcam_view.crop = None;
+        self.camera_panel = None;
+        self.forget_gone_selection();
+    }
+
+    /// Another preset in the live settings (a switch, or the one in use
+    /// deleted): its sound into the live audio, the pictures drawn for the
+    /// other's sources forgotten, and what a scene switch lets go.
+    pub(crate) fn after_preset_switch(&mut self) {
+        push_live_audio(&self.live_audio, &self.settings);
+        self.canvas.pictures.clear();
+        self.canvas.drawing.clear();
+        self.canvas.sizes.clear();
+        self.listening = None;
+        self.canvas.selected = None;
+        self.sources_view.editing = None;
+        eprintln!("preset: {}", self.settings.preset().map_or("?", |p| p.name.as_str()));
+        self.after_scene_switch();
     }
 
     /// Where the chosen display is in `screens`: found by its id, by its
@@ -1229,6 +1414,8 @@ impl App {
                 },
                 SourceKind::Desktop { exclude_apps } => Cap::Desktop { exclude_app_sources: *exclude_apps },
                 SourceKind::App { bundle_id, .. } => Cap::App { bundle_id: bundle_id.clone() },
+                SourceKind::Video { .. } if capture::layers::VIDEO => Cap::Video { id: s.id.clone() },
+                SourceKind::Video { .. } => continue,
             };
             if out.iter().any(|o| o.kind == kind) {
                 continue;
@@ -1316,6 +1503,7 @@ impl eframe::App for App {
         {
             let t = theme::toggle(&ctx, egui::Id::new("title_bar_page"), full, theme::NORMAL);
             shell::tint_title_bar(frame, theme::mix(p.ground, p.base, t), p.dark);
+            shell::keep_drawing_while_held(frame);
         }
         let framed = !full && shell::framed_page();
         let page_rect = ui.available_rect_before_wrap();
@@ -1396,6 +1584,10 @@ impl eframe::App for App {
         self.close_dialog(&ctx);
         self.keys_dialog(&ctx);
         self.go_live_dialog(&ctx);
+        // Presets and scenes (the Sources page's, and the recorder's menu's).
+        self.sources_dialogs(&ctx);
+        // The video, fullscreen on a monitor (Sources' Preview on monitor).
+        self.projector_window(&ctx);
         #[cfg(target_os = "macos")]
         self.setup_dialog(&ctx);
         ui_kit::pointer_cursor(&ctx);
@@ -1455,7 +1647,7 @@ impl eframe::App for App {
         // (to look at it without clicking there); `=crop`, the webcam's crop page.
         static CAMERA_PANEL: std::sync::Once = std::sync::Once::new();
         if std::env::var_os("HASTECLIP_DEV_CAMERA_PANEL").is_some()
-            && let Some(w) = &self.settings.webcam
+            && let Some(w) = self.settings.first_webcam()
         {
             let id = w.id.clone();
             CAMERA_PANEL.call_once(|| {
@@ -1508,6 +1700,24 @@ impl eframe::App for App {
             if launched.elapsed().as_secs_f64() > quit_at - 1.5 && !SAVED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 eprintln!("dev: saving a clip");
                 self.save_clip();
+            }
+        }
+        // `HASTECLIP_DEV_SCENES=<secs>`: show the next scene every so many
+        // seconds while capturing (to check switching live: each switch is
+        // said here, and no camera should open again). With
+        // `HASTECLIP_SETTINGS=<file>` it saves nothing.
+        if let Some(every) = std::env::var("HASTECLIP_DEV_SCENES").ok().and_then(|s| s.parse::<f64>().ok())
+            && !self.rec_state.idle()
+            && self.settings.scenes.len() > 1
+        {
+            static STEP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let step = (launched.elapsed().as_secs_f64() / every) as u64;
+            if STEP.swap(step, std::sync::atomic::Ordering::Relaxed) != step && step > 0 {
+                let scenes = &self.settings.scenes;
+                let at = scenes.iter().position(|s| s.id == self.settings.active_scene).unwrap_or(0);
+                let next = scenes[(at + 1) % scenes.len()].id;
+                eprintln!("dev: the next scene");
+                self.show_scene(next);
             }
         }
         // A clip plays in its card on Clips only, and hearing a microphone is
@@ -1694,6 +1904,9 @@ impl App {
                 settings::ShortcutAction::Screenshot => self.take_screenshot(),
             }
         }
+        // A scene or preset asked for: before the capture's kept in step
+        // below (and the boxes refitted), never mid-change on a page.
+        self.apply_switch();
 
         // "HasteClip that": saved already, as it was said.
         for _ in 0..self.voice.heard() {
@@ -1738,31 +1951,54 @@ impl App {
         self.sync_capture_blend();
         self.watch_stream();
         self.refit_boxes();
+        self.sync_video_sounds();
         // A locked button clicked anywhere: why, in a toast, as a locked
         // setting says it.
         if let Some(why) = ui_kit::take_locked_click(ctx) {
             self.toast_icon(egui_phosphor::regular::LOCK_SIMPLE, why);
         }
-        *self.webcam_placement.lock().unwrap() = match &self.settings.webcam {
+        *self.webcam_placement.lock().unwrap() = match self.settings.first_webcam() {
             Some(w) if w.enabled => w.placement.into(),
             _ => capture::webcam::Placement::hidden(),
         };
         *self.screen_placement.lock().unwrap() = self.settings.screen_placement();
-        // Keep the webcam open whenever one is set up and on, previewed or
-        // recorded or not: closing a camera can reset its own settings. Off,
-        // it's closed (its light goes out), but while its crop's set (its
-        // picture's cropped on) or its Camera page is open (its picture, and
-        // on Windows its settings, are the open camera's); a capture takes
-        // it up again.
-        let on = self.settings.webcam.as_ref().is_some_and(|w| w.enabled) || self.webcam_view.crop.is_some() || self.camera_panel.is_some();
-        let camera = self.webcam_source().filter(|_| on).map(|w| (w.device, w.format));
-        if camera != self.kept_camera {
-            // Its settings go back on as it opens.
-            if let Some((device, _)) = &camera {
+        self.refresh_visual_pictures();
+        let layers = self.layers_for_capture();
+        {
+            let mut shared = self.capture_layers.lock().unwrap();
+            if *shared != layers {
+                *shared = layers;
+            }
+        }
+        // Keep each webcam open whenever a scene of the preset shows it (the
+        // one shown, or another: switching to it then shows it at once),
+        // previewed or recorded or not: closing a camera can reset its own
+        // settings. Hidden in every scene, it's closed (its light goes out),
+        // but while its crop's set (its picture's cropped on) or its Camera
+        // page is open (its picture, and on Windows its settings, are the
+        // open camera's); a capture takes it up again. Where only one camera
+        // can be open, the one drawn (see `webcam_source`).
+        let paged = self.webcam_view.crop.as_ref().or(self.camera_panel.as_ref()).map(|p| p.device.clone());
+        let mut webcams: Vec<&settings::WebcamCfg> = if capture::webcam::MANY {
+            self.settings.cameras_in_use()
+        } else {
+            let drawn = self.settings.first_webcam().filter(|w| w.enabled).or_else(|| self.settings.cameras_in_use().first().copied());
+            drawn.into_iter().collect()
+        };
+        if let Some(w) = paged.as_deref().and_then(|d| self.settings.webcam_of(d))
+            && !webcams.iter().any(|x| x.id == w.id)
+            && (capture::webcam::MANY || webcams.is_empty())
+        {
+            webcams.push(w);
+        }
+        let cameras: Vec<(String, Option<capture::webcam::Format>)> = webcams.into_iter().filter(|_| capture::webcam::AVAILABLE).map(|w| (w.id.clone(), w.format.map(Into::into))).collect();
+        if cameras != self.kept_cameras {
+            // Their settings go back on as each opens.
+            for (device, _) in &cameras {
                 capture::webcam::remember_controls(device, self.settings.camera_controls.get(device).map(|m| m.iter().map(|(k, v)| (*k, *v)).collect()).unwrap_or_default());
             }
-            capture::webcam::keep_open(camera.clone());
-            self.kept_camera = camera;
+            capture::webcam::keep_open(cameras.clone());
+            self.kept_cameras = cameras;
         }
     }
 

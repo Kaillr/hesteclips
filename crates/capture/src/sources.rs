@@ -35,6 +35,10 @@ pub enum SourceKind {
     /// executable name (`Discord.exe`) on Windows, or program name
     /// (`Discord`, or `Game.exe` for one running in Wine/Proton) on Linux.
     App { bundle_id: String },
+    /// A video source's sound: the video layer whose `sound` is `id` (the
+    /// source's own) plays its file's sound into it as it plays (see
+    /// [`video_sound`]).
+    Video { id: String },
 }
 
 /// One source to capture, and where its audio goes in the file.
@@ -570,6 +574,11 @@ impl AudioCapture {
                     mic.opened(opened, Instant::now());
                     mics.push(mic);
                 }
+                // Filled by its video as it plays.
+                SourceKind::Video { .. } => {
+                    video_sound::listen(&source.id, feed);
+                    channel.set_status(crate::mixer::SourceStatus::Live);
+                }
                 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
                 _ => system_sources.push((source.clone(), feed.clone(), channel)),
                 #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
@@ -657,6 +666,10 @@ impl AudioCapture {
         let channel = live.channel(&source.id);
         match &source.kind {
             SourceKind::Microphone { device } => self.mics.add(Mic::new(&source.id, device, feed.clone(), channel)),
+            SourceKind::Video { .. } => {
+                video_sound::listen(&source.id, &feed);
+                channel.set_status(SourceStatus::Live);
+            }
             // Desktop or app sound, to a capture of it started now if
             // there's none (started empty: nothing's waited for).
             _ => {
@@ -686,6 +699,7 @@ impl AudioCapture {
             SourceKind::Microphone { .. } => {
                 self.mics.remove(&source.id);
             }
+            SourceKind::Video { .. } => video_sound::forget(feed),
             _ => {
                 if let Some(system) = &self.system {
                     system.remove(&source.id);
@@ -713,6 +727,7 @@ impl AudioCapture {
     pub(crate) fn stop(mut self) {
         for (_, feed) in &self.captured {
             own_sound::forget(feed);
+            video_sound::forget(feed);
         }
         #[cfg(not(target_os = "linux"))]
         self.mics.stop();
@@ -953,6 +968,97 @@ pub mod own_sound {
                 return;
             }
             let at = super::host_now() + delay;
+            for (_, child) in &self.children {
+                child.push(at, samples, channels);
+            }
+        }
+    }
+
+    impl Drop for Playing {
+        fn drop(&mut self) {
+            self.leave();
+        }
+    }
+}
+
+/// Video sources' sound: each video layer with sound plays its file's sound,
+/// as it shows its picture, into the feeds of the audio source it names
+/// ([`SourceKind::Video`]): the meters' capture's, a recording's, those
+/// that start while it plays too.
+pub mod video_sound {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex, Weak};
+
+    use crate::mixer::SourceFeed;
+
+    /// Each video source's feeds, by its id; bumped generation on change.
+    fn listeners() -> &'static Mutex<Vec<(String, Weak<SourceFeed>)>> {
+        static LISTENERS: Mutex<Vec<(String, Weak<SourceFeed>)>> = Mutex::new(Vec::new());
+        &LISTENERS
+    }
+    static GENERATION: AtomicU64 = AtomicU64::new(0);
+
+    /// `feed` takes the sound of the video source `id` (once, however
+    /// often it's said).
+    pub(crate) fn listen(id: &str, feed: &Arc<SourceFeed>) {
+        let mut d = listeners().lock().unwrap();
+        d.retain(|(_, w)| w.strong_count() > 0);
+        if !d.iter().any(|(_, w)| std::ptr::eq(w.as_ptr(), Arc::as_ptr(feed))) {
+            d.push((id.to_owned(), Arc::downgrade(feed)));
+            GENERATION.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// `feed` takes no video's sound (any more).
+    pub(crate) fn forget(feed: &Arc<SourceFeed>) {
+        let mut d = listeners().lock().unwrap();
+        let had = d.len();
+        d.retain(|(_, w)| w.strong_count() > 0 && !std::ptr::eq(w.as_ptr(), Arc::as_ptr(feed)));
+        if d.len() != had {
+            GENERATION.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// One video's sound being played into the feeds of the source `id`,
+    /// at `rate`.
+    pub struct Playing {
+        id: String,
+        rate: u32,
+        generation: u64,
+        children: Vec<(Weak<SourceFeed>, Arc<SourceFeed>)>,
+    }
+
+    impl Playing {
+        pub fn new(id: &str, rate: u32) -> Self {
+            let mut playing = Self { id: id.to_owned(), rate, generation: u64::MAX, children: Vec::new() };
+            playing.follow();
+            playing
+        }
+
+        /// Into the feeds of its source right now.
+        fn follow(&mut self) {
+            let generation = GENERATION.load(Ordering::Relaxed);
+            if generation == self.generation {
+                return;
+            }
+            self.generation = generation;
+            self.leave();
+            let children = listeners().lock().unwrap().iter().filter(|(id, _)| *id == self.id).filter_map(|(_, w)| Some((w.clone(), w.upgrade()?.add_child(self.rate)))).collect();
+            self.children = children;
+        }
+
+        fn leave(&mut self) {
+            for (parent, child) in self.children.drain(..) {
+                if let Some(p) = parent.upgrade() {
+                    p.remove_child(&child);
+                }
+            }
+        }
+
+        /// Interleaved samples, `channels` a frame, the first heard at host
+        /// time `at`.
+        pub fn push_at(&mut self, at: f64, samples: &[f32], channels: usize) {
+            self.follow();
             for (_, child) in &self.children {
                 child.push(at, samples, channels);
             }
@@ -1410,6 +1516,30 @@ mod tests {
         let during = channel.input.take().max_peak();
         eprintln!("desktop peak before {before:.3}, with our sound {during:.3}");
         assert!(during > 0.7, "{during}");
+    }
+
+    /// A video's sound reaches the source of its id, at its own rate, and
+    /// no other: no device is opened for it (it's filled by its video).
+    #[test]
+    fn a_videos_sound_reaches_its_source() {
+        let live = LiveAudio::new();
+        let video = AudioSource { kind: SourceKind::Video { id: "video-7".into() }, ..src("video-7", true, false) };
+        let other = AudioSource { kind: SourceKind::Video { id: "video-8".into() }, ..src("video-8", true, false) };
+        let _monitor = LevelMonitor::start(&[video, other], live.clone()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let (channel, quiet) = (live.channel("video-7"), live.channel("video-8"));
+        assert_eq!(channel.status(), SourceStatus::Live);
+        // Half a second of a loud tone at 44.1 kHz, each block when it's heard.
+        let mut playing = video_sound::Playing::new("video-7", 44_100);
+        let block: Vec<f32> = (0..441).flat_map(|i| [0.8 * (i as f32 * 0.1).sin(); 2]).collect();
+        for _ in 0..50 {
+            playing.push_at(host_now(), &block, 2);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let (heard, not) = (channel.input.take().max_peak(), quiet.input.take().max_peak());
+        assert!(heard > 0.7, "{heard}");
+        assert!(not < 0.01, "{not}");
     }
 
     #[test]
