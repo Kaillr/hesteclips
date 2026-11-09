@@ -73,7 +73,7 @@ pub use camera::{keep_open as keep_camera_open, list_cameras};
 pub(crate) use layers::{app_window_size, video_size};
 pub use kwin::helper as kde_stream_helper;
 
-use crate::mixer::{self, Clock, LiveAudio};
+use crate::mixer::{self, Clock, LiveAudio, MixChange, MixInput};
 use crate::mp4file::Layout;
 use crate::mp4mux::Spec;
 use crate::outputs::{Capture, Outputs};
@@ -312,6 +312,10 @@ impl Recorder for LinuxRecorder {
 
     fn set_blend(&mut self, looks: u32, shape: BlendShape) -> bool {
         self.outputs.session.as_mut().is_some_and(|s| s.set_blend(looks, shape))
+    }
+
+    fn set_sources(&mut self, sources: &[crate::sources::AudioSource]) -> bool {
+        self.outputs.session.as_mut().is_some_and(|s| s.set_sources(sources, &self.live))
     }
 
     /// Record something else without restarting: another list of games and
@@ -571,6 +575,8 @@ struct Session {
     pacer: Option<(Arc<AtomicBool>, JoinHandle<()>)>,
     audio: Option<AudioCapture>,
     mixer: Option<(Arc<AtomicBool>, JoinHandle<()>)>,
+    /// Sources added to the mix and taken out of it while it runs.
+    mix_changes: Option<Sender<MixChange>>,
     /// AAC encoder threads, one per track; they end when the mixer drops its senders.
     encoders: Vec<JoinHandle<()>>,
     writer_tx: Sender<writer::Command>,
@@ -646,6 +652,7 @@ impl Session {
             pacer: None,
             audio: None,
             mixer: None,
+            mix_changes: None,
             encoders: Vec::new(),
             writer_tx,
             writer: Some(writer),
@@ -671,7 +678,9 @@ impl Session {
             let rest_track = if has_rest { tracks.next() } else { None };
             session.audio = Some(audio);
             let stop = Arc::new(AtomicBool::new(false));
-            let mixer = mixer::spawn_mixer(inputs, mix_track, rest_track, live.clone(), clock.clone(), host_now, MIX_LATENCY, stop.clone());
+            let (mix_changes, changes) = mpsc::channel();
+            session.mix_changes = Some(mix_changes);
+            let mixer = mixer::spawn_changing_mixer(inputs, changes, mix_track, rest_track, live.clone(), clock.clone(), host_now, MIX_LATENCY, stop.clone());
             session.mixer = Some((stop, mixer));
 
             let picture = Picture::new(feed.clone(), width, height, s.screen.clone(), s.layers.clone());
@@ -701,6 +710,24 @@ impl Session {
         true
     }
 
+    /// Capture these audio sources from now on, without restarting (see
+    /// [`Recorder::set_sources`]): the capture starts and stops them, and
+    /// the mixer takes them in and out.
+    fn set_sources(&mut self, sources: &[crate::sources::AudioSource], live: &LiveAudio) -> bool {
+        let (Some(audio), Some(changes)) = (self.audio.as_mut(), &self.mix_changes) else { return false };
+        let (added, gone) = audio.set_sources(sources, live);
+        for source in gone {
+            eprintln!("audio source \"{}\": taken out while capturing", source.name);
+            let _ = changes.send(MixChange::Remove(source.id));
+        }
+        for (source, feed) in added {
+            eprintln!("audio source \"{}\": added while capturing, into the mix", source.name);
+            let input = MixInput { channel: live.channel(&source.id), id: source.id, feed, in_mix: source.in_mix, track: None };
+            let _ = changes.send(MixChange::Add(input));
+        }
+        true
+    }
+
     /// Stop capturing and finish what the writer was doing (a recording's
     /// file; the ring's let go).
     fn end(mut self) -> Result<()> {
@@ -723,6 +750,7 @@ impl Session {
         }
         // The mixer writes what's left and drops its senders; the AAC
         // encoders then flush and exit.
+        self.mix_changes = None;
         if let Some((stop, handle)) = self.mixer.take() {
             stop.store(true, Ordering::Relaxed);
             let _ = handle.join();

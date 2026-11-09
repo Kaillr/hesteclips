@@ -1085,9 +1085,9 @@ pub const STREAMING: bool = cfg!(any(target_os = "windows", target_os = "macos",
 pub const BLEND_WHILE_CAPTURING: bool = cfg!(any(target_os = "windows", target_os = "macos", target_os = "linux"));
 
 /// Whether audio sources can be added to and taken out of a running capture
-/// ([`Recorder::set_sources`]): on Windows so far; elsewhere they're set
-/// when the capture starts.
-pub const SOURCES_WHILE_CAPTURING: bool = cfg!(target_os = "windows");
+/// ([`Recorder::set_sources`]): on Windows and Linux so far; on macOS
+/// they're set when the capture starts.
+pub const SOURCES_WHILE_CAPTURING: bool = cfg!(any(target_os = "windows", target_os = "linux"));
 
 /// A capture device (screen, app, or audio device) as seen by the backend.
 #[derive(Debug, Clone)]

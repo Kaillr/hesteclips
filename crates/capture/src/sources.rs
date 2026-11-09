@@ -97,7 +97,7 @@ pub(crate) struct AudioCapture {
     /// and those added since ([`Self::set_sources`]), less those taken out.
     captured: Vec<(AudioSource, Arc<SourceFeed>)>,
     /// What every source's sound is placed by.
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    #[cfg_attr(not(any(target_os = "windows", target_os = "linux")), allow(dead_code))]
     clock: Arc<Clock>,
     #[cfg(not(target_os = "linux"))]
     mics: Mics,
@@ -626,7 +626,7 @@ impl AudioCapture {
     /// [`Self::set_mic`]). Anything else about one captured already (where
     /// it goes, which apps it leaves out) stays as it started. The sources
     /// added, with their feeds, and those taken out, for the mixer.
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     pub(crate) fn set_sources(&mut self, sources: &[AudioSource], live: &LiveAudio) -> (Vec<(AudioSource, Arc<SourceFeed>)>, Vec<AudioSource>) {
         let mut gone = Vec::new();
         self.captured.retain(|(s, feed)| {
@@ -660,28 +660,35 @@ impl AudioCapture {
     }
 
     /// Start capturing `source` too, while capturing: its feed.
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     fn start_one(&mut self, source: &AudioSource, live: &LiveAudio) -> Arc<SourceFeed> {
         let feed = SourceFeed::new(crate::mixer::RATE, self.clock.clone());
         let channel = live.channel(&source.id);
         match &source.kind {
+            #[cfg(target_os = "windows")]
             SourceKind::Microphone { device } => self.mics.add(Mic::new(&source.id, device, feed.clone(), channel)),
             SourceKind::Video { .. } => {
                 video_sound::listen(&source.id, &feed);
-                channel.set_status(SourceStatus::Live);
+                channel.set_status(crate::mixer::SourceStatus::Live);
             }
-            // Desktop or app sound, to a capture of it started now if
-            // there's none (started empty: nothing's waited for).
+            // Desktop or app sound (on Linux a mic too: a PipeWire stream
+            // as they are), to a capture of it started now if there's none
+            // (started empty: nothing's waited for).
             _ => {
+                #[cfg(target_os = "linux")]
+                if matches!(source.kind, SourceKind::Microphone { .. }) {
+                    feed.mono_with(channel.mono_flag());
+                    feed.denoise_with(channel.denoise_mode());
+                }
                 if self.system.is_none() {
                     match SystemAudio::start(Vec::new()) {
                         Ok(system) => self.system = Some(system),
                         Err(e) => eprintln!("audio source \"{}\": {e:#}", source.name),
                     }
                 }
-                match &self.system {
+                match self.system.as_mut() {
                     Some(system) => system.add(source.clone(), feed.clone(), channel),
-                    None => channel.set_status(SourceStatus::Unavailable),
+                    None => channel.set_status(crate::mixer::SourceStatus::Unavailable),
                 }
             }
         }
@@ -691,17 +698,18 @@ impl AudioCapture {
 
     /// Stop capturing `source`, whose feed is `feed`, while capturing: what
     /// its feed has is still there to mix.
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     fn stop_one(&mut self, source: &AudioSource, feed: &Arc<SourceFeed>) {
         feed.close();
         own_sound::forget(feed);
         match source.kind {
+            #[cfg(target_os = "windows")]
             SourceKind::Microphone { .. } => {
                 self.mics.remove(&source.id);
             }
             SourceKind::Video { .. } => video_sound::forget(feed),
             _ => {
-                if let Some(system) = &self.system {
+                if let Some(system) = self.system.as_mut() {
                     system.remove(&source.id);
                 }
             }
