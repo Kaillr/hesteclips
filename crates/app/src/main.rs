@@ -18,6 +18,7 @@ mod canvas_ui;
 mod clipboard_ui;
 mod clips;
 mod collections;
+mod control;
 mod crop_ui;
 mod demo;
 mod fonts;
@@ -771,6 +772,9 @@ struct App {
     pub(crate) presence: discord::Presence,
     /// Saves a clip as Save clip is pressed, frames or not.
     quick_save: service::QuickSave,
+    /// A Stream Deck, or another app on this computer, controlling this one
+    /// (see `control.rs`).
+    control: control::Control,
     /// Listens for "HasteClip that".
     pub(crate) voice: voice::Voice,
     pub(crate) voice_review: voice_review::Review,
@@ -833,8 +837,10 @@ impl App {
         let setup_open = false;
         let updater = update::Updater::new(ctx.clone(), settings.auto_update);
         let (tray_tx, tray_rx) = std::sync::mpsc::channel();
+        // Controls come in on the same port as later launches.
+        let control = control::Control::new(ctx.clone(), std::sync::Arc::new(quick_save.clone()), live_audio.clone());
         if let Some(listener) = instance {
-            tray::serve(listener, &ctx, tray_tx.clone());
+            tray::serve(listener, &ctx, tray_tx.clone(), Some(control.door()));
         }
         let tray = tray::Tray::new(&ctx, tray_tx, tray_rx, quick_save.clone());
         // No tray icon to open it from: it shows after all.
@@ -863,6 +869,7 @@ impl App {
             voice: voice::Voice::new(quick_save.clone(), live_audio.clone(), ctx.clone()),
             voice_review: Default::default(),
             quick_save,
+            control,
             hotkeys,
             recording_shortcut: None,
             confirm_reset: false,
@@ -1758,6 +1765,8 @@ impl eframe::App for App {
         self.come_to_front(ctx, _frame);
         self.background(ctx);
         self.pump_tray(ctx);
+        // Once all of this frame's changes are in.
+        self.tell_control();
         self.handle_close(ctx);
         self.every_second();
         self.keep_open(ctx);
@@ -1927,6 +1936,9 @@ impl App {
                 settings::ShortcutAction::Screenshot => self.take_screenshot(),
             }
         }
+        // What a Stream Deck (or another control) asked for: before the
+        // switch below, so a scene it asks for shows in this frame.
+        self.pump_control(ctx);
         // A scene or preset asked for: before the capture's kept in step
         // below (and the boxes refitted), never mid-change on a page.
         self.apply_switch();
