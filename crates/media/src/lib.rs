@@ -1395,6 +1395,16 @@ fn render_video(source: &Path, info: &ClipInfo, edit: &Edit, pieces: &[Piece], w
     // copies timestamps without rescaling, plays the middle at the wrong rate:
     // a 60 fps trim came out as 48 fps with a fifth of its frames gone.
     let timescale = source_timescale(source).unwrap_or(600).to_string();
+    // The recording's picture kept: encoded again as the recording was, every
+    // frame stored in the order it's shown (no B-frames). x264 by itself made
+    // three, so the stretches beside what's copied had them, and a clip with
+    // them anywhere is one whose frames come out of order, scrubbed the
+    // slower way; the join took up their delay, two frames' time, so its rate
+    // read 60.011 for 60 and its frames were numbered off their times. Even a
+    // clip only made quieter has its frames after the last keyframe encoded
+    // again. A new size, rate or bitrate, a file to watch, is the encoder's
+    // to make as it does best.
+    let in_order: &[&str] = if edit.output.changes_video(info) { &[] } else { &["-bf", "0"] };
     let encoder = video_encoder();
     // VA-API encodes from GPU memory: the frames go up last.
     if encoder == "h264_vaapi" {
@@ -1424,6 +1434,7 @@ fn render_video(source: &Path, info: &ClipInfo, edit: &Edit, pieces: &[Piece], w
             .args(&cap)
             // Same profile as our recordings so the segments can be joined.
             .args(["-profile:v", "high"])
+            .args(in_order)
             .args(if encoder == "h264_vaapi" { &[][..] } else { &["-pix_fmt", "yuv420p"][..] })
             .args(["-video_track_timescale", &timescale])
             .arg(dest);
@@ -2273,6 +2284,43 @@ mod cut_render_tests {
         for stream in 0..2 {
             let secs = decode_audio(&out, stream).unwrap().len() as f64 / 2.0 / PREVIEW_RATE as f64;
             assert!((secs - 3.1).abs() < 0.002, "sound {stream} lasts {secs} s, every track muted");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Each picture's time in `file`, in the order the file stores them.
+    fn stored_times(file: &Path) -> Vec<i64> {
+        let out = ffprobe().args(["-v", "error", "-select_streams", "v:0", "-show_entries", "packet=pts", "-of", "csv=p=0"]).arg(file).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| l.trim().trim_end_matches(',').parse().ok()).collect()
+    }
+
+    /// A saved edit stores its pictures in the order they're shown, as the
+    /// recording does, every time later than the one before: what's encoded
+    /// again beside what's copied makes no B-frames. x264 made three, and
+    /// a clip with them anywhere reads as one whose frames come out of order
+    /// (numbered at a rate that's off, scrubbed the slower way). Trimmed off
+    /// its keyframes, and only made quieter, which still encodes again the
+    /// frames after its last keyframe.
+    #[test]
+    fn a_saved_edit_keeps_its_frames_in_order() {
+        let dir = std::env::temp_dir().join(format!("hc-media-order-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (src, out) = (dir.join("clip.mp4"), dir.join("saved.mp4"));
+        clip(&src);
+        let info = probe(&src).unwrap();
+        let mut trimmed = Edit::new(&info);
+        trimmed.set_parts(&[(0.5, 4.6)]);
+        let mut quieter = Edit::new(&info);
+        quieter.tracks[0].gain = 0.5;
+        for (name, edit) in [("trimmed", trimmed), ("quieter", quieter)] {
+            let pieces = plan(&src, &info, &edit);
+            assert!(pieces.iter().any(|p| matches!(p, Piece::Copy(..))) && pieces.iter().any(|p| matches!(p, Piece::Encode(..))), "{name}: {pieces:?}");
+            render_to(&src, &info, &edit, &out, None).unwrap();
+            let times = stored_times(&out);
+            assert_eq!(times.len() as f64, (edit.duration() * 30.0).round(), "{name}: every frame");
+            let back: Vec<usize> = (1..times.len()).filter(|&i| times[i] <= times[i - 1]).collect();
+            assert!(back.is_empty(), "{name}: {} pictures stored after one shown later, the first at {:?}", back.len(), back.first());
         }
         std::fs::remove_dir_all(&dir).unwrap();
     }

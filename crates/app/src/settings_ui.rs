@@ -686,8 +686,10 @@ impl App {
                         self.refresh_clips();
                     }
                     let room = (ui.available_width() - 8.0).clamp(60.0, 240.0);
-                    let job = ui_kit::single_line_job(&short, theme::font(13.0, W::Regular), p.text2, room);
-                    ui.label(job).on_hover_text(&path);
+                    // Laid out here: a label would lay a job out again with
+                    // its own wrapping, and show all of a long path.
+                    let shown = ui.painter().layout_job(ui_kit::single_line_job(&short, theme::font(13.0, W::Regular), p.text2, room));
+                    ui.label(shown).on_hover_text(&path);
                 });
             }
             if f.shows(&["folder per game"]) {

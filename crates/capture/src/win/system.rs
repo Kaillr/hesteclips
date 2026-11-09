@@ -169,12 +169,106 @@ pub(crate) fn display_pixels(id: Option<&str>) -> Option<(u32, u32)> {
     Some((m.width, m.height))
 }
 
-/// The monitor with this device name, else the main one.
-/// Display `id`, if it's connected.
+/// Display `id` (a GDI device name), if it's connected: not while it's gone
+/// (a monitor that sleeps can go, as if unplugged).
 pub(crate) fn connected_monitor(id: &str) -> Option<HMONITOR> {
     monitors().into_iter().find(|m| m.device == id).map(|m| m.handle)
 }
 
+/// The time of day, as the log's lines start with it.
+pub(crate) fn time_of_day() -> impl std::fmt::Display {
+    chrono::Local::now().format("%H:%M:%S")
+}
+
+/// How many times the displays have turned back on after Windows turned them
+/// off (to save power, or with the PC asleep), or the PC woke from sleep,
+/// from when this was first asked. Each of those, and the displays turning
+/// off and the PC going to sleep, is said in the log as it happens, with its
+/// time: what a recording that froze after one went through (issue #34).
+pub(crate) fn display_wakes() -> u64 {
+    use std::ffi::c_void;
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+    use windows::Win32::System::Power::{DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS, POWERBROADCAST_SETTING, PowerRegisterSuspendResumeNotification, PowerSettingRegisterNotification};
+    use windows::Win32::UI::WindowsAndMessaging::{DEVICE_NOTIFY_CALLBACK, PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND, PBT_POWERSETTINGCHANGE};
+    // The displays' state as Windows tells it: 0 off, 1 on, 2 dimmed
+    // (`GUID_CONSOLE_DISPLAY_STATE`, without the big module it's in).
+    const DISPLAY_STATE: windows::core::GUID = windows::core::GUID::from_u128(0x6fe69556_704a_47a0_8f24_c28d936fda47);
+    static STATE: AtomicU32 = AtomicU32::new(1);
+    static WAKES: AtomicU64 = AtomicU64::new(0);
+    static ASKED: std::sync::Once = std::sync::Once::new();
+    unsafe extern "system" fn told(_: *const c_void, kind: u32, setting: *const c_void) -> u32 {
+        if kind != PBT_POWERSETTINGCHANGE || setting.is_null() {
+            return 0;
+        }
+        let s = setting as *const POWERBROADCAST_SETTING;
+        // SAFETY: Windows hands a setting with `DataLength` bytes of data.
+        unsafe {
+            if (*s).PowerSetting == DISPLAY_STATE && (*s).DataLength >= 4 {
+                let data = (s as *const u8).add(std::mem::offset_of!(POWERBROADCAST_SETTING, Data));
+                let now = std::ptr::read_unaligned(data as *const u32);
+                match (STATE.swap(now, Ordering::AcqRel), now) {
+                    (was, 0) if was != 0 => eprintln!("{} the displays turned off", time_of_day()),
+                    (0, now) if now != 0 => {
+                        eprintln!("{} the displays turned back on", time_of_day());
+                        WAKES.fetch_add(1, Ordering::AcqRel);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        0
+    }
+    unsafe extern "system" fn slept(_: *const c_void, kind: u32, _: *const c_void) -> u32 {
+        match kind {
+            PBT_APMSUSPEND => eprintln!("{} the PC is going to sleep", time_of_day()),
+            // Sent at every wake (and another one too when it's by a person).
+            PBT_APMRESUMEAUTOMATIC => {
+                eprintln!("{} the PC woke up", time_of_day());
+                WAKES.fetch_add(1, Ordering::AcqRel);
+            }
+            _ => {}
+        }
+        0
+    }
+    ASKED.call_once(|| {
+        // Kept for good: Windows is told where they are.
+        let recipient = |callback: unsafe extern "system" fn(*const c_void, u32, *const c_void) -> u32| {
+            let params = Box::leak(Box::new(DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS { Callback: Some(callback), Context: std::ptr::null_mut() }));
+            windows::Win32::Foundation::HANDLE(params as *mut DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS as *mut c_void)
+        };
+        let mut handle = std::ptr::null_mut();
+        if let Err(e) = unsafe { PowerSettingRegisterNotification(&DISPLAY_STATE, DEVICE_NOTIFY_CALLBACK, recipient(told), &mut handle) }.ok() {
+            eprintln!("can't tell when the displays turn back on: {e}");
+        }
+        let mut handle = std::ptr::null_mut();
+        if let Err(e) = unsafe { PowerRegisterSuspendResumeNotification(DEVICE_NOTIFY_CALLBACK, recipient(slept), &mut handle) }.ok() {
+            eprintln!("can't tell when the PC sleeps: {e}");
+        }
+    });
+    WAKES.load(Ordering::Acquire)
+}
+
+/// Whether this session is locked (its lock screen up), if Windows says.
+pub(crate) fn session_locked() -> Option<bool> {
+    use windows::Win32::System::RemoteDesktop::{WTS_CURRENT_SESSION, WTS_SESSIONSTATE_LOCK, WTS_SESSIONSTATE_UNLOCK, WTSFreeMemory, WTSINFOEXW, WTSQuerySessionInformationW, WTSSessionInfoEx};
+    let mut buf = windows::core::PWSTR::null();
+    let mut bytes = 0u32;
+    unsafe { WTSQuerySessionInformationW(None, WTS_CURRENT_SESSION, WTSSessionInfoEx, &mut buf, &mut bytes) }.ok()?;
+    // SAFETY: Windows hands a WTSINFOEXW of `bytes`, freed below.
+    let flags = unsafe {
+        let info = buf.0 as *const WTSINFOEXW;
+        let flags = (!info.is_null() && bytes as usize >= std::mem::size_of::<WTSINFOEXW>() && (*info).Level == 1).then(|| (*info).Data.WTSInfoExLevel1.SessionFlags as u32);
+        WTSFreeMemory(buf.0 as *mut std::ffi::c_void);
+        flags
+    };
+    match flags? {
+        WTS_SESSIONSTATE_LOCK => Some(true),
+        WTS_SESSIONSTATE_UNLOCK => Some(false),
+        _ => None,
+    }
+}
+
+/// The monitor with this device name, else the main one.
 pub(crate) fn find_monitor(id: &str) -> HMONITOR {
     monitors()
         .into_iter()

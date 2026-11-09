@@ -266,11 +266,28 @@ impl Live {
     }
 }
 
+/// The most samples a [`Live`] waveform takes in at once: ~22 s of stereo
+/// at 48 kHz, 8 MB as it's worked on.
+///
+/// What had been decoded since it last looked went in at once, with the
+/// waveform held, which the timeline waits for to draw it. While the sound
+/// is decoding that's a little at a time, but opening a clip whose sound is
+/// already decoded (open in the editor before, issue #39) handed it all of
+/// it: a 4-hour clip's track was copied out as 5.5 GB at once, and the
+/// window stood still ("Not responding") while it was summarised.
+const PIECE: usize = 1 << 21;
+
 /// Follow track `track` of `pcm` as it's decoded.
 pub fn follow(pcm: std::sync::Arc<media::pcm::Pcm>, track: usize, ctx: &egui::Context) -> std::sync::Arc<Live> {
+    follow_in(pcm, track, ctx, PIECE)
+}
+
+/// [`follow`], taking at most `piece` samples (even: whole frames) at a time.
+fn follow_in(pcm: std::sync::Arc<media::pcm::Pcm>, track: usize, ctx: &egui::Context, piece: usize) -> std::sync::Arc<Live> {
     use std::sync::atomic::Ordering;
     let live = std::sync::Arc::new(Live { wave: std::sync::Mutex::new(Waveform::empty(media::PREVIEW_RATE)), done: Default::default(), drawn: Default::default() });
     let (out, ctx) = (live.clone(), ctx.clone());
+    let piece = (piece.max(2) / 2) * 2;
     std::thread::Builder::new()
         .name("waveform".into())
         .spawn(move || {
@@ -281,12 +298,17 @@ pub fn follow(pcm: std::sync::Arc<media::pcm::Pcm>, track: usize, ctx: &egui::Co
                 let Some(t) = pcm.tracks().get(track) else { break };
                 let len = t.len();
                 if len > read {
-                    let chunk = t.copy(read, len);
-                    read = len;
+                    let to = len.min(read + piece);
+                    let chunk = t.copy(read, to);
+                    read = to;
                     if let Ok(mut w) = out.wave.lock() {
                         w.extend(&chunk);
                     }
                     ctx.request_repaint();
+                    // More already there: on with it, without waiting.
+                    if read < len {
+                        continue;
+                    }
                 }
                 if done {
                     break;
@@ -324,6 +346,32 @@ mod tests {
                 assert!((x.min - y.min).abs() < 1e-6 && (x.max - y.max).abs() < 1e-6 && (x.ms - y.ms).abs() < 1e-6);
             }
         }
+    }
+
+    /// Sound already decoded is taken in a piece at a time (the waveform
+    /// isn't held all the while), and comes out the same as all at once.
+    #[test]
+    fn decoded_sound_is_followed_a_piece_at_a_time() {
+        let stereo: Vec<f32> = (0..2 * 48_000 * 3 + 38).map(|i| ((i as f32) * 0.017).sin() * (i % 5) as f32 / 5.0).collect();
+        let pcm = media::pcm::Pcm::from_tracks(vec![stereo]);
+        // As stored (16-bit), which is what's followed.
+        let whole = Waveform::new(&pcm.tracks()[0].to_vec(), 48_000);
+        let live = follow_in(pcm, 0, &egui::Context::default(), 4096);
+        let t = std::time::Instant::now();
+        while !live.done.load(std::sync::atomic::Ordering::Acquire) {
+            assert!(t.elapsed() < std::time::Duration::from_secs(5), "never finished");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let fed = live.wave.lock().unwrap();
+        assert_eq!(whole.levels.len(), fed.levels.len());
+        for (a, b) in whole.levels.iter().zip(&fed.levels) {
+            assert_eq!(a.len(), b.len());
+            for (x, y) in a.iter().zip(b) {
+                assert!((x.min - y.min).abs() < 1e-6 && (x.max - y.max).abs() < 1e-6 && (x.ms - y.ms).abs() < 1e-6);
+            }
+        }
+        // 3 s in 4096-sample pieces, with no wait between them.
+        assert!(t.elapsed() < std::time::Duration::from_secs(1), "took {:?}", t.elapsed());
     }
 
     #[test]
