@@ -328,6 +328,7 @@ const PORT: u16 = 52131;
 
 /// Another HasteClip runs (or something else has its port): asked before
 /// [`claim`], which may then show that one and exit.
+#[cfg(any(windows, target_os = "linux"))]
 pub fn another_running() -> bool {
     std::net::TcpListener::bind(("127.0.0.1", PORT)).is_err()
 }
