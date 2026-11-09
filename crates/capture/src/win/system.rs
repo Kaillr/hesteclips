@@ -169,18 +169,55 @@ pub(crate) fn display_pixels(id: Option<&str>) -> Option<(u32, u32)> {
     Some((m.width, m.height))
 }
 
-/// The display called `id` (a GDI device name) if it's there now: not
-/// while it's gone (a monitor that sleeps can go, as if unplugged).
-pub(crate) fn monitor_of(id: &str) -> Option<HMONITOR> {
-    monitors().into_iter().find(|m| m.device == id).map(|m| m.handle)
-}
-
-/// The monitor with this device name, else the main one.
-/// Display `id`, if it's connected.
+/// Display `id` (a GDI device name), if it's connected: not while it's gone
+/// (a monitor that sleeps can go, as if unplugged).
 pub(crate) fn connected_monitor(id: &str) -> Option<HMONITOR> {
     monitors().into_iter().find(|m| m.device == id).map(|m| m.handle)
 }
 
+/// How many times the displays have turned back on after Windows turned them
+/// off (to save power, or with the PC asleep), from when this was first asked.
+pub(crate) fn display_wakes() -> u64 {
+    use std::ffi::c_void;
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+    use windows::Win32::System::Power::{DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS, POWERBROADCAST_SETTING, PowerSettingRegisterNotification};
+    use windows::Win32::UI::WindowsAndMessaging::{DEVICE_NOTIFY_CALLBACK, PBT_POWERSETTINGCHANGE};
+    // The displays' state as Windows tells it: 0 off, 1 on, 2 dimmed
+    // (`GUID_CONSOLE_DISPLAY_STATE`, without the big module it's in).
+    const DISPLAY_STATE: windows::core::GUID = windows::core::GUID::from_u128(0x6fe69556_704a_47a0_8f24_c28d936fda47);
+    static STATE: AtomicU32 = AtomicU32::new(1);
+    static WAKES: AtomicU64 = AtomicU64::new(0);
+    static ASKED: std::sync::Once = std::sync::Once::new();
+    unsafe extern "system" fn told(_: *const c_void, kind: u32, setting: *const c_void) -> u32 {
+        if kind != PBT_POWERSETTINGCHANGE || setting.is_null() {
+            return 0;
+        }
+        let s = setting as *const POWERBROADCAST_SETTING;
+        // SAFETY: Windows hands a setting with `DataLength` bytes of data.
+        unsafe {
+            if (*s).PowerSetting == DISPLAY_STATE && (*s).DataLength >= 4 {
+                let data = (s as *const u8).add(std::mem::offset_of!(POWERBROADCAST_SETTING, Data));
+                let now = std::ptr::read_unaligned(data as *const u32);
+                if STATE.swap(now, Ordering::AcqRel) == 0 && now != 0 {
+                    WAKES.fetch_add(1, Ordering::AcqRel);
+                }
+            }
+        }
+        0
+    }
+    ASKED.call_once(|| {
+        // Kept for good: Windows is told where it is.
+        let params = Box::leak(Box::new(DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS { Callback: Some(told), Context: std::ptr::null_mut() }));
+        let mut handle = std::ptr::null_mut();
+        let recipient = windows::Win32::Foundation::HANDLE(params as *mut DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS as *mut c_void);
+        if let Err(e) = unsafe { PowerSettingRegisterNotification(&DISPLAY_STATE, DEVICE_NOTIFY_CALLBACK, recipient, &mut handle) }.ok() {
+            eprintln!("can't tell when the displays turn back on: {e}");
+        }
+    });
+    WAKES.load(Ordering::Acquire)
+}
+
+/// The monitor with this device name, else the main one.
 pub(crate) fn find_monitor(id: &str) -> HMONITOR {
     monitors()
         .into_iter()

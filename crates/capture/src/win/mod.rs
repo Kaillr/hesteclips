@@ -1002,6 +1002,15 @@ enum DisplayCapture {
 /// the second.
 const RETRY_DUPLICATION: (Duration, Duration) = (Duration::from_secs(5), Duration::from_secs(300));
 
+/// How often a recorded display is looked up, to tell when it went away and
+/// came back (see [`Video::follow_screen`]).
+const LOOK_AT_DISPLAY: Duration = Duration::from_secs(1);
+
+/// A display's capture starts again when the displays turn back on after
+/// Windows turned them off, and once more this long after: a monitor waking
+/// can take a few seconds to be back as it was (a guess).
+const AGAIN_AFTER_WAKE: Duration = Duration::from_secs(4);
+
 impl DisplayCapture {
     /// Capture the display the way `choice` says (see [`dupl::choose`]).
     /// Desktop Duplication that can't start has Windows' capture stand in.
@@ -1306,11 +1315,19 @@ impl Video {
             let (mut item, mut monitor) = (item.0, monitor.0);
             system::com_init();
             let mut display = Some(first.0);
-            // The display went away since its capture started (a monitor
-            // that sleeps can go, as if unplugged).
-            let mut went = false;
+            // The display is gone (a monitor that sleeps can go, as if
+            // unplugged), which has been said.
+            let mut gone = false;
+            // Why its capture starts again, as soon as it can.
+            let mut redo: Option<&str> = None;
             // Its capture couldn't start again, which has been said.
             let mut said = false;
+            // When to look at the display next, how many times the displays
+            // had turned back on by the last look, and when to start its
+            // capture once more after that (see `AGAIN_AFTER_WAKE`).
+            let mut look_at = Instant::now();
+            let mut wakes = system::display_wakes();
+            let mut again_at: Option<Instant> = None;
             // While Windows' capture stands in for Desktop Duplication: when
             // to try it again, and how long to wait after that if it can't.
             let mut retry = (Instant::now() + RETRY_DUPLICATION.0, RETRY_DUPLICATION.0);
@@ -1324,26 +1341,51 @@ impl Video {
             while !stop2.load(Ordering::Relaxed) {
                 // The display came back from going away, or as another (a
                 // monitor that slept, or was unplugged and plugged back in),
-                // or its capture by Windows ended: that capture showed the
-                // last picture from before for good, until the recording
-                // started again (issue #34). Its capture starts again, of the
-                // display as it is now. While it's gone, the last picture stays.
-                let closed = matches!(&display, Some(DisplayCapture::Wgc(c) | DisplayCapture::StandIn(c)) if c.is_closed());
-                match system::monitor_of(&id) {
-                    None => went = true,
-                    Some(now) if went || now != monitor || closed => match d3d::monitor_item(now) {
-                        Ok(again) => {
-                            eprintln!("the display {}: capturing it again", if went || now != monitor { "came back" } else { "capture ended" });
-                            (item, monitor, went, said) = (again, now, false, false);
-                            display = None;
-                        }
-                        Err(e) => {
-                            if !std::mem::replace(&mut said, true) {
-                                eprintln!("the display came back but can't be captured: {e:#}");
+                // Windows' capture of it ended, or the displays turned back on
+                // after Windows turned them off: a capture from before could
+                // show its last picture for good, until the recording started
+                // again (issue #34). Its capture starts again, of the display
+                // as it is now. While it's gone, the last picture stays.
+                if Instant::now() >= look_at {
+                    look_at = Instant::now() + LOOK_AT_DISPLAY;
+                    if matches!(&display, Some(DisplayCapture::Wgc(c) | DisplayCapture::StandIn(c)) if c.is_closed()) {
+                        redo.get_or_insert("Windows' capture of the display ended");
+                    }
+                    let woke = system::display_wakes();
+                    if woke != wakes {
+                        wakes = woke;
+                        again_at = Some(Instant::now() + AGAIN_AFTER_WAKE);
+                        redo.get_or_insert("the display turned back on");
+                    } else if again_at.is_some_and(|t| Instant::now() >= t) {
+                        again_at = None;
+                        redo.get_or_insert("the display turned back on a moment ago");
+                    }
+                    match system::connected_monitor(&id) {
+                        None => {
+                            if !std::mem::replace(&mut gone, true) {
+                                eprintln!("the display went away: its last picture stays until it's back");
                             }
                         }
-                    },
-                    Some(_) => {}
+                        Some(now) => {
+                            if std::mem::take(&mut gone) || now != monitor {
+                                redo = Some("the display came back");
+                            }
+                            if let Some(why) = redo {
+                                match d3d::monitor_item(now) {
+                                    Ok(again) => {
+                                        eprintln!("{why}: capturing it again");
+                                        (item, monitor, redo, said) = (again, now, None, false);
+                                        display = None;
+                                    }
+                                    Err(e) => {
+                                        if !std::mem::replace(&mut said, true) {
+                                            eprintln!("{why}, but it can't be captured: {e:#}");
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 // A fullscreen window in focus on this display.
                 let game = system::foreground_app()
