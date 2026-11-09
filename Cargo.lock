@@ -848,6 +848,8 @@ dependencies = [
  "resvg",
  "rubato",
  "serde_json",
+ "sha2",
+ "ureq",
  "wayland-client",
  "wayland-protocols",
  "wayland-protocols-plasma",

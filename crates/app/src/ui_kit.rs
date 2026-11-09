@@ -869,6 +869,26 @@ pub fn keycaps(ui: &mut egui::Ui, keys: &[String], listening: bool) -> Response 
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
+/// A thin bar `width` wide: how far something's got, or (`None`) that it's
+/// under way, how far not known: a part of it moving across.
+pub fn progress_bar(ui: &mut egui::Ui, width: f32, done: Option<f32>) {
+    let p = theme::pal(ui);
+    let (r, _) = ui.allocate_exact_size(vec2(width, 6.0), Sense::hover());
+    ui.painter().rect_filled(r, 3, p.control);
+    let (from, to) = match done {
+        Some(f) => (0.0, f.clamp(0.0, 1.0)),
+        None => {
+            ui.ctx().request_repaint();
+            let t = (ui.input(|i| i.time) * 0.7).fract() as f32 * 1.4 - 0.2;
+            ((t - 0.2).max(0.0), (t + 0.2).min(1.0))
+        }
+    };
+    if to > from {
+        let x = |f: f32| r.left() + r.width() * f;
+        ui.painter().rect_filled(egui::Rect::from_min_max(egui::pos2(x(from), r.top()), egui::pos2(x(to), r.bottom())), 3, p.text);
+    }
+}
+
 // --- Switch, segmented, select ---
 
 /// On or off. The knob slides; the track fills.

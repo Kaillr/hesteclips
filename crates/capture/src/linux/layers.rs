@@ -1,15 +1,16 @@
 //! The pictures of a capture's layers other than its own (see
 //! `crate::layers`): each webcam's newest picture, other displays' and app
 //! windows' captures, pictures and colours, animated pictures and video
-//! files, for the frame (`super::Picture`) to draw with the screen's, on the
-//! graphics card (`super::gpu_frame`) or the CPU (`super::image`).
+//! files, web pages, for the frame (`super::Picture`) to draw with the
+//! screen's, on the graphics card (`super::gpu_frame`) or the CPU
+//! (`super::image`).
 //!
 //! The layer list changes while it runs (the app keeps it up to date): a
 //! layer added gets its picture, one taken out lets go of it, one changed to
 //! another camera, display, window, picture or file gets the new one's.
 //! [`Feeds::stack`] follows it, on the pacer's thread, once per frame.
-//! What takes time to open (a display's or a window's capture, a video)
-//! opens on a thread of its own, and shows once it's there.
+//! What takes time to open (a display's or a window's capture, a video, a
+//! web page) opens on a thread of its own, and shows once it's there.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -40,12 +41,15 @@ pub(crate) enum Pixels {
     Still(Arc<StillImage>),
     /// An animated picture's frame `n` (B, G, R, A rows, its alpha kept).
     Animated(Animation, usize),
+    /// A web page's frame (`super::web`), in our memory or on the graphics
+    /// card: its colours premultiplied by its alpha, as Chromium draws them.
+    Page(Arc<Frame>),
 }
 
 impl Pixels {
     pub(crate) fn size(&self) -> (u32, u32) {
         match self {
-            Pixels::Frame(f) => (f.width, f.height),
+            Pixels::Frame(f) | Pixels::Page(f) => (f.width, f.height),
             Pixels::Camera(c) => (c.width, c.height),
             Pixels::Still(s) => (s.width, s.height),
             Pixels::Animated(a, n) => a.0.get(*n).map_or((0, 0), |(s, _)| (s.width, s.height)),
@@ -55,17 +59,23 @@ impl Pixels {
     /// The picture on the graphics card, if it's there.
     pub(crate) fn texture(&self) -> Option<&wgpu::Texture> {
         match self {
-            Pixels::Frame(f) => f.texture.as_ref(),
+            Pixels::Frame(f) | Pixels::Page(f) => f.texture.as_ref(),
             _ => None,
         }
+    }
+
+    /// Whether its colours are premultiplied by its alpha already (else
+    /// they're blended by it as they are).
+    pub(crate) fn premultiplied(&self) -> bool {
+        matches!(self, Pixels::Page(_))
     }
 
     /// The picture in our memory: its rows, the bytes from one to the
     /// next, and which way round its colours are.
     pub(crate) fn rows(&self) -> Option<(&[u8], usize, Order)> {
         match self {
-            Pixels::Frame(f) if f.texture.is_none() => Some((&f.data, f.stride, f.order)),
-            Pixels::Frame(_) => None,
+            Pixels::Frame(f) | Pixels::Page(f) if f.texture.is_none() => Some((&f.data, f.stride, f.order)),
+            Pixels::Frame(_) | Pixels::Page(_) => None,
             Pixels::Camera(c) => Some((&c.bgra, c.width as usize * 4, Order::Bgr)),
             Pixels::Still(s) => Some((&s.bgra, s.width as usize * 4, Order::Bgr)),
             Pixels::Animated(a, n) => a.0.get(*n).map(|(s, _)| (&s.bgra[..], s.width as usize * 4, Order::Bgr)),
@@ -130,6 +140,8 @@ pub(crate) type StackKey = (Vec<(u64, u64, Place, bool)>, bool, Vec<(u64, u64, P
 /// The layers' pictures, for one capture (the recording's, or the preview's).
 pub(crate) struct Feeds {
     layers: SharedLayers,
+    /// The capture's frame rate (a web page is drawn up to it).
+    fps: u32,
     /// Each layer's own picture source, by layer id (none for the main
     /// picture).
     feeds: Vec<(u64, Feed)>,
@@ -145,6 +157,8 @@ enum Feed {
     /// An animated picture: the frame showing by the time since it started.
     Animated { of: Animation, start: Instant, seq: u64 },
     Video { path: PathBuf, size: (u32, u32), sound: Option<String>, video: VideoFeed },
+    /// A web page, drawn by Chromium's engine (`super::web`).
+    Browser { url: String, size: (u32, u32), css: String, page: super::web::PageHandle },
 }
 
 /// What a still layer's picture was made from.
@@ -156,7 +170,7 @@ enum Still {
 
 /// A number no other picture has: a still's, or the first of an
 /// animation's or a capture's numbers (each has 2^40 of them).
-fn fresh_seq() -> u64 {
+pub(crate) fn fresh_seq() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(1);
     NEXT.fetch_add(1, Ordering::Relaxed) << 40
 }
@@ -172,6 +186,7 @@ impl Feed {
             (Feed::Still { of: Still::Colour(c), .. }, LayerSource::Colour { rgba, .. }) => c == rgba,
             (Feed::Animated { of, .. }, LayerSource::Animation { animation, .. }) => of == animation,
             (Feed::Video { path, size, sound, .. }, LayerSource::Video { path: p, width, height, sound: s, .. }) => path == p && *size == (*width, *height) && sound == s,
+            (Feed::Browser { url, size, css, .. }, LayerSource::Browser { url: u, width, height, css: c, .. }) => url == u && *size == (*width, *height) && css == c,
             _ => false,
         }
     }
@@ -190,13 +205,14 @@ impl Feed {
                 Some((Pixels::Animated(of.clone(), n), *seq + n as u64))
             }
             Feed::Video { video, .. } => video.picture().map(|(f, seq)| (Pixels::Frame(f), seq)),
+            Feed::Browser { page, .. } => page.picture().map(|(f, seq)| (Pixels::Page(f), seq)),
         }
     }
 }
 
 impl Feeds {
-    pub(crate) fn new(layers: SharedLayers) -> Self {
-        Self { layers, feeds: Vec::new() }
+    pub(crate) fn new(layers: SharedLayers, fps: u32) -> Self {
+        Self { layers, fps, feeds: Vec::new() }
     }
 
     /// Follow the layer list (a picture for each layer added or changed,
@@ -263,8 +279,10 @@ impl Feeds {
                     let video = VideoFeed::start(path, (*width, *height), *fps, *looped, sound.clone(), !placement.hidden);
                     Feed::Video { path: path.clone(), size: (*width, *height), sound: sound.clone(), video }
                 }
-                // Not drawn here (see `crate::layers::BROWSER`).
-                LayerSource::Browser { .. } => continue,
+                LayerSource::Browser { url, width, height, css, .. } => {
+                    let spec = super::web::Spec { layer: l.id, url: url.clone(), width: *width, height: *height, css: css.clone() };
+                    Feed::Browser { url: url.clone(), size: (*width, *height), css: css.clone(), page: super::web::PageHandle::open(spec, self.fps, self.layers.clone()) }
+                }
             };
             self.feeds.push((l.id, feed));
         }

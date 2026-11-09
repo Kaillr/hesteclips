@@ -126,6 +126,12 @@ impl log::Log for GpuLog {
 }
 
 fn main() -> eframe::Result<()> {
+    // Started again by itself to draw web pages (the web page host, or one
+    // of Chromium's own processes under it): does only that, and exits.
+    #[cfg(target_os = "linux")]
+    if capture::linux::web_helper() {
+        return Ok(());
+    }
     // Started again by itself to ask KDE for the screen (so its own windows
     // are in the recording): does only that, and exits.
     #[cfg(target_os = "linux")]

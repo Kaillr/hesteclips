@@ -288,7 +288,8 @@ struct Draw {
     origin: vec2<u32>,
     // How it's sampled (1 a webcam's, 0 as the screen is), turned a quarter
     // this many times, flipped (1 across, 2 upside down), and blended by its
-    // alpha (else it covers all of its box).
+    // alpha (1; 2 its colours premultiplied by it already, a web page's;
+    // else 0, it covers all of its box).
     mode: u32,
     turns: u32,
     flips: u32,
@@ -400,7 +401,9 @@ fn draw_layer(@builtin(global_invocation_id) id: vec3<u32>) {
             for (var x = floor(r.x); x < r.y; x += 1.0) {
                 let w = (min(r.y, x + 1.0) - max(r.x, x)) * wy;
                 let t = textureLoad(picture, vec2<i32>(i32(x), i32(y)), 0);
-                if (d.blended != 0u) {
+                if (d.blended == 2u) {
+                    sum += t * w;
+                } else if (d.blended != 0u) {
                     sum += vec4<f32>(t.rgb * t.a, t.a) * w;
                 } else {
                     sum += vec4<f32>(t.rgb, 1.0) * w;
@@ -701,9 +704,20 @@ fn layer_params(l: &Shown, (fw, fh): (u32, u32)) -> Option<(Vec<u8>, [u32; 4])> 
         .iter()
         .chain(&b)
         .flat_map(|v| v.to_le_bytes())
-        .chain([fw, fh, pw, ph, region[0], region[1], mode, turns, flips, u32::from(l.blended), 0, 0].iter().flat_map(|v| v.to_le_bytes()))
+        .chain([fw, fh, pw, ph, region[0], region[1], mode, turns, flips, blend_mode(l), 0, 0].iter().flat_map(|v| v.to_le_bytes()))
         .collect();
     Some((bytes, region))
+}
+
+/// How `l` goes over what's under it (`LAYER_SHADER`'s `blended`): covering
+/// its box (0), blended by its alpha (1), or by it with its colours
+/// premultiplied already (2: a web page's, as Chromium draws them).
+fn blend_mode(l: &Shown) -> u32 {
+    match (l.blended, l.pixels.premultiplied()) {
+        (false, _) => 0,
+        (true, false) => 1,
+        (true, true) => 2,
+    }
 }
 
 impl GpuPicture {

@@ -164,7 +164,7 @@ HasteClip is in beta (versions 0.x). It works day to day, but not every feature 
 | Share links, copy, export and import | ✅ | ✅ | ✅ |
 | Voice saving, named clips, per-app sound, webcam | ✅ | ✅ | ✅ |
 | Several webcams, other displays, windows, images, text and videos in the video | ✅ | ✅ | ✅ |
-| A web page in the video (alerts, chat) | ✅ | ✅ | — |
+| A web page in the video (alerts, chat) | ✅ | ✅ | ✅ (see below) |
 | Record a single game or app window | ✅ | ✅ | ✅ (see below) |
 | Drag clips out, system share sheet | ✅ | ✅ | Drag out on Wayland (no share sheet) |
 | Frame blending | ✅ | ✅ | ✅ |
@@ -174,6 +174,8 @@ HasteClip is in beta (versions 0.x). It works day to day, but not every feature 
 | Game capture for fullscreen games | — | ✅ | — |
 
 **Games and apps on Linux:** every window on KDE Plasma, on X11 desktops, and on Sway and other desktops with the ext window capture protocols (Sway 1.11 and later). On GNOME, the windows of X11 apps, which includes games run through Proton or Wine; GNOME doesn't let apps follow its native Wayland windows, so record the whole screen for those.
+
+**Web pages on Linux** are drawn by Chromium's engine ([CEF](https://bitbucket.org/chromiumembedded/cef), the one OBS uses), on your graphics card where it can. It isn't part of the download: the first time you add a web page, HasteClip downloads it once from its releases (about 107 MB) and keeps it in `~/.local/share/hasteclip`. A build of your own can use an engine unpacked elsewhere with `HASTECLIP_WEB_ENGINE_DIR=<folder>`.
 
 **Encoders:** VideoToolbox on macOS. NVENC, AMF or Quick Sync through Media Foundation on Windows. NVENC or VA-API through ffmpeg on Linux, with x264 when there's no GPU encoder. A stream gets an encoder of its own (on Linux, always ffmpeg's).
 

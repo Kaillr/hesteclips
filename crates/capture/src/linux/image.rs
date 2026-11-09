@@ -24,8 +24,9 @@ pub(crate) struct Canvas {
 }
 
 /// What a layer's scaled picture was made from: the layer, its picture,
-/// the part of it used, its size scaled, and whether it's blended.
-type PartKey = (u64, u64, [u32; 4], (usize, usize), bool);
+/// the part of it used, its size scaled, and whether it's blended (and
+/// with its colours premultiplied already).
+type PartKey = (u64, u64, [u32; 4], (usize, usize), bool, bool);
 
 /// Layers' scaled pictures kept at most.
 const PARTS_KEPT: usize = 16;
@@ -52,12 +53,18 @@ impl Canvas {
                 }
                 // Scaled its own way round, then put in its place turned and flipped.
                 let (pw, ph) = if place.turns % 2 == 1 { (dh as usize, dw as usize) } else { (dw as usize, dh as usize) };
-                let key = (l.id, l.seq, [sx, sy, sw, sh], (pw, ph), l.blended);
+                let premultiplied = pixels.premultiplied();
+                let key = (l.id, l.seq, [sx, sy, sw, sh], (pw, ph), l.blended, premultiplied);
                 let at = match self.parts.iter().position(|(k, _)| *k == key) {
                     Some(at) => at,
                     None => {
                         let data = &rows[sy as usize * stride + sx as usize * 4..];
-                        let part = scaled_part(data, (sw as usize, sh as usize), stride, order == Order::Rgb, (pw, ph), l.blended);
+                        let blend = match (l.blended, premultiplied) {
+                            (false, _) => Blend::Covers,
+                            (true, false) => Blend::Alpha,
+                            (true, true) => Blend::Premultiplied,
+                        };
+                        let part = scaled_part(data, (sw as usize, sh as usize), stride, order == Order::Rgb, (pw, ph), blend);
                         self.parts.retain(|(k, _)| k.0 != l.id);
                         if self.parts.len() >= PARTS_KEPT {
                             self.parts.remove(0);
@@ -257,13 +264,25 @@ impl Canvas {
     }
 }
 
+/// How a layer's picture goes over what's under it.
+#[derive(Clone, Copy, PartialEq)]
+enum Blend {
+    /// Covering its box.
+    Covers,
+    /// Blended by its alpha.
+    Alpha,
+    /// Blended by its alpha, its colours premultiplied by it already (a web
+    /// page's, as Chromium draws them).
+    Premultiplied,
+}
+
 /// A picture (`size`, rows `stride` bytes apart, B, G, R, A, or R, G, B,
 /// A with `swap`) scaled to `to`, each pixel the average of the area it
-/// covers: opaque, or with `blended` its colour premultiplied by its alpha
+/// covers: opaque, or when blended its colour premultiplied by its alpha
 /// and its alpha kept (each averaged on its own).
-fn scaled_part(data: &[u8], size: (usize, usize), stride: usize, swap: bool, to: (usize, usize), blended: bool) -> Vec<u8> {
+fn scaled_part(data: &[u8], size: (usize, usize), stride: usize, swap: bool, to: (usize, usize), blend: Blend) -> Vec<u8> {
     let mut out = vec![0u8; to.0 * to.1 * 4];
-    if !blended {
+    if blend == Blend::Covers {
         resample(data, size, stride, swap, &mut out, to);
         return out;
     }
@@ -275,8 +294,12 @@ fn scaled_part(data: &[u8], size: (usize, usize), stride: usize, swap: bool, to:
             let p = &data[y * stride + x * 4..][..4];
             let a = p[3] as u32;
             let at = (y * w + x) * 4;
-            for k in 0..3 {
-                colour[at + k] = ((p[k] as u32 * a + 127) / 255) as u8;
+            if blend == Blend::Premultiplied {
+                colour[at..at + 3].copy_from_slice(&p[..3]);
+            } else {
+                for k in 0..3 {
+                    colour[at + k] = ((p[k] as u32 * a + 127) / 255) as u8;
+                }
             }
             alpha[at..at + 3].fill(p[3]);
         }

@@ -81,18 +81,6 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
-/// A script adding `css` to a page as it's made (a style sheet at the end
-/// of its head, so it goes over the page's own), if there's any.
-fn css_script(css: &str) -> Option<String> {
-    if css.trim().is_empty() {
-        return None;
-    }
-    let text = serde_json::to_string(css).ok()?;
-    Some(format!(
-        "(() => {{ const add = () => {{ const s = document.createElement('style'); s.textContent = {text}; (document.head || document.documentElement).appendChild(s); }}; if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', add); else add(); }})();"
-    ))
-}
-
 /// The page's window, made, shown off every display, its page loaded (with
 /// `css`); then its messages pumped until it's to stop.
 fn run(url: &str, width: u32, height: u32, css: &str, out: &AtomicIsize, stop: &AtomicBool) -> Result<()> {
@@ -143,7 +131,7 @@ fn run(url: &str, width: u32, height: u32, css: &str, out: &AtomicIsize, stop: &
                 c2.SetDefaultBackgroundColor(COREWEBVIEW2_COLOR { A: 0, R: 0, G: 0, B: 0 })?;
             }
             let view = controller.CoreWebView2()?;
-            if let Some(script) = css_script(css) {
+            if let Some(script) = crate::layers::style_script(css) {
                 let v = view.clone();
                 AddScriptToExecuteOnDocumentCreatedCompletedHandler::wait_for_async_operation(
                     Box::new(move |handler| v.AddScriptToExecuteOnDocumentCreated(&HSTRING::from(script), &handler).map_err(webview2_com::Error::WindowsError)),
@@ -199,17 +187,4 @@ fn environment() -> Result<ICoreWebView2Environment> {
     )
     .map_err(|e| anyhow!("WebView2 (Edge's web view, part of Windows) couldn't start: {e}"))?;
     Ok(rx.recv().context("WebView2 didn't start")??)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::css_script;
-
-    /// No style, no script; a style's quotes and lines kept, as a string.
-    #[test]
-    fn a_style_sheet_goes_in_as_written() {
-        assert_eq!(css_script("  \n"), None);
-        let s = css_script("body { font-family: \"Inter\"; }\n.x{}").unwrap();
-        assert!(s.contains(r#""body { font-family: \"Inter\"; }\n.x{}""#), "{s}");
-    }
 }

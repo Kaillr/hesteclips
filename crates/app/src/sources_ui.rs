@@ -114,18 +114,24 @@ pub(crate) struct SourcesView {
 }
 
 /// Dev aid: `HASTECLIP_OPEN_SOURCES` names whose settings are open
-/// (`screen`, `webcam`: the first one, `mix`, `video`) or the crop's page
-/// (`crop`).
+/// (`screen`, `webcam`: the first one, `page`: the first web page, `mix`,
+/// `video`) or the crop's page (`crop`).
 pub(crate) fn open_dev(app: &mut App, names: &str) {
     use crate::canvas_ui::Layer;
     use crate::inspector_ui::Editing;
     let webcam = app.settings.first_webcam().map(|w| w.key);
+    let page = app.settings.visuals.iter().find(|v| matches!(v.visual, crate::settings::Visual::Browser { .. })).map(|v| v.key);
     for name in names.split(',').map(str::trim) {
         match name {
             "screen" => app.edit_layer(Layer::Screen),
             "webcam" => {
                 if let Some(k) = webcam {
                     app.edit_layer(Layer::Webcam(k));
+                }
+            }
+            "page" => {
+                if let Some(k) = page {
+                    app.edit_layer(Layer::Visual(k));
                 }
             }
             "mix" => app.sources_view.editing = Some(Editing::Mix),

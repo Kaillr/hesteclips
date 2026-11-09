@@ -63,8 +63,57 @@ pub enum LayerSource {
 }
 
 /// Whether this platform can show a web page as a layer: WebView2 on
-/// Windows, WebKit on macOS.
-pub const BROWSER: bool = cfg!(any(target_os = "windows", target_os = "macos"));
+/// Windows, WebKit on macOS (both part of the system), Chromium's engine
+/// on Linux, fetched the first time a page is shown ([`browser_engine`]).
+pub const BROWSER: bool = cfg!(any(target_os = "windows", target_os = "macos", target_os = "linux"));
+
+/// Where the engine that draws web pages stands.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BrowserEngine {
+    /// Here: pages draw.
+    Ready,
+    /// Being downloaded (Linux, the first time a page is shown): bytes so
+    /// far, of how many.
+    Fetching { got: u64, total: Option<u64> },
+    /// Downloaded, being unpacked.
+    Unpacking,
+    /// It couldn't be fetched, or doesn't start: why.
+    Failed(String),
+}
+
+/// Where the engine that draws web pages stands. On Linux, asking starts
+/// fetching it, if it isn't here yet (a page is being shown).
+pub fn browser_engine() -> BrowserEngine {
+    #[cfg(target_os = "linux")]
+    {
+        crate::linux::browser_engine()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        BrowserEngine::Ready
+    }
+}
+
+/// After a failure: fetch the engine again, or start it again.
+pub fn retry_browser_engine() {
+    #[cfg(target_os = "linux")]
+    crate::linux::retry_browser_engine();
+}
+
+/// The script adding a web page's own style (`LayerSource::Browser`'s
+/// `css`) as it loads: a style sheet at the end of its head, so it goes
+/// over the page's own, once (run again, it adds nothing); none without a
+/// style.
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+pub(crate) fn style_script(css: &str) -> Option<String> {
+    if css.trim().is_empty() {
+        return None;
+    }
+    let text = serde_json::to_string(css).ok()?;
+    Some(format!(
+        "(() => {{ const add = () => {{ if (document.getElementById('hasteclip-style')) return; const s = document.createElement('style'); s.id = 'hasteclip-style'; s.textContent = {text}; (document.head || document.documentElement).appendChild(s); }}; if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', add); else add(); }})();"
+    ))
+}
 
 /// Whether this platform can play a video file as a layer.
 pub const VIDEO: bool = cfg!(any(target_os = "windows", target_os = "macos", target_os = "linux"));
@@ -194,4 +243,16 @@ pub fn with_webcam(w: Option<&crate::webcam::Webcam>, main_in_front: bool) -> Sh
         None => vec![main],
     };
     Arc::new(Mutex::new(list))
+}
+
+#[cfg(test)]
+mod tests {
+    /// No style, no script; a style's quotes and lines kept, as a string.
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_style_sheet_goes_in_as_written() {
+        assert_eq!(super::style_script("  \n"), None);
+        let s = super::style_script("body { font-family: \"Inter\"; }\n.x{}").unwrap();
+        assert!(s.contains(r#""body { font-family: \"Inter\"; }\n.x{}""#), "{s}");
+    }
 }

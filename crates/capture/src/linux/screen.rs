@@ -157,6 +157,13 @@ impl Latest {
         Some(spare.swap_remove(at))
     }
 
+    /// No picture till the next (its source stopped: left out meanwhile,
+    /// rather than its last picture kept).
+    pub(crate) fn clear(&self) {
+        self.frame.lock().unwrap().take();
+        self.seq.fetch_add(1, Ordering::Release);
+    }
+
     /// The newest picture is this texture, on the card.
     pub(crate) fn store_texture(&self, texture: wgpu::Texture) {
         let (width, height) = (texture.width(), texture.height());

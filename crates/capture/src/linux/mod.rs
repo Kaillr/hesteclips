@@ -36,6 +36,7 @@ mod apps;
 pub mod audio;
 mod blend;
 mod camera;
+mod cef;
 pub mod decode;
 mod dmabuf;
 pub(crate) mod export;
@@ -55,6 +56,10 @@ mod nvenc;
 mod portal;
 mod screen;
 mod vkenc;
+mod web;
+mod web_engine;
+mod web_host;
+mod web_wire;
 mod wl_outputs;
 mod wlr;
 mod wlr_windows;
@@ -73,6 +78,7 @@ use anyhow::{Context, Result, bail};
 pub use camera::{keep_open as keep_camera_open, list_cameras};
 pub(crate) use layers::{app_window_size, video_size};
 pub use kwin::helper as kde_stream_helper;
+pub use web_host::helper as web_helper;
 
 use crate::mixer::{self, Clock, LiveAudio, MixChange, MixInput};
 use crate::mp4file::Layout;
@@ -84,6 +90,29 @@ use crate::stream::StreamSettings;
 use crate::writer::{self, Writer};
 use crate::{AUDIO_BITRATE, BlendShape, Device, EncodeSettings, Mode, Recorder, Running, VideoSource};
 use image::Canvas;
+
+/// Where the engine drawing web pages stands (`crate::layers::browser_engine`):
+/// fetched now if it isn't here yet.
+pub(crate) fn browser_engine() -> crate::layers::BrowserEngine {
+    use crate::layers::BrowserEngine;
+    use web_engine::Engine;
+    match web_engine::status() {
+        Engine::Missing => {
+            web_engine::ensure();
+            BrowserEngine::Fetching { got: 0, total: None }
+        }
+        Engine::Fetching { got, total } => BrowserEngine::Fetching { got, total },
+        Engine::Unpacking => BrowserEngine::Unpacking,
+        Engine::Ready(_) => BrowserEngine::Ready,
+        Engine::Failed(why) => BrowserEngine::Failed(why),
+    }
+}
+
+/// After a failure: the engine fetched again, or started again.
+pub(crate) fn retry_browser_engine() {
+    web_engine::retry();
+    web::retry_now();
+}
 
 /// CLOCK_MONOTONIC in seconds: PipeWire's clock, and so every timestamp's.
 pub(crate) fn host_now() -> f64 {
@@ -706,7 +735,7 @@ impl Session {
             let mixer = mixer::spawn_changing_mixer(inputs, changes, mix_track, rest_track, live.clone(), clock.clone(), host_now, MIX_LATENCY, stop.clone());
             session.mixer = Some((stop, mixer));
 
-            let picture = Picture::new(feed.clone(), width, height, s.screen.clone(), s.layers.clone());
+            let picture = Picture::new(feed.clone(), width, height, s.fps, s.screen.clone(), s.layers.clone());
             let encoder = VideoEncoder::start(width, height, s, session.writer_tx.clone(), picture.gpu.as_ref())?;
             session.on_card = picture.gpu.is_some();
             let ctl = session.ctl.clone();
@@ -812,12 +841,12 @@ struct Picture {
 }
 
 impl Picture {
-    fn new(feed: Feed, width: u32, height: u32, screen: crate::SharedScreen, layers: crate::SharedLayers) -> Self {
+    fn new(feed: Feed, width: u32, height: u32, fps: u32, screen: crate::SharedScreen, layers: crate::SharedLayers) -> Self {
         let placed = *screen.lock().unwrap();
         let gpu = screen::gpu_frames().map(|g| gpu_frame::GpuPicture::new(g, width, height, placed));
         let mut canvas = if gpu.is_some() { Canvas::new(0, 0) } else { Canvas::new(width, height) };
         canvas.clear();
-        Self { feed, width, height, canvas, gpu, screen, feeds: layers::Feeds::new(layers), stack: layers::Stack::main_only(), shows: None, nv12: Vec::new(), version: 0 }
+        Self { feed, width, height, canvas, gpu, screen, feeds: layers::Feeds::new(layers, fps), stack: layers::Stack::main_only(), shows: None, nv12: Vec::new(), version: 0 }
     }
 
     /// Where the screen goes now (hidden when the list hasn't it: a scene
@@ -1349,7 +1378,7 @@ impl PreviewCapture {
             };
             *opened2.lock().unwrap() = Some(feed.clone());
             let (width, height) = feed.recorded_size(size);
-            let mut picture = Picture::new(feed.clone(), width, height, screen, layers);
+            let mut picture = Picture::new(feed.clone(), width, height, fps, screen, layers);
             let mut sent = Previewed::new(generation);
             // Paced like the recording would be.
             let every = 1.0 / fps.max(1) as f64;

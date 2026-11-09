@@ -686,6 +686,7 @@ impl App {
                 });
             }
             Visual::Browser { url, width, height, reload, css } => {
+                engine_row(l);
                 // Typed in full, then taken when it's done (Enter, or
                 // clicking away): each key would load the page again.
                 let draft_id = egui::Id::new(("browser_url", key));
@@ -941,6 +942,37 @@ fn dialog_scroll(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::Debug, 
         add(ui);
         ui.add_space(4.0);
     });
+}
+
+/// Where the engine drawing web pages stands, while it isn't ready (Linux
+/// downloads Chromium the first time a page is shown): how far it's got,
+/// or why it couldn't, with a way to try again.
+fn engine_row(l: &mut ui_kit::List) {
+    use capture::layers::BrowserEngine;
+    let mb = |b: u64| (b as f64 / 1e6).round() as u64;
+    match capture::layers::browser_engine() {
+        BrowserEngine::Ready => {}
+        BrowserEngine::Fetching { got, total } => {
+            let note = match total {
+                Some(t) => format!("Pages are drawn by Chromium, downloaded once: {} of {} MB", mb(got), mb(t)),
+                None => "Pages are drawn by Chromium, downloaded once".to_owned(),
+            };
+            l.row(Row::new("Engine").note(note), |ui| ui_kit::progress_bar(ui, 120.0, total.filter(|t| *t > 0).map(|t| got as f32 / t as f32)));
+            l.ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+        }
+        BrowserEngine::Unpacking => {
+            l.row(Row::new("Engine").note("Pages are drawn by Chromium: unpacking it"), |ui| ui_kit::progress_bar(ui, 120.0, None));
+            l.ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+        }
+        BrowserEngine::Failed(why) => {
+            l.row(Row::new("Engine").note(why).warn(true), |ui| {
+                if Btn::normal("Try again").with_icon(icon::ARROWS_CLOCKWISE).small().show(ui).clicked() {
+                    capture::layers::retry_browser_engine();
+                }
+            });
+            l.ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+        }
+    }
 }
 
 /// A row whose control is as wide as the row, under its name (an address,

@@ -87,7 +87,7 @@ impl Page {
         window.setCollectionBehavior(NSWindowCollectionBehavior::Transient | NSWindowCollectionBehavior::IgnoresCycle | NSWindowCollectionBehavior::Stationary);
         let config = unsafe { WKWebViewConfiguration::new(mtm) };
         unsafe { config.setMediaTypesRequiringUserActionForPlayback(WKAudiovisualMediaTypes::None) };
-        if let Some(script) = css_script(css) {
+        if let Some(script) = crate::layers::style_script(css) {
             let script = unsafe { WKUserScript::initWithSource_injectionTime_forMainFrameOnly(WKUserScript::alloc(mtm), &NSString::from_str(&script), WKUserScriptInjectionTime::AtDocumentStart, true) };
             unsafe { config.userContentController().addUserScript(&script) };
         }
@@ -122,31 +122,5 @@ impl Drop for Page {
             }
             drop(views);
         });
-    }
-}
-
-/// A script adding `css` to a page as it's made (a style sheet at the end
-/// of its head, so it goes over the page's own), if there's any (as on
-/// Windows).
-fn css_script(css: &str) -> Option<String> {
-    if css.trim().is_empty() {
-        return None;
-    }
-    let text = serde_json::to_string(css).ok()?;
-    Some(format!(
-        "(() => {{ const add = () => {{ const s = document.createElement('style'); s.textContent = {text}; (document.head || document.documentElement).appendChild(s); }}; if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', add); else add(); }})();"
-    ))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::css_script;
-
-    /// No style, no script; a style's quotes and lines kept, as a string.
-    #[test]
-    fn a_style_sheet_goes_in_as_written() {
-        assert_eq!(css_script("  \n"), None);
-        let s = css_script("body { font-family: \"Inter\"; }\n.x{}").unwrap();
-        assert!(s.contains(r#""body { font-family: \"Inter\"; }\n.x{}""#), "{s}");
     }
 }
