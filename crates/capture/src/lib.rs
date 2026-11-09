@@ -939,14 +939,34 @@ pub fn choose_screen_again() {
 }
 
 /// Where a display (by its id, as [`list_screens`] gives it) is on the
-/// desktop: its left, top, width and height in pixels. Windows; elsewhere
-/// not known (`None`).
+/// desktop: its left, top, width and height in pixels. Windows and X11;
+/// elsewhere not known (`None`: see [`display_monitor`]).
 pub fn display_bounds(id: &str) -> Option<[i32; 4]> {
     #[cfg(target_os = "windows")]
     {
         win::display_bounds(id)
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
+    {
+        linux::display_bounds(id)
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    {
+        let _ = id;
+        None
+    }
+}
+
+/// A display's place among the window system's outputs (winit's
+/// `available_monitors()` order), where a window can only be put on one by
+/// that, fullscreen: Wayland, which places windows itself. `None` elsewhere
+/// (see [`display_bounds`]).
+pub fn display_monitor(id: &str) -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::display_monitor(id)
+    }
+    #[cfg(not(target_os = "linux"))]
     {
         let _ = id;
         None

@@ -55,6 +55,7 @@ mod nvenc;
 mod portal;
 mod screen;
 mod vkenc;
+mod wl_outputs;
 mod wlr;
 mod wlr_windows;
 mod x11;
@@ -212,6 +213,28 @@ pub(crate) fn app_icon(id: &str, size: u32) -> Option<Vec<u8>> {
 /// Running programs with a window, for `VideoSource::Apps`.
 pub(crate) fn list_windowed_apps() -> Vec<Device> {
     if apps::available() { apps::list() } else { Vec::new() }
+}
+
+/// Where monitor `id` is on an X11 desktop (left, top, width, height):
+/// windows are placed there by position. Not on Wayland (see
+/// [`display_monitor`]).
+pub(crate) fn display_bounds(id: &str) -> Option<[i32; 4]> {
+    if !x11::session() {
+        return None;
+    }
+    let m = x11::monitors().into_iter().find(|m| m.id == id)?;
+    Some([m.x.into(), m.y.into(), m.width.into(), m.height.into()])
+}
+
+/// Monitor `id`'s place among the compositor's outputs, on Wayland: the
+/// one a window is put fullscreen on to be on it (an app can't place its
+/// windows there). Matched by the output's name (`kde:DP-1` is `DP-1`).
+pub(crate) fn display_monitor(id: &str) -> Option<usize> {
+    if x11::session() || std::env::var_os("WAYLAND_DISPLAY").is_none() {
+        return None;
+    }
+    let name = id.split_once(':').map_or(id, |(_, n)| n);
+    wl_outputs::names()?.iter().position(|n| n.as_deref() == Some(name))
 }
 
 /// Forget which screen was picked, so the next capture (the preview, when

@@ -20,6 +20,10 @@ pub(crate) struct Projector {
     display: String,
     name: String,
     opened: Instant,
+    /// Where the window system can only put a window on a display
+    /// fullscreen (Wayland): which of its outputs it is. The window opens
+    /// fullscreen there.
+    monitor: Option<usize>,
     /// Fullscreen on its display (put there first, where its place is known).
     placed: bool,
     /// Frames it's been trying to get there.
@@ -33,7 +37,8 @@ const TRIES: u32 = 60;
 impl App {
     /// Preview on display `d`, instead of where it was.
     pub(crate) fn open_projector(&mut self, d: &capture::Device) {
-        self.projector = Some(Projector { display: d.id.clone(), name: d.name.clone(), opened: Instant::now(), placed: false, tries: 0 });
+        let monitor = capture::display_monitor(&d.id);
+        self.projector = Some(Projector { display: d.id.clone(), name: d.name.clone(), opened: Instant::now(), monitor, placed: false, tries: 0 });
     }
 
     /// The displays to preview on, one an item each (the one it's on
@@ -74,7 +79,11 @@ impl App {
         // along its top, and fullscreen takes the frame off by itself.
         // Opened on its display (as near as points go).
         let mut builder = egui::ViewportBuilder::default().with_title(format!("HasteClip preview: {}", p.name)).with_visible(false).with_inner_size([960.0, 540.0]);
-        if let Some(b) = bounds {
+        if let Some(m) = p.monitor {
+            // Made fullscreen on its output as it opens: the only way onto a
+            // display where windows aren't placed by position.
+            builder = builder.with_monitor(m);
+        } else if let Some(b) = bounds {
             builder = builder.with_position(inside(b, ctx.pixels_per_point()));
         }
         let mut close = false;
@@ -94,6 +103,15 @@ impl App {
         // display of another scale exactly), then fullscreen there, shown.
         // Where its display isn't known, or it can't be got there, fullscreen
         // where it is.
+        if let Some(p) = self.projector.as_mut().filter(|p| !p.placed && p.monitor.is_some()) {
+            // Opened fullscreen on its output already: shown, there.
+            if let Some(m) = p.monitor {
+                ctx.send_viewport_cmd(egui::ViewportCommand::SetMonitor(m));
+            }
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            p.placed = true;
+        }
         if let Some(p) = self.projector.as_mut().filter(|p| !p.placed) {
             p.tries += 1;
             let ppp = ctx.pixels_per_point();
