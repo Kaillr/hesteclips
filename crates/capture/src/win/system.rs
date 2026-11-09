@@ -11,11 +11,9 @@ use windows::Win32::Graphics::Gdi::{
     DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplayMonitors, EnumDisplaySettingsW, GetMonitorInfoW, HDC, HMONITOR,
     MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MONITORINFOEXW, MonitorFromPoint,
 };
-use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Media::Audio::{
-    DEVICE_STATE_ACTIVE, IAudioSessionControl2, IAudioSessionManager2, IMMDeviceEnumerator, MMDeviceEnumerator, eConsole, eRender,
+    DEVICE_STATE_ACTIVE, IAudioSessionControl2, IAudioSessionManager2, IMMDeviceEnumerator, MMDeviceEnumerator, eRender,
 };
-use windows::Win32::System::Com::STGM_READ;
 use windows::Win32::Media::MediaFoundation::{MF_VERSION, MFSTARTUP_FULL, MFStartup};
 use windows::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
 use windows::Win32::System::Com::{CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoIncrementMTAUsage, CoInitializeEx};
@@ -322,11 +320,7 @@ pub(crate) struct ProcessTree {
 
 impl ProcessTree {
     pub(crate) fn snapshot() -> Self {
-        Self::of(processes())
-    }
-
-    pub(crate) fn of(processes: Vec<Process>) -> Self {
-        Self { by_pid: processes.into_iter().map(|p| (p.pid, p)).collect() }
+        Self { by_pid: processes().into_iter().map(|p| (p.pid, p)).collect() }
     }
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = &Process> {
@@ -407,41 +401,6 @@ pub(crate) fn audio_session_pids() -> Vec<u32> {
     pids.sort_unstable();
     pids.dedup();
     pids
-}
-
-/// The id of the output device called `name` (its name as
-/// [`crate::audio::list_audio_devices`] gives it, which is cpal's: the
-/// endpoint's friendly name), or of the default one for
-/// [`crate::audio::DEFAULT_DEVICE`]. None if it isn't connected.
-pub(crate) fn render_device_id(name: &str) -> Option<String> {
-    let enumerator: IMMDeviceEnumerator = unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }.ok()?;
-    let id_of = |device: &windows::Win32::Media::Audio::IMMDevice| -> Option<String> {
-        let id = unsafe { device.GetId() }.ok()?;
-        let text = unsafe { id.to_string() }.ok();
-        unsafe { windows::Win32::System::Com::CoTaskMemFree(Some(id.0 as *const _)) };
-        text
-    };
-    if name == crate::audio::DEFAULT_DEVICE {
-        return id_of(&unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole) }.ok()?);
-    }
-    let devices = unsafe { enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE) }.ok()?;
-    for i in 0..unsafe { devices.GetCount() }.ok()? {
-        let Ok(device) = (unsafe { devices.Item(i) }) else { continue };
-        let Ok(props) = (unsafe { device.OpenPropertyStore(STGM_READ) }) else { continue };
-        let Ok(value) = (unsafe { props.GetValue(&PKEY_Device_FriendlyName) }) else { continue };
-        if value.to_string() == name {
-            return id_of(&device);
-        }
-    }
-    None
-}
-
-/// What to call the program `exe`, running as `pid`: its file description
-/// ("FxSound"), else its executable without ".exe".
-pub(crate) fn program_name(pid: u32, exe: &str) -> String {
-    image_path(pid)
-        .and_then(|path| file_description(&path))
-        .unwrap_or_else(|| exe.strip_suffix(".exe").or_else(|| exe.strip_suffix(".EXE")).unwrap_or(exe).to_owned())
 }
 
 // ---------------------------------------------------------------------------

@@ -502,8 +502,8 @@ fn relink(core: &pw::core::CoreRc, g: &Graph, c: &mut Capture, app_ids: &[String
         let Some(app) = &n.app else { return matches!(c.source.kind, SourceKind::Desktop { .. }) };
         match &c.source.kind {
             SourceKind::App { bundle_id } => app.is(bundle_id),
-            SourceKind::Desktop { exclude_app_sources, .. } => !*exclude_app_sources || !app_ids.iter().any(|a| app.is(a)),
-            SourceKind::Microphone { .. } | SourceKind::Video { .. } | SourceKind::Output { .. } => false,
+            SourceKind::Desktop { exclude_app_sources } => !*exclude_app_sources || !app_ids.iter().any(|a| app.is(a)),
+            SourceKind::Microphone { .. } | SourceKind::Video { .. } => false,
         }
     };
     let sources: Vec<u32> = g.playback().filter(|(_, n)| wanted_node(n)).map(|(id, _)| id).collect();
