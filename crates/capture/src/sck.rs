@@ -875,7 +875,7 @@ fn sync_taps(taps: &mut [Tap]) {
     for tap in taps.iter_mut() {
         let (include, wanted): (bool, Vec<&str>) = match &tap.source.kind {
             SourceKind::App { bundle_id } => (true, vec![bundle_id.as_str()]),
-            SourceKind::Desktop { exclude_app_sources: true } => (false, app_sources.iter().map(String::as_str).collect()),
+            SourceKind::Desktop { exclude_app_sources: true, .. } => (false, app_sources.iter().map(String::as_str).collect()),
             _ => (false, Vec::new()),
         };
         let apps: Vec<Retained<SCRunningApplication>> = running
@@ -1319,7 +1319,7 @@ mod tests {
         let live = LiveAudio::new();
         let mut rec = SckRecorder::new(live.clone());
         let mic_name = crate::audio::list_audio_devices().default_input.expect("a microphone");
-        let desktop = AudioSource { id: "desktop".into(), name: "Desktop".into(), kind: SourceKind::Desktop { exclude_app_sources: false }, in_mix: true, own_track: false };
+        let desktop = AudioSource { id: "desktop".into(), name: "Desktop".into(), kind: SourceKind::Desktop { exclude_app_sources: false, leave_out: Vec::new() }, in_mix: true, own_track: false };
         let mic = AudioSource { id: "mic".into(), name: "Mic".into(), kind: SourceKind::Microphone { device: mic_name }, in_mix: true, own_track: false };
         let screen = crate::list_screens().into_iter().next().expect("a screen");
         let dir = std::env::temp_dir().join(format!("hc-live-sources-{}", std::process::id()));
