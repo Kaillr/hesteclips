@@ -231,7 +231,9 @@ enum Stop {
     Direct(Arc<AtomicBool>),
 }
 
-static SHARED: Mutex<Option<Weak<Screen>>> = Mutex::new(None);
+/// The casts running, each shared by whoever records or shows its screen
+/// (the recording's picture, another display's layer, the preview).
+static SHARED: Mutex<Vec<Weak<Screen>>> = Mutex::new(Vec::new());
 
 /// The screen cast of `id`, started if none is running. Blocks while the
 /// desktop asks which screen to share (the portal, and only when no choice
@@ -239,7 +241,8 @@ static SHARED: Mutex<Option<Weak<Screen>>> = Mutex::new(None);
 pub(crate) fn acquire(id: &str) -> Result<Arc<Screen>> {
     // Held throughout, so two starting together share one dialog and cast.
     let mut shared = SHARED.lock().unwrap();
-    if let Some(screen) = shared.as_ref().and_then(Weak::upgrade).filter(|s| s.latest.ended().is_none() && s.id == id) {
+    shared.retain(|w| w.strong_count() > 0);
+    if let Some(screen) = shared.iter().filter_map(Weak::upgrade).find(|s| s.latest.ended().is_none() && s.id == id) {
         return Ok(screen);
     }
     // Should reading the screen directly fail, the portal may still work.
@@ -258,7 +261,7 @@ pub(crate) fn acquire(id: &str) -> Result<Arc<Screen>> {
         Some(s) => s,
         None => Screen::start_portal(id)?,
     });
-    *shared = Some(Arc::downgrade(&screen));
+    shared.push(Arc::downgrade(&screen));
     drop(shared);
     // Fails here, visibly, rather than recording a black file.
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -319,7 +322,7 @@ pub(crate) fn open_ext_window(id: &str) -> Result<Screen> {
 /// Don't hand out the running cast anymore: the next [`acquire`] starts a new
 /// one (it ends once its holders let go).
 pub(crate) fn forget() {
-    *SHARED.lock().unwrap() = None;
+    SHARED.lock().unwrap().clear();
 }
 
 /// Let go of the cast, keeping it running a little longer in case someone

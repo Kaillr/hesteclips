@@ -9,7 +9,7 @@
 //! a capture keeps what it opened for it (a camera, a display's capture) for
 //! as long as it's there.
 //!
-//! Windows draws every layer ([`MANY`]). macOS and Linux draw the recording's
+//! Windows and Linux draw every layer ([`MANY`]). macOS draws the recording's
 //! own picture and one webcam (`EncodeSettings::webcam`), in front or behind
 //! as `ScreenPlacement::in_front` says.
 
@@ -20,7 +20,7 @@ use crate::webcam::{Format, Placement};
 
 /// Whether this platform draws more than the recording's own picture and
 /// one webcam: several webcams, other displays, in any order.
-pub const MANY: bool = cfg!(target_os = "windows");
+pub const MANY: bool = cfg!(any(target_os = "windows", target_os = "linux"));
 
 /// What a layer shows, and where.
 #[derive(Debug, Clone, PartialEq)]
@@ -65,7 +65,7 @@ pub enum LayerSource {
 pub const BROWSER: bool = cfg!(target_os = "windows");
 
 /// Whether this platform can play a video file as a layer.
-pub const VIDEO: bool = cfg!(target_os = "windows");
+pub const VIDEO: bool = cfg!(any(target_os = "windows", target_os = "linux"));
 
 /// A video file's picture size, if it can be played (see [`VIDEO`]).
 pub fn video_size(path: &std::path::Path) -> Option<(u32, u32)> {
@@ -73,7 +73,11 @@ pub fn video_size(path: &std::path::Path) -> Option<(u32, u32)> {
     {
         crate::win::decode::Decoder::open_rgba(path, 64).ok().map(|d| d.source_size())
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
+    {
+        crate::linux::video_size(path)
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     {
         let _ = path;
         None
@@ -110,16 +114,23 @@ impl LayerSource {
     }
 }
 
-/// Whether this platform can capture one app's window as a layer.
-pub const WINDOWS: bool = cfg!(target_os = "windows");
+/// Whether this platform can capture one app's window as a layer (on
+/// Linux where its games and apps can be recorded: `list_windowed_apps`
+/// lists none elsewhere).
+pub const WINDOWS: bool = cfg!(any(target_os = "windows", target_os = "linux"));
 
-/// App `exe`'s main window's inside, in pixels, if it's open (Windows).
+/// App `exe`'s main window's inside, in pixels, if it's open (Windows;
+/// Linux as its layer last captured it, or as KDE Plasma says).
 pub fn app_window_size(exe: &str) -> Option<(u32, u32)> {
     #[cfg(target_os = "windows")]
     {
         crate::win::app_window_size(exe)
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
+    {
+        crate::linux::app_window_size(exe)
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     {
         let _ = exe;
         None

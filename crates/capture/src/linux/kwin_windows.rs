@@ -37,6 +37,8 @@ pub(crate) struct Window {
     pub minimized: bool,
     /// Not in the taskbar: a panel, a popup, a tooltip.
     pub skip_taskbar: bool,
+    /// Its size on screen, frame and all, as KWin says.
+    pub size: Option<(u32, u32)>,
 }
 
 /// What's known: each window, by its object.
@@ -63,6 +65,11 @@ pub(crate) fn windows() -> Option<Vec<Window>> {
     }
     let known = KNOWN.lock().unwrap();
     Some(known.as_ref()?.windows.values().cloned().collect())
+}
+
+/// Window `uuid`'s size, as KWin says.
+pub(crate) fn size(uuid: &str) -> Option<(u32, u32)> {
+    windows()?.into_iter().find(|w| w.uuid == uuid)?.size
 }
 
 /// The active window's process, if KWin lets us follow its windows.
@@ -128,6 +135,7 @@ impl Dispatch<window::OrgKdePlasmaWindow, ()> for State {
             window::Event::PidChanged { pid } => k.windows.entry(w.id()).or_default().pid = Some(pid),
             window::Event::TitleChanged { title } => k.windows.entry(w.id()).or_default().title = title,
             window::Event::AppIdChanged { app_id } => k.windows.entry(w.id()).or_default().app_id = app_id,
+            window::Event::Geometry { width, height, .. } => k.windows.entry(w.id()).or_default().size = Some((width, height)),
             window::Event::StateChanged { flags } => {
                 let win = k.windows.entry(w.id()).or_default();
                 win.active = flags & ACTIVE != 0;
