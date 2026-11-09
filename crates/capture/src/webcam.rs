@@ -286,18 +286,23 @@ impl PartialEq for Webcam {
     }
 }
 
-static FORMATS: Mutex<Option<(String, Vec<Format>)>> = Mutex::new(None);
+/// Each camera's formats, by device, as last opened.
+static FORMATS: Mutex<Option<std::collections::HashMap<String, Vec<Format>>>> = Mutex::new(None);
 
 /// The formats camera `device` offers, biggest first — known once it has
 /// been opened (the preview opens it).
 pub fn formats(device: &str) -> Vec<Format> {
-    FORMATS.lock().unwrap().as_ref().filter(|(d, _)| d == device).map(|(_, f)| f.clone()).unwrap_or_default()
+    FORMATS.lock().unwrap().as_ref().and_then(|m| m.get(device).cloned()).unwrap_or_default()
 }
 
 #[cfg_attr(not(any(target_os = "windows", target_os = "macos", target_os = "linux")), allow(dead_code))]
 pub(crate) fn set_formats(device: &str, formats: Vec<Format>) {
-    *FORMATS.lock().unwrap() = Some((device.to_owned(), formats));
+    FORMATS.lock().unwrap().get_or_insert_with(Default::default).insert(device.to_owned(), formats);
 }
+
+/// Whether several cameras can be open (and drawn) at once: on Windows,
+/// macOS and Linux.
+pub const MANY: bool = cfg!(any(target_os = "windows", target_os = "macos", target_os = "linux"));
 
 /// Whether cameras have their own settings window ([`open_settings`]): on
 /// Windows, from the driver. macOS has none (its controls are in Control
@@ -335,6 +340,10 @@ pub mod cid {
     pub const IRIS: u32 = 0x9a0911;
     /// `V4L2_EXPOSURE_MANUAL`, among the automatic exposure menu's items.
     pub const EXPOSURE_MANUAL: i64 = 1;
+    /// `V4L2_CID_EXPOSURE`: an exposure in the camera's own steps, not a
+    /// time (the PS3 Eye's; on Windows, one whose driver doesn't give it in
+    /// DirectShow's powers of two of a second).
+    pub const EXPOSURE_STEPS: u32 = 0x980911;
 }
 
 /// A setting a camera offers: a V4L2 control (Linux), or one of DirectShow's
@@ -391,24 +400,24 @@ pub struct CameraPreview {
     pub new_pictures: u64,
 }
 
-/// The open camera's newest picture, shrunk to at most `max_width` wide,
-/// if there's one newer than picture `newer_than`.
-pub fn camera_picture(max_width: u32, newer_than: u64) -> Option<CameraPreview> {
-    #[cfg(target_os = "linux")]
+/// Camera `device`'s newest picture, shrunk to at most `max_width` wide,
+/// if it's open and has one newer than picture `newer_than`.
+pub fn camera_picture(device: &str, max_width: u32, newer_than: u64) -> Option<CameraPreview> {
+    #[cfg(target_os = "windows")]
     {
-        crate::linux::camera_picture(max_width, newer_than)
+        crate::win::camera_picture(device, max_width, newer_than)
     }
     #[cfg(target_os = "macos")]
     {
-        crate::mac::camera::picture(max_width, newer_than)
+        crate::mac::camera::picture(device, max_width, newer_than)
     }
-    #[cfg(target_os = "windows")]
+    #[cfg(target_os = "linux")]
     {
-        crate::win::camera_picture(max_width, newer_than)
+        crate::linux::camera_picture(device, max_width, newer_than)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     {
-        let _ = (max_width, newer_than);
+        let _ = (device, max_width, newer_than);
         None
     }
 }
@@ -500,11 +509,11 @@ pub fn open_settings(device: &str, name: &str) {
     }
 }
 
-/// Keep this camera (device, format) open, or close it with `None`. Call it
-/// whenever the chosen webcam changes: a webcam stays open for as long as it's
-/// set up, previewed and recorded or not, because closing a camera can reset
-/// what was set in its own settings window. Doesn't wait.
-pub fn keep_open(want: Option<(String, Option<Format>)>) {
+/// Keep these cameras (device, format) open, and close the rest. Call it
+/// whenever the webcams set up change: a webcam stays open for as long as
+/// it's set up, previewed and recorded or not, because closing a camera can
+/// reset what was set in its own settings window. Doesn't wait.
+pub fn keep_open(want: Vec<(String, Option<Format>)>) {
     #[cfg(target_os = "windows")]
     {
         crate::win::keep_camera_open(want);
@@ -556,26 +565,41 @@ pub enum Status {
     Unavailable(String),
 }
 
-static STATUS: Mutex<Status> = Mutex::new(Status::Off);
+/// Each camera kept open's state, by device.
+static STATUS: Mutex<Option<std::collections::HashMap<String, Status>>> = Mutex::new(None);
 
-/// The webcam's state right now.
+/// Camera `device`'s state right now: off unless it's kept open.
+pub fn status_of(device: &str) -> Status {
+    STATUS.lock().unwrap().as_ref().and_then(|m| m.get(device).cloned()).unwrap_or_default()
+}
+
+/// The state of the camera kept open, if one is (any, where several are).
 pub fn status() -> Status {
-    STATUS.lock().unwrap().clone()
+    STATUS.lock().unwrap().as_ref().and_then(|m| m.values().next().cloned()).unwrap_or_default()
 }
 
+/// Camera `device` is in state `s` now; off forgets it.
 #[cfg_attr(not(any(target_os = "windows", target_os = "macos", target_os = "linux")), allow(dead_code))]
-pub(crate) fn set_status(s: Status) {
-    *STATUS.lock().unwrap() = s;
+pub(crate) fn set_status_of(device: &str, s: Status) {
+    let mut all = STATUS.lock().unwrap();
+    let all = all.get_or_insert_with(Default::default);
+    if s == Status::Off {
+        all.remove(device);
+    } else {
+        all.insert(device.to_owned(), s);
+    }
 }
 
-/// For checks: the size of the newest picture the open camera delivered.
-pub fn frame_size() -> Option<(usize, usize)> {
+/// For checks: the size of the newest picture camera `device` delivered,
+/// if it's open (macOS).
+pub fn frame_size(device: &str) -> Option<(usize, usize)> {
     #[cfg(target_os = "macos")]
     {
-        crate::mac::camera::frame_size()
+        crate::mac::camera::frame_size(device)
     }
     #[cfg(not(target_os = "macos"))]
     {
+        let _ = device;
         None
     }
 }

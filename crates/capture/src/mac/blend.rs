@@ -592,11 +592,13 @@ impl StreamOut {
     }
 }
 
-/// A blended frame the GPU is still making: encoded once it's made.
+/// A frame waiting to be encoded: a blended one the GPU is still making
+/// (`work`), or one made already that waits behind such frames, as frames
+/// are encoded in order.
 struct Making {
     k: i64,
     made: Arc<Buffer>,
-    work: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+    work: Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
     /// How late it was closed, how long closing it took, and when.
     late: f64,
     mixed: Duration,
@@ -662,26 +664,32 @@ impl BlendPacer {
         let late = host_now() - self.look_time(self.shutter.last_look(k)) - BLEND_LATE;
         let Some(made) = self.mix.finish(k) else { return };
         let mixed = started.elapsed();
-        match self.mix.work() {
-            Some(work) => self.making.push_back(Making { k, made, work, late, mixed, closed: started }),
-            None => self.encode(k, made, late, mixed, None),
+        let work = self.mix.work();
+        if work.is_none() && self.making.is_empty() {
+            self.encode(k, made, late, mixed, None);
+        } else {
+            // After the frames before it: blending turned off, the last
+            // blended ones can still be on the GPU, and a frame encoded
+            // ahead of them broke the clip or recording it was in
+            // (AVAssetWriter's -16364 at its end).
+            self.making.push_back(Making { k, made, work, late, mixed, closed: started });
         }
         self.encode_made(false);
     }
 
-    /// Encode the blended frames the GPU has made, in order; `all`, those it
-    /// hasn't too, once it has (stopping).
+    /// Encode the frames that are made, in order; `all`, those the GPU
+    /// hasn't made yet too, once it has (stopping).
     fn encode_made(&mut self, all: bool) {
         while let Some(m) = self.making.front() {
-            if !gpu_done(&m.work) {
+            if let Some(work) = m.work.as_ref().filter(|w| !gpu_done(w)) {
                 if !all {
                     break;
                 }
-                m.work.waitUntilCompleted();
+                work.waitUntilCompleted();
             }
             let Some(m) = self.making.pop_front() else { break };
-            let gpu = m.closed.elapsed();
-            self.encode(m.k, m.made, m.late, m.mixed, Some(gpu));
+            let gpu = m.work.is_some().then(|| m.closed.elapsed());
+            self.encode(m.k, m.made, m.late, m.mixed, gpu);
         }
     }
 

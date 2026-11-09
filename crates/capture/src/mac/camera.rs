@@ -4,8 +4,9 @@
 //! without a copy (`super::gpu`).
 //!
 //! A webcam stays open for as long as it's set up ([`keep_open`]), previewed
-//! and recorded or not, as on Windows. macOS has no driver settings window to
-//! open (`open_settings` does nothing); its camera controls live in Control
+//! and recorded or not, as on Windows; several can be open at once, each in a
+//! session of its own. macOS has no driver settings window to open
+//! (`open_settings` does nothing); its camera controls live in Control
 //! Centre's Video Effects.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -30,7 +31,7 @@ use objc2_core_video::{CVPixelBuffer, kCVPixelBufferIOSurfacePropertiesKey, kCVP
 use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSObject, NSObjectProtocol, NSString};
 
 use crate::Device;
-use crate::webcam::{Format, Status, set_formats, set_status};
+use crate::webcam::{Format, Status, set_formats, set_status_of};
 
 /// One camera picture: NV12 (studio range, BT.709) in an IOSurface.
 pub(crate) struct Frame {
@@ -42,7 +43,7 @@ pub(crate) struct Frame {
 unsafe impl Send for Frame {}
 unsafe impl Sync for Frame {}
 
-/// The camera that's open, delivering pictures.
+/// A camera that's open, delivering pictures.
 pub(crate) struct CameraFeed {
     pub device: String,
     pub format: Option<Format>,
@@ -51,7 +52,8 @@ pub(crate) struct CameraFeed {
     stop: AtomicBool,
 }
 
-static CURRENT: Mutex<Option<Arc<CameraFeed>>> = Mutex::new(None);
+/// The cameras kept open, each in the format asked for.
+static OPEN: Mutex<Vec<Arc<CameraFeed>>> = Mutex::new(Vec::new());
 
 /// Pictures from any camera so far, numbering them: going on from camera to
 /// camera and format to format, so a reader waiting for one newer than the
@@ -64,9 +66,20 @@ impl CameraFeed {
         self.frame.lock().unwrap().clone()
     }
 
-    /// The open camera, if it's this one in this format.
-    pub(crate) fn current(device: &str, format: Option<Format>) -> Option<Arc<CameraFeed>> {
-        CURRENT.lock().unwrap().clone().filter(|f| f.device == device && f.format == format && !f.stop.load(Ordering::Relaxed))
+    /// Camera `device`, open: in `format` if it's open in that, else in
+    /// whatever it's open in (another format's on its way).
+    pub(crate) fn of(device: &str, format: Option<Format>) -> Option<Arc<CameraFeed>> {
+        let open = OPEN.lock().unwrap();
+        let live = || open.iter().filter(|f| f.device == device && !f.stop.load(Ordering::Relaxed));
+        live().find(|f| f.format == format).or_else(|| live().next()).cloned()
+    }
+
+    /// Say how it's doing, while it's still wanted (one let go of says
+    /// nothing: the one that takes its place, or nothing, has the say).
+    fn status(&self, s: Status) {
+        if !self.stop.load(Ordering::Relaxed) {
+            set_status_of(&self.device, s);
+        }
     }
 }
 
@@ -82,44 +95,57 @@ fn discovery() -> Retained<NSArray<AVCaptureDevice>> {
     }
 }
 
-/// Keep this camera (device, format) open, or close it with `None`. Doesn't wait.
-pub fn keep_open(want: Option<(String, Option<Format>)>) {
-    let mut current = CURRENT.lock().unwrap();
-    let same = match (&*current, &want) {
-        (Some(f), Some((d, fm))) => f.device == *d && f.format == *fm,
-        (None, None) => true,
-        _ => false,
-    };
-    if same {
-        return;
+/// Keep these cameras (device, format) open, and close the rest. Doesn't
+/// wait: each opens (and closes) on a thread of its own.
+pub fn keep_open(want: Vec<(String, Option<Format>)>) {
+    let mut open = OPEN.lock().unwrap();
+    open.retain(|f| {
+        let keep = want.iter().any(|(d, fm)| f.device == *d && f.format == *fm);
+        if !keep {
+            // Its thread closes it; it's off unless another format of it is
+            // asked for (that one's status takes over).
+            f.stop.store(true, Ordering::Relaxed);
+            if !want.iter().any(|(d, _)| *d == f.device) {
+                set_status_of(&f.device, Status::Off);
+            }
+        }
+        keep
+    });
+    for (device, format) in want {
+        if open.iter().any(|f| f.device == device && f.format == format) {
+            continue;
+        }
+        let feed = Arc::new(CameraFeed { device, format, frame: Mutex::new(None), seq: AtomicU64::new(0), stop: AtomicBool::new(false) });
+        open.push(feed.clone());
+        thread::spawn(move || run(feed));
     }
-    if let Some(old) = current.take() {
-        old.stop.store(true, Ordering::Relaxed); // its thread closes it
+}
+
+/// Keep camera `device` (in `format`) open too, if it isn't: for a capture
+/// that draws a camera the app hasn't opened (it keeps them open itself).
+fn ensure_open(device: &str, format: Option<Format>) {
+    let mut want: Vec<(String, Option<Format>)> = OPEN.lock().unwrap().iter().filter(|f| !f.stop.load(Ordering::Relaxed)).map(|f| (f.device.clone(), f.format)).collect();
+    if !want.iter().any(|(d, _)| d == device) {
+        want.push((device.to_owned(), format));
+        keep_open(want);
     }
-    let Some((device, format)) = want else {
-        set_status(Status::Off);
-        return;
-    };
-    let feed = Arc::new(CameraFeed { device, format, frame: Mutex::new(None), seq: AtomicU64::new(0), stop: AtomicBool::new(false) });
-    *current = Some(feed.clone());
-    thread::spawn(move || run(feed));
 }
 
 /// Open the camera and keep it open until told to stop, reopening it when it
 /// goes away (unplugged, taken by another app) and comes back.
 fn run(feed: Arc<CameraFeed>) {
     while !feed.stop.load(Ordering::Relaxed) {
-        set_status(Status::Opening);
+        feed.status(Status::Opening);
         let opened = open_session(&feed);
         let (session, _delegate, (width, height)) = match opened {
             Ok(s) => s,
             Err(e) => {
-                set_status(Status::Unavailable(format!("{e:#}")));
+                feed.status(Status::Unavailable(format!("{e:#}")));
                 wait_or_stop(&feed, Duration::from_secs(3));
                 continue;
             }
         };
-        set_status(Status::Live { width, height });
+        feed.status(Status::Live { width, height });
         // The session runs on its own; watch for it stopping. Unplugged, a
         // session can go on "running" with no pictures, and a camera plugged
         // back in is a new device it never picks up: no pictures for a few
@@ -140,7 +166,7 @@ fn run(feed: Arc<CameraFeed>) {
         unsafe { session.stopRunning() };
         *feed.frame.lock().unwrap() = None;
         if !feed.stop.load(Ordering::Relaxed) {
-            set_status(Status::Unavailable("the camera stopped".into()));
+            feed.status(Status::Unavailable("the camera stopped".into()));
             wait_or_stop(&feed, Duration::from_secs(3));
         }
     }
@@ -282,39 +308,40 @@ impl CameraOutput {
     }
 }
 
-/// What a running capture draws: the newest picture of whichever camera
-/// the app keeps open. A new camera or format, the webcam switched off and
-/// on, a dropout: it follows along without the capture restarting.
+/// What a running capture draws for a webcam: the newest picture of camera
+/// `device`, as the app keeps it open. A new format, the webcam switched off
+/// and on, a dropout: it follows along without the capture restarting.
 pub(crate) struct CameraLayer {
+    device: String,
+    format: Option<Format>,
     feed: Option<Arc<CameraFeed>>,
 }
 
 impl CameraLayer {
-    /// Opens webcam `w` if nothing has yet (the app keeps it open itself)
-    /// and it's switched on.
-    pub(crate) fn new(w: &crate::webcam::Webcam) -> Self {
-        let hidden = w.placement.lock().unwrap().is_hidden();
-        if !hidden && CameraFeed::current(&w.device, w.format).is_none() {
-            keep_open(Some((w.device.clone(), w.format)));
+    /// Opens camera `device` if nothing has yet (the app keeps it open
+    /// itself) and it shows.
+    pub(crate) fn new(device: &str, format: Option<Format>, hidden: bool) -> Self {
+        if !hidden && CameraFeed::of(device, format).is_none() {
+            ensure_open(device, format);
         }
-        Self { feed: None }
+        Self { device: device.to_owned(), format, feed: None }
     }
 
-    /// The newest picture, if a camera is delivering.
+    /// The newest picture, if the camera is delivering.
     pub(crate) fn latest(&mut self) -> Option<Arc<Frame>> {
         if self.feed.as_ref().is_none_or(|f| f.stop.load(Ordering::Relaxed)) {
-            self.feed = CURRENT.lock().unwrap().clone().filter(|f| !f.stop.load(Ordering::Relaxed));
+            self.feed = CameraFeed::of(&self.device, self.format);
         }
         self.feed.as_ref()?.latest()
     }
 }
 
-/// The open camera's newest picture, if it's newer than picture
-/// `newer_than`: shrunk to at most `max_width` wide (each pixel the one
-/// under it), in RGBA, for showing it on its own (the webcam's crop page).
-pub(crate) fn picture(max_width: u32, newer_than: u64) -> Option<crate::webcam::CameraPreview> {
+/// Camera `device`'s newest picture, if it's open and has one newer than
+/// picture `newer_than`: shrunk to at most `max_width` wide (each pixel the
+/// one under it), in RGBA, for showing it on its own (its crop, its page).
+pub(crate) fn picture(device: &str, max_width: u32, newer_than: u64) -> Option<crate::webcam::CameraPreview> {
     use objc2_core_video::{CVPixelBufferGetBaseAddressOfPlane, CVPixelBufferGetBytesPerRowOfPlane, CVPixelBufferGetHeight, CVPixelBufferGetWidth, CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress};
-    let feed = CURRENT.lock().unwrap().clone().filter(|f| !f.stop.load(Ordering::Relaxed))?;
+    let feed = CameraFeed::of(device, None)?;
     let f = feed.latest().filter(|f| f.seq > newer_than)?;
     let buf = &f.buffer;
     let (sw, sh) = (CVPixelBufferGetWidth(buf), CVPixelBufferGetHeight(buf));
@@ -358,9 +385,9 @@ fn studio_709(y: u8, cb: u8, cr: u8) -> [u8; 3] {
     [byte(luma + 1.5748 * cr), byte(luma - 0.1873 * cb - 0.4681 * cr), byte(luma + 1.8556 * cb)]
 }
 
-/// The newest picture's size, from the open camera.
-pub(crate) fn frame_size() -> Option<(usize, usize)> {
-    let f = CURRENT.lock().unwrap().clone()?.latest()?;
+/// The newest picture's size, from camera `device` if it's open.
+pub(crate) fn frame_size(device: &str) -> Option<(usize, usize)> {
+    let f = CameraFeed::of(device, None)?.latest()?;
     Some((objc2_core_video::CVPixelBufferGetWidth(&f.buffer), objc2_core_video::CVPixelBufferGetHeight(&f.buffer)))
 }
 

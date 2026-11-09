@@ -64,7 +64,7 @@ use objc2_video_toolbox::{
 };
 
 use crate::aac::AacEncoder;
-use crate::mixer::{self, Channel, Clock, LiveAudio, SourceFeed, SourceStatus};
+use crate::mixer::{self, Channel, Clock, LiveAudio, MixChange, MixInput, SourceFeed, SourceStatus};
 use crate::outputs::{Capture, Outputs};
 use crate::shutter::Shutter;
 use crate::sources::{AudioCapture, AudioSource, Retry, SourceKind, mix_inputs, track_layout};
@@ -133,6 +133,18 @@ impl Recorder for SckRecorder {
     fn set_blend(&mut self, looks: u32, shape: BlendShape) -> bool {
         self.outputs.session.as_mut().is_some_and(|s| s.set_blend(looks, shape))
     }
+
+    fn set_sources(&mut self, sources: &[AudioSource]) -> bool {
+        self.outputs.session.as_mut().is_some_and(|s| s.set_sources(sources, &self.live))
+    }
+
+    /// Every pixel of the display recorded, or of the game's or app's
+    /// window: a capture of its own (`mac::shot`), of the window the running
+    /// capture records, if one runs.
+    fn screenshot(&mut self, video: &VideoSource) -> Result<crate::PendingShot> {
+        let running = self.outputs.session.as_ref().and_then(|s| s.video.as_ref()).map(|p| p.latest.clone());
+        crate::mac::shot::take(video, running.as_deref())
+    }
 }
 
 impl Drop for SckRecorder {
@@ -159,6 +171,8 @@ struct Session {
     pacer: Option<(Arc<AtomicBool>, JoinHandle<()>)>,
     audio: Option<AudioCapture>,
     mixer: Option<(Arc<AtomicBool>, JoinHandle<()>)>,
+    /// Sources added to the running mixer and taken out of it.
+    mix_changes: Option<Sender<MixChange>>,
     /// AAC encoder threads, one per track; they end when the mixer drops its senders.
     encoders: Vec<JoinHandle<()>>,
     writer_tx: Sender<writer::Command>,
@@ -250,6 +264,7 @@ impl Session {
             pacer: None,
             audio: None,
             mixer: None,
+            mix_changes: None,
             encoders: Vec::new(),
             writer_tx,
             writer: Some(writer),
@@ -276,8 +291,11 @@ impl Session {
             let rest_track = if has_rest { tracks.next() } else { None };
             session.audio = Some(audio);
             let stop = Arc::new(AtomicBool::new(false));
-            let mixer = mixer::spawn_mixer(
+            let (mix_changes, changes) = mpsc::channel();
+            session.mix_changes = Some(mix_changes);
+            let mixer = mixer::spawn_changing_mixer(
                 inputs,
+                changes,
                 mix_track,
                 rest_track,
                 live.clone(),
@@ -291,9 +309,10 @@ impl Session {
             let encoder = Encoder::new(width, height, s, session.writer_tx.clone())?;
             let placed = *s.screen.lock().unwrap();
             let picture = Picture::start(&s.video, &content, &display, (width, height), s.fps * looks, away, placed)?;
-            // A webcam that can't open doesn't stop the recording: its status
-            // says why, and the picture goes on without it.
-            let frames = Frames::new(picture.latest.clone(), s.webcam.as_ref(), s.screen.clone(), Some(picture.ctl()), width, height, crate::preview::new_producer())?;
+            // A layer that can't open (a webcam, a window) doesn't stop the
+            // recording: its status says why, and the picture goes on
+            // without it.
+            let frames = Frames::new(picture.latest.clone(), s.layers.clone(), s.screen.clone(), Some(picture.ctl()), width, height, s.fps, crate::preview::new_producer())?;
             let latest = picture.latest.clone();
             session.video = Some(picture);
             // Not blended too, a frame takes the picture that was up at its
@@ -312,6 +331,24 @@ impl Session {
             return Err(e);
         }
         Ok(session)
+    }
+
+    /// Capture these audio sources from now on, without restarting (see
+    /// [`Recorder::set_sources`]): the capture starts and stops them, and
+    /// the mixer takes them in and out.
+    fn set_sources(&mut self, sources: &[AudioSource], live: &LiveAudio) -> bool {
+        let (Some(audio), Some(changes)) = (self.audio.as_mut(), &self.mix_changes) else { return false };
+        let (added, gone) = audio.set_sources(sources, live);
+        for source in gone {
+            eprintln!("audio source \"{}\": taken out while capturing", source.name);
+            let _ = changes.send(MixChange::Remove(source.id));
+        }
+        for (source, feed) in added {
+            eprintln!("audio source \"{}\": added while capturing, into the mix", source.name);
+            let input = MixInput { channel: live.channel(&source.id), id: source.id, feed, in_mix: source.in_mix, track: None };
+            let _ = changes.send(MixChange::Add(input));
+        }
+        true
     }
 
     /// Change frame blending while it runs: the pacer takes it up at its
@@ -457,7 +494,7 @@ impl StreamOutput {
 
 /// SCK delivers float32, usually non-interleaved; flatten to interleaved f32.
 /// Returns the samples and the channel count.
-fn interleaved_pcm(sample: &CMSampleBuffer) -> Option<(Vec<f32>, usize)> {
+pub(crate) fn interleaved_pcm(sample: &CMSampleBuffer) -> Option<(Vec<f32>, usize)> {
     unsafe {
         let desc = sample.format_description()?;
         let asbd: &AudioStreamBasicDescription = &*CMAudioFormatDescriptionGetStreamBasicDescription(&desc);
@@ -500,10 +537,10 @@ fn interleaved_pcm(sample: &CMSampleBuffer) -> Option<(Vec<f32>, usize)> {
 
 /// Why the system stopped a stream, once it has (from its delegate).
 #[derive(Default)]
-struct Stopped(std::sync::Mutex<Option<String>>);
+pub(crate) struct Stopped(std::sync::Mutex<Option<String>>);
 
 impl Stopped {
-    fn take(&self) -> Option<String> {
+    pub(crate) fn take(&self) -> Option<String> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner).take()
     }
 }
@@ -512,7 +549,7 @@ define_class!(
     // SAFETY: NSObject has no subclassing requirements; no Drop impl.
     #[unsafe(super(NSObject))]
     #[ivars = Arc<Stopped>]
-    struct StreamWatch;
+    pub(crate) struct StreamWatch;
 
     unsafe impl NSObjectProtocol for StreamWatch {}
 
@@ -526,7 +563,7 @@ define_class!(
 );
 
 impl StreamWatch {
-    fn new(stopped: Arc<Stopped>) -> Retained<Self> {
+    pub(crate) fn new(stopped: Arc<Stopped>) -> Retained<Self> {
         let this = Self::alloc().set_ivars(stopped);
         unsafe { msg_send![super(this), init] }
     }
@@ -595,13 +632,13 @@ fn await_completion(call: impl FnOnce(&block2::DynBlock<dyn Fn(*mut NSError)>)) 
     }
 }
 
-fn start_capture(stream: &SCStream) -> Result<()> {
+pub(crate) fn start_capture(stream: &SCStream) -> Result<()> {
     let _one = STARTING.lock();
     await_completion(|h| unsafe { stream.startCaptureWithCompletionHandler(Some(h)) })
         .map_err(|e| anyhow::anyhow!("couldn't start screen capture: {e}"))
 }
 
-fn stop_capture(stream: &SCStream) {
+pub(crate) fn stop_capture(stream: &SCStream) {
     let _ = await_completion(|h| unsafe { stream.stopCaptureWithCompletionHandler(Some(h)) });
 }
 
@@ -616,6 +653,15 @@ fn stop_capture(stream: &SCStream) {
 pub(crate) struct SystemAudio {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    /// Sources added and taken out while it runs, for its thread.
+    changes: Sender<TapChange>,
+}
+
+/// A source added to a [`SystemAudio`] that runs, or taken out.
+enum TapChange {
+    Add(AudioSource, Arc<SourceFeed>, Arc<Channel>),
+    /// By its id.
+    Remove(String),
 }
 
 /// One desktop/app source and its stream, owned by the `SystemAudio` thread.
@@ -630,8 +676,20 @@ struct Tap {
 }
 
 impl Tap {
+    fn new(source: AudioSource, feed: Arc<SourceFeed>, channel: Arc<Channel>) -> Self {
+        Self { source, feed, channel, stream: None, pids: None, restart: Restart::default() }
+    }
+
     fn say(&self, line: &str) {
         eprintln!("{} audio source \"{}\": {line}", chrono::Local::now().format("%H:%M:%S"), self.source.name);
+    }
+
+    /// Stop its stream: it's Off.
+    fn stop(&mut self) {
+        if let Some(running) = self.stream.take() {
+            stop_capture(&running.stream);
+        }
+        self.channel.set_status(SourceStatus::Off);
     }
 }
 
@@ -697,38 +755,88 @@ impl SystemAudio {
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
         let (ready_tx, ready_rx) = mpsc::channel();
+        let (changes, changed) = mpsc::channel();
         let thread = thread::spawn(move || {
-            let mut taps: Vec<Tap> = sources
-                .into_iter()
-                .map(|(source, feed, channel)| Tap { source, feed, channel, stream: None, pids: None, restart: Restart::default() })
-                .collect();
+            let mut taps: Vec<Tap> = sources.into_iter().map(|(source, feed, channel)| Tap::new(source, feed, channel)).collect();
             let mut first = true;
-            while !stop2.load(Ordering::Relaxed) {
+            let mut ended = false;
+            while !ended && !stop2.load(Ordering::Relaxed) {
                 sync_taps(&mut taps);
                 if std::mem::take(&mut first) {
                     let _ = ready_tx.send(());
                 }
+                // Until the next rescan, or a source added or taken out:
+                // then at once, so one added starts now, and the desktop
+                // leaves out an app added on its own, or no longer does.
                 let until = Instant::now() + Self::RESCAN;
                 while Instant::now() < until && !stop2.load(Ordering::Relaxed) {
-                    thread::sleep(Duration::from_millis(50));
+                    match changed.recv_timeout(Duration::from_millis(50)) {
+                        Ok(change) => {
+                            change_taps(&mut taps, change);
+                            while let Ok(change) = changed.try_recv() {
+                                change_taps(&mut taps, change);
+                            }
+                            break;
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        // Let go of without being stopped.
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            ended = true;
+                            break;
+                        }
+                    }
                 }
             }
-            for tap in &taps {
-                if let Some(running) = &tap.stream {
-                    stop_capture(&running.stream);
-                }
-                tap.channel.set_status(SourceStatus::Off);
+            for tap in &mut taps {
+                tap.stop();
             }
         });
         // Give the first scan a moment, so capture starts with the audio running.
         let _ = ready_rx.recv_timeout(Duration::from_secs(5));
-        Ok(Self { stop, thread: Some(thread) })
+        Ok(Self { stop, thread: Some(thread), changes })
+    }
+
+    /// Capture `source` too, into `feed`, while it runs: started by its
+    /// thread, at once (not waited for).
+    pub(crate) fn add(&self, source: AudioSource, feed: Arc<SourceFeed>, channel: Arc<Channel>) {
+        let _ = self.changes.send(TapChange::Add(source, feed, channel));
+    }
+
+    /// Stop capturing the source `id`, while it runs: by its thread, at
+    /// once (not waited for).
+    pub(crate) fn remove(&self, id: &str) {
+        let _ = self.changes.send(TapChange::Remove(id.to_owned()));
     }
 
     pub(crate) fn stop(mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(t) = self.thread.take() {
             let _ = t.join();
+        }
+    }
+}
+
+/// A source added or taken out, on the taps' thread: the next scan starts
+/// one added (and has the desktop leave it out, if it leaves out apps with
+/// their own source); one taken out stops now.
+fn change_taps(taps: &mut Vec<Tap>, change: TapChange) {
+    match change {
+        TapChange::Add(source, feed, channel) => {
+            // One with its id is never there already, but if it were, this
+            // one takes its place.
+            if let Some(at) = taps.iter().position(|t| t.source.id == source.id) {
+                taps.remove(at).stop();
+            }
+            let tap = Tap::new(source, feed, channel);
+            tap.say("added");
+            taps.push(tap);
+        }
+        TapChange::Remove(id) => {
+            if let Some(at) = taps.iter().position(|t| t.source.id == id) {
+                let mut tap = taps.remove(at);
+                tap.stop();
+                tap.say("taken out");
+            }
         }
     }
 }
@@ -1147,7 +1255,7 @@ pub(crate) fn probe_encoder(width: usize, height: usize) -> String {
     let s = EncodeSettings {
         output_dir: std::env::temp_dir(), container_ext: "mp4".into(), fps: 60, blend_samples: 1, blend_shape: Default::default(), video_bitrate_kbps: 20000, size: Default::default(),
         use_hardware: true, replay_seconds: 5, video: crate::VideoSource::Screen { id: String::new(), hook: Default::default(), method: Default::default() },
-        away_screen: None, webcam: None, screen: std::sync::Arc::new(std::sync::Mutex::new(crate::ScreenPlacement::whole(crate::Framing::Fit))), sources: Vec::new(),
+        away_screen: None, webcam: None, layers: crate::layers::main_only(), screen: std::sync::Arc::new(std::sync::Mutex::new(crate::ScreenPlacement::whole(crate::Framing::Fit))), sources: Vec::new(),
         stream: None,
     };
     match probe_video_format(width, height, &s) {
@@ -1159,6 +1267,7 @@ pub(crate) fn probe_encoder(width: usize, height: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sources::AudioSource;
 
     /// Clipping, going live, frame blending changed while it runs, and a
     /// recording beside them, all from one capture: each gets what it
@@ -1169,6 +1278,89 @@ mod tests {
     fn everything_at_once() {
         let mut rec = SckRecorder::new(Arc::new(LiveAudio::default()));
         crate::outputs::tests::everything_at_once(&mut rec);
+    }
+
+    /// Sources added to and taken out of a running capture of desktop and
+    /// app sound are taken up at once, not at its next rescan. (An app that
+    /// doesn't run: nothing's captured. Without Screen Recording allowed it's
+    /// Unavailable rather than waiting for its app, taken up all the same.)
+    #[test]
+    fn a_running_capture_takes_sources_added_and_taken_out() {
+        let live = LiveAudio::new();
+        let channel = live.channel("app");
+        let system = SystemAudio::start(Vec::new()).unwrap();
+        let until = |done: &dyn Fn(SourceStatus) -> bool| {
+            let t = Instant::now();
+            while !done(channel.status()) && t.elapsed() < Duration::from_secs(3) {
+                thread::sleep(Duration::from_millis(5));
+            }
+            t.elapsed()
+        };
+        let app = AudioSource { id: "app".into(), name: "No such app".into(), kind: SourceKind::App { bundle_id: "io.github.hasteclip.no-such-app".into() }, in_mix: true, own_track: false };
+        system.add(app, SourceFeed::new(mixer::RATE, Arc::new(Clock::default())), channel.clone());
+        let took = until(&|s| s != SourceStatus::Off);
+        assert!(took < Duration::from_millis(500), "added: taken up after {took:?}");
+        assert_ne!(channel.status(), SourceStatus::Live, "its app doesn't run");
+        system.remove("app");
+        let took = until(&|s| s == SourceStatus::Off);
+        assert!(took < Duration::from_millis(500), "taken out: Off after {took:?}");
+        system.stop();
+    }
+
+    /// A microphone added to a running capture (started with the desktop's
+    /// sound) is captured and mixed at once, and taken out again; the clip
+    /// saved after is whole, its one track the mix. Uses the default mic,
+    /// the screen and the desktop's sound: Screen Recording and the
+    /// microphone allowed to the terminal.
+    #[test]
+    #[ignore = "captures the screen, the desktop's sound and a microphone: cargo test -p capture sources_while_capturing -- --ignored --nocapture"]
+    fn sources_while_capturing() {
+        use crate::sources::{AudioSource, SourceKind};
+        let live = LiveAudio::new();
+        let mut rec = SckRecorder::new(live.clone());
+        let mic_name = crate::audio::list_audio_devices().default_input.expect("a microphone");
+        let desktop = AudioSource { id: "desktop".into(), name: "Desktop".into(), kind: SourceKind::Desktop { exclude_app_sources: false }, in_mix: true, own_track: false };
+        let mic = AudioSource { id: "mic".into(), name: "Mic".into(), kind: SourceKind::Microphone { device: mic_name }, in_mix: true, own_track: false };
+        let screen = crate::list_screens().into_iter().next().expect("a screen");
+        let dir = std::env::temp_dir().join(format!("hc-live-sources-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let settings = EncodeSettings {
+            output_dir: dir.clone(), container_ext: "mp4".into(), fps: 30, blend_samples: 1, blend_shape: Default::default(), video_bitrate_kbps: 6000,
+            size: crate::VideoSize { short_side: Some(720), shape: None, exact: None }, use_hardware: true, replay_seconds: 10,
+            video: VideoSource::Screen { id: screen.id, hook: Default::default(), method: Default::default() },
+            away_screen: None, webcam: None, layers: crate::layers::main_only(), screen: Arc::new(Mutex::new(crate::ScreenPlacement::whole(crate::Framing::Fit))),
+            sources: vec![desktop.clone()], stream: None,
+        };
+        rec.start(Mode::ReplayBuffer, &settings).unwrap();
+        let status = |id: &str| live.channel(id).status();
+        let wait = |id: &str, want: SourceStatus| {
+            let t = Instant::now();
+            while status(id) != want {
+                assert!(t.elapsed() < Duration::from_secs(5), "{id}: {:?}, not {want:?}", status(id));
+                thread::sleep(Duration::from_millis(10));
+            }
+            t.elapsed()
+        };
+        wait("desktop", SourceStatus::Live);
+        assert!(rec.set_sources(&[desktop.clone(), mic.clone()]), "taken while capturing");
+        eprintln!("mic live {:?} after it was added", wait("mic", SourceStatus::Live));
+        // Its sound reaches the mix: a mic always hears something.
+        let _ = live.channel("mic").meter.take();
+        thread::sleep(Duration::from_millis(1500));
+        let heard = live.channel("mic").meter.take();
+        assert!(heard.max_peak() > 0.0, "the mic's sound is mixed: {heard:?}");
+        assert!(rec.set_sources(std::slice::from_ref(&desktop)));
+        eprintln!("mic off {:?} after it was taken out", wait("mic", SourceStatus::Off));
+        assert_eq!(status("desktop"), SourceStatus::Live, "the desktop's sound goes on");
+        thread::sleep(Duration::from_millis(500));
+        let clip = rec.save_clip(&dir).unwrap().finish().expect("a clip");
+        rec.stop_all();
+        let out = std::process::Command::new("ffprobe").args(["-v", "error", "-show_entries", "stream=codec_type:format=duration", "-of", "csv=p=0"]).arg(&clip).output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        eprintln!("clip: {text}");
+        assert_eq!(text.lines().filter(|l| l.starts_with("audio")).count(), 1, "one track, the mix: {text}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A desktop or app sound stream that keeps failing to start is tried

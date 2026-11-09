@@ -8,11 +8,11 @@ fn main() {
     }
     if let Ok(part) = std::env::var("OPEN") {
         let Some(c) = cams.iter().find(|c| c.name.contains(&part)) else { return };
-        capture::webcam::keep_open(Some((c.id.clone(), None)));
+        capture::webcam::keep_open(vec![(c.id.clone(), None)]);
         for _ in 0..10 {
             std::thread::sleep(std::time::Duration::from_millis(500));
             println!("{:?}", capture::webcam::status());
         }
-        capture::webcam::keep_open(None);
+        capture::webcam::keep_open(Vec::new());
     }
 }

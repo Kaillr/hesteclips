@@ -2,20 +2,31 @@
 //!
 //! An update is the release's zipped app (`HasteClip-mac-arm64.zip`, beside
 //! the `.dmg` people install from): found on GitHub, downloaded and checked
-//! against its `.sha256`, unzipped next to the app, and accepted only if
-//! it's signed with HasteClip's own certificate. That certificate is what
-//! keeps macOS's permissions (Screen Recording, Input Monitoring) with the
-//! app from one version to the next, and what says the download is ours:
-//! the checksum comes from the same place as the download, the signature
-//! can't. When the app quits, the new one takes the old one's place (the
-//! old one is moved aside first, and back if that fails), and starts if
-//! asked to. A file the app downloads itself isn't quarantined, so macOS
-//! doesn't ask about it the way it did the first time.
+//! against its `.sha256`, unzipped into HasteClip's cache folder, and
+//! accepted only if it's signed with HasteClip's own certificate. That
+//! certificate is what keeps macOS's permissions (Screen Recording, Input
+//! Monitoring) with the app from one version to the next, and what says the
+//! download is ours: the checksum comes from the same place as the download,
+//! the signature can't. When the app quits, the new one and the old one
+//! trade places in a single step, so there's always a whole app, old or
+//! new, and the new one starts if asked to. A file the app downloads itself
+//! isn't quarantined, so macOS doesn't ask about it the way it did the first
+//! time.
+//!
+//! The whole app is swapped when its folder can be written. A standard (not
+//! administrator) account can't write to Applications, but it owns an app
+//! it copied there while it had administrator rights (as the Privileges app
+//! gives them for a while). Then only what's inside the app is swapped: its
+//! `Contents` folder, which holds all of it, signature included. Firefox's
+//! updater swaps `Contents` the same way.
 //!
 //! Only an installed app updates: not one run from a build folder, or
 //! straight from the disk image.
 
+use std::ffi::CString;
 use std::io::Read;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -30,8 +41,7 @@ const RELEASES: &str = "https://api.github.com/repos/hasteclip/hasteclip/release
 const REQUIREMENT: &str = r#"=identifier "io.github.kaillr.HasteClip" and certificate root = H"57f24a68cb31a35998890f8b6f9b94b74918c2ea""#;
 
 /// The installed app bundle, if it's one we can update: signed as a release
-/// is, somewhere that isn't a disk image or a build folder, and ours to
-/// replace.
+/// is, and somewhere that isn't a disk image or a build folder.
 pub fn install_dir() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     // …/HasteClip.app/Contents/MacOS/hasteclip
@@ -46,14 +56,30 @@ pub fn install_dir() -> Option<PathBuf> {
     signed_by_us(&app).then_some(app)
 }
 
-/// Whether the app's folder can be written: the new app is unzipped beside
-/// it, and takes its place.
-pub fn writable(app: &Path) -> bool {
-    let Some(dir) = app.parent() else { return false };
-    let f = dir.join(format!(".hasteclip-write-test-{}", std::process::id()));
-    let ok = std::fs::write(&f, b"").is_ok();
-    let _ = std::fs::remove_file(&f);
-    ok
+/// What keeps the app from updating where it is, if anything: the app or
+/// folder that isn't ours to write to. The app always has to be, as it's
+/// moved or what's in it is. Its folder only has to be when nothing in the
+/// app can be (see [`apply`]), or when the update has to wait beside it
+/// ([`staging`]).
+pub fn blocker(app: &Path) -> Option<PathBuf> {
+    let Some(dir) = app.parent() else { return Some(app.to_path_buf()) };
+    if !can_write(app) {
+        return Some(app.to_path_buf());
+    }
+    if can_write(dir) {
+        return None;
+    }
+    if !can_write(&app.join("Contents")) {
+        return Some(app.to_path_buf());
+    }
+    staging(app).is_none_or(|s| s.starts_with(dir)).then(|| dir.to_path_buf())
+}
+
+/// Whether this account can write to `path`: make, rename and remove what's
+/// in it. A folder moved to another folder needs it too.
+fn can_write(path: &Path) -> bool {
+    // SAFETY: a valid C string, which `access` only reads.
+    CString::new(path.as_os_str().as_bytes()).is_ok_and(|p| unsafe { libc::access(p.as_ptr(), libc::W_OK) } == 0)
 }
 
 /// Whether `app` is signed with HasteClip's certificate and sealed whole.
@@ -110,17 +136,25 @@ fn newer(a: &str, b: &str) -> bool {
     parts(a) > parts(b)
 }
 
-/// Where a downloaded update waits: beside the app, hidden.
+/// Where a downloaded update waits: in HasteClip's cache folder when that's
+/// on the app's disk, as the update is moved into place and a move can't
+/// cross disks. Otherwise beside the app, hidden.
 fn staging(app: &Path) -> Option<PathBuf> {
+    let disk = |p: &Path| std::fs::metadata(p).ok().map(|m| m.dev());
+    if let Some(cache) = dirs::cache_dir()
+        && disk(&cache).is_some_and(|d| disk(app) == Some(d))
+    {
+        return Some(cache.join("hasteclip").join("update"));
+    }
     Some(app.parent()?.join(".hasteclip-update"))
 }
 
-/// Download `release` beside `app`, check it, unzip it and check its
+/// Download `release` for `app`, check it, unzip it and check its
 /// signature. `progress` gets 0–100. Returns the new app.
 pub fn download(release: &Release, app: &Path, mut progress: impl FnMut(u8)) -> Result<PathBuf> {
     let staging = staging(app).context("the app has no folder")?;
     let _ = std::fs::remove_dir_all(&staging);
-    std::fs::create_dir_all(&staging).context("can't write next to the app")?;
+    std::fs::create_dir_all(&staging).with_context(|| format!("can't write to {}", staging.display()))?;
 
     let expected = ureq::get(&release.checksum).header("User-Agent", "HasteClip-updater").call()?.body_mut().read_to_string()?;
     let expected = expected.split_whitespace().next().unwrap_or_default().to_ascii_lowercase();
@@ -179,7 +213,12 @@ pub fn download(release: &Release, app: &Path, mut progress: impl FnMut(u8)) -> 
 /// An update downloaded earlier and still waiting (the app didn't quit
 /// normally since), with its version.
 pub fn pending(app: &Path) -> Option<(PathBuf, String)> {
-    let ready = staging(app)?.join("HasteClip.app");
+    waiting_in(&staging(app)?)
+}
+
+/// The update waiting in `staging`, if it's newer than this version and ours.
+fn waiting_in(staging: &Path) -> Option<(PathBuf, String)> {
+    let ready = staging.join("HasteClip.app");
     let version = bundle_version(&ready)?;
     (newer(&version, env!("CARGO_PKG_VERSION")) && signed_by_us(&ready)).then_some((ready, version))
 }
@@ -207,20 +246,24 @@ pub fn apply_pending_at_launch() -> bool {
 }
 
 /// Put the new app in place of `app`, and start it if `restart`. Run once
-/// the app has shut down. The old one is moved aside first, and back if the
-/// new one can't go in, so there's always an app.
+/// the app has shut down. The whole app is swapped when its folder can be
+/// written, as Apple advises (nothing inside an app is touched). When it
+/// can't, only what's inside: `Contents`, all an app holds.
 pub fn apply(ready: &Path, app: &Path, restart: bool) -> Result<()> {
     // Checked again: it waited on disk since it was downloaded.
     if !signed_by_us(ready) {
         bail!("the update isn't signed by HasteClip");
     }
     let staging = ready.parent().context("the update has no folder")?;
-    let old = staging.join("HasteClip-old.app");
-    let _ = std::fs::remove_dir_all(&old);
-    std::fs::rename(app, &old).context("couldn't move the old version aside")?;
-    if let Err(e) = std::fs::rename(ready, app) {
-        let _ = std::fs::rename(&old, app);
-        return Err(e).context("couldn't put the new version in place");
+    if app.parent().is_some_and(can_write) {
+        swap(ready, app).context("couldn't put the new version in place")?;
+    } else {
+        swap(&ready.join("Contents"), &app.join("Contents")).context("couldn't put the new version in place")?;
+        // The app's own folder still carries the quarantine flag from the
+        // download it was first installed from, but what's in it now came
+        // from us, checked. Without the flag, macOS sees the app as it sees
+        // a whole one swapped in: not quarantined, nothing to ask about.
+        unquarantine(app);
     }
     let _ = std::fs::remove_dir_all(staging);
     if restart {
@@ -235,6 +278,37 @@ pub fn apply(ready: &Path, app: &Path, restart: bool) -> Result<()> {
         open.spawn().context("couldn't start the new version")?;
     }
     Ok(())
+}
+
+/// Swap `new` and `installed` in a single step (`renamex_np` with
+/// `RENAME_SWAP`): the new one takes the installed one's place and the old
+/// one goes where the new one was, with no moment in between. A disk that
+/// can't (exFAT says so; FAT ignores it and won't rename over a folder)
+/// gets two renames instead, the old one put back if the second fails.
+fn swap(new: &Path, installed: &Path) -> std::io::Result<()> {
+    let c_path = |p: &Path| CString::new(p.as_os_str().as_bytes()).map_err(std::io::Error::other);
+    let (from, to) = (c_path(new)?, c_path(installed)?);
+    // SAFETY: two valid C strings, which `renamex_np` only reads.
+    if unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_SWAP) } == 0 {
+        return Ok(());
+    }
+    let mut aside = new.as_os_str().to_owned();
+    aside.push("-old");
+    let _ = std::fs::remove_dir_all(&aside);
+    std::fs::rename(installed, &aside)?;
+    if let Err(e) = std::fs::rename(new, installed) {
+        let _ = std::fs::rename(&aside, installed);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Take the quarantine flag off `path` itself (not what's in it).
+fn unquarantine(path: &Path) {
+    if let Ok(p) = CString::new(path.as_os_str().as_bytes()) {
+        // SAFETY: two valid C strings, which `removexattr` only reads.
+        unsafe { libc::removexattr(p.as_ptr(), c"com.apple.quarantine".as_ptr(), libc::XATTR_NOFOLLOW) };
+    }
 }
 
 #[cfg(test)]
@@ -265,11 +339,62 @@ mod tests {
         std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
         std::fs::rename(&app, &staged).unwrap();
         assert_eq!(bundle_version(&staged).as_deref(), Some("99.0.0"));
-        assert!(pending(&dir.join("Apps").join("HasteClip.app")).is_none());
+        assert!(waiting_in(staged.parent().unwrap()).is_none());
         let installed = dir.join("Apps").join("HasteClip.app");
         std::fs::create_dir_all(&installed).unwrap();
         assert!(apply(&staged, &installed, false).is_err());
         assert!(installed.exists(), "the installed app stays");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn set_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// A standard account can't write to Applications, but owns the app it
+    /// copied there with administrator rights: the whole app can't be
+    /// swapped, what's inside it can, and nothing is left beside it.
+    #[test]
+    fn swaps_what_is_inside_when_the_folder_is_read_only() {
+        let dir = std::env::temp_dir().join(format!("hc-mac-swap-{}", std::process::id()));
+        let apps = dir.join("Apps");
+        let app = apps.join("HasteClip.app");
+        let ready = dir.join("update").join("HasteClip.app");
+        for (bundle, version) in [(&app, "old"), (&ready, "new")] {
+            std::fs::create_dir_all(bundle.join("Contents/MacOS")).unwrap();
+            std::fs::write(bundle.join("Contents/MacOS/hasteclip"), version).unwrap();
+        }
+        set_mode(&apps, 0o555);
+        assert_eq!(blocker(&app), None);
+        assert!(swap(&ready, &app).is_err(), "the whole app can't leave a folder that can't be written");
+        swap(&ready.join("Contents"), &app.join("Contents")).unwrap();
+        let exe = |bundle: &Path| std::fs::read_to_string(bundle.join("Contents/MacOS/hasteclip")).unwrap();
+        assert_eq!((exe(&app).as_str(), exe(&ready).as_str()), ("new", "old"));
+        let beside: Vec<_> = std::fs::read_dir(&apps).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(beside, ["HasteClip.app"]);
+        set_mode(&apps, 0o755);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An app this account can't change doesn't update, and says what's in
+    /// the way.
+    #[test]
+    fn says_what_isnt_ours_to_write() {
+        let dir = std::env::temp_dir().join(format!("hc-mac-blocker-{}", std::process::id()));
+        let apps = dir.join("Apps");
+        let app = apps.join("HasteClip.app");
+        std::fs::create_dir_all(app.join("Contents")).unwrap();
+        assert_eq!(blocker(&app), None);
+        set_mode(&app, 0o555);
+        assert_eq!(blocker(&app), Some(app.clone()));
+        set_mode(&app, 0o755);
+        // Neither the folder nor what's inside the app.
+        set_mode(&apps, 0o555);
+        set_mode(&app.join("Contents"), 0o555);
+        assert_eq!(blocker(&app), Some(app.clone()));
+        set_mode(&app.join("Contents"), 0o755);
+        set_mode(&apps, 0o755);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

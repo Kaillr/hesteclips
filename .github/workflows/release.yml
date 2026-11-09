@@ -5,8 +5,9 @@
 #    version is, without releasing anything. No release-worthy commits → the
 #    rest is skipped.
 # 2. windows, linux, mac: build that version for the platforms ticked when
-#    running it (installer and update packages, HasteClip-linux-x64.tar.gz,
-#    HasteClip-mac-arm64.dmg and the .zip it updates from), all at once.
+#    running it (installer and update packages, HasteClip-linux-x64.tar.gz
+#    and the web page engine Linux fetches, HasteClip-mac-arm64.dmg and the
+#    .zip it updates from), all at once.
 # 3. publish: only once every ticked build is done, semantic-release tags
 #    vX.Y.Z and publishes the GitHub release with everything on it, which the
 #    installed apps update from. A failed build means no release, never half
@@ -133,10 +134,14 @@ jobs:
 
       - run: scripts/release-linux.sh ${{ needs.version.outputs.version }}
 
+      # The app's tarball, and the web page engine it fetches when a page
+      # is first shown.
       - uses: actions/upload-artifact@v4
         with:
           name: linux
-          path: Releases/HasteClip-linux-x64.tar.gz*
+          path: |
+            Releases/HasteClip-linux-x64.tar.gz*
+            Releases/HasteClip-web-engine-linux-x64-*
           if-no-files-found: error
 
   mac:

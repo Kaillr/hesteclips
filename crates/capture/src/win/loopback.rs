@@ -404,7 +404,8 @@ fn sync_taps(taps: &mut [Tap], start: fn(Target, Arc<SourceFeed>) -> Result<Stre
                 }
             }
             SourceKind::Desktop { exclude_app_sources: false } => vec![Target::Exclude(own)],
-            SourceKind::Microphone { .. } => continue,
+            // Not played by any process: a video's sound comes from its layer.
+            SourceKind::Microphone { .. } | SourceKind::Video { .. } => continue,
         };
 
         // Stop streams no longer wanted (or that died), start new ones.

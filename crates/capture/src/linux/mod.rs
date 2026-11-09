@@ -36,6 +36,7 @@ mod apps;
 pub mod audio;
 mod blend;
 mod camera;
+mod cef;
 pub mod decode;
 mod dmabuf;
 pub(crate) mod export;
@@ -48,12 +49,18 @@ mod gpu_frame;
 mod icons;
 mod kwin;
 mod kwin_windows;
+mod layers;
 pub mod monitor;
 mod mutter;
 mod nvenc;
 mod portal;
 mod screen;
 mod vkenc;
+mod web;
+mod web_engine;
+mod web_host;
+mod web_wire;
+mod wl_outputs;
 mod wlr;
 mod wlr_windows;
 mod x11;
@@ -69,19 +76,43 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 
 pub use camera::{keep_open as keep_camera_open, list_cameras};
+pub(crate) use layers::{app_window_size, video_size};
 pub use kwin::helper as kde_stream_helper;
+pub use web_host::helper as web_helper;
 
-use crate::mixer::{self, Clock, LiveAudio};
+use crate::mixer::{self, Clock, LiveAudio, MixChange, MixInput};
 use crate::mp4file::Layout;
 use crate::mp4mux::Spec;
 use crate::outputs::{Capture, Outputs};
 use crate::shutter::Shutter;
 use crate::sources::{AudioCapture, mix_inputs, track_layout};
 use crate::stream::StreamSettings;
-use crate::webcam::{Placement, SharedPlacement};
 use crate::writer::{self, Writer};
 use crate::{AUDIO_BITRATE, BlendShape, Device, EncodeSettings, Mode, Recorder, Running, VideoSource};
-use image::{CameraPicture, Canvas};
+use image::Canvas;
+
+/// Where the engine drawing web pages stands (`crate::layers::browser_engine`):
+/// fetched now if it isn't here yet.
+pub(crate) fn browser_engine() -> crate::layers::BrowserEngine {
+    use crate::layers::BrowserEngine;
+    use web_engine::Engine;
+    match web_engine::status() {
+        Engine::Missing => {
+            web_engine::ensure();
+            BrowserEngine::Fetching { got: 0, total: None }
+        }
+        Engine::Fetching { got, total } => BrowserEngine::Fetching { got, total },
+        Engine::Unpacking => BrowserEngine::Unpacking,
+        Engine::Ready(_) => BrowserEngine::Ready,
+        Engine::Failed(why) => BrowserEngine::Failed(why),
+    }
+}
+
+/// After a failure: the engine fetched again, or started again.
+pub(crate) fn retry_browser_engine() {
+    web_engine::retry();
+    web::retry_now();
+}
 
 /// CLOCK_MONOTONIC in seconds: PipeWire's clock, and so every timestamp's.
 pub(crate) fn host_now() -> f64 {
@@ -188,9 +219,9 @@ pub(crate) fn app_capture() -> bool {
     apps::available()
 }
 
-/// The open camera's own picture, shrunk.
-pub(crate) fn camera_picture(max_width: u32, newer_than: u64) -> Option<crate::webcam::CameraPreview> {
-    camera::picture(max_width, newer_than)
+/// Open camera `device`'s own picture, shrunk.
+pub(crate) fn camera_picture(device: &str, max_width: u32, newer_than: u64) -> Option<crate::webcam::CameraPreview> {
+    camera::picture(device, max_width, newer_than)
 }
 
 /// A camera's settings (V4L2 controls).
@@ -211,6 +242,28 @@ pub(crate) fn app_icon(id: &str, size: u32) -> Option<Vec<u8>> {
 /// Running programs with a window, for `VideoSource::Apps`.
 pub(crate) fn list_windowed_apps() -> Vec<Device> {
     if apps::available() { apps::list() } else { Vec::new() }
+}
+
+/// Where monitor `id` is on an X11 desktop (left, top, width, height):
+/// windows are placed there by position. Not on Wayland (see
+/// [`display_monitor`]).
+pub(crate) fn display_bounds(id: &str) -> Option<[i32; 4]> {
+    if !x11::session() {
+        return None;
+    }
+    let m = x11::monitors().into_iter().find(|m| m.id == id)?;
+    Some([m.x.into(), m.y.into(), m.width.into(), m.height.into()])
+}
+
+/// Monitor `id`'s place among the compositor's outputs, on Wayland: the
+/// one a window is put fullscreen on to be on it (an app can't place its
+/// windows there). Matched by the output's name (`kde:DP-1` is `DP-1`).
+pub(crate) fn display_monitor(id: &str) -> Option<usize> {
+    if x11::session() || std::env::var_os("WAYLAND_DISPLAY").is_none() {
+        return None;
+    }
+    let name = id.split_once(':').map_or(id, |(_, n)| n);
+    wl_outputs::names()?.iter().position(|n| n.as_deref() == Some(name))
 }
 
 /// Forget which screen was picked, so the next capture (the preview, when
@@ -311,6 +364,10 @@ impl Recorder for LinuxRecorder {
 
     fn set_blend(&mut self, looks: u32, shape: BlendShape) -> bool {
         self.outputs.session.as_mut().is_some_and(|s| s.set_blend(looks, shape))
+    }
+
+    fn set_sources(&mut self, sources: &[crate::sources::AudioSource]) -> bool {
+        self.outputs.session.as_mut().is_some_and(|s| s.set_sources(sources, &self.live))
     }
 
     /// Record something else without restarting: another list of games and
@@ -570,6 +627,8 @@ struct Session {
     pacer: Option<(Arc<AtomicBool>, JoinHandle<()>)>,
     audio: Option<AudioCapture>,
     mixer: Option<(Arc<AtomicBool>, JoinHandle<()>)>,
+    /// Sources added to the mix and taken out of it while it runs.
+    mix_changes: Option<Sender<MixChange>>,
     /// AAC encoder threads, one per track; they end when the mixer drops its senders.
     encoders: Vec<JoinHandle<()>>,
     writer_tx: Sender<writer::Command>,
@@ -645,6 +704,7 @@ impl Session {
             pacer: None,
             audio: None,
             mixer: None,
+            mix_changes: None,
             encoders: Vec::new(),
             writer_tx,
             writer: Some(writer),
@@ -670,10 +730,12 @@ impl Session {
             let rest_track = if has_rest { tracks.next() } else { None };
             session.audio = Some(audio);
             let stop = Arc::new(AtomicBool::new(false));
-            let mixer = mixer::spawn_mixer(inputs, mix_track, rest_track, live.clone(), clock.clone(), host_now, MIX_LATENCY, stop.clone());
+            let (mix_changes, changes) = mpsc::channel();
+            session.mix_changes = Some(mix_changes);
+            let mixer = mixer::spawn_changing_mixer(inputs, changes, mix_track, rest_track, live.clone(), clock.clone(), host_now, MIX_LATENCY, stop.clone());
             session.mixer = Some((stop, mixer));
 
-            let picture = Picture::new(feed.clone(), width, height, s.screen.clone(), s.webcam.as_ref());
+            let picture = Picture::new(feed.clone(), width, height, s.fps, s.screen.clone(), s.layers.clone());
             let encoder = VideoEncoder::start(width, height, s, session.writer_tx.clone(), picture.gpu.as_ref())?;
             session.on_card = picture.gpu.is_some();
             let ctl = session.ctl.clone();
@@ -700,6 +762,24 @@ impl Session {
         true
     }
 
+    /// Capture these audio sources from now on, without restarting (see
+    /// [`Recorder::set_sources`]): the capture starts and stops them, and
+    /// the mixer takes them in and out.
+    fn set_sources(&mut self, sources: &[crate::sources::AudioSource], live: &LiveAudio) -> bool {
+        let (Some(audio), Some(changes)) = (self.audio.as_mut(), &self.mix_changes) else { return false };
+        let (added, gone) = audio.set_sources(sources, live);
+        for source in gone {
+            eprintln!("audio source \"{}\": taken out while capturing", source.name);
+            let _ = changes.send(MixChange::Remove(source.id));
+        }
+        for (source, feed) in added {
+            eprintln!("audio source \"{}\": added while capturing, into the mix", source.name);
+            let input = MixInput { channel: live.channel(&source.id), id: source.id, feed, in_mix: source.in_mix, track: None };
+            let _ = changes.send(MixChange::Add(input));
+        }
+        true
+    }
+
     /// Stop capturing and finish what the writer was doing (a recording's
     /// file; the ring's let go).
     fn end(mut self) -> Result<()> {
@@ -722,6 +802,7 @@ impl Session {
         }
         // The mixer writes what's left and drops its senders; the AAC
         // encoders then flush and exit.
+        self.mix_changes = None;
         if let Some((stop, handle)) = self.mixer.take() {
             stop.store(true, Ordering::Relaxed);
             let _ = handle.join();
@@ -735,8 +816,9 @@ impl Session {
 }
 
 /// Makes the frame: the screen put where its placement says (a box in the
-/// output size, as its framing says), the webcam over it or under it.
-/// Redraws only when one of them changed.
+/// output size, as its framing says), the other layers (webcams, displays,
+/// windows, pictures, videos: `layers`) under it and over it, in their
+/// order. Redraws only when one of them changed.
 struct Picture {
     feed: Feed,
     width: u32,
@@ -746,14 +828,12 @@ struct Picture {
     canvas: Canvas,
     gpu: Option<gpu_frame::GpuPicture>,
     screen: crate::SharedScreen,
-    camera: Option<(camera::CameraLayer, SharedPlacement)>,
-    /// What the canvas shows: the screen picture's number and where it went,
-    /// the camera picture's number (`CameraPicture::seq`) and where it was
-    /// placed.
-    shows: Option<(u64, crate::ScreenPlacement, Option<u64>, Option<Placement>)>,
-    /// The webcam picture's number and where it was placed, as the card's
-    /// layer has it.
-    camera_shown: Option<(Option<u64>, Option<Placement>)>,
+    /// The other layers' pictures, and what of them shows now.
+    feeds: layers::Feeds,
+    stack: layers::Stack,
+    /// What the canvas shows: the screen picture's number, where it went,
+    /// and the other layers' (`Stack::key`).
+    shows: Option<(u64, crate::ScreenPlacement, layers::StackKey)>,
     /// The canvas as NV12, made when it changes.
     nv12: Vec<u8>,
     /// Counts the canvas's changes, so the preview is only sent new ones.
@@ -761,45 +841,27 @@ struct Picture {
 }
 
 impl Picture {
-    fn new(feed: Feed, width: u32, height: u32, screen: crate::SharedScreen, webcam: Option<&crate::webcam::Webcam>) -> Self {
-        let camera = webcam.map(|w| (camera::CameraLayer::new(w), w.placement.clone()));
+    fn new(feed: Feed, width: u32, height: u32, fps: u32, screen: crate::SharedScreen, layers: crate::SharedLayers) -> Self {
         let placed = *screen.lock().unwrap();
         let gpu = screen::gpu_frames().map(|g| gpu_frame::GpuPicture::new(g, width, height, placed));
         let mut canvas = if gpu.is_some() { Canvas::new(0, 0) } else { Canvas::new(width, height) };
         canvas.clear();
-        Self { feed, width, height, canvas, gpu, screen, camera, shows: None, camera_shown: None, nv12: Vec::new(), version: 0 }
+        Self { feed, width, height, canvas, gpu, screen, feeds: layers::Feeds::new(layers, fps), stack: layers::Stack::main_only(), shows: None, nv12: Vec::new(), version: 0 }
     }
 
-    /// Where the screen goes now (on the card too, for the frames made
-    /// there next), and the webcam's picture and place: on the card, its
-    /// layer is drawn again if either changed.
-    fn layers(&mut self) -> (crate::ScreenPlacement, Option<Arc<CameraPicture>>, Option<Placement>) {
-        let placed = *self.screen.lock().unwrap();
+    /// Where the screen goes now (hidden when the list hasn't it: a scene
+    /// without the screen), and what of the other layers shows: on the
+    /// card, for the frames made there next (a set of layers that changed
+    /// is drawn again).
+    fn layers(&mut self) -> crate::ScreenPlacement {
+        self.stack = self.feeds.stack();
+        let mut placed = *self.screen.lock().unwrap();
+        placed.hidden |= !self.stack.main;
         if let Some(g) = &mut self.gpu {
             g.set_screen(placed);
+            g.set_layers(&self.stack.under, &self.stack.over);
         }
-        let (cam, place) = self.camera_layer();
-        (placed, cam, place)
-    }
-
-    /// On the card: draw the webcam's layer again if its picture or place
-    /// changed. Returns the camera picture and place shown.
-    fn camera_layer(&mut self) -> (Option<Arc<CameraPicture>>, Option<Placement>) {
-        let (cam, place) = match &mut self.camera {
-            Some((layer, place)) => {
-                let place = *place.lock().unwrap();
-                (layer.latest().filter(|_| !place.is_hidden()), Some(place))
-            }
-            None => (None, None),
-        };
-        let now = (cam.as_ref().map(|c| c.seq), place);
-        if let Some(g) = &mut self.gpu
-            && self.camera_shown != Some(now)
-        {
-            g.set_camera(cam.as_deref().zip(place.as_ref()));
-            self.camera_shown = Some(now);
-        }
-        (cam, place)
+        placed
     }
 
     /// Bring the canvas up to date. Returns whether there's a picture yet.
@@ -807,8 +869,8 @@ impl Picture {
         // A source that reads the screen on request (X11) reads the next one now.
         self.feed.want();
         let Some((frame, seq)) = self.feed.get() else { return false };
-        let (placed, cam, place) = self.layers();
-        let now = (seq, placed, cam.as_ref().map(|c| c.seq), place);
+        let placed = self.layers();
+        let now = (seq, placed, self.stack.key());
         if self.shows.as_ref() != Some(&now) {
             match &mut self.gpu {
                 Some(g) => {
@@ -816,19 +878,21 @@ impl Picture {
                         return false;
                     }
                 }
-                None => match (&cam, &place) {
-                    // The screen in front: the webcam first, the screen over it.
-                    (Some(cam), Some(place)) if placed.in_front => {
+                None => {
+                    // The layers under the screen, the screen around them
+                    // (on black where there's none), then those over it.
+                    let under = !self.stack.under.is_empty();
+                    if under {
                         self.canvas.clear();
-                        self.canvas.draw_camera(cam, place);
-                        self.canvas.draw_screen(&frame, &placed, true);
+                        for l in &self.stack.under {
+                            self.canvas.draw_layer(l);
+                        }
                     }
-                    (Some(cam), Some(place)) => {
-                        self.canvas.draw_screen(&frame, &placed, false);
-                        self.canvas.draw_camera(cam, place);
+                    self.canvas.draw_screen(&frame, &placed, under);
+                    for l in &self.stack.over {
+                        self.canvas.draw_layer(l);
                     }
-                    _ => self.canvas.draw_screen(&frame, &placed, false),
-                },
+                }
             }
             self.shows = Some(now);
             self.nv12.clear();
@@ -844,9 +908,11 @@ impl Picture {
     }
 }
 
-/// The largest the preview is made: it's shown in a box a third of the
-/// window tall, so more is only more to convert and upload every frame.
-const PREVIEW_MAX: (u32, u32) = (1280, 720);
+/// The largest the preview is made: full size up to 1440p, as Windows', so
+/// things can be lined up on it to the pixel (shrunk, a 1080p picture was
+/// drawn soft); a 4K one is shrunk to 1440p, as every frame is read back,
+/// copied and uploaded, 60 times a second.
+const PREVIEW_MAX: (u32, u32) = (2560, 2560);
 
 /// What's been sent to the preview.
 struct Previewed {
@@ -1286,7 +1352,7 @@ pub(crate) struct PreviewCapture {
 }
 
 impl PreviewCapture {
-    pub(crate) fn start(source: VideoSource, size: crate::VideoSize, fps: u32, away_screen: Option<Arc<crate::StillImage>>, webcam: Option<crate::webcam::Webcam>, screen: crate::SharedScreen) -> Self {
+    pub(crate) fn start(source: VideoSource, size: crate::VideoSize, fps: u32, away_screen: Option<Arc<crate::StillImage>>, layers: crate::SharedLayers, screen: crate::SharedScreen) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let error = Arc::new(Mutex::new(None));
         let opened: Arc<Mutex<Option<Feed>>> = Default::default();
@@ -1312,7 +1378,7 @@ impl PreviewCapture {
             };
             *opened2.lock().unwrap() = Some(feed.clone());
             let (width, height) = feed.recorded_size(size);
-            let mut picture = Picture::new(feed.clone(), width, height, screen, webcam.as_ref());
+            let mut picture = Picture::new(feed.clone(), width, height, fps, screen, layers);
             let mut sent = Previewed::new(generation);
             // Paced like the recording would be.
             let every = 1.0 / fps.max(1) as f64;
@@ -1419,13 +1485,17 @@ mod tests {
             replay_seconds: 5,
             video: video.clone(),
             away_screen: None,
-            // HASTECLIP_WEBCAM=<device> draws a webcam in the corner.
-            webcam: std::env::var("HASTECLIP_WEBCAM").ok().map(|device| crate::webcam::Webcam {
-                device,
-                format: None,
-                placement: Arc::new(Mutex::new(crate::webcam::Placement::default_for(16.0 / 9.0, 16.0 / 9.0))),
-            }),
+            webcam: None,
             screen: Arc::new(Mutex::new(crate::ScreenPlacement::whole(crate::Framing::Fit))),
+            // HASTECLIP_WEBCAM=<device> draws a webcam in the corner.
+            layers: Arc::new(Mutex::new(
+                std::iter::once(crate::Layer { id: 0, source: crate::LayerSource::Main })
+                    .chain(std::env::var("HASTECLIP_WEBCAM").ok().map(|device| crate::Layer {
+                        id: 1,
+                        source: crate::LayerSource::Camera { device, format: None, placement: crate::webcam::Placement::default_for(16.0 / 9.0, 16.0 / 9.0) },
+                    }))
+                    .collect(),
+            )),
             sources: Vec::new(),
             stream: None,
         };

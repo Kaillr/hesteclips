@@ -419,6 +419,23 @@ impl App {
         self.say_locked(locked_click, lock);
     }
 
+    /// The video's size and frame rate, as this page's Video pane has them:
+    /// the Sources page's video dialog shows them (the size over its
+    /// preview opens it).
+    /// Frame blending stays here.
+    pub(crate) fn video_size_rows(&mut self, ui: &mut egui::Ui) {
+        let all = Filter { q: String::new() };
+        self.video_group(ui, &all);
+        ui_kit::gap(ui, 8.0);
+        let lock = self.lock();
+        let mut locked_click = false;
+        ui_kit::list(ui, "scene_fps", |l| {
+            let (_, c) = l.row(Row::new("Frame rate").locked(lock.clone()), |ui| self.fps_field(ui));
+            locked_click |= c;
+        });
+        self.say_locked(locked_click, lock);
+    }
+
     /// Video's motion: the frame rate, and frame blending's motion blur
     /// made from faster captures than it.
     fn motion_group(&mut self, ui: &mut egui::Ui, f: &Filter) {
@@ -1347,20 +1364,14 @@ impl App {
         }
         let modal = ui_kit::dialog(ctx, "reset_settings", 400.0, |ui| {
             ui_kit::dialog_title(ui, "Reset all settings?");
-            ui_kit::dialog_text(ui, "Clipping, video, saving and shortcuts go back to their defaults. Your clips, folders, sources and where you stream to are kept.");
+            ui_kit::dialog_text(ui, "Clipping, video, saving and shortcuts go back to their defaults. Your clips, folders, presets with their scenes, sources and sound, and where you stream to are kept.");
             ui_kit::dialog_buttons(ui, |ui| {
                 if ui.add(ui_kit::danger_button("Reset")).clicked() {
                     let mut fresh = settings::RecordSettings::default();
                     fresh.output_dir = self.settings.output_dir.clone();
                     fresh.game_folders = std::mem::take(&mut self.settings.game_folders);
-                    fresh.audio_sources = std::mem::take(&mut self.settings.audio_sources);
-                    fresh.capture = std::mem::take(&mut self.settings.capture);
-                    fresh.idle_apps = self.settings.idle_apps.take();
-                    fresh.webcam = self.settings.webcam.take();
+                    fresh.keep_presets_from(&mut self.settings);
                     fresh.camera_controls = std::mem::take(&mut self.settings.camera_controls);
-                    fresh.display_id = self.settings.display_id.take();
-                    fresh.display_index = self.settings.display_index;
-                    fresh.limiter = self.settings.limiter;
                     fresh.save_sound.custom = std::mem::take(&mut self.settings.save_sound.custom);
                     fresh.library_sort = self.settings.library_sort;
                     fresh.stream.destinations = std::mem::take(&mut self.settings.stream.destinations);
