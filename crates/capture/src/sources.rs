@@ -1329,7 +1329,7 @@ mod tests {
         assert_eq!(loudest, 0.25, "in it once");
         let arrived = feed.arrived();
         own_sound::forget(&feed);
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(std::time::Duration::from_millis(20));
         playing.push(&[0.25; 960]);
         assert_eq!(feed.arrived(), arrived, "none after it's forgotten");
     }
@@ -1528,7 +1528,7 @@ mod tests {
         let _monitor = LevelMonitor::start(&[video, other], live.clone()).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(200));
         let (channel, quiet) = (live.channel("video-7"), live.channel("video-8"));
-        assert_eq!(channel.status(), SourceStatus::Live);
+        assert_eq!(channel.status(), crate::mixer::SourceStatus::Live);
         // Half a second of a loud tone at 44.1 kHz, each block when it's heard.
         let mut playing = video_sound::Playing::new("video-7", 44_100);
         let block: Vec<f32> = (0..441).flat_map(|i| [0.8 * (i as f32 * 0.1).sin(); 2]).collect();
