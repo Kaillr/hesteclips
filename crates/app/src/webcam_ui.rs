@@ -25,27 +25,101 @@ const FIRST_WIDTH: f32 = 0.25;
 const MIN_SIZE: f32 = 0.03;
 /// Snap distance, as a fraction of the frame.
 const SNAP: f32 = 0.012;
+/// How much of a box (of the video, across and down) stays on the video
+/// however far it's moved past its edges, so it can always be taken hold
+/// of again.
+pub(crate) const SEEN: f32 = 0.03;
+
+/// Where a box `size` big, at `at`, goes along one axis to keep [`SEEN`]
+/// of it on the video.
+pub(crate) fn seen(at: f32, size: f32) -> f32 {
+    let s = SEEN.min(size);
+    at.clamp(s - size, 1.0 - s)
+}
+
+/// The nearest of the video's edges and middle and `lines` to `v`, if one
+/// is close enough to snap to.
+fn snap_to(v: f32, lines: &[f32]) -> Option<f32> {
+    [0.0, 0.5, 1.0].iter().chain(lines).copied().filter(|l| (l - v).abs() < SNAP).min_by(|a, b| (a - v).abs().total_cmp(&(b - v).abs()))
+}
+
+/// `r`, resized with its moving sides `[left, top, right, bottom]`, one of
+/// them on a line near it (the video's edges and middle, `lines`): each on
+/// its own, or (`keep`, its shape kept) the box scaled from its other sides
+/// (its middle, across an axis not resized) so the nearest one is.
+pub(crate) fn snap_sides(r: Rect, [l, t, rt, b]: [bool; 4], keep: bool, lines: &Lines) -> Rect {
+    if !keep {
+        let mut s = r;
+        if l && let Some(v) = snap_to(s.min.x, &lines.xs).filter(|v| *v < s.max.x) {
+            s.min.x = v;
+        }
+        if rt && let Some(v) = snap_to(s.max.x, &lines.xs).filter(|v| *v > s.min.x) {
+            s.max.x = v;
+        }
+        if t && let Some(v) = snap_to(s.min.y, &lines.ys).filter(|v| *v < s.max.y) {
+            s.min.y = v;
+        }
+        if b && let Some(v) = snap_to(s.max.y, &lines.ys).filter(|v| *v > s.min.y) {
+            s.max.y = v;
+        }
+        return s;
+    }
+    let (w, h) = (r.width().max(1e-6), r.height().max(1e-6));
+    let ax = if l { r.max.x } else if rt { r.min.x } else { r.center().x };
+    let ay = if t { r.max.y } else if b { r.min.y } else { r.center().y };
+    // Each moving side's nearest line: how far, and the scale it takes.
+    let mut best: Option<(f32, f32)> = None;
+    let mut consider = |edge: f32, ls: &[f32], k: &dyn Fn(f32) -> f32| {
+        if let Some(v) = snap_to(edge, ls) {
+            let d = (v - edge).abs();
+            if best.is_none_or(|(bd, _)| d < bd) {
+                best = Some((d, k(v)));
+            }
+        }
+    };
+    if l {
+        consider(r.min.x, &lines.xs, &|v| (ax - v) / w);
+    }
+    if rt {
+        consider(r.max.x, &lines.xs, &|v| (v - ax) / w);
+    }
+    if t {
+        consider(r.min.y, &lines.ys, &|v| (ay - v) / h);
+    }
+    if b {
+        consider(r.max.y, &lines.ys, &|v| (v - ay) / h);
+    }
+    let Some((_, k)) = best.filter(|(_, k)| *k > 0.01) else { return r };
+    let (nw, nh) = (w * k, h * k);
+    let x = if l { ax - nw } else if rt { ax } else { ax - nw / 2.0 };
+    let y = if t { ay - nh } else if b { ay } else { ay - nh / 2.0 };
+    Rect::from_min_size(Pos2::new(x, y), vec2(nw, nh))
+}
 
 #[derive(Default)]
 pub(crate) struct WebcamView {
     /// Cameras for the picker, refreshed when it opens.
     cameras: Vec<capture::Device>,
-    /// Just added, or a new camera or format: size its box to the camera's
-    /// shape once the camera delivers it.
-    fit_pending: bool,
+    /// Just added, or a new camera or format: size this webcam's box to the
+    /// camera's shape once the camera delivers it.
+    fit_pending: Option<u64>,
     /// The camera's size when that was asked for: until it changes, the
     /// camera is still the old one (it takes a moment to reopen), and fitting
     /// to it would shape the box for the format just left.
     fit_from: Option<(u32, u32)>,
     /// The crop's page, open: the camera's own picture, to crop on.
     pub(crate) crop: Option<CameraPanel>,
+    /// The selected webcam's camera settings, as last read (see
+    /// `App::camera_settings_sections`).
+    inline: Option<CameraPanel>,
 }
 
 impl WebcamView {
-    /// Fit the box to the camera's shape once the camera reopens.
-    fn ask_fit(&mut self) {
-        self.fit_pending = true;
-        self.fit_from = match capture::webcam::status() {
+    /// Fit webcam `key`'s box to its camera's shape once the camera
+    /// (`device`, as it was) reopens.
+    fn ask_fit(&mut self, key: u64, device: &str) {
+        self.fit_pending = Some(key);
+        self.fit_from = match capture::webcam::status_of(device) {
             Status::Live { width, height } => Some((width, height)),
             _ => None,
         };
@@ -132,8 +206,8 @@ pub(crate) struct Lines {
 /// as the screen's do. Dragging past that opposite side flips the picture
 /// on that axis.
 ///
-/// The box stays inside the frame: moving stops at its edges, and so does
-/// growing (what's not wanted of the picture is cropped instead).
+/// The box goes past the frame's edges as far as it's dragged, [`SEEN`]
+/// of it staying on; its moving sides snap, as a move does (`mods.snap`).
 pub(crate) fn drag(start: Placement, handle: Handle, dx: f32, dy: f32, mods: Mods, lines: &Lines) -> Placement {
     let mut p = start;
     if handle == Handle::Move {
@@ -143,13 +217,13 @@ pub(crate) fn drag(start: Placement, handle: Handle, dx: f32, dy: f32, mods: Mod
             p.x += snap_offset(&[p.x, p.x + p.w], p.x + p.w / 2.0, &lines.xs);
             p.y += snap_offset(&[p.y, p.y + p.h], p.y + p.h / 2.0, &lines.ys);
         }
-        p.x = p.x.clamp(0.0, (1.0 - p.w).max(0.0));
-        p.y = p.y.clamp(0.0, (1.0 - p.h).max(0.0));
+        p.x = seen(p.x, p.w);
+        p.y = seen(p.y, p.h);
         return p;
     }
     let [l, t, r, b] = handle.sides();
     if mods.crop {
-        return crop(start, [l, t, r, b], dx, dy, mods.keep);
+        return crop(start, [l, t, r, b], dx, dy, mods.keep, mods.snap.then_some(lines));
     }
     // Per axis: the fixed side (anchor), and how far the dragged side is from
     // it, signed, before and after. A sign change means it crossed: a flip.
@@ -174,20 +248,9 @@ pub(crate) fn drag(start: Placement, handle: Handle, dx: f32, dy: f32, mods: Mod
         (Some((_, a)), None) | (None, Some((_, a))) => a.abs(),
         (None, None) => 1.0,
     };
-    // No bigger than fits between its anchor and the frame's edge it grows
-    // toward (both edges, for an axis kept centred).
-    let room = |near: bool, ka: Option<(f32, f32)>, pos: f32, size: f32| -> f32 {
-        match ka {
-            Some((anchor, k)) => {
-                if near != (k < 0.0) { anchor } else { 1.0 - anchor }
-            }
-            None => {
-                let c = pos + size / 2.0;
-                2.0 * c.min(1.0 - c)
-            }
-        }
-    };
-    let (most_x, most_y) = (room(l, kx, start.x, start.w) / start.w, room(t, ky, start.y, start.h) / start.h);
+    // As big as it's dragged, past the video's edges too (up to a few
+    // times the video).
+    let (most_x, most_y) = (GROW_MOST / start.w, GROW_MOST / start.h);
     // Shift: each axis as far as it's dragged (one not dragged stays), and
     // the picture as much more stretched.
     let (ax, ay) = if mods.keep {
@@ -220,14 +283,31 @@ pub(crate) fn drag(start: Placement, handle: Handle, dx: f32, dy: f32, mods: Mod
     p.h = h;
     p.flip_h = start.flip_h ^ fx;
     p.flip_v = start.flip_v ^ fy;
+    // Its moving sides snap to the video's edges and middle and the other
+    // sources (but with Ctrl): which sides moved, as it's ended up.
+    if mods.snap {
+        let r0 = Rect::from_min_size(Pos2::new(p.x, p.y), vec2(p.w, p.h));
+        let moving = |ka: Option<(f32, f32)>, pos: f32| ka.map_or((false, false), |(anchor, _)| if (pos - anchor).abs() < 1e-6 { (false, true) } else { (true, false) });
+        let ((ml, mr), (mt, mb)) = (moving(kx, p.x), moving(ky, p.y));
+        let r1 = snap_sides(r0, [ml, mt, mr, mb], !mods.keep, lines);
+        if r1.width() > MIN_SIZE && r1.height() > MIN_SIZE {
+            if mods.keep {
+                p.stretch *= (r1.width() / r0.width()) / (r1.height() / r0.height());
+            }
+            (p.x, p.y, p.w, p.h) = (r1.min.x, r1.min.y, r1.width(), r1.height());
+        }
+    }
     p
 }
+
+/// How big a box can be dragged, in videos (across and down).
+const GROW_MOST: f32 = 8.0;
 
 /// Crop the sides in `sides` (as seen: a flipped picture's left side is the
 /// camera's right) as they're dragged: the picture keeps its scale, the box
 /// shrinks (or grows back) with the crop, like OBS's Alt-drag. With `keep`,
 /// the box keeps its shape.
-fn crop(start: Placement, sides: [bool; 4], dx: f32, dy: f32, keep: bool) -> Placement {
+fn crop(start: Placement, sides: [bool; 4], dx: f32, dy: f32, keep: bool, lines: Option<&Lines>) -> Placement {
     let mut p = start;
     let c = start.crop;
     // Which camera side each visible side is.
@@ -239,9 +319,8 @@ fn crop(start: Placement, sides: [bool; 4], dx: f32, dy: f32, keep: bool) -> Pla
     // The whole camera picture, on the frame: the box stays inside it (it
     // can't uncrop past it) and inside the frame, showing at least 5% of it.
     let whole = Rect::from_min_max(Pos2::new(start.x - c[left] * sx, start.y - c[top] * sy), Pos2::new(start.x + start.w + c[right] * sx, start.y + start.h + c[bottom] * sy));
-    let bounds = whole.intersect(Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)));
     let from = Rect::from_min_size(Pos2::new(start.x, start.y), vec2(start.w, start.h));
-    let to = resize_within(from, sides, vec2(dx, dy), keep, bounds, vec2(0.05 * sx, 0.05 * sy));
+    let to = resize_within(from, sides, vec2(dx, dy), keep, whole, vec2(0.05 * sx, 0.05 * sy), lines);
     p.crop[left] = (to.min.x - whole.min.x) / sx;
     p.crop[right] = (whole.max.x - to.max.x) / sx;
     p.crop[top] = (to.min.y - whole.min.y) / sy;
@@ -255,8 +334,18 @@ fn crop(start: Placement, sides: [bool; 4], dx: f32, dy: f32, keep: bool) -> Pla
 /// `start` with the sides in `sides` dragged by `d`, inside `bounds`, at
 /// least `least` across and down. With `keep`, its shape is kept: scaled
 /// from the opposite corner or side (centred on an axis not dragged), a
-/// corner following the pointer's place along the diagonal.
-pub(crate) fn resize_within(start: Rect, [l, t, r, b]: [bool; 4], d: egui::Vec2, keep: bool, bounds: Rect, least: egui::Vec2) -> Rect {
+/// corner following the pointer's place along the diagonal. With `lines`,
+/// a side dragged snaps to one near it (or the video's edges or middle).
+pub(crate) fn resize_within(start: Rect, sides: [bool; 4], d: egui::Vec2, keep: bool, bounds: Rect, least: egui::Vec2, lines: Option<&Lines>) -> Rect {
+    let to = resize_free(start, sides, d, keep, bounds, least);
+    let Some(lines) = lines else { return to };
+    let snapped = snap_sides(to, sides, keep, lines);
+    let inside = bounds.expand(1e-5).contains_rect(snapped) && snapped.width() >= least.x - 1e-5 && snapped.height() >= least.y - 1e-5;
+    if inside { snapped } else { to }
+}
+
+/// [`resize_within`], without snapping.
+fn resize_free(start: Rect, [l, t, r, b]: [bool; 4], d: egui::Vec2, keep: bool, bounds: Rect, least: egui::Vec2) -> Rect {
     if !keep {
         let mut s = start;
         if l {
@@ -314,6 +403,14 @@ pub(crate) fn uncrop(p: Placement) -> Placement {
     contain(Placement { x: p.x - left * sx, y: p.y - top * sy, w: sx, h: sy, crop: [0.0; 4], ..p })
 }
 
+/// The box with [`SEEN`] of it on the video at least (moved, not shrunk):
+/// where a box typed, or a group's, may go.
+pub(crate) fn on_video(mut p: Placement) -> Placement {
+    p.x = seen(p.x, p.w);
+    p.y = seen(p.y, p.h);
+    p
+}
+
 /// The box inside the frame: shrunk about its centre if it's bigger than the
 /// frame (keeping its shape), then moved in. For a box that may have left it
 /// (turned a quarter, which swaps its sides).
@@ -358,13 +455,18 @@ impl App {
     /// the webcam's box that shape (same width, same top-left; crop kept),
     /// in a video of shape `frame_aspect`.
     pub(crate) fn webcam_fit_pending(&mut self, ctx: &egui::Context, frame_aspect: f32) {
-        let status = capture::webcam::status();
-        if self.webcam_view.fit_pending {
+        let Some(key) = self.webcam_view.fit_pending else { return };
+        let Some(device) = self.settings.webcam(key).map(|w| w.id.clone()) else {
+            self.webcam_view.fit_pending = None;
+            return;
+        };
+        let status = capture::webcam::status_of(&device);
+        {
             let live = match &status {
                 Status::Live { width, height } => Some((*width, *height)),
                 _ => None,
             };
-            let wanted = self.settings.webcam.as_ref().and_then(|w| w.format).map(|f| (f.width, f.height));
+            let wanted = self.settings.webcam(key).and_then(|w| w.format).map(|f| (f.width, f.height));
             // The new camera or format is open: its size is the one asked
             // for, or (Automatic, another camera) not the one before.
             let reopened = live.is_some_and(|l| match wanted {
@@ -374,191 +476,160 @@ impl App {
             if !reopened {
                 ctx.request_repaint_after(std::time::Duration::from_millis(50));
             }
-            if let (true, Status::Live { width, height }, Some(w)) = (reopened, &status, self.settings.webcam.as_mut()) {
+            if let (true, Status::Live { width, height }, Some(w)) = (reopened, &status, self.settings.webcam_mut(key)) {
                 let p = &mut w.placement;
                 let (cw, ch) = if p.turns % 2 == 1 { (*height, *width) } else { (*width, *height) };
                 let camera_aspect = cw as f32 / ch.max(1) as f32;
                 let visible = (1.0 - p.crop[0] - p.crop[2]).max(0.05) / (1.0 - p.crop[1] - p.crop[3]).max(0.05);
                 p.h = p.w * frame_aspect / (camera_aspect * visible);
                 p.frame_aspect = Some(frame_aspect);
-                self.webcam_view.fit_pending = false;
+                self.webcam_view.fit_pending = None;
                 self.webcam_view.fit_from = None;
             }
         }
     }
 
-    /// Put a webcam in the video: the first camera, in the bottom-right
-    /// corner of a video of shape `frame_aspect`.
-    pub(crate) fn add_webcam(&mut self, frame_aspect: f32) {
+    /// Cameras for the Add menu and the pickers, looked for again.
+    pub(crate) fn refresh_cameras(&mut self) {
         self.webcam_view.cameras = capture::webcam::list_cameras();
-        match self.webcam_view.cameras.first().cloned() {
-            Some(c) => {
-                self.settings.webcam = Some(WebcamCfg {
-                    id: c.id,
-                    name: c.name,
-                    format: None,
-                    placement: PlacementCfg::laid_out(Placement::default_for(16.0 / 9.0, frame_aspect), frame_aspect),
-                    enabled: true,
-                });
-                self.webcam_view.ask_fit();
-            }
-            None => self.toast_error("No cameras found"),
-        }
     }
 
-    /// What the webcam's doing, for its card's line (nothing while it's
-    /// fine, or off: its switch says so), and whether it's wrong.
-    pub(crate) fn webcam_state(&self) -> (&'static str, bool) {
-        match (self.settings.webcam.as_ref().map(|w| w.enabled), capture::webcam::status()) {
-            (Some(false), _) => ("", false),
-            (_, Status::Opening) => ("Opening…", false),
-            (_, Status::Unavailable(_)) => ("Not working", true),
-            _ => ("", false),
-        }
+    /// The cameras found when last looked (see `refresh_cameras`).
+    pub(crate) fn cameras(&self) -> &[capture::Device] {
+        &self.webcam_view.cameras
     }
 
-    /// The webcam's settings, in its card: what's wrong with it, its camera
-    /// (and its format, where there's no Camera page), its own settings, and
-    /// where it sits. `frame_aspect`: the video's shape.
-    pub(crate) fn webcam_rows(&mut self, ui: &mut egui::Ui) {
+    /// Put camera `c` in the video, in front of the rest, in the
+    /// bottom-right corner of a video of shape `frame_aspect`. Its key.
+    pub(crate) fn add_webcam(&mut self, c: capture::Device, frame_aspect: f32) -> u64 {
+        let key = self.settings.new_key();
+        self.webcam_view.ask_fit(key, &c.id);
+        self.settings.webcams.push(WebcamCfg {
+            key,
+            id: c.id,
+            name: c.name,
+            title: None,
+            format: None,
+            placement: PlacementCfg::laid_out(Placement::default_for(16.0 / 9.0, frame_aspect), frame_aspect),
+            enabled: true,
+        });
+        self.settings.layer_order.insert(0, crate::canvas_ui::Layer::Webcam(key));
+        key
+    }
+
+    /// Webcam `key`'s box takes its camera's shape once the camera (`device`,
+    /// as it was before a change) opens again: after another camera or
+    /// format is picked.
+    pub(crate) fn webcam_refit_later(&mut self, key: u64, device: &str) {
+        self.webcam_view.ask_fit(key, device);
+    }
+
+    /// Webcam `key` cropped to `c` (its sides cut off, as `Placement::crop`),
+    /// its box taking the shape of what's left.
+    pub(crate) fn webcam_set_crop(&mut self, key: u64, c: [f32; 4]) {
+        let Some(p) = self.settings.webcam(key).map(|w| w.placement) else { return };
+        let orient = Orientation { flip_h: p.flip_h, flip_v: p.flip_v, turns: p.turns };
+        self.webcam_recrop(key, orient, c);
+    }
+
+    /// A webcam's own settings, under its other settings: the camera's
+    /// controls in groups (exposure, white balance, focus…), as its Camera
+    /// page had them, read from the camera as it opens; how fast it really
+    /// goes; and putting them back to its defaults, or (Windows) its
+    /// driver's own window. They apply at once, in every app, and are put
+    /// back each time the camera's opened.
+    pub(crate) fn camera_settings_sections(&mut self, ui: &mut egui::Ui, key: u64) {
         use crate::theme::{self, W};
-        use crate::ui_kit::{Btn, Item};
-        use egui_phosphor::regular as icon;
         let pal = theme::pal(ui);
-        let status = capture::webcam::status();
-        let Some(cam) = self.settings.webcam.clone() else { return };
-        if cam.enabled
-            && let Status::Unavailable(why) = &status
-        {
-            let mut why = why.clone();
-            if let Some(first) = why.get(..1) {
-                why.replace_range(..1, &first.to_uppercase());
-            }
-            // As far from the top as the rows' controls are.
-            ui.add_space((crate::sources_ui::GROUP_ROW_H - crate::ui_kit::CONTROL_H) / 2.0);
-            ui.add(egui::Label::new(theme::text(format!("{why}."), 12.5, W::Regular).color(pal.warn)).wrap());
-            ui.add_space(4.0);
+        let Some(cam) = self.settings.webcam(key).cloned() else { return };
+        if !capture::webcam::HAS_CONTROLS && !capture::webcam::HAS_SETTINGS {
+            return;
         }
-        let row = |ui: &mut egui::Ui, label: &str, add: &mut dyn FnMut(&mut egui::Ui)| {
-            ui.horizontal(|ui| {
-                ui.set_min_height(crate::sources_ui::GROUP_ROW_H);
-                ui.label(theme::text(label, 13.5, W::Regular).color(pal.text));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| add(ui));
-            });
+        // The camera's settings as last read: again for another camera, and
+        // as it opens (on Windows they're only there while it's open).
+        if self.webcam_view.inline.as_ref().is_none_or(|p| p.device != cam.id) {
+            self.webcam_view.inline = Some(CameraPanel::open(&cam.id));
+        }
+        let live = matches!(capture::webcam::status_of(&cam.id), Status::Live { .. });
+        let format_fps = cam.format.map(capture::webcam::Format::from).or_else(|| capture::webcam::formats(&cam.id).into_iter().max_by_key(|f| f.auto_rank())).map(|f| f.fps());
+        let Some(panel) = self.webcam_view.inline.as_mut() else { return };
+        if live && !panel.live {
+            panel.controls = capture::webcam::camera_controls(&panel.device);
+        }
+        panel.live = live;
+        measure_rate(ui.ctx(), panel);
+        let mut set: Vec<(u32, i64)> = Vec::new();
+        let mut reset = false;
+        crate::ui_kit::section_head(ui, "Camera settings", false, |_| {});
+        // What it really sends, when that's less than it should.
+        let status = match (capture::webcam::status_of(&panel.device), panel.fps) {
+            (Status::Live { width, height }, Some(fps)) => format!("{width}×{height} · {fps:.0} new pictures a second"),
+            (Status::Live { width, height }, None) => format!("{width}×{height}"),
+            _ => "The camera's settings show once it's on.".to_owned(),
         };
-        row(ui, "Camera", &mut |ui| {
-            let r = crate::ui_kit::select(ui, &cam.name, 180.0);
-            if r.clicked() {
-                self.webcam_view.cameras = capture::webcam::list_cameras();
+        ui.add(egui::Label::new(theme::text(&status, 12.5, W::Regular).color(pal.text3)).wrap());
+        if let Some(why) = slowdown(panel.fps, format_fps) {
+            ui.add(egui::Label::new(theme::text(why, 12.5, W::Regular).color(pal.warn)).wrap());
+        }
+        if capture::webcam::HAS_CONTROLS && live {
+            controls_view(ui, panel, format_fps, &mut set);
+        }
+        let resettable = !panel.controls.is_empty();
+        ui.add_space(8.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
+            if resettable && crate::ui_kit::Btn::normal("Reset to defaults").small().tip("Back to the camera's own defaults").show(ui).clicked() {
+                reset = true;
             }
-            crate::ui_kit::menu_popup(&r, false, 240.0, |ui| {
-                for c in self.webcam_view.cameras.clone() {
-                    if Item::new(c.name.clone()).check(c.id == cam.id).show(ui).clicked() && c.id != cam.id {
-                        if let Some(w) = self.settings.webcam.as_mut() {
-                            w.id = c.id;
-                            w.name = c.name;
-                            w.format = None; // that camera's own formats
-                        }
-                        self.webcam_view.ask_fit();
+            // What only its driver has, in the driver's own window.
+            if capture::webcam::HAS_SETTINGS && crate::ui_kit::Btn::normal("Driver settings…").small().tip("The camera driver's own settings window, for anything not here").show(ui).clicked() {
+                capture::webcam::open_settings(&panel.device, &cam.name);
+            }
+        });
+        ui.add(egui::Label::new(theme::text("They apply right away, in every app, and are put back each time HasteClip opens this camera.", 12.0, W::Regular).color(pal.text3)).wrap());
+        let device = panel.device.clone();
+        if reset {
+            // Manual values first, while they're still taken, then the automatic modes.
+            let (autos, rest): (Vec<_>, Vec<_>) = panel.controls.iter().filter(|c| c.value != c.default).partition(|c| !matches!(c.kind, ControlKind::Int { .. }));
+            set = rest.into_iter().chain(autos).map(|c| (c.id, c.default)).collect();
+            self.settings.camera_controls.remove(&device);
+        }
+        if !set.is_empty() {
+            let saved = self.settings.camera_controls.entry(device.clone()).or_default();
+            for (id, value) in &set {
+                if let Err(e) = capture::webcam::set_camera_control(&device, *id, *value) {
+                    eprintln!("camera setting: {e:#}");
+                }
+                // Kept only while it isn't the camera's default.
+                match panel.controls.iter().find(|c| c.id == *id) {
+                    Some(c) if c.default == *value || reset => {
+                        saved.remove(id);
+                    }
+                    _ => {
+                        saved.insert(*id, *value);
                     }
                 }
-                if self.webcam_view.cameras.is_empty() {
-                    crate::ui_kit::menu_head(ui, "No cameras found.");
-                }
-            });
-        });
-        // Where there's no Camera page (its settings are the driver's
-        // window, or none), the format is picked here.
-        if !capture::webcam::HAS_CONTROLS {
-            let formats = capture::webcam::formats(&cam.id);
-            let current = cam.format.map(capture::webcam::Format::from);
-            let mut pick: Option<Option<capture::webcam::Format>> = None;
-            crate::ui_kit::divider(ui, 0.0);
-            row(ui, "Resolution", &mut |ui| {
-                let label = current.map_or_else(|| "Automatic".to_owned(), |f| size_label(f.width, f.height));
-                let r = crate::ui_kit::select(ui, &label, 180.0);
-                crate::ui_kit::menu_popup(&r, false, 250.0, |ui| {
-                    egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-                        if Item::new("Automatic").check(current.is_none()).tip("The sharpest picture up to 1080p at 30 fps or more").show(ui).clicked() {
-                            pick = Some(None);
-                        }
-                        if formats.is_empty() {
-                            crate::ui_kit::menu_head(ui, "The camera's sizes show once it's open.");
-                        }
-                        for (w, h) in sizes(&formats) {
-                            let on = current.is_some_and(|f| (f.width, f.height) == (w, h));
-                            let fastest = formats.iter().filter(|f| (f.width, f.height) == (w, h)).map(|f| f.fps()).fold(0.0, f32::max);
-                            if Item::new(size_label(w, h)).value(format!("up to {}", fps_label(fastest))).check(on).show(ui).clicked() && !on {
-                                pick = Some(rate_for(&formats, (w, h), current));
-                            }
-                        }
-                    });
-                });
-            });
-            if let Some(f) = current {
-                crate::ui_kit::divider(ui, 0.0);
-                row(ui, "Frame rate", &mut |ui| {
-                    let r = crate::ui_kit::select(ui, &fps_label(f.fps()), 180.0);
-                    crate::ui_kit::menu_popup(&r, false, 200.0, |ui| {
-                        for o in formats.iter().filter(|o| (o.width, o.height) == (f.width, f.height)) {
-                            if Item::new(fps_label(o.fps())).check(*o == f).show(ui).clicked() && *o != f {
-                                pick = Some(Some(*o));
-                            }
-                        }
-                    });
-                });
             }
-            if let Some(p) = pick {
-                if let Some(w) = self.settings.webcam.as_mut() {
-                    w.format = p.map(Into::into);
-                }
-                self.webcam_view.ask_fit();
+            if saved.is_empty() {
+                self.settings.camera_controls.remove(&device);
             }
+            let values = self.settings.camera_controls.get(&device).map(|m| m.iter().map(|(k, v)| (*k, *v)).collect()).unwrap_or_default();
+            capture::webcam::remember_controls(&device, values);
+            panel.controls = capture::webcam::camera_controls(&device);
         }
-        // Its own settings: a page of them (Linux, Windows).
-        if capture::webcam::HAS_CONTROLS {
-            crate::ui_kit::divider(ui, 0.0);
-            row(ui, "Camera settings", &mut |ui| {
-                let tip = "The camera's own settings: exposure, focus, white balance. They apply right away, in every app.";
-                if Btn::normal("Adjust").trail(icon::CARET_RIGHT).small().tip(tip).show(ui).clicked() {
-                    self.camera_panel = Some(CameraPanel::open(&cam.id));
-                }
-            });
-        }
-        // What's kept of its picture, and a way to the crop's page (as the
-        // screen's crop has). Off, the camera opens while it's cropped.
-        crate::ui_kit::divider(ui, 0.0);
-        let cropped = cam.placement.crop.iter().any(|c| *c > 0.0);
-        let kept = self.webcam_kept();
-        row(ui, "Crop", &mut |ui| {
-            ui.spacing_mut().item_spacing.x = 10.0;
-            if Btn::normal("Adjust").trail(icon::CARET_RIGHT).small().tip("Show only part of your camera's picture").show(ui).clicked() {
-                self.webcam_view.crop = Some(CameraPanel::cropping(&cam.id));
-            }
-            let text = match kept {
-                _ if !cropped => "Off".to_owned(),
-                Some(((w, h), _)) => format!("{w}×{h}"),
-                None => "Cropped".to_owned(),
-            };
-            ui.label(theme::text(text, 12.5, W::Regular).color(pal.text3));
-        });
-        // Where it is in the video, in a few words; its numbers under it.
-        crate::ui_kit::divider(ui, 0.0);
-        self.placement_row(ui, crate::canvas_ui::Layer::Webcam);
     }
-
-    /// Whether the webcam's position, and its size, can be reset: it's not
+    /// Whether webcam `key`'s position, and its size, can be reset: it's not
     /// in the bottom-right corner, or not a quarter of the video wide, or
     /// stretched.
-    pub(crate) fn webcam_resettable(&self) -> (bool, bool) {
-        let Some(p) = self.settings.webcam.as_ref().map(|w| w.placement) else { return (false, false) };
+    pub(crate) fn webcam_resettable(&self, key: u64) -> (bool, bool) {
+        let Some(p) = self.settings.webcam(key).map(|w| w.placement) else { return (false, false) };
         let at_corner = (p.x - (1.0 - p.w)).abs() < 1e-3 && (p.y - (1.0 - p.h)).abs() < 1e-3;
         (!at_corner, (p.w - FIRST_WIDTH).abs() > 1e-3 || (p.stretch - 1.0).abs() > 1e-3)
     }
 
     /// The webcam back in the bottom-right corner, its size kept.
-    pub(crate) fn webcam_reset_position(&mut self, frame_aspect: f32) {
-        let Some(w) = self.settings.webcam.as_mut() else { return };
+    pub(crate) fn webcam_reset_position(&mut self, key: u64, frame_aspect: f32) {
+        let Some(w) = self.settings.webcam_mut(key) else { return };
         let mut p: Placement = w.placement.into();
         (p.x, p.y) = (1.0 - p.w, 1.0 - p.h);
         w.placement = PlacementCfg::laid_out(contain(p), frame_aspect);
@@ -566,8 +637,8 @@ impl App {
 
     /// The webcam a quarter of the video wide again, in its own shape
     /// (unstretched), where it is (in a corner, it stays in it).
-    pub(crate) fn webcam_reset_size(&mut self, frame_aspect: f32) {
-        let Some(w) = self.settings.webcam.as_mut() else { return };
+    pub(crate) fn webcam_reset_size(&mut self, key: u64, frame_aspect: f32) {
+        let Some(w) = self.settings.webcam_mut(key) else { return };
         let mut p: Placement = w.placement.into();
         if p.w <= 0.0 || p.h <= 0.0 {
             return;
@@ -581,8 +652,8 @@ impl App {
 
     /// All of the webcam's picture again: its box grows back around what
     /// showed, at the same scale, kept in the video.
-    pub(crate) fn webcam_uncropped(&mut self, frame_aspect: f32) {
-        if let Some(w) = self.settings.webcam.as_mut() {
+    pub(crate) fn webcam_uncropped(&mut self, key: u64, frame_aspect: f32) {
+        if let Some(w) = self.settings.webcam_mut(key) {
             w.placement = PlacementCfg::laid_out(uncrop(w.placement.into()), frame_aspect);
         }
     }
@@ -617,24 +688,24 @@ mod tests {
     /// The box stays in the frame: moving stops at the edge, growing stops at
     /// it (shape kept), uncropping stops at it, and a turned box is put back.
     #[test]
-    fn stays_inside_the_frame() {
+    fn goes_past_the_frame() {
         let in_frame = |p: Placement| p.x >= -1e-4 && p.y >= -1e-4 && p.x + p.w <= 1.0 + 1e-4 && p.y + p.h <= 1.0 + 1e-4;
+        // Moved out, a sliver of it stays on.
         let p = drag(at(0.7, 0.7, 0.2, 0.2), Handle::Move, 0.5, -0.9, PLAIN, &Lines::default());
-        assert!(in_frame(p) && close(p.x, 0.8) && close(p.y, 0.0));
-        // From the top-left, the bottom-right corner can only grow to the frame's corner.
+        assert!(close(p.x, 0.97) && close(p.y, -0.17), "{p:?}");
+        // From the top-left, the bottom-right corner grows as far as it's dragged.
         let p = drag(at(0.6, 0.7, 0.2, 0.1), Handle::SE, 0.9, 0.9, PLAIN, &Lines::default());
-        assert!(in_frame(p) && close(p.x, 0.6) && close(p.y, 0.7) && close(p.w / p.h, 2.0));
-        assert!(close(p.x + p.w, 1.0) || close(p.y + p.h, 1.0));
-        // An edge handle grows both ways about the middle, as far as the nearer edge.
-        let p = drag(at(0.1, 0.4, 0.2, 0.2), Handle::E, 0.9, 0.0, PLAIN, &Lines::default());
-        assert!(in_frame(p), "{p:?}");
-        // Flipped past its anchor, toward the left edge: only as far as it.
+        assert!(close(p.x, 0.6) && close(p.y, 0.7) && close(p.w / p.h, 2.0) && p.x + p.w > 1.0, "{p:?}");
+        // Its corner snaps onto the frame's, with snapping on.
+        let p = drag(at(0.6, 0.7, 0.2, 0.1), Handle::SE, 0.195, 0.0975, Mods { snap: true, ..PLAIN }, &Lines::default());
+        assert!(close(p.x + p.w, 1.0), "{p:?}");
+        // Flipped past its anchor: still flipped.
         let p = drag(at(0.3, 0.3, 0.2, 0.2), Handle::E, -0.9, 0.0, PLAIN, &Lines::default());
-        assert!(in_frame(p) && p.flip_h, "{p:?}");
-        // Uncropping the left side stops at the frame's left edge.
+        assert!(p.flip_h, "{p:?}");
+        // Uncropping the left side goes past the frame's edge, as far as the picture.
         let cropped = Placement { crop: [0.5, 0.0, 0.0, 0.0], ..at(0.05, 0.5, 0.2, 0.2) };
         let p = drag(cropped, Handle::W, -0.5, 0.0, Mods { crop: true, ..PLAIN }, &Lines::default());
-        assert!(in_frame(p) && close(p.x, 0.0) && p.crop[0] > 0.0, "{p:?}");
+        assert!(close(p.x, -0.15) && p.crop[0] == 0.0, "{p:?}");
         // Turned near the edge, a tall box is moved back in.
         let p = contain(at(0.8, 0.0, 0.3, 1.2));
         assert!(in_frame(p) && close(p.w / p.h, 0.25), "{p:?}");
@@ -755,7 +826,7 @@ mod tests {
 /// The Camera page's state (or the crop page's): the camera's settings as
 /// last read, and its picture.
 pub(crate) struct CameraPanel {
-    device: String,
+    pub(crate) device: String,
     controls: Vec<CameraControl>,
     picture: Option<egui::TextureHandle>,
     seq: u64,
@@ -786,7 +857,7 @@ impl CameraPanel {
     }
 
     fn picture_of(device: &str) -> Self {
-        let live = matches!(capture::webcam::status(), Status::Live { .. });
+        let live = matches!(capture::webcam::status_of(device), Status::Live { .. });
         Self { device: device.to_owned(), controls: Vec::new(), picture: None, seq: 0, new_pictures: 0, counted: None, fps: None, live, cropping: false, crop_drag: None }
     }
 }
@@ -824,7 +895,8 @@ fn panel_groups(controls: &[CameraControl]) -> Vec<(&'static str, Vec<PanelRow<'
         (
             "Exposure",
             vec![
-                auto(AUTO_EXPOSURE, "Automatic exposure", EXPOSURE, "Exposure time"),
+                // A time, or the camera's own steps (no time to it).
+                if find(EXPOSURE).is_some() { auto(AUTO_EXPOSURE, "Automatic exposure", EXPOSURE, "Exposure time") } else { auto(AUTO_EXPOSURE, "Automatic exposure", EXPOSURE_STEPS, "Exposure") },
                 named(GAIN, "Gain"),
                 named(BACKLIGHT, "Backlight compensation"),
                 named(EXPOSURE_DYNAMIC_FPS, "Lower frame rate in the dark"),
@@ -836,7 +908,7 @@ fn panel_groups(controls: &[CameraControl]) -> Vec<(&'static str, Vec<PanelRow<'
         ("Zoom and framing", vec![named(ZOOM, "Zoom"), named(PAN, "Pan"), named(TILT, "Tilt")]),
         (OTHER, Vec::new()),
     ];
-    let known = [BRIGHTNESS, CONTRAST, SATURATION, HUE, AUTO_WHITE_BALANCE, GAMMA, GAIN, POWER_LINE, WHITE_BALANCE, SHARPNESS, BACKLIGHT, AUTO_EXPOSURE, EXPOSURE, EXPOSURE_DYNAMIC_FPS, PAN, TILT, FOCUS, AUTO_FOCUS, ZOOM];
+    let known = [BRIGHTNESS, CONTRAST, SATURATION, HUE, AUTO_WHITE_BALANCE, GAMMA, GAIN, POWER_LINE, WHITE_BALANCE, SHARPNESS, BACKLIGHT, AUTO_EXPOSURE, EXPOSURE, EXPOSURE_STEPS, EXPOSURE_DYNAMIC_FPS, PAN, TILT, FOCUS, AUTO_FOCUS, ZOOM];
     let own = controls.iter().filter(|c| !known.contains(&c.id)).map(|c| Some(PanelRow::Control { label: c.name.clone(), control: c }));
     groups
         .into_iter()
@@ -879,13 +951,13 @@ fn control_widget(ui: &mut egui::Ui, c: &CameraControl, set: &mut Vec<(u32, i64)
                     set.push((c.id, stepped));
                 }
             }
-            if let Some(d) = arrow_steps(ui, &slider) {
+            if let Some(d) = crate::transport::arrow_steps(ui, &slider) {
                 let to = (c.value + d * step).clamp(*min, *max);
                 if to != c.value {
                     set.push((c.id, to));
                 }
             }
-            if slider.double_clicked() {
+            if crate::ui_kit::double_clicked(&slider) {
                 set.push((c.id, c.default));
             }
             slider.on_hover_text("Double-click for the camera's default");
@@ -933,15 +1005,12 @@ impl App {
     pub(crate) fn camera_page(&mut self, ui: &mut egui::Ui) {
         use crate::theme::{self, W};
         use crate::ui_kit::Btn;
-        // Another camera picked: its settings; none: closed.
-        match (&self.settings.webcam, &self.camera_panel) {
-            (Some(w), Some(p)) if w.id != p.device => self.camera_panel = Some(CameraPanel::open(&w.id)),
-            (None, _) => self.camera_panel = None,
-            _ => {}
-        }
-        if self.camera_panel.is_none() {
+        // The webcam showing its camera: gone (taken out, another camera
+        // picked), it's closed.
+        let Some(key) = self.camera_panel.as_ref().and_then(|p| self.settings.webcam_of(&p.device)).map(|w| w.key) else {
+            self.camera_panel = None;
             return;
-        }
+        };
         // Back to Sources: the arrow, or Esc (as Settings' own pages).
         if !crate::ui_kit::overlay_open(ui.ctx()) && !ui.ctx().egui_wants_keyboard_input() && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
             self.camera_panel = None;
@@ -953,18 +1022,18 @@ impl App {
             let p = theme::pal(ui);
             ui.label(theme::text("Camera", 20.0, W::Semibold).color(p.text));
         });
-        let name = self.settings.webcam.as_ref().map(|w| w.name.clone()).unwrap_or_default();
-        let current = self.settings.webcam.as_ref().and_then(|w| w.format).map(capture::webcam::Format::from);
+        let name = self.settings.webcam(key).map(|w| w.name.clone()).unwrap_or_default();
+        let current = self.settings.webcam(key).and_then(|w| w.format).map(capture::webcam::Format::from);
         let mut pick: Option<Option<capture::webcam::Format>> = None;
         // How it's turned and mirrored in the clips (the webcam's placement).
-        let orient = self.settings.webcam.as_ref().map_or_else(Orientation::default, |w| Orientation { flip_h: w.placement.flip_h, flip_v: w.placement.flip_v, turns: w.placement.turns });
+        let orient = self.settings.webcam(key).map_or_else(Orientation::default, |w| Orientation { flip_h: w.placement.flip_h, flip_v: w.placement.flip_v, turns: w.placement.turns });
         let mut reorient: Option<Orientation> = None;
         // Its crop (the camera's sides cut off), set on its own page.
-        let crop = self.settings.webcam.as_ref().map_or([0.0; 4], |w| w.placement.crop);
+        let crop = self.settings.webcam(key).map_or([0.0; 4], |w| w.placement.crop);
         // The frame rate the camera runs at: as picked, or Automatic's pick.
         let fps = current.or_else(|| self.camera_panel.as_ref().and_then(|p| capture::webcam::formats(&p.device).into_iter().max_by_key(|f| f.auto_rank()))).map(|f| f.fps());
         let Some(panel) = self.camera_panel.as_mut() else { return };
-        let live = matches!(capture::webcam::status(), Status::Live { .. });
+        let live = matches!(capture::webcam::status_of(&panel.device), Status::Live { .. });
         if live && !panel.live {
             panel.controls = capture::webcam::camera_controls(&panel.device);
         }
@@ -1035,14 +1104,14 @@ impl App {
             panel.controls = capture::webcam::camera_controls(&device);
         }
         if let Some(p) = pick {
-            if let Some(w) = self.settings.webcam.as_mut() {
+            self.webcam_view.ask_fit(key, &device);
+            if let Some(w) = self.settings.webcam_mut(key) {
                 w.format = p.map(Into::into);
             }
-            self.webcam_view.ask_fit();
         }
         // Turned or mirrored: the placement, as the preview's right-click does
         // it (a quarter turn swaps the box's sides).
-        if let (Some(o), Some(w)) = (reorient, self.settings.webcam.as_mut()) {
+        if let (Some(o), Some(w)) = (reorient, self.settings.webcam_mut(key)) {
             let aspect = w.placement.frame_aspect.unwrap_or(16.0 / 9.0);
             let mut p: Placement = w.placement.into();
             p.flip_h = o.flip_h;
@@ -1065,27 +1134,15 @@ impl App {
 }
 
 impl App {
-    /// What's kept of the webcam's picture, in the camera's pixels as it
-    /// shows (turned): its size, and the whole picture's. From the camera
-    /// while it's live, else its format, if one's picked.
-    fn webcam_kept(&self) -> Option<((u32, u32), (u32, u32))> {
-        let w = self.settings.webcam.as_ref()?;
-        let p = w.placement;
-        let picked = w.format.map(|f| if p.turns % 2 == 1 { (f.height, f.width) } else { (f.width, f.height) });
-        let (cw, ch) = self.camera_size().or(picked)?;
-        let kept = |n: u32, a: f32, b: f32| ((n as f32 * (1.0 - a - b)).round() as u32).max(1);
-        Some(((kept(cw, p.crop[0], p.crop[2]), kept(ch, p.crop[1], p.crop[3])), (cw, ch)))
-    }
-
     /// The webcam cropped to `c` (its sides cut off, as `Placement::crop`):
     /// its box takes the shape of what's left, as stretched as it was (its
     /// width and middle kept),
     /// so nothing more is cut off to fill it; inside the video.
-    fn webcam_recrop(&mut self, orient: Orientation, c: [f32; 4]) {
-        let Some(w) = self.settings.webcam.as_mut() else { return };
+    fn webcam_recrop(&mut self, key: u64, orient: Orientation, c: [f32; 4]) {
+        let Some(w) = self.settings.webcam_mut(key) else { return };
         let aspect = w.placement.frame_aspect.unwrap_or(16.0 / 9.0);
         let mut p: Placement = w.placement.into();
-        if let Status::Live { width, height } = capture::webcam::status() {
+        if let Status::Live { width, height } = capture::webcam::status_of(&w.id) {
             let raw = width as f32 / height.max(1) as f32;
             let full = if p.turns % 2 == 1 { 1.0 / raw } else { raw };
             let kept = crop_shown(orient, c);
@@ -1108,19 +1165,16 @@ impl App {
         use crate::theme::{self, W};
         use crate::ui_kit::Btn;
         let pal = theme::pal(ui);
-        // Closed with the arrow or Esc, or when there's no webcam to crop.
-        // Off, its camera's open while this is (see `App::logic`).
-        let Some(cam) = self.settings.webcam.clone() else {
+        // Closed with the arrow or Esc, or when there's no webcam showing
+        // its camera to crop. Off, its camera's open while this is (see
+        // `App::logic`).
+        let Some(cam) = self.webcam_view.crop.as_ref().and_then(|p| self.settings.webcam_of(&p.device)).cloned() else {
             self.webcam_view.crop = None;
             return;
         };
         if !crate::ui_kit::overlay_open(ui.ctx()) && !ui.ctx().egui_wants_keyboard_input() && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
             self.webcam_view.crop = None;
             return;
-        }
-        // Another camera picked: its picture.
-        if self.webcam_view.crop.as_ref().is_some_and(|p| p.device != cam.id) {
-            self.webcam_view.crop = Some(CameraPanel::cropping(&cam.id));
         }
         let mut back = false;
         self.page_head(ui, "", |_, ui| {
@@ -1139,7 +1193,7 @@ impl App {
         let crop = cam.placement.crop;
         // Its size's link keeps the shape as its edges are dragged too.
         let keep = crate::ui_kit::size_field_keeps(ui.ctx(), "webcam_crop").is_some();
-        let size = self.camera_size();
+        let size = self.camera_size(cam.key);
         let mut recrop: Option<[f32; 4]> = None;
         let Some(panel) = self.webcam_view.crop.as_mut() else { return };
         let picture = |ui: &mut egui::Ui, panel: &mut CameraPanel, max_h: f32, recrop: &mut Option<[f32; 4]>| {
@@ -1180,7 +1234,7 @@ impl App {
             });
         }
         if let Some(c) = recrop {
-            self.webcam_recrop(orient, c);
+            self.webcam_recrop(cam.key, orient, c);
         }
     }
 }
@@ -1282,30 +1336,6 @@ fn exposure_step(value: i64, up: bool, step: i64, min: i64, max: i64) -> i64 {
     (value + if up { step } else { -step }).clamp(min, max)
 }
 
-/// Arrow keys on a camera slider: clicking or dragging it gives it the keys,
-/// then ← and → step it, ten at a time with Shift (↑ and ↓ move between the
-/// page's controls, as egui has them). How many steps, if any were pressed.
-fn arrow_steps(ui: &egui::Ui, slider: &egui::Response) -> Option<i64> {
-    if slider.clicked() || slider.drag_started() {
-        slider.request_focus();
-    }
-    if !slider.has_focus() {
-        return None;
-    }
-    let mut d = 0;
-    ui.input_mut(|i| {
-        let shift = i.modifiers.shift;
-        let by = if shift { 10 } else { 1 };
-        let mods = if shift { egui::Modifiers::SHIFT } else { egui::Modifiers::NONE };
-        for (key, sign) in [(egui::Key::ArrowLeft, -1), (egui::Key::ArrowRight, 1)] {
-            while i.consume_key(mods, key) {
-                d += sign * by;
-            }
-        }
-    });
-    (d != 0).then_some(d)
-}
-
 /// Film's guides for an exposure time at `fps`, in V4L2's units of 100 µs:
 /// the 180° shutter (half a frame, for motion blur that looks natural), and
 /// the whole frame (longer, and the frame rate drops).
@@ -1342,12 +1372,17 @@ fn exposure_widget(ui: &mut egui::Ui, c: &CameraControl, set: &mut Vec<(u32, i64
             set.push((c.id, to));
         }
     }
-    if let Some(d) = arrow_steps(ui, &slider) {
+    if let Some(d) = crate::transport::arrow_steps(ui, &slider) {
         let to = (c.value + d * step).clamp(min, max);
         if to != c.value {
             set.push((c.id, to));
         }
     }
+    // As the camera's other sliders.
+    if crate::ui_kit::double_clicked(&slider) {
+        set.push((c.id, c.default.clamp(min, max)));
+    }
+    slider.on_hover_text("Double-click for the camera's default");
     if crate::ui_kit::Btn::icon(crate::ui_kit::Kind::Ghost, egui_phosphor::regular::MINUS).small().tip("Shorter").show(ui).clicked()
         && let Some(v) = next(false)
     {
@@ -1381,13 +1416,18 @@ fn exposure_steps(ui: &mut egui::Ui, c: &CameraControl, times: &[(i64, String)],
     if slider.changed() {
         go((v * last as f32).round() as usize);
     }
-    if let Some(d) = arrow_steps(ui, &slider) {
+    if let Some(d) = crate::transport::arrow_steps(ui, &slider) {
         go((i as i64 + d).clamp(0, last as i64) as usize);
+    }
+    if crate::ui_kit::double_clicked(&slider)
+        && let Some(d) = times.iter().position(|(v, _)| *v == c.default)
+    {
+        go(d);
     }
     if crate::ui_kit::Btn::icon(crate::ui_kit::Kind::Ghost, egui_phosphor::regular::MINUS).small().enabled(i > 0).tip("Shorter").show(ui).clicked() {
         go(i.saturating_sub(1));
     }
-    slider.on_hover_text("Each step doubles the time");
+    slider.on_hover_text("Each step doubles the time. Double-click for the camera's default");
 }
 
 /// How steep the exposure slider's curve is: near linear at the bottom (the
@@ -1415,7 +1455,7 @@ fn picture_side(ui: &mut egui::Ui, panel: &mut CameraPanel, name: &str, fps: Opt
     let pal = theme::pal(ui);
     picture_view(ui, panel, orient, crop, max_h, false);
     crate::ui_kit::gap(ui, crate::ui_kit::STACK_GAP);
-    let status = match (capture::webcam::status(), panel.fps) {
+    let status = match (capture::webcam::status_of(&panel.device), panel.fps) {
         (capture::webcam::Status::Live { width, height }, Some(fps)) => format!("{name} · {width}×{height} · {fps:.0} new pictures/s"),
         (capture::webcam::Status::Live { width, height }, None) => format!("{name} · {width}×{height}"),
         _ => name.to_owned(),
@@ -1449,6 +1489,26 @@ fn picture_side(ui: &mut egui::Ui, panel: &mut CameraPanel, name: &str, fps: Opt
 /// than its format's `fps`: saying so, and what can cause it. Which one, the
 /// camera doesn't say, and its own limits aren't a frame's length (a C922 at
 /// 60 fps kept up at 17.2 ms and slowed at 16.8 in dimmer light).
+/// How many new pictures (not the camera repeating one, as it does with a
+/// long exposure) the camera sent in the last second, measured into
+/// `panel`, without showing its picture (one a few pixels wide is asked for).
+fn measure_rate(ctx: &egui::Context, panel: &mut CameraPanel) {
+    if let Some(p) = capture::webcam::camera_picture(&panel.device, 8, panel.seq) {
+        panel.seq = p.seq;
+        panel.new_pictures = p.new_pictures;
+    }
+    let now = std::time::Instant::now();
+    match panel.counted {
+        Some((at, from)) if now.duration_since(at).as_secs_f32() >= 1.0 => {
+            panel.fps = Some((panel.new_pictures.saturating_sub(from)) as f32 / now.duration_since(at).as_secs_f32());
+            panel.counted = Some((now, panel.new_pictures));
+        }
+        None if panel.new_pictures > 0 => panel.counted = Some((now, panel.new_pictures)),
+        _ => {}
+    }
+    ctx.request_repaint_after(std::time::Duration::from_millis(250));
+}
+
 fn slowdown(measured: Option<f32>, fps: Option<f32>) -> Option<String> {
     let (measured, fps) = (measured?, fps?);
     (measured < fps * 0.85).then(|| {
@@ -1463,7 +1523,7 @@ fn slowdown(measured: Option<f32>, fps: Option<f32>) -> Option<String> {
 fn picture_view(ui: &mut egui::Ui, panel: &mut CameraPanel, orient: Orientation, crop: [f32; 4], max_h: f32, keep: bool) -> Option<[f32; 4]> {
     let pal = crate::theme::pal(ui);
     let w = ui.available_width();
-    if let Some(p) = capture::webcam::camera_picture((w * ui.ctx().pixels_per_point()) as u32, panel.seq) {
+    if let Some(p) = capture::webcam::camera_picture(&panel.device,(w * ui.ctx().pixels_per_point()) as u32, panel.seq) {
         let image = egui::ColorImage::from_rgba_unmultiplied([p.width as usize, p.height as usize], &p.rgba);
         match &mut panel.picture {
             Some(t) if t.size() == [p.width as usize, p.height as usize] => t.set(image, egui::TextureOptions::LINEAR),
@@ -1588,7 +1648,7 @@ pub(crate) fn crop_editor(ui: &egui::Ui, resp: &egui::Response, area: Rect, boun
             start.translate(vec2(d.x.clamp(bounds.min.x - start.min.x, bounds.max.x - start.max.x), d.y.clamp(bounds.min.y - start.min.y, bounds.max.y - start.max.y)))
         } else {
             // Shift keeps its shape.
-            resize_within(start, g.sides(), d, keep || ui.input(|i| i.modifiers.shift), bounds, least)
+            resize_within(start, g.sides(), d, keep || ui.input(|i| i.modifiers.shift), bounds, least, None)
         });
     }
     if resp.drag_stopped() {
@@ -1785,7 +1845,9 @@ fn controls_view(ui: &mut egui::Ui, panel: &CameraPanel, fps: Option<f32>, set: 
                                     };
                                     l.row(row, |ui| exposure_widget(ui, m, set));
                                 } else {
-                                    l.row(crate::ui_kit::Row::new(label).kid(), |ui| control_widget(ui, m, set));
+                                    let row = crate::ui_kit::Row::new(label).kid();
+                                    let row = if m.id == cid::EXPOSURE_STEPS { row.tip("Exposure", "In the camera's own steps: its driver doesn't say how long they are. Higher is longer, and brighter.") } else { row };
+                                    l.row(row, |ui| control_widget(ui, m, set));
                                 }
                             });
                         }
@@ -1881,11 +1943,20 @@ mod panel_tests {
         assert!(auto_on(ae));
         assert_eq!(auto_value(ae, false), cid::EXPOSURE_MANUAL);
         assert_eq!(auto_value(ae, true), 3);
+        // An exposure in the camera's own steps (no time): under automatic
+        // exposure too, as "Exposure".
+        let steps = vec![
+            ctl(AUTO_EXPOSURE, "Auto Exposure", menu(&[(1, "Manual Mode"), (3, "Aperture Priority Mode")]), 3),
+            ctl(cid::EXPOSURE_STEPS, "Exposure", ControlKind::Int { min: 0, max: 255, step: 1 }, 120),
+        ];
+        let groups = panel_groups(&steps);
+        assert!(matches!(groups[0].1[0], PanelRow::Auto { manual: Some(("Exposure", _)), .. }), "{:?}", groups.iter().map(|(h, _)| *h).collect::<Vec<_>>());
+        assert_eq!(groups.len(), 1, "nothing under Other");
     }
 }
 
 /// The sizes a camera offers, each once, biggest first.
-fn sizes(formats: &[capture::webcam::Format]) -> Vec<(u32, u32)> {
+pub(crate) fn sizes(formats: &[capture::webcam::Format]) -> Vec<(u32, u32)> {
     let mut out: Vec<(u32, u32)> = Vec::new();
     for f in formats {
         if !out.contains(&(f.width, f.height)) {
@@ -1898,18 +1969,18 @@ fn sizes(formats: &[capture::webcam::Format]) -> Vec<(u32, u32)> {
 
 /// The format to take at size `size`: the rate it had, if offered there,
 /// else the fastest.
-fn rate_for(formats: &[capture::webcam::Format], size: (u32, u32), current: Option<capture::webcam::Format>) -> Option<capture::webcam::Format> {
+pub(crate) fn rate_for(formats: &[capture::webcam::Format], size: (u32, u32), current: Option<capture::webcam::Format>) -> Option<capture::webcam::Format> {
     let at = formats.iter().filter(|f| (f.width, f.height) == size);
     let same = current.and_then(|c| at.clone().find(|f| (f.fps() - c.fps()).abs() < 0.05));
     same.or_else(|| at.max_by(|a, b| a.fps().total_cmp(&b.fps()))).copied()
 }
 
 /// A size: "1920×1080".
-fn size_label(w: u32, h: u32) -> String {
+pub(crate) fn size_label(w: u32, h: u32) -> String {
     format!("{w}×{h}")
 }
 
-fn fps_label(fps: f32) -> String {
+pub(crate) fn fps_label(fps: f32) -> String {
     if (fps - fps.round()).abs() < 0.05 { format!("{} fps", fps.round()) } else { format!("{fps:.2} fps") }
 }
 

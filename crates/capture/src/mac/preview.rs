@@ -70,7 +70,7 @@ impl PreviewCapture {
         size: crate::VideoSize,
         fps: u32,
         away: Option<Arc<StillImage>>,
-        webcam: Option<crate::webcam::Webcam>,
+        layers: crate::SharedLayers,
         screen: crate::SharedScreen,
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
@@ -88,7 +88,7 @@ impl PreviewCapture {
                 };
                 let placed = *screen.lock().unwrap();
                 let picture = Picture::start(&source, &content, &display, frame, fps, away, placed)?;
-                let frames = Frames::new(picture.latest.clone(), webcam.as_ref(), screen.clone(), Some(picture.ctl()), frame.0, frame.1, generation)?;
+                let frames = Frames::new(picture.latest.clone(), layers.clone(), screen.clone(), Some(picture.ctl()), frame.0, frame.1, fps, generation)?;
                 Ok((picture, frames))
             })();
             let (mut picture, mut frames) = match opened {

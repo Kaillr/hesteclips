@@ -63,7 +63,7 @@ default: {:?}", d.inputs.iter().map(|i| &i.name).collect::<Vec<_>>(), d.default_
         }),
         exact: None,
     };
-    rec.start(mode, &EncodeSettings {
+    let mut settings = EncodeSettings {
         output_dir: std::env::temp_dir().join("hc"),
         container_ext: env("EXT").unwrap_or("mp4".into()),
         fps: env("FPS").and_then(|f| f.parse().ok()).unwrap_or(60),
@@ -129,7 +129,11 @@ default: {:?}", d.inputs.iter().map(|i| &i.name).collect::<Vec<_>>(), d.default_
         })),
         sources: sources.clone(),
         stream: None,
-    })?;
+        layers: capture::layers::main_only(),
+    };
+    // The webcam over the screen, or under it (SCREEN_FRONT=1).
+    settings.layers = capture::layers::with_webcam(settings.webcam.as_ref(), settings.screen.lock().unwrap().in_front);
+    rec.start(mode, &settings)?;
     let secs: u64 = std::env::var("SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
     for tick in 0..secs * 2 {
         // SWITCH_MIC=<device>: the first source (a mic) switches to it halfway.

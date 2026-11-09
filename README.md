@@ -29,6 +29,7 @@
 - [Compared with other recorders](#compared-with-other-recorders)
 - [Platform support](#platform-support)
 - [Building from source](#building-from-source)
+- [Star history](#star-history)
 - [License](#license)
 
 ## Download
@@ -162,15 +163,19 @@ HasteClip is in beta (versions 0.x). It works day to day, but not every feature 
 | Replay buffer, recording, editor, library | ✅ | ✅ | ✅ |
 | Share links, copy, export and import | ✅ | ✅ | ✅ |
 | Voice saving, named clips, per-app sound, webcam | ✅ | ✅ | ✅ |
+| Several webcams, other displays, windows, images, text and videos in the video | ✅ | ✅ | ✅ |
+| A web page in the video (alerts, chat) | ✅ | ✅ | ✅ (see below) |
 | Record a single game or app window | ✅ | ✅ | ✅ (see below) |
 | Drag clips out, system share sheet | ✅ | ✅ | Drag out on Wayland (no share sheet) |
 | Frame blending | ✅ | ✅ | ✅ |
 | Go live (streaming) | ✅ | ✅ | ✅ |
 | Automatic updates | ✅ | ✅ | ✅ |
-| Screenshots | — | ✅ | ✅ |
+| Screenshots | ✅ | ✅ | ✅ |
 | Game capture for fullscreen games | — | ✅ | — |
 
 **Games and apps on Linux:** every window on KDE Plasma, on X11 desktops, and on Sway and other desktops with the ext window capture protocols (Sway 1.11 and later). On GNOME, the windows of X11 apps, which includes games run through Proton or Wine; GNOME doesn't let apps follow its native Wayland windows, so record the whole screen for those.
+
+**Web pages on Linux** are drawn by Chromium's engine ([CEF](https://bitbucket.org/chromiumembedded/cef), the one OBS uses), on your graphics card where it can. It isn't part of the download: the first time you add a web page, HasteClip downloads it once from its releases (about 107 MB) and keeps it in `~/.local/share/hasteclip`. A build of your own can use an engine unpacked elsewhere with `HASTECLIP_WEB_ENGINE_DIR=<folder>`.
 
 **Encoders:** VideoToolbox on macOS. NVENC, AMF or Quick Sync through Media Foundation on Windows. NVENC or VA-API through ffmpeg on Linux, with x264 when there's no GPU encoder. A stream gets an encoder of its own (on Linux, always ffmpeg's).
 
@@ -220,6 +225,16 @@ The release scripts build the app and bundle ffmpeg:
 - `scripts/release.ps1` (Windows) also bundles OBS Studio's game capture hook. It packs everything with [Velopack](https://velopack.io) into the installer and the delta update packages.
 - `scripts/release-mac.sh` builds the `.dmg`.
 - `scripts/release-linux.sh` builds the tarball.
+
+## Star history
+
+<a href="https://www.star-history.com/?repos=hasteclip%2Fhasteclip&type=date&legend=bottom-right">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=hasteclip/hasteclip&type=date&theme=dark&legend=bottom-right" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=hasteclip/hasteclip&type=date&legend=bottom-right" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=hasteclip/hasteclip&type=date&legend=bottom-right" />
+ </picture>
+</a>
 
 ## License
 

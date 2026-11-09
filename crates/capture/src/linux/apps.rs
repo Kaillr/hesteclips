@@ -153,6 +153,42 @@ pub(crate) fn list() -> Vec<Device> {
     out
 }
 
+/// The window a layer of program `app` (its file name, as [`list`] names
+/// it) shows: the one in focus, else one that isn't minimized, else any
+/// (never a panel's or ours). Its id.
+pub(crate) fn find_window(app: &str) -> Option<String> {
+    let source = source()?;
+    let me = std::process::id();
+    let mut programs = Programs::default();
+    let theirs: Vec<Window> = source
+        .windows()
+        .into_iter()
+        .filter(|w| !w.skip_taskbar && w.pid.is_some_and(|p| p != me))
+        .filter(|w| programs.of(w.pid).is_some_and(|p| p.eq_ignore_ascii_case(app)))
+        .collect();
+    let pick = theirs.iter().find(|w| w.active).or_else(|| theirs.iter().find(|w| !w.minimized)).or(theirs.first())?;
+    Some(pick.id.clone())
+}
+
+/// A stream of window `id` ([`find_window`]'s), at its own size.
+pub(crate) fn open_window(id: &str) -> anyhow::Result<Screen> {
+    source().ok_or_else(|| anyhow::anyhow!("windows can't be captured on this desktop"))?.open(id)
+}
+
+/// Whether window `id` is still open.
+pub(crate) fn window_open(id: &str) -> bool {
+    source().is_some_and(|s| s.windows().iter().any(|w| w.id == id))
+}
+
+/// Program `app`'s window's size, where the desktop says (KDE Plasma).
+pub(crate) fn window_size(app: &str) -> Option<(u32, u32)> {
+    if source()? != Source::Kde {
+        return None;
+    }
+    let id = find_window(app)?;
+    kwin_windows::size(&id)
+}
+
 /// The name in an app's `.desktop` file (`Firefox` for `org.mozilla.firefox`).
 fn desktop_name(app_id: &str) -> Option<String> {
     if app_id.is_empty() || app_id.contains('/') {

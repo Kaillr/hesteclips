@@ -1826,7 +1826,7 @@ mod tests {
         assert!(made.success());
         // 10 s in 12 MB: under 10 Mbit/s, which the plan puts at 1080p, and
         // macOS's encoder makes 44 MB of there.
-        let small = fit_under(&clip, &dir, 12, &Progress::default()).unwrap();
+        let small = made_to_upload(&clip, &dir, &media::Output { max_mb: Some(12), ..default_output() }, &Progress::default()).unwrap();
         let size = std::fs::metadata(&small).unwrap().len();
         assert!(size <= 12 << 20, "{:.1} MB, over 12", size as f64 / 1e6);
         // And it uses what it may: aiming lower made 1.9 MB of it.

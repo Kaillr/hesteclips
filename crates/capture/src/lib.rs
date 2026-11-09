@@ -30,6 +30,7 @@ mod mp4file;
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 mod mp4mux;
 pub mod output;
+pub mod layers;
 pub mod preview;
 pub mod webcam;
 pub mod sources;
@@ -55,6 +56,7 @@ pub mod linux;
 mod writer;
 
 /// The in-process hardware video decoder, for playback (same API on both).
+pub use layers::{Layer, LayerSource, SharedLayers};
 pub use shutter::BlendShape;
 #[cfg(target_os = "macos")]
 pub use mac::decode;
@@ -292,28 +294,41 @@ impl ScreenPlacement {
     }
 
     /// Its box in a `fw`×`fh` frame's pixels, inside the frame: (left, top,
-    /// width, height), its edges on even pixels for the encoder's 4:2:0
-    /// colour (the frame's own edges as they are).
+    /// width, height), on even pixels for the encoder's 4:2:0 colour (the
+    /// frame's own edges as they are).
     pub fn rect_in(&self, fw: u32, fh: u32) -> [u32; 4] {
-        let edge = |v: f32, n: u32| if v >= 1.0 - 1e-4 { n } else { ((v.max(0.0) * n as f32).round() as u32 & !1).min(n) };
+        self.rect_on(fw, fh, true)
+    }
+
+    /// [`rect_in`](Self::rect_in), on even pixels (`even`) or, drawn on a
+    /// full-colour canvas, on any: where it starts and how big it is are
+    /// each rounded on their own, so moving it never changes its size.
+    pub(crate) fn rect_on(&self, fw: u32, fh: u32, even: bool) -> [u32; 4] {
         let [x, y, w, h] = self.rect;
-        let (x0, y0) = (edge(x, fw), edge(y, fh));
-        let (x1, y1) = (edge(x + w, fw).max(x0), edge(y + h, fh).max(y0));
+        let (x0, x1) = span(x, w, fw, even);
+        let (y0, y1) = span(y, h, fh, even);
         [x0, y0, x1 - x0, y1 - y0]
     }
 
     /// Where a picture of `content`'s size (its crop, if any) goes in a
     /// `frame`-size frame: see [`place_picture`](Self::place_picture).
     /// Nothing of it when hidden.
-    // macOS has ScreenCaptureKit cut the crop out (`mac::video::stream_config`).
-    #[cfg_attr(not(any(target_os = "windows", target_os = "linux", test)), allow(dead_code))]
+    // macOS has ScreenCaptureKit cut the crop out (`mac::video::stream_config`);
+    // Windows places on even pixels or any (`place_on`).
+    #[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
     pub(crate) fn place(&self, content: (u32, u32), frame: (u32, u32)) -> ([u32; 4], [u32; 4]) {
+        self.place_on(content, frame, true)
+    }
+
+    /// [`place`](Self::place), where it's drawn on even pixels (`even`: into
+    /// the encoder's 4:2:0 colour) or on any (a full-colour canvas).
+    pub(crate) fn place_on(&self, content: (u32, u32), frame: (u32, u32), even: bool) -> ([u32; 4], [u32; 4]) {
         if self.hidden {
             return ([0; 4], [0; 4]);
         }
-        let Some(c) = self.crop else { return self.place_turned(content, frame) };
+        let Some(c) = self.crop else { return self.place_turned_on(content, frame, even) };
         let [x, y, w, h] = c.rect(content.0, content.1);
-        let ([sx, sy, sw, sh], dest) = self.place_turned((w, h), frame);
+        let ([sx, sy, sw, sh], dest) = self.place_turned_on((w, h), frame, even);
         ([x + sx, y + sy, sw, sh], dest)
     }
 
@@ -321,9 +336,16 @@ impl ScreenPlacement {
     /// turned and flipped: the part of it used, in its own (unturned)
     /// pixels, and where it's drawn. A compositor maps each point of where
     /// it's drawn into that part with [`unturn`](Self::unturn).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn place_turned(&self, content: (u32, u32), frame: (u32, u32)) -> ([u32; 4], [u32; 4]) {
+        self.place_turned_on(content, frame, true)
+    }
+
+    /// [`place_turned`](Self::place_turned), on even pixels or any (see
+    /// [`place_on`](Self::place_on)).
+    pub(crate) fn place_turned_on(&self, content: (u32, u32), frame: (u32, u32), even: bool) -> ([u32; 4], [u32; 4]) {
         let shown = self.turned(content);
-        let ([sx, sy, sw, sh], dest) = self.place_picture(shown, frame);
+        let ([sx, sy, sw, sh], dest) = self.place_picture(shown, frame, even);
         if !self.transformed() || sw == 0 || sh == 0 {
             return ([sx, sy, sw, sh], dest);
         }
@@ -339,23 +361,41 @@ impl ScreenPlacement {
 
     /// Where a picture of `content`'s size goes in a `frame`-size frame,
     /// into the box as `framing` says (see [`placement_in`]): the part of it
-    /// used, and where it's drawn. A box reaching past the frame is cut at
-    /// its edges, and the picture with it (see [`placement_past`]).
-    pub(crate) fn place_picture(&self, content: (u32, u32), (fw, fh): (u32, u32)) -> ([u32; 4], [u32; 4]) {
+    /// used, and where it's drawn, on even pixels or any (`even`). A box
+    /// reaching past the frame is cut at its edges, and the picture with it
+    /// (see [`placement_past`]).
+    pub(crate) fn place_picture(&self, content: (u32, u32), (fw, fh): (u32, u32), even: bool) -> ([u32; 4], [u32; 4]) {
         if self.inside() {
-            return placement_in(content, self.rect_in(fw, fh), self.framing);
+            return placement_in(content, self.rect_on(fw, fh, even), self.framing, even);
         }
-        placement_past(content, self.rect, (fw, fh), self.framing)
+        placement_past(content, self.rect, (fw, fh), self.framing, even)
     }
+}
+
+/// A box's span along an axis of `n` pixels (`at` and `size` as fractions
+/// of it, inside it): where it starts and ends. The start and the length
+/// are each rounded on their own, so moving it never changes its length;
+/// on even pixels (`even`), for drawing straight into 4:2:0 colour. One at
+/// the frame's edges is at them exactly.
+fn span(at: f32, size: f32, n: u32, even: bool) -> (u32, u32) {
+    let px = |v: f32| {
+        let r = (v.max(0.0) * n as f32).round() as u32;
+        if even { r & !1 } else { r }
+    };
+    let start = if at <= 1e-4 { 0 } else { px(at).min(n) };
+    let end = if at + size >= 1.0 - 1e-4 { n } else { (start + px(size)).min(n) };
+    (start, end.max(start))
 }
 
 /// Where a picture of `content`'s size goes in a box reaching past the
 /// edges of a `fw`×`fh` frame (`rect`, as fractions of it): put in as
 /// `framing` says, as if the frame went on (see [`placement_in`]), then cut
 /// at the frame's edges, the part of the picture used with them. Where it's
-/// drawn is even, for the encoder's 4:2:0 colour (the frame's own edges as
-/// they are); nothing, when none of it is in the frame.
-fn placement_past((cw, ch): (u32, u32), [x, y, w, h]: [f32; 4], (fw, fh): (u32, u32), framing: Framing) -> ([u32; 4], [u32; 4]) {
+/// drawn starts and is as big as it is, each rounded on its own (moving it
+/// never changes its size), on even pixels for the encoder's 4:2:0 colour
+/// (`even`; the frame's own edges as they are); nothing, when none of it is
+/// in the frame.
+fn placement_past((cw, ch): (u32, u32), [x, y, w, h]: [f32; 4], (fw, fh): (u32, u32), framing: Framing, even: bool) -> ([u32; 4], [u32; 4]) {
     let (cw, ch, fw, fh) = (cw as f64, ch as f64, fw as f64, fh as f64);
     let bx = [x as f64 * fw, y as f64 * fh, w as f64 * fw, h as f64 * fh];
     if cw <= 0.0 || ch <= 0.0 || bx[2] <= 0.0 || bx[3] <= 0.0 {
@@ -375,9 +415,15 @@ fn placement_past((cw, ch): (u32, u32), [x, y, w, h]: [f32; 4], (fw, fh): (u32, 
             ([(cw - w) / 2.0, (ch - h) / 2.0, w, h], bx)
         }
     };
-    // Cut at the frame's edges, on even pixels inside it.
-    let even = |v: f64, n: f64| if v >= n - 0.5 { n } else { ((v.max(0.0).round() as u32) & !1) as f64 };
-    let (x0, y0, x1, y1) = (even(dest[0], fw), even(dest[1], fh), even(dest[0] + dest[2], fw), even(dest[1] + dest[3], fh));
+    // Its start and size each rounded (on even pixels, `even`), then cut at
+    // the frame's edges.
+    let snap = |v: f64| {
+        let r = v.round();
+        if even { ((r as i64) & !1) as f64 } else { r }
+    };
+    let (sx0, sy0) = (snap(dest[0]), snap(dest[1]));
+    let (x0, y0) = (sx0.max(0.0), sy0.max(0.0));
+    let (x1, y1) = ((sx0 + snap(dest[2])).min(fw), (sy0 + snap(dest[3])).min(fh));
     if x1 <= x0 || y1 <= y0 {
         return ([0; 4], [0; 4]);
     }
@@ -397,7 +443,7 @@ fn placement_past((cw, ch): (u32, u32), [x, y, w, h]: [f32; 4], (fw, fh): (u32, 
 /// [`placement_in`], the box being all of the frame.
 #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
 pub(crate) fn placement(content: (u32, u32), (fw, fh): (u32, u32), framing: Framing) -> ([u32; 4], [u32; 4]) {
-    placement_in(content, [0, 0, fw, fh], framing)
+    placement_in(content, [0, 0, fw, fh], framing, true)
 }
 
 /// Where a picture of `content`'s size goes in the box `bx` (each as left,
@@ -406,9 +452,10 @@ pub(crate) fn placement(content: (u32, u32), (fw, fh): (u32, u32), framing: Fram
 /// around it in the box (what a recording without a shape does with a
 /// window that isn't the screen's shape); Fill cuts off what's past the
 /// box's shape; Stretch draws all of it over all of the box. Where it's
-/// drawn is even, for the encoder's 4:2:0 colour.
+/// drawn is even, for the encoder's 4:2:0 colour (`even`); else (on a
+/// full-colour canvas) a picture as big as its box is drawn as it is.
 #[cfg_attr(not(any(target_os = "windows", target_os = "linux", target_os = "macos")), allow(dead_code))]
-pub(crate) fn placement_in((cw, ch): (u32, u32), [bx, by, bw, bh]: [u32; 4], framing: Framing) -> ([u32; 4], [u32; 4]) {
+pub(crate) fn placement_in((cw, ch): (u32, u32), [bx, by, bw, bh]: [u32; 4], framing: Framing, even: bool) -> ([u32; 4], [u32; 4]) {
     let (all, whole) = ([0, 0, cw, ch], [bx, by, bw, bh]);
     if cw == 0 || ch == 0 || bw == 0 || bh == 0 {
         return (all, whole);
@@ -418,9 +465,12 @@ pub(crate) fn placement_in((cw, ch): (u32, u32), [bx, by, bw, bh]: [u32; 4], fra
     match framing {
         Framing::Stretch => (all, whole),
         Framing::Fit => {
-            let (w, h) = if wider { (bw, (ch as u64 * bw as u64 / cw as u64) as u32) } else { ((cw as u64 * bh as u64 / ch as u64) as u32, bh) };
-            let (w, h) = (w & !1, h & !1);
-            (all, [bx + (((bw - w) / 2) & !1), by + (((bh - h) / 2) & !1), w, h])
+            // Even: rounded down, as the encoder wants it; else to the nearest.
+            let div = |a: u64, b: u64| (if even { a / b } else { (a + b / 2) / b }) as u32;
+            let (w, h) = if wider { (bw, div(ch as u64 * bw as u64, cw as u64).min(bh)) } else { (div(cw as u64 * bh as u64, ch as u64).min(bw), bh) };
+            let e = |v: u32| if even { v & !1 } else { v };
+            let (w, h) = (e(w), e(h));
+            (all, [bx + e((bw - w) / 2), by + e((bh - h) / 2), w, h])
         }
         Framing::Fill => {
             let (w, h) = if wider { ((ch as u64 * bw as u64 / bh as u64) as u32, ch) } else { (cw, (cw as u64 * bh as u64 / bw as u64) as u32) };
@@ -887,6 +937,47 @@ pub fn choose_screen_again() {
     linux::choose_screen_again();
 }
 
+/// Where a display (by its id, as [`list_screens`] gives it) is on the
+/// desktop: its left, top, width and height, in the units windows are
+/// placed in: pixels on Windows and X11, points on macOS (where windows are
+/// placed in points, a display of any scale). Elsewhere not known (`None`:
+/// see [`display_monitor`]).
+pub fn display_bounds(id: &str) -> Option<[i32; 4]> {
+    #[cfg(target_os = "windows")]
+    {
+        win::display_bounds(id)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        mac::display_bounds(id)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux::display_bounds(id)
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        let _ = id;
+        None
+    }
+}
+
+/// A display's place among the window system's outputs (winit's
+/// `available_monitors()` order), where a window can only be put on one by
+/// that, fullscreen: Wayland, which places windows itself. `None` elsewhere
+/// (see [`display_bounds`]).
+pub fn display_monitor(id: &str) -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::display_monitor(id)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = id;
+        None
+    }
+}
+
 /// Screens the backend can capture; their ids go in [`VideoSource::Screen`].
 pub fn list_screens() -> Vec<Device> {
     #[cfg(target_os = "macos")]
@@ -1019,9 +1110,9 @@ pub const STREAMING: bool = cfg!(any(target_os = "windows", target_os = "macos",
 pub const BLEND_WHILE_CAPTURING: bool = cfg!(any(target_os = "windows", target_os = "macos", target_os = "linux"));
 
 /// Whether audio sources can be added to and taken out of a running capture
-/// ([`Recorder::set_sources`]): on Windows so far; elsewhere they're set
-/// when the capture starts.
-pub const SOURCES_WHILE_CAPTURING: bool = cfg!(target_os = "windows");
+/// ([`Recorder::set_sources`]): on Windows, macOS and Linux. Where it
+/// can't be, they're set when the capture starts.
+pub const SOURCES_WHILE_CAPTURING: bool = cfg!(any(target_os = "windows", target_os = "macos", target_os = "linux"));
 
 /// A capture device (screen, app, or audio device) as seen by the backend.
 #[derive(Debug, Clone)]
@@ -1355,8 +1446,12 @@ pub struct EncodeSettings {
     /// Shown while recording games and apps and there's nothing to show (none
     /// is open, or you've tabbed out); black if `None`. Scaled to the frame.
     pub away_screen: Option<std::sync::Arc<StillImage>>,
-    /// A webcam drawn over the picture (or under it, as `screen` says).
+    /// A webcam drawn over the picture (or under it, as `screen` says), on
+    /// the platforms that draw one (see [`layers::MANY`]).
     pub webcam: Option<webcam::Webcam>,
+    /// Every picture in the frame, bottom first, read every frame, on the
+    /// platforms that draw them all (see [`layers::MANY`]).
+    pub layers: SharedLayers,
     /// Where the screen's picture goes in the frame, read every frame.
     pub screen: SharedScreen,
     /// Audio sources, in track order. Track 1 is the mix of every source with
@@ -1384,8 +1479,8 @@ impl PendingClip {
     }
 }
 
-/// Whether [`Recorder::screenshot`] can take one here (Windows and Linux, so far).
-pub const SCREENSHOTS: bool = cfg!(any(target_os = "windows", target_os = "linux"));
+/// Whether [`Recorder::screenshot`] can take one here.
+pub const SCREENSHOTS: bool = cfg!(any(target_os = "windows", target_os = "linux", target_os = "macos"));
 
 /// A screenshot being taken: its picture is the one up when it was asked
 /// for, copied aside on the graphics card; [`PendingShot::finish`] reads it
@@ -1393,7 +1488,7 @@ pub const SCREENSHOTS: bool = cfg!(any(target_os = "windows", target_os = "linux
 pub struct PendingShot(Box<dyn FnOnce() -> anyhow::Result<StillImage> + Send>);
 
 impl PendingShot {
-    #[cfg_attr(not(any(target_os = "windows", target_os = "linux")), allow(dead_code))]
+    #[cfg_attr(not(any(target_os = "windows", target_os = "linux", target_os = "macos")), allow(dead_code))]
     pub(crate) fn new(finish: impl FnOnce() -> anyhow::Result<StillImage> + Send + 'static) -> Self {
         Self(Box::new(finish))
     }
@@ -1553,6 +1648,26 @@ mod size_tests {
         assert_eq!(placement((3440, 1440), (1920, 1080), Framing::Stretch), ([0, 0, 3440, 1440], [0, 0, 1920, 1080]));
         // Nothing to place yet.
         assert_eq!(placement((0, 0), (1920, 1080), Framing::Fit), ([0, 0, 0, 0], [0, 0, 1920, 1080]));
+    }
+
+    /// On a full-colour canvas, a picture as big as its box is drawn as it
+    /// is, on whatever pixel its box starts on, and moving its box a pixel
+    /// moves it a pixel, its size the same (words nudged across the video).
+    #[test]
+    fn a_picture_moves_a_pixel_at_a_time() {
+        let frame = (1920, 1080);
+        let (fw, fh) = (1920.0f32, 1080.0f32);
+        let at = |x: u32| ScreenPlacement { rect: [x as f32 / fw, 301.0 / fh, 401.0 / fw, 59.0 / fh], ..ScreenPlacement::whole(Framing::Fit) };
+        for x in 100..140 {
+            assert_eq!(at(x).place_on((401, 59), frame, false), ([0, 0, 401, 59], [x, 301, 401, 59]), "at {x}");
+        }
+        // Past the frame's left edge: cut there, the same size as it moves.
+        let past = |x: f32| ScreenPlacement { rect: [x / fw, 0.1, 401.0 / fw, 59.0 / fh], ..ScreenPlacement::whole(Framing::Fit) };
+        assert_eq!(past(-100.0).place_on((401, 59), frame, false).1, [0, 108, 301, 59]);
+        assert_eq!(past(-99.0).place_on((401, 59), frame, false).1, [0, 108, 302, 59]);
+        // Straight into 4:2:0 colour: even pixels, its size kept as it moves.
+        let sizes: Vec<(u32, u32)> = (100..140).map(|x| at(x).place_on((401, 59), frame, true).1).map(|[_, _, w, h]| (w, h)).collect();
+        assert!(sizes.iter().all(|s| *s == sizes[0]) && sizes[0].0 % 2 == 0 && sizes[0].1 % 2 == 0, "{sizes:?}");
     }
 
     /// The screen in a box of its own: the box in pixels, even, inside the

@@ -226,7 +226,9 @@ pub(crate) mod tests {
     /// more, else at 30, so two looks a frame are as many as it shows. The
     /// places at their own sizes and rates: 720p at 30 (at 60, its frames
     /// blended from the capture's two while blending's on), and as the
-    /// capture is; the recording and the clip at the capture's.
+    /// capture is; the recording and the clip at the capture's. Where frame
+    /// blending can't be done (Linux without the graphics card taking the
+    /// screen's pictures), the rest is checked without it.
     pub(crate) fn everything_at_once(rec: &mut dyn Recorder) {
         /// What's taken of the screen goes, and the servers stop, however
         /// the test ends.
@@ -272,6 +274,7 @@ pub(crate) mod tests {
             video,
             away_screen: None,
             webcam: None,
+            layers: crate::layers::main_only(),
             screen: Arc::new(Mutex::new(crate::ScreenPlacement::whole(crate::Framing::Fit))),
             sources: Vec::new(),
             stream: None,
@@ -288,12 +291,17 @@ pub(crate) mod tests {
             thread::sleep(Duration::from_millis(50));
         }
         // Frame blending on, and off again, while it runs.
-        assert!(rec.set_blend(2, BlendShape::Soft), "blending didn't change");
+        let blends = crate::frame_blending();
+        if blends {
+            assert!(rec.set_blend(2, BlendShape::Soft), "blending didn't change");
+        }
         thread::sleep(Duration::from_secs(2));
         let blending = crate::health().and_then(|h| h.blend).map(|b| b.looks);
         rec.start(Mode::Record, &settings).unwrap();
         thread::sleep(Duration::from_secs(2));
-        assert!(rec.set_blend(1, BlendShape::Even));
+        if blends {
+            assert!(rec.set_blend(1, BlendShape::Even));
+        }
         thread::sleep(Duration::from_secs(1));
         let clip = rec.save_clip(&dir).unwrap().finish().unwrap();
         let recording = rec.stop(Mode::Record, None).unwrap().expect("a recording");
@@ -324,7 +332,9 @@ pub(crate) mod tests {
             n.parse::<f64>().unwrap_or(0.0) / d.parse::<f64>().unwrap_or(1.0).max(1e-9)
         };
         let secs = |t: &str| field(t, "duration").parse::<f64>().unwrap_or(0.0);
-        assert_eq!(blending, Some(2), "blending changed while running");
+        if blends {
+            assert_eq!(blending, Some(2), "blending changed while running");
+        }
         assert_eq!(field(&s, "height"), "720", "{s}");
         assert!((rate(&s) - 30.0).abs() < 0.5, "the small stream at 30 fps: {s}");
         assert_eq!(field(&full, "height"), height.to_string(), "{full}");

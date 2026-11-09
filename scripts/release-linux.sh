@@ -4,6 +4,8 @@
 # updater). Unpack it anywhere and run ./hasteclip; on
 # first launch it adds itself to the desktop's apps (linux_desktop.rs).
 # ffmpeg is included, so there's nothing else to install.
+# Beside it, the web page engine (HasteClip-web-engine-linux-x64-<cef>.tar.xz
+# and its .sha256), which the app fetches the first time a web page is shown.
 #
 # The release workflow runs this for each new version. It also runs locally:
 #   scripts/release-linux.sh 0.0.1-local
@@ -92,7 +94,9 @@ date, as long as this folder is yours to write to (in your home folder, not
 
 Needs a recent Linux (glibc 2.39+: Ubuntu 24.04, Fedora 40, Debian 13, Arch,
 CachyOS or newer) with PipeWire, as desktops have them. ffmpeg is included
-(ffmpeg, ffprobe and lib/, GPL: see ffmpeg-LICENSE.txt). If it doesn't start,
+(ffmpeg, ffprobe and lib/, GPL: see ffmpeg-LICENSE.txt). Web pages in the
+video are drawn by Chromium's engine (CEF), downloaded once the first time
+you add one (about 107 MB, kept in ~/.local/share/hasteclip). If it doesn't start,
 run it from a terminal: it says what's missing. Its log is in
 ~/.local/share/hasteclip/logs.
 
@@ -103,3 +107,43 @@ tar -C "$work" -czf "$out/$name.tar.gz" "$name"
 # The app's updater checks the download against this before installing it.
 (cd "$out" && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
 echo "built $out/$name.tar.gz"
+
+# The web page engine: Chromium, through CEF, which the app fetches from the
+# release the first time a web page is shown (crates/capture/src/linux/web_engine.rs),
+# so it's never part of the app's own download or its updates. CEF's official
+# build, pinned by checksum, as much of it as off-screen pages take, stripped
+# (its libcef.so is 1.5 GB with symbols, 278 MB without) and English only:
+# about 107 MB packed. The version is the one the app speaks (CEF_VERSION,
+# whose C API crates/capture/src/linux/cef.rs is laid out for). A version of
+# the app from before web pages on Linux (a tag built again) has none.
+if [ ! -f crates/capture/src/linux/web_engine.rs ]; then
+    exit 0
+fi
+cef_build="cef_binary_156.0.26+g8ea0c73+chromium-156.0.8078.88_linux64_minimal"
+cef_sha1="cacfbb7d7261fea682fb67c108de7e4347519ff7"
+cef_version="$(sed -nE 's/^pub\(crate\) const CEF_VERSION: &str = "([^"]+)";/\1/p' crates/capture/src/linux/web_engine.rs)"
+case "$cef_build" in
+    "cef_binary_$cef_version+"*) ;;
+    *) echo "the app speaks CEF $cef_version, but this script packs $cef_build" >&2; exit 1 ;;
+esac
+cef_tarball="$work/$cef_build.tar.bz2"
+if [ ! -f "$cef_tarball" ] || ! echo "$cef_sha1  $cef_tarball" | sha1sum -c --status; then
+    curl -fsSL "https://cef-builds.spotifycdn.com/${cef_build//+/%2B}.tar.bz2" -o "$cef_tarball"
+    echo "$cef_sha1  $cef_tarball" | sha1sum -c --status || { echo "CEF download has the wrong checksum" >&2; exit 1; }
+fi
+rm -rf "$work/$cef_build" "$work/web-engine"
+tar -C "$work" -xjf "$cef_tarball"
+engine="$work/web-engine"
+mkdir -p "$engine/locales"
+cef="$work/$cef_build"
+cp "$cef"/Release/{libcef.so,libvk_swiftshader.so,libvulkan.so.1,vk_swiftshader_icd.json,v8_context_snapshot.bin} "$engine/"
+cp "$cef"/Resources/{icudtl.dat,resources.pak,chrome_100_percent.pak,chrome_200_percent.pak} "$engine/"
+cp "$cef/Resources/locales/en-US.pak" "$engine/locales/"
+cp "$cef/LICENSE.txt" "$engine/CEF-LICENSE.txt"
+cp "$cef/CREDITS.html" "$engine/CREDITS.html"
+strip --strip-all "$engine/libcef.so"
+rm -rf "$cef"
+engine_name="HasteClip-web-engine-linux-x64-$cef_version.tar.xz"
+tar -C "$engine" -cf - . | xz -9 -T0 > "$out/$engine_name"
+(cd "$out" && sha256sum "$engine_name" > "$engine_name.sha256")
+echo "built $out/$engine_name"

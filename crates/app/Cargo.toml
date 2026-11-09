@@ -25,7 +25,7 @@ eframe = "0.36.1"
 epaint_default_fonts = "0.36"
 egui = "0.36.1"
 global-hotkey = "0.8.0"
-image = { version = "0.25", default-features = false, features = ["bmp", "jpeg", "png", "webp"] }
+image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
 # Screenshots as JPG with every pixel's colour (image's own halves it, which
 # blurs coloured text).
 jpeg-encoder = "0.6"
@@ -84,7 +84,7 @@ objc2 = "0.6.4"
 objc2-io-surface = { version = "0.3.2", default-features = false, features = ["std", "IOSurfaceRef", "objc2"] }
 objc2-metal = { version = "0.3.2", default-features = false, features = ["std", "MTLAllocation", "MTLDevice", "MTLPixelFormat", "MTLResource", "MTLTexture", "objc2-io-surface"] }
 objc2-foundation = { version = "0.3.2", features = ["NSArray", "NSString", "NSURL", "NSGeometry", "NSFileManager", "NSError"] }
-objc2-app-kit = { version = "0.3.2", features = ["NSSharingService", "NSView", "NSResponder", "NSWindow", "NSToolbar", "NSButton", "NSControl"] }
+objc2-app-kit = { version = "0.3.2", features = ["NSSharingService", "NSView", "NSResponder", "NSWindow", "NSToolbar", "NSButton", "NSControl", "NSEvent"] }
 # Checking a downloaded update (update_mac.rs).
 sha2 = "0.11"
 # Shortcuts while a game holds the screen: a listen-only key tap (key_tap.rs).
@@ -106,6 +106,7 @@ windows = { version = "0.62", features = [
     "Storage",
     "Storage_Streams",
     "Win32_Foundation",
+    "Win32_Graphics_Gdi",
     "Win32_Storage_FileSystem",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",

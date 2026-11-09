@@ -10,7 +10,8 @@
 //! user can write to, updates its own folder the same way
 //! (`crate::update_linux`). On macOS the app in Applications is replaced by
 //! the release's, once it's checked to be signed with HasteClip's
-//! certificate (`crate::update_mac`).
+//! certificate, or only what's inside it when the account can't write to
+//! Applications (`crate::update_mac`).
 //!
 //! A copy run from the build folder (`cargo run`) isn't installed, so it has
 //! nothing to update: [`Status::Unavailable`].
@@ -147,9 +148,8 @@ impl Updater {
                 {
                     let mut s = shared.lock().unwrap();
                     s.status = Status::Idle;
-                    if !crate::update_mac::writable(&app) {
-                        let dir = app.parent().map_or_else(|| app.display().to_string(), |d| d.display().to_string());
-                        s.status = Status::Failed(format!("Can't update here: {dir} isn't yours to write to"));
+                    if let Some(path) = crate::update_mac::blocker(&app) {
+                        s.status = Status::Failed(format!("Can't update here: {} isn't yours to write to", path.display()));
                     } else if let Some((ready, version)) = crate::update_mac::pending(&app) {
                         // Downloaded last time, but the app didn't quit normally.
                         s.status = Status::Ready(version);
@@ -416,7 +416,8 @@ fn run_mac(app: std::path::PathBuf, shared: Arc<Mutex<Shared>>, check_now: mpsc:
                 continue;
             }
         }
-        if !crate::update_mac::writable(&app) {
+        if let Some(path) = crate::update_mac::blocker(&app) {
+            set(Status::Failed(format!("Can't update here: {} isn't yours to write to", path.display())));
             continue;
         }
         set(Status::Checking);

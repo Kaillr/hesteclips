@@ -176,12 +176,27 @@ pub(crate) fn monitor_of(id: &str) -> Option<HMONITOR> {
 }
 
 /// The monitor with this device name, else the main one.
+/// Display `id`, if it's connected.
+pub(crate) fn connected_monitor(id: &str) -> Option<HMONITOR> {
+    monitors().into_iter().find(|m| m.device == id).map(|m| m.handle)
+}
+
 pub(crate) fn find_monitor(id: &str) -> HMONITOR {
     monitors()
         .into_iter()
         .find(|m| m.device == id)
         .map(|m| m.handle)
         .unwrap_or_else(|| unsafe { MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY) })
+}
+
+/// Where a display is on the desktop, by device name: its left, top, width
+/// and height, in the desktop's pixels. `None` if it isn't there.
+pub fn display_bounds(id: &str) -> Option<[i32; 4]> {
+    let m = monitors().into_iter().find(|m| m.device == id)?;
+    let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+    unsafe { GetMonitorInfoW(m.handle, &mut info) }.ok().ok()?;
+    let r = info.rcMonitor;
+    Some([r.left, r.top, r.right - r.left, r.bottom - r.top])
 }
 
 // ---------------------------------------------------------------------------
@@ -555,6 +570,14 @@ pub(crate) fn client_area_in_capture(hwnd: HWND) -> Option<(u32, u32, u32, u32)>
     }
 }
 
+/// App `exe`'s main window's inside (see [`find_app_window`]), in pixels,
+/// if it's open and not minimized.
+pub fn app_window_size(exe: &str) -> Option<(u32, u32)> {
+    let hwnd = find_app_window(exe).filter(|h| !window_minimized(*h))?;
+    let (_, _, w, h) = client_area_in_capture(hwnd)?;
+    (w >= 2 && h >= 2).then_some((w, h))
+}
+
 /// The full path of a running app, by executable name.
 pub(crate) fn running_app_path(exe: &str) -> Option<std::path::PathBuf> {
     processes().iter().filter(|p| p.exe.eq_ignore_ascii_case(exe)).find_map(|p| image_path(p.pid)).map(Into::into)
@@ -671,15 +694,28 @@ fn read_file_description(path: &str) -> Option<String> {
         let candidates = translations.chunks_exact(2).map(|t| (t[0], t[1])).chain([(0x0409, 0x04B0), (0x0409, 0x04E4)]);
         for (lang, cp) in candidates {
             if let Some((ptr, len)) = query(&format!(r"\StringFileInfo\{lang:04x}{cp:04x}\FileDescription")) {
-                let text = std::slice::from_raw_parts(ptr as *const u16, len as usize);
-                let s = String::from_utf16_lossy(text).trim_end_matches('\0').trim().to_owned();
-                if !s.is_empty() {
+                // The length said can be too long (see `version_string`):
+                // never read past the end of `data` for it.
+                let room = (data.as_ptr_range().end as usize).saturating_sub(ptr as usize) / 2;
+                let text = std::slice::from_raw_parts(ptr as *const u16, (len as usize).min(room));
+                if let Some(s) = version_string(text) {
                     return Some(s);
                 }
             }
         }
         None
     }
+}
+
+/// A string from an executable's version info, as `VerQueryValueW` gives it:
+/// up to its NUL, trimmed; `None` if that leaves nothing. The length it says
+/// can run past the NUL: Spotify's is in bytes, not characters (16 for
+/// "Spotify"), so the start of the next entry came with it ("Spotify\0" then
+/// "8\u{16}\u{1}FileV") and was saved as the app's name.
+fn version_string(text: &[u16]) -> Option<String> {
+    let s = from_wide(text);
+    let s = s.trim();
+    (!s.is_empty()).then(|| s.to_owned())
 }
 
 /// A NUL-terminated UTF-16 buffer as a String.
@@ -769,5 +805,28 @@ pub fn app_icon(exe: &str, size: u32) -> Option<Vec<u8>> {
             }
         }
         Some(px)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().collect()
+    }
+
+    /// A description ends at its NUL, whatever length was said; one with
+    /// nothing in it is none (the exe's name is used then).
+    #[test]
+    fn a_description_ends_at_its_nul() {
+        // Spotify's: 16 characters said for "Spotify", the next entry after it.
+        assert_eq!(version_string(&wide("Spotify\u{0}8\u{16}\u{1}FileV")).as_deref(), Some("Spotify"));
+        // Its length exactly, with no NUL in it.
+        assert_eq!(version_string(&wide("Discord")).as_deref(), Some("Discord"));
+        assert_eq!(version_string(&wide(" Discord \u{0}\u{0}")).as_deref(), Some("Discord"));
+        assert_eq!(version_string(&wide("\u{0}8\u{16}\u{1}FileV")), None);
+        assert_eq!(version_string(&wide("  ")), None);
+        assert_eq!(version_string(&[]), None);
     }
 }
