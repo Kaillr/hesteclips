@@ -24,18 +24,19 @@ cpal = "0.18.2"
 block2 = "0.6.2"
 dispatch2 = "0.3.1"
 objc2 = "0.6.4"
-objc2-app-kit = { version = "0.3.2", features = ["NSWorkspace", "NSRunningApplication", "NSImage", "NSGraphicsContext", "objc2-core-graphics"] }
+objc2-app-kit = { version = "0.3.2", features = ["NSWorkspace", "NSRunningApplication", "NSImage", "NSGraphicsContext", "NSWindow", "NSView", "NSResponder", "NSApplication", "NSColor", "NSGraphics", "NSScreen", "objc2-core-graphics"] }
 objc2-audio-toolbox = { version = "0.3.2", default-features = false, features = ["std", "AudioConverter", "objc2-core-audio-types"] }
-objc2-av-foundation = { version = "0.3.2", default-features = false, features = ["std", "block2", "dispatch2", "AVAssetWriter", "AVAssetWriterInput", "AVMediaFormat", "AVMetadataItem", "AVMetadataIdentifiers", "AVAsynchronousKeyValueLoading", "AVCaptureDevice", "AVCaptureInput", "AVCaptureOutputBase", "AVCaptureSession", "AVCaptureSessionPreset", "AVCaptureVideoDataOutput", "objc2-core-media", "objc2-core-video"] }
+objc2-av-foundation = { version = "0.3.2", default-features = false, features = ["std", "block2", "dispatch2", "AVAsset", "AVAssetReader", "AVAssetReaderOutput", "AVAssetTrack", "AVAssetWriter", "AVAssetWriterInput", "AVMediaFormat", "AVMetadataItem", "AVMetadataIdentifiers", "AVAsynchronousKeyValueLoading", "AVCaptureDevice", "AVCaptureInput", "AVCaptureOutputBase", "AVCaptureSession", "AVCaptureSessionPreset", "AVCaptureVideoDataOutput", "objc2-core-media", "objc2-core-video"] }
 objc2-core-audio-types = "0.3.2"
 objc2-core-foundation = { version = "0.3.2", features = ["CFArray", "CFCGTypes", "CFData", "CFDictionary", "CFNumber", "CFString"] }
 objc2-core-graphics = { version = "0.3.2", features = ["CGColor", "CGGeometry", "CGWindow", "CGDirectDisplay", "CGDisplayStream", "CGBitmapContext", "CGColorSpace", "CGContext", "CGImage"] }
 objc2-core-media = { version = "0.3.2", features = ["CMSampleBuffer", "CMBlockBuffer", "CMFormatDescription", "CMTime", "CMSync", "objc2-core-video", "objc2-core-audio-types"] }
 objc2-core-video = { version = "0.3.2", features = ["CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVPixelBufferIOSurface", "CVPixelBufferPool", "CVReturn", "objc2-io-surface"] }
 objc2-io-surface = { version = "0.3.2", default-features = false, features = ["std", "IOSurfaceRef", "IOSurfaceTypes", "objc2", "objc2-core-foundation"] }
-objc2-foundation = { version = "0.3.2", features = ["NSArray", "NSDictionary", "NSString", "NSError", "NSEnumerator", "NSObject", "NSURL", "NSValue"] }
+objc2-foundation = { version = "0.3.2", features = ["NSArray", "NSDictionary", "NSString", "NSError", "NSEnumerator", "NSObject", "NSURL", "NSValue", "NSKeyValueCoding", "NSRunLoop", "NSDate", "NSGeometry", "NSThread", "NSURLRequest"] }
 objc2-metal = { version = "0.3.2", default-features = false, features = ["std", "block2", "MTLAllocation", "MTLBlitCommandEncoder", "MTLBuffer", "MTLCommandBuffer", "MTLCommandEncoder", "MTLCommandQueue", "MTLComputeCommandEncoder", "MTLComputePipeline", "MTLDevice", "MTLLibrary", "MTLPixelFormat", "MTLResource", "MTLTexture", "MTLTypes", "objc2-io-surface"] }
 objc2-screen-capture-kit = { version = "0.3.2", features = ["SCShareableContent", "SCStream", "SCScreenshotManager", "block2", "dispatch2", "objc2-core-media", "objc2-core-graphics"] }
+objc2-web-kit = { version = "0.3.2", default-features = false, features = ["std", "block2", "objc2-app-kit", "objc2-core-foundation", "WKWebView", "WKWebViewConfiguration", "WKUserContentController", "WKUserScript", "WKPreferences", "WKNavigation", "WKNavigationDelegate", "WKWebsiteDataStore"] }
 objc2-video-toolbox = { version = "0.3.2", features = ["VTCompressionSession", "VTCompressionProperties", "VTDecompressionSession", "VTDecompressionProperties", "VTPixelTransferProperties", "VTSession", "VTErrors", "objc2-core-media", "objc2-core-video"] }
 
 # Windows-only: Windows Graphics Capture + Media Foundation + WASAPI backend.

@@ -2,10 +2,12 @@
 
 pub mod bench;
 pub(crate) mod blend;
+pub(crate) mod browser;
 pub(crate) mod camera;
 pub mod decode;
 pub(crate) mod export;
 pub(crate) mod gpu;
+pub(crate) mod layers;
 pub(crate) mod preview;
 pub(crate) mod shot;
 pub(crate) mod video;

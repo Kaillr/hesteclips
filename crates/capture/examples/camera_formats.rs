@@ -8,11 +8,11 @@ fn main() {
     capture::webcam::keep_open(vec![(cam.id.clone(), None)]);
     std::thread::sleep(std::time::Duration::from_secs(3));
     let formats = capture::webcam::formats(&cam.id);
-    println!("auto: {:?} frames {:?}", capture::webcam::status(), capture::webcam::frame_size());
+    println!("auto: {:?} frames {:?}", capture::webcam::status(), capture::webcam::frame_size(&cam.id));
     for f in formats {
         capture::webcam::keep_open(vec![(cam.id.clone(), Some(f))]);
         std::thread::sleep(std::time::Duration::from_millis(2500));
-        println!("{:<24} status {:?}  frames {:?}", f.label(), capture::webcam::status(), capture::webcam::frame_size());
+        println!("{:<24} status {:?}  frames {:?}", f.label(), capture::webcam::status(), capture::webcam::frame_size(&cam.id));
     }
     capture::webcam::keep_open(Vec::new());
 }

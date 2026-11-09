@@ -5,9 +5,11 @@
 //! the window to record changes, its filter is swapped (`updateContentFilter`).
 //!
 //! The pacer asks for each frame to encode ([`Frames::next`]): the stream's
-//! newest buffer, or the away screen, as is; with a webcam, or the screen in
-//! a box of its own, the compositor (`super::gpu`) makes it in a buffer of
-//! its own. The same buffer feeds the Sources page's preview.
+//! newest buffer, or the away screen, as is; with other layers showing
+//! (webcams, displays, windows, pictures, words, pages, videos: see
+//! `super::layers`), or the screen in a box of its own, the compositor
+//! (`super::gpu`) makes it in a buffer of its own. The same buffer feeds the
+//! Sources page's preview.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -35,10 +37,10 @@ use objc2_screen_capture_kit::{
     SCContentFilter, SCDisplay, SCShareableContent, SCStream, SCStreamConfiguration, SCStreamOutput, SCStreamOutputType, SCWindow,
 };
 
-use super::camera::CameraLayer;
-use super::gpu::{FramePool, Gpu};
+use super::gpu::{Compositor, Draw, FramePool};
+use super::layers::Feeds;
 use super::windows;
-use crate::webcam::{SharedPlacement, Webcam};
+use crate::layers::{LayerSource, SharedLayers};
 use crate::{StillImage, VideoSource};
 
 /// A CoreVideo buffer moved between threads (they're thread-safe reference
@@ -947,7 +949,7 @@ fn fit(w: usize, h: usize, into_w: usize, into_h: usize) -> (usize, usize, usize
     (((into_w - fw) / 2) & !1, ((into_h - fh) / 2) & !1, fw.max(2), fh.max(2))
 }
 
-/// Turns the picture (and the webcam over it, or under it) into frames to
+/// Turns the picture, and the layers over it or under it, into frames to
 /// encode, and feeds the preview.
 pub(crate) struct Frames {
     latest: Arc<Latest>,
@@ -955,29 +957,41 @@ pub(crate) struct Frames {
     /// all of it while it's in a box (it's cut to the box's shape here).
     screen: crate::SharedScreen,
     ctl: Option<Arc<StreamCtl>>,
-    camera: Option<(CameraLayer, SharedPlacement)>,
+    /// The other layers' pictures, followed each frame.
+    feeds: Feeds,
     /// The compositor and the buffers it makes frames in.
-    gpu: Option<(Gpu, FramePool)>,
-    /// The last frame made, and what it was made from (screen frame, camera
-    /// frame, placements), to repeat it when nothing changed.
-    last: Option<(Arc<Buffer>, usize, u64, crate::webcam::Placement, crate::ScreenPlacement)>,
+    gpu: Option<(Compositor, FramePool)>,
+    /// The last frame made, and what it was made from, to repeat it when
+    /// nothing changed.
+    last: Option<(Arc<Buffer>, Made)>,
     preview: crate::mac::preview::Producer,
 }
 
+/// What a frame was made from: the screen's picture, where it went, and
+/// each layer as it was placed and the picture it showed.
+#[derive(PartialEq)]
+struct Made {
+    screen: usize,
+    placed: crate::ScreenPlacement,
+    layers: Vec<(crate::layers::Layer, Option<(usize, u64)>)>,
+}
+
 impl Frames {
-    /// `ctl`: the stream's settings, when it's ours to change.
-    pub(crate) fn new(latest: Arc<Latest>, webcam: Option<&Webcam>, screen: crate::SharedScreen, ctl: Option<Arc<StreamCtl>>, width: usize, height: usize, generation: u64) -> Result<Self> {
-        let camera = webcam.map(|w| (CameraLayer::new(w), w.placement.clone()));
-        let gpu = match Gpu::new().and_then(|g| Ok((g, FramePool::new(width, height)?))) {
+    /// `ctl`: the stream's settings, when it's ours to change. `layers`:
+    /// what's drawn, bottom first (the screen's own picture where `Main`
+    /// is), read every frame; displays and windows in it are captured at
+    /// `fps`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(latest: Arc<Latest>, layers: SharedLayers, screen: crate::SharedScreen, ctl: Option<Arc<StreamCtl>>, width: usize, height: usize, fps: u32, generation: u64) -> Result<Self> {
+        let gpu = match Compositor::new().and_then(|g| Ok((g, FramePool::new(width, height)?))) {
             Ok(g) => Some(g),
             // The screen still records, as ScreenCaptureKit makes it.
-            Err(e) if camera.is_none() => {
+            Err(e) => {
                 eprintln!("no compositor: {e:#}");
                 None
             }
-            Err(e) => return Err(e),
         };
-        Ok(Self { latest, screen, ctl, camera, gpu, last: None, preview: crate::mac::preview::Producer::new(generation) })
+        Ok(Self { latest, screen, ctl, feeds: Feeds::new(layers, fps), gpu, last: None, preview: crate::mac::preview::Producer::new(generation) })
     }
 
     /// The frame to encode now, if there's a picture yet.
@@ -987,9 +1001,8 @@ impl Frames {
     }
 
     /// The frame to encode from `screen` (the newest picture, or a blend of
-    /// several): as is when it fills the frame and no webcam shows, else
-    /// made by the compositor, the screen in its box and the webcam over it
-    /// or under it.
+    /// several): as is when it fills the frame and nothing else shows, else
+    /// made by the compositor, every layer where it's placed, in order.
     pub(crate) fn make(&mut self, screen: Arc<Buffer>) -> Arc<Buffer> {
         let placed = *self.screen.lock().unwrap();
         // Filling the frame (or covering it), ScreenCaptureKit puts the
@@ -1001,31 +1014,39 @@ impl Frames {
             ctl.set_view(framing, crop);
         }
         let streamed = if self.ctl.is_some() { as_streamed(&placed, display) } else { placed.is_whole() && !placed.transformed() };
-        let cam = self.camera.as_mut().and_then(|(layer, placement)| {
-            let p = *placement.lock().unwrap();
-            if p.is_hidden() { None } else { layer.latest().map(|c| (c, p)) }
+        let layers = self.feeds.update();
+        let (w, h) = size_of(&screen.0);
+        // Nothing but the screen shows, filling the frame: its own buffer.
+        let alone = layers.iter().all(|(l, shown)| match &l.source {
+            LayerSource::Main => true,
+            _ => !l.shown() || shown.is_none(),
         });
+        let main = layers.iter().any(|(l, _)| matches!(l.source, LayerSource::Main));
         let frame = match &self.gpu {
-            // Nothing to put together: the screen's own buffer.
-            _ if cam.is_none() && streamed && !placed.hidden => {
+            _ if alone && main && streamed && !placed.hidden => {
                 self.last = None;
                 screen
             }
             None => screen,
             Some((gpu, pool)) => {
-                let p = cam.as_ref().map_or(crate::webcam::Placement::hidden(), |(_, p)| *p);
-                let key = (Arc::as_ptr(&screen) as usize, cam.as_ref().map_or(0, |(c, _)| c.seq), p, placed);
+                // A picture by its buffer (a camera's comes in an Arc of its
+                // own each time) and its number (a pool's buffers come back).
+                let buffer = |b: &Buffer| &*b.0 as *const objc2_core_video::CVPixelBuffer as usize;
+                let made = Made {
+                    screen: buffer(&screen),
+                    placed,
+                    layers: layers.iter().map(|(l, s)| (l.clone(), s.as_ref().map(|s| (buffer(&s.picture), s.version)))).collect(),
+                };
                 match &self.last {
                     // Nothing changed: the same frame again (the encoder holds it anyway).
-                    Some((b, s, c, lp, ls)) if (*s, *c, *lp, *ls) == key => b.clone(),
+                    Some((b, m)) if *m == made => b.clone(),
                     _ => {
-                        let (w, h) = size_of(&screen.0);
                         let picture = self.ctl.as_ref().map_or([0, 0, w as u32, h as u32], |c| c.picture_rect());
-                        let shown = screen_rects(&placed, streamed, picture, (w as u32, h as u32));
-                        match pool.take().and_then(|out| gpu.compose(&screen.0, shown, placed.in_front, cam.as_ref().map(|(c, _)| &*c.buffer), p, &out).map(|()| out)) {
+                        let draws = draws(&layers, &screen.0, &placed, streamed, picture, (w as u32, h as u32));
+                        match pool.take().and_then(|out| gpu.compose(&draws, &out, pool).map(|()| out)) {
                             Ok(out) => {
                                 let b = Arc::new(Buffer(out));
-                                self.last = Some((b.clone(), key.0, key.1, key.2, key.3));
+                                self.last = Some((b.clone(), made));
                                 b
                             }
                             Err(e) => {
@@ -1040,6 +1061,56 @@ impl Frames {
         self.preview.offer(&frame, self.latest.waiting.load(Ordering::Relaxed), self.latest.app.lock().unwrap().clone());
         frame
     }
+}
+
+/// What the compositor draws for `layers`, bottom first, in a `frame`-size
+/// frame: the screen's picture (`screen`, put at `picture` by its stream)
+/// where `Main` is, as `placed` says; each other layer that shows where it's
+/// placed (a webcam filling its box with its own shape; the rest as a
+/// display is, on any pixel).
+fn draws<'a>(
+    layers: &'a [(crate::layers::Layer, Option<super::layers::Shown>)],
+    screen: &'a objc2_core_video::CVPixelBuffer,
+    placed: &crate::ScreenPlacement,
+    streamed: bool,
+    picture: [u32; 4],
+    frame: (u32, u32),
+) -> Vec<Draw<'a>> {
+    let mut out = Vec::with_capacity(layers.len());
+    let edges = |[x, y, w, h]: [u32; 4]| [x as f32, y as f32, (x + w) as f32, (y + h) as f32];
+    for (l, shown) in layers {
+        match &l.source {
+            LayerSource::Main => {
+                if let Some(r) = screen_rects(placed, streamed, picture, frame) {
+                    out.push(r.draw(screen));
+                }
+            }
+            LayerSource::Camera { placement: p, .. } => {
+                let Some(s) = shown else { continue };
+                let (cw, ch) = size_of(&s.picture.0);
+                if let Some((src, dest)) = super::gpu::camera_rects(*p, (cw as u32, ch as u32), frame) {
+                    out.push(Draw::cover(&s.picture.0, src, dest).turned(p.turns, p.flip_h, p.flip_v));
+                }
+            }
+            LayerSource::Display { placement: p, .. }
+            | LayerSource::Window { placement: p, .. }
+            | LayerSource::Picture { placement: p, .. }
+            | LayerSource::Colour { placement: p, .. }
+            | LayerSource::Browser { placement: p, .. }
+            | LayerSource::Animation { placement: p, .. }
+            | LayerSource::Video { placement: p, .. } => {
+                let Some(s) = shown.as_ref().filter(|_| !p.hidden) else { continue };
+                let (pw, ph) = size_of(&s.picture.0);
+                let (src, dest) = p.place_on((pw as u32, ph as u32), frame, false);
+                if src[2] == 0 || src[3] == 0 || dest[2] == 0 || dest[3] == 0 {
+                    continue;
+                }
+                let d = Draw { bt601: s.bt601, ..Draw::blended(&s.picture.0, edges(src), edges(dest), s.alpha) };
+                out.push(d.turned(p.turns, p.flip_h, p.flip_v));
+            }
+        }
+    }
+    out
 }
 
 /// Where the screen's picture is drawn from and to, for the compositor, in

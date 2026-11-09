@@ -322,7 +322,6 @@ impl ScreenPlacement {
 
     /// [`place`](Self::place), where it's drawn on even pixels (`even`: into
     /// the encoder's 4:2:0 colour) or on any (a full-colour canvas).
-    #[cfg_attr(not(any(target_os = "windows", target_os = "linux", test)), allow(dead_code))]
     pub(crate) fn place_on(&self, content: (u32, u32), frame: (u32, u32), even: bool) -> ([u32; 4], [u32; 4]) {
         if self.hidden {
             return ([0; 4], [0; 4]);

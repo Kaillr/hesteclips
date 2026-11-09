@@ -309,9 +309,10 @@ impl Session {
             let encoder = Encoder::new(width, height, s, session.writer_tx.clone())?;
             let placed = *s.screen.lock().unwrap();
             let picture = Picture::start(&s.video, &content, &display, (width, height), s.fps * looks, away, placed)?;
-            // A webcam that can't open doesn't stop the recording: its status
-            // says why, and the picture goes on without it.
-            let frames = Frames::new(picture.latest.clone(), s.webcam.as_ref(), s.screen.clone(), Some(picture.ctl()), width, height, crate::preview::new_producer())?;
+            // A layer that can't open (a webcam, a window) doesn't stop the
+            // recording: its status says why, and the picture goes on
+            // without it.
+            let frames = Frames::new(picture.latest.clone(), s.layers.clone(), s.screen.clone(), Some(picture.ctl()), width, height, s.fps, crate::preview::new_producer())?;
             let latest = picture.latest.clone();
             session.video = Some(picture);
             // Not blended too, a frame takes the picture that was up at its
@@ -493,7 +494,7 @@ impl StreamOutput {
 
 /// SCK delivers float32, usually non-interleaved; flatten to interleaved f32.
 /// Returns the samples and the channel count.
-fn interleaved_pcm(sample: &CMSampleBuffer) -> Option<(Vec<f32>, usize)> {
+pub(crate) fn interleaved_pcm(sample: &CMSampleBuffer) -> Option<(Vec<f32>, usize)> {
     unsafe {
         let desc = sample.format_description()?;
         let asbd: &AudioStreamBasicDescription = &*CMAudioFormatDescriptionGetStreamBasicDescription(&desc);
@@ -536,10 +537,10 @@ fn interleaved_pcm(sample: &CMSampleBuffer) -> Option<(Vec<f32>, usize)> {
 
 /// Why the system stopped a stream, once it has (from its delegate).
 #[derive(Default)]
-struct Stopped(std::sync::Mutex<Option<String>>);
+pub(crate) struct Stopped(std::sync::Mutex<Option<String>>);
 
 impl Stopped {
-    fn take(&self) -> Option<String> {
+    pub(crate) fn take(&self) -> Option<String> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner).take()
     }
 }
@@ -548,7 +549,7 @@ define_class!(
     // SAFETY: NSObject has no subclassing requirements; no Drop impl.
     #[unsafe(super(NSObject))]
     #[ivars = Arc<Stopped>]
-    struct StreamWatch;
+    pub(crate) struct StreamWatch;
 
     unsafe impl NSObjectProtocol for StreamWatch {}
 
@@ -562,7 +563,7 @@ define_class!(
 );
 
 impl StreamWatch {
-    fn new(stopped: Arc<Stopped>) -> Retained<Self> {
+    pub(crate) fn new(stopped: Arc<Stopped>) -> Retained<Self> {
         let this = Self::alloc().set_ivars(stopped);
         unsafe { msg_send![super(this), init] }
     }

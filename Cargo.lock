@@ -841,6 +841,7 @@ dependencies = [
  "objc2-metal 0.3.2",
  "objc2-screen-capture-kit",
  "objc2-video-toolbox",
+ "objc2-web-kit",
  "pipewire",
  "pollster 1.0.1",
  "realfft",
@@ -3957,6 +3958,20 @@ dependencies = [
  "objc2-core-video",
  "objc2-foundation 0.3.2",
  "objc2-metal 0.3.2",
+]
+
+[[package]]
+name = "objc2-web-kit"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b2e5aaab980c433cf470df9d7af96a7b46a9d892d521a2cbbb2f8a4c16751e7f"
+dependencies = [
+ "bitflags 2.13.1",
+ "block2 0.6.2",
+ "objc2 0.6.4",
+ "objc2-app-kit 0.3.2",
+ "objc2-core-foundation",
+ "objc2-foundation 0.3.2",
 ]
 
 [[package]]

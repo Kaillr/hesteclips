@@ -172,8 +172,8 @@ impl VideoPreview {
         }
         #[cfg(target_os = "macos")]
         {
-            let _ = layers;
-            Self { inner: crate::mac::preview::PreviewCapture::start(source.clone(), size, fps, away_screen, webcam, screen) }
+            let _ = webcam;
+            Self { inner: crate::mac::preview::PreviewCapture::start(source.clone(), size, fps, away_screen, layers, screen) }
         }
         #[cfg(target_os = "linux")]
         {
