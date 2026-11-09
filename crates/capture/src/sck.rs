@@ -137,6 +137,14 @@ impl Recorder for SckRecorder {
     fn set_sources(&mut self, sources: &[AudioSource]) -> bool {
         self.outputs.session.as_mut().is_some_and(|s| s.set_sources(sources, &self.live))
     }
+
+    /// Every pixel of the display recorded, or of the game's or app's
+    /// window: a capture of its own (`mac::shot`), of the window the running
+    /// capture records, if one runs.
+    fn screenshot(&mut self, video: &VideoSource) -> Result<crate::PendingShot> {
+        let running = self.outputs.session.as_ref().and_then(|s| s.video.as_ref()).map(|p| p.latest.clone());
+        crate::mac::shot::take(video, running.as_deref())
+    }
 }
 
 impl Drop for SckRecorder {
@@ -623,13 +631,13 @@ fn await_completion(call: impl FnOnce(&block2::DynBlock<dyn Fn(*mut NSError)>)) 
     }
 }
 
-fn start_capture(stream: &SCStream) -> Result<()> {
+pub(crate) fn start_capture(stream: &SCStream) -> Result<()> {
     let _one = STARTING.lock();
     await_completion(|h| unsafe { stream.startCaptureWithCompletionHandler(Some(h)) })
         .map_err(|e| anyhow::anyhow!("couldn't start screen capture: {e}"))
 }
 
-fn stop_capture(stream: &SCStream) {
+pub(crate) fn stop_capture(stream: &SCStream) {
     let _ = await_completion(|h| unsafe { stream.stopCaptureWithCompletionHandler(Some(h)) });
 }
 

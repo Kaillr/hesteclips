@@ -113,6 +113,16 @@ impl Latest {
         self.frame.lock().unwrap().clone()
     }
 
+    /// The game or app being recorded, when following them and one shows.
+    pub(crate) fn recorded_app(&self) -> Option<String> {
+        self.app.lock().unwrap().clone()
+    }
+
+    /// Nothing's being recorded: the away screen (or black) is up.
+    pub(crate) fn is_waiting(&self) -> bool {
+        self.waiting.load(Ordering::Relaxed)
+    }
+
     /// Keep every picture from now on, for [`Self::drain`].
     pub(crate) fn queue_arrivals(&self) {
         self.arrivals.lock().unwrap().queue.get_or_insert_with(VecDeque::new);

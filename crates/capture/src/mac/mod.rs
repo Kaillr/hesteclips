@@ -7,6 +7,7 @@ pub mod decode;
 pub(crate) mod export;
 pub(crate) mod gpu;
 pub(crate) mod preview;
+pub(crate) mod shot;
 pub(crate) mod video;
 pub(crate) mod windows;
 
