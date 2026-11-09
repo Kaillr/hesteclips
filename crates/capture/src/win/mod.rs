@@ -1328,6 +1328,8 @@ impl Video {
             let mut look_at = Instant::now();
             let mut wakes = system::display_wakes();
             let mut again_at: Option<Instant> = None;
+            // The PC is locked (by the last look).
+            let mut locked = system::session_locked().unwrap_or(false);
             // While Windows' capture stands in for Desktop Duplication: when
             // to try it again, and how long to wait after that if it can't.
             let mut retry = (Instant::now() + RETRY_DUPLICATION.0, RETRY_DUPLICATION.0);
@@ -1341,11 +1343,14 @@ impl Video {
             while !stop2.load(Ordering::Relaxed) {
                 // The display came back from going away, or as another (a
                 // monitor that slept, or was unplugged and plugged back in),
-                // Windows' capture of it ended, or the displays turned back on
-                // after Windows turned them off: a capture from before could
-                // show its last picture for good, until the recording started
-                // again (issue #34). Its capture starts again, of the display
-                // as it is now. While it's gone, the last picture stays.
+                // Windows' capture of it ended, the displays turned back on
+                // after Windows turned them off (or the PC woke), or the PC
+                // was unlocked: a capture from before could show its last
+                // picture for good, until the recording started again (issue
+                // #34). Its capture starts again, of the display as it is now.
+                // While it's gone, the last picture stays. Each is said with
+                // its time, as the displays turning off and the PC sleeping
+                // are (see `system::display_wakes`).
                 if Instant::now() >= look_at {
                     look_at = Instant::now() + LOOK_AT_DISPLAY;
                     if matches!(&display, Some(DisplayCapture::Wgc(c) | DisplayCapture::StandIn(c)) if c.is_closed()) {
@@ -1360,10 +1365,20 @@ impl Video {
                         again_at = None;
                         redo.get_or_insert("the display turned back on a moment ago");
                     }
+                    if let Some(now) = system::session_locked()
+                        && now != locked
+                    {
+                        locked = now;
+                        if locked {
+                            eprintln!("{} the PC was locked", system::time_of_day());
+                        } else {
+                            redo.get_or_insert("the PC was unlocked");
+                        }
+                    }
                     match system::connected_monitor(&id) {
                         None => {
                             if !std::mem::replace(&mut gone, true) {
-                                eprintln!("the display went away: its last picture stays until it's back");
+                                eprintln!("{} the display went away: its last picture stays until it's back", system::time_of_day());
                             }
                         }
                         Some(now) => {
@@ -1373,13 +1388,13 @@ impl Video {
                             if let Some(why) = redo {
                                 match d3d::monitor_item(now) {
                                     Ok(again) => {
-                                        eprintln!("{why}: capturing it again");
+                                        eprintln!("{} {why}: capturing it again", system::time_of_day());
                                         (item, monitor, redo, said) = (again, now, None, false);
                                         display = None;
                                     }
                                     Err(e) => {
                                         if !std::mem::replace(&mut said, true) {
-                                            eprintln!("{why}, but it can't be captured: {e:#}");
+                                            eprintln!("{} {why}, but it can't be captured: {e:#}", system::time_of_day());
                                         }
                                     }
                                 }
@@ -2840,6 +2855,95 @@ mod tests {
         eprintln!("pictures/s: before {:.0}, back on {:.0}", rate(&before), rate(&back));
         assert!(rate(&before) > 10.0, "the square's pictures didn't come before the displays went off");
         assert!(rate(&back) > 10.0, "the picture froze once the displays were back on");
+    }
+
+    /// Issue #34, if it's the lock screen: the PC locked (as Windows can when
+    /// it turns the display off) and unlocked again. Locks the PC as Win+L
+    /// does, waits up to `WAIT=<s>` (600) for it to be unlocked by hand, and
+    /// wants a changing square's pictures back after. `SCREEN=<id>`;
+    /// `METHOD=wgc|dupl` (wgc, as on Windows 11).
+    #[test]
+    #[ignore = "locks the PC, to be unlocked by hand: SCREEN=\\\\.\\DISPLAY1 cargo test -p capture display_lock -- --ignored --nocapture"]
+    fn display_lock() {
+        let env = |k: &str| std::env::var(k).ok();
+        let Some(id) = env("SCREEN") else {
+            eprintln!("SCREEN not set: skipped");
+            return;
+        };
+        assert!(system::list_screens().iter().any(|s| s.id == id), "no display {id}");
+        let wait = Duration::from_secs_f64(env("WAIT").and_then(|s| s.parse().ok()).unwrap_or(600.0));
+        let duplication = env("METHOD").as_deref() == Some("dupl");
+        let method = if duplication { crate::ScreenCapture::Duplication } else { crate::ScreenCapture::Wgc };
+        let settings = EncodeSettings {
+            output_dir: std::env::temp_dir().join("hc-lock-test"),
+            container_ext: "mp4".into(),
+            fps: 30,
+            blend_samples: 1,
+            blend_shape: crate::BlendShape::Even,
+            video_bitrate_kbps: 2000,
+            size: crate::VideoSize { short_side: Some(360), shape: None, exact: None },
+            use_hardware: true,
+            replay_seconds: 5,
+            video: VideoSource::Screen { id: id.clone(), hook: crate::GameHook { auto: false, allowed: Vec::new() }, method },
+            away_screen: None,
+            webcam: None,
+            layers: crate::layers::main_only(),
+            screen: Arc::new(std::sync::Mutex::new(crate::ScreenPlacement::whole(crate::Framing::Fit))),
+            sources: Vec::new(),
+            stream: None,
+        };
+        unsafe { windows::Win32::UI::HiDpi::SetThreadDpiAwarenessContext(windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+        let mut info = windows::Win32::Graphics::Gdi::MONITORINFO { cbSize: std::mem::size_of::<windows::Win32::Graphics::Gdi::MONITORINFO>() as u32, ..Default::default() };
+        unsafe { windows::Win32::Graphics::Gdi::GetMonitorInfoW(system::find_monitor(&id), &mut info) }.ok().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let square = changing_square(info.rcMonitor.left + 40, info.rcMonitor.top + 40, stop.clone());
+
+        let mut rec = WinRecorder::new(Arc::new(LiveAudio::default()));
+        rec.start(Mode::ReplayBuffer, &settings).unwrap();
+        let latest = rec.outputs.session.as_ref().unwrap().switch.as_ref().unwrap().latest.clone();
+        let t0 = Instant::now();
+        let mut seen = latest.arrivals().0;
+        // Pictures a second over the next half second.
+        let mut step = |phase: &str| {
+            thread::sleep(Duration::from_millis(500));
+            let n = latest.arrivals().0;
+            let rate = (n - seen) * 2;
+            eprintln!("{:6.1} s {phase}: {rate:3} pictures/s, {:?}", t0.elapsed().as_secs_f64(), crate::screen_capture_in_use());
+            seen = n;
+            rate
+        };
+        let before: Vec<u64> = (0..6).map(|_| step("before")).collect();
+        // Locked, as Win+L does.
+        assert!(std::process::Command::new("rundll32.exe").arg("user32.dll,LockWorkStation").status().unwrap().success(), "couldn't lock");
+        let (start, mut was) = (Instant::now(), false);
+        loop {
+            step("locked");
+            let now = system::session_locked() == Some(true);
+            if was && !now {
+                break;
+            }
+            was |= now;
+            assert!(start.elapsed() < wait, "not unlocked within {wait:?}");
+        }
+        eprintln!("{:6.1} s unlocked", t0.elapsed().as_secs_f64());
+        let back: Vec<u64> = (0..30).map(|_| step("unlocked")).collect();
+        rec.stop(Mode::ReplayBuffer, None).unwrap();
+        stop.store(true, Ordering::Relaxed);
+        let _ = square.join();
+
+        // The last 5 s of each.
+        let rate = |v: &[u64]| v[v.len().saturating_sub(10)..].iter().sum::<u64>() as f64 / v.len().clamp(1, 10) as f64;
+        eprintln!("pictures/s: before {:.0}, unlocked {:.0}", rate(&before), rate(&back));
+        assert!(rate(&before) > 10.0, "the square's pictures didn't come before the PC was locked");
+        assert!(rate(&back) > 10.0, "the picture froze once the PC was unlocked");
+    }
+
+    /// While someone is at the PC, its session reads as unlocked (what tells
+    /// a lock, see `display_lock`).
+    #[test]
+    #[ignore = "needs the PC unlocked: cargo test -p capture session_reads_unlocked -- --ignored"]
+    fn session_reads_unlocked() {
+        assert_eq!(system::session_locked(), Some(false));
     }
 
     /// The pixel at `x`, `y`, as BGRA.
