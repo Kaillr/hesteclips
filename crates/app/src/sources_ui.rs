@@ -254,6 +254,11 @@ impl App {
         let edge = full.left() - crate::ui_kit::PAGE_MARGIN as f32;
         let panel = egui::Rect::from_min_max(egui::pos2(edge, full.top()), egui::pos2(edge + crate::library_view::PANEL_W, full.bottom()));
         let page = egui::Rect::from_min_max(egui::pos2(if wide { panel.right() + 24.0 } else { full.left() }, full.top()), full.max);
+        // A click anywhere nothing else takes it (the heading, the panel,
+        // round the preview and the lists; under them all, so only there)
+        // lets go of what's selected. Not one that only closes a menu.
+        let menu_open = egui::Popup::is_any_open(ui.ctx());
+        let around = ui.interact(if wide { full.union(panel) } else { full }, ui.id().with("sources_around"), Sense::click());
         let mut page_ui = ui.new_child(egui::UiBuilder::new().max_rect(page).layout(egui::Layout::top_down(egui::Align::Min)));
         // The keys: undo, redo, and what's done to the source selected.
         self.source_keys(page_ui.ctx(), aspect);
@@ -265,6 +270,16 @@ impl App {
         }
         self.settings_dialog(ui.ctx(), frame.as_deref(), aspect);
         self.live_audio.set_limiter(self.settings.limiter);
+        if around.clicked() && !menu_open {
+            self.select_nothing();
+        }
+    }
+
+    /// Nothing selected: no source or group, none picked, not cropping.
+    pub(crate) fn select_nothing(&mut self) {
+        self.canvas.selected = None;
+        self.canvas.picked.clear();
+        self.canvas.crop_mode = None;
     }
 
     /// The scene shown, in three places of its own: the preview, as big as
@@ -281,10 +296,6 @@ impl App {
         // The page's margin under it, as the panel's beside it: what's in
         // it ends where the panel's card does.
         let area = Rect::from_min_max(full.min, pos2(full.right(), full.bottom() - (crate::ui_kit::PAGE_MARGIN as f32 - 10.0)));
-        // A click on the page around the preview and the lists (under
-        // them all, so only where none of them is) lets go of what's
-        // selected.
-        let around = ui.interact(full, ui.id().with("scene_around"), Sense::click());
         let (w, h) = (area.width(), area.height());
         let place = |ui: &mut egui::Ui, r: Rect| ui.new_child(egui::UiBuilder::new().max_rect(r).layout(egui::Layout::top_down(egui::Align::Min)));
         let frame = if w >= ONE_COLUMN {
@@ -313,11 +324,6 @@ impl App {
             frame
         };
         ui.allocate_rect(area, Sense::hover());
-        if around.clicked() {
-            self.canvas.selected = None;
-            self.canvas.picked.clear();
-            self.canvas.crop_mode = None;
-        }
         frame
     }
 
