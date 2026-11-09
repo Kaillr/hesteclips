@@ -42,6 +42,22 @@ fn display_mode(id: Option<&str>) -> Option<objc2_core_foundation::CFRetained<ob
     CGDisplayCopyDisplayMode(display)
 }
 
+/// Where display `id` is on the desktop, in points (left, top, width,
+/// height; the main display's top-left corner is 0, 0, as AppKit places
+/// windows by it). `None` if it isn't connected.
+pub(crate) fn display_bounds(id: &str) -> Option<[i32; 4]> {
+    use objc2_core_graphics::{CGDisplayBounds, CGGetActiveDisplayList};
+    let want: u32 = id.parse().ok()?;
+    let mut ids = [0u32; 16];
+    let mut n = 0u32;
+    if unsafe { CGGetActiveDisplayList(16, ids.as_mut_ptr(), &mut n) } != objc2_core_graphics::CGError::Success || !ids[..n as usize].contains(&want) {
+        return None;
+    }
+    let r = CGDisplayBounds(want);
+    let (w, h) = (r.size.width.round() as i32, r.size.height.round() as i32);
+    (w > 0 && h > 0).then(|| [r.origin.x.round() as i32, r.origin.y.round() as i32, w, h])
+}
+
 /// A display's size in pixels, by id (`None`: the main display), else the
 /// main display's.
 pub(crate) fn display_pixels(id: Option<&str>) -> Option<(u32, u32)> {
@@ -57,4 +73,21 @@ pub(crate) fn display_pixels(id: Option<&str>) -> Option<(u32, u32)> {
 pub(crate) fn display_refresh(id: Option<&str>) -> Option<u32> {
     let hz = objc2_core_graphics::CGDisplayMode::refresh_rate(display_mode(id).as_deref());
     (hz >= 1.0).then(|| hz.round() as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    /// The main display's top-left corner is 0, 0, and it's as many points
+    /// as its pixels at its scale (1 or 2); one that isn't connected isn't
+    /// anywhere.
+    #[test]
+    fn where_the_displays_are() {
+        let main = objc2_core_graphics::CGMainDisplayID().to_string();
+        let b = super::display_bounds(&main).expect("the main display");
+        assert_eq!((b[0], b[1]), (0, 0));
+        let (pw, ph) = super::display_pixels(Some(&main)).unwrap();
+        assert!((pw as i32 == b[2] && ph as i32 == b[3]) || (pw as i32 == 2 * b[2] && ph as i32 == 2 * b[3]), "{b:?} for {pw}×{ph} pixels");
+        assert_eq!(super::display_bounds("4000000000"), None);
+        assert_eq!(super::display_bounds("not a display"), None);
+    }
 }

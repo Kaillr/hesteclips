@@ -84,7 +84,7 @@ impl App {
             // display where windows aren't placed by position.
             builder = builder.with_monitor(m);
         } else if let Some(b) = bounds {
-            builder = builder.with_position(inside(b, ctx.pixels_per_point()));
+            builder = builder.with_position(inside(b, units(ctx)));
         }
         let mut close = false;
         ctx.show_viewport_immediate(id, builder, |ui, _| close = self.projector_frame(ui, bounds));
@@ -114,7 +114,7 @@ impl App {
         }
         if let Some(p) = self.projector.as_mut().filter(|p| !p.placed) {
             p.tries += 1;
-            let ppp = ctx.pixels_per_point();
+            let ppp = units(ctx);
             let there = match bounds {
                 Some(b) => ctx.input(|i| i.viewport().outer_rect).is_some_and(|r| on_display(r.center(), ppp, b)),
                 None => true,
@@ -168,13 +168,22 @@ impl App {
     }
 }
 
+/// How many of a display's units (`capture::display_bounds`) a point of
+/// the UI is: pixels on Windows and X11; on macOS, where displays are placed in
+/// points as windows are, the UI's zoom (points are the system's there).
+fn units(ctx: &egui::Context) -> f32 {
+    if cfg!(target_os = "macos") { ctx.zoom_factor() } else { ctx.pixels_per_point() }
+}
+
 /// A point a quarter of the way into display `[x, y, w, h]` (in its
-/// pixels), in points at `ppp`: where the window goes to be on it.
+/// units), in points at `ppp` of them a point: where the window goes to be
+/// on it.
 fn inside([x, y, w, h]: [i32; 4], ppp: f32) -> egui::Pos2 {
     pos2((x as f32 + w as f32 / 4.0) / ppp, (y as f32 + h as f32 / 4.0) / ppp)
 }
 
-/// Whether `p` (in points at `ppp`) is on display `[x, y, w, h]`.
+/// Whether `p` (in points, at `ppp` of the display's units a point) is on
+/// display `[x, y, w, h]`.
 fn on_display(p: egui::Pos2, ppp: f32, [x, y, w, h]: [i32; 4]) -> bool {
     let (px, py) = (p.x * ppp, p.y * ppp);
     px >= x as f32 && px < (x + w) as f32 && py >= y as f32 && py < (y + h) as f32

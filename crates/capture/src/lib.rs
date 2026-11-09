@@ -938,18 +938,24 @@ pub fn choose_screen_again() {
 }
 
 /// Where a display (by its id, as [`list_screens`] gives it) is on the
-/// desktop: its left, top, width and height in pixels. Windows and X11;
-/// elsewhere not known (`None`: see [`display_monitor`]).
+/// desktop: its left, top, width and height, in the units windows are
+/// placed in: pixels on Windows and X11, points on macOS (where windows are
+/// placed in points, a display of any scale). Elsewhere not known (`None`:
+/// see [`display_monitor`]).
 pub fn display_bounds(id: &str) -> Option<[i32; 4]> {
     #[cfg(target_os = "windows")]
     {
         win::display_bounds(id)
     }
+    #[cfg(target_os = "macos")]
+    {
+        mac::display_bounds(id)
+    }
     #[cfg(target_os = "linux")]
     {
         linux::display_bounds(id)
     }
-    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     {
         let _ = id;
         None
