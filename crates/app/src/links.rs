@@ -1,13 +1,19 @@
 //! Share links: a clip uploaded to HasteClip's server, with a link that plays
-//! it in any browser and right in a Discord chat (the server is
+//! it in any browser and right in chats (the server is
 //! <https://github.com/hasteclip/api>).
 //!
 //! Nothing leaves the computer until you pick Share → Share with a link… and
 //! Upload, and then only that clip as it looks now: its video and its mix, without
 //! the file's metadata (repackaged, not re-encoded, so it's quick), and a
-//! picture for the link's preview. The server knows this app only by a
-//! random token it hands out the first time (kept in
-//! `<config_dir>/hasteclip/share.json`): there's no account.
+//! picture for the link's preview. A shared clip is at most [`LINK_MAX_MB`]
+//! (what the server takes, and what plays right in a chat): a bigger one
+//! goes up as a copy that fits. Before uploading, its resolution, frame
+//! rate and the size it fits under can be changed in the dialog (the
+//! editor's export settings), and a new version of it later goes up the
+//! same way.
+//!
+//! The server knows this app only by a random token it hands out the first
+//! time (kept in `<config_dir>/hasteclip/share.json`): there's no account.
 //!
 //! Shared clips are kept in the library's `.hasteclip/links.json`, by the
 //! clip's path inside the library, like collections: renaming or moving a
@@ -55,6 +61,11 @@ pub struct Link {
     pub named: Option<Named>,
     #[serde(default)]
     pub version: Option<Version>,
+    /// How it goes up, as chosen when it was shared: a new version goes up
+    /// the same way. `None` in links kept before it was asked: as
+    /// [`default_output`] makes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<media::Output>,
 }
 
 /// What a shared clip's page calls it.
@@ -260,8 +271,8 @@ pub struct Progress {
     pub sent: AtomicU64,
     pub total: AtomicU64,
     pub cancel: AtomicBool,
-    /// A smaller copy is made first (the clip is too big to play in
-    /// Discord), and how far it's come (0..=1, `f32` bits).
+    /// A copy is made to go up first (the clip doesn't fit its size, or
+    /// it goes up smaller), and how far it's come (0..=1, `f32` bits).
     making: AtomicBool,
     made: AtomicU32,
     /// The copy is made (or wasn't needed): the clip is being got ready to
@@ -322,20 +333,21 @@ impl Progress {
     }
 }
 
-/// Upload `clip` and get its link; `named` is what its page calls it.
-pub fn share(clip: &Path, named: &Named, progress: &Progress) -> Result<Link, String> {
+/// Upload `clip` as `output` makes it, and get its link; `named` is what
+/// its page calls it.
+pub fn share(clip: &Path, named: &Named, output: &media::Output, progress: &Progress) -> Result<Link, String> {
     // Which file, as it was before it was read: if it changes meanwhile,
     // the link is brought up to date after.
     let version = Version::of(clip);
-    let done = upload(clip, named, progress, None)?;
-    Ok(Link { id: done.id, url: done.url, shared: now(), named: Some(named.clone()), version })
+    let done = upload(clip, named, output, progress, None)?;
+    Ok(Link { id: done.id, url: done.url, shared: now(), named: Some(named.clone()), version, output: Some(*output) })
 }
 
 /// Upload a new version of a shared clip under its link, which plays the
-/// old one until this one's all there.
+/// old one until this one's all there. It goes up as the clip did.
 pub fn replace(clip: &Path, link: &Link, named: &Named, progress: &Progress) -> Result<Link, String> {
     let version = Version::of(clip);
-    upload(clip, named, progress, Some(&link.id))?;
+    upload(clip, named, &link.output.unwrap_or_else(default_output), progress, Some(&link.id))?;
     Ok(Link { named: Some(named.clone()), version, ..link.clone() })
 }
 
@@ -352,18 +364,44 @@ pub fn rename(link: &Link, named: &Named) -> Result<(), String> {
         .map(drop)
 }
 
-/// The biggest video Discord plays right in a chat; past it, a link shows
-/// and nothing plays (reported at 100 MB, not documented). A little under.
-const EMBED_MAX_MB: u32 = 95;
+/// The most a shared clip can be, in MB as the app counts them (MiB). The
+/// server takes nothing bigger (`MAX_CLIP_MB`: sharing is free, its storage
+/// isn't), and up to it a link's video plays right in a chat: Discord's
+/// line, reported at 100 MB and not documented, counted as its own limits
+/// are (its upload limit is "20 MiB" in its API docs, "20MB" to people).
+pub(crate) const LINK_MAX_MB: u32 = 100;
+
+/// How a clip goes up unless something else is chosen: as it is, or, past
+/// [`LINK_MAX_MB`], as a copy that fits (the biggest picture that does, at
+/// up to 60 fps), made as Save smaller makes one. Only its mix goes up
+/// either way.
+pub fn default_output() -> media::Output {
+    media::Output { max_mb: Some(LINK_MAX_MB), mix_only: true, ..Default::default() }
+}
+
+/// `output` within what a link can be: never more than [`LINK_MAX_MB`].
+fn capped(output: &media::Output) -> media::Output {
+    media::Output { max_mb: Some(output.max_mb.map_or(LINK_MAX_MB, |mb| mb.min(LINK_MAX_MB))), ..*output }
+}
+
+/// Whether a copy of a clip `duration` seconds long can fit in `mb` MB at
+/// all: even the smallest picture takes about [`LEAST_VIDEO_KBPS`], and the
+/// mix its own.
+fn fits_in(mb: u32, duration: f64) -> bool {
+    let kbps = f64::from(mb) * 1024.0 * 1024.0 * 8.0 / 1000.0 / duration.max(0.1) * 0.9;
+    kbps - f64::from(media::RENDER_AUDIO_KBPS) >= LEAST_VIDEO_KBPS
+}
+
+/// About the least a picture worth watching takes, in kbps: 360p at 30 fps,
+/// soft. Under 100 MB, that's a clip of about 25 minutes.
+const LEAST_VIDEO_KBPS: f64 = 250.0;
 
 /// Upload `clip` as a new shared clip, or as the new version of shared clip
-/// `replacing`. One too big to play in Discord goes up as a smaller copy,
-/// made to fit as Save smaller makes one: the biggest picture that fits,
-/// and the mix.
-fn upload(clip: &Path, named: &Named, progress: &Progress, replacing: Option<&str>) -> Result<Shared, String> {
+/// `replacing`, made as `output` asks ([`made_to_upload`]).
+fn upload(clip: &Path, named: &Named, output: &media::Output, progress: &Progress, replacing: Option<&str>) -> Result<Shared, String> {
     let work = Scratch::new()?;
     let video = work.0.join("video.mp4");
-    let source = playable_size(clip, &work.0, progress)?;
+    let source = made_to_upload(clip, &work.0, output, progress)?;
     progress.readying.store(true, Ordering::Relaxed);
     web_copy(&source, &video)?;
     progress.cancelled()?;
@@ -503,48 +541,59 @@ fn web_copy(clip: &Path, out: &Path) -> Result<(), String> {
     Err(why.lines().last().unwrap_or("ffmpeg failed").to_owned())
 }
 
-/// `clip`, or a copy of it made in `work` that's small enough to play in
-/// Discord ([`EMBED_MAX_MB`]), as Save smaller makes one: the biggest
-/// picture that fits, and the mix.
-fn playable_size(clip: &Path, work: &Path, progress: &Progress) -> Result<PathBuf, String> {
-    fit_under(clip, work, EMBED_MAX_MB, progress)
-}
-
-/// `clip`, or a copy of it made in `work` that's at most `mb` MB.
-fn fit_under(clip: &Path, work: &Path, mb: u32, progress: &Progress) -> Result<PathBuf, String> {
-    let fits = u64::from(mb) << 20;
-    if std::fs::metadata(clip).map_err(|e| e.to_string())?.len() <= fits {
+/// What `clip` goes up as, made in `work` as `output` asks (within
+/// [`LINK_MAX_MB`]): the clip itself when nothing changes its picture and
+/// it fits the size, else a copy made as Save smaller makes one, with the
+/// mix. One too long to fit at all isn't made.
+fn made_to_upload(clip: &Path, work: &Path, output: &media::Output, progress: &Progress) -> Result<PathBuf, String> {
+    let output = capped(output);
+    let mb = output.max_mb.unwrap_or(LINK_MAX_MB);
+    let info = media::probe(clip).map_err(|e| e.to_string())?;
+    let size = std::fs::metadata(clip).map_err(|e| e.to_string())?.len();
+    let mut edit = media::Edit::new(&info);
+    edit.output = media::Output { mix_only: true, ..output };
+    let fits = |bytes: u64| bytes <= u64::from(mb) << 20;
+    if !reshapes(&info, &output) && fits(size) {
         return Ok(clip.to_path_buf());
     }
+    if !fits_in(mb, info.duration) {
+        return Err(too_long(mb));
+    }
     progress.making.store(true, Ordering::Relaxed);
-    let small = work.join("small.mp4");
-    let info = media::probe(clip).map_err(|e| e.to_string())?;
-    let mut edit = media::Edit::new(&info);
-    edit.output.mix_only = true;
-    edit.output.max_mb = Some(mb);
+    let copy = work.join("copy.mp4");
     loop {
         progress.made.store(0, Ordering::Relaxed);
-        media::render_with_progress(clip, &info, &edit, &small, None, |f| progress.made.store(f.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed))
-            .map_err(|e| format!("couldn't make a copy small enough to play in Discord: {e}"))?;
+        media::render_with_progress(clip, &info, &edit, &copy, None, |f| progress.made.store(f.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed))
+            .map_err(|e| format!("couldn't make the copy to upload: {e}"))?;
         progress.cancelled()?;
-        let size = std::fs::metadata(&small).map_err(|e| e.to_string())?.len();
-        if size <= fits {
-            return Ok(small);
+        let size = std::fs::metadata(&copy).map_err(|e| e.to_string())?.len();
+        if fits(size) {
+            return Ok(copy);
         }
         // The encoder went over: a picture too busy for the bitrate. macOS's
         // won't go under what it spends on a frame of that size however low
         // it's asked to (1080p noise asked for 5 Mbit/s came out at 39; at
         // 720p, 3.5), so asking again for less does nothing: a smaller
-        // picture, until it fits. At the smallest, it goes as it is: the
-        // link plays, if not in a chat.
+        // picture, until it fits. Not even the smallest does: it can't be
+        // shared (the server takes nothing bigger).
         let (_, h) = edit.output.size(&info);
-        let Some(next) = SMALLER.into_iter().find(|&s| s < h) else { return Ok(small) };
+        let Some(next) = SMALLER.into_iter().find(|&s| s < h) else { return Err(too_long(mb)) };
         edit.output.height = Some(next);
     }
 }
 
-/// The picture heights a copy for Discord steps down through when it comes
-/// out too big.
+/// Why a clip can't go up: it doesn't fit in `mb` MB.
+fn too_long(mb: u32) -> String {
+    format!("it doesn't fit in {mb} MB, even small. Trim it in the editor and share the part you want")
+}
+
+/// Whether `output` changes the picture of a clip that's `info`, a size to
+/// fit under aside (that only matters to a clip bigger than it).
+pub(crate) fn reshapes(info: &media::ClipInfo, output: &media::Output) -> bool {
+    media::Output { max_mb: None, ..*output }.changes_video(info)
+}
+
+/// The picture heights a copy steps down through when it comes out too big.
 const SMALLER: [u32; 5] = [1080, 720, 540, 480, 360];
 
 /// The picture a link's preview shows: a frame a second in (or from the
@@ -927,6 +976,70 @@ pub struct Dialog {
     views: Option<i64>,
     /// When its link was copied, to say so on the button for a moment.
     copied: Option<Instant>,
+    /// How it goes up, before it's shared. `None` when the clip can't be
+    /// read: it goes up as [`default_output`] makes it.
+    form: Option<UploadForm>,
+}
+
+/// How a clip goes up, as the dialog shows it: what the clip is, and an
+/// edit of all of it whose output is how it's made ([`default_output`] to
+/// start with), changed with the editor's export settings.
+struct UploadForm {
+    info: media::ClipInfo,
+    edit: media::Edit,
+    /// The clip's file size.
+    bytes: u64,
+    /// The settings are shown (else just what goes up).
+    open: bool,
+}
+
+impl UploadForm {
+    fn of(clip: &Path) -> Option<Self> {
+        let info = media::probe(clip).ok()?;
+        let mut edit = media::Edit::new(&info);
+        edit.output = default_output();
+        let bytes = std::fs::metadata(clip).ok()?.len();
+        Some(Self { info, edit, bytes, open: false })
+    }
+
+    /// The most it can take, in MB: the size chosen, within [`LINK_MAX_MB`].
+    fn most(&self) -> u32 {
+        capped(&self.edit.output).max_mb.unwrap_or(LINK_MAX_MB)
+    }
+
+    /// It goes up as it is: nothing changes its picture, and it fits.
+    fn as_it_is(&self) -> bool {
+        !reshapes(&self.info, &self.edit.output) && self.bytes <= u64::from(self.most()) << 20
+    }
+
+    /// Even a copy can't fit: it's too long for the size.
+    fn too_long(&self) -> bool {
+        !self.as_it_is() && !fits_in(self.most(), self.info.duration)
+    }
+
+    /// What goes up, in short ("As it is, 42 MB"; "A copy under 100 MB";
+    /// "Too long to fit in 100 MB"), and in a line under it its picture
+    /// ("1920×1080 · 60 fps · 15 Mbps"), or what to do.
+    fn what(&self) -> (String, String) {
+        use crate::export_ui::{human_bytes, mbps, picture_words};
+        let info = &self.info;
+        let mb = self.most();
+        if self.as_it_is() {
+            let kbps = info.video_kbps.map_or(String::new(), |k| format!(" · {}", mbps(k)));
+            return (format!("As it is, {}", human_bytes(self.bytes)), format!("{}×{} · {:.0} fps{kbps}", info.width, info.height, info.fps));
+        }
+        if self.too_long() {
+            return (format!("Too long to fit in {mb} MB"), "Trim it in the editor, then share the part you want.".to_owned());
+        }
+        let edit = media::Edit { output: capped(&self.edit.output), ..self.edit.clone() };
+        let what = if reshapes(info, &edit.output) {
+            let est = edit.output.estimate_bytes(info, &edit).unwrap_or(self.bytes).min(u64::from(mb) << 20);
+            format!("A copy, about {}", human_bytes(est))
+        } else {
+            format!("A copy under {mb} MB")
+        };
+        (what, picture_words(info, &edit))
+    }
 }
 
 /// What was clicked in the dialog.
@@ -946,14 +1059,16 @@ impl App {
     /// Open the Share with a link dialog for `clip`.
     pub(crate) fn open_link_dialog(&mut self, clip: PathBuf) {
         self.check_link(&clip);
-        self.link_dialog = Some(Dialog { clip, error: None, note: None, views: None, copied: None });
+        // Not shared yet: how it would go up (reading its file is quick).
+        let form = if self.links.get(&clip).is_none() { UploadForm::of(&clip) } else { None };
+        self.link_dialog = Some(Dialog { clip, error: None, note: None, views: None, copied: None, form });
     }
 
     /// Copy the link of a clip that's shared.
     pub(crate) fn copy_link(&mut self, clip: &Path) {
         let Some(link) = self.links.get(clip) else { return };
         self.ctx().copy_text(link.url.clone());
-        self.toast_icon(icon::LINK, format!("Link copied: paste it into Discord or anywhere ({})", crate::hotkey_label_cmd("V")));
+        self.toast_icon(icon::LINK, format!("Link copied: paste it anywhere ({})", crate::hotkey_label_cmd("V")));
         // Said if it turns out to have stopped working.
         self.check_link(clip);
     }
@@ -1005,14 +1120,14 @@ impl App {
         Named { title: found.map(page_title).unwrap_or_default(), game: found.and_then(|c| c.folder.clone()) }
     }
 
-    /// Upload the clip for a link.
-    fn start_share(&mut self, clip: PathBuf) {
+    /// Upload the clip for a link, made as `output` asks.
+    fn start_share(&mut self, clip: PathBuf, output: media::Output) {
         if self.link_jobs.iter().any(|j| j.clip == clip) {
             return;
         }
         let named = self.named(&clip);
         let file = clip.clone();
-        self.start_link_job(clip, Doing::Sharing, None, false, move |progress| share(&file, &named, progress).map(Done::Shared));
+        self.start_link_job(clip, Doing::Sharing, None, false, move |progress| share(&file, &named, &output, progress).map(Done::Shared));
     }
 
     /// Delete the clip from the server; its link stops working.
@@ -1234,6 +1349,11 @@ impl App {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
         let under = format!("{} · {}", found.folder.as_deref().unwrap_or("Other"), found.human_size());
+        // How it goes up, shown and changed while the dialog's drawn.
+        let mut form = self.link_dialog.as_mut().and_then(|d| d.form.take());
+        // A value being typed as the frame began: Enter and Esc are its
+        // (applying it, putting it back), not the dialog's.
+        let typing = ctx.memory(|m| m.focused().is_some());
         let mut pick = None;
         let modal = ui_kit::dialog(ctx, "share_link", 420.0, |ui| {
             let p = theme::pal(ui);
@@ -1253,7 +1373,7 @@ impl App {
                     Some(n) => format!("Watched {n} times. "),
                     None => String::new(),
                 };
-                ui_kit::dialog_text(ui, &format!("{watched}Anyone with the link can watch it, in a browser or right in Discord. A link nobody watches for 90 days stops working."));
+                ui_kit::dialog_text(ui, &format!("{watched}Anyone with the link can watch it, in a browser or right in a chat. A link nobody watches for 90 days stops working."));
                 // It follows the clip: a new version on its way, or waiting
                 // to be.
                 if let Some((sent, total, making, f, left)) = updating {
@@ -1261,7 +1381,7 @@ impl App {
                     progress_bar(ui, f);
                     ui.add_space(8.0);
                     let how = match (making, total) {
-                        (Some(made), _) => format!("Making a copy that plays in Discord… {}%", ((made * 100.0) as u32).min(99)),
+                        (Some(made), _) => format!("Making the copy to upload… {}%", ((made * 100.0) as u32).min(99)),
                         (None, 0) => "Getting the new version ready…".to_owned(),
                         (None, _) => format!("Updating the link to this version… {}", going(sent, total, left)),
                     };
@@ -1278,7 +1398,7 @@ impl App {
                 // No total yet: the copy to upload is still being made, or
                 // got ready to go up.
                 let how = match (making, total) {
-                    (Some(made), _) => format!("Making a copy that plays in Discord… {}%", ((made * 100.0) as u32).min(99)),
+                    (Some(made), _) => format!("Making the copy to upload… {}%", ((made * 100.0) as u32).min(99)),
                     (None, 0) => "Getting it ready to upload…".to_owned(),
                     (None, _) => format!("Uploading… {}", going(sent, total, left)),
                 };
@@ -1289,12 +1409,18 @@ impl App {
                 if let Some(n) = &note {
                     ui_kit::dialog_text(ui, n);
                 }
-                ui_kit::dialog_text(ui, "Uploads the clip to HasteClip for a link that plays it in any browser, and right in Discord. Anyone with the link can watch it, until you stop sharing.");
+                ui_kit::dialog_text(ui, "Uploads the clip to HasteClip for a link that plays it in any browser, and right in chats. Anyone with the link can watch it, until you stop sharing.");
+                if let Some(f) = &mut form {
+                    upload_form(ui, f);
+                }
             }
             if let Some(e) = &error {
                 ui.add_space(4.0);
                 ui.add(egui::Label::new(theme::text(e, 12.5, W::Regular).color(p.danger)).wrap());
             }
+            // Too long to fit even as a copy: nothing to upload, until it's
+            // trimmed (or a bigger size is chosen).
+            let blocked = link.is_none() && uploading.is_none() && form.as_ref().is_some_and(UploadForm::too_long);
             ui_kit::dialog_buttons(ui, |ui| {
                 if stopping {
                     if ui.add(ui_kit::button("Close", false)).clicked() {
@@ -1318,7 +1444,9 @@ impl App {
                         pick = Some(Pick::CancelUpload);
                     }
                 } else {
-                    if Btn::primary(if error.is_some() { "Try again" } else { "Upload" }).with_icon(icon::CLOUD_ARROW_UP).show(ui).clicked() {
+                    let upload = Btn::primary(if error.is_some() { "Try again" } else { "Upload" }).with_icon(icon::CLOUD_ARROW_UP).enabled(!blocked);
+                    let upload = if blocked { upload.tip(format!("It doesn't fit in {LINK_MAX_MB} MB: trim it in the editor first")) } else { upload };
+                    if upload.show(ui).clicked() {
                         pick = Some(Pick::Upload);
                     }
                     if ui.add(ui_kit::button("Cancel", false).ghost()).clicked() {
@@ -1327,17 +1455,21 @@ impl App {
                 }
             });
             // Enter does the main thing: upload, or copy the link.
-            if !stopping && uploading.is_none() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            if !stopping && uploading.is_none() && !typing && !blocked && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                 pick = Some(if link.is_some() { Pick::Copy } else { Pick::Upload });
             }
         });
+        let output = form.as_ref().map_or_else(default_output, |f| f.edit.output);
+        if let Some(d) = &mut self.link_dialog {
+            d.form = form;
+        }
         match pick {
             Some(Pick::Upload) => {
                 if let Some(d) = &mut self.link_dialog {
                     d.error = None;
                     d.note = None;
                 }
-                self.start_share(clip);
+                self.start_share(clip, output);
             }
             Some(Pick::CancelUpload) => {
                 // Let go of it now; it stops (and its half on the server goes)
@@ -1362,8 +1494,46 @@ impl App {
                 self.stop_sharing(clip);
             }
             Some(Pick::Close) => self.link_dialog = None,
-            None if modal.dismissed() => self.link_dialog = None,
+            None if modal.dismissed() && !typing => self.link_dialog = None,
             None => {}
+        }
+    }
+}
+
+/// Before it's shared: what goes up ("As it is, 42 MB"; "A copy under
+/// 100 MB"), and on asking the settings it's made with, the editor's
+/// export settings as far as an upload can change them: always a size, up
+/// to [`LINK_MAX_MB`].
+fn upload_form(ui: &mut egui::Ui, f: &mut UploadForm) {
+    let p = theme::pal(ui);
+    ui.add_space(10.0);
+    let (what, under) = f.what();
+    ui.horizontal(|ui| {
+        ui.label(theme::text(what, 13.5, W::Medium).color(if f.too_long() { p.danger } else { p.text }));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let (label, caret) = if f.open { ("Done", icon::CARET_UP) } else { ("Change", icon::CARET_DOWN) };
+            if Btn::ghost(label).trail(caret).small().tip("The resolution, frame rate and size it goes up at").show(ui).clicked() {
+                f.open = !f.open;
+            }
+        });
+    });
+    ui_kit::hint(ui, &under);
+    if f.open {
+        ui.add_space(4.0);
+        let form = crate::export_ui::Form {
+            id: "share",
+            crop: None,
+            more: false,
+            size_hint: "The most the upload can take: up to 100 MB",
+            cap_mb: Some(LINK_MAX_MB),
+            size_note: Some((LINK_MAX_MB, "the most")),
+        };
+        crate::export_ui::rows(ui, &f.info, &mut f.edit, form);
+        if f.edit.output != default_output() {
+            ui.add_space(4.0);
+            if Btn::ghost("Back to the usual").small().tip(format!("As it is, or a copy under {LINK_MAX_MB} MB when it's bigger")).show(ui).clicked() {
+                f.edit.output = default_output();
+            }
         }
     }
 }
@@ -1557,7 +1727,7 @@ mod tests {
     fn links_follow_their_clip_and_are_saved() {
         let lib = std::env::temp_dir().join(format!("hc-links-{}", std::process::id()));
         std::fs::create_dir_all(&lib).unwrap();
-        let link = Link { id: "aB3xY9k2Qp".into(), url: "https://clips.hasteclip.com/aB3xY9k2Qp".into(), shared: 1, named: None, version: None };
+        let link = Link { id: "aB3xY9k2Qp".into(), url: "https://clips.hasteclip.com/aB3xY9k2Qp".into(), shared: 1, named: None, version: None, output: None };
         let mut links = Links::load(&lib);
         links.set(&lib.join("Game").join("Ace.mp4"), link.clone());
         links.follow(&lib.join("Game").join("Ace.mp4"), &lib.join("Ace!.mp4"));
@@ -1576,7 +1746,7 @@ mod tests {
     fn deleted_links_wait_for_undo() {
         let lib = std::env::temp_dir().join(format!("hc-links-gone-{}", std::process::id()));
         std::fs::create_dir_all(&lib).unwrap();
-        let link = Link { id: "aB3xY9k2Qp".into(), url: "u".into(), shared: 1, named: None, version: None };
+        let link = Link { id: "aB3xY9k2Qp".into(), url: "u".into(), shared: 1, named: None, version: None, output: None };
         let clip = lib.join("Game").join("Ace.mp4");
         let mut links = Links::load(&lib);
         links.set(&clip, link.clone());
@@ -1656,7 +1826,7 @@ mod tests {
         assert!(made.success());
         // 10 s in 12 MB: under 10 Mbit/s, which the plan puts at 1080p, and
         // macOS's encoder makes 44 MB of there.
-        let small = fit_under(&clip, &dir, 12, &Progress::default()).unwrap();
+        let small = made_to_upload(&clip, &dir, &media::Output { max_mb: Some(12), ..default_output() }, &Progress::default()).unwrap();
         let size = std::fs::metadata(&small).unwrap().len();
         assert!(size <= 12 << 20, "{:.1} MB, over 12", size as f64 / 1e6);
         // And it uses what it may: aiming lower made 1.9 MB of it.
@@ -1664,11 +1834,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A clip too big to play in Discord goes as a copy that fits, still an
+    /// A clip too big to play in a chat goes as a copy that fits, still an
     /// H.264 MP4 a browser plays; a small one as it is.
     #[test]
-    #[ignore = "encodes ~100 MB of video: cargo test -p hasteclip copies_fit_discord -- --ignored"]
-    fn copies_fit_discord() {
+    #[ignore = "encodes ~100 MB of video: cargo test -p hasteclip copies_fit_chats -- --ignored"]
+    fn copies_fit_chats() {
         let dir = std::env::temp_dir().join(format!("hc-fit-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let clip = dir.join("Big.mp4");
@@ -1681,19 +1851,83 @@ mod tests {
             .unwrap();
         assert!(made.success());
         let big = std::fs::metadata(&clip).unwrap().len();
-        assert!(big > u64::from(EMBED_MAX_MB) << 20, "the test clip is {big} bytes");
+        assert!(big > u64::from(LINK_MAX_MB) << 20, "the test clip is {big} bytes");
         let progress = Progress::default();
-        let small = playable_size(&clip, &dir, &progress).unwrap();
+        let small = made_to_upload(&clip, &dir, &default_output(), &progress).unwrap();
         let size = std::fs::metadata(&small).unwrap().len();
-        assert!(size <= u64::from(EMBED_MAX_MB) << 20, "{size} bytes");
+        assert!(size <= u64::from(LINK_MAX_MB) << 20, "{size} bytes");
         let probe = media::probe(&small).unwrap();
         assert!(probe.width > 0 && probe.duration > 4.5, "{probe:?}");
         assert!(progress.made.load(Ordering::Relaxed) > 0);
         let out = dir.join("web.mp4");
         web_copy(&small, &out).unwrap();
         // A small one stays as it is.
-        assert_eq!(playable_size(&out, &dir, &Progress::default()).unwrap(), out);
+        assert_eq!(made_to_upload(&out, &dir, &default_output(), &Progress::default()).unwrap(), out);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A clip that fits goes up as it is, whatever size it's to fit under;
+    /// one asked to be smaller goes as a copy.
+    #[test]
+    fn a_clip_goes_as_it_is_unless_its_picture_changes() {
+        let dir = std::env::temp_dir().join(format!("hc-asis-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("Small.mp4");
+        let made = media::ffmpeg()
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc2=s=320x240:r=30:d=2", "-f", "lavfi", "-i", "sine=f=440:d=2"])
+            .args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest"])
+            .arg(&clip)
+            .status()
+            .unwrap();
+        if !made.success() {
+            // An ffmpeg without x264 (an LGPL build) can't make the test clip.
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let progress = Progress::default();
+        assert_eq!(made_to_upload(&clip, &dir, &default_output(), &progress).unwrap(), clip);
+        let original = media::Output { mix_only: true, ..Default::default() };
+        assert_eq!(made_to_upload(&clip, &dir, &original, &progress).unwrap(), clip);
+        assert!(progress.making().is_none(), "nothing was made");
+        let smaller = media::Output { height: Some(144), ..default_output() };
+        let copy = made_to_upload(&clip, &dir, &smaller, &progress).unwrap();
+        assert_ne!(copy, clip);
+        assert_eq!(media::probe(&copy).unwrap().height, 144);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The dialog says what goes up: the clip itself while it fits, a copy
+    /// under the size once it doesn't, never more than a link can be, and
+    /// when even a copy can't fit, that it's too long.
+    #[test]
+    fn the_dialog_says_what_goes_up() {
+        let info = media::ClipInfo { duration: 60.0, fps: 60.0, width: 1920, height: 1080, video_kbps: Some(40_000), audio: Vec::new(), id: None, bt601: false };
+        let mut edit = media::Edit::new(&info);
+        edit.output = default_output();
+        let form = |bytes: u64, edit: &media::Edit, duration: f64| UploadForm { info: media::ClipInfo { duration, ..info.clone() }, edit: edit.clone(), bytes, open: false };
+        assert_eq!(form(50 << 20, &edit, 60.0).what().0, "As it is, 50 MB");
+        let (what, picture) = form(300 << 20, &edit, 60.0).what();
+        assert_eq!(what, "A copy under 100 MB");
+        assert!(picture.contains("fps"), "{picture}");
+        // No size at all is still the most a link can be.
+        edit.output.max_mb = None;
+        assert_eq!(form(300 << 20, &edit, 60.0).what().0, "A copy under 100 MB");
+        // An hour doesn't fit in 100 MB however small: said, and not uploaded.
+        let hour = form(3 << 30, &edit, 3600.0);
+        assert!(hour.too_long());
+        assert_eq!(hour.what().0, "Too long to fit in 100 MB");
+        assert!(!form(300 << 20, &edit, 60.0).too_long());
+    }
+
+    #[test]
+    fn copies_fit_in_a_link_up_to_a_length() {
+        assert!(fits_in(LINK_MAX_MB, 60.0));
+        assert!(fits_in(LINK_MAX_MB, 20.0 * 60.0), "20 minutes, small");
+        assert!(!fits_in(LINK_MAX_MB, 40.0 * 60.0), "40 minutes is too long");
+        assert!(!fits_in(10, 10.0 * 60.0), "10 minutes in 10 MB");
+        assert_eq!(capped(&media::Output::default()).max_mb, Some(LINK_MAX_MB));
+        assert_eq!(capped(&media::Output { max_mb: Some(500), ..Default::default() }).max_mb, Some(LINK_MAX_MB));
+        assert_eq!(capped(&media::Output { max_mb: Some(25), ..Default::default() }).max_mb, Some(25));
     }
 
     #[test]
@@ -1758,7 +1992,7 @@ mod tests {
         assert!(made.success());
         let progress = Progress::default();
         let named = Named { title: "End to end".into(), game: Some("Test Game".into()) };
-        let link = share(&clip, &named, &progress).unwrap();
+        let link = share(&clip, &named, &default_output(), &progress).unwrap();
         assert!(link.url.ends_with(&link.id), "{link:?}");
         assert_eq!((link.named.as_ref(), link.version), (Some(&named), Version::of(&clip)));
         assert_eq!(progress.sent.load(Ordering::Relaxed), progress.total.load(Ordering::Relaxed));

@@ -26,8 +26,39 @@ pub(crate) struct Window {
     pub id: u32,
     pub pid: i32,
     pub on_screen: bool,
+    /// Where it is, in points (the main display's top-left is 0, 0).
+    pub x: f64,
+    pub y: f64,
     pub width: f64,
     pub height: f64,
+}
+
+impl Window {
+    /// Its size in pixels: as the display under its middle has its points.
+    pub(crate) fn pixels(&self) -> (f64, f64) {
+        let scale = display_scale(self.x + self.width / 2.0, self.y + self.height / 2.0);
+        (self.width * scale, self.height * scale)
+    }
+}
+
+/// How many pixels a point is on the display at `(x, y)` (points), else the
+/// main display's.
+fn display_scale(x: f64, y: f64) -> f64 {
+    use objc2_core_graphics::{CGDisplayBounds, CGGetActiveDisplayList, CGMainDisplayID};
+    let mut ids = [0u32; 16];
+    let mut n = 0u32;
+    let ok = unsafe { CGGetActiveDisplayList(16, ids.as_mut_ptr(), &mut n) } == objc2_core_graphics::CGError::Success;
+    let ids = if ok { &ids[..n as usize] } else { &[][..] };
+    let on = ids.iter().copied().find(|&d| {
+        let b = CGDisplayBounds(d);
+        x >= b.origin.x && x < b.origin.x + b.size.width && y >= b.origin.y && y < b.origin.y + b.size.height
+    });
+    let d = on.unwrap_or_else(|| CGMainDisplayID());
+    let points = CGDisplayBounds(d).size.width;
+    match super::display_pixels(Some(&d.to_string())) {
+        Some((w, _)) if points > 0.0 => w as f64 / points,
+        _ => 1.0,
+    }
 }
 
 /// Every normal app window (layer 0, big enough), front to back; with
@@ -60,7 +91,7 @@ pub(crate) fn windows(on_screen_only: bool) -> Vec<Window> {
             continue;
         }
         let on_screen = d.get(unsafe { kCGWindowIsOnscreen }).and_then(|v| v.downcast::<objc2_core_foundation::CFBoolean>().ok()).is_some_and(|b| b.as_bool());
-        out.push(Window { id: id as u32, pid: pid as i32, on_screen, width: rect.size.width, height: rect.size.height });
+        out.push(Window { id: id as u32, pid: pid as i32, on_screen, x: rect.origin.x, y: rect.origin.y, width: rect.size.width, height: rect.size.height });
     }
     out
 }

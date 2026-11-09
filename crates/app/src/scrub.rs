@@ -34,13 +34,22 @@
 //!   memory. The frames the next few redraws will show are uploaded to the
 //!   GPU ahead of them by a thread of their own ([`Uploader`]): uploading
 //!   one on the UI thread cost it more than drawing everything else did.
+//!   On the card (NVIDIA's NVDEC, AMD's and Intel's through VA-API),
+//!   libavcodec decodes there into buffers of the renderer's, a pool for
+//!   each decoder as on Windows, and the card copies the frames the next
+//!   redraws show into their textures.
 //! - **macOS**: VideoToolbox (the media engine), frames in IOSurfaces the
 //!   renderer draws from where they are.
 //! - **Windows**: Media Foundation on the graphics card, frames in
 //!   textures shared with the renderer, each decoder's in a pool of its
-//!   own made when it opens ([`Inner::limits`]).
+//!   own made when it opens ([`Inner::limits`]). The card's decoder takes
+//!   turns between everything decoding on it, so while another app is
+//!   decoding video (a browser playing one) only one decoder works
+//!   ([`watch_others`]): with three, that video froze. One keeps up as
+//!   well, about: the card decodes as many frames a second for one as
+//!   for three (about a thousand, 1080p on an RTX 4060 Ti).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -63,9 +72,13 @@ fn budget(gpu: &Gpu) -> u64 {
 /// Linux: frames in memory. An eighth of the machine's, or a quarter of
 /// what's free when the clip opens if that's less (a game may hold the
 /// rest), from 128 MB to 3 GB (a 1440p frame is 5.5 MB: up to 550 of
-/// them, 9 s of 60 fps).
+/// them, 9 s of 60 fps). Decoded on the card, as on Windows: a sixth of the
+/// card's own memory, from 512 MB to 1.5 GB (games want the rest).
 #[cfg(target_os = "linux")]
-fn platform_budget(_: &Gpu) -> u64 {
+fn platform_budget(gpu: &Gpu) -> u64 {
+    if let Some(card) = &gpu.card {
+        return card.memory().map_or(512 << 20, |m| m / 6).clamp(512 << 20, 3 << 29);
+    }
     let share = capture::total_memory().map_or(1 << 30, |m| m / 8);
     let free = meminfo("MemAvailable").map_or(u64::MAX, |m| m / 4);
     share.min(free).clamp(128 << 20, 3 << 30)
@@ -100,20 +113,23 @@ fn meminfo(key: &str) -> Option<u64> {
 
 /// How many decoders ([`platform_decoders`]). `HASTECLIP_SCRUB_DECODERS`
 /// overrides it.
-fn decoders() -> usize {
+fn decoders(gpu: &Gpu) -> usize {
     if let Some(n) = std::env::var("HASTECLIP_SCRUB_DECODERS").ok().and_then(|s| s.parse::<usize>().ok()) {
         return n.clamp(1, 32);
     }
-    platform_decoders()
+    platform_decoders(gpu)
 }
 
 /// Linux: one per physical core, 2 to 12. More (one per hardware thread)
 /// decoded no more frames in all, and each one so much slower (25 ms a
 /// frame instead of 6, on 6 cores) that none could keep up with the
 /// playhead at 1×, while the UI, sharing a core with one, drew half as
-/// often.
+/// often. Decoding on the card, 3, as elsewhere.
 #[cfg(target_os = "linux")]
-fn platform_decoders() -> usize {
+fn platform_decoders(gpu: &Gpu) -> usize {
+    if gpu.card.is_some() {
+        return 3;
+    }
     let logical = std::thread::available_parallelism().map_or(4, |n| n.get());
     physical_cores().unwrap_or(logical / 2).clamp(2, 12)
 }
@@ -122,17 +138,20 @@ fn platform_decoders() -> usize {
 /// decodes for all of them. A few at once keep it busy and work in as many
 /// places ahead of the playhead; more would only hold more of its memory.
 #[cfg(not(target_os = "linux"))]
-fn platform_decoders() -> usize {
+fn platform_decoders(_: &Gpu) -> usize {
     3
 }
 
 /// Where decoded frames go: on Windows, the graphics card the renderer
-/// draws with (frames are shared with it); elsewhere, wherever the decoder
-/// puts them.
-#[derive(Clone, Copy)]
+/// draws with (frames are shared with it); on Linux, the renderer's memory
+/// on the card where it decodes there; elsewhere, wherever the decoder puts
+/// them.
+#[derive(Clone)]
 struct Gpu {
     #[cfg(windows)]
     luid: u64,
+    #[cfg(target_os = "linux")]
+    card: Option<Arc<capture::decode::Card>>,
 }
 
 impl Gpu {
@@ -149,7 +168,7 @@ impl Gpu {
 
     #[cfg(target_os = "linux")]
     fn find() -> Option<Self> {
-        Some(Self {})
+        Some(Self { card: crate::gpu_frames::card() })
     }
 }
 
@@ -160,11 +179,18 @@ struct Source {
 
 impl Source {
     /// Open `path`, frames numbered at `fps`. `bytes`: the memory for its
-    /// frames, where a decoder sets that aside as it opens (Windows).
+    /// frames, where a decoder sets that aside as it opens (Windows; Linux
+    /// on the card, its pool of buffers there).
     /// Linux: on one thread (each decoder has a core).
     #[cfg(target_os = "linux")]
-    fn open(path: &Path, fps: f64, _: &Gpu, _: u64) -> anyhow::Result<Self> {
-        let mut dec = Decoder::open_threads(path, Output::Screen, 1)?;
+    fn open(path: &Path, fps: f64, gpu: &Gpu, bytes: u64) -> anyhow::Result<Self> {
+        let on_card = gpu.card.as_ref().and_then(|card| {
+            Decoder::open_card_pooled(path, card, bytes).inspect_err(|e| eprintln!("scrubbing: decoding on the CPU ({e:#})")).ok()
+        });
+        let mut dec = match on_card {
+            Some(d) => d,
+            None => Decoder::open_threads(path, Output::Screen, 1)?,
+        };
         dec.set_fps(fps);
         Ok(Self { dec })
     }
@@ -306,6 +332,44 @@ struct Entry {
     from: Option<usize>,
 }
 
+/// A cached frame that would make way for another, and its weight
+/// ([`Inner::heaviest`]): none when there's room.
+type Weighed = Option<(u64, u64)>;
+
+/// A decoder's frames in the cache, keyframes and the others apart, each in
+/// order. Weight grows away from the playhead either side, so its heaviest
+/// is at an end of one ([`Inner::heaviest_of`]): found at once, not by going
+/// through the whole cache, as a decoder did for every frame (holding the
+/// lock the UI and the other decoders wait on).
+#[derive(Default, Clone)]
+struct Own {
+    keys: BTreeSet<u64>,
+    others: BTreeSet<u64>,
+}
+
+impl Own {
+    fn len(&self) -> usize {
+        self.keys.len() + self.others.len()
+    }
+
+    fn set(&mut self, key: bool) -> &mut BTreeSet<u64> {
+        if key { &mut self.keys } else { &mut self.others }
+    }
+}
+
+/// A decoder's share of the cache when it's full (Windows: its pool's
+/// textures, less [`POOL_FREE`]): what a frame it keeps would take the place
+/// of ([`Inner::share`], [`Inner::own_room`]).
+#[derive(Clone, Copy)]
+struct Full {
+    /// Its own heaviest frame, and its weight: the one that makes way.
+    own: Option<(u64, u64)>,
+    /// The weight of the heaviest frame any decoder working now holds.
+    top: u64,
+    /// Another decoder working now has room.
+    others_free: bool,
+}
+
 /// What a decoder does next: a stretch's keyframe alone, or the stretch.
 #[derive(Clone, Copy)]
 enum Job {
@@ -346,11 +410,17 @@ struct Inner {
     frames: BTreeMap<u64, Entry>,
     /// Per decoder, the stretch (an index into `keys`) it's on.
     jobs: Vec<Option<usize>>,
+    /// How many decoders work (the first so many): all of them, or
+    /// (Windows) one while another app is decoding video ([`watch_others`]).
+    working: usize,
     /// Per decoder, how many of its frames the cache may hold, if that's
-    /// limited (Windows: its pool's textures, less [`POOL_FREE`]), and how
-    /// many it holds.
+    /// limited (Windows: its pool's textures, less [`POOL_FREE`]), and the
+    /// ones it holds.
     limits: Vec<Option<usize>>,
-    held: Vec<usize>,
+    own: Vec<Own>,
+    /// Every cached frame's number, keyframes and the others apart, for
+    /// [`Self::heaviest`].
+    all: Own,
     /// Stretches whose keyframe can't be decoded: left alone.
     dead: Vec<bool>,
     /// The number of the picture the UI took last, for the repaint.
@@ -395,7 +465,9 @@ impl Shared {
         for p in pics {
             if spare.len() >= SPARE {
                 extra.push(p);
-            } else if let Some(buf) = p.gpu.and_then(|s| Arc::try_unwrap(s.nv12).ok()) {
+            } else if let Some(capture::decode::Nv12::Memory(nv12)) = p.gpu.map(|s| s.nv12)
+                && let Ok(buf) = Arc::try_unwrap(nv12)
+            {
                 spare.push(buf);
             }
         }
@@ -408,6 +480,19 @@ impl Shared {
     #[cfg(not(target_os = "linux"))]
     fn let_go(&self, pics: Vec<Picture>) {
         drop(pics);
+    }
+}
+
+/// The last of the engine (it, its decoders' threads and its watcher) gone:
+/// its cache goes now, and with it the decoders' pools of textures, unless
+/// a frame is still held somewhere. Logged (`HASTECLIP_DEBUG_VIDEO`), to see
+/// that a clip let go of actually closed.
+impl Drop for Shared {
+    fn drop(&mut self) {
+        if crate::player::debug() {
+            let frames = self.inner.get_mut().map_or(0, |s| s.frames.len());
+            eprintln!("{:>8.3} scrub: engine closed, letting go of the {frames} frames it kept", crate::player::uptime());
+        }
     }
 }
 
@@ -454,14 +539,17 @@ impl Inner {
     /// grows with distance either side of the playhead (by a factor of
     /// its own per side, and for keyframes), so the heaviest is at an end
     /// of the cache: the first or last keyframe, or the first or last of
-    /// the others.
+    /// the others ([`Self::all`]). (Found going in from each end of the
+    /// cache, past every keyframe kept to the first frame that isn't one,
+    /// it went through a hundred frames each time.)
     fn heaviest(&self, fps: f64) -> Option<(u64, u64)> {
-        let ends = |keys: bool| {
-            let first = self.frames.keys().copied().find(|&i| self.is_key(i) == keys);
-            let last = self.frames.keys().rev().copied().find(|&i| self.is_key(i) == keys);
-            [first, last]
-        };
-        ends(false).into_iter().chain(ends(true)).flatten().map(|i| (i, self.weight(i, fps))).max_by_key(|&(_, w)| w)
+        Self::heaviest_in(&self.all, |i| self.weight(i, fps))
+    }
+
+    /// The heaviest of `frames` by `weight`: at an end of its keyframes or
+    /// of its other frames.
+    fn heaviest_in(frames: &Own, weight: impl Fn(u64) -> u64) -> Option<(u64, u64)> {
+        [frames.others.first(), frames.others.last(), frames.keys.first(), frames.keys.last()].into_iter().flatten().map(|&i| (i, weight(i))).max_by_key(|&(_, w)| w)
     }
 
     /// How many frames are kept now: all the budget holds while scrubbing,
@@ -474,6 +562,69 @@ impl Inner {
     /// something kept.
     fn fits(&self, i: u64, fps: f64) -> bool {
         self.fits_with(i, self.heaviest(fps), fps)
+    }
+
+    /// Whether frame `i`, decoded by decoder `w`, would be kept: the cache
+    /// would keep it, and so would the decoder's own share of it (Windows:
+    /// its pool's textures, [`Self::store`]). Asking only the first, a
+    /// decoder whose pool was full was given frames it then let go, the same
+    /// ones again and again, for as long as the clip was open.
+    fn fits_for(&self, w: usize, i: u64, fps: f64) -> bool {
+        self.fits(i, fps) && self.own_room(i, self.share(w, fps), fps)
+    }
+
+    /// Whether decoder `w` has a texture free for another frame (its share
+    /// isn't limited, or isn't full).
+    fn own_free(&self, w: usize) -> bool {
+        self.limits[w].is_none_or(|limit| self.own[w].len() < limit)
+    }
+
+    /// Decoder `w`'s share of the cache when it's full (none while it has
+    /// room), for [`Self::own_room`]. Of the others, only the decoders
+    /// working now count: those waiting (another app decodes video) neither
+    /// do the work nor make way.
+    fn share(&self, w: usize, fps: f64) -> Option<Full> {
+        if self.own_free(w) {
+            return None;
+        }
+        let n = self.working;
+        let others_free = (0..n).any(|k| k != w && self.limits[k].is_some_and(|limit| self.own[k].len() < limit));
+        let own = self.heaviest_of(w, fps);
+        let top = (0..self.own.len()).filter(|&d| d == w || d < n).filter_map(|d| self.heaviest_of(d, fps)).map(|(_, wt)| wt).max().unwrap_or(0);
+        Some(Full { own, top, others_free })
+    }
+
+    /// Whether a decoder whose share of the cache is `share` ([`Self::share`])
+    /// would keep frame `i`: it has room, or `i` takes the place of its own
+    /// heaviest frame.
+    ///
+    /// Moving, for any nearer frame, so every decoder keeps up. Standing
+    /// still, only for one less than half as far (one barely nearer, 40
+    /// frames off for 41, cost its stretch from the keyframe, two decoders
+    /// taking turns at it for seconds after every pause); only from a
+    /// decoder whose heaviest frame weighs at least half what any working
+    /// decoder's does (what goes is what nothing wants back, as with one
+    /// cache: one whose frames were all near let them go for nearer ones,
+    /// which another decoded again, its whole stretch for each); and not
+    /// while another working decoder has room, which does the work (a full
+    /// one keeping a frame, a far keyframe weighing little, let one near
+    /// the playhead go, decoded again with its stretch).
+    ///
+    /// (Waiting for decoders that didn't work, the one working while another
+    /// app decoded video kept nothing once its pool was full: scrubbing
+    /// showed no new picture till the playhead stopped. And only the decoder
+    /// holding the cache's heaviest frame could make way: after a jump, the
+    /// decoders filled the frames around the playhead one at a time, each
+    /// waking a tenth of a second late and starting from a stretch's
+    /// keyframe again.)
+    fn own_room(&self, i: u64, share: Option<Full>, fps: f64) -> bool {
+        let Some(full) = share else { return true };
+        let Some((_, hw)) = full.own else { return false };
+        let wi = self.weight(i, fps);
+        if self.dir(fps) != 0 {
+            return wi < hw;
+        }
+        !full.others_free && wi.saturating_mul(2) < hw && hw.saturating_mul(2) >= full.top
     }
 
     /// [`Self::fits`] with the heaviest frame found already (it's the same
@@ -494,18 +645,21 @@ impl Inner {
         out
     }
 
-    /// Frame `i` out of the cache, counted off its decoder's.
+    /// Frame `i` out of the cache, and out of its decoder's.
     fn remove(&mut self, i: u64) -> Option<Entry> {
         let e = self.frames.remove(&i)?;
+        let key = self.is_key(i);
+        self.all.set(key).remove(&i);
         if let Some(d) = e.from {
-            self.held[d] = self.held[d].saturating_sub(1);
+            self.own[d].set(key).remove(&i);
         }
         Some(e)
     }
 
-    /// Decoder `d`'s cached frame that would leave first, and its weight.
+    /// Decoder `d`'s cached frame that would leave first, and its weight: at
+    /// an end of its keyframes or of its other frames ([`Own`]).
     fn heaviest_of(&self, d: usize, fps: f64) -> Option<(u64, u64)> {
-        self.frames.iter().filter(|(_, e)| e.from == Some(d)).map(|(&i, _)| (i, self.weight(i, fps))).max_by_key(|&(_, w)| w)
+        Self::heaviest_in(&self.own[d], |i| self.weight(i, fps))
     }
 
     /// Frame `prev` was decoded right before frame `i`: it shows up to the
@@ -522,23 +676,21 @@ impl Inner {
     /// it replaces), for their memory to be used again, outside the lock.
     fn store(&mut self, i: u64, pic: Picture, from: Option<usize>, fps: f64) -> Vec<Picture> {
         let mut out = Vec::new();
-        if let Some(e) = self.frames.get_mut(&i) {
-            // Two frames on one slot: the later shows.
-            let was = std::mem::replace(&mut e.from, from);
-            out.push(std::mem::replace(&mut e.pic, pic));
-            if let Some(d) = was {
-                self.held[d] = self.held[d].saturating_sub(1);
-            }
-            if let Some(d) = from {
-                self.held[d] += 1;
-            }
+        if self.frames.contains_key(&i) {
+            // Decoded again (a decoder starts a stretch at its keyframe, so
+            // it goes through what another kept of it): the same picture, and
+            // the one there stays. Replaced, it moved to this decoder's pool:
+            // two decoders on a stretch took its frames from each other and
+            // both stopped where their pools were full, never getting past
+            // it, decoding the same frames for as long as the clip was open.
+            out.push(pic);
             return out;
         }
         let w = self.weight(i, fps);
         // Its decoder's share full (Windows: the textures it has, but for
         // those it keeps free): room among its own frames, else it isn't kept.
         if let Some(d) = from {
-            while self.limits[d].is_some_and(|limit| self.held[d] >= limit) {
+            while self.limits[d].is_some_and(|limit| self.own[d].len() >= limit) {
                 let Some((far, fw)) = self.heaviest_of(d, fps) else { break };
                 if fw <= w {
                     out.push(pic);
@@ -562,8 +714,10 @@ impl Inner {
             }
         }
         self.frames.insert(i, Entry { pic, to: i, from });
+        let key = self.is_key(i);
+        self.all.set(key).insert(i);
         if let Some(d) = from {
-            self.held[d] += 1;
+            self.own[d].set(key).insert(i);
         }
         self.stats.decoded += 1;
         out
@@ -661,12 +815,12 @@ impl Inner {
         Some((lo as u64, hi as u64))
     }
 
-    /// The first frame of stretch `g` not cached that a decoder starting
-    /// on it now would have out in time ([`Self::reachable`]), counting
-    /// from where the playhead gets into it going `dir` (both ways
-    /// standing still), if one would be kept (`heavy`: see
-    /// [`Self::fits_with`]).
-    fn missing_of(&self, g: usize, dir: i8, heavy: Option<(u64, u64)>, fps: f64, total: u64) -> Option<u64> {
+    /// The first frame of stretch `g` not cached that a decoder starting on
+    /// it now would have out in time ([`Self::reachable`]), counting from
+    /// where the playhead gets into it going `dir` (both ways standing
+    /// still), if it would be kept (`heavy`: see [`Self::fits_with`];
+    /// `share`, the decoder's: [`Self::own_room`]).
+    fn missing_of(&self, g: usize, dir: i8, heavy: Weighed, share: Option<Full>, fps: f64, total: u64) -> Option<u64> {
         let (lo, hi) = self.reachable(g, dir, total)?;
         let at = self.at;
         let m = if hi < at {
@@ -683,7 +837,7 @@ impl Inner {
                 },
             }
         };
-        m.filter(|&m| self.fits_with(m, heavy, fps))
+        m.filter(|&m| self.fits_with(m, heavy, fps) && self.own_room(m, share, fps))
     }
 
     /// What decoder `w` does next, its decoder about to give frame
@@ -691,14 +845,21 @@ impl Inner {
     /// other decoder is on. Pressing is near the playhead going its way;
     /// stretches it's left behind come last.
     fn next_job(&self, w: usize, position: Option<u64>, fps: f64, total: u64) -> Option<Job> {
-        if self.resting || self.keys.is_empty() {
+        if self.resting || self.keys.is_empty() || w >= self.working {
             return None;
         }
         let (at, dir) = (self.at, self.dir(fps));
         let heavy = self.heaviest(fps);
+        let share = self.share(w, fps);
         // Full, nothing farther than this from the playhead would be kept (a
-        // keyframe weighs a [`KEY`]th of its distance).
-        let reach = heavy.filter(|_| self.frames.len() >= self.room()).map(|(_, hw)| hw.saturating_mul(KEY));
+        // keyframe weighs a [`KEY`]th of its distance); nor, its own share
+        // full, by this decoder, which keeps nothing at all standing still
+        // while another has room ([`Self::own_room`]).
+        let mut reach = heavy.filter(|_| self.frames.len() >= self.room()).map(|(_, hw)| hw.saturating_mul(KEY));
+        if let Some(full) = share {
+            let (_, ow) = full.own.filter(|_| dir != 0 || !full.others_free)?;
+            reach = Some(reach.map_or(ow.saturating_mul(KEY), |r| r.min(ow.saturating_mul(KEY))));
+        }
         let mut best: Option<(f64, Job)> = None;
         // Outward from the playhead's stretch, a side at a time, each side
         // ending where nothing could beat what's found or be kept: every
@@ -706,7 +867,7 @@ impl Inner {
         // left behind). A clip with thousands of stretches isn't gone
         // through for each job, holding the lock the UI waits on.
         let h = self.stretch_of(at);
-        self.offer_stretch(h, w, position, heavy, fps, total, &mut best);
+        self.offer_stretch(h, w, position, (heavy, share), fps, total, &mut best);
         let (mut lo, mut hi) = (h, h);
         let (mut left, mut right) = (h > 0, h + 1 < self.keys.len());
         let out_of_reach = |d: u64, behind: bool, best: &Option<(f64, Job)>| {
@@ -719,7 +880,7 @@ impl Inner {
                 if out_of_reach(self.keys[g].saturating_sub(at), dir < 0, &best) {
                     right = false;
                 } else {
-                    self.offer_stretch(g, w, position, heavy, fps, total, &mut best);
+                    self.offer_stretch(g, w, position, (heavy, share), fps, total, &mut best);
                     hi = g;
                     right = hi + 1 < self.keys.len();
                 }
@@ -729,7 +890,7 @@ impl Inner {
                 if out_of_reach(at.saturating_sub(self.end_of(g, total)), dir > 0, &best) {
                     left = false;
                 } else {
-                    self.offer_stretch(g, w, position, heavy, fps, total, &mut best);
+                    self.offer_stretch(g, w, position, (heavy, share), fps, total, &mut best);
                     lo = g;
                     left = lo > 0;
                 }
@@ -739,9 +900,10 @@ impl Inner {
     }
 
     /// For [`Self::next_job`]: what stretch `g` has for decoder `w` (its
-    /// keyframe alone, or the stretch), if it's more pressing than `best`.
+    /// keyframe alone, or the stretch), if it's more pressing than `best`
+    /// and it would be kept (`heavy`, `share`: see [`Self::missing_of`]).
     #[allow(clippy::too_many_arguments)]
-    fn offer_stretch(&self, g: usize, w: usize, position: Option<u64>, heavy: Option<(u64, u64)>, fps: f64, total: u64, best: &mut Option<(f64, Job)>) {
+    fn offer_stretch(&self, g: usize, w: usize, position: Option<u64>, (heavy, share): (Weighed, Option<Full>), fps: f64, total: u64, best: &mut Option<(f64, Job)>) {
         if self.dead[g] || self.jobs.iter().enumerate().any(|(k, j)| k != w && *j == Some(g)) {
             return;
         }
@@ -761,10 +923,10 @@ impl Inner {
             (key, dir < 0)
         };
         let dist = at.abs_diff(entry) as f64 + if behind { 1e9 } else { 0.0 };
-        if !self.frames.contains_key(&key) && self.fits_with(key, heavy, fps) {
+        if !self.frames.contains_key(&key) && self.fits_with(key, heavy, fps) && self.own_room(key, share, fps) {
             offer(dist * KEY_FIRST, Job::Key(g));
         }
-        if let Some(m) = self.missing_of(g, dir, heavy, fps, total) {
+        if let Some(m) = self.missing_of(g, dir, heavy, share, fps, total) {
             let mut u = at.abs_diff(m) as f64 + if behind { 1e9 } else { 0.0 };
             // Its decoder is in this stretch already: nothing to decode twice.
             if position.is_some_and(|p| p > key && p <= end) {
@@ -774,14 +936,15 @@ impl Inner {
         }
     }
 
-    /// Whether a decoder on stretch `g`, about to decode frame `next`,
+    /// Whether decoder `w` on stretch `g`, about to decode frame `next`,
     /// should leave it: the playhead has left it behind at speed, or
     /// passed `next` with no catching it up (going back, a frame past the
-    /// playhead is behind it), or nothing more of it would be kept.
-    fn should_stop(&self, g: usize, next: u64, fps: f64, total: u64) -> bool {
+    /// playhead is behind it), or nothing more of it would be kept; or
+    /// it's stopped working (another app decodes video).
+    fn should_stop(&self, w: usize, g: usize, next: u64, fps: f64, total: u64) -> bool {
         let (key, end, at) = (self.keys[g], self.end_of(g, total), self.at);
         // Playing: the playback decoder has the frames.
-        if next > end || self.resting {
+        if next > end || self.resting || w >= self.working {
             return true;
         }
         let dir = self.dir(fps);
@@ -791,13 +954,13 @@ impl Inner {
         if dir < 0 && (key > at || next > at) {
             return true;
         }
-        !self.fits(at.clamp(next, end), fps)
+        !self.fits_for(w, at.clamp(next, end), fps)
     }
 
     /// Whether a stretch nearer the playhead than `g` (the one it's in or
-    /// the next two its way; either way, standing still) has frames to
-    /// decode in time and no decoder on it.
-    fn more_pressing(&self, g: usize, fps: f64, total: u64) -> bool {
+    /// the next two its way; either way, standing still) has frames that
+    /// decoder `w` would decode in time and keep, and no decoder on it.
+    fn more_pressing(&self, w: usize, g: usize, fps: f64, total: u64) -> bool {
         let dir = self.dir(fps);
         let h = self.stretch_of(self.at) as i64;
         let near: [i64; 3] = match dir {
@@ -806,16 +969,38 @@ impl Inner {
             _ => [h, h - 1, h + 1],
         };
         let heavy = self.heaviest(fps);
+        let share = self.share(w, fps);
         for n in near {
             let Some(n) = usize::try_from(n).ok().filter(|&n| n < self.keys.len()) else { continue };
             if n == g {
                 return false;
             }
-            if !self.dead[n] && !self.jobs.contains(&Some(n)) && self.missing_of(n, dir, heavy, fps, total).is_some() {
+            if !self.dead[n] && !self.jobs.contains(&Some(n)) && self.missing_of(n, dir, heavy, share, fps, total).is_some() {
                 return true;
             }
         }
         false
+    }
+
+    /// Whether decoder `w`, about to give frame `position` reading on, goes
+    /// on from there on stretch `g` rather than from its keyframe: that's in
+    /// the stretch, and no frame before it that would be kept is missing.
+    /// Weight grows away from the playhead, so the likeliest kept of the
+    /// missing ones are those nearest it either way, and the first after
+    /// the keyframe (looking at only that one, it read on away from the
+    /// frames wanted).
+    fn reads_on(&self, w: usize, g: usize, position: Option<u64>, fps: f64, total: u64) -> bool {
+        let (key, end) = (self.keys[g], self.end_of(g, total));
+        position.is_some_and(|p| {
+            p > key && p <= end && {
+                let (heavy, share) = (self.heaviest(fps), self.share(w, fps));
+                let c = self.at.clamp(key, p - 1);
+                [self.missing_forward(key, p - 1), self.missing_backward(c, key), self.missing_forward(c, p - 1)]
+                    .into_iter()
+                    .flatten()
+                    .all(|m| !(self.fits_with(m, heavy, fps) && self.own_room(m, share, fps)))
+            }
+        })
     }
 
     /// Frame `i` just came in: whether the UI should redraw (while
@@ -837,7 +1022,8 @@ impl Engine {
     /// none if the renderer can't draw decoded frames where they are.
     pub fn open(ctx: &egui::Context, path: &Path, fps: f64, total: u64) -> Option<Self> {
         let gpu = Gpu::find()?;
-        let n = decoders();
+        let n = decoders(&gpu);
+        let budget = budget(&gpu);
         let shared = Arc::new(Shared {
             inner: Mutex::new(Inner {
                 keys: Vec::new(),
@@ -853,8 +1039,11 @@ impl Engine {
                 frame_secs: 1.0 / 150.0,
                 frames: BTreeMap::new(),
                 jobs: vec![None; n],
+                // Windows: one, till it's known no other app is decoding video.
+                working: if cfg!(windows) { 1 } else { n },
                 limits: vec![None; n],
-                held: vec![0; n],
+                own: vec![Own::default(); n],
+                all: Own::default(),
                 dead: Vec::new(),
                 shown: None,
                 stats: Stats::default(),
@@ -869,11 +1058,16 @@ impl Engine {
             ctx: ctx.clone(),
             fps,
             total,
-            budget: budget(&gpu),
+            budget,
         });
         for w in 0..n {
             let (shared, path) = (shared.clone(), path.to_path_buf());
             std::thread::Builder::new().name(format!("scrub decoder {w}")).spawn(move || work(shared, path, w)).expect("spawn a scrub decoder");
+        }
+        #[cfg(windows)]
+        {
+            let shared = shared.clone();
+            std::thread::Builder::new().name("scrub watcher".into()).spawn(move || watch_others(shared)).expect("spawn the scrub watcher");
         }
         Some(Self { shared })
     }
@@ -947,6 +1141,12 @@ impl Engine {
     /// may have been skipped.)
     pub fn offer(&self, pic: Picture) {
         if !KEEPS_PLAYBACK {
+            return;
+        }
+        // Linux, decoded on the card: in a buffer of playback's own few
+        // dozen, which it would run short of (as on Windows).
+        #[cfg(target_os = "linux")]
+        if pic.gpu.as_ref().is_some_and(|g| matches!(g.nv12, capture::decode::Nv12::Card(_))) {
             return;
         }
         let mut s = self.shared.inner.lock().unwrap();
@@ -1254,7 +1454,11 @@ fn upload_work(shared: Arc<UpShared>, engine: Arc<Shared>) {
         };
         match job {
             Some((k, p)) => {
-                let written = p.gpu.as_ref().is_some_and(|g| shared.ring.fill(k, &g.nv12));
+                let written = match p.gpu.as_ref().map(|g| &g.nv12) {
+                    Some(capture::decode::Nv12::Memory(nv12)) => shared.ring.fill(k, nv12),
+                    Some(capture::decode::Nv12::Card(f)) => shared.ring.fill_card(k, f.clone()),
+                    None => false,
+                };
                 let mut s = shared.inner.lock().unwrap();
                 if written {
                     // Ready once the UI has had it copied in (`Uploader::flush`).
@@ -1303,6 +1507,71 @@ fn trim_memory() {
 fn debug_jobs() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("HASTECLIP_DEBUG_SCRUB").is_some())
+}
+
+/// Windows: another app keeping the card's video decoder at least this busy
+/// (percent, all of them together) is decoding video.
+#[cfg(windows)]
+const OTHERS_DECODING: f64 = 0.5;
+
+/// Windows: while the clip is open, whether another app is decoding video (a
+/// browser playing one), read about once a second: while one is, only the
+/// first decoder works. The card's video decoder takes turns between
+/// everything decoding on it, whatever their priority: beside the three
+/// decoders, busy all through a scrub, another app got a fifth of it, too
+/// little for a big video, which froze and stuttered; beside one, about
+/// half (see the `decode_share` example). And one scrubs about as well:
+/// the card decodes about as many frames a second, and jumps to as many
+/// keyframes, for one decoder as for three (1080p on an RTX 4060 Ti,
+/// 2026-11-04: a thousand frames, 430 jumps against 460). (Its pool full,
+/// the one working kept nothing at first, waiting for the others to fill
+/// theirs: see [`Inner::own_room`].) It starts with one, till the first
+/// reading (a fraction of a second) says no other app is decoding.
+#[cfg(windows)]
+fn watch_others(shared: Arc<Shared>) {
+    let Some(mut others) = capture::win::gpu::GpuUse::video_decode() else {
+        set_working(&shared, shared.workers);
+        return;
+    };
+    let me = std::process::id();
+    // Readings in a row with no other app decoding (none yet, so the
+    // first quiet one is enough).
+    let mut quiet = 1;
+    let mut wait = Duration::from_millis(300);
+    loop {
+        // In short steps, to be gone soon after the clip closes.
+        let until = Instant::now() + wait;
+        while Instant::now() < until {
+            if shared.stop.load(Ordering::Relaxed) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        wait = Duration::from_secs(1);
+        let busy = others.others_now(me);
+        quiet = if busy > OTHERS_DECODING { 0 } else { quiet + 1 };
+        // All of them again once the other app's been quiet for two readings:
+        // a video that buffers or loops is no reason to switch back and forth.
+        let n = if quiet >= 2 { shared.workers } else { 1 };
+        if set_working(&shared, n) && crate::player::debug() {
+            eprintln!("{:>8.3} scrub: other apps keep the video decoder {busy:.0}% busy: {n} of {} decoders work", crate::player::uptime(), shared.workers);
+        }
+    }
+}
+
+/// Let the first `n` decoders work (the others finish the frame they're on
+/// and wait): whether that's a change.
+#[cfg(windows)]
+fn set_working(shared: &Shared, n: usize) -> bool {
+    let mut s = shared.inner.lock().unwrap();
+    if s.working == n {
+        return false;
+    }
+    s.working = n;
+    drop(s);
+    // Those that may work now find their jobs.
+    shared.wake.notify_all();
+    true
 }
 
 /// A decoder's thread: its stretches, one after another.
@@ -1368,22 +1637,7 @@ fn work(shared: Arc<Shared>, path: PathBuf, w: usize) {
                         Job::Key(g) | Job::Stretch(g) => g,
                     };
                     let (key, end) = (s.keys[g], s.end_of(g, total));
-                    // On from where the decoder is when that's in the stretch
-                    // and no frame before it that would be kept is missing.
-                    // Weight grows away from the playhead, so the likeliest
-                    // kept of the missing ones are those nearest it either
-                    // way, and the first after the keyframe (looking at only
-                    // that one, it read on away from the frames wanted).
-                    let read_on = position.is_some_and(|p| {
-                        p > key && p <= end && {
-                            let heavy = s.heaviest(fps);
-                            let c = s.at.clamp(key, p - 1);
-                            [s.missing_forward(key, p - 1), s.missing_backward(c, key), s.missing_forward(c, p - 1)]
-                                .into_iter()
-                                .flatten()
-                                .all(|m| !s.fits_with(m, heavy, fps))
-                        }
-                    });
+                    let read_on = s.reads_on(w, g, position, fps, total);
                     s.jobs[w] = Some(g);
                     let wanted = if s.scrubbing { 0 } else { 10 };
                     if wanted != nice && set_nice(wanted) {
@@ -1450,7 +1704,7 @@ fn work(shared: Arc<Shared>, path: PathBuf, w: usize) {
                         let i = pic.index;
                         s.frame_secs += (took - s.frame_secs) * 0.05;
                         s.cover(prev, i);
-                        if s.fits(i, fps) {
+                        if s.fits_for(w, i, fps) {
                             evicted = s.store(i, pic, Some(w), fps);
                             redraw = s.worth_a_redraw(i);
                         } else {
@@ -1465,9 +1719,9 @@ fn work(shared: Arc<Shared>, path: PathBuf, w: usize) {
                             Some("its end")
                         } else if shared.stop.load(Ordering::Relaxed) {
                             Some("closing")
-                        } else if s.should_stop(g, i + 1, fps, total) {
+                        } else if s.should_stop(w, g, i + 1, fps, total) {
                             Some("passed, or no more of it kept")
-                        } else if n % LOOK == 0 && s.more_pressing(g, fps, total) {
+                        } else if n.is_multiple_of(LOOK) && s.more_pressing(w, g, fps, total) {
                             Some("a nearer stretch waits")
                         } else {
                             None
@@ -1501,7 +1755,11 @@ fn work(shared: Arc<Shared>, path: PathBuf, w: usize) {
                         }
                         Err(e) => {
                             eprintln!("scrubbing: decoder {w} can't open the clip again: {e:#}");
-                            shared.inner.lock().unwrap().jobs[w] = None;
+                            let mut s = shared.inner.lock().unwrap();
+                            s.jobs[w] = None;
+                            // Its room isn't waited for (`Inner::share`).
+                            s.limits[w] = None;
+                            drop(s);
                             shared.failed.fetch_add(1, Ordering::Relaxed);
                             return;
                         }
@@ -1540,8 +1798,10 @@ mod tests {
             frame_secs: 1.0 / 150.0,
             frames: BTreeMap::new(),
             jobs: vec![None; workers],
+            working: workers,
             limits: vec![None; workers],
-            held: vec![0; workers],
+            own: vec![Own::default(); workers],
+            all: Own::default(),
             dead: vec![false; 100],
             shown: None,
             stats: Stats::default(),
@@ -1554,9 +1814,14 @@ mod tests {
 
     /// What each decoder's count says agrees with the frames kept.
     fn counts_agree(s: &Inner) {
-        for d in 0..s.held.len() {
-            let kept = s.frames.values().filter(|e| e.from == Some(d)).count();
-            assert_eq!(s.held[d], kept, "decoder {d}'s count");
+        let (keys, others): (Vec<u64>, Vec<u64>) = s.frames.keys().partition(|&&i| s.is_key(i));
+        assert_eq!(s.all.keys.iter().copied().collect::<Vec<_>>(), keys, "the cache's keyframes");
+        assert_eq!(s.all.others.iter().copied().collect::<Vec<_>>(), others, "the cache's other frames");
+        for d in 0..s.own.len() {
+            let kept: Vec<u64> = s.frames.iter().filter(|(_, e)| e.from == Some(d)).map(|(&i, _)| i).collect();
+            let (keys, others): (Vec<u64>, Vec<u64>) = kept.iter().partition(|&&i| s.is_key(i));
+            assert_eq!(s.own[d].keys.iter().copied().collect::<Vec<_>>(), keys, "decoder {d}'s keyframes");
+            assert_eq!(s.own[d].others.iter().copied().collect::<Vec<_>>(), others, "decoder {d}'s other frames");
         }
     }
 
@@ -1575,23 +1840,369 @@ mod tests {
         for i in 1100..1110 {
             s.store(i, picture(i), Some(1), fps);
         }
-        assert_eq!(s.held[0], 5);
+        assert_eq!(s.own[0].len(), 5);
         let mine: Vec<u64> = s.frames.iter().filter(|(_, e)| e.from == Some(0)).map(|(&i, _)| i).collect();
         assert_eq!(mine, vec![1000, 1001, 1002, 1003, 1004], "the nearest five");
-        assert_eq!(s.held[1], 10, "the other decoder's frames stay");
+        assert_eq!(s.own[1].len(), 10, "the other decoder's frames stay");
         // The playhead moves back: a nearer frame of its own takes the
         // farthest one's place.
         s.at = 990;
         let out = s.store(995, picture(995), Some(0), fps);
         assert_eq!(out.iter().map(|p| p.index).collect::<Vec<_>>(), vec![1004]);
         assert!(s.frames.contains_key(&995) && !s.frames.contains_key(&1004));
-        assert_eq!(s.held[0], 5);
+        assert_eq!(s.own[0].len(), 5);
         counts_agree(&s);
     }
 
-    /// The counts follow every way a frame leaves or replaces another:
-    /// two frames on one slot, a full cache, shrinking when a scrub ends.
-    /// Playback's frames count against no decoder.
+    /// Decoders working as [`work`] does, one job at a time each, for up to
+    /// `rounds` rounds: how many frames they decoded, and whether they ran
+    /// out of things to do (the playhead standing still, they should).
+    fn run_decoders(s: &mut Inner, fps: f64, total: u64, rounds: usize) -> (u64, bool) {
+        let mut decoded = 0;
+        for _ in 0..rounds {
+            let mut busy = false;
+            for w in 0..s.jobs.len() {
+                let Some(job) = s.next_job(w, None, fps, total) else { continue };
+                busy = true;
+                let g = match job {
+                    Job::Key(g) | Job::Stretch(g) => g,
+                };
+                let (key, end) = (s.keys[g], s.end_of(g, total));
+                s.jobs[w] = Some(g);
+                let mut prev = None;
+                for i in key..=end {
+                    decoded += 1;
+                    s.cover(prev, i);
+                    if s.fits_for(w, i, fps) {
+                        s.store(i, picture(i), Some(w), fps);
+                    }
+                    prev = Some(i);
+                    if matches!(job, Job::Key(_)) || i >= end || s.should_stop(w, g, i + 1, fps, total) {
+                        break;
+                    }
+                }
+                s.jobs[w] = None;
+            }
+            if !busy {
+                return (decoded, true);
+            }
+        }
+        (decoded, false)
+    }
+
+    /// A decoder in [`play_scrub`]: its job and stretch, the frame it gives
+    /// next and when that's out, the one it gave before, how many it gave on
+    /// this job, where it is reading on, whether it looks for a job now (it
+    /// just left one), and, waiting, till when.
+    struct Sim {
+        job: Option<(Job, usize)>,
+        next: u64,
+        ready: f64,
+        prev: Option<u64>,
+        n: u64,
+        position: Option<u64>,
+        look: bool,
+        wait: f64,
+        /// When it asked for the frame it gives next.
+        asked: f64,
+    }
+
+    /// A scrub played out in time as [`work`] and the UI go at it, at the
+    /// card's pace (an RTX 4060 Ti, 1080p60, measured 2026-11-04): the
+    /// decoders share its one video decoder, about a thousand frames a
+    /// second whether one decodes or six, so a frame takes a millisecond
+    /// for each decoder at it; a jump to a keyframe 2 ms more (low-latency
+    /// mode, alone); one with nothing to do waits
+    /// a tenth of a second, or till the playhead moves ([`Engine::scrub_to`]
+    /// wakes it). The UI redraws at 240 Hz, the playhead at frame `path(t)`,
+    /// `t` seconds in, for `secs`. Over the redraws: the share that showed
+    /// the playhead's own frame, and how many frames off the picture was on
+    /// average (nothing within reach counting as a second off).
+    fn play_scrub(s: &mut Inner, fps: f64, total: u64, secs: f64, path: impl Fn(f64) -> f64) -> (f64, f64) {
+        const FRAME: f64 = 1e-3;
+        const START: f64 = 2e-3;
+        const REDRAW: f64 = 1.0 / 240.0;
+        const STEP: f64 = 2e-4;
+        s.frame_secs = FRAME;
+        s.scrubbing = true;
+        let mut sims: Vec<Sim> = (0..s.jobs.len()).map(|_| Sim { job: None, next: 0, ready: 0.0, prev: None, n: 0, position: None, look: true, wait: 0.0, asked: 0.0 }).collect();
+        let (mut exact, mut off, mut redraws) = (0u64, 0u64, 0u64);
+        let (mut t, mut redraw) = (0.0, 0.0);
+        while t < secs {
+            let mut woken = false;
+            if t >= redraw {
+                redraw += REDRAW;
+                let before = (s.at, s.dir(fps));
+                s.at = path(t).round().clamp(0.0, (total - 1) as f64) as u64;
+                s.speed = (path(t + REDRAW) - path(t)) / REDRAW;
+                woken = before != (s.at, s.dir(fps));
+                redraws += 1;
+                match s.nearest(s.at, fps) {
+                    Some((_, true)) => exact += 1,
+                    Some((p, false)) => off += p.index.abs_diff(s.at),
+                    None => off += fps as u64,
+                }
+            }
+            let busy = sims.iter().filter(|d| d.job.is_some()).count().max(1) as f64;
+            for (w, d) in sims.iter_mut().enumerate() {
+                if d.ready > t {
+                    continue;
+                }
+                if let Some((job, g)) = d.job {
+                    let i = d.next;
+                    // A frame's time, smoothed, as `work` measures it.
+                    s.frame_secs += (t - d.asked - s.frame_secs) * 0.05;
+                    s.cover(d.prev, i);
+                    if s.fits_for(w, i, fps) {
+                        s.store(i, picture(i), Some(w), fps);
+                    }
+                    (d.prev, d.position, d.n) = (Some(i), Some(i + 1), d.n + 1);
+                    let leave = matches!(job, Job::Key(_))
+                        || i >= s.end_of(g, total)
+                        || s.should_stop(w, g, i + 1, fps, total)
+                        || (d.n.is_multiple_of(LOOK) && s.more_pressing(w, g, fps, total));
+                    if !leave {
+                        (d.next, d.ready, d.asked) = (i + 1, t + FRAME * busy, t);
+                        continue;
+                    }
+                    s.jobs[w] = None;
+                    (d.job, d.look) = (None, true);
+                }
+                if !(woken || t >= d.wait || std::mem::take(&mut d.look)) {
+                    continue;
+                }
+                let Some(job) = s.next_job(w, d.position, fps, total) else {
+                    d.wait = t + 0.1;
+                    continue;
+                };
+                let g = match job {
+                    Job::Key(g) | Job::Stretch(g) => g,
+                };
+                let key = s.keys[g];
+                let read_on = s.reads_on(w, g, d.position, fps, total);
+                let start = if read_on || d.position == Some(key) { 0.0 } else { START };
+                s.jobs[w] = Some(g);
+                d.job = Some((job, g));
+                d.next = if read_on { d.position.unwrap_or(key) } else { key };
+                d.prev = if read_on { d.position.map(|p| p - 1) } else { None };
+                (d.n, d.ready, d.asked) = (0, t + FRAME * busy + start, t);
+            }
+            t += STEP;
+        }
+        s.jobs = vec![None; s.jobs.len()];
+        (exact as f64 / redraws as f64, off as f64 / redraws as f64)
+    }
+
+    /// Where [`play_scrubs`] takes the playhead from frame 3000 (paused),
+    /// `t` seconds into a drag.
+    type Path = Box<dyn Fn(f64) -> f64>;
+
+    /// Drags at speeds either way, back and forth (a second each way, up
+    /// to 6×), and a click far off held a moment before dragging on at 1×.
+    fn scrub_paths() -> Vec<(&'static str, Path)> {
+        let at = |speed: f64| -> Path { Box::new(move |t| 3000.0 + speed * 60.0 * t) };
+        vec![
+            ("0.5x", at(0.5)),
+            ("1x", at(1.0)),
+            ("3x", at(3.0)),
+            ("10x", at(10.0)),
+            ("30x", at(30.0)),
+            ("-1x", at(-1.0)),
+            ("-10x", at(-10.0)),
+            ("back and forth", Box::new(|t: f64| 3000.0 + 60.0 * (std::f64::consts::TAU * t / 2.0).sin())),
+            ("click, hold, 1x", Box::new(|t: f64| 4500.0 + 60.0 * (t - 0.3).max(0.0))),
+        ]
+    }
+
+    /// Each of [`scrub_paths`] played out ([`play_scrub`]) with `workers`
+    /// decoders, their pools limited (Windows), the cache filled around the
+    /// paused playhead first by `working` of them (one: another app was
+    /// decoding video). Each path's share of redraws exact, and frames off.
+    fn play_scrubs(workers: usize, working: usize) -> Vec<(&'static str, f64, f64)> {
+        let fps = 60.0;
+        scrub_paths()
+            .into_iter()
+            .map(|(name, path)| {
+                let mut s = cache(workers, 80 * workers, 3000);
+                s.scrubbing = false;
+                s.working = working;
+                s.limits = vec![Some(80); workers];
+                assert!(run_decoders(&mut s, fps, 6000, 400).1, "{name}: the paused decoders settle");
+                let (exact, off) = play_scrub(&mut s, fps, 6000, 1.5, path);
+                counts_agree(&s);
+                (name, exact, off)
+            })
+            .collect()
+    }
+
+    /// Scrubbed at any speed, either way, the picture keeps up with the
+    /// playhead ([`play_scrubs`] with three decoders, `working` of them
+    /// having filled the cache around the paused playhead).
+    fn scrubs_keep_up(working: usize) {
+        for (name, exact, off) in play_scrubs(3, working) {
+            // Twice what one decoder (the card's) decodes a second, not every
+            // frame can be had: the first ones of each stretch, keyframes.
+            let (least, most) = if name == "30x" { (0.3, 8.0) } else { (0.9, 1.0) };
+            assert!(exact >= least, "{name}: the playhead's own frame on {:.0}% of redraws", exact * 100.0);
+            assert!(off <= most, "{name}: the picture {off:.1} frames off on average");
+        }
+    }
+
+    /// Another app decoding video (Windows), one decoder scrubs: as well,
+    /// about. (Once its pool was full it kept nothing, waiting for the
+    /// others, which didn't work: the playhead's own frame showed on two
+    /// redraws in three at 1×, one in five at 3× with the picture 80 frames
+    /// off on average, one in fourteen at 10× (over 200 off), none after a
+    /// click.)
+    #[test]
+    fn scrubs_keep_up_beside_another_video() {
+        scrubs_keep_up(1);
+    }
+
+    #[test]
+    fn scrubs_keep_up_alone() {
+        scrubs_keep_up(3);
+    }
+
+    /// Paused (Windows: each decoder's pool limits what it keeps), the
+    /// decoders fill the cache around the playhead and then stop: a decoder
+    /// whose pool is full isn't given frames it couldn't keep. (It was: it
+    /// decoded a stretch, kept none of it, and was given the same stretch
+    /// again, the hardware decoder busy for as long as the player was open.)
+    #[test]
+    fn paused_decoders_settle() {
+        let fps = 60.0;
+        for at in [3030, 0, 3000, 5999] {
+            let mut s = cache(3, 120, at);
+            s.scrubbing = false;
+            s.limits = vec![Some(40); 3];
+            let (decoded, settled) = run_decoders(&mut s, fps, 6000, 200);
+            assert!(settled, "at {at}: still decoding after {decoded} frames, {} kept", s.frames.len());
+            assert!(decoded < 600, "at {at}: {decoded} frames decoded to keep {}", s.frames.len());
+            assert!(s.frames.len() >= 100, "at {at}: the room's used ({} kept)", s.frames.len());
+            assert!(s.frames.contains_key(&at), "at {at}: the playhead's own frame");
+            counts_agree(&s);
+        }
+    }
+
+    /// While another app decodes video (Windows), only the first decoder
+    /// works around a paused playhead: the others get nothing to do and
+    /// leave the stretch they're on, and the one alone fills the cache
+    /// around it.
+    #[test]
+    fn only_working_decoders_decode() {
+        let fps = 60.0;
+        let mut s = cache(3, 120, 3030);
+        s.scrubbing = false;
+        s.working = 1;
+        assert!(s.next_job(0, None, fps, 6000).is_some());
+        assert!(s.next_job(1, None, fps, 6000).is_none() && s.next_job(2, None, fps, 6000).is_none());
+        let g = s.stretch_of(3030);
+        assert!(s.should_stop(1, g, 3031, fps, 6000) && !s.should_stop(0, g, 3031, fps, 6000));
+        let (decoded, settled) = run_decoders(&mut s, fps, 6000, 400);
+        assert!(settled, "still decoding after {decoded} frames");
+        assert!(s.frames.contains_key(&3030), "the playhead's own frame");
+        assert!(s.frames.values().all(|e| e.from == Some(0)), "only the first decoder's frames");
+        counts_agree(&s);
+    }
+
+    /// While another app decodes video (Windows), the one decoder working
+    /// follows the paused playhead to where it's put: the frames in its
+    /// pool, around where it was, make way for those around where it went.
+    /// (They didn't: its pool full and the others' empty, the cache wasn't
+    /// full, and it kept nothing, leaving the work to decoders that didn't
+    /// work. Scrubbing showed no new picture until the playhead stopped.)
+    #[test]
+    fn one_decoder_follows_a_jump() {
+        let fps = 60.0;
+        let mut s = cache(3, 120, 1000);
+        s.scrubbing = false;
+        s.working = 1;
+        s.limits = vec![Some(40); 3];
+        assert!(run_decoders(&mut s, fps, 6000, 200).1);
+        assert_eq!(s.own.iter().map(Own::len).collect::<Vec<_>>(), [40, 0, 0]);
+        s.at = 4030;
+        let (decoded, settled) = run_decoders(&mut s, fps, 6000, 200);
+        assert!(settled, "still decoding after {decoded} frames");
+        assert!(decoded < 300, "{decoded} frames decoded");
+        assert!(s.frames.contains_key(&4030), "the playhead's own frame");
+        let near = s.frames.iter().filter(|(i, e)| i.abs_diff(4030) <= 60 && e.from == Some(0)).count();
+        assert!(near >= 25, "{near} of the working decoder's 40 near the playhead");
+        counts_agree(&s);
+    }
+
+    /// Paused, the playhead put far off: each decoder whose pool holds
+    /// frames from around where it was takes a stretch near where it went,
+    /// at once. (Only the one holding the farthest frame did, the others
+    /// waiting their turns, each decoding from a stretch's keyframe again
+    /// what the one before had.)
+    #[test]
+    fn every_decoder_follows_a_jump() {
+        let fps = 60.0;
+        let mut s = cache(3, 120, 1000);
+        s.scrubbing = false;
+        s.limits = vec![Some(40); 3];
+        assert!(run_decoders(&mut s, fps, 6000, 200).1);
+        s.at = 4030;
+        for w in 0..3 {
+            let Some(Job::Key(g) | Job::Stretch(g)) = s.next_job(w, None, fps, 6000) else { panic!("decoder {w} has nothing to do") };
+            s.jobs[w] = Some(g);
+        }
+    }
+
+    /// While another app decodes video (Windows), the one decoder working
+    /// keeps up with a scrub, its pool full: its frames passed make way for
+    /// those ahead. The others stay out of it. Once the other app's quiet,
+    /// they work too, and the full one leaves the frames ahead to them
+    /// while they have room, standing still, but not moving.
+    #[test]
+    fn one_decoder_keeps_up_with_a_scrub() {
+        let fps = 60.0;
+        let mut s = cache(3, 120, 1000);
+        s.scrubbing = false;
+        s.working = 1;
+        s.limits = vec![Some(40); 3];
+        assert!(run_decoders(&mut s, fps, 6000, 200).1);
+        s.scrubbing = true;
+        s.at = 1030;
+        s.speed = 2.0 * fps;
+        assert!(s.next_job(0, None, fps, 6000).is_some(), "the one working, its pool full");
+        assert!(s.next_job(1, None, fps, 6000).is_none() && s.next_job(2, None, fps, 6000).is_none());
+        s.working = 3;
+        for w in 0..3 {
+            let Some(Job::Key(g) | Job::Stretch(g)) = s.next_job(w, None, fps, 6000) else { panic!("decoder {w} has nothing to do") };
+            s.jobs[w] = Some(g);
+        }
+        s.jobs = vec![None; 3];
+        s.speed = 0.0;
+        assert!(s.next_job(0, None, fps, 6000).is_none(), "standing still, the full one waits for those with room");
+        assert!(s.next_job(1, None, fps, 6000).is_some());
+    }
+
+    /// Paused, the playhead put somewhere else (a click on the timeline):
+    /// the frames around it take the places of those around where it was,
+    /// and then the decoders stop again.
+    #[test]
+    fn paused_decoders_follow_a_jump() {
+        let fps = 60.0;
+        let mut s = cache(3, 120, 1000);
+        s.scrubbing = false;
+        s.limits = vec![Some(40); 3];
+        assert!(run_decoders(&mut s, fps, 6000, 200).1);
+        s.at = 4030;
+        let (decoded, settled) = run_decoders(&mut s, fps, 6000, 200);
+        assert!(settled, "still decoding after {decoded} frames");
+        assert!(decoded < 600, "{decoded} frames decoded");
+        assert!(s.frames.contains_key(&4030), "the playhead's own frame");
+        let near = s.frames.keys().filter(|&&i| i.abs_diff(4030) <= 120).count();
+        assert!(near >= 90, "{near} of {} kept near the playhead", s.frames.len());
+        counts_agree(&s);
+    }
+
+    /// The counts follow every way a frame leaves or another comes: a frame
+    /// decoded again (the one there stays, with its decoder), a full cache,
+    /// shrinking when a scrub ends. Playback's frames count against no
+    /// decoder.
     #[test]
     fn counts_follow_the_cache() {
         let fps = 60.0;
@@ -1601,11 +2212,13 @@ mod tests {
             counts_agree(&s);
         }
         assert_eq!(s.frames.len(), 12);
-        // Another decoder's frame on the same slot.
+        // Another decoder's copy of a frame kept: let go, the first stays.
         let d = s.frames[&500].from.unwrap();
-        s.store(500, picture(500), Some((d + 1) % 3), fps);
+        let out = s.store(500, picture(500), Some((d + 1) % 3), fps);
+        assert_eq!((out.len(), s.frames[&500].from), (1, Some(d)));
         counts_agree(&s);
-        // Playback's.
+        // Playback's, on a slot of its own.
+        s.remove(501);
         s.store(501, picture(501), None, fps);
         counts_agree(&s);
         assert!(s.frames[&501].from.is_none());

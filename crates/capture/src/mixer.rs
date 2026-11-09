@@ -3,14 +3,15 @@
 //! recorded tracks.
 //!
 //! Every source is aligned on one host clock: [`SourceFeed`] places each block of
-//! samples by its capture timestamp (gaps become silence, overlaps are dropped)
+//! samples by its capture timestamp (gaps become silence, overlaps are dropped,
+//! a clock that runs a little fast or slow is steered back a frame at a time)
 //! and converts it to 48 kHz stereo. The mixer then pulls exactly the same span
 //! from every feed a short moment behind real time, applies volume, meters it, and
 //! writes the mix and the separate tracks — so tracks can never drift apart.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -357,15 +358,27 @@ struct FeedState {
     /// Output frames still to discard: resampler delay, or audio that arrived
     /// after the mixer had already moved past it.
     skip_out: i64,
+    /// Input frames still to throw away: sound that came twice (an overlap
+    /// put right at once), from the packets that bring it.
+    skip_in: i64,
+    /// Keeps its sound on its timestamps while its clock runs a little fast
+    /// or slow.
+    steer: Steer,
     /// Both sides made one, when this feed is a microphone's: before noise
     /// removal, which then cleans what's heard.
     mono: Option<Mono>,
     /// Noise removal, when this feed is a microphone's.
     denoise: Option<Denoise>,
+    /// Its stream has stopped (see [`SourceFeed::remove_child`]): it takes
+    /// no more sound, and goes once the mixer has taken what it has.
+    closed: bool,
 }
 
 impl SourceFeed {
-    /// Correct timing once it's off by more than this; smaller jitter is ignored.
+    /// Timing off by more than this, even for a packet, is put right at
+    /// once: a gap (a dropout) filled with silence, or what came twice thrown
+    /// away. Smaller sudden offsets are too, once they're kept up, and a
+    /// clock that runs a little fast or slow is steered back (see [`Steer`]).
     const TOLERANCE: f64 = 0.04;
     /// A gap longer than this starts the feed over instead of being filled
     /// with silence (a guess: longer than any dropout worth keeping in step).
@@ -386,8 +399,11 @@ impl SourceFeed {
                 out_base: 0,
                 heard: 0,
                 skip_out: 0,
+                skip_in: 0,
+                steer: Steer::default(),
                 mono: None,
                 denoise: None,
+                closed: false,
             }),
             children: Mutex::new(Vec::new()),
         })
@@ -407,15 +423,42 @@ impl SourceFeed {
         self.st.lock().unwrap().mono = Some(Mono::new(on));
     }
 
-    /// A new feed (at `rate`) whose audio is added to this one's.
+    /// A new feed (at `rate`) whose audio is added to this one's. Closed
+    /// from the start if this one is (see [`Self::close`]).
     pub(crate) fn add_child(&self, rate: u32) -> Arc<SourceFeed> {
         let child = SourceFeed::new(rate, self.clock.clone());
-        self.children.lock().unwrap().push(child.clone());
+        // Its state held throughout, so it can't be closed in between.
+        let st = self.st.lock().unwrap();
+        if st.closed {
+            child.st.lock().unwrap().closed = true;
+        } else {
+            self.children.lock().unwrap().push(child.clone());
+        }
+        drop(st);
         child
     }
 
+    /// Its source has stopped being captured (taken out while recording):
+    /// it takes no more sound, nor do the feeds it sums, now or added
+    /// later. What they've sent is still taken: the mixer runs behind, and
+    /// mixes it to its end.
+    #[cfg_attr(not(any(target_os = "windows", target_os = "macos")), allow(dead_code))]
+    pub(crate) fn close(&self) {
+        // Held while its feeds are closed: none is added meanwhile.
+        let mut st = self.st.lock().unwrap();
+        st.closed = true;
+        for child in self.children.lock().unwrap().iter() {
+            child.close();
+        }
+        drop(st);
+    }
+
+    /// Stop summing `child`, whose stream has stopped (a mic switched or
+    /// opened again, an app that quit, the player closed), once the mixer
+    /// has taken the sound it had sent: up to the mix's 0.3 s behind real
+    /// time, which went with it. It takes no more sound from now on.
     pub(crate) fn remove_child(&self, child: &Arc<SourceFeed>) {
-        self.children.lock().unwrap().retain(|c| !Arc::ptr_eq(c, child));
+        child.st.lock().unwrap().closed = true;
     }
 
     /// Interleaved samples (`channels` per frame) whose first frame was captured
@@ -428,6 +471,9 @@ impl SourceFeed {
         let rate = self.rate as f64;
         let expected = ((start - t0) * rate).round() as i64;
         let mut st = self.st.lock().unwrap();
+        if st.closed {
+            return;
+        }
 
         // Back after a long gap (playback paused, a device that stopped):
         // start over at its time, as on its first sound, rather than fill the
@@ -448,21 +494,49 @@ impl SourceFeed {
             st.out_base = (expected as f64 * RATE as f64 / rate).round() as i64;
             st.skip_out = st.resampler.as_ref().map_or(0, |r| r.output_delay() as i64)
                 + if st.denoise.is_some() { Denoise::DELAY as i64 } else { 0 };
+            st.skip_in = 0;
+            st.steer = Steer::default();
         }
         let drift = expected - st.next_in.unwrap();
         let tolerance = (Self::TOLERANCE * rate) as i64;
-        let mut skip = 0usize;
-        if drift > tolerance {
-            st.feed_silence(drift as usize);
-        } else if drift < -tolerance {
-            skip = ((-drift) as usize).min(frames);
+        let mut slips = 0;
+        // A big jump at once; a smaller sudden one once it's kept up; a
+        // clock's drift a frame at a time. Not while an overlap is still
+        // being thrown away.
+        let jump = if st.skip_in > 0 {
+            None
+        } else if drift.abs() > tolerance {
+            Some(drift)
+        } else {
+            match st.steer.step(drift, frames, rate) {
+                Steering::Slip(n) => {
+                    slips = n;
+                    None
+                }
+                Steering::Jump(off) => Some(off),
+            }
+        };
+        if let Some(off) = jump {
+            if off > 0 {
+                st.feed_silence(off as usize);
+            } else {
+                st.skip_in = -off;
+            }
+            st.steer = Steer::default();
         }
-        let (l, r): (Vec<f32>, Vec<f32>) = (skip..frames)
+        let skip = (st.skip_in as usize).min(frames);
+        st.skip_in -= skip as i64;
+        let (mut l, mut r): (Vec<f32>, Vec<f32>) = (skip..frames)
             .map(|i| {
                 let f = &samples[i * channels..];
                 (f[0], if channels > 1 { f[1] } else { f[0] })
             })
             .unzip();
+        if slips != 0 {
+            let over = (Steer::SLIP * rate).round() as usize;
+            slip(&mut l, slips, over);
+            slip(&mut r, slips, over);
+        }
         st.feed(&l, &r);
         st.heard = st.out_base + st.out.len() as i64;
     }
@@ -519,12 +593,18 @@ impl SourceFeed {
             st.out_base = end;
         }
         drop(st);
-        for child in self.children.lock().unwrap().iter() {
+        let mut children = self.children.lock().unwrap();
+        for child in children.iter() {
             for (a, c) in buf.iter_mut().zip(child.take(from, n)) {
                 a[0] += c[0];
                 a[1] += c[1];
             }
         }
+        // A stopped stream's feed goes once all it had is taken.
+        children.retain(|c| {
+            let st = c.st.lock().unwrap();
+            !(st.closed && st.out.is_empty())
+        });
         buf
     }
 }
@@ -587,6 +667,138 @@ impl FeedState {
             } else {
                 self.out.push_back(f);
             }
+        }
+    }
+}
+
+/// Keeps a source on its timestamps while its clock runs a little fast or
+/// slow against the host's: a USB mic, or an HDMI or Bluetooth output, is
+/// often 10-100 ppm off. Sound is put where counting its frames says, so
+/// that error grew for as long as it played, and was put right only at
+/// [`SourceFeed::TOLERANCE`]: 40 ms of silence at once (a slow clock) or a
+/// packet thrown away (fast). At 50 ppm that's a gap every 13 minutes,
+/// with the sound up to 40 ms early or late in between.
+///
+/// Now, from 2 ms off on, single frames are put in (slow) or taken out
+/// (fast) as it comes: as often as the drift needs, never more than one in
+/// 5000 frames (up to 200 ppm is followed: ~10 a second at 48 kHz), each
+/// spread over a millisecond (see [`slip`]). At 100 ppm, a frame every
+/// 10,000 and the sound ~3 ms off its timestamps for good.
+///
+/// Each frame slid moves the sound by a frame within a millisecond; many a
+/// second could make a long high note sound rough. So they're kept for
+/// gradual drift, and an offset that comes all at once (a dropout under
+/// [`SourceFeed::TOLERANCE`], timestamps that jump) is put right at once,
+/// silence in or the overlap thrown away, once it has been over
+/// [`Self::SUDDEN`] for [`Self::SURE`]: steered, 20 ms took 20 s of 48
+/// slips a second.
+#[derive(Debug, Default)]
+struct Steer {
+    /// How far its sound is put from where its timestamps say, in input
+    /// frames (+: earlier, as a slow clock's is), averaged over about a
+    /// second: timestamps jitter by a millisecond or so.
+    drift: f64,
+    /// Frames owed: one is put in (+) or taken out (-) each time it gets to 1.
+    owed: f64,
+    /// The packets in a row that came over [`Self::SUDDEN`] off, one way.
+    run: Option<Run>,
+}
+
+/// Packets in a row that came a sudden offset off, one way.
+#[derive(Debug, Clone, Copy)]
+struct Run {
+    frames: usize,
+    packets: u32,
+    /// The least any of them was off (input frames, signed).
+    least: i64,
+}
+
+/// What [`Steer::step`] does with a packet.
+#[derive(Debug, PartialEq)]
+enum Steering {
+    /// Put this many frames into it (+) or take them out (-), one by one.
+    Slip(i64),
+    /// It's this far off (input frames; +: early), and has been for a
+    /// while: put right at once.
+    Jump(i64),
+}
+
+impl Steer {
+    /// Off by less than this (seconds), it's left alone: that's the jitter.
+    const FROM: f64 = 0.002;
+    /// From this far off on, it's steered as hard as it gets.
+    const FULL: f64 = 0.004;
+    /// At most one frame in this many put in or taken out.
+    const EVERY: f64 = 5000.0;
+    /// How long its drift is averaged over (seconds).
+    const SMOOTH: f64 = 1.0;
+    /// How long a frame put in or taken out is spread over (seconds).
+    const SLIP: f64 = 0.001;
+    /// An offset over this (seconds) that came all at once is put right at
+    /// once, not steered off...
+    const SUDDEN: f64 = 0.01;
+    /// ...once it has held for this long (seconds), and three packets: a
+    /// packet whose timestamp is off alone isn't one.
+    const SURE: f64 = 0.05;
+
+    /// A packet of `frames` frames (at `rate`) that came `drift` frames off
+    /// where counting puts it.
+    fn step(&mut self, drift: i64, frames: usize, rate: f64) -> Steering {
+        if drift.abs() as f64 > Self::SUDDEN * rate {
+            let run = self.run.filter(|r| r.least.signum() == drift.signum()).unwrap_or(Run { frames: 0, packets: 0, least: drift });
+            let run = Run {
+                frames: run.frames + frames,
+                packets: run.packets + 1,
+                least: if drift.abs() < run.least.abs() { drift } else { run.least },
+            };
+            if run.packets >= 3 && run.frames as f64 >= Self::SURE * rate {
+                *self = Self::default();
+                return Steering::Jump(run.least);
+            }
+            // Not steered meanwhile: it's about to be put right.
+            self.run = Some(run);
+            return Steering::Slip(0);
+        }
+        self.run = None;
+        let weight = 1.0 - (-(frames as f64 / rate) / Self::SMOOTH).exp();
+        self.drift += (drift as f64 - self.drift) * weight;
+        let pull = ((self.drift.abs() / rate - Self::FROM) / (Self::FULL - Self::FROM)).clamp(0.0, 1.0);
+        let towards = self.drift.signum() * pull;
+        if towards == 0.0 || towards * self.owed < 0.0 {
+            self.owed = 0.0;
+        }
+        self.owed += towards * frames as f64 / Self::EVERY;
+        let now = self.owed.trunc();
+        self.owed -= now;
+        Steering::Slip(now as i64)
+    }
+}
+
+/// Put `n` frames into `x` (or take `-n` out), spread evenly through it.
+/// A frame repeated or dropped outright jumps (a click, on a high note):
+/// instead the `over` frames around it are read a little slower (or
+/// faster), each taken between two neighbours, so the sound slides by one
+/// frame over them.
+fn slip(x: &mut Vec<f32>, n: i64, over: usize) {
+    let len = x.len();
+    if len < 3 {
+        return;
+    }
+    let w = over.clamp(1, len - 2);
+    let count = n.unsigned_abs() as usize;
+    let step = 1.0 / (w + 1) as f32;
+    // From the last to the first, so each leaves the places of those before it.
+    for k in (0..count).rev() {
+        let centre = (2 * k + 1) * len / (2 * count);
+        let at = centre.saturating_sub(w / 2).clamp(1, len - w - 1);
+        if n > 0 {
+            // Read back towards the frame before, one more frame out.
+            let slid: Vec<f32> = (0..w).map(|i| x[at + i] + (x[at + i - 1] - x[at + i]) * (i + 1) as f32 * step).collect();
+            x.splice(at..at + w - 1, slid);
+        } else {
+            // Read on towards the frame after, one frame less.
+            let slid: Vec<f32> = (0..w).map(|i| x[at + i] + (x[at + i + 1] - x[at + i]) * (i + 1) as f32 * step).collect();
+            x.splice(at..at + w + 1, slid);
         }
     }
 }
@@ -731,11 +943,27 @@ impl Denoise {
 
 /// A source as the mixer sees it.
 pub(crate) struct MixInput {
+    /// Its source's id: what a [`MixChange`] names it by.
+    pub id: String,
     pub feed: Arc<SourceFeed>,
     pub channel: Arc<Channel>,
     pub in_mix: bool,
     /// Its own track, if it has one.
     pub track: Option<Sender<Vec<f32>>>,
+}
+
+/// A change to the sources of a mixer that's running (see
+/// [`spawn_changing_mixer`]). The tracks stay as they are: a file's are set
+/// once it's started.
+#[cfg_attr(not(any(target_os = "windows", target_os = "macos")), allow(dead_code))]
+pub(crate) enum MixChange {
+    /// Mix this source in from now on. One taken out before (by its id)
+    /// gets its own track back, if it had one. Any other has none: in the
+    /// mix, it goes into the rest track, with the others that have none.
+    Add(MixInput),
+    /// Take out the source with this id: the sound it has sent is mixed,
+    /// then it goes, and its own track, if it has one, goes on silent.
+    Remove(String),
 }
 
 /// How far behind real time the meters run: just enough for the sources'
@@ -773,109 +1001,36 @@ pub(crate) fn spawn_mixer(
     latency: f64,
     stop: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
+    // Nothing sends it changes: its sources stay as they are.
+    let (_, changes) = std::sync::mpsc::channel();
+    spawn_changing_mixer(inputs, changes, mix_track, rest_track, live, clock, now, latency, stop)
+}
+
+/// [`spawn_mixer`], with its sources changed while it runs by what `changes`
+/// brings: one added, one taken out (see [`MixChange`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_changing_mixer(
+    inputs: Vec<MixInput>,
+    changes: Receiver<MixChange>,
+    mix_track: Option<Sender<Vec<f32>>>,
+    rest_track: Option<Sender<Vec<f32>>>,
+    live: Arc<LiveAudio>,
+    clock: Arc<Clock>,
+    now: fn() -> f64,
+    latency: f64,
+    stop: Arc<AtomicBool>,
+) -> JoinHandle<()> {
     thread::spawn(move || {
-        let mut gains: Vec<f32> = inputs.iter().map(|i| i.channel.effective_gain()).collect();
-        let mut limiter = Limiter::new();
-        let mut mixed: Option<i64> = None;
-        // The meters' own position and limiter, ahead of the mix.
-        let mut metered: Option<i64> = None;
-        let mut meter_limiter = Limiter::new();
-        // When the meters last moved, and whether that's been said: they
-        // stood still now and then, until clipping was restarted; this says
-        // where they were stuck, in the log.
-        let mut moved = Instant::now();
-        let mut said_stuck = false;
+        let mut mixer = Mixing::new(inputs, mix_track, rest_track, live.clone(), latency);
         loop {
             let tick = Instant::now();
             let stopping = stop.load(Ordering::Relaxed);
+            while let Ok(change) = changes.try_recv() {
+                mixer.change(change);
+            }
             if let Some(t0) = clock.get() {
-                let mut target = ((now() - t0 - METER_LAG) * RATE as f64).floor() as i64;
-                let stalled = target - (STALLED * RATE as f64) as i64;
-                if let Some(slowest) = inputs.iter().filter_map(|i| i.feed.arrived()).filter(|&a| a > stalled).min() {
-                    target = target.min(slowest);
-                }
-                let from = metered.get_or_insert(target.max(0));
-                // Never meter what's already been written (and so is gone).
-                *from = (*from).max(mixed.unwrap_or(0));
-                while *from < target {
-                    let n = ((target - *from) as usize).min(RATE as usize / 50);
-                    let mut mix = vec![[0f32; 2]; n];
-                    for input in &inputs {
-                        let mut block = input.feed.peek(*from, n);
-                        input.channel.input.record(&block);
-                        input.channel.send_tap(&block);
-                        let g = input.channel.effective_gain();
-                        for f in block.iter_mut() {
-                            f[0] *= g;
-                            f[1] *= g;
-                        }
-                        input.channel.meter.record(&block);
-                        if input.in_mix {
-                            add(&mut mix, &block);
-                        }
-                    }
-                    if live.limiter.load(Ordering::Relaxed) {
-                        let reduction = meter_limiter.process(&mut mix);
-                        live.reduction_db.fetch_max(reduction);
-                    }
-                    live.master.record(&mix);
-                    *from += n as i64;
-                    moved = Instant::now();
-                }
-                if !stopping && moved.elapsed() > Duration::from_secs(2) {
-                    if !said_stuck {
-                        said_stuck = true;
-                        let arrived: Vec<Option<i64>> = inputs.iter().map(|i| i.feed.arrived()).collect();
-                        eprintln!(
-                            "meters: stuck for {:.1} s at frame {}, aiming at {} ({:.3} s since the start), mixed to {mixed:?}; newest audio per source: {arrived:?}",
-                            moved.elapsed().as_secs_f32(),
-                            metered.unwrap_or(0),
-                            target,
-                            now() - t0
-                        );
-                    }
-                } else if said_stuck && moved.elapsed() < Duration::from_secs(1) {
-                    said_stuck = false;
-                    eprintln!("meters: moving again");
-                }
-                let behind = if stopping { 0.0 } else { latency };
-                let target = ((now() - t0 - behind) * RATE as f64).floor() as i64;
-                let from = mixed.get_or_insert(0);
-                while *from < target {
-                    let n = ((target - *from) as usize).min(RATE as usize / 50);
-                    let mut mix = vec![[0f32; 2]; n];
-                    let mut rest = vec![[0f32; 2]; if rest_track.is_some() { n } else { 0 }];
-                    for (input, gain) in inputs.iter().zip(gains.iter_mut()) {
-                        let mut block = input.feed.take(*from, n);
-                        // Ramp to the new volume across the block so fader moves don't click.
-                        let target_gain = input.channel.effective_gain();
-                        for (k, f) in block.iter_mut().enumerate() {
-                            let g = *gain + (target_gain - *gain) * (k + 1) as f32 / n as f32;
-                            f[0] *= g;
-                            f[1] *= g;
-                        }
-                        *gain = target_gain;
-                        if input.in_mix {
-                            add(&mut mix, &block);
-                            if input.track.is_none() {
-                                add(&mut rest, &block);
-                            }
-                        }
-                        if let Some(tx) = &input.track {
-                            let _ = tx.send(interleave(&block));
-                        }
-                    }
-                    if live.limiter.load(Ordering::Relaxed) {
-                        limiter.process(&mut mix);
-                    }
-                    if let Some(tx) = &mix_track {
-                        let _ = tx.send(interleave(&mix));
-                    }
-                    if let Some(tx) = &rest_track {
-                        let _ = tx.send(interleave(&rest));
-                    }
-                    *from += n as i64;
-                }
+                mixer.meter(now() - t0, stopping);
+                mixer.mix(now() - t0, stopping);
             }
             if stopping {
                 break;
@@ -887,6 +1042,208 @@ pub(crate) fn spawn_mixer(
         }
         live.all_off();
     })
+}
+
+/// A running mixer: its sources and tracks, and how far it has got, in
+/// mixing them and in metering them.
+struct Mixing {
+    inputs: Vec<Input>,
+    /// The own tracks of sources taken out, by the source's id. They go on,
+    /// silent (every track runs to the file's end), and go back to the
+    /// source if it's added again.
+    parked: Vec<(String, Sender<Vec<f32>>)>,
+    mix_track: Option<Sender<Vec<f32>>>,
+    rest_track: Option<Sender<Vec<f32>>>,
+    live: Arc<LiveAudio>,
+    latency: f64,
+    limiter: Limiter,
+    /// The next frame to mix, once mixing has begun.
+    mixed: Option<i64>,
+    /// The meters' own position and limiter, ahead of the mix.
+    metered: Option<i64>,
+    meter_limiter: Limiter,
+    /// When the meters last moved, and whether that's been said: they
+    /// stood still now and then, until clipping was restarted; this says
+    /// where they were stuck, in the log.
+    moved: Instant,
+    said_stuck: bool,
+}
+
+/// One of a mixer's sources.
+struct Input {
+    mix: MixInput,
+    /// The gain its last block ended at, which the next one ramps from.
+    gain: f32,
+    /// Taken out: mixed up to where its sound ends, then let go of.
+    leaving: bool,
+}
+
+impl Input {
+    fn new(mix: MixInput) -> Self {
+        Self { gain: mix.channel.effective_gain(), mix, leaving: false }
+    }
+}
+
+impl Mixing {
+    fn new(inputs: Vec<MixInput>, mix_track: Option<Sender<Vec<f32>>>, rest_track: Option<Sender<Vec<f32>>>, live: Arc<LiveAudio>, latency: f64) -> Self {
+        Self {
+            inputs: inputs.into_iter().map(Input::new).collect(),
+            parked: Vec::new(),
+            mix_track,
+            rest_track,
+            live,
+            latency,
+            limiter: Limiter::new(),
+            mixed: None,
+            metered: None,
+            meter_limiter: Limiter::new(),
+            moved: Instant::now(),
+            said_stuck: false,
+        }
+    }
+
+    fn change(&mut self, change: MixChange) {
+        match change {
+            MixChange::Add(mut input) => {
+                // Its own track, if it was here before: from it still
+                // leaving (which goes now, the last of its sound with it),
+                // or from it gone.
+                let mut tracks = Vec::new();
+                if let Some(at) = self.inputs.iter().position(|i| i.mix.id == input.id) {
+                    tracks.extend(self.inputs.remove(at).mix.track);
+                }
+                if let Some(at) = self.parked.iter().position(|(id, _)| *id == input.id) {
+                    tracks.push(self.parked.remove(at).1);
+                }
+                for tx in tracks {
+                    if input.track.is_none() {
+                        input.track = Some(tx);
+                    } else {
+                        // A source has one track of its own at most, but a
+                        // track is never let go of before the file ends.
+                        self.parked.push((input.id.clone(), tx));
+                    }
+                }
+                self.inputs.push(Input::new(input));
+            }
+            MixChange::Remove(id) => {
+                for input in self.inputs.iter_mut().filter(|i| i.mix.id == id) {
+                    input.leaving = true;
+                }
+            }
+        }
+    }
+
+    /// Meter up to `at` (seconds on the clock) less [`METER_LAG`], or as far
+    /// as the sources' sound has come, if that's less. Sources taken out
+    /// aren't: their sound is only mixed, to its end.
+    fn meter(&mut self, at: f64, stopping: bool) {
+        let mut target = ((at - METER_LAG) * RATE as f64).floor() as i64;
+        let stalled = target - (STALLED * RATE as f64) as i64;
+        if let Some(slowest) = self.inputs.iter().filter(|i| !i.leaving).filter_map(|i| i.mix.feed.arrived()).filter(|&a| a > stalled).min() {
+            target = target.min(slowest);
+        }
+        let from = self.metered.get_or_insert(target.max(0));
+        // Never meter what's already been written (and so is gone).
+        *from = (*from).max(self.mixed.unwrap_or(0));
+        while *from < target {
+            let n = ((target - *from) as usize).min(RATE as usize / 50);
+            let mut mix = vec![[0f32; 2]; n];
+            for input in self.inputs.iter().filter(|i| !i.leaving).map(|i| &i.mix) {
+                let mut block = input.feed.peek(*from, n);
+                input.channel.input.record(&block);
+                input.channel.send_tap(&block);
+                let g = input.channel.effective_gain();
+                for f in block.iter_mut() {
+                    f[0] *= g;
+                    f[1] *= g;
+                }
+                input.channel.meter.record(&block);
+                if input.in_mix {
+                    add(&mut mix, &block);
+                }
+            }
+            if self.live.limiter.load(Ordering::Relaxed) {
+                let reduction = self.meter_limiter.process(&mut mix);
+                self.live.reduction_db.fetch_max(reduction);
+            }
+            self.live.master.record(&mix);
+            *from += n as i64;
+            self.moved = Instant::now();
+        }
+        if !stopping && self.moved.elapsed() > Duration::from_secs(2) {
+            if !self.said_stuck {
+                self.said_stuck = true;
+                let arrived: Vec<Option<i64>> = self.inputs.iter().map(|i| i.mix.feed.arrived()).collect();
+                eprintln!(
+                    "meters: stuck for {:.1} s at frame {}, aiming at {target} ({at:.3} s since the start), mixed to {:?}; newest audio per source: {arrived:?}",
+                    self.moved.elapsed().as_secs_f32(),
+                    self.metered.unwrap_or(0),
+                    self.mixed,
+                );
+            }
+        } else if self.said_stuck && self.moved.elapsed() < Duration::from_secs(1) {
+            self.said_stuck = false;
+            eprintln!("meters: moving again");
+        }
+    }
+
+    /// Mix up to `latency` behind `at` (seconds on the clock; all of it,
+    /// `stopping`), and send every track its part.
+    fn mix(&mut self, at: f64, stopping: bool) {
+        let behind = if stopping { 0.0 } else { self.latency };
+        let target = ((at - behind) * RATE as f64).floor() as i64;
+        let from = self.mixed.get_or_insert(0);
+        while *from < target {
+            let n = ((target - *from) as usize).min(RATE as usize / 50);
+            let mut mix = vec![[0f32; 2]; n];
+            let mut rest = vec![[0f32; 2]; if self.rest_track.is_some() { n } else { 0 }];
+            for input in &mut self.inputs {
+                let mut block = input.mix.feed.take(*from, n);
+                // Ramp to the new volume across the block so fader moves don't click.
+                let target_gain = input.mix.channel.effective_gain();
+                for (k, f) in block.iter_mut().enumerate() {
+                    let g = input.gain + (target_gain - input.gain) * (k + 1) as f32 / n as f32;
+                    f[0] *= g;
+                    f[1] *= g;
+                }
+                input.gain = target_gain;
+                if input.mix.in_mix {
+                    add(&mut mix, &block);
+                    if input.mix.track.is_none() {
+                        add(&mut rest, &block);
+                    }
+                }
+                if let Some(tx) = &input.mix.track {
+                    let _ = tx.send(interleave(&block));
+                }
+            }
+            for (_, tx) in &self.parked {
+                let _ = tx.send(vec![0.0; n * 2]);
+            }
+            if self.live.limiter.load(Ordering::Relaxed) {
+                self.limiter.process(&mut mix);
+            }
+            if let Some(tx) = &self.mix_track {
+                let _ = tx.send(interleave(&mix));
+            }
+            if let Some(tx) = &self.rest_track {
+                let _ = tx.send(interleave(&rest));
+            }
+            *from += n as i64;
+        }
+        // Those taken out go once all their sound is mixed: their own
+        // tracks go on, silent.
+        let mixed = *from;
+        let parked = &mut self.parked;
+        self.inputs.retain_mut(|input| {
+            let gone = input.leaving && input.mix.feed.arrived().is_none_or(|a| a <= mixed);
+            if gone && let Some(tx) = input.mix.track.take() {
+                parked.push((input.mix.id.clone(), tx));
+            }
+            !gone
+        });
+    }
 }
 
 fn add(acc: &mut [[f32; 2]], block: &[[f32; 2]]) {
@@ -1124,6 +1481,184 @@ mod tests {
         assert!(out[4_000..44_000].iter().all(|f| (f[0] - 0.5).abs() < 0.01), "its level, in place");
     }
 
+    /// A source whose clock runs 100 ppm fast or slow (a USB mic, an HDMI
+    /// output) for 10 minutes, its timestamps jittering by up to a
+    /// millisecond: it stays within a few ms of where they put it, without a
+    /// gap filled or a packet thrown away, steered one frame at a time, all
+    /// one way, at most one in 5000 frames. At its right rate, the jitter
+    /// alone steers nothing.
+    #[test]
+    fn drifting_clock_is_steered_a_frame_at_a_time() {
+        for (rate, ppm) in [(RATE, 100.0), (RATE, -100.0), (RATE, 0.0), (44_100, 100.0), (44_100, -100.0)] {
+            let feed = SourceFeed::new(rate, clock_at_zero());
+            let packet = rate as usize / 100;
+            let true_rate = rate as f64 * (1.0 + ppm * 1e-6);
+            let mut seed = 7u32;
+            let mut jitter = move || {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                ((seed >> 8) as f64 / (1u32 << 24) as f64 * 2.0 - 1.0) * 0.001
+            };
+            // A click every 100 ms of its own time, on a steady level.
+            let every = packet * 10;
+            let level = |frame: usize| if frame % every == every / 2 { 1.0f32 } else { 0.25 };
+            let packets = 10 * 60 * 100;
+            let mut worst = 0f64;
+            let mut slips: Vec<(usize, i64)> = Vec::new();
+            let (mut taken, mut silent) = (0i64, 0usize);
+            let mut clicks: Vec<(i64, f32)> = Vec::new();
+            for k in 0..packets {
+                let first = k * packet;
+                let captured = 1000.05 + first as f64 / true_rate;
+                let samples: Vec<f32> = (first..first + packet).map(level).collect();
+                let before = feed.st.lock().unwrap().next_in;
+                if let Some(next) = before {
+                    // Where it's put, against where it was captured.
+                    worst = worst.max(((captured - 1000.0) * rate as f64 - next as f64).abs() / rate as f64);
+                }
+                feed.push(captured + jitter(), &samples, 1);
+                let after = feed.st.lock().unwrap().next_in.unwrap();
+                if let Some(before) = before
+                    && after - before != packet as i64
+                {
+                    slips.push((k, after - before - packet as i64));
+                }
+                // The mixer, 100 ms behind. At 48 kHz, where each click lands.
+                let upto = ((captured - 1000.1) * RATE as f64) as i64;
+                if upto > taken {
+                    for (i, f) in feed.take(taken, (upto - taken) as usize).into_iter().enumerate() {
+                        let at = taken + i as i64;
+                        if rate != RATE {
+                            continue;
+                        }
+                        if at > (0.06 * RATE as f64) as i64 && f[0] < 0.2 {
+                            silent += 1;
+                        }
+                        // A click slid over is split between two frames.
+                        if f[0] > 0.6 {
+                            match clicks.last_mut() {
+                                Some(c) if at - c.0 <= 2 => {
+                                    if f[0] > c.1 {
+                                        *c = (at, f[0]);
+                                    }
+                                }
+                                _ => clicks.push((at, f[0])),
+                            }
+                        }
+                    }
+                    taken = upto;
+                }
+            }
+            let what = format!("{rate} Hz at {ppm:+} ppm");
+            assert!(worst < 0.004, "{what}: up to {:.2} ms off", worst * 1e3);
+            let total: i64 = slips.iter().map(|s| s.1).sum();
+            eprintln!("{what}: {} frames steered, up to {:.2} ms off", total, worst * 1e3);
+            if ppm == 0.0 {
+                assert!(slips.is_empty(), "{what}: steered by jitter: {slips:?}");
+                continue;
+            }
+            // Fast: frames taken out. All of the 10 minutes' drift (60 ms)
+            // but the couple of ms it's let be off.
+            let drift = -ppm * 1e-6 * 600.0 * rate as f64;
+            assert!(slips.iter().all(|s| s.1.signum() == drift.signum() as i64), "{what}: steered both ways");
+            assert!(total as f64 / drift > 0.9 && total as f64 / drift < 1.0, "{what}: steered {total} of {drift:.0}");
+            assert!(slips.iter().all(|s| s.1.abs() == 1), "{what}: more than a frame at once");
+            let closest = slips.windows(2).map(|w| (w[1].0 - w[0].0) * packet).min().unwrap();
+            assert!(closest >= 4_800, "{what}: two frames {closest} apart");
+            if rate == RATE {
+                assert_eq!(silent, 0, "{what}: silence put in");
+                // Every click there, within 4 ms of where it was captured.
+                let expected = (taken as f64 / RATE as f64 - 0.05) * true_rate / every as f64;
+                assert!((clicks.len() as f64 - expected).abs() < 2.0, "{what}: {} clicks of {expected:.0}", clicks.len());
+                for (m, (at, _)) in clicks.iter().enumerate() {
+                    let captured = 0.05 + (m * every + every / 2) as f64 / true_rate;
+                    let off = (*at as f64 / RATE as f64 - captured).abs();
+                    assert!(off < 0.004, "{what}: click {m} {:.2} ms off", off * 1e3);
+                }
+            }
+        }
+    }
+
+    /// A dropout of 20 ms (under the 40 ms put right at once even for one
+    /// packet), or timestamps that jump 20 ms back: put right at once, 20 ms
+    /// of silence put in or 20 ms thrown away, not steered off a frame at a
+    /// time (that took 20 s). A single packet stamped 15 ms off isn't one.
+    #[test]
+    fn sudden_offset_is_put_right_at_once() {
+        for (jump, outlier) in [(0.02, false), (-0.02, false), (0.0, true)] {
+            let feed = SourceFeed::new(RATE, clock_at_zero());
+            let mut seed = 11u32;
+            let mut jitter = move || {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                ((seed >> 8) as f64 / (1u32 << 24) as f64 * 2.0 - 1.0) * 0.0005
+            };
+            // 20 s in 10 ms packets of a steady level; at 10 s, the jump.
+            let (mut slips, mut silent, mut taken) = (0i64, 0usize, 0i64);
+            let mut late = 0f64;
+            for k in 0..2_000 {
+                let mut captured = 1000.05 + k as f64 * 0.01;
+                if k >= 1_000 {
+                    captured += jump;
+                }
+                let stamped = captured + jitter() + if outlier && k == 1_000 { 0.015 } else { 0.0 };
+                let before = feed.st.lock().unwrap().next_in;
+                feed.push(stamped, &[0.25; 480], 1);
+                let after = feed.st.lock().unwrap().next_in.unwrap();
+                if let Some(before) = before {
+                    // A frame or two: slid (not the jump, which is hundreds).
+                    let moved = after - before - 480;
+                    if moved.abs() <= 2 {
+                        slips += moved.abs();
+                    }
+                    // From 0.1 s after the jump, within a couple of ms.
+                    if k >= 1_010 {
+                        late = late.max(((captured - 1000.0) * RATE as f64 - after as f64 + 480.0).abs() / RATE as f64);
+                    }
+                }
+                let upto = ((captured - 1000.1) * RATE as f64) as i64;
+                if upto > taken {
+                    silent += feed.take(taken, (upto - taken) as usize).iter().filter(|f| f[0] == 0.0).count();
+                    taken = upto;
+                }
+            }
+            let what = if outlier { "one packet 15 ms off".to_owned() } else { format!("a {:+} ms jump", jump * 1e3) };
+            eprintln!("{what}: {silent} frames of silence, {slips} frames slid, then up to {:.2} ms off", late * 1e3);
+            assert!(late < 0.002, "{what}: {:.2} ms off after it", late * 1e3);
+            assert_eq!(slips, 0, "{what}: steered off");
+            let expected = if jump > 0.0 { (jump * RATE as f64) as usize } else { 0 };
+            // The first 50 ms, before the source began, are silent too.
+            assert!(silent.abs_diff(2_400 + expected) < 50, "{what}: {silent} frames of silence");
+        }
+    }
+
+    /// A frame put in or taken out slides the sound by one frame over a
+    /// millisecond, read a little slower or faster there: no jump, and the
+    /// rest as it was.
+    #[test]
+    fn a_slip_slides_without_a_jump() {
+        let ramp: Vec<f32> = (0..480).map(|i| i as f32).collect();
+        for n in [1i64, -1] {
+            let mut x = ramp.clone();
+            slip(&mut x, n, 48);
+            assert_eq!(x.len() as i64, 480 + n);
+            let steps: Vec<f32> = x.windows(2).map(|w| w[1] - w[0]).collect();
+            // A ramp read at 48/49 or 50/49 of its speed there, else as it was.
+            assert!(steps.iter().all(|&s| (s - 1.0).abs() <= 1.0 / 49.0 + 1e-4), "{n}: {steps:?}");
+            assert_eq!(x[..200], ramp[..200]);
+            assert_eq!(x[x.len() - 200..], ramp[ramp.len() - 200..]);
+        }
+        // An 8 kHz note (at half scale) moves up to 0.433 from one frame to
+        // the next, and barely more slid; a frame dropped outright can jump
+        // 0.866.
+        let note: Vec<f32> = (0..480).map(|i| 0.5 * (std::f32::consts::TAU * 8000.0 * i as f32 / RATE as f32).sin()).collect();
+        let most = |x: &[f32]| x.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0, f32::max);
+        for n in [1i64, -1] {
+            let mut x = note.clone();
+            slip(&mut x, n, 48);
+            eprintln!("8 kHz note, {n:+} frame: moves up to {:.3} a frame ({:.3} as it came)", most(&x), most(&note));
+            assert!(most(&x) < most(&note) * 1.05, "{n}: {}", most(&x));
+        }
+    }
+
     /// A short gap is still filled, so what follows stays in step.
     #[test]
     fn short_gap_is_filled() {
@@ -1150,6 +1685,26 @@ mod tests {
         assert!(feed.take(480, 480).iter().all(|f| (f[0] - 0.25).abs() < 1e-6));
     }
 
+    /// A mic switched while its last 300 ms aren't mixed yet (the mix runs
+    /// that far behind): they're in the mix, then the new mic. The old
+    /// feed takes nothing more, and goes once all it had is taken.
+    #[test]
+    fn removed_child_is_mixed_to_its_end() {
+        let feed = SourceFeed::new(RATE, clock_at_zero());
+        let old = feed.add_child(RATE);
+        old.push(1000.0, &vec![0.5; 14_400 * 2], 2);
+        feed.remove_child(&old);
+        old.push(1000.3, &vec![0.5; 480 * 2], 2);
+        let new = feed.add_child(RATE);
+        new.push(1000.3, &vec![0.25; 480 * 2], 2);
+        assert!(feed.take(0, 4_800).iter().all(|f| f[0] == 0.5));
+        assert_eq!(feed.children.lock().unwrap().len(), 2, "not all taken yet");
+        let out = feed.take(4_800, 14_400 - 4_800 + 480);
+        assert!(out[..9_600].iter().all(|f| f[0] == 0.5), "the old mic's last 300 ms");
+        assert!(out[9_600..].iter().all(|f| f[0] == 0.25), "the new mic, alone");
+        assert_eq!(feed.children.lock().unwrap().len(), 1, "the old one's gone");
+    }
+
     #[test]
     fn peek_reads_ahead_without_consuming() {
         let feed = SourceFeed::new(RATE, clock_at_zero());
@@ -1169,6 +1724,147 @@ mod tests {
         assert_eq!(feed.arrived(), Some(480));
         feed.take(0, 4800);
         assert_eq!(feed.arrived(), Some(480), "the mixer reading on isn't sound arriving");
+    }
+
+    /// Everything a track got, as frames.
+    fn frames(track: &Receiver<Vec<f32>>) -> Vec<[f32; 2]> {
+        track.try_iter().flatten().collect::<Vec<f32>>().chunks_exact(2).map(|f| [f[0], f[1]]).collect()
+    }
+
+    /// A source of the clip's sound (unity gain), in or out of the mix.
+    fn source(live: &LiveAudio, id: &str, feed: &Arc<SourceFeed>, track: Option<Sender<Vec<f32>>>) -> MixInput {
+        MixInput { id: id.into(), feed: feed.clone(), channel: live.channel(id), in_mix: true, track }
+    }
+
+    /// Frame `at` seconds in.
+    fn frame(at: f64) -> usize {
+        (at * RATE as f64) as usize
+    }
+
+    /// `seconds` of a steady level, as interleaved stereo.
+    fn steady(level: f32, seconds: f64) -> Vec<f32> {
+        vec![level; frame(seconds) * 2]
+    }
+
+    /// A source added while mixing (one added while recording, which has no
+    /// track of its own in the file) goes into the mix and, so the separate
+    /// tracks still add up to it, into the rest track. The others' tracks
+    /// go on as they were.
+    #[test]
+    fn a_source_added_while_mixing_goes_into_the_mix_and_the_rest_track() {
+        let clock = clock_at_zero();
+        let live = LiveAudio::new();
+        live.set_limiter(false);
+        let (mix_tx, mix) = std::sync::mpsc::channel();
+        let (rest_tx, rest) = std::sync::mpsc::channel();
+        let (game_tx, game_track) = std::sync::mpsc::channel();
+        let game = SourceFeed::new(RATE, clock.clone());
+        let mut mixer = Mixing::new(vec![source(&live, "game", &game, Some(game_tx))], Some(mix_tx), Some(rest_tx), live.clone(), 0.25);
+        game.push(1000.0, &steady(0.25, 2.0), 2);
+        mixer.mix(1.25, false);
+        // Added when the mix is at 1 s; its sound from 1.1 s on.
+        let music = SourceFeed::new(RATE, clock.clone());
+        mixer.change(MixChange::Add(source(&live, "music", &music, None)));
+        music.push(1001.1, &steady(0.5, 0.9), 2);
+        mixer.mix(2.25, false);
+        let (mix, rest, game_track) = (frames(&mix), frames(&rest), frames(&game_track));
+        assert_eq!((mix.len(), rest.len(), game_track.len()), (frame(2.0), frame(2.0), frame(2.0)), "every track as long");
+        assert!(mix[..frame(1.1)].iter().all(|f| f[0] == 0.25));
+        assert!(mix[frame(1.1)..].iter().all(|f| f[0] == 0.75), "the added source mixed in");
+        assert!(rest[..frame(1.1)].iter().all(|f| f[0] == 0.0));
+        assert!(rest[frame(1.1)..].iter().all(|f| f[0] == 0.5), "and in the rest track");
+        assert!(game_track.iter().all(|f| f[0] == 0.25), "the game's own track, the game alone");
+    }
+
+    /// A source taken out while mixing (its capture stopped when the mix is
+    /// 250 ms behind) is mixed to where its sound ended, in the mix and in
+    /// its own track; then it's gone, and its track goes on silent, as long
+    /// as the others. Added again, it has its own track back.
+    #[test]
+    fn a_source_taken_out_is_mixed_to_its_end_then_its_track_goes_on_silent() {
+        let clock = clock_at_zero();
+        let live = LiveAudio::new();
+        live.set_limiter(false);
+        let (mix_tx, mix) = std::sync::mpsc::channel();
+        let (rest_tx, rest) = std::sync::mpsc::channel();
+        let (game_tx, game_track) = std::sync::mpsc::channel();
+        let (mic_tx, mic_track) = std::sync::mpsc::channel();
+        let (game, mic) = (SourceFeed::new(RATE, clock.clone()), SourceFeed::new(RATE, clock.clone()));
+        let inputs = vec![source(&live, "game", &game, Some(game_tx)), source(&live, "mic", &mic, Some(mic_tx))];
+        let mut mixer = Mixing::new(inputs, Some(mix_tx), Some(rest_tx), live.clone(), 0.25);
+        game.push(1000.0, &steady(0.25, 3.0), 2);
+        mic.push(1000.0, &steady(0.5, 1.0), 2);
+        mixer.mix(1.0, false);
+        // Taken out at 1 s: what it sends after isn't taken.
+        mic.close();
+        mixer.change(MixChange::Remove("mic".into()));
+        mic.push(1001.0, &steady(0.5, 0.5), 2);
+        mixer.mix(2.0, false);
+        assert!(mixer.inputs.iter().all(|i| i.mix.id != "mic"), "gone once its sound is mixed");
+        assert_eq!(mixer.parked.len(), 1);
+        mixer.mix(2.25, false);
+        let mic_was = frames(&mic_track);
+        assert_eq!((mic_was.len(), frames(&game_track).len()), (frame(2.0), frame(2.0)), "its track goes on, as long as the game's");
+        assert!(mic_was[..frame(1.0)].iter().all(|f| f[0] == 0.5), "its last 250 ms too");
+        assert!(mic_was[frame(1.0)..].iter().all(|f| f[0] == 0.0), "silent once it's taken out");
+        let mixed = frames(&mix);
+        assert!(mixed[..frame(1.0)].iter().all(|f| f[0] == 0.75));
+        assert!(mixed[frame(1.0)..].iter().all(|f| f[0] == 0.25));
+
+        // Added again when the mix is at 2 s, its sound from 2.5 s: on its
+        // own track.
+        let mic = SourceFeed::new(RATE, clock.clone());
+        mixer.change(MixChange::Add(source(&live, "mic", &mic, None)));
+        mic.push(1002.5, &steady(0.5, 0.5), 2);
+        mixer.mix(3.25, false);
+        let mic_now = frames(&mic_track);
+        assert_eq!(mic_now.len(), frame(1.0));
+        assert!(mic_now[..frame(0.5)].iter().all(|f| f[0] == 0.0));
+        assert!(mic_now[frame(0.5)..].iter().all(|f| f[0] == 0.5), "its own track back");
+        assert!(mixer.parked.is_empty());
+        assert!(frames(&rest).iter().all(|f| f[0] == 0.0), "not in the rest track: it has a track of its own");
+    }
+
+    /// A feed whose source has stopped being captured takes no more sound,
+    /// in itself or the feeds it sums, nor in one added to it after; what
+    /// came before is still there to mix.
+    #[test]
+    fn a_closed_feed_takes_no_more_sound() {
+        let feed = SourceFeed::new(RATE, clock_at_zero());
+        let child = feed.add_child(RATE);
+        child.push(1000.0, &steady(0.5, 0.01), 2);
+        feed.close();
+        child.push(1000.01, &steady(0.5, 0.01), 2);
+        feed.push(1000.01, &steady(0.5, 0.01), 2);
+        feed.add_child(RATE).push(1000.01, &steady(0.5, 0.01), 2);
+        assert_eq!(feed.arrived(), Some(480), "only what came before");
+        let out = feed.take(0, 960);
+        assert!(out[..480].iter().all(|f| f[0] == 0.5));
+        assert!(out[480..].iter().all(|f| f[0] == 0.0));
+    }
+
+    /// A change sent to a mixer that's running is taken up: here a source
+    /// added before its first pass, which (stopping) mixes all there is.
+    #[test]
+    fn a_running_mixer_takes_changes() {
+        static NOW: AtomicU64 = AtomicU64::new(0);
+        fn now() -> f64 {
+            f64::from_bits(NOW.load(Ordering::Relaxed))
+        }
+        NOW.store(1001.0f64.to_bits(), Ordering::Relaxed);
+        let clock = clock_at_zero();
+        let live = LiveAudio::new();
+        live.set_limiter(false);
+        let (mix_tx, mix) = std::sync::mpsc::channel();
+        let (changes, changed) = std::sync::mpsc::channel();
+        let music = SourceFeed::new(RATE, clock.clone());
+        music.push(1000.0, &steady(0.5, 1.0), 2);
+        changes.send(MixChange::Add(source(&live, "music", &music, None))).unwrap();
+        let stop = Arc::new(AtomicBool::new(true));
+        spawn_changing_mixer(Vec::new(), changed, Some(mix_tx), None, live, clock, now, 0.25, stop).join().unwrap();
+        let mix = frames(&mix);
+        assert_eq!(mix.len(), frame(1.0));
+        assert!(mix.iter().all(|f| f[0] == 0.5));
     }
 
     #[test]

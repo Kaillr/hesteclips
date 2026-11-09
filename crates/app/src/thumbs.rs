@@ -1,10 +1,11 @@
 //! Clip preview images.
 //!
-//! A frame is grabbed with ffmpeg on a few background workers, cached as a JPEG
-//! (and the clip's duration beside it) under the OS cache dir, keyed by path +
-//! mtime + size so a replaced file gets a fresh thumbnail. A cached clip starts
-//! no process at all. A screenshot is simply made smaller. Each picture is
-//! uploaded to the GPU once and reused.
+//! A clip's first frame is decoded on a few background workers, by the
+//! decoder playback uses (ffmpeg for what that can't open), and cached as a
+//! JPEG (and the clip's duration beside it) under the OS cache dir, keyed by
+//! path + mtime + size so a replaced file gets a fresh thumbnail. A
+//! screenshot is simply made smaller. Each picture is uploaded to the GPU
+//! once and reused.
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
@@ -68,13 +69,15 @@ impl Thumbs {
         let (done_tx, done_rx) = mpsc::channel::<Done>();
         let app_ctx = ctx.clone();
         // A few workers sharing one queue: thumbnails still arrive roughly
-        // newest-first (the order they're requested). Each ffmpeg runs at low
-        // priority and is mostly process start-up, so a capture isn't starved.
+        // newest-first (the order they're requested). Each decodes at low
+        // priority (as ffmpeg did, made one), so a game or a capture isn't
+        // starved.
         let workers = std::thread::available_parallelism().map_or(2, |n| n.get() / 3).clamp(2, 4);
         let job_rx = Arc::new(Mutex::new(job_rx));
         for _ in 0..workers {
             let (job_rx, done_tx, ctx) = (job_rx.clone(), done_tx.clone(), ctx.clone());
             std::thread::spawn(move || {
+                crate::video::lower_priority();
                 loop {
                     let Ok((key, path)) = job_rx.lock().unwrap().recv() else { break };
                     let (image, duration) = generate(key, &path);
@@ -220,7 +223,14 @@ fn generate(key: u64, video: &Path) -> (Option<egui::ColorImage>, Option<Duratio
     };
     if !jpg.exists() {
         let _ = std::fs::create_dir_all(cache_dir());
-        // The first frame: what you see when the clip starts playing.
+        // The first frame: what you see when the clip starts playing. Kept
+        // as it's decoded (no reading the JPEG back).
+        if let Some((w, h, rgba)) = first_frame(video) {
+            if let Some(bytes) = media::encode_jpeg(&rgba, w as u16, h as u16, 85) {
+                let _ = std::fs::write(&jpg, bytes);
+            }
+            return (Some(egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba)), duration);
+        }
         let _ = media::ffmpeg_background()
             .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
             .arg(video)
@@ -232,6 +242,15 @@ fn generate(key: u64, video: &Path) -> (Option<egui::ColorImage>, Option<Duratio
             .status();
     }
     (load(&jpg), duration)
+}
+
+/// A clip's first frame, [`WIDTH`] wide, as (width, height, RGBA), by the
+/// decoder playback uses: ~30 ms where ffmpeg took ~150 ms (and twice the
+/// CPU time) to start and write it. `None` where that can't open the clip.
+fn first_frame(video: &Path) -> Option<(usize, usize, Vec<u8>)> {
+    let mut dec = capture::decode::Decoder::open_rgba(video, WIDTH).ok()?;
+    let p = dec.frame(0).ok()??;
+    (p.rgba.len() == p.width as usize * p.height as usize * 4 && p.width > 0).then(|| (p.width as usize, p.height as usize, p.rgba))
 }
 
 /// A picture `w` wide (box-averaged), as (width, height, RGBA).
@@ -279,14 +298,8 @@ fn load(jpg: &Path) -> Option<egui::ColorImage> {
 }
 
 fn probe_duration(video: &Path) -> Option<Duration> {
-    let out = media::ffprobe()
-        .args(["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0"])
-        .arg(video)
-        .stdin(Stdio::null())
-        .output()
-        .ok()?;
-    let secs: f64 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
-    Some(Duration::from_secs_f64(secs))
+    let secs = media::probe(video).ok()?.duration;
+    (secs.is_finite() && secs >= 0.0).then(|| Duration::from_secs_f64(secs))
 }
 
 /// "0:42", "12:05", "1:02:33".
@@ -294,4 +307,45 @@ pub fn format_duration(d: Duration) -> String {
     let s = d.as_secs_f64().round() as u64;
     let (h, m, s) = (s / 3600, (s / 60) % 60, s % 60);
     if h > 0 { format!("{h}:{m:02}:{s:02}") } else { format!("{m}:{s:02}") }
+}
+
+#[cfg(test)]
+mod first_frame_tests {
+    use super::*;
+
+    /// The first frame decoded here is ffmpeg's, scaled down the same way
+    /// (each pixel the average of the area it covers), in a fraction of the
+    /// time ffmpeg takes to make a thumbnail (its own, bicubic).
+    #[test]
+    #[ignore = "needs a clip: HASTECLIP_CLIP=<mp4> cargo test --release -p hasteclip first_frame -- --ignored --nocapture"]
+    fn first_frame_is_ffmpegs() {
+        let clip = PathBuf::from(std::env::var("HASTECLIP_CLIP").unwrap());
+        let t = Instant::now();
+        let (w, h, ours) = first_frame(&clip).expect("decoded");
+        let ours_ms = t.elapsed().as_secs_f64() * 1000.0;
+        let t = Instant::now();
+        let thumbnail = std::env::temp_dir().join(format!("hc-first-frame-{}.jpg", std::process::id()));
+        media::ffmpeg()
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+            .arg(&clip)
+            .args(["-frames:v", "1", "-vf", &format!("scale={WIDTH}:-2"), "-q:v", "4"])
+            .arg(&thumbnail)
+            .output()
+            .unwrap();
+        let theirs_ms = t.elapsed().as_secs_f64() * 1000.0;
+        let _ = std::fs::remove_file(&thumbnail);
+        // With the colour matrix playback uses (an untagged HD clip is
+        // BT.709, as players take it; ffmpeg would take BT.601).
+        let matrix = if media::probe(&clip).unwrap().bt601 { "bt601" } else { "bt709" };
+        let out = media::ffmpeg()
+            .args(["-hide_banner", "-loglevel", "error", "-i"])
+            .arg(&clip)
+            .args(["-frames:v", "1", "-vf", &format!("scale={WIDTH}:-2:flags=area:in_color_matrix={matrix}"), "-f", "rawvideo", "-pix_fmt", "rgba", "-"])
+            .output()
+            .unwrap();
+        assert_eq!(out.stdout.len(), w * h * 4, "the same size ({w}x{h})");
+        let mean = ours.iter().zip(&out.stdout).map(|(a, b)| a.abs_diff(*b) as u64).sum::<u64>() as f64 / ours.len() as f64;
+        eprintln!("{w}x{h}: {ours_ms:.1} ms here, {theirs_ms:.1} ms by ffmpeg; off by {mean:.2} on average");
+        assert!(mean < 2.0, "off by {mean:.2}");
+    }
 }

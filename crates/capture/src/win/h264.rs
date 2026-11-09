@@ -8,9 +8,13 @@
 //!
 //! Output is Annex B; it's converted to AVCC for the MP4 writer here, with the
 //! parameter sets attached to every keyframe so a clip can start on any of them.
+//!
+//! Exports (`win::export`) use the hardware encoders too, set up for a file
+//! to watch rather than one to cut clips from.
 
 use std::mem::ManuallyDrop;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -32,10 +36,14 @@ use crate::EncodeSettings;
 use crate::mp4mux::{AvcConfig, annexb_to_avcc};
 use crate::writer::{Command, Media};
 
-/// Frames waiting for the encoder before the pacer starts dropping them:
-/// enough for the pacer's bursts after a stall at high rates (4 skipped 10%
-/// of a 540 fps recording; 8, 0.4%). A guess beyond that.
-const QUEUE: usize = 8;
+/// Frames waiting for the encoder before the pacer starts dropping them, at
+/// `fps`: a tenth of a second's, at least 8 (enough for the pacer's bursts
+/// after a stall at high rates: 4 skipped 10% of a 540 fps recording; 8,
+/// 0.4%), at most 24. Measured at 240 fps: the encoder now and then held a
+/// frame 43 ms, and 8 frames (33 ms) overflowed, 18 dropped at once.
+fn queue_len(fps: u32) -> usize {
+    (fps as usize / 10).clamp(8, 24)
+}
 
 /// One frame to encode: pool slot `slot`, presented at `n / fps`.
 pub(crate) struct Frame {
@@ -43,41 +51,93 @@ pub(crate) struct Frame {
     pub n: i64,
 }
 
+/// How an encoder is set up.
+#[derive(Clone, Copy)]
+pub(crate) struct Setup {
+    pub fps: u32,
+    pub kbps: u32,
+    /// The graphics card's encoder where one works, else Microsoft's
+    /// software one.
+    pub hardware: bool,
+    /// For a file to watch, not a recording: the card's encoder or none
+    /// (x264 does better on the CPU), keyframes seconds apart and the
+    /// bitrate free to follow the picture, as x264's.
+    pub export: bool,
+    /// For a stream (`crate::stream`): a constant bitrate and a keyframe
+    /// every two seconds, as the services ask, and its frames handed over
+    /// as the stream's own, this one of its pictures (its rendition).
+    pub stream: Option<usize>,
+}
+
 /// The encoder thread.
 pub(crate) struct Encoder {
     tx: Option<SyncSender<Frame>>,
     thread: Option<JoinHandle<()>>,
     pub pool: Arc<TexturePool>,
+    /// Which encoder it is (its own name for itself).
+    pub name: String,
+    /// Encoding stopped on the way (said in the log).
+    failed: Arc<AtomicBool>,
 }
 
 impl Encoder {
     pub(crate) fn start(gpu: &Gpu, width: u32, height: u32, s: &EncodeSettings, out: Sender<Command>) -> Result<Self> {
+        Self::start_with(gpu, width, height, Setup { fps: s.fps, kbps: s.video_bitrate_kbps, hardware: s.use_hardware, export: false, stream: None }, out)
+    }
+
+    pub(crate) fn start_with(gpu: &Gpu, width: u32, height: u32, setup: Setup, out: Sender<Command>) -> Result<Self> {
         // Enough to ride out the GPU being taken by a game for a while: even
         // with our raised GPU priority (`d3d::raise_gpu_priority`), CS2 kept
         // a frame's work waiting up to ~230 ms now and then; 8 frames (133 ms
-        // at 60 fps) ran out and frames were skipped. ~3 MB each at 1080p.
-        let pool = TexturePool::new(gpu, width, height, 16)?;
-        let (tx, rx) = mpsc::sync_channel::<Frame>(QUEUE);
-        let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
-        let (gpu2, pool2, s2) = (gpu.clone(), pool.clone(), s.clone());
+        // at 60 fps) ran out and frames were skipped. The queue's and 8 more:
+        // 16 at 60 fps, 32 from 240 fps up. ~3 MB each at 1080p.
+        let queue = queue_len(setup.fps);
+        let pool = TexturePool::new(gpu, width, height, queue + 8)?;
+        let (tx, rx) = mpsc::sync_channel::<Frame>(queue);
+        let (ready_tx, ready_rx) = mpsc::channel::<Result<String>>();
+        let failed = Arc::new(AtomicBool::new(false));
+        let (gpu2, pool2, failed2) = (gpu.clone(), pool.clone(), failed.clone());
         let thread = thread::spawn(move || {
             super::system::com_init();
-            super::system::multimedia_thread("Capture");
-            let mft = match open(&gpu2, width, height, &s2) {
+            // An export is work asked for, not something that must keep up.
+            if !setup.export {
+                super::system::multimedia_thread("Capture");
+            }
+            let (mft, name) = match open(&gpu2, width, height, &setup) {
                 Ok(m) => m,
                 Err(e) => {
                     let _ = ready_tx.send(Err(e));
                     return;
                 }
             };
-            let _ = ready_tx.send(Ok(()));
-            let mut run = Run { gpu: gpu2, pool: pool2, fps: s2.fps, out, config: None, width, height, staging: None };
+            let _ = ready_tx.send(Ok(name));
+            let last_out = setup.export.then_some(None);
+            let mut run = Run { gpu: gpu2, pool: pool2, fps: setup.fps, out, config: None, width, height, staging: None, last_out, stream: setup.stream };
             if let Err(e) = run.run(mft, rx) {
                 eprintln!("video encoder stopped: {e:#}");
+                failed2.store(true, Ordering::Relaxed);
             }
         });
-        ready_rx.recv_timeout(Duration::from_secs(10)).map_err(|_| anyhow!("the video encoder didn't start"))??;
-        Ok(Self { tx: Some(tx), thread: Some(thread), pool })
+        let name = ready_rx.recv_timeout(Duration::from_secs(10)).map_err(|_| anyhow!("the video encoder didn't start"))??;
+        Ok(Self { tx: Some(tx), thread: Some(thread), pool, name, failed })
+    }
+
+    /// Queue slot `slot` as frame `n`, waiting while the encoder is behind:
+    /// an export skips nothing. False if the encoder has stopped (the slot
+    /// is freed).
+    pub(crate) fn encode_waiting(&self, slot: usize, n: i64) -> bool {
+        match self.tx.as_ref().map(|tx| tx.send(Frame { slot, n })) {
+            Some(Ok(())) => true,
+            _ => {
+                self.pool.give(slot);
+                false
+            }
+        }
+    }
+
+    /// Encoding stopped on the way.
+    pub(crate) fn failed(&self) -> bool {
+        self.failed.load(Ordering::Relaxed)
     }
 
     /// Queue slot `slot` as frame `n`. If the encoder is behind, the frame is
@@ -93,8 +153,9 @@ impl Encoder {
         }
     }
 
-    /// Encode what's queued, flush the encoder and wait for it.
-    pub(crate) fn finish(mut self) {
+    /// Encode what's queued, flush the encoder and wait for it. False if
+    /// encoding stopped on the way or didn't finish (said in the log).
+    pub(crate) fn finish(mut self) -> bool {
         drop(self.tx.take());
         if let Some(t) = self.thread.take() {
             // It waits on the encoder's events: one that went quiet mustn't
@@ -107,8 +168,10 @@ impl Encoder {
                 let _ = t.join();
             } else {
                 eprintln!("video encoder didn't finish in 5 s; left behind");
+                return false;
             }
         }
+        !self.failed()
     }
 }
 
@@ -128,16 +191,20 @@ impl Mft {
     }
 }
 
-/// The best encoder that accepts our settings: a hardware one on our GPU if
-/// asked for (falling back to software if none works), else software.
-fn open(gpu: &Gpu, width: u32, height: u32, s: &EncodeSettings) -> Result<Mft> {
+/// The best encoder that accepts our settings, and its name: a hardware
+/// one on our GPU if asked for (falling back to software if none works,
+/// except for an export), else software.
+fn open(gpu: &Gpu, width: u32, height: u32, s: &Setup) -> Result<(Mft, String)> {
     let mut errors = Vec::new();
-    if s.use_hardware {
+    if s.hardware {
         for activate in enum_encoders(true, gpu.adapter_luid()) {
             match configure_hardware(&activate, gpu, width, height, s) {
-                Ok(m) => return Ok(m),
+                Ok(m) => return Ok((m, friendly_name(&activate))),
                 Err(e) => errors.push(format!("{}: {e:#}", friendly_name(&activate))),
             }
+        }
+        if s.export {
+            bail!("no hardware H.264 encoder works here ({})", if errors.is_empty() { "there's none".to_owned() } else { errors.join("; ") });
         }
         if !errors.is_empty() {
             eprintln!("hardware H.264 encoders failed, using software: {}", errors.join("; "));
@@ -148,7 +215,7 @@ fn open(gpu: &Gpu, width: u32, height: u32, s: &EncodeSettings) -> Result<Mft> {
             .map_err(anyhow::Error::from)
             .and_then(|mft| configure(&mft, width, height, s).map(|()| Mft::Sync { mft }));
         match result {
-            Ok(m) => return Ok(m),
+            Ok(m) => return Ok((m, friendly_name(&activate))),
             Err(e) => errors.push(format!("{}: {e:#}", friendly_name(&activate))),
         }
     }
@@ -200,7 +267,7 @@ fn friendly_name(activate: &IMFActivate) -> String {
         .unwrap_or_else(|_| "encoder".into())
 }
 
-fn configure_hardware(activate: &IMFActivate, gpu: &Gpu, width: u32, height: u32, s: &EncodeSettings) -> Result<Mft> {
+fn configure_hardware(activate: &IMFActivate, gpu: &Gpu, width: u32, height: u32, s: &Setup) -> Result<Mft> {
     unsafe {
         let mft: IMFTransform = activate.ActivateObject()?;
         let attrs = mft.GetAttributes()?;
@@ -208,7 +275,9 @@ fn configure_hardware(activate: &IMFActivate, gpu: &Gpu, width: u32, height: u32
             bail!("not an asynchronous encoder");
         }
         attrs.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1)?;
-        let _ = attrs.SetUINT32(&MF_LOW_LATENCY, 1);
+        if !s.export {
+            let _ = attrs.SetUINT32(&MF_LOW_LATENCY, 1);
+        }
         let mut token = 0u32;
         let mut manager = None;
         MFCreateDXGIDeviceManager(&mut token, &mut manager)?;
@@ -222,23 +291,46 @@ fn configure_hardware(activate: &IMFActivate, gpu: &Gpu, width: u32, height: u32
 }
 
 /// Rate control, GOP and latency, then the media types, then start streaming.
-fn configure(mft: &IMFTransform, width: u32, height: u32, s: &EncodeSettings) -> Result<()> {
-    let bitrate = s.video_bitrate_kbps.saturating_mul(1000);
-    let gop = crate::keyframe_every(s.fps);
+fn configure(mft: &IMFTransform, width: u32, height: u32, s: &Setup) -> Result<()> {
+    let bitrate = s.kbps.saturating_mul(1000);
+    // A recording: keyframes often (a clip starts on one), the bitrate held
+    // near its mean. An export, a file to watch: keyframes every few
+    // seconds and peaks of three times the bitrate, as Linux's NVENC export.
+    // A stream: a keyframe every two seconds, the bitrate held to it.
+    let (gop, peak) = if s.export {
+        ((s.fps * 4).min(600), bitrate.saturating_mul(3))
+    } else if s.stream.is_some() {
+        (s.fps * 2, bitrate)
+    } else {
+        (crate::keyframe_every(s.fps), bitrate.saturating_mul(3) / 2)
+    };
     unsafe {
         if let Ok(api) = mft.cast::<ICodecAPI>() {
             // Each is best effort: encoders support different subsets.
             let set = |key: &windows::core::GUID, v: VARIANT| {
                 let _ = api.SetValue(key, &v);
             };
-            if api.SetValue(&CODECAPI_AVEncCommonRateControlMode, &variant_u32(eAVEncCommonRateControlMode_PeakConstrainedVBR.0 as u32)).is_err() {
+            // A stream's bitrate is constant: what the services ask for, and
+            // what a connection can be counted on to carry.
+            let rate = if s.stream.is_some() { eAVEncCommonRateControlMode_CBR } else { eAVEncCommonRateControlMode_PeakConstrainedVBR };
+            if api.SetValue(&CODECAPI_AVEncCommonRateControlMode, &variant_u32(rate.0 as u32)).is_err() {
                 set(&CODECAPI_AVEncCommonRateControlMode, variant_u32(eAVEncCommonRateControlMode_UnconstrainedVBR.0 as u32));
             }
             set(&CODECAPI_AVEncCommonMeanBitRate, variant_u32(bitrate));
-            set(&CODECAPI_AVEncCommonMaxBitRate, variant_u32(bitrate.saturating_mul(3) / 2));
+            set(&CODECAPI_AVEncCommonMaxBitRate, variant_u32(peak));
+            if s.export {
+                // Over a buffer of six seconds' worth (in bits), as Linux's.
+                // Its speed preset is left as it is: NVIDIA's slowest
+                // (quality against speed 100) made a 1080p export no better
+                // (+0.007 dB SSIM) at 1.7 times the time.
+                set(&CODECAPI_AVEncCommonBufferSize, variant_u32(bitrate.saturating_mul(6)));
+            } else if s.stream.is_some() {
+                // A second's worth: no burst the connection can't carry.
+                set(&CODECAPI_AVEncCommonBufferSize, variant_u32(bitrate));
+            }
             set(&CODECAPI_AVEncMPVGOPSize, variant_u32(gop));
             set(&CODECAPI_AVEncMPVDefaultBPictureCount, variant_u32(0));
-            set(&CODECAPI_AVLowLatencyMode, variant_bool(true));
+            set(&CODECAPI_AVLowLatencyMode, variant_bool(!s.export));
         }
 
         let out = MFCreateMediaType()?;
@@ -310,6 +402,12 @@ struct Run {
     height: u32,
     /// Software path: CPU-readable copy of a frame.
     staging: Option<ID3D11Texture2D>,
+    /// An export's last frame out: frames must come out in order (see
+    /// `process_output`).
+    last_out: Option<Option<i64>>,
+    /// A stream's encoder: its frames are the stream's own (this one of
+    /// its pictures).
+    stream: Option<usize>,
 }
 
 impl Run {
@@ -489,6 +587,16 @@ impl Run {
             }
             let Some(sample) = sample else { return Ok(true) };
             let n = ((sample.GetSampleTime().unwrap_or(0) as f64) * self.fps as f64 / 1e7).round() as i64;
+            // An export's writer takes frames in the order they're shown.
+            // One asked for none but making B-frames anyway (in the order
+            // they're decoded) would play out of order: it stops, and ffmpeg
+            // makes the export.
+            if let Some(last) = &mut self.last_out {
+                if last.is_some_and(|l| n <= l) {
+                    bail!("the encoder gave frame {n} after frame {}: B-frames, though asked for none", last.unwrap_or(0));
+                }
+                *last = Some(n);
+            }
             let clean = sample.GetUINT32(&MFSampleExtension_CleanPoint).unwrap_or(0) != 0;
             let buffer = sample.ConvertToContiguousBuffer()?;
             let mut ptr = std::ptr::null_mut();
@@ -504,10 +612,11 @@ impl Run {
             }
             let key = frame.idr || clean;
             let config = if key { self.config.clone() } else { None };
-            let media = Media::Video {
-                frame: VideoFrame(Arc::new(EncodedFrame { data: Arc::from(frame.data), config })),
-                pts: n as f64 / self.fps as f64,
-                key,
+            let pts = n as f64 / self.fps as f64;
+            let media = if let Some(rendition) = self.stream {
+                Media::Stream(crate::stream::StreamFrame { rendition, data: Arc::from(frame.data), avcc: config.map(|c| Arc::from(c.record())), pts, key })
+            } else {
+                Media::Video { frame: VideoFrame(Arc::new(EncodedFrame { data: Arc::from(frame.data), config })), pts, key }
             };
             if self.out.send(Command::Media(media)).is_err() {
                 bail!("the file writer stopped");
@@ -555,5 +664,15 @@ impl IMFAsyncCallback_Impl for Release_Impl {
         HELD_N.fetch_add(1, Relaxed);
         self.pool.give(self.slot);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// A tenth of a second's frames wait for the encoder, from 8 to 24.
+    #[test]
+    fn a_tenth_of_a_second_waits() {
+        let lens: Vec<usize> = [30, 60, 120, 240, 540].into_iter().map(super::queue_len).collect();
+        assert_eq!(lens, [8, 8, 12, 24, 24]);
     }
 }

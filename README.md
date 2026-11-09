@@ -29,6 +29,7 @@
 - [Compared with other recorders](#compared-with-other-recorders)
 - [Platform support](#platform-support)
 - [Building from source](#building-from-source)
+- [Star history](#star-history)
 - [License](#license)
 
 ## Download
@@ -89,6 +90,7 @@ Clips are saved in a `hasteclip` folder in your Videos folder (Movies on macOS),
 - **Replay buffer.** It keeps the last 5 seconds to 1 hour in memory. Save it with a shortcut, or by voice: “HasteClip that” is recognised on your computer and never sent anywhere.
 - **Clips named after the play.** “3 kills on Mirage”, “Pentakill as Jinx”, “412pp FC”: clips of Counter-Strike 2, Dota 2, League of Legends and osu! are named after what happened. Other games' clips are named by the time.
 - **Recording.** Record straight to disk for as long as you like. A crash or power loss still leaves a playable file.
+- **Go live.** Stream to Twitch, YouTube, Kick or a server of your own, to several at once, at a size, frame rate and bitrate of the stream's own, frame blending and all. Clipping and recording go on beside it, all from one capture.
 - **Native, hardware encoding.** H.264 on your graphics card's video engine, at native resolution or scaled down, up to 540 fps at 1080p. HasteClip is written in Rust and draws on the GPU, with no browser running behind your game.
 - **Any shape.** Record the whole screen or a game's window, in its own aspect ratio or another, like 16:9 from an ultrawide screen.
 - **Sound as sources, not tracks.** Add your microphone, desktop sound, or single apps like the game, Discord or music. For each one, choose whether it's in the clip's sound, has its own track for editing later, or both. Each source has a live meter and a fader. There's noise reduction and mono for microphones, and a limiter on the mix.
@@ -161,16 +163,21 @@ HasteClip is in beta (versions 0.x). It works day to day, but not every feature 
 | Replay buffer, recording, editor, library | ✅ | ✅ | ✅ |
 | Share links, copy, export and import | ✅ | ✅ | ✅ |
 | Voice saving, named clips, per-app sound, webcam | ✅ | ✅ | ✅ |
+| Several webcams, other displays, windows, images, text and videos in the video | ✅ | ✅ | ✅ |
+| A web page in the video (alerts, chat) | ✅ | ✅ | ✅ (see below) |
 | Record a single game or app window | ✅ | ✅ | ✅ (see below) |
 | Drag clips out, system share sheet | ✅ | ✅ | Drag out on Wayland (no share sheet) |
 | Frame blending | ✅ | ✅ | ✅ |
+| Go live (streaming) | ✅ | ✅ | ✅ |
 | Automatic updates | ✅ | ✅ | ✅ |
-| Screenshots | — | ✅ | ✅ |
+| Screenshots | ✅ | ✅ | ✅ |
 | Game capture for fullscreen games | — | ✅ | — |
 
 **Games and apps on Linux:** every window on KDE Plasma, on X11 desktops, and on Sway and other desktops with the ext window capture protocols (Sway 1.11 and later). On GNOME, the windows of X11 apps, which includes games run through Proton or Wine; GNOME doesn't let apps follow its native Wayland windows, so record the whole screen for those.
 
-**Encoders:** VideoToolbox on macOS. NVENC, AMF or Quick Sync through Media Foundation on Windows. NVENC or VA-API through ffmpeg on Linux, with x264 when there's no GPU encoder.
+**Web pages on Linux** are drawn by Chromium's engine ([CEF](https://bitbucket.org/chromiumembedded/cef), the one OBS uses), on your graphics card where it can. It isn't part of the download: the first time you add a web page, HasteClip downloads it once from its releases (about 107 MB) and keeps it in `~/.local/share/hasteclip`. A build of your own can use an engine unpacked elsewhere with `HASTECLIP_WEB_ENGINE_DIR=<folder>`.
+
+**Encoders:** VideoToolbox on macOS. NVENC, AMF or Quick Sync through Media Foundation on Windows. NVENC or VA-API through ffmpeg on Linux, with x264 when there's no GPU encoder. A stream gets an encoder of its own (on Linux, always ffmpeg's).
 
 **Frame blending** captures several times faster than the clip's frame rate and blends those pictures into each frame, for smooth motion.
 
@@ -218,6 +225,16 @@ The release scripts build the app and bundle ffmpeg:
 - `scripts/release.ps1` (Windows) also bundles OBS Studio's game capture hook. It packs everything with [Velopack](https://velopack.io) into the installer and the delta update packages.
 - `scripts/release-mac.sh` builds the `.dmg`.
 - `scripts/release-linux.sh` builds the tarball.
+
+## Star history
+
+<a href="https://www.star-history.com/?repos=hasteclip%2Fhasteclip&type=date&legend=bottom-right">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=hasteclip/hasteclip&type=date&theme=dark&legend=bottom-right" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=hasteclip/hasteclip&type=date&legend=bottom-right" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=hasteclip/hasteclip&type=date&legend=bottom-right" />
+ </picture>
+</a>
 
 ## License
 

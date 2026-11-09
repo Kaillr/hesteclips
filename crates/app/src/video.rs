@@ -92,7 +92,8 @@ pub fn yield_to_scrub() {
 }
 
 /// This thread yields to the game, the app and playback (background decoding
-/// and compressing: scrub frames, the filmstrip).
+/// and compressing: scrub frames, the filmstrip; listening for "HasteClip
+/// that").
 pub fn lower_priority() {
     #[cfg(windows)]
     unsafe {
@@ -218,6 +219,17 @@ pub struct Video {
     state: Arc<Mutex<State>>,
 }
 
+/// Says (`HASTECLIP_DEBUG_VIDEO`) the playback decoder's thread is done.
+struct Closed;
+
+impl Drop for Closed {
+    fn drop(&mut self) {
+        if crate::player::debug() {
+            eprintln!("{:>8.3} video: playback decoder closed", crate::player::uptime());
+        }
+    }
+}
+
 impl Video {
     /// Start opening `path` in the background.
     /// Frames are decoded at the video's own resolution and numbered at
@@ -227,6 +239,9 @@ impl Video {
         let state = Arc::new(Mutex::new(State::default()));
         let (path, shared, ctx) = (path.to_path_buf(), state.clone(), ctx.clone());
         std::thread::spawn(move || {
+            // Logged as the thread ends, after the decoder's gone
+            // (`HASTECLIP_DEBUG_VIDEO`): a player that let go of it closed it.
+            let _closed = Closed;
             let opened = open_decoder(&path);
             let mut dec = match opened {
                 Ok(mut d) => {
@@ -303,6 +318,11 @@ impl Video {
                 };
                 let room = {
                     let s = shared.lock().unwrap();
+                    // Playing with hardly a frame ahead of the clock: the
+                    // decoder is what holds playback back.
+                    if playing && !at_end && s.ahead.len() < 3 {
+                        capture::playback_behind();
+                    }
                     // Scrubbing, the frames kept are the read-ahead.
                     !at_end && dir == 0 && s.ahead.len() < if playing { ahead_playing } else { AHEAD_PAUSED }
                 };
@@ -829,7 +849,14 @@ fn open_decoder(path: &Path) -> anyhow::Result<Decoder> {
     #[cfg(target_os = "linux")]
     {
         anyhow::ensure!(crate::gpu_frames::can_upload(), "the renderer can't draw decoded frames");
-        Decoder::open(path, capture::decode::Output::Screen)
+        // On the card where it can: a tenth of the CPU.
+        let on_card = crate::gpu_frames::card().and_then(|card| {
+            Decoder::open_card(path, &card).inspect_err(|e| eprintln!("video: this clip is decoded on the CPU ({e:#})")).ok()
+        });
+        match on_card {
+            Some(d) => Ok(d),
+            None => Decoder::open(path, capture::decode::Output::Screen),
+        }
     }
 }
 

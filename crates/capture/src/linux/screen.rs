@@ -26,6 +26,7 @@ use anyhow::{Result, anyhow, bail};
 use pipewire as pw;
 use pw::spa;
 
+use super::kwin_windows::{self, Rect};
 use super::portal::{self, Cast};
 use super::{gpu, kwin, mutter, wlr, x11};
 
@@ -156,6 +157,13 @@ impl Latest {
         Some(spare.swap_remove(at))
     }
 
+    /// No picture till the next (its source stopped: left out meanwhile,
+    /// rather than its last picture kept).
+    pub(crate) fn clear(&self) {
+        self.frame.lock().unwrap().take();
+        self.seq.fetch_add(1, Ordering::Release);
+    }
+
     /// The newest picture is this texture, on the card.
     pub(crate) fn store_texture(&self, texture: wgpu::Texture) {
         let (width, height) = (texture.width(), texture.height());
@@ -231,7 +239,9 @@ enum Stop {
     Direct(Arc<AtomicBool>),
 }
 
-static SHARED: Mutex<Option<Weak<Screen>>> = Mutex::new(None);
+/// The casts running, each shared by whoever records or shows its screen
+/// (the recording's picture, another display's layer, the preview).
+static SHARED: Mutex<Vec<Weak<Screen>>> = Mutex::new(Vec::new());
 
 /// The screen cast of `id`, started if none is running. Blocks while the
 /// desktop asks which screen to share (the portal, and only when no choice
@@ -239,7 +249,8 @@ static SHARED: Mutex<Option<Weak<Screen>>> = Mutex::new(None);
 pub(crate) fn acquire(id: &str) -> Result<Arc<Screen>> {
     // Held throughout, so two starting together share one dialog and cast.
     let mut shared = SHARED.lock().unwrap();
-    if let Some(screen) = shared.as_ref().and_then(Weak::upgrade).filter(|s| s.latest.ended().is_none() && s.id == id) {
+    shared.retain(|w| w.strong_count() > 0);
+    if let Some(screen) = shared.iter().filter_map(Weak::upgrade).find(|s| s.latest.ended().is_none() && s.id == id) {
         return Ok(screen);
     }
     // Should reading the screen directly fail, the portal may still work.
@@ -258,7 +269,7 @@ pub(crate) fn acquire(id: &str) -> Result<Arc<Screen>> {
         Some(s) => s,
         None => Screen::start_portal(id)?,
     });
-    *shared = Some(Arc::downgrade(&screen));
+    shared.push(Arc::downgrade(&screen));
     drop(shared);
     // Fails here, visibly, rather than recording a black file.
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -275,8 +286,9 @@ pub(crate) fn acquire(id: &str) -> Result<Arc<Screen>> {
 }
 
 /// A stream of one window on KDE Plasma (by its uuid in KWin's window list),
-/// at its own size; not shared. Blocks until its first picture (for up to 2
-/// seconds: a window that isn't drawing yet still opens).
+/// at its own size: its inside, without title bar and borders (see
+/// [`WindowInside`]); not shared. Blocks until its first picture (for up to
+/// 2 seconds: a window that isn't drawing yet still opens).
 pub(crate) fn open_kwin_window(uuid: &str) -> Result<Screen> {
     let latest = Arc::new(Latest::default());
     let ended = Arc::downgrade(&latest);
@@ -286,7 +298,8 @@ pub(crate) fn open_kwin_window(uuid: &str) -> Result<Screen> {
         }
     })?;
     let node = cast.node;
-    let screen = Screen::start_pipewire(uuid, None, node, latest, move || drop(cast))?;
+    let inside = WindowInside { uuid: uuid.to_owned(), ..Default::default() };
+    let screen = Screen::start_pipewire(uuid, None, node, latest, Some(inside), move || drop(cast))?;
     let deadline = Instant::now() + Duration::from_secs(2);
     while !screen.latest.has_frame() && screen.latest.ended().is_none() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(10));
@@ -319,7 +332,7 @@ pub(crate) fn open_ext_window(id: &str) -> Result<Screen> {
 /// Don't hand out the running cast anymore: the next [`acquire`] starts a new
 /// one (it ends once its holders let go).
 pub(crate) fn forget() {
-    *SHARED.lock().unwrap() = None;
+    SHARED.lock().unwrap().clear();
 }
 
 /// Let go of the cast, keeping it running a little longer in case someone
@@ -358,7 +371,7 @@ impl Screen {
     fn start_portal(id: &str) -> Result<Self> {
         let (cast, fd) = Cast::open()?;
         let node = cast.node;
-        Self::start_pipewire(id, Some(fd), node, Arc::new(Latest::default()), move || cast.close())
+        Self::start_pipewire(id, Some(fd), node, Arc::new(Latest::default()), None, move || cast.close())
     }
 
     /// KWin's stream: the node is on the session's own PipeWire.
@@ -371,7 +384,7 @@ impl Screen {
             }
         })?;
         let node = cast.node;
-        Self::start_pipewire(id, None, node, latest, move || drop(cast))
+        Self::start_pipewire(id, None, node, latest, None, move || drop(cast))
     }
 
     /// Mutter's stream: the node is on the session's own PipeWire.
@@ -384,17 +397,17 @@ impl Screen {
             }
         })?;
         let node = cast.node;
-        Self::start_pipewire(id, None, node, latest, move || drop(cast))
+        Self::start_pipewire(id, None, node, latest, None, move || drop(cast))
     }
 
     /// Read a PipeWire video node on its own thread: on the remote behind
-    /// `fd` (the portal's), else the session's PipeWire. `done` runs when the
-    /// reading stops.
-    fn start_pipewire(id: &str, fd: Option<OwnedFd>, node: u32, latest: Arc<Latest>, done: impl FnOnce() + Send + 'static) -> Result<Self> {
+    /// `fd` (the portal's), else the session's PipeWire; of a window's
+    /// pictures only its `inside`. `done` runs when the reading stops.
+    fn start_pipewire(id: &str, fd: Option<OwnedFd>, node: u32, latest: Arc<Latest>, inside: Option<WindowInside>, done: impl FnOnce() + Send + 'static) -> Result<Self> {
         let (ready_tx, ready_rx) = mpsc::channel::<Result<pw::channel::Sender<()>>>();
         let latest2 = latest.clone();
         let thread = thread::Builder::new().name("screen".into()).spawn(move || {
-            if let Err(e) = run(fd, node, &latest2, &ready_tx) {
+            if let Err(e) = run(fd, node, &latest2, inside, &ready_tx) {
                 latest2.end(format!("{e:#}"));
                 let _ = ready_tx.send(Err(e));
             }
@@ -451,6 +464,74 @@ struct StreamState {
     imported: HashMap<i64, wgpu::Texture>,
     /// An import failed (said once).
     failed: bool,
+    /// A window's stream: where its inside is in each picture.
+    inside: Option<WindowInside>,
+}
+
+impl StreamState {
+    /// The part of a `w` × `h` picture to keep: x, y, width, height.
+    fn part(&mut self, (w, h): (u32, u32)) -> (u32, u32, u32, u32) {
+        self.inside.as_mut().map_or((0, 0, w, h), |i| i.part((w, h)))
+    }
+}
+
+/// Where a KWin window's inside (without its title bar and borders, as
+/// Windows captures a window) is in its stream's pictures. KWin streams a
+/// window's frame, with any menu or tooltip of it that's open past the
+/// frame, at the scale of the display it's on; its window list says where
+/// the frame and the inside are on the desktop.
+#[derive(Default)]
+struct WindowInside {
+    uuid: String,
+    /// How far in from the frame's edges the inside is (left, top, right,
+    /// bottom, on the desktop), as KWin last said it in a way that fits: it
+    /// says where the frame is and where the inside is one after the other,
+    /// so a move can come between them.
+    margins: Option<[u32; 4]>,
+    /// The window's scale, as the last picture of just its frame said.
+    scale: Option<f64>,
+}
+
+impl WindowInside {
+    /// The part of a `w` × `h` picture to keep: x, y, width, height. All of
+    /// it where KWin doesn't say where the inside is (an older Plasma).
+    fn part(&mut self, (w, h): (u32, u32)) -> (u32, u32, u32, u32) {
+        let all = (0, 0, w, h);
+        let Some((Some(frame), Some(inside))) = kwin_windows::geometry(&self.uuid) else { return all };
+        self.part_of((w, h), frame, inside).unwrap_or(all)
+    }
+
+    fn part_of(&mut self, (w, h): (u32, u32), frame: Rect, inside: Rect) -> Option<(u32, u32, u32, u32)> {
+        if frame.width == 0 || frame.height == 0 {
+            return None;
+        }
+        let left = inside.x - frame.x;
+        let top = inside.y - frame.y;
+        let right = frame.x + frame.width as i32 - (inside.x + inside.width as i32);
+        let bottom = frame.y + frame.height as i32 - (inside.y + inside.height as i32);
+        if [left, top, right, bottom].iter().all(|m| *m >= 0) {
+            self.margins = Some([left, top, right, bottom].map(|m| m as u32));
+        }
+        let [left, top, right, bottom] = self.margins?;
+        // A picture of just the frame is the frame's size times the scale,
+        // both ways (to within rounding); a menu open past the frame makes
+        // it bigger one way or both.
+        let (sx, sy) = (w as f64 / frame.width as f64, h as f64 / frame.height as f64);
+        if (sx - sy).abs() <= 0.5 / frame.width as f64 + 0.5 / frame.height as f64 {
+            self.scale = Some((sx + sy) / 2.0);
+        }
+        let scale = self.scale.unwrap_or(sx.min(sy));
+        let px = |v: u32| (v as f64 * scale).round() as u32;
+        // The frame is at the picture's top left: a menu or tooltip open past
+        // it is to its right or below it nearly always. (One above it or to
+        // its left would move the frame, which can't be told from here: the
+        // window would be cut wrong while that's open.) Never past the
+        // inside's own size, so a menu past the frame doesn't show.
+        let (x, y) = (px(left), px(top));
+        let width = w.saturating_sub(x + px(right)).min(px(inside.width));
+        let height = h.saturating_sub(y + px(bottom)).min(px(inside.height));
+        (width >= 2 && height >= 2).then_some((x, y, width, height))
+    }
 }
 
 /// The graphics card, when pictures are taken and worked on it (whenever
@@ -461,7 +542,7 @@ pub(crate) fn gpu_frames() -> Option<Arc<gpu::Gpu>> {
 
 /// Read the cast until told to stop (or it ends). Sends the stopper once the
 /// stream is connected.
-fn run(fd: Option<OwnedFd>, node: u32, latest: &Arc<Latest>, ready: &mpsc::Sender<Result<pw::channel::Sender<()>>>) -> Result<()> {
+fn run(fd: Option<OwnedFd>, node: u32, latest: &Arc<Latest>, inside: Option<WindowInside>, ready: &mpsc::Sender<Result<pw::channel::Sender<()>>>) -> Result<()> {
     pw::init();
     let mainloop = pw::main_loop::MainLoopRc::new(None)?;
     let context = pw::context::ContextRc::new(&mainloop, None)?;
@@ -484,7 +565,7 @@ fn run(fd: Option<OwnedFd>, node: u32, latest: &Arc<Latest>, ready: &mpsc::Sende
     let (latest_p, latest_s) = (latest.clone(), latest.clone());
     let quit = mainloop.downgrade();
     let _listener = stream
-        .add_local_listener_with_user_data(StreamState::default())
+        .add_local_listener_with_user_data(StreamState { inside, ..Default::default() })
         .state_changed(move |_, _, _, new| {
             let why = match new {
                 pw::stream::StreamState::Error(e) => format!("the screen capture failed: {e}"),
@@ -513,7 +594,8 @@ fn run(fd: Option<OwnedFd>, node: u32, latest: &Arc<Latest>, ready: &mpsc::Sende
             };
             st.width = info.size().width;
             st.height = info.size().height;
-            if st.width > 0 && st.height > 0 {
+            // A screen's size (not a window's).
+            if st.width > 0 && st.height > 0 && st.inside.is_none() {
                 portal::remember_size((st.width, st.height));
             }
             st.imported.clear();
@@ -564,11 +646,13 @@ fn run(fd: Option<OwnedFd>, node: u32, latest: &Arc<Latest>, ready: &mpsc::Sende
             let (w, h) = (st.width, st.height);
             let stride = if stride > 0 { stride as usize } else { w as usize * 4 };
             let Some(bytes) = data.data() else { return };
-            let need = offset + stride * (h as usize).saturating_sub(1) + w as usize * 4;
+            let (x, y, w, h) = st.part((w, h));
+            let start = offset + y as usize * stride + x as usize * 4;
+            let need = start + stride * (h as usize).saturating_sub(1) + w as usize * 4;
             if w == 0 || h == 0 || bytes.len() < need {
                 return;
             }
-            latest_p.store(w, h, stride, order, &bytes[offset..]);
+            latest_p.store(w, h, stride, order, &bytes[start..]);
         })
         .register()?;
 
@@ -687,11 +771,13 @@ fn buffers_pod(dmabuf: bool) -> Vec<u8> {
 }
 
 /// A picture on the card: imported (once per buffer), copied into a texture
-/// of ours on the card, which becomes the newest picture; waited for, so the
-/// compositor can draw into its buffer again once it's handed back.
+/// of ours on the card (the part kept: a window's inside), which becomes the
+/// newest picture; waited for, so the compositor can draw into its buffer
+/// again once it's handed back.
 #[allow(clippy::too_many_arguments)]
 fn take_dmabuf(card: &gpu::Gpu, st: &mut StreamState, latest: &Latest, fd: i64, fourcc: u32, modifier: u64, offset: u64, stride: u64) {
     let (w, h) = (st.width, st.height);
+    let (x, y, part_w, part_h) = st.part((w, h));
     if !st.imported.contains_key(&fd) {
         // SAFETY: the buffer's fd, valid while PipeWire holds the buffer (it's dup'ed to import).
         let borrowed = unsafe { BorrowedFd::borrow_raw(fd as i32) };
@@ -709,6 +795,7 @@ fn take_dmabuf(card: &gpu::Gpu, st: &mut StreamState, latest: &Latest, fd: i64, 
     }
     let input = &st.imported[&fd];
     let format = input.format();
+    let (w, h) = (part_w, part_h);
     let out = latest.spare_texture(w, h, format).unwrap_or_else(|| {
         card.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("screen picture"),
@@ -722,7 +809,8 @@ fn take_dmabuf(card: &gpu::Gpu, st: &mut StreamState, latest: &Latest, fd: i64, 
         })
     });
     let mut enc = card.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("take picture") });
-    enc.copy_texture_to_texture(input.as_image_copy(), out.as_image_copy(), wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 });
+    let from = wgpu::TexelCopyTextureInfo { origin: wgpu::Origin3d { x, y, z: 0 }, ..input.as_image_copy() };
+    enc.copy_texture_to_texture(from, out.as_image_copy(), wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 });
     let done = card.queue.submit([enc.finish()]);
     let _ = card.device.poll(wgpu::PollType::Wait { submission_index: Some(done), timeout: Some(Duration::from_secs(1)) });
     latest.store_texture(out);
@@ -756,5 +844,111 @@ mod gpu_tests {
             std::fs::write(out, [format!("P6\n{w} {h}\n255\n").as_bytes(), &rgb].concat()).unwrap();
         }
         assert!(lit > 0, "all black");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rect(x: i32, y: i32, width: u32, height: u32) -> Rect {
+        Rect { x, y, width, height }
+    }
+
+    /// A window's picture is cut to its inside: its frame's title bar and
+    /// borders off, at its display's scale, whatever else is open past it.
+    #[test]
+    fn a_window_is_cut_to_its_inside() {
+        // A 30-pixel title bar, 2-pixel borders.
+        let frame = rect(100, 50, 800, 630);
+        let inside = rect(102, 80, 796, 598);
+        let mut w = WindowInside::default();
+        assert_eq!(w.part_of((800, 630), frame, inside), Some((2, 30, 796, 598)));
+        // A menu open past its bottom right: the picture's bigger, the inside isn't.
+        assert_eq!(w.part_of((900, 700), frame, inside), Some((2, 30, 796, 598)));
+        // KWin's said the frame moved and not yet the inside: as before.
+        assert_eq!(w.part_of((800, 630), rect(110, 60, 800, 630), inside), Some((2, 30, 796, 598)));
+        // On a display at 150%.
+        let mut w = WindowInside::default();
+        assert_eq!(w.part_of((1200, 945), frame, inside), Some((3, 45, 1194, 897)));
+        assert_eq!(w.part_of((1300, 1000), frame, inside), Some((3, 45, 1194, 897)));
+        // No title bar or borders (it draws its own, or it's fullscreen): all of it.
+        let mut w = WindowInside::default();
+        assert_eq!(w.part_of((800, 600), rect(0, 0, 800, 600), rect(0, 0, 800, 600)), Some((0, 0, 800, 600)));
+        // Never past the picture, which can lag behind the window growing.
+        let mut w = WindowInside::default();
+        w.part_of((800, 630), frame, inside);
+        assert_eq!(w.part_of((800, 630), rect(100, 50, 1000, 630), rect(102, 80, 996, 598)), Some((2, 30, 796, 598)));
+    }
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+
+    /// A window's stream on KDE Plasma is its inside: a QML window, magenta
+    /// with a red square in its top left corner, in a frame KWin draws (run
+    /// in a nested KWin: its title bar is Breeze's). Then with a popup open
+    /// over its bottom right corner and past it, which KWin streams too:
+    /// only the part over the inside shows.
+    #[test]
+    #[ignore = "opens a window and captures it on KDE Plasma (HASTECLIP_NO_GPU_CAPTURE=1): cargo test -p capture window_inside -- --ignored"]
+    fn window_inside() {
+        let qml = std::env::temp_dir().join("hc-window-inside.qml");
+        std::fs::write(
+            &qml,
+            r##"import QtQuick
+Window {
+    id: main; width: 400; height: 300; visible: true; title: "hc inside"; color: "#ff00ff"
+    Rectangle { width: 20; height: 20; color: "#ff0000" }
+    Window { id: pop; flags: Qt.ToolTip; transientParent: main; x: main.x + 350; y: main.y + 250; width: 200; height: 150; color: "#00ff00"; visible: false }
+    Timer { interval: 3000; running: true; onTriggered: pop.visible = true }
+}
+"##,
+        )
+        .unwrap();
+        let mut child = std::process::Command::new("qml6").arg(&qml).spawn().expect("qml6");
+        let t = Instant::now();
+        let uuid = loop {
+            if let Some(w) = kwin_windows::windows().expect("KWin's window list").into_iter().find(|w| w.title == "hc inside" && w.frame.is_some()) {
+                break w.uuid;
+            }
+            assert!(t.elapsed() < Duration::from_secs(10), "the window didn't open");
+            thread::sleep(Duration::from_millis(50));
+        };
+        thread::sleep(Duration::from_millis(300));
+        let screen = open_kwin_window(&uuid).unwrap();
+        let shot = |when: &str| {
+            let (f, _) = screen.latest.get().expect("a picture");
+            assert!(f.texture.is_none(), "run with HASTECLIP_NO_GPU_CAPTURE=1 to read it");
+            let px = |x: u32, y: u32| {
+                let at = y as usize * f.stride + x as usize * 4;
+                let p = &f.data[at..at + 4];
+                if f.order == Order::Bgr { [p[2], p[1], p[0]] } else { [p[0], p[1], p[2]] }
+            };
+            let (w, h) = (f.width, f.height);
+            let points = [px(2, 2), px(w - 3, 2), px(2, h - 3), px(30, 30), px(w - 3, h - 3)];
+            eprintln!("{when}: window {:?}, picture {w}x{h}; top left, top right, bottom left, inside, bottom right: {points:?}", kwin_windows::geometry(&uuid));
+            ((w, h), points)
+        };
+        thread::sleep(Duration::from_millis(800));
+        let before = shot("before");
+        while t.elapsed() < Duration::from_secs(5) {
+            thread::sleep(Duration::from_millis(50));
+        }
+        let open = shot("popup open");
+        drop(screen);
+        let _ = child.kill();
+        let _ = child.wait();
+        let near = |p: [u8; 3], q: [u8; 3]| p.iter().zip(q).all(|(a, b)| a.abs_diff(b) < 24);
+        let (red, magenta, green) = ([255, 0, 0], [255, 0, 255], [0, 255, 0]);
+        for ((size, points), corner) in [(before, magenta), (open, green)] {
+            assert_eq!(size, (400, 300), "not the inside's size");
+            assert!(near(points[0], red), "the top left isn't the red square");
+            for p in &points[1..4] {
+                assert!(near(*p, magenta), "{p:?} isn't the window's magenta");
+            }
+            assert!(near(points[4], corner), "the bottom right is {:?}", points[4]);
+        }
     }
 }

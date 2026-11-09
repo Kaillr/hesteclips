@@ -3,3 +3,4 @@
 /node_modules
 /Releases
 .next-version
+.cloudflare/

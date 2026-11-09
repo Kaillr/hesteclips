@@ -21,18 +21,22 @@
 
 mod aac;
 pub mod anticheat;
+mod browser;
 mod camera;
 mod changes;
 mod cursor;
 mod d3d;
 mod dupl;
+pub(crate) mod export;
 pub mod decode;
 pub(crate) mod direct;
 pub mod gpu;
 mod h264;
 pub mod hook;
+mod layers;
 mod loopback;
 mod quad;
+mod sound_file;
 pub(crate) mod system;
 
 use std::path::{Path, PathBuf};
@@ -47,16 +51,17 @@ use anyhow::{Context, Result, bail};
 pub(crate) use loopback::SystemAudio;
 pub(crate) use system::host_now;
 pub use camera::{keep_open as keep_camera_open, list_cameras, open_camera_settings};
-pub(crate) use camera::picture as camera_picture;
-pub use system::{cursor_state, foreground_app_path, foreground_exe, list_apps, list_screens, list_windowed_apps};
+pub(crate) use camera::{controls as camera_controls, picture as camera_picture, set_control as set_camera_control};
+pub use system::{app_window_size, cursor_state, display_bounds, foreground_app_path, foreground_exe, list_apps, list_screens, list_windowed_apps};
 pub(crate) use system::display_pixels;
 
-use crate::mixer::{self, Clock, LiveAudio};
+use crate::mixer::{self, Clock, LiveAudio, MixChange, MixInput};
 use crate::mp4mux::Spec;
-use crate::output::{in_progress, timestamp};
-use crate::sources::{AudioCapture, mix_inputs, track_layout};
+use crate::outputs::{Capture, Outputs};
+use crate::sources::{AudioCapture, AudioSource, mix_inputs, track_layout};
+use crate::stream::StreamSettings;
 use crate::writer::{self, Media, Writer};
-use crate::{EncodeSettings, Mode, Recorder, VideoSource};
+use crate::{BlendShape, EncodeSettings, Mode, Recorder, Running, VideoSource, eprintln_later};
 use aac::AacEncoder;
 use crate::mp4file::Layout;
 
@@ -64,116 +69,66 @@ use crate::mp4file::Layout;
 const AUDIO_BITRATE: u32 = 192_000;
 
 pub struct WinRecorder {
-    session: Option<Session>,
-    mode: Option<Mode>,
-    current_file: Option<PathBuf>,
-    replay_seconds: u32,
-    output_dir: PathBuf,
-    container_ext: String,
+    outputs: Outputs<Session>,
     live: Arc<LiveAudio>,
 }
 
 impl WinRecorder {
     /// `live` receives the meters and supplies each source's volume.
     pub fn new(live: Arc<LiveAudio>) -> Self {
-        Self {
-            session: None,
-            mode: None,
-            current_file: None,
-            replay_seconds: 60,
-            output_dir: PathBuf::from("."),
-            container_ext: "mp4".to_string(),
-            live,
-        }
+        Self { outputs: Outputs::new(), live }
     }
 }
 
 impl Recorder for WinRecorder {
     fn start(&mut self, mode: Mode, settings: &EncodeSettings) -> Result<()> {
-        if self.session.is_some() {
-            let _ = self.stop(None);
-        }
-        self.replay_seconds = settings.replay_seconds;
-        self.output_dir = settings.output_dir.clone();
-        // Our muxer writes MP4 and MOV; MKV isn't one of them.
-        self.container_ext = if settings.container_ext == "mov" { "mov".into() } else { "mp4".into() };
-        std::fs::create_dir_all(&settings.output_dir)?;
-
-        let s = settings.clone();
-        let target = match mode {
-            Mode::Record => {
-                let file = self.output_dir.join(format!("recording_{}.{}", timestamp(), self.container_ext));
-                self.current_file = Some(file.clone());
-                Target::Record(in_progress(&file))
-            }
-            Mode::ReplayBuffer => {
-                self.current_file = None;
-                Target::Replay(settings.replay_seconds as f64)
-            }
-        };
-        self.session = Some(Session::start(&s, target, &self.live, self.container_ext == "mov")?);
-        self.mode = Some(mode);
-        Ok(())
+        let live = self.live.clone();
+        self.outputs.start(mode, settings, |s, mov| Session::start(s, &live, mov))
     }
 
     fn save_clip(&mut self, dir: &Path) -> Result<crate::PendingClip> {
-        let session = self.session.as_ref().filter(|_| self.mode == Some(Mode::ReplayBuffer));
-        let session = session.context("replay buffer is not running")?;
-        std::fs::create_dir_all(dir)?;
-        writer::request_clip(&session.writer_tx, dir, &self.container_ext, self.replay_seconds as f64)
+        self.outputs.save_clip(dir)
     }
 
-    fn stop(&mut self, dir: Option<&Path>) -> Result<Option<PathBuf>> {
-        let finished = self.session.take().map(Session::finish);
-        let file = self.current_file.take();
-        let was_record = self.mode == Some(Mode::Record);
-        self.mode = None;
-        if !was_record {
-            return Ok(None);
-        }
-        let Some(file) = file else { return Ok(None) };
-        let partial = in_progress(&file);
-        if let Some(Err(e)) = finished {
-            // A fragmented MP4 is still playable up to the failure: keep what we got.
-            if !partial.exists() {
-                return Err(e.context("recording failed"));
-            }
-            eprintln!("recording ended with an error: {e:#}");
-        }
-        if !partial.exists() {
-            bail!("recording failed — nothing was written");
-        }
-        let file = crate::output::destination(&file, dir);
-        crate::output::finish_rename(&partial, &file).context("couldn't finish the recording")?;
-        Ok(Some(file))
+    fn stop(&mut self, mode: Mode, dir: Option<&Path>) -> Result<Option<PathBuf>> {
+        self.outputs.stop(mode, dir)
     }
 
-    fn is_running(&self) -> bool {
-        self.session.is_some()
+    fn stop_all(&mut self) {
+        self.outputs.stop_all();
+    }
+
+    fn running(&self) -> Running {
+        self.outputs.running()
     }
 
     fn set_replay_seconds(&mut self, seconds: u32) {
-        self.replay_seconds = seconds;
-        if let Some(session) = self.session.as_ref().filter(|_| self.mode == Some(Mode::ReplayBuffer)) {
-            let _ = session.writer_tx.send(writer::Command::SetWindow(seconds as f64));
-        }
+        self.outputs.set_replay_seconds(seconds);
     }
 
     fn update_video(&mut self, video: &VideoSource) -> bool {
-        self.session.as_mut().is_some_and(|s| s.update_video(video))
+        self.outputs.session.as_mut().is_some_and(|s| s.update_video(video))
     }
 
     fn set_mic(&mut self, id: &str, device: &str) -> bool {
-        self.session.as_mut().and_then(|s| s.audio.as_mut()).is_some_and(|a| a.set_mic(id, device))
+        self.outputs.session.as_mut().and_then(|s| s.audio.as_mut()).is_some_and(|a| a.set_mic(id, device))
+    }
+
+    fn set_blend(&mut self, looks: u32, shape: BlendShape) -> bool {
+        self.outputs.session.as_mut().is_some_and(|s| s.set_blend(looks, shape))
+    }
+
+    fn set_sources(&mut self, sources: &[AudioSource]) -> bool {
+        self.outputs.session.as_mut().is_some_and(|s| s.set_sources(sources, &self.live))
     }
 
     fn screenshot(&mut self, video: &VideoSource) -> Result<crate::PendingShot> {
-        if let Some(sw) = self.session.as_ref().and_then(|s| s.switch.as_ref()) {
+        if let Some(sw) = self.outputs.session.as_ref().and_then(|s| s.switch.as_ref()) {
             return shot_of(&sw.latest);
         }
         // Nothing running: a capture of its own, for one picture.
         system::com_init();
-        let gpu = d3d::Gpu::new()?;
+        let gpu = d3d::Gpu::for_capture()?;
         let (source, (w, h)) = PictureSource::plan(video)?;
         let picture = source.open(&gpu, w, h, 60, None)?;
         // A screen has its picture by now; games and apps take a moment to
@@ -203,18 +158,8 @@ fn shot_of(latest: &d3d::Latest) -> Result<crate::PendingShot> {
 impl Drop for WinRecorder {
     /// Dropping (app quit) must still finalise the file.
     fn drop(&mut self) {
-        if self.session.is_some() {
-            let _ = self.stop(None);
-        }
+        self.outputs.stop_all();
     }
-}
-
-/// Where a session's media goes.
-enum Target {
-    /// Straight to this (hidden, partial) file.
-    Record(PathBuf),
-    /// An in-memory ring of this many seconds.
-    Replay(f64),
 }
 
 // ---------------------------------------------------------------------------
@@ -238,18 +183,193 @@ struct Session {
     pacer: Option<(Arc<AtomicBool>, JoinHandle<()>)>,
     audio: Option<AudioCapture>,
     mixer: Option<(Arc<AtomicBool>, JoinHandle<()>)>,
+    /// The sources added and taken out while it runs, for the mixer.
+    mix_changes: Option<Sender<MixChange>>,
     /// AAC encoder threads, one per track; they end when the mixer drops its senders.
     encoders: Vec<JoinHandle<()>>,
     writer_tx: Sender<writer::Command>,
     writer: Option<Writer>,
+    /// Frames a second, and the frame's size.
+    fps: u32,
+    size: (u32, u32),
+    /// Frame blending changed while it runs, for the pacer to take up.
+    blend_ctl: Arc<std::sync::Mutex<Option<(u32, BlendShape)>>>,
+    /// The stream's own pictures, for the pacer to take up: one per
+    /// rendition (`stream::renditions`) when it starts, none when it stops.
+    stream_ctl: Arc<std::sync::Mutex<Option<Vec<StreamOut>>>>,
+    /// What the stream's pictures are made from.
+    stream_from: Option<StreamFrom>,
+}
+
+/// What the stream's own pictures are made from: the frame the pacer
+/// makes (its average), with the other layers over it or under it and the
+/// screen placed, as the recording's.
+struct StreamFrom {
+    gpu: d3d::Gpu,
+    average: Arc<d3d::Latest>,
+    feeds: Arc<layers::Feeds>,
+    screen: crate::SharedScreen,
+    hardware: bool,
+}
+
+/// One of the stream's pictures (a rendition: `stream::renditions`), in the
+/// pacer: a frame for every `every` of the pacer's, in its own size,
+/// through an encoder of its own.
+struct StreamOut {
+    /// Made from the pacer's frame as it is: one in every `every`.
+    direct: d3d::Converter,
+    /// At a fraction of the frame rate, with frame blending on: the frames
+    /// in its own time averaged (`StreamBlend`), and converted from that.
+    blended: Option<(StreamBlend, d3d::Converter)>,
+    encoder: h264::Encoder,
+    every: i64,
+    /// Frames its encoder couldn't take.
+    dropped: u64,
+}
+
+impl StreamOut {
+    /// Whether frame `k` is wanted: every one while it blends its own,
+    /// else the ones at its own frames' times.
+    fn wants(&self, k: i64, blending: bool) -> bool {
+        (blending && self.blended.is_some()) || k.rem_euclid(self.every) == 0
+    }
+
+    /// Frame `k` is made (in the pacer's average, `content` of it valid):
+    /// the stream's frame from it, once one's due.
+    fn frame(&mut self, gpu: &d3d::Gpu, k: i64, blending: bool, content: (u32, u32)) {
+        let phase = k.rem_euclid(self.every);
+        if !blending && let Some((b, _)) = &mut self.blended {
+            b.count = 0;
+        }
+        let converter = match self.blended.as_mut().filter(|_| blending) {
+            Some((b, c)) => {
+                b.add(gpu);
+                if phase != self.every - 1 {
+                    return;
+                }
+                b.finish(gpu, content);
+                &*c
+            }
+            None => {
+                if phase != 0 {
+                    return;
+                }
+                &self.direct
+            }
+        };
+        let Some(slot) = self.encoder.pool.take() else {
+            self.dropped += 1;
+            return;
+        };
+        match converter.convert(slot) {
+            Ok(()) => {
+                if !self.encoder.encode(slot, k / self.every) {
+                    self.dropped += 1;
+                }
+            }
+            Err(e) => {
+                self.encoder.pool.give(slot);
+                eprintln_later!("stream: {e:#}");
+            }
+        }
+    }
+}
+
+/// A stream frame made of every frame in its own time (frame blending on,
+/// and the stream at a fraction of the frame rate: 48 fps from 144): their
+/// average, as light, as frames are made of their looks, so its motion is
+/// blurred over all of its time as the recording's is over each frame's.
+/// Taking one frame in three instead blurred a third of it.
+struct StreamBlend {
+    quad: quad::Quad,
+    light: (windows::Win32::Graphics::Direct3D11::ID3D11RenderTargetView, windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView),
+    /// The pacer's frame, read as each is added.
+    from: windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView,
+    /// The stream frame, as its converter reads it.
+    out: Arc<d3d::Latest>,
+    out_target: windows::Win32::Graphics::Direct3D11::ID3D11RenderTargetView,
+    size: (u32, u32),
+    /// Frames in the one being made so far.
+    count: u32,
+}
+
+impl StreamBlend {
+    fn new(gpu: &d3d::Gpu, average: &Arc<d3d::Latest>) -> Result<Self> {
+        use windows::Win32::Graphics::Direct3D11::{D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_USAGE_DEFAULT};
+        let bind = (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32;
+        let size = (average.width, average.height);
+        let light = gpu.texture(size.0, size.1, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT, bind, D3D11_USAGE_DEFAULT, 0)?;
+        let out = d3d::Latest::new(gpu, size.0, size.1)?;
+        Ok(Self {
+            quad: quad::Quad::new(gpu)?,
+            light: (quad::target_view(gpu, &light)?, quad::shader_view(gpu, &light)?),
+            from: quad::shader_view(gpu, &average.texture)?,
+            out_target: quad::target_view(gpu, &out.texture)?,
+            out,
+            size,
+            count: 0,
+        })
+    }
+
+    /// The pacer's frame, added (each the same in the average).
+    fn add(&mut self, gpu: &d3d::Gpu) {
+        self.count += 1;
+        self.quad.average_light(gpu, &self.light.0, self.size, &self.from, 1.0 / self.count as f32);
+    }
+
+    /// The stream frame's done: its average, for the converter.
+    fn finish(&mut self, gpu: &d3d::Gpu, content: (u32, u32)) {
+        self.quad.from_light(gpu, &self.out_target, self.size, &self.light.1);
+        self.out.mark_frame(content);
+        self.count = 0;
+    }
+}
+
+impl Capture for Session {
+    fn writer(&self) -> &Sender<writer::Command> {
+        &self.writer_tx
+    }
+
+    fn stream_video(&mut self, stream: Option<&StreamSettings>) -> Result<()> {
+        let Some(st) = stream else {
+            *self.stream_ctl.lock().unwrap() = Some(Vec::new());
+            return Ok(());
+        };
+        let from = self.stream_from.as_ref().context("the capture can't stream")?;
+        let camera = || Some(from.feeds.clone());
+        let (renditions, _) = crate::stream::renditions(st, self.fps);
+        let mut outs = Vec::with_capacity(renditions.len());
+        for (i, r) in renditions.iter().enumerate() {
+            let every = (self.fps / r.fps.max(1)).max(1) as i64;
+            let (width, height) = crate::output_size(self.size.0, self.size.1, r.short_side);
+            let setup = h264::Setup { fps: r.fps, kbps: r.kbps, hardware: from.hardware, export: false, stream: Some(i) };
+            let encoder = h264::Encoder::start_with(&from.gpu, width, height, setup, self.writer_tx.clone())?;
+            let direct = d3d::Converter::new(&from.gpu, &from.average, camera(), &encoder.pool.textures, true, width, height, r.fps, from.screen.clone())?;
+            let blended = if every > 1 {
+                let b = StreamBlend::new(&from.gpu, &from.average)?;
+                let c = d3d::Converter::new(&from.gpu, &b.out, camera(), &encoder.pool.textures, true, width, height, r.fps, from.screen.clone())?;
+                Some((b, c))
+            } else {
+                None
+            };
+            eprintln!("stream: {} at {width}×{height}, {} fps, {} kb/s", encoder.name, r.fps, r.kbps);
+            outs.push(StreamOut { direct, blended, encoder, every, dropped: 0 });
+        }
+        *self.stream_ctl.lock().unwrap() = Some(outs);
+        Ok(())
+    }
+
+    fn finish(self) -> Result<()> {
+        self.end()
+    }
 }
 
 impl Session {
-    fn start(s: &EncodeSettings, target: Target, live: &Arc<LiveAudio>, mov: bool) -> Result<Self> {
+    fn start(s: &EncodeSettings, live: &Arc<LiveAudio>, mov: bool) -> Result<Self> {
         crate::capture_started();
         system::com_init();
         system::mf_startup()?;
-        let gpu = d3d::Gpu::new()?;
+        let gpu = d3d::Gpu::for_capture()?;
         let (picture_source, (canvas_w, canvas_h)) = PictureSource::plan(&s.video)?;
         let (width, height) = s.size.of(canvas_w, canvas_h);
         let clock = Arc::new(Clock::default());
@@ -257,16 +377,28 @@ impl Session {
         let (titles, comment, has_rest) = track_layout(&s.sources);
         let aac: Vec<AacEncoder> = titles.iter().map(|_| AacEncoder::new(AUDIO_BITRATE)).collect::<Result<_>>()?;
         let layout = Layout {
-            spec: Spec { width, height, fps: s.fps, audio_titles: titles, audio_bitrate: AUDIO_BITRATE, comment, mov },
+            spec: Spec { width, height, fps: s.fps, audio_titles: titles, audio_bitrate: AUDIO_BITRATE, comment, mov, reorder: 0 },
         };
-        let writer = match target {
-            Target::Record(file) => Writer::record(file, layout, s.fps),
-            Target::Replay(seconds) => Writer::replay(seconds, layout, s.fps),
-        };
+        let writer = Writer::new(layout, s.fps);
         let writer_tx = writer.tx.clone();
 
-        let mut session =
-            Self { video: None, apps: None, switch: None, pacer: None, audio: None, mixer: None, encoders: Vec::new(), writer_tx, writer: Some(writer) };
+        let mut session = Self {
+            video: None,
+            apps: None,
+            switch: None,
+            pacer: None,
+            audio: None,
+            mixer: None,
+            mix_changes: None,
+            encoders: Vec::new(),
+            writer_tx,
+            writer: Some(writer),
+            fps: s.fps,
+            size: (width, height),
+            blend_ctl: Default::default(),
+            stream_ctl: Default::default(),
+            stream_from: None,
+        };
         let started = (|| -> Result<()> {
             // One PCM channel + AAC thread per track, in layout order: the mix,
             // each own track, the rest.
@@ -283,8 +415,11 @@ impl Session {
             let rest_track = if has_rest { tracks.next() } else { None };
             session.audio = Some(audio);
             let stop = Arc::new(AtomicBool::new(false));
-            let mixer = mixer::spawn_mixer(
+            let (mix_changes, changes) = mpsc::channel();
+            session.mix_changes = Some(mix_changes);
+            let mixer = mixer::spawn_changing_mixer(
                 inputs,
+                changes,
                 mix_track,
                 rest_track,
                 live.clone(),
@@ -305,16 +440,11 @@ impl Session {
             let latest = picture.latest.clone();
             session.video = Some(picture.video);
             session.switch = Some(Switch { gpu: gpu.clone(), latest: latest.clone(), fps: looks_per_second, away: s.away_screen.clone(), source: s.video.clone() });
-            // A webcam that can't open doesn't stop the recording: its status
-            // says why, and the picture goes on without it.
-            let camera = s.webcam.as_ref().and_then(|w| match camera::CameraLayer::new(&gpu, w) {
-                Ok(c) => Some(c),
-                Err(e) => {
-                    eprintln!("webcam: {e:#}");
-                    None
-                }
-            });
-            let overlay = camera.as_ref().zip(s.webcam.as_ref()).map(|(c, w)| (&c.latest, w.placement.clone()));
+            // The other layers: a webcam or display that can't open doesn't
+            // stop the recording (its status says why), the picture goes on
+            // without it.
+            let feeds = layers::Feeds::new(&gpu, s.layers.clone(), looks_per_second);
+            let overlay = Some(feeds.clone());
             // Each frame comes from the pictures shown during it, timed by
             // when each came up (see `FrameBlend`): with blending their
             // average, without it the one up at the frame's time. Taking the
@@ -328,14 +458,70 @@ impl Session {
             latest.set_wants_queue(true);
             let converter = d3d::Converter::new(&gpu, &blend.average, overlay.clone(), &encoder.pool.textures, true, width, height, s.fps, s.screen.clone())?;
             let preview = d3d::Previewer::new(&gpu, &latest, overlay, width, height, s.fps, s.screen.clone(), crate::preview::new_producer())?;
-            session.pacer = Some(spawn_blend_pacer(s.fps, looks, shutter, latest, blend, converter, encoder, preview, camera, clock));
+            session.stream_from = Some(StreamFrom {
+                gpu: gpu.clone(),
+                average: blend.average.clone(),
+                feeds: feeds.clone(),
+                screen: s.screen.clone(),
+                hardware: s.use_hardware,
+            });
+            let ctl = PacerCtl { blend: session.blend_ctl.clone(), stream: session.stream_ctl.clone() };
+            session.pacer = Some(spawn_blend_pacer(s.fps, looks, shutter, latest, blend, converter, encoder, preview, Some(feeds), clock, ctl));
             Ok(())
         })();
         if let Err(e) = started {
-            let _ = session.finish();
+            let _ = session.end();
             return Err(e);
         }
         Ok(session)
+    }
+
+    /// Change frame blending while it runs: the pacer takes it up at its
+    /// next frame, and the screen is captured as fast as the looks need
+    /// (its capture started again at that rate). False if it can't.
+    fn set_blend(&mut self, looks: u32, shape: BlendShape) -> bool {
+        if self.pacer.is_none() {
+            return false;
+        }
+        let looks = looks.max(1);
+        *self.blend_ctl.lock().unwrap() = Some((looks, shape));
+        let rate = self.fps * looks;
+        if self.switch.as_ref().is_some_and(|sw| sw.fps != rate) {
+            if let Some(sw) = &mut self.switch {
+                sw.fps = rate;
+            }
+            self.restart_video();
+        }
+        true
+    }
+
+    /// Start the picture's capture again as it is (at the rate `switch` has
+    /// now), into the same picture.
+    fn restart_video(&mut self) {
+        let Some(sw) = &self.switch else { return };
+        let source = match PictureSource::plan(&sw.source) {
+            Ok((source, _)) => source,
+            Err(e) => {
+                eprintln!("can't start the capture again: {e:#}");
+                return;
+            }
+        };
+        if let Some(old) = self.video.take() {
+            old.stop();
+        }
+        let apps = source.apps();
+        match source.start(&sw.gpu, &sw.latest, sw.fps, sw.away.clone()) {
+            Ok(v) => {
+                // The games and apps followed, as they were.
+                if let (Some(new), Some(old)) = (&apps, &self.apps) {
+                    let config = old.lock().unwrap().clone();
+                    *new.lock().unwrap() = config;
+                }
+                self.video = Some(v);
+                self.apps = apps;
+            }
+            Err(e) => eprintln!("can't start the capture again: {e:#}"),
+        }
     }
 
     /// Record something else without restarting: another list of games and
@@ -384,8 +570,27 @@ impl Session {
         }
     }
 
-    /// Stop capturing and finish the file (record) or drop the ring (replay).
-    fn finish(mut self) -> Result<()> {
+    /// Capture these audio sources from now on, without restarting (see
+    /// [`Recorder::set_sources`]): the capture starts and stops them, and
+    /// the mixer takes them in and out.
+    fn set_sources(&mut self, sources: &[AudioSource], live: &LiveAudio) -> bool {
+        let (Some(audio), Some(changes)) = (self.audio.as_mut(), &self.mix_changes) else { return false };
+        let (added, gone) = audio.set_sources(sources, live);
+        for source in gone {
+            eprintln!("audio source \"{}\": taken out while capturing", source.name);
+            let _ = changes.send(MixChange::Remove(source.id));
+        }
+        for (source, feed) in added {
+            eprintln!("audio source \"{}\": added while capturing, into the mix", source.name);
+            let input = MixInput { channel: live.channel(&source.id), id: source.id, feed, in_mix: source.in_mix, track: None };
+            let _ = changes.send(MixChange::Add(input));
+        }
+        true
+    }
+
+    /// Stop capturing and finish what the writer was doing (a recording's
+    /// file; the ring's let go).
+    fn end(mut self) -> Result<()> {
         // Each step logged with its time: a step that never ends is a frozen
         // quit, and the log then says which.
         let t = Instant::now();
@@ -394,6 +599,12 @@ impl Session {
         if let Some((stop, handle)) = self.pacer.take() {
             stop.store(true, Ordering::Relaxed);
             let _ = handle.join();
+        }
+        // A stream the pacer stopped before it took it up: finished here
+        // (its encoders would hold the writer open).
+        let pending = self.stream_ctl.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+        for s in pending.into_iter().flatten() {
+            s.encoder.finish();
         }
         step("frame pacer stopped");
         if let Some(video) = self.video.take() {
@@ -561,7 +772,7 @@ impl PreviewCapture {
         size: crate::VideoSize,
         fps: u32,
         away: Option<Arc<crate::StillImage>>,
-        webcam: Option<crate::webcam::Webcam>,
+        layers: crate::SharedLayers,
         screen: crate::SharedScreen,
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
@@ -572,20 +783,19 @@ impl PreviewCapture {
         let apps2 = apps.clone();
         thread::spawn(move || {
             system::com_init();
-            let opened = (|| -> Result<(Picture, d3d::Previewer, Option<camera::CameraLayer>)> {
-                let gpu = d3d::Gpu::new()?;
+            let opened = (|| -> Result<(Picture, d3d::Previewer, Arc<layers::Feeds>)> {
+                let gpu = d3d::Gpu::for_capture()?;
                 let (mut source, (w, h)) = PictureSource::plan(&source)?;
                 if let (PictureSource::Apps(list), Some(shared)) = (&mut source, apps2) {
                     *list = shared; // so `update` reaches the running follower
                 }
                 let picture = source.open(&gpu, w, h, fps, away)?;
                 let (width, height) = size.of(w, h);
-                let cam = webcam.as_ref().and_then(|wc| camera::CameraLayer::new(&gpu, wc).ok());
-                let overlay = cam.as_ref().zip(webcam.as_ref()).map(|(c, wc)| (&c.latest, wc.placement.clone()));
-                let preview = d3d::Previewer::new(&gpu, &picture.latest, overlay, width, height, fps, screen, generation)?;
-                Ok((picture, preview, cam))
+                let feeds = layers::Feeds::new(&gpu, layers, fps);
+                let preview = d3d::Previewer::new(&gpu, &picture.latest, Some(feeds.clone()), width, height, fps, screen, generation)?;
+                Ok((picture, preview, feeds))
             })();
-            let (picture, preview, mut cam) = match opened {
+            let (picture, preview, feeds) = match opened {
                 Ok(p) => p,
                 Err(e) => {
                     *error2.lock().unwrap() = Some(format!("{e:#}"));
@@ -598,9 +808,7 @@ impl PreviewCapture {
             let t0 = host_now();
             let mut n = 0u64;
             while !stop2.load(Ordering::Relaxed) {
-                if let Some(c) = cam.as_mut() {
-                    c.pull();
-                }
+                feeds.update();
                 if let Err(e) = preview.submit() {
                     eprintln!("preview: {e:#}");
                 }
@@ -613,7 +821,7 @@ impl PreviewCapture {
                 }
             }
             drop(preview);
-            drop(cam);
+            drop(feeds);
             picture.video.stop();
         });
         Self { stop, error, apps }
@@ -658,11 +866,12 @@ impl WindowCapture {
 }
 
 /// Exclusive fullscreen: a fullscreen game in focus is drawing (on the
-/// graphics card, `gpu`) while Windows' capture has had nothing from it for
-/// this long. Windows' capture gets a frame for every frame a window
-/// presents, the same picture again too (measured: a still window drawn 180
-/// times a second, 180 frames a second), so a game on a still screen isn't
-/// mistaken for this; one that stops drawing isn't busy on the graphics card.
+/// graphics card, `gpu`) while its pictures haven't reached the capture for
+/// this long (see [`Sight`]). Windows' capture gets a frame for every frame a
+/// window presents, the same picture again too (measured: a still window
+/// drawn 180 times a second, 180 frames a second), and Desktop Duplication a
+/// new picture, so a game on a still screen isn't mistaken for this; one that
+/// stops drawing isn't busy on the graphics card.
 const FROZEN: Duration = Duration::from_secs(2);
 
 /// Percent of the graphics card's 3D engine that counts as drawing. A guess:
@@ -670,12 +879,113 @@ const FROZEN: Duration = Duration::from_secs(2);
 /// that doesn't draw 0.
 const DRAWING: f64 = 0.3;
 
-/// Whether a fullscreen game's window that Windows' capture has had
-/// nothing from for `FROZEN` is drawing all the same (`gpu`, sampled every
-/// call while it's watched): exclusive fullscreen.
-fn unseen_but_drawing(gpu: &mut Option<gpu::GpuUse>, window: windows::Win32::Foundation::HWND, since_last_frame: Duration) -> Option<f64> {
-    let percent = gpu.as_mut()?.percent(system::window_pid(window));
-    (since_last_frame > FROZEN && percent > DRAWING).then_some(percent)
+/// How busy a fullscreen game keeps the graphics card drawing, in percent
+/// (`gpu`, sampled every call while it's watched), if that can be told.
+fn drawing(gpu: &mut Option<gpu::GpuUse>, window: windows::Win32::Foundation::HWND) -> Option<f64> {
+    Some(gpu.as_mut()?.percent(system::window_pid(window)))
+}
+
+/// What tells how busy games keep the graphics card (see [`drawing`]); said
+/// in the log (once) where Windows can't: without it, no fullscreen game is
+/// switched to the game capture hook for going unseen.
+fn gpu_meter() -> Option<gpu::GpuUse> {
+    let found = gpu::GpuUse::new();
+    if found.is_none() {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| eprintln!("can't tell how busy games keep the graphics card (Windows' GPU counters): a fullscreen game Windows can't see won't switch to the game capture hook"));
+    }
+    found
+}
+
+/// How long after a game comes up, or its window moves, to look at it: a
+/// window just gone fullscreen can still be shown by the compositor for its
+/// first frames (measured: 0.2 s), and the look would end there. A guess.
+const FIRST_LOOK: Duration = Duration::from_secs(1);
+
+/// How long after a look that saw the game to look again: at first, then
+/// twice as long each time, up to the second.
+const LOOK_AGAIN: (Duration, Duration) = (Duration::from_secs(5), Duration::from_secs(60));
+
+/// Whether a fullscreen game in focus that Windows' capture records reaches
+/// it. Windows' capture can't tell by itself: it hands over a frame each time
+/// the cursor moves too, even over a game it can't see (its last picture
+/// again, the cursor moved on it), and a game being played moves one of its
+/// own (Minecraft 1.12 and before an invisible one, put back in the middle
+/// every frame), which brings it frames even with the cursor left out of it.
+/// That kept a frozen Minecraft's recording from ever switching to the hook
+/// (issue #11). Desktop Duplication tells ([`dupl::Probe`]), so one looks:
+/// when the game comes up, when its window moves or changes size (going
+/// exclusive fullscreen), and now and then after (see [`FIRST_LOOK`],
+/// [`LOOK_AGAIN`]), till a new picture shows the game seen. Not one kept
+/// open: that costs the compositor about as much as Windows' capture does
+/// (measured with a game at 540 fps: 15% more of a core on top of Windows'
+/// capture, 37% alone, however seldom it's asked); a look keeps one open a
+/// fifth of a second, and makes a frame or two come a refresh late. Where
+/// the display can't be duplicated, Windows' capture's own frames tell, as
+/// they can.
+#[derive(Default)]
+struct Sight {
+    /// The game's window and when it came up there (another, or moved, is
+    /// looked at soon).
+    window: Option<(WindowAt, Instant)>,
+    /// The look going on.
+    probe: Option<dupl::Probe>,
+    /// The display can't be duplicated.
+    cannot: bool,
+    /// When to look again (none: at once), and how long after that.
+    next: Option<Instant>,
+    wait: Duration,
+}
+
+/// A window, and where it is on the desktop (see [`system::window_place`]).
+type WindowAt = (usize, (i32, i32, i32, i32));
+
+impl Sight {
+    /// How long the game in `window` hasn't reached the capture, since it
+    /// came up: told by looks with a Desktop Duplication of the display
+    /// (`probe`: Windows' capture records it), else by how long the capture's
+    /// had nothing new (`own`: Desktop Duplication's own pictures, or Windows'
+    /// capture's frames where the display can't be duplicated). None: it was
+    /// seen lately, and isn't looked at now.
+    fn unseen(&mut self, gpu: &d3d::Gpu, window: WindowAt, probe: Option<windows::Win32::Graphics::Gdi::HMONITOR>, own: Duration) -> Option<Duration> {
+        let now = Instant::now();
+        if self.window.is_none_or(|(w, _)| w != window) {
+            *self = Sight { window: Some((window, now)), next: Some(now + FIRST_LOOK), ..Default::default() };
+        }
+        let up = self.window.map_or(Duration::ZERO, |(_, at)| now - at);
+        let Some(monitor) = probe.filter(|_| !self.cannot) else {
+            return Some(own.min(up));
+        };
+        if self.probe.is_none() {
+            if self.next.is_some_and(|next| now < next) {
+                return None;
+            }
+            match dupl::Probe::start(gpu, monitor) {
+                Ok(probe) => self.probe = Some(probe),
+                Err(why) => {
+                    // Once: it's the same each time a game comes up.
+                    static SAID: std::sync::Once = std::sync::Once::new();
+                    SAID.call_once(|| eprintln!("can't look at the display with Desktop Duplication ({why}): a fullscreen game Windows' capture can't see is told by its frames alone, which moving the cursor brings too"));
+                    self.cannot = true;
+                    return Some(own.min(up));
+                }
+            }
+        }
+        let (unseen, seen) = self.probe.as_mut()?.since_last_picture();
+        if seen {
+            self.look_later();
+            return None;
+        }
+        Some(unseen)
+    }
+
+    /// The look's over (the game's seen, or doesn't draw: nothing to see):
+    /// the next, later.
+    fn look_later(&mut self) {
+        self.probe = None;
+        self.wait = (self.wait * 2).clamp(LOOK_AGAIN.0, LOOK_AGAIN.1);
+        self.next = Some(Instant::now() + self.wait);
+    }
 }
 
 /// A display's capture: Windows' own, or Desktop Duplication (see `dupl`).
@@ -788,7 +1098,8 @@ impl Video {
             let mut hook_failed: std::collections::HashSet<usize> = Default::default();
             // Apps Windows' capture froze on: hooked from then on.
             let mut frozen: std::collections::HashSet<String> = Default::default();
-            let mut gpu_use = gpu::GpuUse::new();
+            let mut sight = Sight::default();
+            let mut gpu_use = gpu_meter();
             // A window that couldn't be captured, so it's reported once.
             let mut failed = None;
             // The away screen is up (so it's uploaded once, not every tick).
@@ -833,15 +1144,31 @@ impl Video {
                     }
                     current = None;
                 }
-                // Windows' capture of a fullscreen game in focus sends nothing:
-                // it can't see the game (exclusive fullscreen). The hook can.
-                if let Some((h, app, WindowCapture::Wgc(capture, true))) = &current
-                    && let Some(percent) = unseen_but_drawing(&mut gpu_use, *h, capture.since_last_frame())
-                    && focused.as_ref().is_some_and(|(f, _, _)| f == h)
-                    && !system::window_hidden(*h)
-                    && system::covers_display(*h)
-                {
-                    eprintln!("{app}: drawing ({percent:.1}% of the graphics card) but Windows' capture has had nothing for {FROZEN:?}: exclusive fullscreen; switching to the game capture hook");
+                // Windows' capture of a fullscreen game in focus gets nothing
+                // from it: it can't see the game (exclusive fullscreen, see
+                // `Sight`). The hook can.
+                let mut unseen = None;
+                match &current {
+                    Some((h, app, WindowCapture::Wgc(capture, true)))
+                        if focused.as_ref().is_some_and(|(f, _, _)| f == h) && !system::window_hidden(*h) && system::covers_display(*h) =>
+                    {
+                        if let Some(percent) = drawing(&mut gpu_use, *h)
+                            && sight
+                                .unseen(&gpu, (h.0 as usize, system::window_place(*h)), Some(system::window_monitor(*h)), capture.since_last_frame())
+                                .is_some_and(|u| u > FROZEN)
+                        {
+                            if percent > DRAWING {
+                                unseen = Some((app.clone(), percent));
+                            } else {
+                                // Nothing to see: it doesn't draw.
+                                sight.look_later();
+                            }
+                        }
+                    }
+                    _ => sight = Sight::default(),
+                }
+                if let Some((app, percent)) = unseen {
+                    eprintln!("{app}: drawing ({percent:.1}% of the graphics card) but Windows' capture has had nothing from it for {FROZEN:?}: exclusive fullscreen; switching to the game capture hook");
                     frozen.insert(app.to_lowercase());
                     current = None;
                 }
@@ -986,7 +1313,8 @@ impl Video {
             let mut plans: std::collections::HashMap<usize, hook::Plan> = Default::default();
             let mut hook_failed: std::collections::HashSet<usize> = Default::default();
             let mut frozen: std::collections::HashSet<String> = Default::default();
-            let mut gpu_use = gpu::GpuUse::new();
+            let mut sight = Sight::default();
+            let mut gpu_use = gpu_meter();
             while !stop2.load(Ordering::Relaxed) {
                 // A fullscreen window in focus on this display.
                 let game = system::foreground_app()
@@ -995,7 +1323,7 @@ impl Video {
                 let plan = game.as_ref().map(|(h, exe)| {
                     *plans.entry(h.0 as usize).or_insert_with(|| {
                         let (plan, why) = hook::plan(exe, *h, &settings);
-                        eprintln!("{exe} fullscreen: {} ({why})", if plan == hook::Plan::Hook { "the game capture hook" } else { "Windows' capture" });
+                        eprintln!("{exe} fullscreen: {} ({why})", if plan == hook::Plan::Hook { "the game capture hook" } else { "the display's capture" });
                         plan
                     })
                 });
@@ -1068,14 +1396,30 @@ impl Video {
                     }
                     retry.0 = Instant::now() + retry.1;
                 }
-                // Windows' capture sends nothing new while a fullscreen game
-                // is in focus: it can't see it (exclusive fullscreen).
-                // (Desktop Duplication sees it: it's what the display shows.)
-                if let (Some(DisplayCapture::Wgc(capture) | DisplayCapture::StandIn(capture)), Some((h, exe)), Some(hook::Plan::Watch)) = (&display, &game, plan)
-                    && let Some(percent) = unseen_but_drawing(&mut gpu_use, *h, capture.since_last_frame())
-                    && frozen.insert(exe.to_lowercase())
-                {
-                    eprintln!("{exe}: drawing ({percent:.1}% of the graphics card) but Windows' capture has had nothing for {FROZEN:?}: exclusive fullscreen; switching to the game capture hook");
+                // The display's capture gets nothing new while a fullscreen
+                // game is in focus: it can't see it (exclusive fullscreen, or
+                // a game that goes to the display past the compositor, issue
+                // #11). Desktop Duplication tells; for Windows' capture, one
+                // that looks now and then (see `Sight`).
+                match (&display, &game, plan) {
+                    (Some(capture), Some((h, exe)), Some(hook::Plan::Watch)) if !frozen.contains(&exe.to_lowercase()) => {
+                        if let Some(percent) = drawing(&mut gpu_use, *h) {
+                            let (own, probe) = match capture {
+                                DisplayCapture::Dupl(c) => (c.since_last_picture(), None),
+                                DisplayCapture::Wgc(c) | DisplayCapture::StandIn(c) => (c.since_last_frame(), Some(monitor)),
+                            };
+                            if sight.unseen(&gpu, (h.0 as usize, system::window_place(*h)), probe, own).is_some_and(|u| u > FROZEN) {
+                                if percent > DRAWING {
+                                    eprintln!("{exe}: drawing ({percent:.1}% of the graphics card) but the display's capture has had nothing from it for {FROZEN:?}: exclusive fullscreen; switching to the game capture hook");
+                                    frozen.insert(exe.to_lowercase());
+                                } else {
+                                    // Nothing to see: it doesn't draw.
+                                    sight.look_later();
+                                }
+                            }
+                        }
+                    }
+                    _ => sight = Sight::default(),
                 }
                 let until = Instant::now() + Self::RESCAN;
                 while Instant::now() < until && !stop2.load(Ordering::Relaxed) {
@@ -1140,8 +1484,8 @@ fn spawn_aac(track: usize, mut enc: AacEncoder, rx: mpsc::Receiver<Vec<f32>>, ou
 /// dark background ghosts far too faint (a fifth of its value is about 3% of
 /// its light, not 20%), and a dark thing over a bright one ghosts too strong.
 ///
-/// Looks are taken `BLEND_LATE` after their time, so that pictures noticed
-/// late still count.
+/// Looks are taken a while after their time (at least `BLEND_LATE`, longer
+/// while pictures come in later), so that pictures noticed late still count.
 struct FrameBlend {
     quad: quad::Quad,
     gpu: d3d::Gpu,
@@ -1200,6 +1544,26 @@ impl FrameBlend {
             weight: [0.0; 2],
             pending: [0.0; 2],
         })
+    }
+
+    /// Blend `looks` a frame from now on, `open` frames made at once: the
+    /// averages it needs made (or let go of), every frame being made
+    /// started again.
+    fn set_looks(&mut self, looks: u32, open: usize) -> Result<()> {
+        let want = if looks > 1 { open.clamp(1, 2) } else { 0 };
+        if self.light.len() != want {
+            use windows::Win32::Graphics::Direct3D11::{D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_USAGE_DEFAULT};
+            let bind = (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32;
+            let (w, h) = (self.own.width, self.own.height);
+            self.light = (0..want)
+                .map(|_| {
+                    let t = self.gpu.texture(w, h, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT, bind, D3D11_USAGE_DEFAULT, 0)?;
+                    Ok((quad::target_view(&self.gpu, &t)?, quad::shader_view(&self.gpu, &t)?))
+                })
+                .collect::<Result<Vec<_>>>()?;
+        }
+        self.drop_all();
+        Ok(())
     }
 
     /// Which average frame `k` is made in.
@@ -1284,13 +1648,57 @@ impl FrameBlend {
 /// How long after a frame's time it's made: the game capture knows a picture
 /// is new a few milliseconds after it came up (it compares it with the last),
 /// and it must still get into its frame; Desktop Duplication asks for new
-/// pictures every half of it while the screen is still. A guess.
+/// pictures every half of it while the screen is still. A guess. The least it
+/// waits: pictures that keep coming later make it wait longer (see
+/// `BlendPacer::wait`).
 const BLEND_LATE: f64 = 0.012;
-/// How much of the way the looks move toward halfway between the game's
-/// pictures, on each picture. A guess: slow enough that the noise in
-/// pictures' times averages out (a few hundred milliseconds), quick enough to
-/// follow a game that drifts.
-const PHASE_GAIN: f64 = 0.03;
+/// The longest it waits for late pictures. A game that keeps the graphics card
+/// busy (Geometry Dash at 1000 fps) gets the hook's comparisons answered 10-20
+/// ms late: waiting 12 ms, a third of its pictures came too late for the looks
+/// that should have seen them, which saw the one before instead, and motion
+/// came out uneven. Waiting longer only delays when frames are made, not their
+/// times in the file.
+const BLEND_LATE_MAX: f64 = 0.1;
+/// How the wait comes back down once pictures come in sooner: it's long enough
+/// for the latest picture of the last one to two of these (seconds). Timed, not
+/// counted in pictures: one hitch holds it up a second or two, in a 60 fps game
+/// as in one at 1000 fps, and a short quiet stretch doesn't drop it just before
+/// the next late picture.
+const LATE_WINDOW: f64 = 1.0;
+
+/// How late pictures come in (seconds after their time): the latest in this
+/// `LATE_WINDOW` and in the one before.
+#[derive(Default)]
+struct Lateness {
+    since: f64,
+    now: f64,
+    before: f64,
+}
+
+impl Lateness {
+    /// A picture came in `late`, at `now`.
+    fn note(&mut self, now: f64, late: f64) {
+        let gone = now - self.since;
+        if gone >= LATE_WINDOW {
+            self.before = if gone < 2.0 * LATE_WINDOW { self.now } else { 0.0 };
+            self.now = 0.0;
+            self.since = now;
+        }
+        self.now = self.now.max(late);
+    }
+
+    /// The latest picture of the last one or two windows, as of `now`.
+    fn worst(&self, now: f64) -> f64 {
+        let gone = now - self.since;
+        if gone >= 2.0 * LATE_WINDOW {
+            0.0
+        } else if gone >= LATE_WINDOW {
+            self.now
+        } else {
+            self.now.max(self.before)
+        }
+    }
+}
 /// How far behind its frames the pacer may fall (seconds) before it skips
 /// the ones it missed instead of making each. Made in a burst, they'd mostly
 /// be skipped anyway (more than the encoder takes at once) and mostly repeat
@@ -1305,12 +1713,16 @@ const MAX_BEHIND: f64 = 0.25;
 
 struct BlendPacer {
     t0: f64,
+    /// Frames a second.
+    fps: u32,
     /// Seconds between looks (one over the blend rate), and looks per frame.
     step: f64,
     looks: i64,
     /// Look `m` is at `t0 + phase + (m + 0.5) * step`; frame `k`'s own time
     /// is looks `k * looks` to `(k + 1) * looks - 1`.
     phase: f64,
+    /// A picture the capture timed has come up (it set `phase`).
+    timed: bool,
     /// Which frames each look counts toward.
     shutter: crate::shutter::Shutter,
     /// The next look to take.
@@ -1325,28 +1737,45 @@ struct BlendPacer {
     last_taken: Option<u64>,
     /// Different pictures in the frame's own time so far.
     different: u32,
+    /// How late pictures come in, lately.
+    lateness: Lateness,
     blend: FrameBlend,
     converter: d3d::Converter,
     encoder: h264::Encoder,
     preview: d3d::Previewer,
-    camera: Option<camera::CameraLayer>,
+    /// The other layers' pictures, followed each frame.
+    feeds: Option<Arc<layers::Feeds>>,
+    /// The stream's own pictures, while it streams (one per rendition).
+    stream: Vec<StreamOut>,
     dropped: u64,
     stats: BlendStats,
     diag: EncodeDiag,
 }
 
+/// What the session changes in a running pacer: frame blending, and the
+/// stream's pictures (see `Session::set_blend`, `Session::stream_video`).
+struct PacerCtl {
+    blend: Arc<std::sync::Mutex<Option<(u32, BlendShape)>>>,
+    stream: Arc<std::sync::Mutex<Option<Vec<StreamOut>>>>,
+}
+
 /// Where frames wait, logged for every 5 s in which frames were skipped
 /// (every 5 s with `HASTECLIP_ENCODE_LOG=1`), so a log from a PC that can't
 /// keep up says what it's short of: how late the pacer closed frames and how
-/// long closing took (CPU), how long the GPU took to finish a frame's work
-/// after it was submitted, how long the encoder held frames, the fewest free
-/// encoder frames, and why frames were skipped.
+/// long closing took (CPU), and which of its steps the slowest one's time
+/// went to, how long the GPU took to finish a frame's work after it was
+/// submitted, how long the encoder held frames, the fewest free encoder
+/// frames, and why frames were skipped. (A real session's log had the pacer
+/// held up 349 ms closing one frame, 20 frames skipped, and no way to tell
+/// where.)
 struct EncodeDiag {
     verbose: bool,
     since: Instant,
     frames: u32,
     late_max: f64,
     close_max: Duration,
+    /// Where the slowest closing's time went.
+    slowest: CloseSteps,
     /// Queries ending each frame's GPU work, oldest first, with when.
     pending: std::collections::VecDeque<(windows::Win32::Graphics::Direct3D11::ID3D11Query, Instant)>,
     spare: Vec<windows::Win32::Graphics::Direct3D11::ID3D11Query>,
@@ -1357,6 +1786,36 @@ struct EncodeDiag {
     caught_up: u32,
 }
 
+/// How long each step of closing a frame took (see `BlendPacer::close`).
+#[derive(Clone, Copy, Default)]
+struct CloseSteps {
+    /// The webcam's newest picture taken in.
+    webcam: Duration,
+    /// The frame's looks mixed and the average made.
+    blend: Duration,
+    /// Scaled and converted into the encoder's frame.
+    convert: Duration,
+    /// Handed to the encoder.
+    encode: Duration,
+    /// The preview's picture started.
+    preview: Duration,
+}
+
+impl std::fmt::Display for CloseSteps {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+        write!(
+            f,
+            "webcam {:.1}, blend {:.1}, convert {:.1}, encoder {:.1}, preview {:.1}",
+            ms(self.webcam),
+            ms(self.blend),
+            ms(self.convert),
+            ms(self.encode),
+            ms(self.preview)
+        )
+    }
+}
+
 impl EncodeDiag {
     fn new() -> Self {
         Self {
@@ -1365,6 +1824,7 @@ impl EncodeDiag {
             frames: 0,
             late_max: 0.0,
             close_max: Duration::ZERO,
+            slowest: CloseSteps::default(),
             pending: Default::default(),
             spare: Vec::new(),
             gpu_ms: Vec::new(),
@@ -1375,11 +1835,14 @@ impl EncodeDiag {
         }
     }
 
-    fn frame(&mut self, gpu: &d3d::Gpu, late: f64, close: Duration) {
+    fn frame(&mut self, gpu: &d3d::Gpu, late: f64, close: Duration, steps: CloseSteps) {
         use windows::Win32::Graphics::Direct3D11::{D3D11_ASYNC_GETDATA_DONOTFLUSH, D3D11_QUERY_DESC, D3D11_QUERY_EVENT};
         self.frames += 1;
         self.late_max = self.late_max.max(late);
-        self.close_max = self.close_max.max(close);
+        if close > self.close_max {
+            self.close_max = close;
+            self.slowest = steps;
+        }
         unsafe {
             while let Some((q, at)) = self.pending.front() {
                 let mut done = 0i32;
@@ -1411,11 +1874,13 @@ impl EncodeDiag {
         if self.verbose || self.pool_empty + self.queue_full + self.caught_up > 0 {
             self.gpu_ms.sort_by(f64::total_cmp);
             let pct = |p: f64| self.gpu_ms.get(((self.gpu_ms.len() as f64 - 1.0) * p).round() as usize).copied().unwrap_or(f64::NAN);
-            eprintln!(
-                "encode: {} frames; closed up to {:.1} ms late, closing took up to {:.1} ms; GPU done after {:.1}/{:.1}/{:.1} ms (median/99%/max), {} unfinished; encoder held frames {:.1} ms avg, {:.1} max; fewest free frames {}; skipped {} (no free frame) + {} (queue full) + {} (caught up)",
+            // On the pacer: written by another thread.
+            eprintln_later!(
+                "encode: {} frames; closed up to {:.1} ms late, closing took up to {:.1} ms ({}); GPU done after {:.1}/{:.1}/{:.1} ms (median/99%/max), {} unfinished; encoder held frames {:.1} ms avg, {:.1} max; fewest free frames {}; skipped {} (no free frame) + {} (queue full) + {} (caught up)",
                 self.frames,
                 self.late_max * 1000.0,
                 self.close_max.as_secs_f64() * 1000.0,
+                self.slowest,
                 pct(0.5),
                 pct(0.99),
                 pct(1.0),
@@ -1437,6 +1902,12 @@ impl EncodeDiag {
 }
 
 impl BlendPacer {
+    /// How long after their time looks are taken: long enough for the
+    /// pictures that come in latest, with a little to spare.
+    fn wait(&self) -> f64 {
+        (self.lateness.worst(host_now()) * 1.2 + 0.002).clamp(BLEND_LATE, BLEND_LATE_MAX)
+    }
+
     fn look_time(&self, m: i64) -> f64 {
         self.t0 + self.phase + (m as f64 + 0.5) * self.step
     }
@@ -1468,6 +1939,53 @@ impl BlendPacer {
             self.stats.caught_up(missed as u32, behind);
             self.diag.caught_up += missed as u32;
         }
+    }
+
+    /// Blend `looks` a frame from the next frame on, weighed by `shape`:
+    /// the frame under way is made from the looks it gets from now (at the
+    /// new rate), and the looks lock onto the pictures again.
+    fn change_blend(&mut self, looks: u32, shape: BlendShape) {
+        let looks = looks.max(1);
+        let shutter = crate::shutter::Shutter::new(looks, shape);
+        if looks as i64 == self.looks && shutter == self.shutter {
+            return;
+        }
+        if let Err(e) = self.blend.set_looks(looks, shutter.frames_open()) {
+            eprintln_later!("frame blending couldn't change: {e:#}");
+            return;
+        }
+        let k = self.closed + 1;
+        self.looks = looks as i64;
+        self.step = 1.0 / (self.fps.max(1) * looks) as f64;
+        self.shutter = shutter;
+        // Frame `k`'s own time is where it was: looks `k * looks` on, at
+        // the new step. The first picture the capture times puts them
+        // halfway between pictures again.
+        self.phase = 0.0;
+        self.timed = false;
+        self.next = self.shutter.first_look(k);
+        self.different = 0;
+        crate::blending(self.fps, looks);
+        eprintln_later!("{}", if looks > 1 { format!("frame blending: {looks} looks a frame from now on") } else { "frame blending: off from now on".to_owned() });
+    }
+
+    /// The stream started or stopped, if the session says so. A stopped
+    /// stream's encoders are finished on a thread of their own (it waits
+    /// for them).
+    fn take_stream(&mut self, ctl: &PacerCtl) {
+        let Some(change) = ctl.stream.lock().unwrap().take() else { return };
+        let old = std::mem::replace(&mut self.stream, change);
+        if old.is_empty() {
+            return;
+        }
+        let _ = thread::Builder::new().name("stream-end".into()).spawn(move || {
+            for s in old {
+                if s.dropped > 0 {
+                    eprintln!("stream: its encoder couldn't take {} frames", s.dropped);
+                }
+                s.encoder.finish();
+            }
+        });
     }
 
     /// Take every look before `t`: each sees the picture that's up.
@@ -1514,14 +2032,30 @@ impl BlendPacer {
         if self.blend.is_empty(k) {
             return;
         }
-        if let Some(c) = self.camera.as_mut() {
-            c.pull();
+        let mut steps = CloseSteps::default();
+        let mut lap = Instant::now();
+        let mut took = || {
+            let now = Instant::now();
+            let d = now - lap;
+            lap = now;
+            d
+        };
+        if let Some(f) = &self.feeds {
+            f.update();
         }
+        steps.webcam = took();
         self.diag.free_min = self.diag.free_min.min(self.encoder.pool.free_count());
+        // The stream's pictures want this frame too: each blending its own
+        // frames wants every one, else those at its frames' times.
+        let blending = self.looks > 1;
+        let streams_want = self.stream.iter().any(|s| s.wants(k, blending));
         match self.encoder.pool.take() {
             Some(slot) => {
                 self.blend.finish(k);
-                match self.converter.convert(slot) {
+                steps.blend = took();
+                let converted = self.converter.convert(slot);
+                steps.convert = took();
+                match converted {
                     Ok(()) => {
                         if self.encoder.encode(slot, k) {
                             encoded();
@@ -1529,47 +2063,58 @@ impl BlendPacer {
                             skipped(&mut self.dropped, 1);
                             self.diag.queue_full += 1;
                         }
+                        steps.encode = took();
                     }
                     Err(e) => {
                         self.encoder.pool.give(slot);
-                        eprintln!("{e:#}");
+                        eprintln_later!("{e:#}");
                     }
                 }
             }
             // No frame free for the encoder: skipped, and not blended (work
-            // a graphics card that's behind can't spare).
+            // a graphics card that's behind can't spare), unless the stream
+            // takes it.
             None => {
-                self.blend.drop_frame(k);
+                if streams_want {
+                    self.blend.finish(k);
+                } else {
+                    self.blend.drop_frame(k);
+                }
                 skipped(&mut self.dropped, 1);
                 self.diag.pool_empty += 1;
             }
         }
-        if let Err(e) = self.preview.submit() {
-            eprintln!("preview: {e:#}");
+        if streams_want {
+            let content = self.blend.average.content();
+            for s in &mut self.stream {
+                s.frame(&self.blend.gpu, k, blending, content);
+            }
         }
-        self.diag.frame(&self.blend.gpu, late, started.elapsed());
+        let _ = took();
+        if let Err(e) = self.preview.submit() {
+            eprintln_later!("preview: {e:#}");
+        }
+        steps.preview = took();
+        self.diag.frame(&self.blend.gpu, late, started.elapsed(), steps);
     }
 
     /// A new picture came up at `at`: the looks before it saw the one before.
     /// Then the looks move toward halfway between pictures.
     fn arrive(&mut self, at: f64, picture: Option<d3d::Queued>, latest: &d3d::Latest) {
         crate::count_picture();
+        let now = host_now();
+        self.lateness.note(now, now - at);
+        self.stats.wait = self.stats.wait.max(self.wait());
         if at < self.look_time(self.next - 1) {
             self.stats.late += 1;
             crate::count_missed(1);
         }
         self.look_until(at);
-        // Pictures belong on whole steps of the looks (halfway between two).
-        let steps = (at - self.t0 - self.phase) / self.step;
-        self.phase += (steps - steps.round()) * self.step * PHASE_GAIN;
-        // A whole step either way is the same lock, one look over: a game a
-        // little off the blend rate gets a picture seen twice, or one missed,
-        // now and then, as it must; every frame still has its looks.
-        if self.phase > self.step / 2.0 {
-            self.phase -= self.step;
-        } else if self.phase < -self.step / 2.0 {
-            self.phase += self.step;
-        }
+        // Pictures belong on whole steps of the looks (halfway between two);
+        // the first the capture timed puts them there.
+        let first = picture.is_some() && !self.timed;
+        self.timed |= picture.is_some();
+        self.phase = crate::shutter::follow_picture(self.phase, self.step, at - self.t0, first);
         match picture {
             Some(q) => self.blend.hold_queued(q),
             None => self.blend.hold(latest),
@@ -1595,11 +2140,13 @@ struct BlendStats {
     late: u32,
     caught_up: u32,
     behind: f64,
+    /// The longest the looks waited for late pictures (see `BlendPacer::wait`).
+    wait: f64,
 }
 
 impl BlendStats {
     fn new() -> Self {
-        Self { since: Instant::now(), pictures: 0, frames: 0, full: 0, fewest: u32::MAX, most: 0, late: 0, caught_up: 0, behind: 0.0 }
+        Self { since: Instant::now(), pictures: 0, frames: 0, full: 0, fewest: u32::MAX, most: 0, late: 0, caught_up: 0, behind: 0.0, wait: 0.0 }
     }
 
     fn caught_up(&mut self, frames: u32, behind: f64) {
@@ -1613,14 +2160,16 @@ impl BlendStats {
         self.fewest = self.fewest.min(different);
         self.most = self.most.max(different);
         if self.since.elapsed() >= Duration::from_secs(5) {
-            eprintln!(
-                "{}: the game showed {:.0} pictures/s; {looks} looks per frame, {}-{} different pictures in each, {:.0}% of frames with {looks}; {} pictures too late, over {} frames{}",
+            // On the pacer: written by another thread.
+            eprintln_later!(
+                "{}: the game showed {:.0} pictures/s; {looks} looks per frame, {}-{} different pictures in each, {:.0}% of frames with {looks}; {} pictures too late (waited up to {:.0} ms), over {} frames{}",
                 if looks == 1 { "frame timing" } else { "frame blending" },
                 self.pictures as f64 / self.since.elapsed().as_secs_f64(),
                 self.fewest,
                 self.most,
                 self.full as f64 * 100.0 / self.frames as f64,
                 self.late,
+                self.wait * 1000.0,
                 self.frames,
                 match self.caught_up {
                     0 => String::new(),
@@ -1643,8 +2192,9 @@ fn spawn_blend_pacer(
     converter: d3d::Converter,
     encoder: h264::Encoder,
     preview: d3d::Previewer,
-    camera: Option<camera::CameraLayer>,
+    feeds: Option<Arc<layers::Feeds>>,
     clock: Arc<Clock>,
+    ctl: PacerCtl,
 ) -> (Arc<AtomicBool>, JoinHandle<()>) {
     let stop = Arc::new(AtomicBool::new(false));
     let stop2 = stop.clone();
@@ -1655,9 +2205,11 @@ fn spawn_blend_pacer(
         clock.set(t0);
         let mut p = BlendPacer {
             t0,
+            fps,
             step: 1.0 / (fps.max(1) * looks.max(1)) as f64,
             looks: looks.max(1) as i64,
             phase: 0.0,
+            timed: false,
             shutter,
             next: 0,
             closed: -1,
@@ -1665,11 +2217,13 @@ fn spawn_blend_pacer(
             pictures: 0,
             last_taken: None,
             different: 0,
+            lateness: Lateness::default(),
             blend,
             converter,
             encoder,
             preview,
-            camera,
+            feeds,
+            stream: Vec::new(),
             dropped: 0,
             stats: BlendStats::new(),
             diag: EncodeDiag::new(),
@@ -1680,9 +2234,14 @@ fn spawn_blend_pacer(
         }
         let mut others = latest.others();
         while !stop2.load(Ordering::Relaxed) {
-            p.catch_up(host_now() - BLEND_LATE);
+            // Frame blending changed, the stream started or stopped.
+            if let Some((looks, shape)) = ctl.blend.lock().unwrap().take() {
+                p.change_blend(looks, shape);
+            }
+            p.take_stream(&ctl);
+            p.catch_up(host_now() - p.wait());
             let (seen, _) = latest.arrivals();
-            let wait = p.frame_end() + BLEND_LATE - host_now();
+            let wait = p.frame_end() + p.wait() - host_now();
             if wait > 0.0 && latest.queue_len() == 0 {
                 latest.wait_for_frame(seen, Duration::from_secs_f64(wait.min(0.05)));
             }
@@ -1696,7 +2255,10 @@ fn spawn_blend_pacer(
                 p.arrive(host_now(), None, &latest);
             }
             // Looks whose time is past (and late pictures' too) see what's up.
-            p.look_until(host_now() - BLEND_LATE);
+            p.look_until(host_now() - p.wait());
+        }
+        for s in std::mem::take(&mut p.stream) {
+            s.encoder.finish();
         }
         p.encoder.finish();
     });
@@ -1717,7 +2279,7 @@ fn skipped(dropped: &mut u64, n: u64) {
     *dropped += n;
     crate::count_skipped(n);
     if n > 0 && (before == 0 || dropped.ilog2() > before.ilog2()) {
-        eprintln!("video is behind: {dropped} frames skipped");
+        eprintln_later!("video is behind: {dropped} frames skipped");
     }
 }
 
@@ -1775,6 +2337,20 @@ mod tests {
         assert!(blend.is_empty(2) && blend.is_empty(3), "both start empty again");
     }
 
+    /// A fullscreen game that's seen is looked at again 5 s on, then twice as
+    /// long each time, up to a minute.
+    #[test]
+    fn looks_again_later_and_later() {
+        let mut sight = Sight::default();
+        let waits: Vec<u64> = (0..6)
+            .map(|_| {
+                sight.look_later();
+                sight.wait.as_secs()
+            })
+            .collect();
+        assert_eq!(waits, [5, 10, 20, 40, 60, 60]);
+    }
+
     /// With nothing running, a screenshot of the main screen is taken by a
     /// capture of its own: the screen's size, opaque, not all black.
     /// `HASTECLIP_SHOT=<file.png>` keeps it to look at.
@@ -1799,6 +2375,113 @@ mod tests {
         }
     }
 
+    /// Clipping, then going live to two places (RTMP servers here: ffmpegs
+    /// listening), each sent a picture of its own, frame blending turned on
+    /// and off while it all runs, a recording beside them, a clip saved:
+    /// each gets what it should, from the one capture. The places at their
+    /// own sizes and rates (720p at 30, its frames blended from the
+    /// capture's while blending's on, and 1080p at 60, from a 1080p capture
+    /// at 60); the recording and the clip at the capture's.
+    #[test]
+    #[ignore = "captures the screen: cargo test -p capture everything_at_once -- --ignored --nocapture"]
+    fn everything_at_once() {
+        use crate::stream::{Destination, Link, Status, StreamSettings};
+        /// What's taken of the screen goes, and the servers stop, however
+        /// the test ends.
+        struct Leave(PathBuf, Vec<std::process::Child>);
+        impl Drop for Leave {
+            fn drop(&mut self) {
+                for c in &mut self.1 {
+                    let _ = c.kill();
+                    let _ = c.wait();
+                }
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let screen = system::list_screens().into_iter().next().expect("a screen");
+        let dir = std::env::temp_dir().join(format!("hc-at-once-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut leave = Leave(dir.clone(), Vec::new());
+        let mut urls = Vec::new();
+        for name in ["small", "full"] {
+            let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+            let url = format!("rtmp://127.0.0.1:{port}/live/test_key");
+            let got = dir.join(format!("{name}.flv"));
+            leave.1.push(crate::stream::ffmpeg().args(["-v", "error", "-y", "-timeout", "30", "-i"]).arg(&url).args(["-c", "copy"]).arg(&got).stdin(std::process::Stdio::null()).spawn().unwrap());
+            urls.push(url);
+        }
+        thread::sleep(Duration::from_millis(700));
+        let status = Status::new();
+        let mut settings = EncodeSettings {
+            output_dir: dir.clone(),
+            container_ext: "mp4".into(),
+            fps: 60,
+            blend_samples: 1,
+            blend_shape: crate::BlendShape::Even,
+            video_bitrate_kbps: 12000,
+            size: crate::VideoSize { short_side: Some(1080), shape: None, exact: None },
+            use_hardware: true,
+            replay_seconds: 10,
+            video: VideoSource::Screen { id: screen.id.clone(), hook: crate::GameHook { auto: false, allowed: Vec::new() }, method: Default::default() },
+            away_screen: None,
+            webcam: None,
+            layers: crate::layers::main_only(),
+            screen: Arc::new(std::sync::Mutex::new(crate::ScreenPlacement::whole(crate::Framing::Fit))),
+            sources: Vec::new(),
+            stream: None,
+        };
+        let place = |name: &str, url: &str, short_side, fps, kbps| Destination { name: name.into(), url: url.into(), secret: "test_key".into(), quality: crate::stream::Quality { short_side: Some(short_side), fps, kbps } };
+        settings.stream = Some(StreamSettings { destinations: vec![place("Small", &urls[0], 720, 30, 3000), place("Full", &urls[1], 1080, 60, 6000)], status: status.clone() });
+        let mut rec = WinRecorder::new(Arc::new(LiveAudio::default()));
+        rec.start(Mode::ReplayBuffer, &settings).unwrap();
+        thread::sleep(Duration::from_secs(1));
+        rec.start(Mode::Stream, &settings).unwrap();
+        assert_eq!(rec.running(), Running { replay: true, record: false, stream: true });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !status.get().iter().all(|d| matches!(d.link, Link::Live { .. })) {
+            assert!(Instant::now() < deadline, "never live: {:?}", status.get());
+            thread::sleep(Duration::from_millis(50));
+        }
+        // Frame blending on, and off again, while it runs.
+        assert!(rec.set_blend(4, crate::BlendShape::Soft));
+        thread::sleep(Duration::from_secs(2));
+        let blending = crate::health().and_then(|h| h.blend).map(|b| b.looks);
+        rec.start(Mode::Record, &settings).unwrap();
+        thread::sleep(Duration::from_secs(2));
+        assert!(rec.set_blend(1, crate::BlendShape::Even));
+        thread::sleep(Duration::from_secs(1));
+        let clip = rec.save_clip(&dir).unwrap().finish().unwrap();
+        let recording = rec.stop(Mode::Record, None).unwrap().expect("a recording");
+        assert_eq!(rec.running(), Running { replay: true, record: false, stream: true });
+        rec.stop(Mode::Stream, None).unwrap();
+        rec.stop(Mode::ReplayBuffer, None).unwrap();
+        assert!(!rec.is_running());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while leave.1.iter_mut().any(|c| c.try_wait().unwrap().is_none()) {
+            assert!(Instant::now() < deadline, "a server didn't end");
+            thread::sleep(Duration::from_millis(50));
+        }
+        let probe = |f: &Path| {
+            let out = std::process::Command::new("ffprobe")
+                .args(["-v", "error", "-select_streams", "v:0", "-count_frames", "-show_entries", "stream=width,height,avg_frame_rate,nb_read_frames:format=duration", "-of", "default=nw=1"])
+                .arg(f)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).to_string()
+        };
+        let (s, full, r, c) = (probe(&dir.join("small.flv")), probe(&dir.join("full.flv")), probe(&recording), probe(&clip));
+        eprintln!("blending while it ran: {blending:?} looks\nsmall stream:\n{s}\nfull stream:\n{full}\nrecording:\n{r}\nclip:\n{c}");
+        assert_eq!(blending, Some(4), "blending changed while running");
+        assert!(s.contains("width=1280") && s.contains("height=720") && s.contains("avg_frame_rate=30/1"), "{s}");
+        assert!(full.contains("width=1920") && full.contains("height=1080") && full.contains("avg_frame_rate=60/1"), "{full}");
+        assert!(r.contains("height=1080") && r.contains("avg_frame_rate=60/1"), "{r}");
+        assert!(c.contains("height=1080"), "{c}");
+        let secs = |t: &str| t.lines().find_map(|l| l.strip_prefix("duration=")).and_then(|d| d.parse::<f64>().ok()).unwrap_or(0.0);
+        assert!(secs(&s) > 4.0, "the stream ran on: {}", secs(&s));
+        assert!((2.5..4.5).contains(&secs(&r)), "the recording's 3 s: {}", secs(&r));
+    }
+
     /// While clipping at 720p in 1:1, a screenshot is still all of the screen
     /// at its own size: the recording's shape and size aren't the picture's.
     #[test]
@@ -1819,8 +2502,10 @@ mod tests {
             video: video.clone(),
             away_screen: None,
             webcam: None,
+            layers: crate::layers::main_only(),
             screen: Arc::new(std::sync::Mutex::new(crate::ScreenPlacement::whole(crate::Framing::Fill))),
             sources: Vec::new(),
+            stream: None,
         };
         let mut rec = WinRecorder::new(Arc::new(LiveAudio::default()));
         rec.start(Mode::ReplayBuffer, &settings).unwrap();
@@ -1828,7 +2513,7 @@ mod tests {
         let t = Instant::now();
         let img = rec.screenshot(&video).unwrap().finish().unwrap();
         eprintln!("{}×{} in {} ms", img.width, img.height, t.elapsed().as_millis());
-        rec.stop(None).unwrap();
+        rec.stop(Mode::ReplayBuffer, None).unwrap();
         let (w, h) = system::display_pixels(Some(&screen.id)).expect("its size");
         assert_eq!((img.width, img.height), (w, h));
         assert!(img.bgra.chunks_exact(4).any(|p| p[0] > 16 || p[1] > 16 || p[2] > 16), "all black");
@@ -1952,8 +2637,10 @@ mod tests {
             video: VideoSource::Screen { id: id.clone(), hook: crate::GameHook { auto: false, allowed: Vec::new() }, method },
             away_screen: None,
             webcam: None,
+            layers: crate::layers::main_only(),
             screen: Arc::new(std::sync::Mutex::new(crate::ScreenPlacement::whole(crate::Framing::Fit))),
             sources: Vec::new(),
+            stream: None,
         };
         unsafe { windows::Win32::UI::HiDpi::SetThreadDpiAwarenessContext(windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
         let mut info = windows::Win32::Graphics::Gdi::MONITORINFO { cbSize: std::mem::size_of::<windows::Win32::Graphics::Gdi::MONITORINFO>() as u32, ..Default::default() };
@@ -1963,7 +2650,7 @@ mod tests {
 
         let mut rec = WinRecorder::new(Arc::new(LiveAudio::default()));
         rec.start(Mode::ReplayBuffer, &settings).unwrap();
-        let latest = rec.session.as_ref().unwrap().switch.as_ref().unwrap().latest.clone();
+        let latest = rec.outputs.session.as_ref().unwrap().switch.as_ref().unwrap().latest.clone();
         let t0 = Instant::now();
         let mut seen = latest.arrivals().0;
         // Pictures a second, over each half second for `for_`, and how the
@@ -1986,7 +2673,7 @@ mod tests {
         let changed_content = latest.content();
         drop(changed);
         let (back, back_in_use) = watch("back", hold);
-        rec.stop(None).unwrap();
+        rec.stop(Mode::ReplayBuffer, None).unwrap();
         stop.store(true, Ordering::Relaxed);
         let _ = square.join();
 

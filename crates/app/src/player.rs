@@ -116,6 +116,29 @@ impl Pacing {
     }
 }
 
+/// What the window is doing, for what a player keeps open meanwhile
+/// ([`Player::set_window`]). An open clip held 756 MB of the graphics card
+/// (a 1440p 60 fps one, measured), minimized or not, until it was closed:
+/// beside a game short of its own, the game's would go to the system's
+/// memory, and it would stutter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Window {
+    /// In use: everything's open.
+    InUse,
+    /// On screen, but other windows have been in front of it a while (a
+    /// game): the scrub engine goes.
+    Behind,
+    /// Out of sight (minimized, in the tray): the playback decoder goes too,
+    /// once the player's paused and hasn't been drawn for [`UNSEEN`].
+    Hidden,
+}
+
+/// Out of sight, a paused player lets go of its playback decoder once it
+/// hasn't been drawn for this long: a window still drawn while it's hidden
+/// (as some desktops do) keeps it, instead of opening it again every frame.
+#[cfg(hw_decode)]
+const UNSEEN: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Seconds since the app started, for debug logs.
 pub fn uptime() -> f64 {
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -322,7 +345,9 @@ pub struct Player {
     on_screen: Option<Picture>,
     /// GPU frames just taken off screen, held a few more frames: the GPU may
     /// still be drawing them, and the decoder reuses a released texture.
-    retired: std::collections::VecDeque<(u64, Picture)>,
+    /// With the pass each left the screen in, and whether it was the scrub
+    /// engine's.
+    retired: std::collections::VecDeque<(u64, Picture, bool)>,
     /// GPU frames opened for drawing (see `gpu_frames.rs`).
     #[cfg(hw_decode)]
     gpu_frames: crate::gpu_frames::Frames,
@@ -353,6 +378,37 @@ pub struct Player {
     /// by several decoders, read on every redraw.
     #[cfg(hw_decode)]
     scrub: Option<crate::scrub::Engine>,
+    /// The engine while it opens, on a thread of its own: it waits for the
+    /// graphics card's decoder, which the first clip of a run starts
+    /// (~150 ms: the UI was held that long). Until it's there, scrubbing
+    /// goes through the playback decoder.
+    #[cfg(hw_decode)]
+    scrub_opening: Option<Receiver<Option<crate::scrub::Engine>>>,
+    /// The picture on screen is the scrub engine's (it holds one of its
+    /// decoders' textures).
+    #[cfg(hw_decode)]
+    engine_on_screen: bool,
+    /// Windows: the scrub engine's pools whose frames went on screen, so
+    /// were opened for drawing (`gpu_frames`).
+    #[cfg(all(hw_decode, windows))]
+    engine_pools: Vec<usize>,
+    /// The engine, and the playback decoder, were let go of while the
+    /// window wasn't in use ([`Self::set_window`]): opened again once it is.
+    #[cfg(hw_decode)]
+    engine_let_go: bool,
+    #[cfg(hw_decode)]
+    video_let_go: bool,
+    /// The cuts, as frames (`from..to`), as the playback decoder was told
+    /// them: told again when it's opened again.
+    #[cfg(hw_decode)]
+    video_skips: Vec<(u64, u64)>,
+    /// When the picture was last brought up to date ([`Self::update`]):
+    /// while it's drawn, it's seen.
+    #[cfg(hw_decode)]
+    drawn_at: Option<std::time::Instant>,
+    /// What the window was doing, as last told ([`Self::set_window`]).
+    #[cfg(hw_decode)]
+    window: Window,
     /// The playhead's motion while scrubbing.
     #[cfg(hw_decode)]
     motion: Option<Motion>,
@@ -378,11 +434,6 @@ pub struct Player {
     /// anyway (longer while the decoder is catching up: it decodes from
     /// the keyframe before).
     pending_wait: std::time::Duration,
-    /// While the playhead itself is scrubbed (a drag of it, the wheel), how
-    /// near the playhead (seconds) a picture held still on stays, and where
-    /// letting go lands ([`Self::land`]); `None` for other drags (a trim's
-    /// edge: the picture is fetched for where the edge is).
-    landing: Option<f64>,
     /// Play was pressed; the sound starts with the first frame (or after
     /// [`START_WAIT`], [`FFMPEG_START_WAIT`] for ffmpeg's), so picture and
     /// sound start together.
@@ -501,10 +552,7 @@ impl Player {
         // `HASTECLIP_SCRUB_ENGINE=0`: scrub through the playback decoder
         // instead, to compare (as it does where the engine can't start).
         #[cfg(hw_decode)]
-        let scrub = video
-            .as_ref()
-            .filter(|_| scrubs && std::env::var_os("HASTECLIP_SCRUB_ENGINE").is_none_or(|v| v != "0"))
-            .and_then(|_| crate::scrub::Engine::open(ctx, source, info.fps, total_frames(&info) as u64));
+        let scrub_opening = video.as_ref().filter(|_| scrubs && std::env::var_os("HASTECLIP_SCRUB_ENGINE").is_none_or(|v| v != "0")).map(|_| open_engine(ctx, source, &info));
         #[cfg(not(hw_decode))]
         let _ = scrubs;
         Self {
@@ -533,7 +581,23 @@ impl Player {
             stand_in: None,
             video,
             #[cfg(hw_decode)]
-            scrub,
+            scrub: None,
+            #[cfg(hw_decode)]
+            scrub_opening,
+            #[cfg(hw_decode)]
+            engine_on_screen: false,
+            #[cfg(all(hw_decode, windows))]
+            engine_pools: Vec::new(),
+            #[cfg(hw_decode)]
+            engine_let_go: false,
+            #[cfg(hw_decode)]
+            video_let_go: false,
+            #[cfg(hw_decode)]
+            video_skips: Vec::new(),
+            #[cfg(hw_decode)]
+            drawn_at: None,
+            #[cfg(hw_decode)]
+            window: Window::InUse,
             #[cfg(hw_decode)]
             motion: None,
             #[cfg(hw_decode)]
@@ -545,7 +609,6 @@ impl Player {
             #[cfg(hw_decode)]
             catching_up: false,
             pending_wait: START_WAIT,
-            landing: None,
             pending_start: None,
             video_playing: false,
             played_at: None,
@@ -585,7 +648,6 @@ impl Player {
         }
         self.shared.speed.store(1.0f32.to_bits(), Ordering::Relaxed);
         self.shared.scrubbing.store(false, Ordering::Relaxed);
-        self.landing = None;
         self.stepping = false;
         self.set_cuts(&[]);
         // Hushed for a curtain and handed straight back (a quick switch
@@ -606,6 +668,151 @@ impl Player {
         self.pause();
         self._stream = None;
         self.stepping = false;
+    }
+
+    /// What the window is doing ([`Window`]), each frame. While it isn't
+    /// in use the scrub engine is let go of, and out of sight the playback
+    /// decoder too (paused, and not drawn for [`UNSEEN`]); each is opened
+    /// again once it's back. The clip, the playhead, the sound and the
+    /// picture on screen stay as they are. Whether it let go of either just
+    /// now.
+    pub fn set_window(&mut self, ctx: &egui::Context, window: Window) -> bool {
+        #[cfg(hw_decode)]
+        {
+            if window != self.window {
+                trace!("window {}", match window {
+                    Window::InUse => "in use",
+                    Window::Behind => "not in use",
+                    Window::Hidden => "out of sight",
+                });
+                self.window = window;
+            }
+            let held = (self.engine_let_go, self.video_let_go);
+            match window {
+                // The playback decoder first: the engine opens only beside it.
+                Window::InUse => {
+                    self.open_video_again(ctx);
+                    self.open_engine_again(ctx);
+                }
+                Window::Behind => {
+                    self.let_go_of_engine();
+                    self.open_video_again(ctx);
+                }
+                // The engine first: what it keeps can be on screen.
+                Window::Hidden => {
+                    self.let_go_of_engine();
+                    if !self.is_playing() && self.drawn_at.is_none_or(|t| t.elapsed() >= UNSEEN) {
+                        self.let_go_of_video();
+                    }
+                }
+            }
+            (!held.0 && self.engine_let_go) || (!held.1 && self.video_let_go)
+        }
+        #[cfg(not(hw_decode))]
+        {
+            let _ = (ctx, window);
+            false
+        }
+    }
+
+    /// Let go of the scrub engine: its decoders and their textures (on
+    /// Windows made as they open, up to a sixth of the card's memory: 512 MB
+    /// to 1.5 GB), and its watcher reading the card's counters every second.
+    /// Scrubbing goes through the playback decoder until it's back.
+    #[cfg(hw_decode)]
+    fn let_go_of_engine(&mut self) {
+        if self.scrub.is_none() && self.scrub_opening.is_none() {
+            return;
+        }
+        trace!("scrub engine let go of: the window isn't in use");
+        // Still opening: it stops as it drops, once it's open.
+        self.scrub_opening = None;
+        self.scrub = None;
+        #[cfg(target_os = "linux")]
+        {
+            self.uploader = None;
+        }
+        self.motion = None;
+        self.stood_in_for = None;
+        self.engine_let_go = true;
+        // Windows: its frames on screen and just off it hold its decoders'
+        // textures (a pool each), and so does what opened them for drawing.
+        // They go: no decoder of its writes them again, and what draws the
+        // picture on screen keeps that one. Elsewhere the engine keeps
+        // playback's frames too (`scrub::KEEPS_PLAYBACK`): one taken for its
+        // own may be playback's, which would get it back to write over while
+        // it's still on screen. They stay till they're off it.
+        #[cfg(windows)]
+        {
+            if std::mem::take(&mut self.engine_on_screen) {
+                self.on_screen = None;
+            }
+            self.retired.retain(|(_, _, engine)| !engine);
+            self.gpu_frames.forget(&std::mem::take(&mut self.engine_pools));
+        }
+    }
+
+    /// The scrub engine again, after [`Self::let_go_of_engine`]: opening
+    /// on a thread of its own, as when the clip opened.
+    #[cfg(hw_decode)]
+    fn open_engine_again(&mut self, ctx: &egui::Context) {
+        if !self.engine_let_go || self.hw().is_none() {
+            return;
+        }
+        trace!("scrub engine opened again");
+        self.engine_let_go = false;
+        self.scrub_opening = Some(open_engine(ctx, &self.source, &self.info));
+    }
+
+    /// Let go of the playback decoder, paused while the window's out of
+    /// sight (after the engine: no decoder is left to write a frame again):
+    /// its own textures (16 to 24 frames at the video's size: 133 MB at
+    /// 1440p) and its decoder's, every frame held, and what opened them for
+    /// drawing. The picture on screen stays (what draws it is kept).
+    #[cfg(hw_decode)]
+    fn let_go_of_video(&mut self) {
+        // None (let go of already), or broken: ffmpeg's frames meanwhile.
+        if self.hw().is_none() {
+            return;
+        }
+        trace!("playback decoder let go of: the window's out of sight");
+        self.video = None;
+        self.video_let_go = true;
+        self.video_playing = false;
+        self.still_wanted = None;
+        self.scrub_asked = None;
+        self.catching_up = false;
+        self.on_screen = None;
+        self.engine_on_screen = false;
+        self.retired.clear();
+        self.gpu_frames = Default::default();
+        #[cfg(windows)]
+        self.engine_pools.clear();
+        // Dev aid: `HASTECLIP_DEV_DROP_PICTURE=1` lets go of the picture on
+        // screen too (what draws it holds its texture; it comes back from the
+        // playback decoder as the window does), to see whether that's what
+        // keeps a clip's memory held.
+        if dev_flag("HASTECLIP_DEV_DROP_PICTURE") && matches!(self.display, Some(Display::Gpu(..))) {
+            self.display = None;
+            self.shown_frame = None;
+            self.screen_index = None;
+        }
+    }
+
+    /// The playback decoder again, after [`Self::let_go_of_video`], told
+    /// the cuts and asked at once for the frame at the playhead and the few
+    /// after it: play waits for them, as after a scrub.
+    #[cfg(hw_decode)]
+    fn open_video_again(&mut self, ctx: &egui::Context) {
+        if !std::mem::take(&mut self.video_let_go) {
+            return;
+        }
+        trace!("playback decoder opened again");
+        self.video = open_video(ctx, &self.source, self.info.fps);
+        if let Some(v) = &self.video {
+            v.set_skips(self.video_skips.clone());
+        }
+        self.ask_exact(self.info.frame_index(self.time()));
     }
 
     /// The player for `source`: `handoff` (the other screen's) taken over
@@ -789,8 +996,13 @@ impl Player {
         drop(now);
         // Frames read ahead from after a cut may be for one that's gone.
         self.after_cut = None;
+        let frames: Vec<(u64, u64)> = kept.windows(2).map(|w| (self.info.frame_index(w[0].1), self.info.frame_index(w[1].0))).collect();
         if let Some(v) = self.hw() {
-            v.set_skips(kept.windows(2).map(|w| (self.info.frame_index(w[0].1), self.info.frame_index(w[1].0))).collect());
+            v.set_skips(frames.clone());
+        }
+        #[cfg(hw_decode)]
+        {
+            self.video_skips = frames;
         }
         if let Some(to) = into.filter(|_| self.is_playing()) {
             self.seek(to);
@@ -832,6 +1044,13 @@ impl Player {
     /// Returns the size of what's on screen (in pixels, to fit it); draw it
     /// with [`Self::paint`].
     pub fn update(&mut self, ctx: &egui::Context, scrubbing: bool) -> Option<egui::Vec2> {
+        #[cfg(hw_decode)]
+        {
+            self.drawn_at = Some(std::time::Instant::now());
+            // Drawn: the playback decoder, if it was let go of meanwhile
+            // (else it would count as broken, just below).
+            self.open_video_again(ctx);
+        }
         // The hardware decoder broke (or can't read this file): scrub from a
         // proxy after all.
         if self.proxy.is_none() && self.hw().is_none() {
@@ -843,6 +1062,7 @@ impl Player {
                     self.uploader = None;
                 }
                 self.scrub = None;
+                self.scrub_opening = None;
             }
         }
         if let Some(proxy) = &self.proxy {
@@ -1024,6 +1244,17 @@ impl Player {
         let want = self.info.frame_index(self.time());
         #[cfg(hw_decode)]
         {
+            // The engine, once it's open.
+            if let Some(rx) = &self.scrub_opening {
+                match rx.try_recv() {
+                    Ok(engine) => {
+                        self.scrub = engine;
+                        self.scrub_opening = None;
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => self.scrub_opening = None,
+                    Err(mpsc::TryRecvError::Empty) => {}
+                }
+            }
             // Its decoders gone: its frames and textures go too (scrubbing
             // carries on through the playback decoder).
             if self.scrub.as_ref().is_some_and(|e| e.failed()) {
@@ -1205,11 +1436,11 @@ impl Player {
     /// (each frame decoded on the way to it showed as it came, nearer and
     /// nearer: stopped, the picture played on a few frames).
     ///
-    /// Held still, the engine decodes around it. Scrubbing the playhead
-    /// itself, a picture near it stays put (letting go lands on it,
-    /// [`Self::land`]); otherwise its own frame comes in one step, the
-    /// engine's or the playback decoder's (all its threads on the one
-    /// frame: soonest).
+    /// Held still, the engine decodes around it, and its own frame comes in
+    /// one step, the engine's or the playback decoder's (all its threads on
+    /// the one frame: soonest). (A picture near it used to stay put while
+    /// held, letting go moving the playhead to it: up to half a second off
+    /// where it was put, and the playhead not where it was let go.)
     #[cfg(hw_decode)]
     fn scrub_engine(&mut self, ctx: &egui::Context, want: u64) {
         let m = self.motion_at(want);
@@ -1233,11 +1464,6 @@ impl Player {
             ctx.request_repaint_after(HELD.saturating_sub(m.moved.elapsed()) + std::time::Duration::from_millis(2));
         }
         if self.shown_frame == Some(want) {
-            return;
-        }
-        let fps = self.info.fps;
-        let keep = held && !m.jumped && self.landing.zip(self.screen_index).is_some_and(|(reach, i)| i.abs_diff(want) as f64 <= reach * fps);
-        if keep {
             return;
         }
         match found {
@@ -1301,12 +1527,20 @@ impl Player {
                 }
             }
         };
+        // Windows: its pool, opened for drawing as it goes on screen.
+        #[cfg(windows)]
+        let pool = p.gpu.as_ref().map(|s| s.key().0);
         #[cfg(not(target_os = "linux"))]
         let got = {
             let _ = speed;
             self.put_picture(ctx, p);
             wanted
         };
+        self.engine_on_screen = true;
+        #[cfg(windows)]
+        if let Some(pool) = pool.filter(|p| !self.engine_pools.contains(p)) {
+            self.engine_pools.push(pool);
+        }
         if debug() {
             self.scrub_stats.showed(t.elapsed().as_secs_f64());
         }
@@ -1351,43 +1585,6 @@ impl Player {
         };
         self.motion = Some(m);
         m
-    }
-
-    /// While the playhead itself is scrubbed (`Some`), how near the
-    /// playhead (seconds) the picture it's held still on may be to stay,
-    /// and where letting go lands ([`Self::land`]). Set every frame, before
-    /// [`Self::update`].
-    pub fn set_landing(&mut self, reach: Option<f64>) {
-        self.landing = reach;
-    }
-
-    /// A scrub of the playhead (a drag of it, the wheel) ended: when the
-    /// picture on screen is a frame near the playhead (within the reach
-    /// [`Self::set_landing`] gave) but not the playhead's own, the playhead
-    /// goes to it. Letting go lands on the frame you see, rather than the
-    /// picture jumping to the one under the pointer once it's decoded. Not
-    /// after a jump (a click): that picture is only a stand-in for where it
-    /// went. Nor into a stretch cut out of the clip.
-    pub fn land(&mut self) {
-        #[cfg(hw_decode)]
-        {
-            let (Some(reach), Some(on_screen)) = (self.landing, self.screen_index) else { return };
-            if self.scrub.as_ref().is_none_or(|e| e.failed()) || self.motion.is_none_or(|m| m.jumped) {
-                return;
-            }
-            let want = self.info.frame_index(self.time());
-            if self.shown_frame == Some(want) || on_screen == want || on_screen.abs_diff(want) as f64 > reach * self.info.fps {
-                return;
-            }
-            let t = self.info.snap(on_screen as f64 / self.info.fps + 1e-9) + 1e-6;
-            let cut = self.shared.skips.lock().is_ok_and(|s| s.iter().any(|k| (k.from..k.to).contains(&to_samples(t))));
-            if cut || t > self.info.duration {
-                return;
-            }
-            trace!("scrub lands on the frame shown, {on_screen} (the playhead was at {want})");
-            self.seek(t);
-            self.shown_frame = Some(on_screen);
-        }
     }
 
     #[cfg_attr(not(windows), allow(dead_code))]
@@ -1487,11 +1684,17 @@ impl Player {
         /// Passes to hold a frame after it leaves the screen: more than the
         /// GPU ever runs behind.
         const HOLD: u64 = 4;
+        // Whether the one going was the scrub engine's; the next says so
+        // once it's on (`show_scrubbed`).
+        #[cfg(hw_decode)]
+        let engine = std::mem::take(&mut self.engine_on_screen);
+        #[cfg(not(hw_decode))]
+        let engine = false;
         let pass = ctx.cumulative_pass_nr();
         if let Some(old) = std::mem::replace(&mut self.on_screen, next) {
-            self.retired.push_back((pass, old));
+            self.retired.push_back((pass, old, engine));
         }
-        while self.retired.front().is_some_and(|(at, _)| pass >= at + HOLD) {
+        while self.retired.front().is_some_and(|(at, ..)| pass >= at + HOLD) {
             self.retired.pop_front();
         }
     }
@@ -1544,6 +1747,25 @@ fn still_worker(ctx: &egui::Context, source: &Path, nv12: Option<(u32, u32)>) ->
         }
     });
     (still_tx, still_rx)
+}
+
+/// The scrub engine for `source`, opening on a thread of its own (see
+/// `Player::scrub_opening`).
+#[cfg(hw_decode)]
+fn open_engine(ctx: &egui::Context, source: &Path, info: &ClipInfo) -> Receiver<Option<crate::scrub::Engine>> {
+    let (tx, rx) = mpsc::channel();
+    let (ctx, source, fps, total) = (ctx.clone(), source.to_path_buf(), info.fps, total_frames(info) as u64);
+    let opened = std::thread::Builder::new().name("scrub engine".into()).spawn(move || {
+        // Gone already (the clip closed, or the window's no longer in use):
+        // the engine stops as it drops.
+        if tx.send(crate::scrub::Engine::open(&ctx, &source, fps, total)).is_ok() {
+            ctx.request_repaint();
+        }
+    });
+    if let Err(e) = opened {
+        eprintln!("scrubbing through the playback decoder: no thread for the scrub engine ({e})");
+    }
+    rx
 }
 
 /// The in-process decoder for `source` (unless `HASTECLIP_NO_HW_DECODE` is

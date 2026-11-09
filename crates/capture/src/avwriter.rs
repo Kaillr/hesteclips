@@ -137,6 +137,8 @@ impl FileWriter {
                 let fmt = &self.audio_formats[*track].0;
                 (input, packet_sample(&shifted, fmt).context("couldn't wrap an audio packet")?)
             }
+            // The stream's own pictures never go in a file.
+            Media::Stream(_) => return Ok(()),
         };
         unsafe {
             // Real-time inputs interleave themselves; this only waits when the disk
@@ -205,8 +207,21 @@ fn comment_item(text: &str) -> Retained<objc2_av_foundation::AVMetadataItem> {
     }
 }
 
+/// What went wrong with `w`, with the errors under it: AVFoundation's own
+/// only says "The operation could not be completed" (-11800), the reason's
+/// in the error it wraps (-16364: a frame out of order).
 fn writer_error(w: &AVAssetWriter) -> String {
-    unsafe { w.error() }.map_or_else(|| "unknown error".into(), |e| e.localizedDescription().to_string())
+    let Some(mut e) = (unsafe { w.error() }) else { return "unknown error".into() };
+    let mut out = e.localizedDescription().to_string();
+    let mut codes = vec![e.code()];
+    while codes.len() < 4 {
+        let Some(under) = e.userInfo().objectForKey(unsafe { objc2_foundation::NSUnderlyingErrorKey }).and_then(|u| u.downcast::<objc2_foundation::NSError>().ok()) else { break };
+        codes.push(under.code());
+        e = under;
+    }
+    let codes: Vec<String> = codes.iter().map(ToString::to_string).collect();
+    out.push_str(&format!(" (error {})", codes.join(", from ")));
+    out
 }
 
 /// A copy of a video sample with presentation/decode time `frame / fps`.

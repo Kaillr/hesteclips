@@ -1,0 +1,14 @@
+# Inputs follow "Inputs guide" at the top of crates/app/src/ui_kit.rs: each
+# kind of value has its own ui_kit control, which offers the common values
+# and takes nothing that makes no sense (a word is only ever picked; a
+# number's box only takes digits). These turn away egui's own inputs, which
+# do neither. A text box that is for free text (a name, a search) says so
+# where it's made, with #[allow(clippy::disallowed_methods)] and why.
+disallowed-types = [
+    { path = "egui::DragValue", reason = "a number is a ui_kit::ValueField, or a ui_kit::ChoiceField with Custom: see \"Inputs guide\" in crates/app/src/ui_kit.rs" },
+    { path = "egui::Slider", reason = "a number is a ui_kit::ValueField, or a ui_kit::ChoiceField with Custom: see \"Inputs guide\" in crates/app/src/ui_kit.rs" },
+]
+disallowed-methods = [
+    { path = "egui::TextEdit::singleline", reason = "a text box is only for free text (a name, a search: ui_kit::text_field). A number is a ui_kit::ValueField, a choice a ui_kit::ChoiceField: see \"Inputs guide\" in crates/app/src/ui_kit.rs" },
+    { path = "egui::TextEdit::multiline", reason = "a text box is only for free text (a name, a search: ui_kit::text_field). A number is a ui_kit::ValueField, a choice a ui_kit::ChoiceField: see \"Inputs guide\" in crates/app/src/ui_kit.rs" },
+]

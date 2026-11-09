@@ -38,8 +38,8 @@ pub enum Timed {
     Stepped(f64),
     /// Typed and confirmed (Enter, Tab or clicking away).
     Typed(f64),
-    /// Typed, but not a length.
-    Unreadable(String),
+    /// Typed, but not a length: it shows what it was.
+    Unreadable,
 }
 
 /// While the field has the keyboard.
@@ -300,7 +300,7 @@ fn confirm(typed: &str) -> Timed {
     }
     match read(typed) {
         Some(v) => Timed::Typed(v),
-        None => Timed::Unreadable(typed.to_owned()),
+        None => Timed::Unreadable,
     }
 }
 

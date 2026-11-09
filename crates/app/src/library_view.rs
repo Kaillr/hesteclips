@@ -24,15 +24,16 @@ use crate::library::{Action, CardDrag, DropOn, Filter, ShowKind, View};
 use crate::settings::LibrarySort;
 use crate::theme::{self, W, icon};
 use crate::ui_kit::{self, Btn, Item, Kind};
-use crate::{App, RecState, clips, share, thumbs};
+use crate::{App, clips, share, thumbs};
 
-/// The panel's width, from the rail's edge (its card's right edge is where
-/// Settings' search ends too).
+/// The panel's width, from the rail's edge (Settings' panel is the same).
 pub const PANEL_W: f32 = 244.0;
 use crate::library_grid::{DAY_H, GridItem};
 /// The window is too narrow for the panel below this page width: its list
-/// moves into a menu on the title.
-const PANEL_FROM: f32 = 700.0;
+/// moves into a menu on the title (Settings' too).
+pub(crate) const PANEL_FROM: f32 = 700.0;
+/// What Free up space does, on its button and menu items.
+pub(crate) const FREE_UP_TIP: &str = "Trim or delete original recordings kept for edits, or make clips smaller by encoding them again";
 /// How long a freshly saved clip has its dot.
 const NEW_FOR: Duration = Duration::from_secs(60 * 30);
 
@@ -40,7 +41,7 @@ impl App {
     pub(crate) fn library(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
         self.hover_seen = false;
         // One card for a recording in progress, and one per clip still being written.
-        let placeholders = usize::from(self.rec_state == RecState::Recording) + self.saving;
+        let placeholders = usize::from(self.rec_state.recording) + self.saving;
         let new_renders: Vec<usize> = (0..self.renders.len()).filter(|&i| self.renders[i].as_new).collect();
         let empty_library = self.clips.is_empty() && placeholders == 0 && new_renders.is_empty();
         // What's shown: worked out again only when something it's made of
@@ -140,28 +141,18 @@ impl App {
                         });
                     }
                 }
-                ui.label(theme::text(&count, 13.5, W::Regular).color(theme::pal(ui).text3));
+                // How many clips and screenshots are here, which is also where
+                // they're picked between.
+                if let Some(a) = app.kind_counts(ui, &count, tight) {
+                    head_action = Some(a);
+                }
                 ui.add_space(2.0);
                 let sort = app.settings.library_sort;
                 let all_folded = days.iter().all(|d| app.folded.contains(d));
                 let fold_label = if all_folded { "Expand all" } else { "Collapse all" };
-                // Clips, screenshots or both: once there are screenshots.
-                let kinds = app.shown.any_shots;
-                let chosen = ShowKind::ALL.iter().position(|k| *k == app.library_kind).unwrap_or(0);
                 if tight {
-                    // Not enough room: clips or screenshots as their icons,
-                    // the order and fold-all in a menu (the recorder keeps
-                    // its words longer).
-                    if kinds {
-                        let opts = [
-                            ui_kit::Seg::from("All"),
-                            ui_kit::Seg { icon: Some(icon::FILM_STRIP), label: "", tip: Some("Clips") },
-                            ui_kit::Seg { icon: Some(icon::CAMERA), label: "", tip: Some("Screenshots") },
-                        ];
-                        if let Some(i) = ui_kit::segmented_opts(ui, "lib_kind_tight", &opts, chosen, None, true) {
-                            head_action = Some(Action::Kind(ShowKind::ALL[i]));
-                        }
-                    }
+                    // Not enough room: the order and fold-all in a menu (the
+                    // recorder keeps its words longer).
                     let r = Btn::icon(Kind::Ghost, icon::DOTS_THREE).small().id("lib_more").tip(format!("Order: {}", sort.label())).show(ui);
                     ui_kit::menu_popup(&r, true, 200.0, |ui| {
                         ui_kit::menu_head(ui, "Order");
@@ -178,12 +169,6 @@ impl App {
                         }
                     });
                 } else {
-                    if kinds {
-                        let opts: Vec<ui_kit::Seg> = ShowKind::ALL.iter().map(|k| ui_kit::Seg::from(k.label())).collect();
-                        if let Some(i) = ui_kit::segmented_opts(ui, "lib_kind", &opts, chosen, None, true) {
-                            head_action = Some(Action::Kind(ShowKind::ALL[i]));
-                        }
-                    }
                     let r = Btn::ghost(sort.label()).with_icon(icon::ARROWS_DOWN_UP).small().id("lib_sort").show(ui);
                     ui_kit::menu_popup(&r, true, 200.0, |ui| {
                         for s in LibrarySort::ALL {
@@ -347,7 +332,7 @@ impl App {
                         cui.multiply_opacity(open * p.shown);
                     }
                     match item {
-                        GridItem::Placeholder(_) => self.placeholder_card(&mut cui, rect),
+                        GridItem::Placeholder(n) => self.placeholder_card(&mut cui, rect, n),
                         GridItem::NewRender(r) => self.new_render_card(&mut cui, r, rect),
                         GridItem::Clip(ci) => {
                             let c = self.clips[ci].clone();
@@ -416,6 +401,44 @@ impl App {
             Filter::Folder(name) => name.clone(),
             Filter::Collection(id) => self.collections.get(id).map(|c| c.name.clone()).unwrap_or_default(),
         }
+    }
+
+    /// The heading's count, which also picks between clips and screenshots.
+    /// Where both are here (found, while searching), each kind's number is a
+    /// quiet button that shows only that kind; the kind shown is a chip that
+    /// shows both again (with ✕ while there's room), the other beside it to
+    /// switch to. Otherwise `count`, in words. (Picking them had a control of
+    /// its own, which took room the clipping bar needs.) `tight`: each kind
+    /// as its icon and number.
+    fn kind_counts(&self, ui: &mut egui::Ui, count: &str, tight: bool) -> Option<Action> {
+        let (clips, shots) = self.shown.found;
+        let kind = self.library_kind;
+        if kind == ShowKind::All && (clips == 0 || shots == 0) {
+            ui.label(theme::text(count, 13.5, W::Regular).color(theme::pal(ui).text3));
+            return None;
+        }
+        let mut action = None;
+        ui.scope(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            for (k, n, glyph, one, many) in [(ShowKind::Clips, clips, icon::FILM_STRIP, "clip", "clips"), (ShowKind::Screenshots, shots, icon::CAMERA, "screenshot", "screenshots")] {
+                let chosen = kind == k;
+                // A kind that isn't here, to switch to: left out.
+                if n == 0 && !chosen {
+                    continue;
+                }
+                let label = if tight { n.to_string() } else { format!("{n} {}", if n == 1 { one } else { many }) };
+                let b = Btn::new(if chosen { Kind::On } else { Kind::Ghost }, label).with_icon(glyph).small().id(("lib_kind", many));
+                let b = match (chosen, tight) {
+                    (true, false) => b.trail(icon::X).tip("Show clips and screenshots"),
+                    (true, true) => b.tip("Show clips and screenshots"),
+                    (false, _) => b.tip(format!("Show only {many}")),
+                };
+                if b.show(ui).clicked() {
+                    action = Some(Action::Kind(if chosen { ShowKind::All } else { k }));
+                }
+            }
+        });
+        action
     }
 
     /// The Clips panel: title and search, then the card of filters.
@@ -736,7 +759,7 @@ impl App {
                 let hint = match key {
                     Some(key) if shots => format!("Press {key} in a game to take one."),
                     None if shots => "Choose a key for them in Settings, under Shortcuts.".to_owned(),
-                    _ => "Show All to see everything here.".to_owned(),
+                    _ => "Show all to see everything here.".to_owned(),
                 };
                 ui.label(theme::text(hint, 13.5, W::Regular).color(p.text3));
                 ui.add_space(10.0);
@@ -778,10 +801,13 @@ impl App {
         cui.label(theme::text("Your clips will show up here", 22.0, W::Semibold).color(p.text));
         cui.add_space(8.0);
         let key = save.as_ref().map(|k| ui_kit::key_text(k)).unwrap_or_else(|| "the shortcut".into());
-        let text = match self.rec_state {
-            RecState::Idle => format!("Start clipping and play as usual. When something worth keeping happens, press {key} to save the last {len}."),
-            RecState::Buffering => format!("Clipping. Play as usual, and when something worth keeping happens, press {key} to save the last {len}."),
-            RecState::Recording => "Recording. Stop it to see your recording here.".to_owned(),
+        let state = self.rec_state;
+        let text = if state.clipping {
+            format!("Clipping. Play as usual, and when something worth keeping happens, press {key} to save the last {len}.")
+        } else if state.recording {
+            "Recording. Stop it to see your recording here.".to_owned()
+        } else {
+            format!("Start clipping and play as usual. When something worth keeping happens, press {key} to save the last {len}.")
         };
         cui.allocate_ui(vec2(440.0, 60.0), |ui| {
             ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
@@ -790,7 +816,7 @@ impl App {
         });
         cui.add_space(18.0);
         // The row is as wide as its buttons, so it centres on them.
-        let start = (self.rec_state == RecState::Idle).then(|| Btn::primary("Start clipping").min_width(130.0));
+        let start = (!self.rec_state.clipping && !self.rec_state.recording).then(|| Btn::primary("Start clipping").min_width(130.0));
         let choose = Btn::normal("Choose what's recorded");
         let gap = 8.0;
         let row_w = choose.width(&cui) + start.as_ref().map_or(0.0, |b| b.width(&cui) + gap);
@@ -846,7 +872,11 @@ impl App {
         }
         painter.text(Pos2::new(rect.left() + 2.0, thumb.bottom() + 9.0), Align2::LEFT_TOP, caption, theme::font(13.5, W::Medium), p.text);
         painter.text(Pos2::new(rect.left() + 2.0, thumb.bottom() + 29.0), Align2::LEFT_TOP, "In progress", theme::font(12.5, W::Regular), p.text3);
-        ui.ctx().request_repaint_after(Duration::from_millis(33));
+        // Nothing asked for here: the dot asks for its ring, the app's tick
+        // (every 100 ms while capturing) moves the recording's time on, and
+        // a render's progress asks as it comes. (33 ms asked here came after
+        // 16: a recording kept the library drawn 60 times a second, the
+        // window in use or not.)
     }
 
     fn new_render_card(&mut self, ui: &mut egui::Ui, i: usize, rect: Rect) {
@@ -871,9 +901,11 @@ impl App {
         }
     }
 
-    fn placeholder_card(&mut self, ui: &mut egui::Ui, rect: Rect) {
+    /// Placeholder `n`: the recording in progress first (while one runs),
+    /// then the clips still being written.
+    fn placeholder_card(&mut self, ui: &mut egui::Ui, rect: Rect, n: usize) {
         let p = theme::pal(ui);
-        if self.rec_state == RecState::Recording {
+        if self.rec_state.recording && n == 0 {
             let secs = self.rec_started.map_or(0, |t| t.elapsed().as_secs());
             Self::progress_card(ui, rect, &format!("Recording {}", thumbs::format_duration(Duration::from_secs(secs))), "Recording", p.rec, None);
         } else {
@@ -1032,6 +1064,16 @@ impl App {
             x += 14.0;
         }
         let title = painter.layout_job(ui_kit::single_line_job(&clip.title(), theme::font(13.5, W::Medium), p.text, rect.right() - x - 2.0));
+        // The whole name and game, on them, when they're cut short; no tip
+        // over the card itself, which would cover its picture and buttons'
+        // tips.
+        let card_id = resp.id;
+        let elided_tip = |ui: &egui::Ui, g: &std::sync::Arc<egui::Galley>, at: Pos2, id: &str, text: &str| {
+            if g.elided {
+                ui.interact(Rect::from_min_size(at, g.size()), card_id.with(id), Sense::hover()).on_hover_text(text);
+            }
+        };
+        elided_tip(ui, &title, Pos2::new(x, cap_y), "title", &clip.title());
         painter.galley(Pos2::new(x, cap_y), title, p.text);
         let meta_y = cap_y + 21.0;
         let mut mx = rect.left() + 2.0;
@@ -1051,6 +1093,7 @@ impl App {
         let game_g = painter.layout_job(ui_kit::single_line_job(&game, theme::font(12.5, W::Regular), p.text3, game_w));
         let gy = meta_y + 7.5 - game_g.size().y / 2.0;
         let gw = game_g.size().x;
+        elided_tip(ui, &game_g, Pos2::new(mx, gy), "game", &game);
         painter.galley(Pos2::new(mx, gy), game_g, p.text3);
         mx += gw + 7.0;
         painter.circle_filled(Pos2::new(mx, meta_y + 8.0), 1.5, theme::fade(p.text3, 0.6));
@@ -1060,7 +1103,7 @@ impl App {
         let when = clip.captured_at().format("Saved %-d %B at %H:%M").to_string();
         let size_tip = if clip.kept_bytes > 0 {
             format!(
-                "{when}\n{} in all: {} for the clip, and {} for its original recording, kept so the edit can be changed or undone. In the editor, ⋯ → Free up space trims or deletes it.",
+                "{when}\n{} in all: {} for the clip, and {} for its original recording, kept so the edit can be changed or undone. Right-click → Free up space to trim or delete it.",
                 clips::human_bytes(clip.size_bytes + clip.kept_bytes),
                 clip.human_size(),
                 clips::human_bytes(clip.kept_bytes),
@@ -1070,7 +1113,7 @@ impl App {
         };
         ui.interact(size_rect, resp.id.with("size"), Sense::hover()).on_hover_text(size_tip);
 
-        let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text_at_pointer(clip.title());
+        let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
         if hovered && is_new {
             self.seen_new.insert(clip.path.clone());
         }
@@ -1124,6 +1167,11 @@ impl App {
             {
                 action = Some(Action::Export(paths.clone()));
             }
+            if !paths.iter().all(|p| clips::is_image(p))
+                && Item::new("Free up space…").icon(icon::HARD_DRIVE).tip(FREE_UP_TIP).show(ui).clicked()
+            {
+                action = Some(Action::FreeUp(paths.clone()));
+            }
             ui_kit::menu_sep(ui);
             if Item::new("Deselect all").icon(icon::X_CIRCLE).show(ui).clicked() {
                 action = Some(Action::Deselect);
@@ -1176,6 +1224,9 @@ impl App {
         let selected = self.selection.paths.contains(&clip.path);
         if Item::new(if selected { "Deselect" } else { "Select" }).icon(icon::CHECK_CIRCLE).show(ui).clicked() {
             action = Some(Action::Select { path: clip.path.clone(), range: false });
+        }
+        if !image && Item::new("Free up space…").icon(icon::HARD_DRIVE).tip(FREE_UP_TIP).show(ui).clicked() {
+            action = Some(Action::FreeUp(vec![clip.path.clone()]));
         }
         ui_kit::menu_sep(ui);
         let del_key = Some(vec![if cfg!(target_os = "macos") { icon::BACKSPACE.to_owned() } else { "Del".to_owned() }]);
@@ -1300,6 +1351,9 @@ impl App {
                                     }
                                 });
                             }
+                            if !selected.iter().all(|p| clips::is_image(p)) && Btn::ghost("Free up space").with_icon(icon::HARD_DRIVE).small().tip(FREE_UP_TIP).show(ui).clicked() {
+                                action = Some(Action::FreeUp(selected.clone()));
+                            }
                             let label = if self.settings.delete_permanently { format!("Delete {n}") } else { format!("Move {n} to {}", crate::store::bin_name()) };
                             if Btn::new(Kind::DangerText, label).with_icon(icon::TRASH).small().show(ui).clicked() {
                                 action = Some(Action::TrashSelected);
@@ -1381,6 +1435,7 @@ impl App {
             }
             Action::Export(paths) => self.export_clips(&paths),
             Action::Import => self.import_clips_dialog(),
+            Action::FreeUp(paths) => self.ask_free_up(&paths),
         }
     }
 }
@@ -1404,6 +1459,8 @@ pub fn search_field(ui: &mut egui::Ui, id: &str, text: &mut String, hint: &str) 
     let right_w = if text.is_empty() { ui_kit::key_hint_width(ui, &crate::shortcuts::command("F"), 11.0) + 6.0 } else { 26.0 };
     let field = Rect::from_min_max(Pos2::new(rect.left() + 28.0, rect.top()), Pos2::new(rect.right() - right_w - 4.0, rect.bottom()));
     let mut fui = ui.new_child(egui::UiBuilder::new().max_rect(field).layout(egui::Layout::left_to_right(egui::Align::Center)));
+    // Free text: a search.
+    #[allow(clippy::disallowed_methods)]
     let out = egui::TextEdit::singleline(text)
         .id(id)
         .frame(egui::Frame::NONE)

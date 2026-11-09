@@ -14,6 +14,8 @@ mod aac;
 pub mod audio;
 #[cfg(target_os = "macos")]
 mod avwriter;
+pub mod colours;
+pub mod h264;
 pub mod mixer;
 /// Hearing a microphone live: through PipeWire on Linux (`linux::monitor`).
 #[cfg(not(target_os = "linux"))]
@@ -25,15 +27,20 @@ pub mod mp4meta;
 pub(crate) mod mp4read;
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 mod mp4file;
-#[cfg(any(target_os = "windows", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 mod mp4mux;
 pub mod output;
+pub mod layers;
 pub mod preview;
 pub mod webcam;
 pub mod sources;
 mod shutter;
+pub mod export;
 mod steady;
 pub mod stores;
+pub mod stream;
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+mod outputs;
 
 #[cfg(target_os = "macos")]
 pub mod mac;
@@ -49,6 +56,7 @@ pub mod linux;
 mod writer;
 
 /// The in-process hardware video decoder, for playback (same API on both).
+pub use layers::{Layer, LayerSource, SharedLayers};
 pub use shutter::BlendShape;
 #[cfg(target_os = "macos")]
 pub use mac::decode;
@@ -99,11 +107,11 @@ impl Recorder for Unsupported {
     fn save_clip(&mut self, _: &Path) -> anyhow::Result<PendingClip> {
         anyhow::bail!("recording isn't available on this platform yet")
     }
-    fn stop(&mut self, _: Option<&Path>) -> anyhow::Result<Option<PathBuf>> {
+    fn stop(&mut self, _: Mode, _: Option<&Path>) -> anyhow::Result<Option<PathBuf>> {
         Ok(None)
     }
-    fn is_running(&self) -> bool {
-        false
+    fn running(&self) -> Running {
+        Running::default()
     }
 }
 
@@ -128,12 +136,12 @@ pub fn output_size(w: u32, h: u32, short_side: Option<u32>) -> (u32, u32) {
 /// How the screen goes into a recording of another shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Framing {
+    /// All of it, with black bars where the shapes differ.
+    #[default]
+    Fit,
     /// Its middle, as much as fills the shape: what's past that is cut off
     /// (an ultrawide screen's sides, recorded 16:9).
-    #[default]
     Fill,
-    /// All of it, with black bars where the shapes differ.
-    Fit,
     /// All of it, stretched or squeezed into the shape.
     Stretch,
 }
@@ -286,28 +294,41 @@ impl ScreenPlacement {
     }
 
     /// Its box in a `fw`×`fh` frame's pixels, inside the frame: (left, top,
-    /// width, height), its edges on even pixels for the encoder's 4:2:0
-    /// colour (the frame's own edges as they are).
+    /// width, height), on even pixels for the encoder's 4:2:0 colour (the
+    /// frame's own edges as they are).
     pub fn rect_in(&self, fw: u32, fh: u32) -> [u32; 4] {
-        let edge = |v: f32, n: u32| if v >= 1.0 - 1e-4 { n } else { ((v.max(0.0) * n as f32).round() as u32 & !1).min(n) };
+        self.rect_on(fw, fh, true)
+    }
+
+    /// [`rect_in`](Self::rect_in), on even pixels (`even`) or, drawn on a
+    /// full-colour canvas, on any: where it starts and how big it is are
+    /// each rounded on their own, so moving it never changes its size.
+    pub(crate) fn rect_on(&self, fw: u32, fh: u32, even: bool) -> [u32; 4] {
         let [x, y, w, h] = self.rect;
-        let (x0, y0) = (edge(x, fw), edge(y, fh));
-        let (x1, y1) = (edge(x + w, fw).max(x0), edge(y + h, fh).max(y0));
+        let (x0, x1) = span(x, w, fw, even);
+        let (y0, y1) = span(y, h, fh, even);
         [x0, y0, x1 - x0, y1 - y0]
     }
 
     /// Where a picture of `content`'s size (its crop, if any) goes in a
     /// `frame`-size frame: see [`place_picture`](Self::place_picture).
     /// Nothing of it when hidden.
-    // macOS has ScreenCaptureKit cut the crop out (`mac::video::stream_config`).
-    #[cfg_attr(not(any(target_os = "windows", target_os = "linux", test)), allow(dead_code))]
+    // macOS has ScreenCaptureKit cut the crop out (`mac::video::stream_config`);
+    // Windows places on even pixels or any (`place_on`).
+    #[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
     pub(crate) fn place(&self, content: (u32, u32), frame: (u32, u32)) -> ([u32; 4], [u32; 4]) {
+        self.place_on(content, frame, true)
+    }
+
+    /// [`place`](Self::place), where it's drawn on even pixels (`even`: into
+    /// the encoder's 4:2:0 colour) or on any (a full-colour canvas).
+    pub(crate) fn place_on(&self, content: (u32, u32), frame: (u32, u32), even: bool) -> ([u32; 4], [u32; 4]) {
         if self.hidden {
             return ([0; 4], [0; 4]);
         }
-        let Some(c) = self.crop else { return self.place_turned(content, frame) };
+        let Some(c) = self.crop else { return self.place_turned_on(content, frame, even) };
         let [x, y, w, h] = c.rect(content.0, content.1);
-        let ([sx, sy, sw, sh], dest) = self.place_turned((w, h), frame);
+        let ([sx, sy, sw, sh], dest) = self.place_turned_on((w, h), frame, even);
         ([x + sx, y + sy, sw, sh], dest)
     }
 
@@ -315,9 +336,16 @@ impl ScreenPlacement {
     /// turned and flipped: the part of it used, in its own (unturned)
     /// pixels, and where it's drawn. A compositor maps each point of where
     /// it's drawn into that part with [`unturn`](Self::unturn).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn place_turned(&self, content: (u32, u32), frame: (u32, u32)) -> ([u32; 4], [u32; 4]) {
+        self.place_turned_on(content, frame, true)
+    }
+
+    /// [`place_turned`](Self::place_turned), on even pixels or any (see
+    /// [`place_on`](Self::place_on)).
+    pub(crate) fn place_turned_on(&self, content: (u32, u32), frame: (u32, u32), even: bool) -> ([u32; 4], [u32; 4]) {
         let shown = self.turned(content);
-        let ([sx, sy, sw, sh], dest) = self.place_picture(shown, frame);
+        let ([sx, sy, sw, sh], dest) = self.place_picture(shown, frame, even);
         if !self.transformed() || sw == 0 || sh == 0 {
             return ([sx, sy, sw, sh], dest);
         }
@@ -333,23 +361,41 @@ impl ScreenPlacement {
 
     /// Where a picture of `content`'s size goes in a `frame`-size frame,
     /// into the box as `framing` says (see [`placement_in`]): the part of it
-    /// used, and where it's drawn. A box reaching past the frame is cut at
-    /// its edges, and the picture with it (see [`placement_past`]).
-    pub(crate) fn place_picture(&self, content: (u32, u32), (fw, fh): (u32, u32)) -> ([u32; 4], [u32; 4]) {
+    /// used, and where it's drawn, on even pixels or any (`even`). A box
+    /// reaching past the frame is cut at its edges, and the picture with it
+    /// (see [`placement_past`]).
+    pub(crate) fn place_picture(&self, content: (u32, u32), (fw, fh): (u32, u32), even: bool) -> ([u32; 4], [u32; 4]) {
         if self.inside() {
-            return placement_in(content, self.rect_in(fw, fh), self.framing);
+            return placement_in(content, self.rect_on(fw, fh, even), self.framing, even);
         }
-        placement_past(content, self.rect, (fw, fh), self.framing)
+        placement_past(content, self.rect, (fw, fh), self.framing, even)
     }
+}
+
+/// A box's span along an axis of `n` pixels (`at` and `size` as fractions
+/// of it, inside it): where it starts and ends. The start and the length
+/// are each rounded on their own, so moving it never changes its length;
+/// on even pixels (`even`), for drawing straight into 4:2:0 colour. One at
+/// the frame's edges is at them exactly.
+fn span(at: f32, size: f32, n: u32, even: bool) -> (u32, u32) {
+    let px = |v: f32| {
+        let r = (v.max(0.0) * n as f32).round() as u32;
+        if even { r & !1 } else { r }
+    };
+    let start = if at <= 1e-4 { 0 } else { px(at).min(n) };
+    let end = if at + size >= 1.0 - 1e-4 { n } else { (start + px(size)).min(n) };
+    (start, end.max(start))
 }
 
 /// Where a picture of `content`'s size goes in a box reaching past the
 /// edges of a `fw`×`fh` frame (`rect`, as fractions of it): put in as
 /// `framing` says, as if the frame went on (see [`placement_in`]), then cut
 /// at the frame's edges, the part of the picture used with them. Where it's
-/// drawn is even, for the encoder's 4:2:0 colour (the frame's own edges as
-/// they are); nothing, when none of it is in the frame.
-fn placement_past((cw, ch): (u32, u32), [x, y, w, h]: [f32; 4], (fw, fh): (u32, u32), framing: Framing) -> ([u32; 4], [u32; 4]) {
+/// drawn starts and is as big as it is, each rounded on its own (moving it
+/// never changes its size), on even pixels for the encoder's 4:2:0 colour
+/// (`even`; the frame's own edges as they are); nothing, when none of it is
+/// in the frame.
+fn placement_past((cw, ch): (u32, u32), [x, y, w, h]: [f32; 4], (fw, fh): (u32, u32), framing: Framing, even: bool) -> ([u32; 4], [u32; 4]) {
     let (cw, ch, fw, fh) = (cw as f64, ch as f64, fw as f64, fh as f64);
     let bx = [x as f64 * fw, y as f64 * fh, w as f64 * fw, h as f64 * fh];
     if cw <= 0.0 || ch <= 0.0 || bx[2] <= 0.0 || bx[3] <= 0.0 {
@@ -369,9 +415,15 @@ fn placement_past((cw, ch): (u32, u32), [x, y, w, h]: [f32; 4], (fw, fh): (u32, 
             ([(cw - w) / 2.0, (ch - h) / 2.0, w, h], bx)
         }
     };
-    // Cut at the frame's edges, on even pixels inside it.
-    let even = |v: f64, n: f64| if v >= n - 0.5 { n } else { ((v.max(0.0).round() as u32) & !1) as f64 };
-    let (x0, y0, x1, y1) = (even(dest[0], fw), even(dest[1], fh), even(dest[0] + dest[2], fw), even(dest[1] + dest[3], fh));
+    // Its start and size each rounded (on even pixels, `even`), then cut at
+    // the frame's edges.
+    let snap = |v: f64| {
+        let r = v.round();
+        if even { ((r as i64) & !1) as f64 } else { r }
+    };
+    let (sx0, sy0) = (snap(dest[0]), snap(dest[1]));
+    let (x0, y0) = (sx0.max(0.0), sy0.max(0.0));
+    let (x1, y1) = ((sx0 + snap(dest[2])).min(fw), (sy0 + snap(dest[3])).min(fh));
     if x1 <= x0 || y1 <= y0 {
         return ([0; 4], [0; 4]);
     }
@@ -391,7 +443,7 @@ fn placement_past((cw, ch): (u32, u32), [x, y, w, h]: [f32; 4], (fw, fh): (u32, 
 /// [`placement_in`], the box being all of the frame.
 #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
 pub(crate) fn placement(content: (u32, u32), (fw, fh): (u32, u32), framing: Framing) -> ([u32; 4], [u32; 4]) {
-    placement_in(content, [0, 0, fw, fh], framing)
+    placement_in(content, [0, 0, fw, fh], framing, true)
 }
 
 /// Where a picture of `content`'s size goes in the box `bx` (each as left,
@@ -400,9 +452,10 @@ pub(crate) fn placement(content: (u32, u32), (fw, fh): (u32, u32), framing: Fram
 /// around it in the box (what a recording without a shape does with a
 /// window that isn't the screen's shape); Fill cuts off what's past the
 /// box's shape; Stretch draws all of it over all of the box. Where it's
-/// drawn is even, for the encoder's 4:2:0 colour.
+/// drawn is even, for the encoder's 4:2:0 colour (`even`); else (on a
+/// full-colour canvas) a picture as big as its box is drawn as it is.
 #[cfg_attr(not(any(target_os = "windows", target_os = "linux", target_os = "macos")), allow(dead_code))]
-pub(crate) fn placement_in((cw, ch): (u32, u32), [bx, by, bw, bh]: [u32; 4], framing: Framing) -> ([u32; 4], [u32; 4]) {
+pub(crate) fn placement_in((cw, ch): (u32, u32), [bx, by, bw, bh]: [u32; 4], framing: Framing, even: bool) -> ([u32; 4], [u32; 4]) {
     let (all, whole) = ([0, 0, cw, ch], [bx, by, bw, bh]);
     if cw == 0 || ch == 0 || bw == 0 || bh == 0 {
         return (all, whole);
@@ -412,9 +465,12 @@ pub(crate) fn placement_in((cw, ch): (u32, u32), [bx, by, bw, bh]: [u32; 4], fra
     match framing {
         Framing::Stretch => (all, whole),
         Framing::Fit => {
-            let (w, h) = if wider { (bw, (ch as u64 * bw as u64 / cw as u64) as u32) } else { ((cw as u64 * bh as u64 / ch as u64) as u32, bh) };
-            let (w, h) = (w & !1, h & !1);
-            (all, [bx + (((bw - w) / 2) & !1), by + (((bh - h) / 2) & !1), w, h])
+            // Even: rounded down, as the encoder wants it; else to the nearest.
+            let div = |a: u64, b: u64| (if even { a / b } else { (a + b / 2) / b }) as u32;
+            let (w, h) = if wider { (bw, div(ch as u64 * bw as u64, cw as u64).min(bh)) } else { (div(cw as u64 * bh as u64, ch as u64).min(bw), bh) };
+            let e = |v: u32| if even { v & !1 } else { v };
+            let (w, h) = (e(w), e(h));
+            (all, [bx + e((bw - w) / 2), by + e((bh - h) / 2), w, h])
         }
         Framing::Fill => {
             let (w, h) = if wider { ((ch as u64 * bw as u64 / bh as u64) as u32, ch) } else { (cw, (cw as u64 * bh as u64 / bw as u64) as u32) };
@@ -642,6 +698,31 @@ pub fn screen_capture_auto_duplicates() -> bool {
     }
 }
 
+/// Until when playback's decoder was last behind, in ms on [`clock_ms`]:
+/// background decoding (the filmstrip, exports) keeps off the decoder
+/// playback uses meanwhile. A card has one (NVIDIA's RTX 4060 Ti decodes
+/// ~600 1440p frames a second), and a 1440p 540 fps clip needs nearly all
+/// of it: the filmstrip decoding there too held playback to 400 frames a
+/// second.
+static PLAYBACK_BEHIND_UNTIL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Milliseconds since the first time this was asked.
+fn clock_ms() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
+
+/// Playback's decoder can't keep ahead of the clock: background decoding
+/// keeps off its decoder for the next moment (said again while it lasts).
+pub fn playback_behind() {
+    PLAYBACK_BEHIND_UNTIL_MS.fetch_max(clock_ms() + 500, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether playback's decoder is behind, or was a moment ago.
+pub fn playback_short() -> bool {
+    clock_ms() < PLAYBACK_BEHIND_UNTIL_MS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// How much memory this computer has, in bytes.
 pub fn total_memory() -> Option<u64> {
     #[cfg(target_os = "windows")]
@@ -856,6 +937,47 @@ pub fn choose_screen_again() {
     linux::choose_screen_again();
 }
 
+/// Where a display (by its id, as [`list_screens`] gives it) is on the
+/// desktop: its left, top, width and height, in the units windows are
+/// placed in: pixels on Windows and X11, points on macOS (where windows are
+/// placed in points, a display of any scale). Elsewhere not known (`None`:
+/// see [`display_monitor`]).
+pub fn display_bounds(id: &str) -> Option<[i32; 4]> {
+    #[cfg(target_os = "windows")]
+    {
+        win::display_bounds(id)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        mac::display_bounds(id)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux::display_bounds(id)
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        let _ = id;
+        None
+    }
+}
+
+/// A display's place among the window system's outputs (winit's
+/// `available_monitors()` order), where a window can only be put on one by
+/// that, fullscreen: Wayland, which places windows itself. `None` elsewhere
+/// (see [`display_bounds`]).
+pub fn display_monitor(id: &str) -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::display_monitor(id)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = id;
+        None
+    }
+}
+
 /// Screens the backend can capture; their ids go in [`VideoSource::Screen`].
 pub fn list_screens() -> Vec<Device> {
     #[cfg(target_os = "macos")]
@@ -933,14 +1055,64 @@ pub fn request_screen_permission() {
     }
 }
 
-/// How the recorder is running.
+/// What a capture does with what it captures. Any of them can run at once,
+/// from the same pictures and sound ([`Running`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
-    /// Continuously buffer the last N seconds; `save_clip` flushes it to a file.
+    /// Clipping: keep the last N seconds; `save_clip` saves them as a clip.
     ReplayBuffer,
     /// Record straight to disk until stopped.
     Record,
+    /// Send it live to the stream's destinations ([`EncodeSettings::stream`]).
+    Stream,
 }
+
+/// Which of the [`Mode`]s a capture is doing now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Running {
+    pub replay: bool,
+    pub record: bool,
+    pub stream: bool,
+}
+
+impl Running {
+    /// Something runs.
+    pub fn any(self) -> bool {
+        self.replay || self.record || self.stream
+    }
+
+    pub fn has(self, mode: Mode) -> bool {
+        match mode {
+            Mode::ReplayBuffer => self.replay,
+            Mode::Record => self.record,
+            Mode::Stream => self.stream,
+        }
+    }
+
+    /// The same, `mode` on or off.
+    pub fn with(mut self, mode: Mode, on: bool) -> Self {
+        match mode {
+            Mode::ReplayBuffer => self.replay = on,
+            Mode::Record => self.record = on,
+            Mode::Stream => self.stream = on,
+        }
+        self
+    }
+}
+
+/// Whether going live is here ([`Mode::Stream`]): the stream has an encoder
+/// of its own on Windows (Media Foundation's), macOS (VideoToolbox) and
+/// Linux (ffmpeg's: NVENC, VA-API or x264).
+pub const STREAMING: bool = cfg!(any(target_os = "windows", target_os = "macos", target_os = "linux"));
+
+/// Whether frame blending can be changed while capturing
+/// ([`Recorder::set_blend`]): taken up at the capture's next frame.
+pub const BLEND_WHILE_CAPTURING: bool = cfg!(any(target_os = "windows", target_os = "macos", target_os = "linux"));
+
+/// Whether audio sources can be added to and taken out of a running capture
+/// ([`Recorder::set_sources`]): on Windows, macOS and Linux. Where it
+/// can't be, they're set when the capture starts.
+pub const SOURCES_WHILE_CAPTURING: bool = cfg!(any(target_os = "windows", target_os = "macos", target_os = "linux"));
 
 /// A capture device (screen, app, or audio device) as seen by the backend.
 #[derive(Debug, Clone)]
@@ -958,14 +1130,49 @@ pub struct Devices {
     pub apps: Vec<Device>,
 }
 
-/// How the running capture keeps up, second by second: kept this many
-/// seconds back (an hour: the longest a clip reaches).
-const HEALTH_SECONDS: usize = 3600;
+/// Write `line` to stderr (the log) from a thread that can't wait for it: it's
+/// handed to a thread of its own that writes it. The frame pacer has a few
+/// milliseconds between the game's pictures, and a line written straight to
+/// stderr waits for wherever it goes: measured, the pacer's stats (written
+/// every 5 s) took 11-20 ms to reach a file, held the pacer up 43 ms, and the
+/// pictures that came up meanwhile were too late for their frames (one
+/// repeated, the next skipped). A terminal holds a writer for as long as text
+/// in it is selected.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) fn log_later(line: String) {
+    static WRITER: std::sync::OnceLock<Option<std::sync::mpsc::Sender<String>>> = std::sync::OnceLock::new();
+    let writer = WRITER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        let spawned = std::thread::Builder::new().name("log".into()).spawn(move || {
+            for line in rx {
+                eprintln!("{line}");
+            }
+        });
+        spawned.ok().map(|_| tx)
+    });
+    match writer {
+        Some(tx) => {
+            let _ = tx.send(line);
+        }
+        // No thread for it: written here after all.
+        None => eprintln!("{line}"),
+    }
+}
+
+/// `eprintln!` through [`log_later`].
+#[cfg_attr(not(target_os = "windows"), allow(unused_macros))]
+macro_rules! eprintln_later {
+    ($($arg:tt)*) => {
+        $crate::log_later(format!($($arg)*))
+    };
+}
+#[cfg_attr(not(target_os = "windows"), allow(unused_imports))]
+pub(crate) use eprintln_later;
 
 /// One second of the running capture: frames handed to the video encoder
-/// and frames skipped, and (frame blending) the screen's pictures blended and
+/// and frames skipped, and (frame blending) the screen's new pictures and
 /// those that missed their frame.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 struct Second {
     encoded: u32,
     skipped: u32,
@@ -973,38 +1180,39 @@ struct Second {
     missed: u32,
 }
 
-/// The running capture's seconds, from its start.
+impl Second {
+    const NONE: Self = Self { encoded: 0, skipped: 0, pictures: 0, missed: 0 };
+}
+
+/// The running capture's second under way and the whole one before it, as
+/// a frame rate counter would count them: from the capture's start, or its
+/// pacer's once that says so ([`blending`]).
 struct History {
     started: Option<std::time::Instant>,
-    /// Frame blending: looks at the screen a second, and per frame (none: it
-    /// doesn't blend).
-    rate: u32,
+    /// Frames a second, and looks at the screen each blends (one: it doesn't
+    /// blend; none before the pacer begins).
+    fps: u32,
     looks: u32,
-    /// Second `first` (counted from the start) onward, the newest last.
-    first: u64,
-    seconds: std::collections::VecDeque<Second>,
+    /// The second under way (counted from the start) and its counts.
+    at: u64,
+    now: Second,
+    /// The whole second before it (none until one has gone by).
+    last: Option<Second>,
 }
 
 impl History {
-    const NONE: Self = Self { started: None, rate: 0, looks: 0, first: 0, seconds: std::collections::VecDeque::new() };
+    const NONE: Self = Self { started: None, fps: 0, looks: 0, at: 0, now: Second::NONE, last: None };
 
-    /// The second under way (those that went by with nothing counted are
-    /// added, empty); none between captures.
+    /// The second under way: once another begins, the one before is whole
+    /// (a quiet one when seconds went by with nothing counted). None between
+    /// captures.
     fn now(&mut self) -> Option<&mut Second> {
         let at = self.started?.elapsed().as_secs();
-        let end = self.first + self.seconds.len() as u64;
-        if at >= end + HEALTH_SECONDS as u64 {
-            self.seconds.clear();
-            self.first = at;
+        if at > self.at {
+            self.last = Some(if at == self.at + 1 { self.now } else { Second::NONE });
+            (self.at, self.now) = (at, Second::NONE);
         }
-        while self.first + (self.seconds.len() as u64) <= at {
-            self.seconds.push_back(Second::default());
-            if self.seconds.len() > HEALTH_SECONDS {
-                self.seconds.pop_front();
-                self.first += 1;
-            }
-        }
-        self.seconds.back_mut()
+        Some(&mut self.now)
     }
 }
 
@@ -1023,11 +1231,12 @@ pub(crate) fn capture_started() {
     *HISTORY.lock().unwrap() = History { started: Some(std::time::Instant::now()), ..History::NONE };
 }
 
-/// The capture blends `looks` looks at the screen into each frame, `fps` frames a second.
+/// The capture's pacer begins: `fps` frames a second, each blending `looks`
+/// looks at the screen (one doesn't blend: Windows times its frames so
+/// without blending). Its seconds are counted from here, so the first whole
+/// one is all the pacer's.
 pub(crate) fn blending(fps: u32, looks: u32) {
-    let mut h = HISTORY.lock().unwrap();
-    h.rate = fps.saturating_mul(looks);
-    h.looks = looks;
+    *HISTORY.lock().unwrap() = History { started: Some(std::time::Instant::now()), fps, looks, ..History::NONE };
 }
 
 /// A frame handed to the video encoder.
@@ -1070,39 +1279,60 @@ pub struct LastSecond {
     /// before a skipped frame longer.
     pub encoded: u32,
     pub skipped: u32,
-    /// Frame blending's pictures that missed their frame (came too late for
-    /// it, or were let go of waiting): those frames reused the picture before.
-    pub missed: u32,
 }
 
-/// How frame blending kept up ([`CaptureHealth::blend`]).
+/// How frame blending keeps up ([`CaptureHealth::blend`]).
 #[derive(Debug, Clone, Copy)]
 pub struct BlendHealth {
     /// Looks at the screen a second, and per frame.
     pub rate: u32,
     pub looks: u32,
-    /// The screen's new pictures in the busiest whole second of the span
-    /// (none until one has gone by): the screen only sends one when
-    /// something changes.
-    pub busiest: Option<u32>,
+    /// Its last whole second (none until one has gone by).
+    pub last_second: Option<BlendSecond>,
 }
 
-/// How the running capture keeps up: its last whole second, and frame
-/// blending's busiest whole second in its last `span`, counted each second
-/// from its start. None before a capture starts.
-pub fn health(span: std::time::Duration) -> Option<CaptureHealth> {
-    HISTORY.lock().unwrap().summary(span)
+/// One whole second of frame blending ([`BlendHealth::last_second`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BlendSecond {
+    /// Looks blended into the frames that went to the video: every look,
+    /// whether or not the screen had changed for it, but a skipped frame's.
+    pub blended: u32,
+    /// The screen's new pictures: it only shows one when something on it
+    /// changes (as often as the game draws, or the display refreshes), and
+    /// each look takes the newest one up.
+    pub pictures: u32,
+    /// Pictures that missed their frame (came too late for it, or were let go
+    /// of waiting): those frames reused the picture before.
+    pub missed: u32,
+}
+
+/// How the running capture keeps up: its last whole second, counted each
+/// second from its start, as a frame rate counter would. None before a
+/// capture starts.
+pub fn health() -> Option<CaptureHealth> {
+    HISTORY.lock().unwrap().summary()
 }
 
 impl History {
     /// [`health`] of this history.
-    fn summary(&mut self, span: std::time::Duration) -> Option<CaptureHealth> {
+    fn summary(&mut self) -> Option<CaptureHealth> {
         self.now()?;
-        // The second under way is the last: those before it are whole.
-        let whole = || self.seconds.iter().rev().skip(1);
-        let last_second = whole().next().map(|s| LastSecond { encoded: s.encoded, skipped: s.skipped, missed: s.missed });
-        let busiest = whole().take(span.as_secs().max(1) as usize).map(|s| s.pictures).max();
-        let blend = (self.rate > 0).then_some(BlendHealth { rate: self.rate, looks: self.looks, busiest });
+        let last_second = self.last.map(|s| LastSecond { encoded: s.encoded, skipped: s.skipped });
+        let (fps, looks) = (self.fps, self.looks);
+        let blend = (looks > 1).then(|| BlendHealth {
+            rate: fps.saturating_mul(looks),
+            looks,
+            last_second: self.last.map(|s| BlendSecond {
+                // Every frame made blends all its looks; a skipped one's go
+                // with it. Told by the frames skipped, not those made: the
+                // pacer makes exactly `fps` a second on its own clock, but a
+                // second here can catch one more or one fewer of them as
+                // they're finished. None made or skipped: it was held up.
+                blended: if s.encoded + s.skipped == 0 { 0 } else { fps.saturating_sub(s.skipped).saturating_mul(looks) },
+                pictures: s.pictures,
+                missed: s.missed,
+            }),
+        });
         Some(CaptureHealth { last_second, blend })
     }
 }
@@ -1112,55 +1342,66 @@ mod health_tests {
     use super::*;
     use std::time::{Duration, Instant};
 
-    /// A capture that started `secs` seconds ago.
-    fn started(secs: u64) -> History {
-        History { started: Some(Instant::now() - Duration::from_secs(secs)), ..History::NONE }
+    /// A capture whose pacer began `ms` milliseconds ago, blending 9 looks
+    /// into each of 60 frames a second.
+    fn began(ms: u64) -> History {
+        History { started: Some(Instant::now() - Duration::from_millis(ms)), fps: 60, looks: 9, ..History::NONE }
     }
 
-    /// Counts go to the second they happened in: the last whole second is
-    /// as it was, and the busiest second a whole one of the span.
+    /// Counts go to the second they happened in: the last whole second's are
+    /// as they were, not the one under way's.
     #[test]
     fn the_last_whole_second() {
-        let mut h = started(0);
-        assert!(h.summary(Duration::from_secs(60)).is_some_and(|s| s.blend.is_none() && s.last_second.is_none()), "not blending, no whole second yet");
-        h.rate = 540;
-        h.looks = 9;
-        // Three seconds in: 500 pictures in second 0, 530 in second 1, 40 so far in second 2.
-        h.started = Some(Instant::now() - Duration::from_millis(2500));
-        h.seconds = [500u32, 530, 40].iter().map(|&p| Second { encoded: 60, skipped: 0, pictures: p, missed: 0 }).collect();
-        h.seconds[0].skipped = 7;
-        h.seconds[1].skipped = 3;
-        h.seconds[2].missed = 2;
-        let s = h.summary(Duration::from_secs(60)).unwrap();
-        assert_eq!(s.last_second, Some(LastSecond { encoded: 60, skipped: 3, missed: 0 }), "the second under way isn't whole yet");
-        let b = s.blend.unwrap();
-        assert_eq!((b.rate, b.looks, b.busiest), (540, 9, Some(530)), "the second under way isn't the busiest");
-        // A one-second span: the busiest is the last whole second's.
-        h.seconds[0].pictures = 539;
-        assert_eq!(h.summary(Duration::from_secs(1)).unwrap().blend.unwrap().busiest, Some(530));
+        let mut h = began(0);
+        let s = h.summary().unwrap();
+        assert_eq!((s.last_second, s.blend.map(|b| (b.rate, b.looks, b.last_second))), (None, Some((540, 9, None))), "no whole second yet");
+        // Second 0: 57 frames made and 3 skipped, 500 new pictures, 2 of them too late.
+        *h.now().unwrap() = Second { encoded: 57, skipped: 3, pictures: 500, missed: 2 };
+        // Half a second into second 1: 40 pictures so far.
+        h.started = Some(Instant::now() - Duration::from_millis(1500));
+        h.now().unwrap().pictures = 40;
+        let s = h.summary().unwrap();
+        assert_eq!(s.last_second, Some(LastSecond { encoded: 57, skipped: 3 }));
+        assert_eq!(s.blend.unwrap().last_second, Some(BlendSecond { blended: 57 * 9, pictures: 500, missed: 2 }), "a skipped frame's looks aren't blended");
     }
 
-    /// Seconds with nothing counted still go by: a span reaches only as far
-    /// back as it says, and the last whole second is a quiet one.
+    /// Every look of a frame made is blended, whether or not the screen
+    /// showed a new picture for it: a still screen is blended at the full
+    /// rate. A second that skips more frames than it has (catching up)
+    /// blended none.
+    #[test]
+    fn every_look_counts() {
+        let mut h = began(1500);
+        (h.at, h.last) = (1, Some(Second { encoded: 60, ..Second::NONE }));
+        assert_eq!(h.summary().unwrap().blend.unwrap().last_second, Some(BlendSecond { blended: 540, pictures: 0, missed: 0 }));
+        // Catching up after falling behind: more than a second's frames skipped at once.
+        h.last = Some(Second { skipped: 75, ..Second::NONE });
+        assert_eq!(h.summary().unwrap().blend.unwrap().last_second.map(|b| b.blended), Some(0));
+    }
+
+    /// Seconds with nothing counted still go by: the last whole second is a
+    /// quiet one, not the last one anything was counted in.
     #[test]
     fn quiet_seconds_go_by() {
-        let mut h = started(0);
-        h.rate = 540;
-        h.looks = 9;
-        h.now().unwrap().missed = 5;
-        h.now().unwrap().pictures = 500;
-        assert_eq!(h.summary(Duration::from_secs(60)).unwrap().blend.unwrap().busiest, None, "no whole second yet");
-        // Ten seconds later, nothing more counted.
+        let mut h = began(0);
+        *h.now().unwrap() = Second { encoded: 60, skipped: 0, pictures: 500, missed: 5 };
+        // Ten seconds later, nothing more counted: the pacer was held up.
         h.started = Some(Instant::now() - Duration::from_secs(10));
-        let s = h.summary(Duration::from_secs(5)).unwrap();
-        assert_eq!((s.last_second, s.blend.unwrap().busiest), (Some(LastSecond::default()), Some(0)));
-        assert_eq!(h.summary(Duration::from_secs(60)).unwrap().blend.unwrap().busiest, Some(500));
-        // Over an hour later: only the last hour is kept (and nothing of it
-        // was counted: no whole second known yet).
-        h.started = Some(Instant::now() - Duration::from_secs(5000));
-        let s = h.summary(Duration::from_secs(4000)).unwrap();
-        assert!(h.seconds.len() <= HEALTH_SECONDS + 1);
-        assert_eq!((s.last_second, s.blend.unwrap().busiest), (None, None));
+        let s = h.summary().unwrap();
+        assert_eq!(s.last_second, Some(LastSecond::default()));
+        assert_eq!(s.blend.unwrap().last_second, Some(BlendSecond::default()), "nothing made, nothing blended");
+    }
+
+    /// One look a frame isn't blending (Windows times its frames so without
+    /// it), and a capture whose pacer hasn't begun isn't blending yet.
+    #[test]
+    fn not_blending() {
+        let mut h = History { looks: 1, ..began(0) };
+        assert!(h.summary().is_some_and(|s| s.blend.is_none()));
+        let mut h = History { started: Some(Instant::now()), ..History::NONE };
+        assert!(h.summary().is_some_and(|s| s.blend.is_none()));
+        let mut none = History::NONE;
+        assert!(none.summary().is_none(), "no capture");
     }
 }
 
@@ -1205,14 +1446,20 @@ pub struct EncodeSettings {
     /// Shown while recording games and apps and there's nothing to show (none
     /// is open, or you've tabbed out); black if `None`. Scaled to the frame.
     pub away_screen: Option<std::sync::Arc<StillImage>>,
-    /// A webcam drawn over the picture (or under it, as `screen` says).
+    /// A webcam drawn over the picture (or under it, as `screen` says), on
+    /// the platforms that draw one (see [`layers::MANY`]).
     pub webcam: Option<webcam::Webcam>,
+    /// Every picture in the frame, bottom first, read every frame, on the
+    /// platforms that draw them all (see [`layers::MANY`]).
+    pub layers: SharedLayers,
     /// Where the screen's picture goes in the frame, read every frame.
     pub screen: SharedScreen,
     /// Audio sources, in track order. Track 1 is the mix of every source with
     /// `in_mix` (so the file sounds right in any player); each source with
     /// `own_track` follows on its own track, for rebalancing later.
     pub sources: Vec<sources::AudioSource>,
+    /// Where to stream, and how: for [`Mode::Stream`].
+    pub stream: Option<stream::StreamSettings>,
 }
 
 /// A replay clip being saved: what it shows is settled, the file is still
@@ -1232,8 +1479,8 @@ impl PendingClip {
     }
 }
 
-/// Whether [`Recorder::screenshot`] can take one here (Windows and Linux, so far).
-pub const SCREENSHOTS: bool = cfg!(any(target_os = "windows", target_os = "linux"));
+/// Whether [`Recorder::screenshot`] can take one here.
+pub const SCREENSHOTS: bool = cfg!(any(target_os = "windows", target_os = "linux", target_os = "macos"));
 
 /// A screenshot being taken: its picture is the one up when it was asked
 /// for, copied aside on the graphics card; [`PendingShot::finish`] reads it
@@ -1241,7 +1488,7 @@ pub const SCREENSHOTS: bool = cfg!(any(target_os = "windows", target_os = "linux
 pub struct PendingShot(Box<dyn FnOnce() -> anyhow::Result<StillImage> + Send>);
 
 impl PendingShot {
-    #[cfg_attr(not(any(target_os = "windows", target_os = "linux")), allow(dead_code))]
+    #[cfg_attr(not(any(target_os = "windows", target_os = "linux", target_os = "macos")), allow(dead_code))]
     pub(crate) fn new(finish: impl FnOnce() -> anyhow::Result<StillImage> + Send + 'static) -> Self {
         Self(Box::new(finish))
     }
@@ -1255,22 +1502,44 @@ impl PendingShot {
 /// A capture backend. Implemented by `SckRecorder` (macOS), `WinRecorder`
 /// (Windows) and `LinuxRecorder` (Linux).
 pub trait Recorder {
-    /// Begin capturing in the given mode with the given settings.
+    /// Begin `mode`. When nothing runs, the capture starts with `settings`;
+    /// while it runs, `mode` joins it, from the same pictures and sound, and
+    /// what it was started with stays (only what's the mode's own is taken
+    /// from `settings`: the clip length, the stream).
     fn start(&mut self, mode: Mode, settings: &EncodeSettings) -> anyhow::Result<()>;
 
-    /// In `ReplayBuffer` mode, save the buffered window as a clip in `dir` (a
+    /// While clipping, save the buffered window as a clip in `dir` (a
     /// game's folder in the library, say). Its moment is taken right away; the
     /// returned [`PendingClip`] finishes writing it, which can take a while — so
     /// another can be saved meanwhile.
     fn save_clip(&mut self, dir: &Path) -> anyhow::Result<PendingClip>;
 
-    /// Stop capturing. In `Record` mode, returns the finished file, moved into
-    /// `dir` if given (it's written in the output folder: which game it was is
-    /// only known at the end).
-    fn stop(&mut self, dir: Option<&Path>) -> anyhow::Result<Option<PathBuf>>;
+    /// Stop `mode`; the capture stops with the last one. Stopping `Record`
+    /// returns the finished file, moved into `dir` if given (it's written in
+    /// the output folder: which game it was is only known at the end).
+    fn stop(&mut self, mode: Mode, dir: Option<&Path>) -> anyhow::Result<Option<PathBuf>>;
+
+    /// Stop everything (quitting): a recording is finished where it's written.
+    fn stop_all(&mut self) {
+        for mode in [Mode::Stream, Mode::ReplayBuffer, Mode::Record] {
+            let _ = self.stop(mode, None);
+        }
+    }
+
+    /// What the capture is doing now.
+    fn running(&self) -> Running;
 
     /// Whether a capture is currently running.
-    fn is_running(&self) -> bool;
+    fn is_running(&self) -> bool {
+        self.running().any()
+    }
+
+    /// Change frame blending while capturing: `looks` at the screen a frame
+    /// (one: none), weighed by `shape`. Whether it was applied (see
+    /// [`BLEND_WHILE_CAPTURING`]); otherwise it's taken at the next start.
+    fn set_blend(&mut self, _looks: u32, _shape: BlendShape) -> bool {
+        false
+    }
 
     /// Change what the running capture records, without restarting it, if the
     /// change allows (a different list of games and apps). Returns whether it
@@ -1286,6 +1555,18 @@ pub trait Recorder {
     /// Switch the running capture's microphone source `id` to `device`
     /// (its track stays). Returns whether it was applied.
     fn set_mic(&mut self, _id: &str, _device: &str) -> bool {
+        false
+    }
+
+    /// Capture these audio sources from now on, without restarting (see
+    /// [`SOURCES_WHILE_CAPTURING`]). The file's tracks stay as they started:
+    /// a source added goes into the mix at once, and into the rest track if
+    /// there's one, having no track of its own (but the one it had at the
+    /// start, if it's added back). One taken out goes silent in its tracks.
+    /// A microphone given another device switches to it (as
+    /// [`Self::set_mic`]). Anything else about a source waits for the next
+    /// start. Returns whether it was applied.
+    fn set_sources(&mut self, _sources: &[sources::AudioSource]) -> bool {
         false
     }
 
@@ -1367,6 +1648,26 @@ mod size_tests {
         assert_eq!(placement((3440, 1440), (1920, 1080), Framing::Stretch), ([0, 0, 3440, 1440], [0, 0, 1920, 1080]));
         // Nothing to place yet.
         assert_eq!(placement((0, 0), (1920, 1080), Framing::Fit), ([0, 0, 0, 0], [0, 0, 1920, 1080]));
+    }
+
+    /// On a full-colour canvas, a picture as big as its box is drawn as it
+    /// is, on whatever pixel its box starts on, and moving its box a pixel
+    /// moves it a pixel, its size the same (words nudged across the video).
+    #[test]
+    fn a_picture_moves_a_pixel_at_a_time() {
+        let frame = (1920, 1080);
+        let (fw, fh) = (1920.0f32, 1080.0f32);
+        let at = |x: u32| ScreenPlacement { rect: [x as f32 / fw, 301.0 / fh, 401.0 / fw, 59.0 / fh], ..ScreenPlacement::whole(Framing::Fit) };
+        for x in 100..140 {
+            assert_eq!(at(x).place_on((401, 59), frame, false), ([0, 0, 401, 59], [x, 301, 401, 59]), "at {x}");
+        }
+        // Past the frame's left edge: cut there, the same size as it moves.
+        let past = |x: f32| ScreenPlacement { rect: [x / fw, 0.1, 401.0 / fw, 59.0 / fh], ..ScreenPlacement::whole(Framing::Fit) };
+        assert_eq!(past(-100.0).place_on((401, 59), frame, false).1, [0, 108, 301, 59]);
+        assert_eq!(past(-99.0).place_on((401, 59), frame, false).1, [0, 108, 302, 59]);
+        // Straight into 4:2:0 colour: even pixels, its size kept as it moves.
+        let sizes: Vec<(u32, u32)> = (100..140).map(|x| at(x).place_on((401, 59), frame, true).1).map(|[_, _, w, h]| (w, h)).collect();
+        assert!(sizes.iter().all(|s| *s == sizes[0]) && sizes[0].0 % 2 == 0 && sizes[0].1 % 2 == 0, "{sizes:?}");
     }
 
     /// The screen in a box of its own: the box in pixels, even, inside the

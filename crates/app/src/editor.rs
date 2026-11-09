@@ -9,7 +9,7 @@
 //! renders the edited file in the background; the original is never touched.
 
 use crate::ui_kit::Dismissed as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
 
@@ -25,7 +25,10 @@ use crate::viewer::Resume;
 /// Timeline geometry, in points.
 const RULER_H: f32 = crate::transport::RULER_H;
 const VIDEO_H: f32 = 56.0;
+/// A sound lane, and the tallest one grows when the divider gives the
+/// timeline more room than its lanes need.
 const AUDIO_H: f32 = 52.0;
+const AUDIO_MAX_H: f32 = AUDIO_H * 3.0;
 /// The line under the lanes that says how long the kept part is.
 const LENGTH_H: f32 = 28.0;
 const DIVIDER_H: f32 = 9.0;
@@ -113,6 +116,12 @@ struct Ready {
     /// picture and timeline (whatever the guess of the other parts' height
     /// missed).
     lanes_short: f32,
+    /// How tall the sound lanes are: [`AUDIO_H`], or taller (up to
+    /// [`AUDIO_MAX_H`]) with the divider dragged up past what they need.
+    lane_h: f32,
+    /// The split leaves the sound lanes short of room on purpose (they
+    /// scroll): how short they come isn't a miss for `lanes_short` to make up.
+    lanes_cut: bool,
     /// The kept length being typed (click the length under the timeline).
     typing_length: Option<String>,
     /// The mix's meter on the right of the timeline (as on Sources).
@@ -139,12 +148,17 @@ struct Ready {
     /// The whole clip until you zoom in.
     view: (f64, f64),
     confirm_discard: bool,
-    /// The "Free up space" dialog: the original's size in bytes.
-    free_up: Option<u64>,
+    /// The recording the edit is of (the original, once it's been edited),
+    /// in bytes: what Save ▾'s ways to free up space free.
+    original_bytes: u64,
+    /// "Save and delete the original?" is asked.
+    confirm_delete_original: bool,
     /// "Save as new clip" dialog: the name being typed, and any problem with it.
     save_as: Option<(String, Option<String>)>,
     /// F2 was pressed.
     rename_requested: bool,
+    /// Esc was pressed: back, as the back button.
+    back_requested: bool,
     /// The export settings were opened by the dev hook.
     export_shown: bool,
     /// The export settings popup is open.
@@ -175,6 +189,10 @@ struct Ready {
     confirm_revert: bool,
     /// The Save as new name was selected for typing over.
     save_as_focused: bool,
+    /// The edit last saved as a new clip (the editor stays open after).
+    saved_new: Option<Edit>,
+    /// The clips saved as new from here, which may not be there yet.
+    new_clips: Vec<PathBuf>,
     /// The clip's kills and your markers, as pins (the editor shows the
     /// whole recording, which they're kept for).
     moments: Vec<crate::transport::Moment>,
@@ -246,8 +264,9 @@ impl Meter {
 pub struct Editor {
     target: EditTarget,
     state: State,
-    /// How much of the height the preview gets; the timeline has the rest.
-    preview_share: f32,
+    /// How much of the height the preview gets, as dragged (the timeline has
+    /// the rest); none: fitted (see [`Ready::ui`]).
+    preview_share: Option<f32>,
     /// Snapping, as the app keeps it (settings), until the clip has loaded.
     snap: bool,
     /// Where the player was when the editor was opened from it (the clip
@@ -262,7 +281,7 @@ impl Editor {
     /// Edit the clip at `clip`. An edited clip is decoded from its original, so
     /// every earlier decision can still be changed. Opened from the player:
     /// `from` where it was, with what it handed over.
-    pub fn open(ctx: &egui::Context, clip: &Path, preview_share: f32, snap: bool, from: Option<Resume>, mut handoff: Handoff) -> Self {
+    pub fn open(ctx: &egui::Context, clip: &Path, preview_share: Option<f32>, snap: bool, from: Option<Resume>, mut handoff: Handoff) -> Self {
         let target = EditTarget::of(clip);
         let state = if handoff.kept.info(&target.source).is_some() {
             match load(&target.source, &mut handoff.kept) {
@@ -330,8 +349,19 @@ impl Editor {
         &self.target.clip
     }
 
-    /// The preview's share of the height, as last dragged (to remember it).
-    pub fn preview_share(&self) -> f32 {
+    /// What the window is doing, for what the player keeps open (see
+    /// [`crate::player::Window`]); the edit stays as it is. Not in use, the
+    /// last screen's player standing in until this one has a picture goes,
+    /// with all it has open. Whether anything was let go of just now.
+    pub fn set_window(&mut self, ctx: &egui::Context, window: crate::player::Window) -> bool {
+        let State::Ready(r) = &mut self.state else { return false };
+        let curtain = window != crate::player::Window::InUse && r.curtain.take().is_some();
+        r.player.set_window(ctx, window) || curtain
+    }
+
+    /// The preview's share of the height, as last dragged (to remember it);
+    /// none: fitted.
+    pub fn preview_share(&self) -> Option<f32> {
         self.preview_share
     }
 
@@ -353,7 +383,9 @@ impl Editor {
         })
     }
 
-    pub fn ui(&mut self, ui: &mut egui::Ui) -> EditorOutcome {
+    /// `delete_permanently`: deleting skips the Bin (Settings), for Free up
+    /// space to say.
+    pub fn ui(&mut self, ui: &mut egui::Ui, delete_permanently: bool) -> EditorOutcome {
         if let State::Loading(rx) = &self.state {
             if let Ok((result, kept)) = rx.try_recv() {
                 self.handoff.kept = kept;
@@ -394,7 +426,7 @@ impl Editor {
                 });
                 out
             }
-            State::Ready(r) => r.ui(ui, &self.target, &mut self.preview_share),
+            State::Ready(r) => r.ui(ui, &self.target, &mut self.preview_share, delete_permanently),
         }
     }
 }
@@ -437,6 +469,8 @@ impl Ready {
             mix_meter: Default::default(),
             typing_length: None,
             lanes_short: 0.0,
+            lane_h: AUDIO_H,
+            lanes_cut: false,
             dragging: None,
             resume: false,
             grab_offset: 0.0,
@@ -448,9 +482,11 @@ impl Ready {
             zoom_glide: Default::default(),
             view: (0.0, full),
             confirm_discard: false,
-            free_up: None,
+            original_bytes: std::fs::metadata(source).map(|m| m.len()).unwrap_or(0),
+            confirm_delete_original: false,
             save_as: None,
             rename_requested: false,
+            back_requested: false,
             export_shown: false,
             export_open: false,
             undo: Vec::new(),
@@ -467,6 +503,8 @@ impl Ready {
             was_playing: false,
             confirm_revert: false,
             save_as_focused: false,
+            saved_new: None,
+            new_clips: Vec::new(),
             moments: crate::moments::of(&target.clip).pins(full),
             crop_tool: None,
             menu_at: None,
@@ -474,7 +512,7 @@ impl Ready {
         }
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, target: &EditTarget, preview_share: &mut f32) -> EditorOutcome {
+    fn ui(&mut self, ui: &mut egui::Ui, target: &EditTarget, preview_share: &mut Option<f32>, delete_permanently: bool) -> EditorOutcome {
         // The clip as named in the library; decoding uses `target.source`.
         let source = target.clip.as_path();
         let ctx = ui.ctx().clone();
@@ -536,15 +574,21 @@ impl Ready {
         // --- Header: back and the name; export, ⋯, Cancel, Save ---
         let stem = source.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
         let title = crate::clips::title_for_stem(&stem);
-        let dirty = self.dirty();
+        // Unsaved: not this clip's edit, nor a clip just saved as new.
+        let dirty = self.unsaved();
         let changed = !self.edit.is_identity(&self.info);
         let has_saved_edit = target.source != target.clip;
         let mut cancel = false;
         let mut save = false;
         let mut save_new = false;
         let mut revert = false;
-        let mut free_up = false;
+        let mut save_and_free = None;
         let mut keys = false;
+        // Save ▾: save, then free up the space the original takes. With
+        // nothing to save (this edit is the clip's), just that.
+        let needs_save = self.dirty() || !has_saved_edit;
+        let original_bytes = self.original_bytes;
+        let trim_bytes = store::trim_frees(original_bytes, self.info.duration, &self.edit);
         let (back, rename) = crate::transport::header(ui, &title, dirty, 0.0, |ui, part| {
             use crate::ui_kit::{Btn, Item, Kind};
             use egui_phosphor::regular as icon;
@@ -554,25 +598,49 @@ impl Ready {
             // Narrower windows: the export button shows just its icon, and
             // Cancel goes (back and Esc cancel too).
             let narrow = ui.ctx().content_rect().width() < 820.0;
-            // Save, with Save as new in its menu.
-            let corners_l = egui::CornerRadius { nw: 6, sw: 6, ne: 0, se: 0 };
-            let corners_r = egui::CornerRadius { nw: 0, sw: 0, ne: 6, se: 6 };
+            // Save, joined to its ▾ (laid out right to left: the ▾ first).
+            // Freeing up the original's space is the last step of an edit,
+            // so it's there. The space after an item is the spacing when
+            // it's laid out: a hairline after the ▾, the usual after Save.
+            let r = crate::ui_kit::RADIUS;
             ui.spacing_mut().item_spacing.x = 1.0;
-            let more = Btn::icon(Kind::Primary, icon::CARET_DOWN).corners(corners_r).tip("More ways to save").show(ui);
-            crate::ui_kit::menu_popup(&more, false, 240.0, |ui| {
-                if Item::new("Save").icon(icon::CHECK).keys(Some(crate::shortcuts::command("S"))).show(ui).clicked() {
-                    save = true;
+            let more_save = Btn::icon(Kind::Primary, icon::CARET_DOWN)
+                .exact_width(24.0)
+                .corners(egui::CornerRadius { nw: 0, sw: 0, ne: r, se: r })
+                .enabled(changed)
+                .tip("Save and free up the space the original recording takes")
+                .show(ui);
+            crate::ui_kit::menu_popup(&more_save, false, 280.0, |ui| {
+                let (trim_label, delete_label) = if needs_save { ("Save and trim original", "Save and delete original…") } else { ("Trim original", "Delete original…") };
+                let trim_tip = if trim_bytes == 0 {
+                    "The original is already about as short as this edit".to_owned()
+                } else {
+                    "Keeps only the part this edit uses: you can still change the edit within it, or revert it".to_owned()
+                };
+                let trim = Item::new(trim_label).icon(icon::SCISSORS).value(format!("about {}", crate::export_ui::human_bytes(trim_bytes))).enabled(trim_bytes > 0).tip(trim_tip);
+                if trim.show(ui).clicked() {
+                    save_and_free = Some(store::FreeUp::Trim);
                 }
-                let item = Item::new("Save as new clip…").icon(icon::COPY).enabled(changed);
-                let item = if changed { item.tip("Keep this clip as it is and save the edit as a separate clip") } else { item.tip("Trim, change the sound or the export settings first") };
-                if item.show(ui).clicked() {
-                    save_new = true;
+                let delete = Item::new(delete_label).icon(icon::TRASH).value(crate::export_ui::human_bytes(original_bytes)).danger().tip("The clip stays as it is, but this edit can't be changed or reverted any more");
+                if delete.show(ui).clicked() {
+                    save_and_free = Some(store::FreeUp::Delete);
                 }
             });
-            if Btn::primary("Save").corners(corners_l).min_width(64.0).tip("Save the edit to this clip. The original recording is kept, so you can change it later.").show(ui).clicked() {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            let save_btn = Btn::primary("Save").min_width(64.0).corners(egui::CornerRadius { nw: r, sw: r, ne: 0, se: 0 });
+            if save_btn.tip("Save the edit to this clip. The original recording is kept, so you can change it later.").show(ui).clicked() {
                 save = true;
             }
-            ui.spacing_mut().item_spacing.x = 6.0;
+            // Save as new beside it: cutting several clips out of one
+            // recording is Save as new each time, so it's not in a menu.
+            let tip = if changed {
+                format!("Keep this clip as it is and save the edit as a separate clip  (Shift {} S). The editor stays open for the next one.", crate::shortcuts::cmd_name())
+            } else {
+                "Trim, change the sound or the export settings first".to_owned()
+            };
+            if Btn::normal("Save as new").enabled(changed).tip(tip).show(ui).clicked() {
+                save_new = true;
+            }
             ui.add_space(4.0);
             if !narrow && Btn::ghost("Cancel").show(ui).clicked() {
                 cancel = true;
@@ -583,9 +651,6 @@ impl Ready {
                 let item = Item::new("Revert to the original").icon(icon::ARROW_COUNTER_CLOCKWISE).enabled(has_saved_edit || changed).tip("Undo every edit and go back to the recording");
                 if item.show(ui).clicked() {
                     revert = true;
-                }
-                if Item::new("Free up space…").icon(icon::HARD_DRIVE).enabled(changed).tip("Trim or delete the original recording this edit keeps").show(ui).clicked() {
-                    free_up = true;
                 }
                 crate::ui_kit::menu_sep(ui);
                 if Item::new("Keyboard shortcuts").icon(icon::KEYBOARD).keys(Some(vec!["?".into()])).show(ui).clicked() {
@@ -640,52 +705,53 @@ impl Ready {
         if rename {
             outcome = EditorOutcome::Rename;
         }
-        if back || cancel {
+        if back || cancel || std::mem::take(&mut self.back_requested) {
             if dirty {
                 self.confirm_discard = true;
             } else {
                 outcome = EditorOutcome::Close;
             }
         }
-        if save || (ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::S)) && !crate::ui_kit::overlay_open(&ctx)) {
+        // Shift Cmd S first: Cmd S alone would take it too (egui's shortcuts
+        // don't mind an extra Shift).
+        let (key_save_new, key_save) = if crate::ui_kit::overlay_open(&ctx) {
+            (false, false)
+        } else {
+            ctx.input_mut(|i| (i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, Key::S), i.consume_key(egui::Modifiers::COMMAND, Key::S)))
+        };
+        if save || key_save {
             self.player.pause();
             outcome = self.save(target, None);
         }
-        if save_new {
+        if save_new || key_save_new && changed {
             self.player.pause();
-            let base = source.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-            let suggested = crate::clips::sanitize_name(&format!("{} (edit)", crate::clips::title_for_stem(&base)));
-            self.save_as = Some((suggested, None));
+            let ext = source.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or("mp4".into());
+            let dir = source.parent().unwrap_or(Path::new("."));
+            self.save_as = Some((suggest_new_name(&title, dir, &ext, &self.new_clips), None));
         }
         if revert {
             self.player.pause();
             self.confirm_revert = true;
         }
-        if free_up {
-            self.player.pause();
-            let original = if has_saved_edit { &target.source } else { &target.clip };
-            self.free_up = Some(std::fs::metadata(original).map(|m| m.len()).unwrap_or(0));
+        match save_and_free {
+            Some(how @ store::FreeUp::Trim) => {
+                self.player.pause();
+                outcome = self.save_and_free(target, how);
+            }
+            // Deleting it is asked first: the edit can't be changed after.
+            Some(store::FreeUp::Delete) => {
+                self.player.pause();
+                self.confirm_delete_original = true;
+            }
+            None => {}
         }
 
         // --- Picture: what's left over after the transport and timeline ---
-        // The divider under it sets the split; the timeline always keeps room
-        // for the ruler, the video lane and one sound lane (the rest scroll).
         let total = ui.available_height();
-        let below_min = DIVIDER_H + crate::transport::BAR_H + RULER_H + VIDEO_H + 4.0 + AUDIO_H + LENGTH_H + 10.0;
-        // Never more timeline than its lanes need: the picture gets the rest.
-        // (The same sum the timeline makes: its ruler, video lane, the gap
-        // above the sound lanes, each lane and the gap after it, the length.)
-        let below_max = DIVIDER_H + crate::transport::BAR_H + RULER_H + VIDEO_H + 4.0 + 4.0 + self.edit.tracks.len() as f32 * (AUDIO_H + 4.0) + LENGTH_H + 10.0 + self.lanes_short;
-        // The divider's share, except that every sound lane shows (no
-        // scrolling) whenever the picture can still have a third of the room.
-        let preview_h = (total * *preview_share).min((total - below_max).max(total / 3.0)).max(total - below_max).min(total - below_min).max(MIN_PREVIEW_H);
+        let split = split(total, self.edit.tracks.len(), self.lanes_short, *preview_share);
+        let preview_h = split.picture;
+        (self.lane_h, self.lanes_cut) = (split.lane, split.cut);
         let (preview_rect, preview_resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), preview_h), Sense::click());
-        // Dragging the playhead: held still, the picture stays, and letting
-        // go lands on it, within a dozen pixels of the timeline. (A trim's
-        // edge instead gets its frame: the edge is where it's put.)
-        let reach = (12.0 / self.px_per_s.max(1e-9)).min(0.5);
-        let free = matches!(self.dragging, Some(Drag::Playhead)) && !self.playhead_snapped;
-        self.player.set_landing(free.then_some(reach));
         let size = self.player.update(&ctx, self.dragging.is_some());
         if size.is_some() {
             self.curtain = None;
@@ -736,7 +802,7 @@ impl Ready {
                 self.toggle_play();
             }
         }
-        divider(ui, preview_h, total, preview_share);
+        divider(ui, preview_h, split.heights, total, preview_share);
 
         // --- Transport ---
         let bar = Rect::from_min_size(ui.cursor().min, Vec2::new(ui.available_width(), crate::transport::BAR_H));
@@ -774,7 +840,7 @@ impl Ready {
             let mut submit = false;
             let modal = crate::ui_kit::dialog(&ctx, "save_as_new", 400.0, |ui| {
                 crate::ui_kit::dialog_title(ui, "Save as new clip");
-                crate::ui_kit::dialog_text(ui, "This clip stays as it is. Your edit is saved as a separate clip:");
+                crate::ui_kit::dialog_text(ui, "This clip stays as it is. Your edit is saved as a separate clip, and the editor stays open for the next one:");
                 ui.add_space(4.0);
                 let out = crate::ui_kit::text_field(ui, name, "");
                 // Open with the name selected and ready to type over.
@@ -802,11 +868,13 @@ impl Ready {
             if submit {
                 let ext = source.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or("mp4".into());
                 let dir = source.parent().unwrap_or(Path::new("."));
-                match crate::clips::path_for_name(dir, name, &ext, None) {
-                    Ok(_) => {
+                // One saved as new a moment ago may not be there yet.
+                match crate::clips::path_for_name(dir, name, &ext, None).and_then(|p| if self.new_clips.contains(&p) { Err("A clip with that name is already being saved.".into()) } else { Ok(p) }) {
+                    Ok(path) => {
                         let name = name.trim().to_owned();
                         self.save_as = None;
                         self.save_as_focused = false;
+                        self.new_clips.push(path);
                         outcome = self.save(target, Some(name));
                     }
                     Err(e) => *err = Some(e),
@@ -817,75 +885,25 @@ impl Ready {
             }
         }
 
-        if let Some(bytes) = self.free_up {
-            let needs_save = self.dirty() || target.source == target.clip;
-            // Roughly what a trim keeps: the edit's share of the length.
-            let kept = ((self.edit.end + 1.0).min(self.info.duration) - self.edit.start) / self.info.duration.max(1e-6);
-            let trim_frees = (bytes as f64 * (1.0 - kept.clamp(0.0, 1.0))) as u64;
-            let mut choice = None;
-            let mut cancel = false;
-            let modal = crate::ui_kit::dialog(&ctx, "free_up", 440.0, |ui| {
-                let pal = crate::theme::pal(ui);
-                crate::ui_kit::dialog_title(ui, "Free up space");
-                crate::ui_kit::dialog_text(ui, &format!("The original recording ({}) is kept so you can change this edit later.", crate::export_ui::human_bytes(bytes)));
-                if needs_save {
-                    crate::ui_kit::hint(ui, "Your changes are saved first.");
-                }
-                ui.add_space(8.0);
-                let option = |ui: &mut egui::Ui, title: &str, text: &str, button: crate::ui_kit::ButtonWidget| {
-                    egui::Frame::new()
-                        .fill(pal.raise2)
-                        .corner_radius(8)
-                        .inner_margin(egui::Margin::symmetric(12, 10))
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.horizontal(|ui| {
-                                let w = ui.available_width() - 100.0;
-                                ui.vertical(|ui| {
-                                    ui.set_width(w);
-                                    ui.label(crate::theme::text(title, 13.5, crate::theme::W::Semibold).color(pal.text));
-                                    crate::ui_kit::hint(ui, text);
-                                });
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui.add(button).clicked()).inner
-                            })
-                            .inner
-                        })
-                        .inner
-                };
-                if option(
-                    ui,
-                    "Trim the original",
-                    &format!("Frees about {}. Keeps only the part this edit uses: you can still change the edit within it.", crate::export_ui::human_bytes(trim_frees)),
-                    crate::ui_kit::button("Trim", false),
-                ) {
-                    choice = Some(store::FreeUp::Trim);
-                }
-                ui.add_space(8.0);
-                if option(
-                    ui,
-                    "Delete the original",
-                    &format!("Frees {}. The edit can't be changed or reverted afterwards.", crate::export_ui::human_bytes(bytes)),
-                    crate::ui_kit::ButtonWidget(crate::ui_kit::Btn::new(crate::ui_kit::Kind::DangerText, "Delete")),
-                ) {
-                    choice = Some(store::FreeUp::Delete);
+        if self.confirm_delete_original {
+            let (mut yes, mut no) = (false, false);
+            let modal = crate::ui_kit::dialog(&ctx, "delete_original", 400.0, |ui| {
+                crate::ui_kit::dialog_title(ui, if needs_save { "Save and delete the original?" } else { "Delete the original?" });
+                let saved = if needs_save { "The clip is saved as it is now, and its" } else { "The clip stays as it is, but its" };
+                crate::ui_kit::dialog_text(ui, &format!("{saved} original recording ({}) is deleted. This edit can't be changed or reverted afterwards.", crate::export_ui::human_bytes(original_bytes)));
+                if !delete_permanently {
+                    crate::ui_kit::hint(ui, &format!("It goes to the {}: empty it to get the space back.", store::bin_name()));
                 }
                 crate::ui_kit::dialog_buttons(ui, |ui| {
-                    cancel = ui.add(crate::ui_kit::button("Cancel", false).ghost()).clicked();
+                    yes = ui.add(crate::ui_kit::danger_button(if needs_save { "Save and delete" } else { "Delete original" })).clicked();
+                    no = ui.add(crate::ui_kit::button("Cancel", false).ghost()).clicked();
                 });
             });
-            if modal.dismissed() || cancel {
-                self.free_up = None;
-            }
-            if let Some(how) = choice {
-                self.free_up = None;
-                outcome = if needs_save {
-                    match self.save(target, None) {
-                        EditorOutcome::Saved { target, info, edit, new_name, .. } => EditorOutcome::Saved { target, info, edit, new_name, then: Some(how) },
-                        other => other,
-                    }
-                } else {
-                    EditorOutcome::FreeUp(target.clone(), how)
-                };
+            if yes {
+                self.confirm_delete_original = false;
+                outcome = self.save_and_free(target, store::FreeUp::Delete);
+            } else if no || modal.dismissed() {
+                self.confirm_delete_original = false;
             }
         }
 
@@ -1121,6 +1139,29 @@ impl Ready {
         }
     }
 
+    /// Track `i`'s volume typed in, as it is at `t`: a flat one is set to
+    /// it; a curve goes up or down as a whole until it's there (as dragging
+    /// its line does).
+    fn set_level_at(&mut self, i: usize, t: f64, db: f32) {
+        if i >= self.edit.tracks.len() {
+            return;
+        }
+        let db = (db.clamp(media::SILENT_DB, media::FADER_MAX_DB) * 10.0).round() / 10.0;
+        let was = self.edit.clone();
+        let track = &mut self.edit.tracks[i];
+        if track.points.is_empty() {
+            track.gain = media::from_db(db);
+        } else {
+            let d = media::fader_pos(db) - media::fader_pos(track.db_at(t));
+            for pt in &mut track.points {
+                pt.db = media::fader_db(media::fader_pos(pt.db) + d);
+            }
+        }
+        if !same_edit(&self.edit, &was) {
+            self.push_undo(was);
+        }
+    }
+
     /// The kept length under the timeline: shown, and on a click typed over
     /// (digits fill the clock, "1250" is 12:50 and "12.5" 12.5 seconds; or
     /// frames when times show as frames). Enter, or ↑ ↓, makes the kept part
@@ -1170,6 +1211,9 @@ impl Ready {
             }
             Some(text) => {
                 ui.painter().rect_filled(rect, 5, pal.control);
+                // A number of frames: only digits go in.
+                crate::ui_kit::keep_to_number(ui, id.with("edit"), false, false);
+                #[allow(clippy::disallowed_methods)]
                 let out = egui::TextEdit::singleline(text)
                     .id(id.with("edit"))
                     .frame(egui::Frame::NONE)
@@ -1233,8 +1277,15 @@ impl Ready {
         targets.into_iter().filter(|x| (x - t).abs() < reach).min_by(|a, b| (a - t).abs().total_cmp(&(b - t).abs()))
     }
 
+    /// The edit isn't this clip's.
     fn dirty(&self) -> bool {
         !same_edit(&self.edit, &self.saved)
+    }
+
+    /// The edit is saved nowhere: not as this clip's, nor as the clip last
+    /// saved as new (leaving then asks nothing).
+    fn unsaved(&self) -> bool {
+        self.dirty() && !self.saved_new.as_ref().is_some_and(|s| same_edit(&self.edit, s))
     }
 
     fn save(&mut self, target: &EditTarget, new_name: Option<String>) -> EditorOutcome {
@@ -1251,28 +1302,52 @@ impl Ready {
                 EditorOutcome::Close
             };
         }
-        self.saved = self.edit.clone();
+        // As new, this clip stays as it was: it's still what the edit's
+        // compared with.
+        if new_name.is_some() {
+            self.saved_new = Some(self.edit.clone());
+        } else {
+            self.saved = self.edit.clone();
+        }
         EditorOutcome::Saved { target: target.clone(), info: self.info.clone(), edit: self.edit.clone(), new_name, then: None }
+    }
+
+    /// Save ▾'s ways to free up space: save the edit, then trim or delete the
+    /// original. Already saved, just that.
+    fn save_and_free(&mut self, target: &EditTarget, how: store::FreeUp) -> EditorOutcome {
+        if target.source != target.clip && !self.dirty() {
+            return EditorOutcome::FreeUp(target.clone(), how);
+        }
+        match self.save(target, None) {
+            EditorOutcome::Saved { target, info, edit, new_name, .. } => EditorOutcome::Saved { target, info, edit, new_name, then: Some(how) },
+            other => other,
+        }
     }
 
     fn keyboard(&mut self, ctx: &egui::Context) {
         // A dialog (its own or the app's) or a menu has the keys.
-        if ctx.egui_wants_keyboard_input() || crate::ui_kit::overlay_open(ctx) || self.save_as.is_some() || self.confirm_discard || self.free_up.is_some() {
+        if ctx.egui_wants_keyboard_input() || crate::ui_kit::overlay_open(ctx) || self.save_as.is_some() || self.confirm_discard || self.confirm_delete_original {
             return;
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::F2)) {
             self.rename_requested = true;
         }
-        let (crop, done) = ctx.input_mut(|i| {
+        let (crop, done, back) = ctx.input_mut(|i| {
             let crop = i.consume_key(egui::Modifiers::NONE, Key::C);
             let done = self.crop_tool.is_some() && (i.consume_key(egui::Modifiers::NONE, Key::Enter) || i.consume_key(egui::Modifiers::NONE, Key::Escape));
-            (crop, done)
+            // Esc otherwise: back, as the back button does (asking first
+            // when there are changes).
+            let back = self.crop_tool.is_none() && i.consume_key(egui::Modifiers::NONE, Key::Escape);
+            (crop, done, back)
         });
         if crop {
             self.toggle_crop();
         }
         if done {
             self.crop_tool = None;
+        }
+        if back {
+            self.back_requested = true;
         }
         let (redo, undo, snap, mute) = ctx.input_mut(|i| {
             (
@@ -1562,7 +1637,7 @@ impl Ready {
     /// What the pointer does on the timeline (`resp`, laid out as `l`, as
     /// it was drawn last frame): a drag takes hold of what's under it (a
     /// part's edge, a split, a part, a volume line or point, else the
-    /// playhead) and moves it; a click goes there; a double-click adds a
+    /// playhead) and moves it; a press goes there; a double-click adds a
     /// volume point or takes one away; a right-click picks what the menu is
     /// for. Read first thing in the frame, so the picture, the time, the
     /// playhead and the parts' edges all follow the pointer on the frame it
@@ -1577,6 +1652,19 @@ impl Ready {
         let vol_at = |pos: Pos2, this: &Self| l.vol_at(pos, &this.edit.tracks);
         let hit = |pos: Pos2, this: &Self| l.hit(pos, &this.edit.tracks);
 
+        // The playhead goes where the button goes down, at once, and playing
+        // pauses until it's let go, a click as a drag (a drag on a part or
+        // its edge then moves it on). Not on the volume, where a drag only
+        // shapes it and never interrupts playback.
+        if resp.is_pointer_button_down_on()
+            && let Some(pos) = ui.input(|i| i.pointer.primary_pressed().then(|| i.pointer.press_origin()).flatten())
+            && !matches!(hit(pos, self), Some(Drag::Line(_) | Drag::Point(..)))
+        {
+            self.resume = self.player.is_playing();
+            self.player.pause();
+            let t = self.snapped(t_of(pos.x), px_per_s, Some(Drag::Playhead));
+            self.player.seek(self.info.snap(t) + 1e-6);
+        }
         if resp.drag_started() {
             // Hit-test where the button went down, not where the pointer is now: a
             // drag only starts after a few pixels of movement, by which time a
@@ -1611,7 +1699,8 @@ impl Ready {
                 // Moving the playhead or a trim pauses while you drag and carries on
                 // after; shaping the volume never interrupts playback.
                 if matches!(d, Drag::Start(_) | Drag::End(_) | Drag::Range(_) | Drag::Playhead) {
-                    self.resume = self.player.is_playing();
+                    // (Already paused by the press, which noted if it played.)
+                    self.resume |= self.player.is_playing();
                     self.player.pause();
                 }
             }
@@ -1643,16 +1732,16 @@ impl Ready {
                 // the clip's ends), and keep it a frame long.
                 let lo = |k: usize, parts: &[(f64, f64)]| if k > 0 { parts[k - 1].1 } else { 0.0 };
                 let hi = |k: usize, parts: &[(f64, f64)]| parts.get(k + 1).map_or(self.info.duration, |p| p.0);
+                let edge = |this: &Self| trim_edge(pos.x, lanes, l.view, dur, || this.snapped(t_of(pos.x) - this.grab_offset, px_per_s, Some(d)));
                 match d {
                     Drag::Start(k) if k < parts.len() => {
-                        let t = self.info.snap(self.snapped(t_of(pos.x) - self.grab_offset, px_per_s, Some(d)));
+                        let t = self.info.snap(edge(self));
                         parts[k].0 = t.min(parts[k].1 - fd).max(lo(k, &parts));
                         self.edit.set_parts(&parts);
                         self.player.seek(parts[k].0);
                     }
                     Drag::End(k) if k < parts.len() => {
-                        let t = self.snapped(t_of(pos.x) - self.grab_offset, px_per_s, Some(d));
-                        parts[k].1 = self.info.snap(t).clamp(parts[k].0 + fd, hi(k, &parts).max(parts[k].0 + fd));
+                        parts[k].1 = trimmed_end(&self.info, edge(self)).clamp(parts[k].0 + fd, hi(k, &parts).max(parts[k].0 + fd));
                         self.edit.set_parts(&parts);
                         self.player.seek(parts[k].1 - fd);
                     }
@@ -1677,7 +1766,8 @@ impl Ready {
                     Drag::Line(i) => {
                         // The whole curve, up or down by how far it's been
                         // dragged (along the fader, so it follows the pointer).
-                        // Level, it snaps to 0 dB as it passes (Ctrl: it doesn't).
+                        // Level, it snaps to 0 dB or silence within a pixel of
+                        // it (Ctrl: it doesn't).
                         let lane = lane_rects[i];
                         let travel = lane.height() - 8.0;
                         let was = self.before_drag.as_ref().and_then(|e| e.tracks.get(i)).cloned();
@@ -1688,7 +1778,7 @@ impl Ready {
                             if was.points.is_empty() {
                                 let mut db = media::fader_db(media::fader_pos(media::to_db(was.gain)) + d);
                                 // Unchanged, or silent at the bottom.
-                                if let Some(to) = [0.0, media::SILENT_DB].into_iter().find(|&to| !no_snap && (y_of_db(lane, db) - y_of_db(lane, to)).abs() < SNAP_PX) {
+                                if let Some(to) = [0.0, media::SILENT_DB].into_iter().find(|&to| !no_snap && (y_of_db(lane, db) - y_of_db(lane, to)).abs() < SNAP_PX * fine) {
                                     db = to;
                                     guide = Some((i, to));
                                 }
@@ -1705,7 +1795,8 @@ impl Ready {
                         // From where it was by how far it's been dragged (taken
                         // hold of off its middle, it doesn't jump to the
                         // pointer), between its neighbours. Its level snaps to
-                        // 0 dB and to theirs as it passes (Ctrl: it doesn't).
+                        // 0 dB, silence or theirs within a pixel of it (Ctrl:
+                        // it doesn't).
                         let lane = lane_rects[i];
                         let from = self.before_drag.as_ref().and_then(|e| e.tracks.get(i)).and_then(|t| t.points.get(k)).map(|p| (p.t, p.db));
                         let mut guide = None;
@@ -1722,7 +1813,7 @@ impl Ready {
                                     .into_iter()
                                     .flatten()
                                     .map(|to| (to, (y_of_db(lane, db) - y_of_db(lane, to)).abs()))
-                                    .filter(|(_, off)| *off < SNAP_PX)
+                                    .filter(|(_, off)| *off < SNAP_PX * fine)
                                     .min_by(|a, b| a.1.total_cmp(&b.1));
                                 if let Some((to, _)) = nearest {
                                     db = to;
@@ -1747,10 +1838,6 @@ impl Ready {
             {
                 self.push_undo(was);
             }
-            // The playhead on the frame you see, not one decoded after.
-            if self.dragging == Some(Drag::Playhead) {
-                self.player.land();
-            }
             self.dragging = None;
             self.playhead_snapped = false;
             if std::mem::take(&mut self.resume) && self.player.time() < self.edit.end - fd {
@@ -1758,6 +1845,14 @@ impl Ready {
             }
         }
 
+        // Let go of a press that didn't become a drag: playing carries on
+        // from where it went.
+        if self.dragging.is_none() && self.resume && !ui.input(|i| i.pointer.primary_down()) {
+            self.resume = false;
+            if self.player.time() < self.edit.end - fd {
+                self.player.play(self.edit.end);
+            }
+        }
         if resp.double_clicked() {
             if let Some(pos) = resp.interact_pointer_pos() {
                 if let Some(Drag::Point(i, k)) = vol_at(pos, self) {
@@ -1781,8 +1876,8 @@ impl Ready {
                 }
             }
         } else if resp.clicked() {
-            // Jump there; playing carries on from the new spot.
-            if let Some(pos) = resp.interact_pointer_pos() {
+            // On the volume, jump there (elsewhere, the press already did).
+            if let Some(pos) = resp.interact_pointer_pos().filter(|&pos| matches!(hit(pos, self), Some(Drag::Line(_) | Drag::Point(..)))) {
                 let t = self.snapped(t_of(pos.x), px_per_s, Some(Drag::Playhead));
                 self.player.seek(self.info.snap(t) + 1e-6);
             }
@@ -1819,7 +1914,7 @@ impl Ready {
     /// scroll and the edit are now (see [`Layout`]).
     fn layout(&self, outer: Rect) -> Layout {
         let n_audio = self.edit.tracks.len();
-        let lane_step = AUDIO_H + 4.0;
+        let lane_step = self.lane_h + 4.0;
         // Under the lanes, the line saying how long the parts are.
         let body_bottom = outer.bottom() - LENGTH_H;
         let audio_view = Rect::from_x_y_ranges(outer.x_range(), outer.top() + RULER_H + VIDEO_H..=body_bottom);
@@ -1834,7 +1929,7 @@ impl Ready {
         let video = Rect::from_min_size(Pos2::new(lanes.left(), ruler.bottom()), Vec2::new(lanes.width(), VIDEO_H));
         // The sound lanes, as far as they're scrolled.
         let top = audio_view.top() - self.lane_scroll + 4.0;
-        let lane_rects = (0..n_audio).map(|i| Rect::from_min_size(Pos2::new(lanes.left(), top + i as f32 * lane_step), Vec2::new(lanes.width(), AUDIO_H))).collect();
+        let lane_rects = (0..n_audio).map(|i| Rect::from_min_size(Pos2::new(lanes.left(), top + i as f32 * lane_step), Vec2::new(lanes.width(), self.lane_h))).collect();
         let body = Rect::from_x_y_ranges(lanes_x, video.top()..=(top + n_audio as f32 * lane_step - 4.0).min(audio_view.bottom()));
         let hit_area = Rect::from_x_y_ranges(lanes.left() - HANDLE_W - 4.0..=lanes.right() + HANDLE_W + 4.0, ruler.top()..=body_bottom + LENGTH_H);
         let dur = self.info.duration.max(1e-6);
@@ -1882,7 +1977,7 @@ impl Ready {
     fn timeline(&mut self, ui: &mut egui::Ui, resp: Option<egui::Response>) {
         let pal = crate::theme::pal(ui);
         let n_audio = self.edit.tracks.len();
-        let lane_step = AUDIO_H + 4.0;
+        let lane_step = self.lane_h + 4.0;
         let lanes_h = n_audio as f32 * lane_step;
         // As tall as it needs, up to what's left; the sound lanes scroll in
         // whatever height that leaves them.
@@ -1901,11 +1996,16 @@ impl Ready {
         let over = 4.0 + lanes_h - audio_view.height();
         let max_scroll = if over > 2.0 { over } else { 0.0 };
         // Short with the picture already as small as the divider lets it be
-        // (it gives the lanes their room first): next frame asks for this much more.
-        if over > 0.5 {
-            self.lanes_short = (self.lanes_short + over).min(200.0);
-        } else if over < -0.5 {
-            self.lanes_short = (self.lanes_short + over).max(0.0);
+        // (it gives the lanes their room first): next frame asks for this much
+        // more. (Not while they're left short on purpose: it climbed to its
+        // most, and dragged back up, the divider's range was that far off till
+        // it had come down again.)
+        if !self.lanes_cut {
+            if over > 0.5 {
+                self.lanes_short = (self.lanes_short + over).min(200.0);
+            } else if over < -0.5 {
+                self.lanes_short = (self.lanes_short + over).max(0.0);
+            }
         }
         let p = ui.painter_at(outer);
 
@@ -2276,14 +2376,20 @@ impl Ready {
                     self.solo = if solo_before == Some(i) { None } else { Some(i) };
                 }
             }
-            // Right-click: mute, solo, reset the volume.
+            // Right-click: the volume (where the playhead is) to type, mute,
+            // solo, reset the volume.
             let track = &self.edit.tracks[i];
             let (muted, flat) = (track.muted, track.points.is_empty() && (track.gain - 1.0).abs() < 0.005);
             let has_points = !track.points.is_empty();
+            let now_t = self.player.time();
+            let shown = crate::ui_kit::db_edit_text(track.db_at(now_t), media::SILENT_DB);
             let mut pick = None;
-            crate::ui_kit::context_menu(&hresp, 220.0, |ui| {
+            let mut typed = None;
+            crate::ui_kit::context_menu_typed(&hresp, 220.0, |ui| {
                 use crate::ui_kit::Item;
                 use egui_phosphor::regular as icon;
+                typed = crate::ui_kit::menu_db_field(ui, "Volume", &shown);
+                crate::ui_kit::menu_sep(ui);
                 if Item::new(if muted { "Unmute" } else { "Mute" }).icon(icon::SPEAKER_X).show(ui).clicked() {
                     pick = Some(0);
                 }
@@ -2298,6 +2404,9 @@ impl Ready {
                     pick = Some(3);
                 }
             });
+            if let Some(db) = typed {
+                self.set_level_at(i, now_t, db);
+            }
             match pick {
                 Some(0) => {
                     self.push_undo(self.edit.clone());
@@ -2391,11 +2500,16 @@ impl Ready {
                 Mute(usize),
                 RemovePoint(usize, usize),
                 PointLevel(usize, usize, f32),
+                Typed(usize, f32),
             }
             let can_split = self.split_at(t).is_some();
             let at_playhead = self.part_at(self.player.time());
+            let vol_t = self.info.snap(t);
             let mut act = None;
-            let open = crate::ui_kit::context_menu(resp, 220.0, |ui| {
+            // A volume menu has a field to type it into, which a click
+            // into mustn't close.
+            let typing = matches!(spot, Spot::Volume(_) | Spot::Point(..));
+            let body = |ui: &mut egui::Ui| {
                 use crate::ui_kit::Item;
                 use egui_phosphor::regular as icon;
                 match spot {
@@ -2423,6 +2537,12 @@ impl Ready {
                     Spot::Volume(i) => {
                         let Some(track) = self.edit.tracks.get(i) else { return };
                         let flat = track.points.is_empty() && (track.gain - 1.0).abs() < 0.005;
+                        // Here, on a curve: it all goes up or down to it.
+                        let shown = crate::ui_kit::db_edit_text(track.db_at(vol_t), media::SILENT_DB);
+                        if let Some(db) = crate::ui_kit::menu_db_field(ui, if track.points.is_empty() { "Volume" } else { "Volume here" }, &shown) {
+                            act = Some(Act::Typed(i, db));
+                        }
+                        crate::ui_kit::menu_sep(ui);
                         if Item::new("Add a point here").icon(icon::PLUS).keys(Some(vec!["Double-click".into()])).show(ui).clicked() {
                             act = Some(Act::AddPoint(i));
                         }
@@ -2438,6 +2558,13 @@ impl Ready {
                         }
                     }
                     Spot::Point(i, k) => {
+                        if let Some(pt) = self.edit.tracks.get(i).and_then(|t| t.points.get(k)) {
+                            let shown = crate::ui_kit::db_edit_text(pt.db, media::SILENT_DB);
+                            if let Some(db) = crate::ui_kit::menu_db_field(ui, "Volume", &shown) {
+                                act = Some(Act::PointLevel(i, k, (db.clamp(media::SILENT_DB, media::FADER_MAX_DB) * 10.0).round() / 10.0));
+                            }
+                            crate::ui_kit::menu_sep(ui);
+                        }
                         if Item::new("Set to 0 dB").icon(icon::ARROW_COUNTER_CLOCKWISE).show(ui).clicked() {
                             act = Some(Act::PointLevel(i, k, 0.0));
                         }
@@ -2446,7 +2573,8 @@ impl Ready {
                         }
                     }
                 }
-            });
+            };
+            let open = if typing { crate::ui_kit::context_menu_typed(resp, 220.0, body) } else { crate::ui_kit::context_menu(resp, 220.0, body) };
             // Closed (picked from, or clicked away): its part isn't lit anymore.
             if open.is_none() {
                 self.menu_at = None;
@@ -2475,6 +2603,7 @@ impl Ready {
                     self.edit.tracks[i].muted = !self.edit.tracks[i].muted;
                 }
                 Some(Act::RemovePoint(i, k)) => self.remove_point(i, k),
+                Some(Act::Typed(i, db)) => self.set_level_at(i, vol_t, db),
                 Some(Act::PointLevel(i, k, db)) => {
                     if let Some(pt) = self.edit.tracks.get(i).and_then(|t| t.points.get(k)).copied() {
                         self.push_undo(self.edit.clone());
@@ -2634,15 +2763,75 @@ impl Layout {
     }
 }
 
+/// How the editor's height splits between the picture and, under the
+/// divider, the transport and the timeline.
+struct Split {
+    /// The picture's height.
+    picture: f32,
+    /// Each sound lane's.
+    lane: f32,
+    /// Where the divider can take the picture's height.
+    heights: std::ops::RangeInclusive<f32>,
+    /// The sound lanes are left short of room (they scroll), the picture
+    /// being taller than fits them.
+    cut: bool,
+}
+
+/// `total` split, with `n_audio` sound lanes, the picture's share as the
+/// divider was left (none: fitted). `short`: how far short the lanes came
+/// last frame ([`Ready::lanes_short`]).
+///
+/// Fitted (till the divider's dragged, and after a double-click on it), the
+/// timeline's as tall as its lanes need and the picture has the rest, unless
+/// that's under a third of the room: then the sound lanes scroll. Dragged,
+/// the picture's as tall as it was left: down, the sound lanes scroll, the
+/// timeline keeping room for the ruler, the video lane and one sound lane;
+/// up, they grow taller into the room (up to [`AUDIO_MAX_H`]), the timeline
+/// never taller than its lanes. (Fitted was all there was: with a sound
+/// lane or two, the divider couldn't move.)
+fn split(total: f32, n_audio: usize, short: f32, share: Option<f32>) -> Split {
+    let n = n_audio as f32;
+    let below_min = DIVIDER_H + crate::transport::BAR_H + RULER_H + VIDEO_H + 4.0 + AUDIO_H + LENGTH_H + 10.0;
+    // Every lane showing, as tall as it starts. (The same sum the timeline
+    // makes: its ruler, video lane, the gap above the sound lanes, each lane
+    // and the gap after it, the length.)
+    let below_fit = DIVIDER_H + crate::transport::BAR_H + RULER_H + VIDEO_H + 4.0 + 4.0 + n * (AUDIO_H + 4.0) + LENGTH_H + 10.0 + short;
+    let shortest = (total - below_fit - n * (AUDIO_MAX_H - AUDIO_H)).max(MIN_PREVIEW_H);
+    let tallest = (total - below_min).max(shortest);
+    let fitted = (total - below_fit).max(total / 3.0);
+    let picture = share.map_or(fitted, |s| total * s).clamp(shortest, tallest);
+    // The room the timeline has beyond its lanes' need, shared out among them.
+    let lane = if n_audio > 0 { (AUDIO_H + (total - picture - below_fit).max(0.0) / n).min(AUDIO_MAX_H) } else { AUDIO_H };
+    Split { picture, lane, heights: shortest..=tallest, cut: picture > total - below_fit + 0.5 }
+}
+
 /// The bar between the picture and the timeline: drag it to give either more
-/// room. `share` is the picture's fraction of `total`.
-fn divider(ui: &mut egui::Ui, preview_h: f32, total: f32, share: &mut f32) {
+/// room, the picture (`preview_h` tall now) kept within `heights`; or
+/// double-click it for the fitted split again. `share`: the picture's
+/// fraction of `total` as dragged (none: fitted).
+fn divider(ui: &mut egui::Ui, preview_h: f32, heights: std::ops::RangeInclusive<f32>, total: f32, share: &mut Option<f32>) {
     let pal = crate::theme::pal(ui);
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), DIVIDER_H), Sense::drag());
-    let resp = resp.on_hover_cursor(egui::CursorIcon::ResizeVertical).on_hover_text("Drag to resize the picture and the timeline");
-    if resp.dragged() {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), DIVIDER_H), Sense::click_and_drag());
+    let resp = resp.on_hover_cursor(egui::CursorIcon::ResizeVertical).on_hover_text("Drag to resize the picture and the timeline. Double-click to fit the timeline to its lanes again.");
+    // How far down the bar it was taken hold of: it stays that far above the
+    // pointer, and waits at either end of its range till the pointer's back
+    // (moved by the pointer's moves instead, it fell behind it at an end).
+    let held = resp.id.with("held");
+    if resp.drag_started()
+        && let Some(origin) = ui.input(|i| i.pointer.press_origin())
+    {
+        ui.data_mut(|d| d.insert_temp(held, origin.y - rect.top()));
+    }
+    if resp.double_clicked() {
+        *share = None;
+    } else if resp.dragged()
+        && let Some(pointer) = resp.interact_pointer_pos()
+    {
         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
-        *share = ((preview_h + resp.drag_delta().y) / total.max(1.0)).clamp(0.1, 0.95);
+        let held = ui.data(|d| d.get_temp::<f32>(held)).unwrap_or(DIVIDER_H / 2.0);
+        // The picture as tall as puts the bar there.
+        let h = preview_h + (pointer.y - held - rect.top());
+        *share = Some(h.clamp(*heights.start(), *heights.end()) / total.max(1.0));
     }
     let active = theme_fade(ui.ctx(), "ed_divider", resp.hovered() || resp.dragged());
     let grip = Rect::from_center_size(rect.center(), Vec2::new(36.0 + 8.0 * active, 3.0));
@@ -2666,6 +2855,17 @@ fn db_label(db: f32) -> String {
     }
 }
 
+/// A name for a clip saved as new from the clip titled `title`: "… (edit)",
+/// or "… (edit 2)" and on when that's taken, by a clip in `dir` or one
+/// still being saved (`pending`).
+fn suggest_new_name(title: &str, dir: &Path, ext: &str, pending: &[PathBuf]) -> String {
+    let name = |n: u32| crate::clips::sanitize_name(&if n == 1 { format!("{title} (edit)") } else { format!("{title} (edit {n})") });
+    (1..1000)
+        .map(name)
+        .find(|name| crate::clips::path_for_name(dir, name, ext, None).is_ok_and(|p| !pending.contains(&p)))
+        .unwrap_or_else(|| name(1))
+}
+
 fn same_edit(a: &Edit, b: &Edit) -> bool {
     a.output == b.output
         && (a.start - b.start).abs() < 1e-6
@@ -2681,6 +2881,30 @@ fn same_edit(a: &Edit, b: &Edit) -> bool {
 /// The kept part (`start`..`end`) made `secs` long around its middle; where
 /// that runs past an end of the clip, it shifts back in (as long as the clip
 /// allows). On frames, at least one long.
+/// Where a trimmed edge goes, the pointer at `x`: past either end of the
+/// `lanes`, to that end of what's shown (`view`: its start and length, in a
+/// clip `dur` long); within them, with the pointer, as it was taken hold of
+/// (`with_pointer`). A handle sits outside its edge, so it's taken hold of a
+/// handle's width from it, and the pointer's time stops at the lanes' ends:
+/// without this, an edge could never be brought all the way to the clip's
+/// start or end.
+fn trim_edge(x: f32, lanes: Rect, (v0, span): (f64, f64), dur: f64, with_pointer: impl FnOnce() -> f64) -> f64 {
+    if x <= lanes.left() {
+        v0
+    } else if x >= lanes.right() {
+        (v0 + span).min(dur)
+    } else {
+        with_pointer()
+    }
+}
+
+/// A part's end at `t`, on a frame, but at the clip's end its own end
+/// (within half a frame of it): a clip's length isn't always a whole number
+/// of frames, and short of it, it would count as trimmed.
+fn trimmed_end(info: &media::ClipInfo, t: f64) -> f64 {
+    if t >= info.duration - info.frame_duration() / 2.0 { info.duration } else { info.snap(t) }
+}
+
 fn trim_to_length(info: &media::ClipInfo, start: f64, end: f64, secs: f64) -> (f64, f64) {
     let fd = info.frame_duration();
     let secs = secs.clamp(fd, info.duration);
@@ -2768,12 +2992,12 @@ fn put_back(parts: &[(f64, f64)], spot: Spot, duration: f64) -> Option<(Vec<(f64
     Some((parts, back))
 }
 
-/// The volume line, striped (so it reads as a control over the waveform, not
-/// part of it): faint where it's unchanged, bright with its points as
-/// diamonds where it's been changed.
-/// How a volume drag that comes this close (points) to a level it snaps to
-/// lands on it.
-const SNAP_PX: f32 = 5.0;
+/// How close a volume drag has to come to a level it snaps to (0 dB,
+/// silence, a neighbouring point's) to land on it: a pixel of the
+/// pointer's, so it only catches when it's right there. Shift's fine steps
+/// move the line a fifth as far, so on screen it's a fifth of a pixel then
+/// (they go past it, as the Sources fader's do).
+const SNAP_PX: f32 = 1.0;
 
 /// How a lane's volume line looks this frame: how much it's pointed at (0 to
 /// 1), the point pointed at or held, whether that point is held, and a level
@@ -2786,6 +3010,9 @@ struct Look {
     guide: Option<f32>,
 }
 
+/// The volume line, striped (so it reads as a control over the waveform, not
+/// part of it): faint where it's unchanged, bright with its points as
+/// diamonds where it's been changed.
 fn draw_envelope(p: &egui::Painter, pal: &crate::theme::Pal, lane: Rect, track: &media::TrackEdit, dur: f64, x_of: impl Fn(f64) -> f32, look: Look) {
     let flat = track.points.is_empty() && (track.gain - 1.0).abs() < 0.005;
     // Amber: apart from the waveform's blue-grey and the edit's white.
@@ -2860,6 +3087,53 @@ mod length_tests {
         // Longer than the whole clip: all of it.
         assert_eq!(trim_to_length(&info(), 5.0, 10.0, 90.0), (0.0, 60.0));
     }
+
+    /// A trimmed edge reaches the clip's very start and end: past either end
+    /// of the lanes it goes there, however far from its handle's middle it
+    /// was taken hold of; within them it follows the pointer.
+    #[test]
+    fn trimming_reaches_the_ends() {
+        let lanes = Rect::from_min_max(Pos2::new(100.0, 0.0), Pos2::new(700.0, 100.0));
+        let whole = (0.0, 60.0);
+        let pointer = || 12.5;
+        assert_eq!(trim_edge(99.0, lanes, whole, 60.0, pointer), 0.0, "past the start");
+        assert_eq!(trim_edge(100.0, lanes, whole, 60.0, pointer), 0.0);
+        assert_eq!(trim_edge(701.0, lanes, whole, 60.0, pointer), 60.0, "past the end");
+        assert_eq!(trim_edge(400.0, lanes, whole, 60.0, pointer), 12.5, "with the pointer");
+        // Zoomed in: the ends of what's shown (the view then scrolls on).
+        assert_eq!(trim_edge(50.0, lanes, (20.0, 10.0), 60.0, pointer), 20.0);
+        assert_eq!(trim_edge(750.0, lanes, (55.0, 10.0), 60.0, pointer), 60.0);
+    }
+
+    /// At the clip's end, an end is the clip's own, even when its length
+    /// isn't a whole number of frames; elsewhere, on a frame.
+    #[test]
+    fn an_end_at_the_clips_end_is_its_own() {
+        let info = media::ClipInfo { duration: 59.52, ..info() };
+        assert_eq!(trimmed_end(&info, 59.52), 59.52);
+        assert_eq!(trimmed_end(&info, 59.515), 59.52, "within half a frame");
+        assert_eq!(trimmed_end(&info, 30.01), 30.0, "on a frame");
+    }
+}
+
+#[cfg(test)]
+mod new_name_tests {
+    use super::*;
+
+    #[test]
+    fn skips_names_taken_on_disk_or_still_saving() {
+        let dir = std::env::temp_dir().join(format!("hc-new-name-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(suggest_new_name("Kill", &dir, "mp4", &[]), "Kill (edit)");
+        std::fs::write(dir.join("Kill (edit).mp4"), b"").unwrap();
+        assert_eq!(suggest_new_name("Kill", &dir, "mp4", &[]), "Kill (edit 2)");
+        // Saved as new a moment ago, not written yet.
+        assert_eq!(suggest_new_name("Kill", &dir, "mp4", &[dir.join("Kill (edit 2).mp4")]), "Kill (edit 3)");
+        // A title a file can't have, made safe.
+        assert_eq!(suggest_new_name("14:51:01", &dir, "mp4", &[]), "14.51.01 (edit)");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]
@@ -2931,5 +3205,51 @@ mod part_tests {
         assert_eq!(put_back(&[(0.0, 5.0), (5.0, 10.0)], Spot::Split(0), 10.0), Some((vec![(0.0, 10.0)], (5.0, 5.0))));
         // Nothing trimmed off: nothing to put back.
         assert_eq!(put_back(&[(0.0, 10.0)], Spot::Before, 10.0), None);
+    }
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::*;
+
+    /// The divider moves the picture. (It used to be pinned where the
+    /// timeline fitted its lanes, whatever the divider said, with a sound
+    /// lane or two.) Down, the picture's taller and the lanes as they were
+    /// (they scroll); up, it's shorter and the lanes share what it gave up.
+    #[test]
+    fn the_divider_moves_the_picture() {
+        let (total, n, short) = (900.0, 2, 12.0);
+        let fitted = split(total, n, short, None);
+        assert_eq!((fitted.lane, fitted.cut), (AUDIO_H, false), "fitted, every lane as it starts");
+        let down = split(total, n, short, Some((fitted.picture + 40.0) / total));
+        assert!((down.picture - (fitted.picture + 40.0)).abs() < 0.01, "{} for {}", down.picture, fitted.picture + 40.0);
+        assert_eq!((down.lane, down.cut), (AUDIO_H, true), "down, the lanes short of room");
+        let up = split(total, n, short, Some((fitted.picture - 60.0) / total));
+        assert!((up.picture - (fitted.picture - 60.0)).abs() < 0.01, "{} for {}", up.picture, fitted.picture - 60.0);
+        assert!((up.lane - (AUDIO_H + 30.0)).abs() < 0.01 && !up.cut, "{}", up.lane);
+    }
+
+    /// Its ends: up, where the lanes are as tall as they grow (the timeline
+    /// never taller than its lanes); down, where the timeline has one sound
+    /// lane's room. A small window keeps the picture's least height.
+    #[test]
+    fn the_divider_stops_at_its_ends() {
+        let (total, n, short) = (900.0, 2, 12.0);
+        let top = split(total, n, short, Some(0.0));
+        assert_eq!((top.picture, top.lane), (*top.heights.start(), AUDIO_MAX_H));
+        let bottom = split(total, n, short, Some(1.0));
+        assert_eq!((bottom.picture, bottom.lane), (*bottom.heights.end(), AUDIO_H));
+        assert!(split(300.0, 4, short, Some(0.9)).picture >= MIN_PREVIEW_H);
+        // No sound lanes: nothing to grow.
+        assert_eq!(split(total, 0, short, Some(0.0)).lane, AUDIO_H);
+    }
+
+    /// Fitted with more sound lanes than fit, the picture keeps a third and
+    /// the lanes scroll.
+    #[test]
+    fn fitted_keeps_a_third_for_the_picture() {
+        let s = split(900.0, 8, 12.0, None);
+        assert!((s.picture - 300.0).abs() < 0.01, "{}", s.picture);
+        assert_eq!((s.lane, s.cut), (AUDIO_H, true));
     }
 }

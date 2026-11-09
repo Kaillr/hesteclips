@@ -14,12 +14,17 @@ pub fn dir() -> Option<PathBuf> {
     dirs::data_local_dir().map(|d| d.join("hasteclip").join("logs"))
 }
 
+/// Where stderr went before the log took it over (Windows): the terminal a
+/// build of your own was run from, if it was (see [`tell`]).
+#[cfg(windows)]
+static TERMINAL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
 /// Send stderr to the log file, and note what's running where.
 #[cfg(windows)]
 pub fn start() {
     use std::os::windows::io::IntoRawHandle;
     use windows::Win32::Foundation::HANDLE;
-    use windows::Win32::System::Console::{STD_ERROR_HANDLE, SetStdHandle};
+    use windows::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, SetStdHandle};
 
     let Some(dir) = dir() else { return };
     if std::fs::create_dir_all(&dir).is_err() {
@@ -28,6 +33,10 @@ pub fn start() {
     let path = dir.join("hasteclip.log");
     let _ = std::fs::rename(&path, dir.join("hasteclip.previous.log"));
     let Ok(file) = std::fs::File::create(&path) else { return };
+    // A release build has no console of its own, but one run from a
+    // terminal (`cargo run --release`) is handed the terminal's.
+    // SAFETY: only asks which handle stderr has.
+    let before = unsafe { GetStdHandle(STD_ERROR_HANDLE) }.ok().filter(|h| !h.is_invalid() && !h.0.is_null());
     // Rust's stderr asks Windows for the handle on every write, so this takes
     // over `eprintln!` and panic messages from here on. The file stays open
     // for the life of the process.
@@ -36,12 +45,33 @@ pub fn start() {
     if unsafe { SetStdHandle(STD_ERROR_HANDLE, handle) }.is_err() {
         return;
     }
+    if let Some(h) = before {
+        let _ = TERMINAL.set(h.0 as usize);
+    }
     eprintln!(
         "HasteClip {} on {}, started {}",
         env!("CARGO_PKG_VERSION"),
         windows_version(),
         chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
     );
+}
+
+/// Say `line` in the log, and in the terminal the app was run from: for what
+/// someone running a build of their own must read there. (On Linux the log
+/// prints there anyway; on Windows it took stderr over.)
+pub fn tell(line: &str) {
+    eprintln!("{line}");
+    #[cfg(windows)]
+    {
+        if let Some(&handle) = TERMINAL.get() {
+            use std::io::Write;
+            use std::os::windows::io::FromRawHandle;
+            // SAFETY: stderr's handle at launch, which nothing closes, and
+            // this doesn't either.
+            let mut terminal = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_handle(handle as *mut std::ffi::c_void) });
+            let _ = writeln!(terminal, "{line}");
+        }
+    }
 }
 
 /// Copy stderr into the log file, still printing it where it went (a

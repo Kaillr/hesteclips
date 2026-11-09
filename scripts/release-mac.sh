@@ -92,6 +92,7 @@ PLIST
 # signature; the app is sealed around it.
 sign=-
 if [ -n "${MAC_SIGNING_P12:-}" ]; then
+    echo "signing: making a keychain with the certificate"
     keychain="$PWD/$work/signing.keychain-db"
     kc_pass="$(openssl rand -hex 16)"
     rm -f "$keychain"
@@ -102,10 +103,18 @@ if [ -n "${MAC_SIGNING_P12:-}" ]; then
     security import "$work/signing.p12" -k "$keychain" -P "$MAC_SIGNING_PASSWORD" -T /usr/bin/codesign >/dev/null
     rm "$work/signing.p12"
     security set-key-partition-list -S apple-tool:,apple: -s -k "$kc_pass" "$keychain" >/dev/null
+    # On the search list too, ahead of the others: codesign on GitHub's
+    # macOS 15 runners didn't find the key with --keychain alone ("The
+    # specified item could not be found in the keychain"). The list is put
+    # back as it was afterwards.
+    searched=()
+    while IFS= read -r k; do searched+=("$k"); done < <(security list-keychains -d user | sed -E 's/^[[:space:]]*"(.*)"$/\1/')
+    security list-keychains -d user -s "$keychain" ${searched[@]+"${searched[@]}"}
+    trap 'security list-keychains -d user -s ${searched[@]+"${searched[@]}"}; security delete-keychain "$keychain" 2>/dev/null || true' EXIT
     # Not trusted (it isn't Apple's), so it's found by its hash.
     sign="$(security find-identity -p codesigning "$keychain" | awk '/"HasteClip"/ {print $2; exit}')"
     [ -n "$sign" ] || { echo "the signing certificate wasn't found" >&2; exit 1; }
-    trap 'security delete-keychain "$keychain" 2>/dev/null || true' EXIT
+    echo "signing: with $sign"
 fi
 codesign --force --sign "$sign" ${keychain:+--keychain "$keychain"} "$app/Contents/MacOS/hasteclip"
 codesign --force --sign "$sign" ${keychain:+--keychain "$keychain"} "$app"

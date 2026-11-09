@@ -97,6 +97,13 @@ impl Kept {
             *p = to.to_path_buf();
         }
     }
+
+    /// Forget every file but `path`: the others changed (a clip's original,
+    /// trimmed or deleted to free up space).
+    pub fn keep_only(&mut self, path: &Path) {
+        self.read.retain(|(p, _)| p == path);
+        self.sounds.retain(|(p, _, _)| p == path);
+    }
 }
 
 #[cfg(test)]

@@ -1,11 +1,11 @@
 //! The picture's sources on the Sources page's preview, placed the way OBS
-//! places them: the screen and the webcam, each dragged to move it and by a
-//! handle to resize it (keeping its shape; Shift stretches the screen), one
-//! in front of the other, and cropped with Alt and a handle (the picture
-//! keeps its scale, its box shrinks with it). The webcam also flips (past
-//! its opposite side) and turns (its right-click menu): see `webcam_ui`.
-//! Moves snap to the video's edges and middle and to the other source's
-//! edges (Ctrl to place freely).
+//! places them: the screen, the webcams and other displays, each dragged to
+//! move it and by a handle to resize it (keeping its shape; Shift stretches
+//! it), in front of or behind each other, and cropped with Alt and a handle
+//! (the picture keeps its scale, its box shrinks with it; not another
+//! display yet). A webcam also flips (past its opposite side) and turns
+//! (its right-click menu): see `webcam_ui`. Moves snap to the video's edges
+//! and middle and to the other sources' edges (Ctrl to place freely).
 //!
 //! The screen goes into the video as Fill, Fit or Stretch say (its menu)
 //! until it's taken hold of: then it's in a box of its own where it was, so
@@ -32,12 +32,12 @@ const HANDLE: f32 = 8.0;
 /// How the screen can fill a video of another shape: the choices, as
 /// they're named side by side and in a menu, and what each does.
 pub(crate) const FRAMINGS: [(Framing, &str, &str, &str); 3] = [
-    (Framing::Fill, "Fill", "Fill the video", "Its middle covers all of the video: what's past the video's shape is cut off"),
     (Framing::Fit, "Fit", "Fit in the video", "All of it, as big as fits, with black bars where the shapes differ"),
+    (Framing::Fill, "Fill", "Fill the video", "Its middle covers all of the video: what's past the video's shape is cut off"),
     (Framing::Stretch, "Stretch", "Stretch to the video", "All of it over all of the video, stretched or squeezed to its shape"),
 ];
 
-/// Fill, Fit or Stretch, side by side: the one clicked. None is lit while
+/// Fit, Fill or Stretch, side by side: the one clicked. None is lit while
 /// the screen's placed by hand (`now` is `None`).
 pub(crate) fn framing_choice(ui: &mut egui::Ui, id: &str, now: Option<Framing>) -> Option<Framing> {
     let opts: Vec<crate::ui_kit::Seg> = FRAMINGS.iter().map(|(_, label, _, tip)| crate::ui_kit::Seg { icon: None, label, tip: Some(tip) }).collect();
@@ -53,17 +53,47 @@ const CROP: Color32 = Color32::from_rgb(80, 220, 120);
 const MIN_SIZE: f32 = 0.05;
 
 /// One of the picture's sources.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum Layer {
-    Screen,
-    Webcam,
+pub(crate) use crate::settings::LayerKey as Layer;
+
+/// What's selected on the Sources page: a source in the video, or a group
+/// of them (by its id), on the preview or in the layers. It's outlined,
+/// with handles, and the keys act on it; a source's settings are in a
+/// dialog (see `inspector_ui`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum Selected {
+    Layer(Layer),
+    Group(u64),
+}
+
+/// Where sources go in the order (see `move_layers`): all to the front or
+/// the back, or a place forward or back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OrderStep {
+    Front,
+    Forward,
+    Backward,
+    Back,
+}
+
+/// A group held on the preview: by what, where, its box then, and each of
+/// its sources' boxes then (fractions of the video), to move or resize
+/// them all from.
+#[derive(Debug, Clone)]
+struct GroupHold {
+    handle: Handle,
+    from: Pos2,
+    start: Rect,
+    members: Vec<(Layer, Rect)>,
 }
 
 /// A drag on the preview.
 #[derive(Debug, Clone, Copy)]
 enum Drag {
-    /// The webcam: what's held, where it was taken hold of, its placement then.
-    Webcam(Handle, Pos2, Placement),
+    /// A webcam: which, what's held, where it was taken hold of, its placement then.
+    Webcam(u64, Handle, Pos2, Placement),
+    /// A boxed source (a display, a window, a picture…): which, and as the
+    /// screen's is held (moved, resized, or with Alt cropped).
+    Visual(u64, ScreenHold),
     /// The screen: moved, resized, or (Alt) cropped.
     Screen(ScreenHold),
     /// A source filling the video, held in its middle: it has nowhere to move.
@@ -100,7 +130,7 @@ impl ScreenHold {
     fn dragged(&self, dx: f32, dy: f32, mods: Mods, lines: &Lines) -> (Rect, Option<ScreenCrop>, Option<f32>) {
         match self.cropping_from.filter(|_| mods.crop) {
             Some((start, part, display)) => {
-                let (b, crop) = screen_crop_drag(start, part, display, self.handle, dx, dy, mods.keep);
+                let (b, crop) = screen_crop_drag(start, part, display, self.handle, dx, dy, mods.keep, mods.snap.then_some(lines));
                 // Its picture's what's kept of the display now, as it shows.
                 let (w, h) = crop.map_or(display, |c| (c.w, c.h));
                 (b, crop.map(|c| self.own_crop(c, display)), Some(w as f32 / h.max(1) as f32))
@@ -122,40 +152,134 @@ impl ScreenHold {
 /// The preview's own state on the Sources page.
 #[derive(Default)]
 pub(crate) struct CanvasView {
+    /// What's selected (see [`Selected`]).
+    pub(crate) selected: Option<Selected>,
+    /// Cropping this source on the preview (its Crop button): its handles
+    /// crop, as with Alt held, till Done, Enter or Esc.
+    pub(crate) crop_mode: Option<Layer>,
+    /// When the last undo step was kept, and what for: changes to the same
+    /// thing in quick succession (typing, a number stepped) are one step.
+    last_step: Option<(String, std::time::Instant)>,
     drag: Option<Drag>,
-    /// The right-click menu is open, on this source.
-    menu: Option<Layer>,
+    /// The right-click menu is open, on this source or group.
+    menu: Option<Selected>,
+    /// A group held on the preview, moved or resized as one.
+    group_hold: Option<GroupHold>,
+    /// The preview's own menu is open (right-clicked where no source is).
+    canvas_menu: bool,
+    /// Sources picked besides the one selected, Ctrl- or Shift-clicked in
+    /// the list: to group them.
+    pub(crate) picked: Vec<Layer>,
     /// The screen's picture size (what's kept of it), asked for now and then.
     picture: Option<(capture::VideoSource, Option<(u32, u32)>, std::time::Instant)>,
+    /// Each boxed source's size, by key, asked for now and then, and its
+    /// picture (an image's, words drawn), made again when it changes: see
+    /// `visuals_ui`.
+    pub(crate) sizes: std::collections::HashMap<u64, (Option<(u32, u32)>, std::time::Instant)>,
+    pub(crate) pictures: std::collections::HashMap<u64, (crate::settings::Visual, Option<std::sync::Arc<capture::StillImage>>)>,
+    /// Words being drawn, by key: as what they were, the picture to come.
+    pub(crate) drawing: std::collections::HashMap<u64, (crate::settings::Visual, std::sync::mpsc::Receiver<capture::StillImage>)>,
+    /// Whether the computer's fonts were found when words were last drawn.
+    pub(crate) fonts_found: bool,
     /// Arrangements to go back to (Ctrl+Z), and forward again.
     undo: Vec<Arrangement>,
     redo: Vec<Arrangement>,
     /// The source whose card (under the preview) the pointer is on: it's
     /// outlined on the preview, so it's clear which it is.
     pub(crate) card_hover: Option<Layer>,
+    /// What was copied (Ctrl+C) or cut, to paste (see `clipboard_ui`):
+    /// kept across scenes and presets.
+    pub(crate) clipboard: Option<crate::settings::CopiedSources>,
+    /// Each animated image's frames, by key (its first is in `pictures`).
+    pub(crate) animations: std::collections::HashMap<u64, capture::layers::Animation>,
+    /// Each video file's size, frame rate and whether it has sound, once
+    /// asked for (`None`: it can't be played).
+    pub(crate) video_sizes: std::collections::HashMap<std::path::PathBuf, Option<(u32, u32, f64, bool)>>,
 }
 
-/// Where the sources are, as undo keeps it: the screen (its box or how it
-/// fills the video, in front or behind, its crop) and the webcam's placement.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// The video's sources as undo keeps them: the screen (its box or how it
+/// fills the video, its crop, its name), each webcam and boxed source as it
+/// is (so one taken out comes back), and which is in front.
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Arrangement {
     screen: ScreenCfg,
+    screen_title: Option<String>,
     framing: Framing,
     crop: Option<ScreenCrop>,
-    webcam: Option<PlacementCfg>,
+    webcams: Vec<crate::settings::WebcamCfg>,
+    visuals: Vec<crate::settings::VisualCfg>,
+    order: Vec<Layer>,
+    groups: Vec<crate::settings::GroupCfg>,
 }
 
-/// What's at `p` on the preview (`shown` puts a box there, as much of it as
-/// is on the preview: its handles are on that): a handle of a source (front
-/// first), else the source in front there.
-fn hit(layers: &[(Layer, Rect)], shown: &dyn Fn(Rect) -> Rect, p: Pos2) -> Option<(Layer, Handle)> {
-    for (l, r) in layers {
+/// What's at `p` on the preview (`shown` puts a box there, past the video's
+/// edge too: its handles are on that): a handle of the source
+/// selected, else that source if it's there (under others too: it's the
+/// one dragged), else the source in front there.
+fn hit(layers: &[(Layer, Rect)], shown: &dyn Fn(Rect) -> Rect, p: Pos2, selected: Option<Layer>) -> Option<(Layer, Handle)> {
+    // Only the one selected has handles.
+    if let Some((l, r)) = layers.iter().find(|(l, _)| Some(*l) == selected) {
         let bx = shown(*r);
         if let Some(h) = Handle::ALL.into_iter().find(|h| h.pos(bx).distance(p) <= HANDLE) {
             return Some((*l, h));
         }
+        if bx.expand(2.0).contains(p) {
+            return Some((*l, Handle::Move));
+        }
     }
-    layers.iter().find(|(_, r)| shown(*r).expand(2.0).contains(p)).map(|(l, _)| (*l, Handle::Move))
+    under(layers, shown, p).first().map(|l| (*l, Handle::Move))
+}
+
+/// The sources at `p` on the preview, the one in front first.
+fn under(layers: &[(Layer, Rect)], shown: &dyn Fn(Rect) -> Rect, p: Pos2) -> Vec<Layer> {
+    layers.iter().filter(|(_, r)| shown(*r).expand(2.0).contains(p)).map(|(l, _)| *l).collect()
+}
+
+/// What clicks at `p` on the preview go down through, front first: each
+/// source there, a group (of `groups`) before the first of its own there.
+fn picks_at(layers: &[(Layer, Rect)], shown: &dyn Fn(Rect) -> Rect, p: Pos2, groups: &[crate::settings::GroupCfg]) -> Vec<Selected> {
+    let mut out = Vec::new();
+    for l in under(layers, shown, p) {
+        if let Some(g) = groups.iter().find(|g| g.members.contains(&l))
+            && !out.contains(&Selected::Group(g.id))
+        {
+            out.push(Selected::Group(g.id));
+        }
+        out.push(Selected::Layer(l));
+    }
+    out
+}
+
+/// What a click at a place on the preview selects, of `under` (what's
+/// there, front first): the one in front, or, with one of them selected,
+/// the next one down (round to the front again from the back).
+fn clicked_through<T: PartialEq + Clone>(under: &[T], selected: Option<&T>) -> Option<T> {
+    match selected.and_then(|s| under.iter().position(|l| l == s)) {
+        Some(i) => under.get((i + 1) % under.len()).cloned(),
+        None => under.first().cloned(),
+    }
+}
+
+/// `r` (in `from`) where it is in `to`, as `from` became `to`: moved and
+/// scaled with it.
+fn mapped(r: Rect, from: Rect, to: Rect) -> Rect {
+    let sx = to.width() / from.width().max(1e-6);
+    let sy = to.height() / from.height().max(1e-6);
+    let p = |q: Pos2| Pos2::new(to.min.x + (q.x - from.min.x) * sx, to.min.y + (q.y - from.min.y) * sy);
+    Rect::from_min_max(p(r.min), p(r.max))
+}
+
+/// Words in a dark pill along the top of the preview (`frame`): what the
+/// keys do. Left out where it doesn't fit.
+fn pill(painter: &egui::Painter, frame: Rect, text: String) {
+    let galley = painter.layout_no_wrap(text, egui::FontId::proportional(11.5), Color32::from_gray(235));
+    let size = galley.size() + vec2(14.0, 6.0);
+    if size.x > frame.width() - 8.0 {
+        return;
+    }
+    let pill = Rect::from_center_size(Pos2::new(frame.center().x, frame.top() + 8.0 + size.y / 2.0), size);
+    painter.rect_filled(pill, pill.height() / 2.0, Color32::from_black_alpha(170));
+    painter.galley(pill.center() - galley.size() / 2.0, galley, Color32::WHITE);
 }
 
 /// What a move of `me` snaps to besides the video's edges and middle: the
@@ -171,7 +295,7 @@ fn lines_of(layers: &[(Layer, Rect)], me: Layer) -> Lines {
 }
 
 /// Whether a box covers all of the video (all of it, or past its edges).
-fn fills(r: Rect) -> bool {
+pub(crate) fn fills(r: Rect) -> bool {
     r.min.x <= 1e-4 && r.min.y <= 1e-4 && r.max.x >= 1.0 - 1e-4 && r.max.y >= 1.0 - 1e-4
 }
 
@@ -258,6 +382,10 @@ impl Turned {
         Self { turns: s.turns % 4, flip_h: s.flip_h, flip_v: s.flip_v }
     }
 
+    pub(crate) fn new(turns: u8, flip_h: bool, flip_v: bool) -> Self {
+        Self { turns: turns % 4, flip_h, flip_v }
+    }
+
     fn placement(self) -> capture::ScreenPlacement {
         capture::ScreenPlacement { turns: self.turns, flip_h: self.flip_h, flip_v: self.flip_v, ..capture::ScreenPlacement::whole(capture::Framing::Stretch) }
     }
@@ -317,12 +445,11 @@ fn same(a: Rect, b: Rect) -> bool {
 }
 
 /// The screen's box after dragging `handle` by `(dx, dy)` (fractions of the
-/// video) from `start`: moved (snapping to the video and to `lines`, unless
-/// `snap` is off), or resized from the opposite corner or side, keeping its
-/// shape unless it's to `stretch`. Moved, it stays in the video while it
-/// fits in it, and over all of it (across or down) while it's bigger,
-/// never further out than it was; resized, it goes as far as the video's
-/// edges, or as far past them as it was.
+/// video) from `start`: moved, or resized from the opposite corner or side,
+/// keeping its shape unless it's to `stretch`, snapping (unless `snap` is
+/// off) to the video's edges and middle and to `lines`. It goes past the
+/// video's edges as far as it's dragged, [`webcam_ui::SEEN`] of it staying
+/// on the video.
 pub(crate) fn screen_drag(start: Rect, handle: Handle, dx: f32, dy: f32, snap: bool, stretch: bool, lines: &Lines) -> Rect {
     if handle == Handle::Move {
         let mut r = start.translate(vec2(dx, dy));
@@ -331,36 +458,36 @@ pub(crate) fn screen_drag(start: Rect, handle: Handle, dx: f32, dy: f32, snap: b
             let sy = webcam_ui::snap_offset(&[r.min.y, r.max.y], r.center().y, &lines.ys);
             r = r.translate(vec2(sx, sy));
         }
-        let keep = |at: f32, size: f32, was: f32| {
-            let (lo, hi) = ((1.0 - size).min(0.0), (1.0 - size).max(0.0));
-            at.clamp(lo.min(was), hi.max(was))
-        };
-        let (x, y) = (keep(r.min.x, r.width(), start.min.x), keep(r.min.y, r.height(), start.min.y));
+        let (x, y) = (webcam_ui::seen(r.min.x, r.width()), webcam_ui::seen(r.min.y, r.height()));
         return Rect::from_min_size(Pos2::new(x, y), r.size());
     }
-    let bounds = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)).union(start);
-    webcam_ui::resize_within(start, handle.sides(), vec2(dx, dy), !stretch, bounds, vec2(MIN_SIZE, MIN_SIZE))
+    let bounds = Rect::from_min_max(Pos2::new(-GROW, -GROW), Pos2::new(1.0 + GROW, 1.0 + GROW)).union(start);
+    webcam_ui::resize_within(start, handle.sides(), vec2(dx, dy), !stretch, bounds, vec2(MIN_SIZE, MIN_SIZE), snap.then_some(lines))
 }
+
+/// How far past the video's edges a box can be resized, in videos.
+const GROW: f32 = 4.0;
 
 /// The screen's box and crop after cropping it by dragging `handle` by
 /// `(dx, dy)` (fractions of the video), from its box `start` showing `part`
 /// of a `dw`×`dh` display (in its pixels): the picture keeps its scale and
-/// place, the box follows the crop's edges, inside the video and the
-/// display (it can't be uncropped past it), at least 64 of its pixels each
-/// way, on even pixels. With `keep`, the box keeps its shape. `None`: all
-/// of the display.
-pub(crate) fn screen_crop_drag(start: Rect, part: Rect, (dw, dh): (u32, u32), handle: Handle, dx: f32, dy: f32, keep: bool) -> (Rect, Option<ScreenCrop>) {
+/// place, the box follows the crop's edges, inside the display (it can't
+/// be uncropped past it), past the video's edges too, at least 64 of its
+/// pixels each way, on even pixels, its edges snapping to `lines` (and the
+/// video's edges and middle). With `keep`, the box keeps its shape. `None`:
+/// all of the display.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn screen_crop_drag(start: Rect, part: Rect, (dw, dh): (u32, u32), handle: Handle, dx: f32, dy: f32, keep: bool, lines: Option<&Lines>) -> (Rect, Option<ScreenCrop>) {
     let (sx, sy) = (start.width() / part.width().max(1.0), start.height() / part.height().max(1.0));
     // All of the display, on the video.
     let whole = Rect::from_min_size(Pos2::new(start.min.x - part.min.x * sx, start.min.y - part.min.y * sy), vec2(dw as f32 * sx, dh as f32 * sy));
-    let video = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
-    let to = webcam_ui::resize_within(start, handle.sides(), vec2(dx, dy), keep, whole.intersect(video), vec2(64.0 * sx, 64.0 * sy));
+    let to = webcam_ui::resize_within(start, handle.sides(), vec2(dx, dy), keep, whole, vec2(64.0 * sx, 64.0 * sy), lines);
     // In the display's pixels, even.
     let even = |v: f32, most: u32| (((v.max(0.0) / 2.0).round() as u32) * 2).min(most & !1);
     let (x0, x1) = (even((to.min.x - whole.min.x) / sx, dw), even((to.max.x - whole.min.x) / sx, dw));
     let (y0, y1) = (even((to.min.y - whole.min.y) / sy, dh), even((to.max.y - whole.min.y) / sy, dh));
     let at = |x: u32, y: u32| Pos2::new(whole.min.x + x as f32 * sx, whole.min.y + y as f32 * sy);
-    let b = Rect::from_min_max(at(x0, y0), at(x1, y1)).intersect(video);
+    let b = Rect::from_min_max(at(x0, y0), at(x1, y1));
     let all = (x0, y0, x1, y1) == (0, 0, dw & !1, dh & !1);
     (b, (!all).then_some(ScreenCrop { w: x1 - x0, h: y1 - y0, at: Some([x0, y0]) }))
 }
@@ -396,10 +523,9 @@ impl App {
     }
 
     /// Where the screen goes as the video puts it, its first place and size:
-    /// Fill, Fit or Stretch's, in a video of a shape of its own, else all of
-    /// it (see [`framed`]).
+    /// Fit, Fill or Stretch's (see [`framed`]).
     pub(crate) fn screen_first_rect(&mut self, frame_aspect: f32) -> Rect {
-        let framing = if self.video_shaped() { self.settings.framing.into() } else { capture::Framing::Fit };
+        let framing = self.settings.framing.into();
         self.screen_aspect().map_or(Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), |picture| framed(framing, picture, frame_aspect))
     }
 
@@ -447,16 +573,40 @@ impl App {
     }
 
     pub(crate) fn arrangement(&self) -> Arrangement {
-        Arrangement { screen: self.settings.screen, framing: self.settings.framing, crop: self.settings.screen_crop, webcam: self.settings.webcam.as_ref().map(|w| w.placement) }
+        Arrangement {
+            screen: self.settings.screen,
+            screen_title: self.settings.screen_title.clone(),
+            framing: self.settings.framing,
+            crop: self.settings.screen_crop,
+            webcams: self.settings.webcams.clone(),
+            visuals: self.settings.visuals.clone(),
+            order: self.settings.layer_order(),
+            groups: self.settings.groups.clone(),
+        }
     }
 
     /// `was` (how the sources were before a change just made) can be gone
     /// back to.
     pub(crate) fn keep_for_undo(&mut self, was: Arrangement) {
-        // Taking the webcam out (or putting one in) isn't a step to go back to.
-        if was.webcam.is_some() != self.settings.webcam.is_some() {
+        self.canvas.last_step = None;
+        self.push_undo(was);
+    }
+
+    /// [`keep_for_undo`](Self::keep_for_undo), but a change to the same
+    /// thing (`what`) less than a second after the last is part of that
+    /// step: typing a word is one step, not one a letter.
+    pub(crate) fn keep_for_undo_as(&mut self, was: Arrangement, what: String) {
+        let now = std::time::Instant::now();
+        let same = self.canvas.last_step.as_ref().is_some_and(|(w, at)| *w == what && now.duration_since(*at) < std::time::Duration::from_millis(1200));
+        self.canvas.last_step = Some((what, now));
+        if same {
+            self.canvas.redo.clear();
             return;
         }
+        self.push_undo(was);
+    }
+
+    fn push_undo(&mut self, was: Arrangement) {
         if self.canvas.undo.last() != Some(&was) {
             self.canvas.undo.push(was);
             if self.canvas.undo.len() > 100 {
@@ -466,12 +616,118 @@ impl App {
         self.canvas.redo.clear();
     }
 
-    /// The sources where `a` has them (each one on or off as it is now).
+    /// The sources as `a` has them.
     fn arrange(&mut self, a: Arrangement) {
-        self.settings.screen = ScreenCfg { enabled: self.settings.screen.enabled, ..a.screen };
+        self.settings.screen = a.screen;
+        self.settings.screen_title = a.screen_title;
         (self.settings.framing, self.settings.screen_crop) = (a.framing, a.crop);
-        if let (Some(w), Some(p)) = (self.settings.webcam.as_mut(), a.webcam) {
-            w.placement = p;
+        self.settings.webcams = a.webcams;
+        self.settings.visuals = a.visuals;
+        self.settings.layer_order = a.order;
+        self.settings.groups = a.groups;
+        // A source no scene has any more (one deleted meanwhile) goes.
+        self.settings.tidy_pool();
+        self.settings.pack_groups();
+        self.forget_gone_selection();
+    }
+
+    /// What's selected, if it's gone: nothing.
+    pub(crate) fn forget_gone_selection(&mut self) {
+        let gone = match self.canvas.selected {
+            Some(Selected::Layer(l)) => !self.settings.layer_order().contains(&l),
+            Some(Selected::Group(id)) => self.settings.group(id).is_none(),
+            None => false,
+        };
+        if gone {
+            self.canvas.selected = None;
+        }
+        let order = self.settings.layer_order();
+        self.canvas.picked.retain(|l| order.contains(l));
+    }
+
+    /// What belonged to the scene shown before a switch: its undo steps
+    /// (they'd put its sources' places into the one shown now), a drag, the
+    /// right-click menu.
+    pub(crate) fn forget_canvas_steps(&mut self) {
+        self.canvas.undo.clear();
+        self.canvas.redo.clear();
+        self.canvas.last_step = None;
+        self.canvas.drag = None;
+        self.canvas.menu = None;
+        self.canvas.card_hover = None;
+        self.canvas.crop_mode = None;
+        self.canvas.group_hold = None;
+        self.canvas.picked.clear();
+    }
+
+    /// The video source selected, if one is.
+    pub(crate) fn selected_layer(&self) -> Option<Layer> {
+        match self.canvas.selected {
+            Some(Selected::Layer(l)) => Some(l),
+            _ => None,
+        }
+    }
+
+    /// Select `layer` (on the preview and in its list; its settings beside them).
+    pub(crate) fn select_layer(&mut self, layer: Layer) {
+        self.canvas.selected = Some(Selected::Layer(layer));
+    }
+
+    /// The group selected, if one is.
+    pub(crate) fn selected_group(&self) -> Option<u64> {
+        match self.canvas.selected {
+            Some(Selected::Group(id)) => Some(id),
+            _ => None,
+        }
+    }
+
+    /// What's moved and resized as one on the preview: the group selected
+    /// (its id), else the sources selected when there's more than one.
+    pub(crate) fn held_together(&self) -> Option<(Option<u64>, Vec<Layer>)> {
+        match self.selected_group() {
+            Some(id) => self.settings.group(id).map(|g| (Some(id), g.members.clone())),
+            None => Some(self.chosen()).filter(|c| c.len() > 1).map(|c| (None, c)),
+        }
+    }
+
+    /// Start renaming `layer`: a box for its name in its row, or in its
+    /// settings' head where they're open for it.
+    pub(crate) fn rename_layer(&mut self, ctx: &egui::Context, layer: Layer) {
+        // Its row shows: its group unfolded.
+        if let Some(id) = self.settings.group_of(layer).map(|g| g.id)
+            && let Some(g) = self.settings.group_mut(id)
+        {
+            g.collapsed = false;
+        }
+        let title = self.settings.layer_title(layer);
+        ctx.data_mut(|d| d.insert_temp(egui::Id::new(("rename_layer", layer)).with("draft"), title));
+    }
+
+    /// The sources selected, front first: the one selected and those picked
+    /// with it (Ctrl- or Shift-clicked in the list).
+    pub(crate) fn chosen(&self) -> Vec<Layer> {
+        let mut set = self.canvas.picked.clone();
+        if let Some(s) = self.selected_layer().filter(|s| !set.contains(s)) {
+            set.push(s);
+        }
+        self.layer_order().into_iter().filter(|l| set.contains(l)).collect()
+    }
+
+    /// What a new group of `layer` takes: it and the others picked in the
+    /// list (with the one selected), if it's one of them; else it alone.
+    pub(crate) fn grouping(&self, layer: Layer) -> Vec<Layer> {
+        let mut set = self.canvas.picked.clone();
+        if let Some(s) = self.selected_layer().filter(|s| !set.is_empty() && !set.contains(s)) {
+            set.push(s);
+        }
+        if set.len() > 1 && set.contains(&layer) { set } else { vec![layer] }
+    }
+
+    /// `layers` in a new group, selected.
+    pub(crate) fn group_layers(&mut self, layers: &[Layer]) {
+        if let Some(id) = self.settings.make_group(layers) {
+            self.canvas.selected = Some(Selected::Group(id));
+            self.canvas.picked.clear();
         }
     }
 
@@ -493,86 +749,195 @@ impl App {
         }
     }
 
-    /// Whether there's a change to where the sources are to undo or redo.
-    pub(crate) fn arrangement_history(&self) -> bool {
-        !self.canvas.undo.is_empty() || !self.canvas.redo.is_empty()
-    }
-
-    /// Undo and redo, left to right over the sources' cards: shown once
-    /// there's something to undo (or redo), ready for a change that went
-    /// wrong.
-    pub(crate) fn undo_buttons(&mut self, ui: &mut egui::Ui) {
-        use crate::ui_kit::{Btn, Kind};
-        if !self.arrangement_history() {
-            return;
-        }
-        let ctrl = crate::shortcuts::ctrl_name();
-        let undo = Btn::icon(Kind::Ghost, icon::ARROW_COUNTER_CLOCKWISE).small().enabled(!self.canvas.undo.is_empty()).tip(format!("Undo where your sources are  ({ctrl}+Z)"));
-        if undo.show(ui).clicked() {
+    /// The preview's own menu (right-click it where no source is): undo,
+    /// redo, the video's size, and previewing it on a monitor.
+    fn canvas_menu(&mut self, ui: &mut egui::Ui) {
+        let ctrl = crate::shortcuts::cmd_name();
+        let keys = |k: &[&str]| Some(k.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>());
+        if Item::new("Undo").icon(icon::ARROW_COUNTER_CLOCKWISE).enabled(!self.canvas.undo.is_empty()).keys(keys(&[ctrl, "Z"])).show(ui).clicked() {
             self.undo_arrangement();
+            ui.close();
         }
-        let redo = Btn::icon(Kind::Ghost, icon::ARROW_CLOCKWISE).small().enabled(!self.canvas.redo.is_empty()).tip(format!("Redo  ({ctrl}+Shift+Z)"));
-        if redo.show(ui).clicked() {
+        if Item::new("Redo").icon(icon::ARROW_CLOCKWISE).enabled(!self.canvas.redo.is_empty()).keys(keys(&[ctrl, "Shift", "Z"])).show(ui).clicked() {
             self.redo_arrangement();
+            ui.close();
+        }
+        crate::ui_kit::menu_sep(ui);
+        let aspect = self.frame_aspect().unwrap_or(16.0 / 9.0);
+        self.clipboard_items(ui, false, aspect);
+        crate::ui_kit::menu_sep(ui);
+        if Item::new("Video size and frame rate…").icon(icon::FRAME_CORNERS).show(ui).clicked() {
+            self.sources_view.editing = Some(crate::inspector_ui::Editing::Video);
+            ui.close();
+        }
+        let mut on = None;
+        crate::ui_kit::submenu(ui, Item::new("Preview on monitor").icon(icon::PROJECTOR_SCREEN), |ui| on = self.projector_items(ui));
+        if let Some(d) = on {
+            self.open_projector(&d);
+            ui.close();
         }
     }
 
-    /// Where the webcam goes.
-    pub(crate) fn webcam_placement(&self) -> Option<Placement> {
-        self.settings.webcam.as_ref().map(|w| w.placement.into())
+    /// Where webcam `key` goes.
+    pub(crate) fn webcam_placement(&self, key: u64) -> Option<Placement> {
+        self.settings.webcam(key).map(|w| w.placement.into())
+    }
+
+    /// Where a source is in a video of shape `frame_aspect` (fractions of
+    /// it), hidden or not.
+    pub(crate) fn layer_box(&mut self, layer: Layer, frame_aspect: f32) -> Option<Rect> {
+        match layer {
+            Layer::Screen => Some(self.screen_rect(frame_aspect)),
+            Layer::Webcam(key) => self.webcam_placement(key).map(|p| Rect::from_min_size(Pos2::new(p.x, p.y), vec2(p.w, p.h))),
+            Layer::Visual(key) => self.settings.visual(key).is_some().then(|| self.visual_rect(key, frame_aspect)),
+        }
     }
 
     /// The picture's sources, front first, for their cards: the screen, and
-    /// the webcam once there is one (off too).
+    /// each webcam and other display (off too).
     pub(crate) fn layer_order(&self) -> Vec<Layer> {
-        let webcam = self.settings.webcam.is_some().then_some(Layer::Webcam);
-        let order = if self.settings.screen.in_front { [Some(Layer::Screen), webcam] } else { [webcam, Some(Layer::Screen)] };
-        order.into_iter().flatten().collect()
+        self.settings.layer_order()
     }
 
     /// The sources in this order, front first.
     pub(crate) fn set_layer_order(&mut self, order: &[Layer]) {
-        let at = |l: Layer| order.iter().position(|o| *o == l);
-        if let (Some(screen), Some(webcam)) = (at(Layer::Screen), at(Layer::Webcam)) {
-            self.settings.screen.in_front = screen < webcam;
-        }
+        self.settings.layer_order = order.to_vec();
+        self.settings.pack_groups();
     }
 
     /// The sources in the video, front first, and where each is (fractions
     /// of the video).
     fn layers(&mut self, frame_aspect: f32) -> Vec<(Layer, Rect)> {
-        let screen = self.settings.screen.enabled.then(|| (Layer::Screen, self.screen_rect(frame_aspect)));
-        let webcam = self.webcam_placement().filter(|_| self.settings.webcam.as_ref().is_some_and(|w| w.enabled)).map(|p| (Layer::Webcam, Rect::from_min_size(Pos2::new(p.x, p.y), vec2(p.w, p.h))));
-        let order = if self.settings.screen.in_front { [screen, webcam] } else { [webcam, screen] };
-        order.into_iter().flatten().collect()
+        let mut out = Vec::new();
+        for l in self.layer_order() {
+            let r = match l {
+                Layer::Screen => self.settings.screen.enabled.then(|| self.screen_rect(frame_aspect)),
+                Layer::Webcam(key) => self.settings.webcam(key).filter(|w| w.enabled).map(|w| Rect::from_min_size(Pos2::new(w.placement.x, w.placement.y), vec2(w.placement.w, w.placement.h))),
+                Layer::Visual(key) => self.settings.visual(key).is_some_and(|d| d.enabled).then(|| self.visual_rect(key, frame_aspect)),
+            };
+            if let Some(r) = r {
+                out.push((l, r));
+            }
+        }
+        out
     }
 
     /// The sources on the preview (`frame_rect`, whose `response` takes the
-    /// pointer): their outlines and handles, dragging them, and their menus.
-    pub(crate) fn canvas_on_preview(&mut self, ui: &mut egui::Ui, frame_rect: Rect, response: &egui::Response) {
+    /// pointer): a click selects the one in front under it (or nothing), and
+    /// clicks again there the ones under it in turn; the one selected has
+    /// its outline and handles, to move, resize and (Alt) crop it, and it's
+    /// what's dragged where it is, under others too; any other can be
+    /// dragged, which selects it. Others show their outline under the
+    /// pointer, and right-click opens a source's menu. A locked source can't
+    /// be moved here, and clicks go through it. A source in a group: the
+    /// first click selects the group (moved and resized as one, its sources
+    /// with it), the next the source itself.
+    pub(crate) fn canvas_on_preview(&mut self, ui: &mut egui::Ui, frame_rect: Rect, room: Rect, response: &egui::Response) {
         let aspect = frame_rect.width() / frame_rect.height().max(1.0);
         let at = move |p: Pos2| Pos2::new(frame_rect.left() + p.x * frame_rect.width(), frame_rect.top() + p.y * frame_rect.height());
         let to_screen = move |r: Rect| Rect::from_min_max(at(r.min), at(r.max));
         let layers = self.layers(aspect);
-        if layers.is_empty() {
-            self.canvas.drag = None;
-            return;
-        }
-        // As much of a box as is on the preview: a screen bigger than the
-        // video reaches past it, and its outline and handles stay on it.
-        let shown = move |r: Rect| to_screen(r).intersect(frame_rect);
+        // A box where it is, past the video's edge too (what's past it
+        // isn't in the video: its outline and handles say where it goes),
+        // as far as the preview's room round it.
+        let shown = to_screen;
         let modifiers = ui.input(|i| i.modifiers);
-        let pointer = ui.input(|i| i.pointer.hover_pos()).filter(|p| frame_rect.expand(HANDLE).contains(*p));
+        // On the preview or its room: not on a dialog or menu over it (its
+        // cursors and outlines aren't theirs).
+        let on_preview = ui.rect_contains_pointer(room);
+        let pointer = ui.input(|i| i.pointer.hover_pos()).filter(|p| on_preview && room.contains(*p));
+        // What can be taken hold of: not what's locked.
+        let free: Vec<(Layer, Rect)> = layers.iter().filter(|(l, _)| !self.settings.is_locked(*l)).copied().collect();
+        let selected = self.selected_layer().filter(|l| free.iter().any(|(x, _)| x == l));
+        let hit_at = |p: Pos2| hit(&free, &shown, p, selected);
+        // Its handles crop: Alt held, or its Crop button on (that one only).
+        if self.canvas.crop_mode.is_some() && self.canvas.crop_mode != selected {
+            self.canvas.crop_mode = None;
+        }
+        let crop_on = modifiers.alt || self.canvas.crop_mode.is_some();
 
+        // The group selected (or the sources picked together), and its box:
+        // the boxes of its sources that can be taken hold of.
+        let group = self.held_together().and_then(|(id, members)| {
+            let boxes: Vec<(Layer, Rect)> = free.iter().filter(|(l, _)| members.contains(l)).copied().collect();
+            let bx = boxes.iter().map(|(_, r)| *r).reduce(|a, b| a.union(b))?;
+            Some((id, bx, boxes))
+        });
+        let group_hit = |p: Pos2| -> Option<Handle> {
+            let (_, bx, _) = group.as_ref()?;
+            let b = shown(*bx);
+            Handle::ALL.into_iter().find(|h| h.pos(b).distance(p) <= HANDLE).or_else(|| b.expand(2.0).contains(p).then_some(Handle::Move))
+        };
+        // A click selects what's under it, in front (a group before its
+        // sources), and again there the one under that, and so on; on
+        // nothing, nothing. On a handle, what's selected stays.
+        if let Some(p) = response.interact_pointer_pos()
+            && response.clicked()
+        {
+            let there = picks_at(&free, &shown, p, &self.settings.groups);
+            let on_handle = hit_at(p).is_some_and(|(l, h)| Some(l) == selected && h != Handle::Move) || group_hit(p).is_some_and(|h| h != Handle::Move);
+            if !on_handle {
+                let now = self.canvas.selected.clone();
+                self.canvas.selected = clicked_through(&there, now.as_ref());
+                self.canvas.picked.clear();
+            }
+        }
         // A drag only starts once the pointer has moved a little, so what was
         // grabbed is judged by where the button went down, not where it is now.
+        // The group selected is what's dragged on it; a source in a group,
+        // not selected itself, takes its group along.
+        let origin = response.drag_started().then(|| ui.input(|i| i.pointer.press_origin()).or(response.interact_pointer_pos())).flatten();
+        let mut layer_hold = origin.and_then(|p| hit_at(p).map(|h| (h, p)));
+        let group_held = origin.and_then(|p| match group_hit(p) {
+            Some(h) => group.as_ref().map(|(id, _, boxes)| (*id, h, p, boxes.iter().map(|(l, _)| *l).collect::<Vec<_>>())),
+            None => layer_hold.filter(|((l, _), _)| Some(*l) != selected).and_then(|((l, _), _)| self.settings.group_of(l).map(|g| (Some(g.id), Handle::Move, p, g.members.clone()))),
+        });
+        if let Some((id, handle, from, members)) = group_held {
+            layer_hold = None;
+            let boxes: Vec<(Layer, Rect)> = free.iter().filter(|(l, _)| members.contains(l)).copied().collect();
+            if let Some(start) = boxes.iter().map(|(_, r)| *r).reduce(|a, b| a.union(b)) {
+                if let Some(id) = id {
+                    self.canvas.selected = Some(Selected::Group(id));
+                }
+                let was = self.arrangement();
+                self.keep_for_undo(was);
+                self.canvas.group_hold = Some(GroupHold { handle, from, start, members: boxes });
+            }
+        }
+        let mut guides = Vec::new();
+        if let Some(hold) = self.canvas.group_hold.clone() {
+            if response.dragged()
+                && let Some(now) = response.interact_pointer_pos()
+            {
+                // Ctrl (Cmd on a Mac) held: no snapping.
+                let snap = !modifiers.command;
+                let (dx, dy) = ((now.x - hold.from.x) / frame_rect.width(), (now.y - hold.from.y) / frame_rect.height());
+                let others: Vec<(Layer, Rect)> = layers.iter().filter(|(l, _)| !hold.members.iter().any(|(m, _)| m == l)).copied().collect();
+                let lines = lines_of(&others, hold.members[0].0);
+                let to = screen_drag(hold.start, hold.handle, dx, dy, snap, modifiers.shift, &lines);
+                for (l, r) in &hold.members {
+                    self.set_layer_rect(*l, mapped(*r, hold.start, to), aspect);
+                }
+                if hold.handle == Handle::Move && snap {
+                    guides = snapped(to, &lines);
+                }
+                ui.ctx().set_cursor_icon(if hold.handle == Handle::Move { CursorIcon::Grabbing } else { hold.handle.cursor() });
+            }
+            if response.drag_stopped() || !response.dragged() && !ui.input(|i| i.pointer.any_down()) {
+                self.canvas.group_hold = None;
+            }
+        }
         if response.drag_started() {
-            let origin = ui.input(|i| i.pointer.press_origin()).or(response.interact_pointer_pos());
-            if let Some(((layer, handle), from)) = origin.and_then(|p| hit(&layers, &shown, p).map(|h| (h, p))) {
+            if let Some(((layer, handle), from)) = layer_hold {
+                if !self.canvas.picked.contains(&layer) {
+                    self.canvas.picked.clear();
+                }
+                self.select_layer(layer);
                 let was = self.arrangement();
                 let drag = match layer {
-                    Layer::Webcam => Drag::Webcam(handle, from, self.webcam_placement().unwrap_or_else(Placement::hidden)),
+                    Layer::Webcam(key) => Drag::Webcam(key, handle, from, self.webcam_placement(key).unwrap_or_else(Placement::hidden)),
                     Layer::Screen => self.take_screen(handle, from, aspect),
+                    Layer::Visual(key) => self.take_visual(key, handle, from, aspect),
                 };
                 // Something that moves can be put back (one held that can't, can't).
                 if !matches!(drag, Drag::Stuck(_)) {
@@ -581,29 +946,43 @@ impl App {
                 self.canvas.drag = Some(drag);
             }
         }
-        let mut guides = Vec::new();
         if let Some(drag) = self.canvas.drag {
             if response.dragged()
                 && let Some(now) = response.interact_pointer_pos()
             {
-                let snap = !modifiers.ctrl;
+                // Ctrl (Cmd on a Mac) held: no snapping.
+                let snap = !modifiers.command;
                 let d = |from: Pos2| ((now.x - from.x) / frame_rect.width(), (now.y - from.y) / frame_rect.height());
                 match drag {
-                    Drag::Webcam(handle, from, start) => {
-                        let lines = lines_of(&layers, Layer::Webcam);
+                    Drag::Webcam(key, handle, from, start) => {
+                        let lines = lines_of(&layers, Layer::Webcam(key));
                         let (dx, dy) = d(from);
-                        let moved = webcam_ui::drag(start, handle, dx, dy, Mods { crop: modifiers.alt, snap, keep: modifiers.shift }, &lines);
-                        if let Some(w) = self.settings.webcam.as_mut() {
+                        let moved = webcam_ui::drag(start, handle, dx, dy, Mods { crop: crop_on, snap, keep: modifiers.shift }, &lines);
+                        if let Some(w) = self.settings.webcam_mut(key) {
                             w.placement = PlacementCfg::laid_out(moved, aspect);
                         }
                         if handle == Handle::Move && snap {
                             guides = snapped(Rect::from_min_size(Pos2::new(moved.x, moved.y), vec2(moved.w, moved.h)), &lines);
                         }
                     }
+                    Drag::Visual(key, h) => {
+                        let (dx, dy) = d(h.from);
+                        let lines = lines_of(&layers, Layer::Visual(key));
+                        // A colour has no shape of its own to keep.
+                        let shapeless = self.settings.visual(key).is_some_and(|v| v.visual.shapeless());
+                        let (r, crop, picture) = h.dragged(dx, dy, Mods { crop: crop_on, snap, keep: modifiers.shift || shapeless }, &lines);
+                        if let Some(v) = self.settings.visual_mut(key) {
+                            v.placed = Some(BoxCfg::new([r.min.x, r.min.y, r.width(), r.height()], aspect, if shapeless { None } else { picture }));
+                            v.crop = crop;
+                        }
+                        if h.handle == Handle::Move && snap {
+                            guides = snapped(r, &lines);
+                        }
+                    }
                     Drag::Screen(h) => {
                         let (dx, dy) = d(h.from);
                         let lines = lines_of(&layers, Layer::Screen);
-                        let (r, crop, picture) = h.dragged(dx, dy, Mods { crop: modifiers.alt, snap, keep: modifiers.shift }, &lines);
+                        let (r, crop, picture) = h.dragged(dx, dy, Mods { crop: crop_on, snap, keep: modifiers.shift }, &lines);
                         self.settings.screen.placed = Some(BoxCfg::new([r.min.x, r.min.y, r.width(), r.height()], aspect, picture));
                         self.settings.screen_crop = crop;
                         if h.handle == Handle::Move && snap {
@@ -613,25 +992,48 @@ impl App {
                     Drag::Stuck(_) => {}
                 }
                 ui.ctx().set_cursor_icon(match drag {
-                    Drag::Webcam(Handle::Move, ..) | Drag::Screen(ScreenHold { handle: Handle::Move, .. }) => CursorIcon::Grabbing,
-                    Drag::Webcam(h, ..) | Drag::Screen(ScreenHold { handle: h, .. }) => h.cursor(),
+                    Drag::Webcam(_, Handle::Move, ..) | Drag::Visual(_, ScreenHold { handle: Handle::Move, .. }) | Drag::Screen(ScreenHold { handle: Handle::Move, .. }) => CursorIcon::Grabbing,
+                    Drag::Webcam(_, h, ..) | Drag::Visual(_, ScreenHold { handle: h, .. }) | Drag::Screen(ScreenHold { handle: h, .. }) => h.cursor(),
                     Drag::Stuck(_) => CursorIcon::NotAllowed,
                 });
             }
             if response.drag_stopped() || !response.dragged() && !ui.input(|i| i.pointer.any_down()) {
                 self.canvas.drag = None;
             }
-        } else if let Some((_, h)) = pointer.and_then(|p| hit(&layers, &shown, p)) {
+        } else if self.canvas.group_hold.is_none()
+            && let Some(h) = pointer.and_then(|p| group_hit(p).or_else(|| hit_at(p).map(|(_, h)| h)))
+        {
+            // A handle resizes only what's selected; anywhere else on a
+            // source moves it.
             ui.ctx().set_cursor_icon(h.cursor());
         }
 
-        // Right-click on a source: its menu (tied to the click that opened it).
+        // Right-click on a source: it's selected, and its menu opens (tied
+        // to the click that opened it).
         if response.secondary_clicked() {
-            self.canvas.menu = ui.input(|i| i.pointer.interact_pos()).and_then(|p| hit(&layers, &shown, p)).map(|(l, _)| l);
+            let p = ui.input(|i| i.pointer.interact_pos());
+            let on_group = p.and_then(group_hit).and(self.selected_group());
+            let target = match on_group {
+                Some(id) => Some(Selected::Group(id)),
+                None => p.and_then(hit_at).map(|(l, _)| match self.settings.group_of(l) {
+                    Some(g) if Some(l) != selected => Selected::Group(g.id),
+                    _ => Selected::Layer(l),
+                }),
+            };
+            self.canvas.selected = target.clone().or(self.canvas.selected.clone());
+            // Where no source is: the preview's own menu.
+            self.canvas.canvas_menu = target.is_none();
+            self.canvas.menu = target;
         }
-        if let Some(layer) = self.canvas.menu {
+        if self.canvas.menu.is_none() && self.canvas.canvas_menu && crate::ui_kit::context_menu(response, 230.0, |ui| self.canvas_menu(ui)).is_none() {
+            self.canvas.canvas_menu = false;
+        }
+        if let Some(target) = self.canvas.menu.clone() {
             let was = self.arrangement();
-            let open = crate::ui_kit::context_menu(response, 230.0, |ui| self.layer_menu(ui, layer, aspect));
+            let open = crate::ui_kit::context_menu(response, 230.0, |ui| match target {
+                Selected::Layer(layer) => self.layer_menu(ui, layer, aspect),
+                Selected::Group(id) => self.group_menu(ui, id),
+            });
             if self.arrangement() != was {
                 self.keep_for_undo(was);
             }
@@ -640,39 +1042,88 @@ impl App {
             }
         }
 
-        // The source held or under the pointer: its outline and handles, over
-        // the picture, on as much of it as is in the video (a screen bigger
-        // than the video, past its edges, along them). Not clipped further:
-        // a box against the picture's edge keeps all of its outline.
         let layers = self.layers(aspect);
+        let free: Vec<(Layer, Rect)> = layers.iter().filter(|(l, _)| !self.settings.is_locked(*l)).copied().collect();
+        let selected = self.selected_layer().filter(|l| layers.iter().any(|(x, _)| x == l));
+        let locked = selected.is_some_and(|l| self.settings.is_locked(l));
         let held = self.canvas.drag.map(|d| match d {
-            Drag::Webcam(h, ..) => (Layer::Webcam, Some(h)),
+            Drag::Webcam(key, h, ..) => (Layer::Webcam(key), Some(h)),
+            Drag::Visual(key, h) => (Layer::Visual(key), Some(h.handle)),
             Drag::Screen(h) => (Layer::Screen, Some(h.handle)),
             Drag::Stuck(l) => (l, None),
         });
-        let over = pointer.and_then(|p| hit(&layers, &shown, p));
-        // Else the source whose card the pointer's on: only its outline.
-        let card = self.canvas.card_hover.filter(|_| held.is_none() && over.is_none());
-        let Some((active, handle)) = held.or(over.map(|(l, h)| (l, Some(h)))).or(card.map(|l| (l, None))) else { return };
-        if held.is_none() && self.canvas.menu.is_some() {
+        let painter = ui.painter().with_clip_rect(room.intersect(ui.clip_rect()));
+        let over = pointer.and_then(|p| hit(&free, &shown, p, selected.filter(|_| !locked)));
+        // Under the pointer (or its row in the list), not selected: a thin
+        // outline, so it's clear what a click would pick.
+        let hovered = held.is_none().then(|| over.map(|(l, _)| l).or(self.canvas.card_hover)).flatten().filter(|l| Some(*l) != selected);
+        if let Some(r) = hovered.and_then(|l| layers.iter().find(|(x, _)| *x == l)).map(|(_, r)| shown(*r)).filter(|r| r.is_positive()) {
+            painter.rect_stroke(r.shrink(0.5), 0.0, Stroke::new(1.0, ACCENT.gamma_multiply(0.6)), egui::StrokeKind::Middle);
+        }
+        // Picked in the list besides it (to group): a thin outline each.
+        for r in self.canvas.picked.iter().filter_map(|p| layers.iter().find(|(l, _)| l == p)).map(|(_, r)| shown(*r)) {
+            painter.rect_stroke(r.shrink(0.5), 0.0, Stroke::new(1.5, ACCENT.gamma_multiply(0.8)), egui::StrokeKind::Middle);
+        }
+        // The group selected (or held, or the sources picked together):
+        // each of its sources' outlines, thin, and its box's, with handles
+        // to resize it all.
+        if let Some((_, members)) = self.held_together() {
+            let boxes: Vec<Rect> = layers.iter().filter(|(l, _)| members.contains(l)).map(|(_, r)| *r).collect();
+            let movable = free.iter().any(|(l, _)| members.contains(l));
+            if let Some(bx) = boxes.iter().copied().reduce(|a, b| a.union(b)) {
+                for r in &boxes {
+                    painter.rect_stroke(shown(*r).shrink(0.5), 0.0, Stroke::new(1.0, ACCENT.gamma_multiply(0.5)), egui::StrokeKind::Middle);
+                }
+                let b = shown(bx);
+                painter.rect_stroke(b.shrink(0.5), 0.0, Stroke::new(3.0, Color32::from_black_alpha(110)), egui::StrokeKind::Middle);
+                painter.rect_stroke(b.shrink(1.0), 0.0, Stroke::new(2.0, ACCENT), egui::StrokeKind::Middle);
+                let near = pointer.and_then(group_hit);
+                for h in Handle::ALL.into_iter().filter(|_| movable) {
+                    let r = if Some(h) == near.or(self.canvas.group_hold.as_ref().map(|g| g.handle)) { HANDLE * 0.65 } else { HANDLE * 0.5 };
+                    painter.circle(h.pos(b.shrink(1.0)), r, Color32::WHITE, Stroke::new(1.0, Color32::from_black_alpha(140)));
+                }
+            }
+            let guide = Stroke::new(1.0, ACCENT.gamma_multiply(0.6));
+            for (across, v) in guides {
+                let line = if across {
+                    let x = frame_rect.left() + v * frame_rect.width();
+                    [Pos2::new(x, frame_rect.top()), Pos2::new(x, frame_rect.bottom())]
+                } else {
+                    let y = frame_rect.top() + v * frame_rect.height();
+                    [Pos2::new(frame_rect.left(), y), Pos2::new(frame_rect.right(), y)]
+                };
+                painter.extend(egui::Shape::dashed_line(&line, guide, 5.0, 4.0));
+            }
             return;
         }
+        // The one held, else the one selected: its outline and handles.
+        let active = held.or(selected.map(|l| (l, over.filter(|(o, _)| *o == l).map(|(_, h)| h))));
+        let Some((active, handle)) = active else {
+            return;
+        };
         let Some(rect) = layers.iter().find(|(l, _)| *l == active).map(|(_, r)| *r) else { return };
         let bx = shown(rect);
         if !bx.is_positive() {
             return;
         }
-        let painter = ui.painter().clone();
-        let webcam: Option<Placement> = (active == Layer::Webcam).then(|| self.webcam_placement()).flatten();
-        // The screen's box, the part of the display it shows and the
-        // display's size, when it can be cropped (a display, not games and apps).
-        let screen = (active == Layer::Screen).then(|| self.screen_crop_hold(aspect)).flatten();
-        let croppable = webcam.is_some() || screen.is_some();
-        let cropping = modifiers.alt && croppable && handle.is_some_and(|h| h != Handle::Move);
+        let webcam: Option<Placement> = match active {
+            Layer::Webcam(key) => self.webcam_placement(key),
+            _ => None,
+        };
+        // The box, the part of the picture it shows and the picture's size,
+        // when it can be cropped (a display, a window, a picture; not games
+        // and apps, a colour or words).
+        let boxed = match active {
+            Layer::Screen => self.screen_crop_hold(aspect),
+            Layer::Visual(key) => self.visual_crop_hold(key, aspect),
+            Layer::Webcam(_) => None,
+        };
+        let croppable = webcam.is_some() || boxed.is_some();
+        let cropping = crop_on && croppable && handle.is_some_and(|h| h != Handle::Move);
 
         // Cropping: where the whole camera picture (or display) would be,
         // dashed, so it's clear what's cut off and how far it can grow back.
-        let whole = match (webcam, screen) {
+        let whole = match (webcam, boxed) {
             (Some(p), _) => {
                 let sx = p.w / (1.0 - p.crop[0] - p.crop[2]).max(0.01);
                 let sy = p.h / (1.0 - p.crop[1] - p.crop[3]).max(0.01);
@@ -687,10 +1138,10 @@ impl App {
             _ => None,
         };
         if let Some(whole) = whole.filter(|w| cropping && *w != bx) {
-            // Kept to the preview: all of a display can be far bigger than it.
+            // Kept to the preview's room: all of a display can be far bigger.
             let ghost = Stroke::new(1.0, CROP.gamma_multiply(0.8));
             let c = [whole.left_top(), whole.right_top(), whole.right_bottom(), whole.left_bottom(), whole.left_top()];
-            painter.with_clip_rect(frame_rect.expand(1.0)).extend(egui::Shape::dashed_line(&c, ghost, 4.0, 3.0));
+            painter.extend(egui::Shape::dashed_line(&c, ghost, 4.0, 3.0));
         }
 
         // Moved onto the video's middle, or another source's edge: a guide.
@@ -707,20 +1158,23 @@ impl App {
         }
 
         // The outline, just inside the box, over a soft dark edge so it shows
-        // on a bright picture. The camera's own sides, as they show (a
-        // mirrored picture's left is the camera's right), and the display's,
-        // are green if cropped (not one past the video: the video's edge
-        // is drawn there).
-        let [cl, ct, cr, cb] = match (webcam, self.screen_crop_shown()) {
+        // on a bright picture. A cropped side (as it shows: a mirrored
+        // picture's left is its right) is green, where it is.
+        let [cl, ct, cr, cb] = match (webcam, boxed.map(|(_, part, (dw, dh))| (part, (dw, dh)))) {
             (Some(p), _) => p.crop.map(|c| c > 0.0),
-            (None, Some((r, (dw, dh)))) if active == Layer::Screen => [r.min.x > 0.5, r.min.y > 0.5, r.max.x < (dw & !1) as f32 - 0.5, r.max.y < (dh & !1) as f32 - 0.5],
+            (None, Some(_)) => {
+                let shown_crop = match active {
+                    Layer::Screen => self.screen_crop_shown(),
+                    Layer::Visual(key) => self.visual_crop_shown(key),
+                    Layer::Webcam(_) => None,
+                };
+                shown_crop.map_or([false; 4], |(r, (dw, dh))| [r.min.x > 0.5, r.min.y > 0.5, r.max.x < (dw & !1) as f32 - 0.5, r.max.y < (dh & !1) as f32 - 0.5])
+            }
             _ => [false; 4],
         };
         let (flip_h, flip_v) = webcam.map_or((false, false), |p| (p.flip_h, p.flip_v));
         let (left, right) = if flip_h { (cr, cl) } else { (cl, cr) };
         let (top, bottom) = if flip_v { (cb, ct) } else { (ct, cb) };
-        let (left, top) = (left && rect.min.x >= -1e-4, top && rect.min.y >= -1e-4);
-        let (right, bottom) = (right && rect.max.x <= 1.0 + 1e-4, bottom && rect.max.y <= 1.0 + 1e-4);
         let line = bx.shrink(1.0);
         painter.rect_stroke(bx.shrink(0.5), 0.0, Stroke::new(3.0, Color32::from_black_alpha(110)), egui::StrokeKind::Middle);
         let side = |cropped: bool| Stroke::new(2.0, if cropped || cropping { CROP } else { ACCENT });
@@ -728,51 +1182,22 @@ impl App {
         painter.line_segment([line.left_bottom(), line.right_bottom()], side(bottom));
         painter.line_segment([line.left_top(), line.left_bottom()], side(left));
         painter.line_segment([line.right_top(), line.right_bottom()], side(right));
-        if card.is_some() {
-            return;
-        }
 
         // Handles: round, white, green while Alt is held on something that
         // crops (they'll crop); the one held or under the pointer a little bigger.
-        for h in Handle::ALL {
+        // Locked: its outline, no handles.
+        for h in Handle::ALL.into_iter().filter(|_| !locked) {
             let r = if Some(h) == handle { HANDLE * 0.65 } else { HANDLE * 0.5 };
-            let fill = if modifiers.alt && croppable || cropping { CROP } else { Color32::WHITE };
+            let fill = if crop_on && croppable || cropping { CROP } else { Color32::WHITE };
             painter.circle(h.pos(line), r, fill, Stroke::new(1.0, Color32::from_black_alpha(140)));
         }
 
-        // What the keys do, along the picture's top: always there, so it
-        // doesn't jump about as the box is dragged past the middle. (Alt is
-        // Option on a Mac, Ctrl Control: the keys as they're named there.)
-        let (alt, ctrl) = (crate::shortcuts::alt_name(), crate::shortcuts::ctrl_name());
-        // All of the video exactly, it has nowhere to move.
-        let moves = !stuck(rect);
-        let hint = match (self.canvas.drag, active) {
-            (Some(Drag::Stuck(_)), _) => "It fills the video: drag a corner to make it smaller".to_owned(),
-            (Some(Drag::Webcam(Handle::Move, ..) | Drag::Screen(ScreenHold { handle: Handle::Move, .. })), _) => format!("{ctrl}: place freely"),
-            (Some(Drag::Webcam(..) | Drag::Screen(..)), _) if cropping && modifiers.shift => "Cropping, keeping the shape".to_owned(),
-            (Some(Drag::Webcam(..) | Drag::Screen(..)), _) if cropping => "Cropping · Shift keeps the shape".to_owned(),
-            (Some(Drag::Webcam(..)), _) if modifiers.shift => format!("Stretching · {alt}: crop"),
-            (Some(Drag::Webcam(..)), _) => format!("Shift: stretch · {alt}: crop"),
-            (Some(Drag::Screen(h)), _) if modifiers.shift && h.cropping_from.is_some() => format!("Stretching · {alt}: crop"),
-            (Some(Drag::Screen(..)), _) if modifiers.shift => "Stretching · let go of Shift to keep its shape".to_owned(),
-            (Some(Drag::Screen(h)), _) if h.cropping_from.is_some() => format!("Shift: stretch · {alt}: crop"),
-            (Some(Drag::Screen(..)), _) => "Shift: stretch".to_owned(),
-            (None, Layer::Webcam) => format!("Drag to move · {alt} + handle to crop · right-click for more"),
-            (None, Layer::Screen) if croppable && moves => format!("Drag to move · {alt} + handle to crop · right-click for more"),
-            (None, Layer::Screen) if croppable => format!("Drag a corner to make it smaller · {alt} + handle to crop"),
-            (None, Layer::Screen) if moves => "Drag to move · a corner to resize · right-click for more".to_owned(),
-            (None, Layer::Screen) => "Drag a corner to make your screen smaller · right-click for more".to_owned(),
-        };
-        let galley = painter.layout_no_wrap(hint, egui::FontId::proportional(11.5), Color32::from_gray(235));
-        let size = galley.size() + vec2(14.0, 6.0);
-        if size.x > frame_rect.width() - 8.0 {
-            return;
+        // No keys said over the picture (they're in the menus, and the
+        // tooltips): only why a drag that can't move doesn't, while it's held.
+        if matches!(self.canvas.drag, Some(Drag::Stuck(_))) {
+            pill(&painter, frame_rect, "It fills the video: drag a corner to make it smaller".to_owned());
         }
-        let pill = Rect::from_center_size(Pos2::new(frame_rect.center().x, frame_rect.top() + 8.0 + size.y / 2.0), size);
-        painter.rect_filled(pill, pill.height() / 2.0, Color32::from_black_alpha(170));
-        painter.galley(pill.center() - galley.size() / 2.0, galley, Color32::WHITE);
     }
-
     /// Take hold of the screen: in its box as it is; put in by Fill, Fit or
     /// Stretch, into a box of its own where it shows, so nothing jumps
     /// (Fill's past the video's edges, Stretch's all of it, stretched). Over
@@ -791,6 +1216,28 @@ impl App {
         let cropping_from = (handle != Handle::Move).then(|| self.screen_crop_hold(aspect)).flatten();
         let (turned, display) = (Turned::of(&self.settings.screen), self.crop_whole().unwrap_or_default());
         Drag::Screen(ScreenHold { handle, from, start: shown, crop: self.settings.screen_crop, picture, cropping_from, turned, display })
+    }
+
+    /// Take hold of a boxed source, as the screen is (see `take_screen`):
+    /// one not placed yet goes into a box of its own where it shows; one
+    /// that's all of the video exactly, held in its middle, stays. Held by a
+    /// handle, its picture can be cropped too (Alt), but a colour's or words'.
+    fn take_visual(&mut self, key: u64, handle: Handle, from: Pos2, aspect: f32) -> Drag {
+        let start = self.visual_rect(key, aspect);
+        let Some(d) = self.settings.visual(key).cloned() else { return Drag::Stuck(Layer::Visual(key)) };
+        if d.placed.is_none() {
+            if stuck(start) && handle == Handle::Move {
+                return Drag::Stuck(Layer::Visual(key));
+            }
+            let picture = (!d.visual.shapeless()).then(|| self.visual_size(key).map(|(w, h)| w as f32 / h.max(1) as f32)).flatten();
+            if let Some(v) = self.settings.visual_mut(key) {
+                v.placed = Some(BoxCfg::new([start.min.x, start.min.y, start.width(), start.height()], aspect, picture));
+            }
+        }
+        let picture = self.settings.visual(key).and_then(|v| v.placed).and_then(|b| b.picture_aspect);
+        let cropping_from = (handle != Handle::Move && d.visual.croppable()).then(|| self.visual_crop_hold(key, aspect)).flatten();
+        let (turned, display) = (Turned::new(d.turns, d.flip_h, d.flip_v), self.visual_own_size(key).unwrap_or_default());
+        Drag::Visual(key, ScreenHold { handle, from, start, crop: d.crop, picture, cropping_from, turned, display })
     }
 
     /// The screen's crop as it is (left, top, width, height in the
@@ -833,21 +1280,11 @@ impl App {
         let s = &mut self.settings.screen;
         let by = if s.flip_h != s.flip_v { -by } else { by };
         s.turns = (s.turns as i8 + by).rem_euclid(4) as u8;
-        let Some(b) = s.placed else { return };
-        let r = Rect::from_min_size(Pos2::new(b.x, b.y), vec2(b.w, b.h));
-        let mut size = vec2(r.height() / aspect, r.width() * aspect);
-        if r.width() <= 1.0 + 1e-4 && r.height() <= 1.0 + 1e-4 {
-            size *= (1.0 / size.x).min(1.0 / size.y).min(1.0);
-        }
-        let mut t = Rect::from_center_size(r.center(), size);
-        if size.x <= 1.0 && size.y <= 1.0 {
-            t = t.translate(vec2((-t.min.x).max(0.0) - (t.max.x - 1.0).max(0.0), (-t.min.y).max(0.0) - (t.max.y - 1.0).max(0.0)));
-        }
-        s.placed = Some(BoxCfg::new([t.min.x, t.min.y, t.width(), t.height()], aspect, b.picture_aspect.map(|a| 1.0 / a)));
+        s.placed = s.placed.map(|b| turned_box(b, aspect));
     }
 
     /// Whether the video has a shape of its own (an aspect ratio, or a size
-    /// of its own): then the screen fills it as Fill, Fit or Stretch say.
+    /// of its own) rather than the screen's.
     pub(crate) fn video_shaped(&self) -> bool {
         self.settings.capture_shape().is_some()
     }
@@ -858,90 +1295,637 @@ impl App {
         self.settings.screen.placed = None;
     }
 
-    /// A source's menu (right-click it on the preview, or its card's ⋯),
-    /// the same for both as far as each goes: its Placement numbers, how the
-    /// video puts the screen in (a video of a shape of its own), its
-    /// position, size and crop back, turning, mirroring and flipping it,
-    /// which is in front, and taking the webcam out.
+    /// A source's menu (right-click it on the preview or in the list, or the
+    /// ⋯ in its settings' dialog), the same for each as far as each goes:
+    /// its settings, how the video puts the screen in, cropping it on the
+    /// preview, its position, size and crop back, turning, mirroring and
+    /// flipping it, which is in front, duplicating it, copying it to other
+    /// scenes (placed as here) or unlinking it from them, hiding and
+    /// removing it, with the keys that do the same.
     pub(crate) fn layer_menu(&mut self, ui: &mut egui::Ui, layer: Layer, aspect: f32) {
         let screen = layer == Layer::Screen;
-        if Item::new("Edit placement…").icon(icon::SLIDERS_HORIZONTAL).tip("Its position, size, turn and flip as numbers, on its card").show(ui).clicked() {
-            self.open_placement(layer);
+        let ctrl = crate::shortcuts::cmd_name();
+        let keys = |k: &[&str]| Some(k.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>());
+        // What it does, it does to each source picked with it in the list.
+        let set = self.grouping(layer);
+        let many = set.len() > 1;
+        let counted = |one: &str| if many { format!("{one} {} sources", set.len()) } else { one.to_owned() };
+        // Its settings, but in their dialog (whose ⋯ this is).
+        let in_dialog = self.sources_view.editing.is_some();
+        if !in_dialog && Item::new("Settings…").icon(icon::SLIDERS_HORIZONTAL).tip("What it shows, and where: in a dialog").show(ui).clicked() {
+            self.edit_layer(layer);
+            ui.close();
+        }
+        // Its name, in its row (or its settings' head, where they're open).
+        if Item::new("Rename").icon(icon::PENCIL_SIMPLE).keys(keys(&["F2"])).show(ui).clicked() {
+            self.rename_layer(ui.ctx(), layer);
             ui.close();
         }
         crate::ui_kit::menu_sep(ui);
-        // How the video puts the screen in: its position and size both.
-        if screen && self.video_shaped() {
-            let now = self.settings.screen.placed.is_none().then_some(self.settings.framing);
-            for (framing, _, label, tip) in FRAMINGS {
-                if Item::new(label).check(now == Some(framing)).tip(tip).show(ui).clicked() {
-                    self.screen_framed(framing);
-                    ui.close();
-                }
-            }
-            crate::ui_kit::menu_sep(ui);
+        // Cut, copy, paste; a copy of it here, it into another scene.
+        self.clipboard_items(ui, true, aspect);
+        let visuals: Vec<Layer> = set.iter().copied().filter(|l| matches!(l, Layer::Visual(_))).collect();
+        let label = if visuals.len() > 1 { format!("Duplicate {} sources", visuals.len()) } else { "Duplicate".to_owned() };
+        if !visuals.is_empty() && Item::new(label).icon(icon::STACK_PLUS).keys(keys(&[ctrl, "D"])).tip("A copy of its own, in this scene").show(ui).clicked() {
+            self.duplicate_layers(&visuals, aspect);
+            ui.close();
         }
-        // Each on its own; both are its first place and size.
-        let (position, size) = if screen { self.screen_resettable(aspect) } else { self.webcam_resettable() };
+        if !many {
+            self.copy_menu(ui, layer);
+        }
+        crate::ui_kit::menu_sep(ui);
+        // Where it is and how it's turned, in a menu of their own (all here,
+        // this one was taller than a short window): the screen's framings,
+        // the resets, turns and flips.
+        enum Act {
+            Framing(Framing),
+            ResetPosition,
+            ResetSize,
+            ResetCrop,
+            Turn(i8),
+            Flip(bool),
+        }
+        let resettable: Vec<(bool, bool)> = set.iter().map(|l| self.layer_resettable(*l, aspect)).collect();
+        let (position, size) = (resettable.iter().any(|r| r.0), resettable.iter().any(|r| r.1));
         let (place_tip, size_tip) = match layer {
             Layer::Screen if self.video_shaped() => ("Back in the middle of the video, its size kept", "Back to the size the video gives it, where it is"),
             Layer::Screen => ("Back in the middle of the video, its size kept", "As big as the video again, where it is"),
-            Layer::Webcam => ("Back to the bottom-right corner, its size kept", "A quarter of the video wide again, where it is"),
+            Layer::Webcam(_) => ("Back to the bottom-right corner, its size kept", "A quarter of the video wide again, where it is"),
+            Layer::Visual(_) => ("Back in the middle of the video, its size kept", "Its own size again (a pixel of it a pixel of the video), where it is"),
         };
-        if Item::new("Reset position").icon(icon::ARROWS_OUT_CARDINAL).enabled(position).tip(place_tip).show(ui).clicked() {
-            if screen { self.screen_reset_position(aspect) } else { self.webcam_reset_position(aspect) }
+        let cropped = self.layer_cropped(layer).filter(|_| !many);
+        let (mirrored, upside_down) = self.layer_flips(layer);
+        // How the video puts the screen in: its position and size both. In
+        // the screen's own shape too, for when it changes (a game at a
+        // stretched resolution).
+        let framing = (screen && !many).then(|| self.settings.screen.placed.is_none().then_some(self.settings.framing));
+        let mut act = None;
+        crate::ui_kit::submenu(ui, Item::new("Transform").icon(icon::BOUNDING_BOX), |ui| {
+            if let Some(now) = framing {
+                for (f, _, label, tip) in FRAMINGS {
+                    if Item::new(label).check(now == Some(f)).tip(tip).show(ui).clicked() {
+                        act = Some(Act::Framing(f));
+                    }
+                }
+                crate::ui_kit::menu_sep(ui);
+            }
+            if Item::new("Reset position").icon(icon::ARROWS_OUT_CARDINAL).enabled(position).tip(place_tip).show(ui).clicked() {
+                act = Some(Act::ResetPosition);
+            }
+            if Item::new("Reset size").icon(icon::RESIZE).enabled(size).tip(size_tip).show(ui).clicked() {
+                act = Some(Act::ResetSize);
+            }
+            if let Some(cropped) = cropped
+                && Item::new("Reset crop").icon(icon::ARROWS_OUT).enabled(cropped).tip("All of its picture again").show(ui).clicked()
+            {
+                act = Some(Act::ResetCrop);
+            }
+            crate::ui_kit::menu_sep(ui);
+            // Turned a quarter at a time, as it's seen.
+            for (label, ic, by) in [("Turn clockwise", icon::ARROW_CLOCKWISE, 1), ("Turn anticlockwise", icon::ARROW_COUNTER_CLOCKWISE, -1)] {
+                if Item::new(label).icon(ic).show(ui).clicked() {
+                    act = Some(Act::Turn(by));
+                }
+            }
+            if Item::new("Mirror").icon(icon::FLIP_HORIZONTAL).check(mirrored).tip("Flip left to right").show(ui).clicked() {
+                act = Some(Act::Flip(true));
+            }
+            if Item::new("Flip upside down").icon(icon::FLIP_VERTICAL).check(upside_down).show(ui).clicked() {
+                act = Some(Act::Flip(false));
+            }
+        });
+        if let Some(act) = act {
+            for l in &set {
+                match act {
+                    Act::Framing(f) => self.screen_framed(f),
+                    Act::ResetPosition => self.layer_reset_position(*l, aspect),
+                    Act::ResetSize => self.layer_reset_size(*l, aspect),
+                    Act::ResetCrop => self.layer_uncrop(*l, aspect),
+                    Act::Turn(by) => self.turn_layer(*l, by, aspect),
+                    Act::Flip(across) => self.flip_layer(*l, across, aspect),
+                }
+            }
             ui.close();
         }
-        if Item::new("Reset size").icon(icon::RESIZE).enabled(size).tip(size_tip).show(ui).clicked() {
-            if screen { self.screen_reset_size(aspect) } else { self.webcam_reset_size(aspect) }
-            ui.close();
+        if cropped.is_some() {
+            // Its handles crop till Done or Enter, on the preview (the
+            // dialog closes for it).
+            let tip = format!("Drag its handles to cut its edges off, till Done or Enter ({} and a handle do it too)", crate::shortcuts::alt_name());
+            if Item::new("Crop").icon(icon::CROP).tip(tip).show(ui).clicked() {
+                self.select_layer(layer);
+                self.canvas.crop_mode = Some(layer);
+                self.sources_view.editing = None;
+                ui.close();
+            }
         }
-        // Its crop: a display's or the camera's (games and apps have none).
-        if !screen || self.crop_whole().is_some() {
-            let cropped = if screen { self.settings.screen_crop.is_some_and(|c| !c.is_none()) } else { self.webcam_placement().is_some_and(|p| p.crop.iter().any(|c| *c > 0.0)) };
-            let tip = if screen { "All of the screen again" } else { "All of the camera's picture again" };
-            if Item::new("Reset crop").icon(icon::CROP).enabled(cropped).tip(tip).show(ui).clicked() {
-                if screen { self.settings.screen_crop = None } else { self.webcam_uncropped(aspect) }
+        // Which is in front: with others to go in front of or behind.
+        let order = self.layer_order();
+        if order.len() > set.len() {
+            let at = order.iter().position(|l| *l == layer).unwrap_or(0);
+            let (front, back) = if many { (true, true) } else { (at > 0, at + 1 < order.len()) };
+            let mut step = None;
+            crate::ui_kit::submenu(ui, Item::new("Order").icon(icon::ARROWS_DOWN_UP), |ui| {
+                if Item::new("Bring to front").icon(icon::SELECTION_FOREGROUND).enabled(front).keys(keys(&[ctrl, "Shift", "]"])).show(ui).clicked() {
+                    step = Some(OrderStep::Front);
+                }
+                if order.len() > 2 && Item::new("Bring forward").icon(icon::ARROW_UP).enabled(front).keys(keys(&[ctrl, "]"])).show(ui).clicked() {
+                    step = Some(OrderStep::Forward);
+                }
+                if order.len() > 2 && Item::new("Send backward").icon(icon::ARROW_DOWN).enabled(back).keys(keys(&[ctrl, "["])).show(ui).clicked() {
+                    step = Some(OrderStep::Backward);
+                }
+                if Item::new("Send to back").icon(icon::SELECTION_BACKGROUND).enabled(back).keys(keys(&[ctrl, "Shift", "["])).show(ui).clicked() {
+                    step = Some(OrderStep::Back);
+                }
+            });
+            if let Some(step) = step {
+                self.move_layers(&set, step);
                 ui.close();
             }
         }
         crate::ui_kit::menu_sep(ui);
-        // Turned a quarter at a time, as it's seen.
-        for (label, ic, by) in [("Turn clockwise", icon::ARROW_CLOCKWISE, 1), ("Turn anticlockwise", icon::ARROW_COUNTER_CLOCKWISE, -1)] {
-            if Item::new(label).icon(ic).show(ui).clicked() {
-                self.turn_layer(layer, by, aspect);
+        // Groups: a new one of it (and the others picked in the list), into
+        // another, or out of its own.
+        let set = self.grouping(layer);
+        let label = if set.len() > 1 { format!("Group {} sources", set.len()) } else { "Group".to_owned() };
+        if Item::new(label).icon(icon::FOLDER_SIMPLE_PLUS).keys(keys(&[ctrl, "G"])).tip("Moved, resized, hidden and locked as one").show(ui).clicked() {
+            self.group_layers(&set);
+            ui.close();
+        }
+        let own = self.settings.group_of(layer).map(|g| g.id);
+        let others: Vec<(u64, String)> = self.settings.groups.iter().filter(|g| Some(g.id) != own).map(|g| (g.id, g.name.clone())).collect();
+        if !others.is_empty() {
+            let mut into = None;
+            crate::ui_kit::submenu(ui, Item::new("Move to group").icon(icon::FOLDER_SIMPLE), |ui| {
+                for (id, name) in &others {
+                    if Item::new(name.clone()).show(ui).clicked() {
+                        into = Some(*id);
+                    }
+                }
+            });
+            if let Some(id) = into {
+                for l in &set {
+                    self.settings.set_group(*l, Some(id));
+                }
                 ui.close();
             }
         }
+        let grouped = set.iter().any(|l| self.settings.group_of(*l).is_some());
+        if grouped && Item::new("Take out of group").icon(icon::FOLDER_SIMPLE_MINUS).show(ui).clicked() {
+            for l in &set {
+                self.settings.set_group(*l, None);
+            }
+            ui.close();
+        }
         crate::ui_kit::menu_sep(ui);
-        let (mirrored, upside_down) = match layer {
+        let locked = set.iter().all(|l| self.settings.is_locked(*l));
+        let lock = Item::new(counted(if locked { "Unlock" } else { "Lock" })).icon(if locked { icon::LOCK_SIMPLE_OPEN } else { icon::LOCK_SIMPLE }).keys(keys(&[ctrl, "Shift", "L"]));
+        let lock = lock.tip(if locked { "It moves on the preview again" } else { "It can't be moved on the preview, and clicks go through it" });
+        if lock.show(ui).clicked() {
+            for l in &set {
+                self.settings.set_locked(*l, !locked);
+            }
+            ui.close();
+        }
+        // Any showing: Hide hides them all; else Show shows them.
+        let on = set.iter().any(|l| self.layer_enabled(*l));
+        if Item::new(counted(if on { "Hide" } else { "Show" })).icon(if on { icon::EYE_SLASH } else { icon::EYE }).keys(keys(&["H"])).tip(if on { "Out of your clips, its settings kept" } else { "Back in your clips" }).show(ui).clicked() {
+            for l in &set {
+                self.set_layer_enabled(*l, !on);
+            }
+            ui.close();
+        }
+        if Item::new(counted("Remove")).icon(icon::TRASH).danger().keys(keys(&["Del"])).tip("Take it out of this scene").show(ui).clicked() {
+            self.remove_layers(&set);
+            ui.close();
+        }
+    }
+
+    /// Copy to scene (the same source into another scene, or every one,
+    /// placed as here: one that has it already is placed so), and Unlink
+    /// from other scenes (a copy of its own here; never a webcam, a camera
+    /// opening once, nor the screen).
+    fn copy_menu(&mut self, ui: &mut egui::Ui, layer: Layer) {
+        let title = self.settings.layer_title(layer);
+        // Each other scene: whether it has it, and whether it can't take it
+        // (where a scene draws one webcam, one that has another).
+        let others: Vec<(u64, String, bool, bool)> = self
+            .settings
+            .scenes
+            .iter()
+            .filter(|s| s.id != self.settings.active_scene)
+            .map(|s| {
+                let has = s.items.iter().any(|i| i.layer() == layer);
+                let full = !capture::layers::MANY && matches!(layer, Layer::Webcam(_)) && s.items.iter().any(|i| matches!(i.layer(), Layer::Webcam(_)) && i.layer() != layer);
+                (s.id, s.name.clone(), has, full)
+            })
+            .collect();
+        if !others.is_empty() {
+            let mut to: Vec<(u64, String)> = Vec::new();
+            crate::ui_kit::submenu(ui, Item::new("Copy to scene").icon(icon::COPY_SIMPLE), |ui| {
+                for (id, name, has, full) in &others {
+                    let item = Item::new(name.clone()).check(*has).enabled(!*full);
+                    let item = if *full {
+                        item.tip("It has a webcam: a scene shows one here")
+                    } else if *has {
+                        item.tip("It's there: placed as here (where it is, its size and crop)")
+                    } else {
+                        item.tip("The same source, placed as here")
+                    };
+                    if item.show(ui).clicked() {
+                        to = vec![(*id, name.clone())];
+                    }
+                }
+                if others.len() > 1 {
+                    crate::ui_kit::menu_sep(ui);
+                    if Item::new("Every scene").tip("In each, placed as here").show(ui).clicked() {
+                        to = others.iter().filter(|o| !o.3).map(|o| (o.0, o.1.clone())).collect();
+                    }
+                }
+            });
+            if !to.is_empty() {
+                for (id, _) in &to {
+                    self.settings.copy_to_scene(layer, *id);
+                }
+                let where_ = if to.len() == 1 { to[0].1.clone() } else { "every scene".to_owned() };
+                self.toast_icon(icon::COPY_SIMPLE, format!("Copied {title} to {where_}"));
+                ui.close();
+            }
+        }
+        if layer == Layer::Screen || self.settings.scenes_with(layer).is_empty() {
+            return;
+        }
+        let cam = matches!(layer, Layer::Webcam(_));
+        let item = Item::new("Unlink from other scenes").icon(icon::LINK_BREAK).enabled(!cam);
+        let item = if cam {
+            item.tip("A camera opens once, in one format: what it shows is the same in every scene. Where it is, and its crop, are each scene's own")
+        } else {
+            item.tip("A copy of its own here: what it shows changes in this scene alone")
+        };
+        if item.show(ui).clicked()
+            && let Some(new) = self.settings.unlink(layer)
+        {
+            if self.selected_layer() == Some(layer) {
+                self.select_layer(new);
+            }
+            if let Some(crate::inspector_ui::Editing::Layer { layer: open, .. }) = &mut self.sources_view.editing
+                && *open == layer
+            {
+                *open = new;
+            }
+            self.toast_icon(icon::LINK_BREAK, format!("{title} is this scene's own now"));
+            ui.close();
+        }
+    }
+
+    /// Whether a source's in the video (its switch, its eye in the list).
+    pub(crate) fn layer_enabled(&self, layer: Layer) -> bool {
+        match layer {
+            Layer::Screen => self.settings.screen.enabled,
+            Layer::Webcam(key) => self.settings.webcam(key).is_some_and(|w| w.enabled),
+            Layer::Visual(key) => self.settings.visual(key).is_some_and(|v| v.enabled),
+        }
+    }
+
+    pub(crate) fn set_layer_enabled(&mut self, layer: Layer, on: bool) {
+        match layer {
+            Layer::Screen => self.settings.screen.enabled = on,
+            Layer::Webcam(key) => {
+                if let Some(w) = self.settings.webcam_mut(key) {
+                    w.enabled = on;
+                }
+            }
+            Layer::Visual(key) => {
+                if let Some(v) = self.settings.visual_mut(key) {
+                    v.enabled = on;
+                }
+            }
+        }
+    }
+
+    /// The Sources page's keys, while nothing's being typed and no menu or
+    /// dialog is open: Ctrl+Z and Ctrl+Shift+Z (or Ctrl+Y) undo and redo,
+    /// and for the source selected, Delete removes it, the arrows nudge it a
+    /// pixel (Shift: ten), H hides or shows it, Ctrl+D duplicates it,
+    /// Ctrl+[ and Ctrl+] send it back or forward (Shift: all the way), and
+    /// Esc lets go of it. `aspect`: the video's shape.
+    pub(crate) fn source_keys(&mut self, ctx: &egui::Context, aspect: f32) {
+        if ctx.egui_wants_keyboard_input() || crate::ui_kit::overlay_open(ctx) || egui::Popup::is_any_open(ctx) {
+            return;
+        }
+        use egui::{Key, Modifiers};
+        let (redo, undo) = ctx.input_mut(|i| (i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z) || i.consume_key(Modifiers::COMMAND, Key::Y), i.consume_key(Modifiers::COMMAND, Key::Z)));
+        if undo {
+            self.undo_arrangement();
+        }
+        if redo {
+            self.redo_arrangement();
+        }
+        self.clipboard_keys(ctx, aspect);
+        if let Some(id) = self.selected_group() {
+            self.group_keys(ctx, id, aspect);
+            return;
+        }
+        if self.selected_layer().is_none() {
+            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+                self.canvas.selected = None;
+                self.canvas.picked.clear();
+            }
+            return;
+        }
+        // What the keys do, they do to each source selected (the one
+        // selected and those picked with it in the list).
+        let set = self.chosen();
+        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::G)) {
+            let was = self.arrangement();
+            self.group_layers(&set);
+            self.keep_for_undo(was);
+            return;
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F2))
+            && let Some(layer) = self.selected_layer()
+        {
+            self.rename_layer(ctx, layer);
+            return;
+        }
+        // Cropping on the preview: Esc or Enter is done (it stays selected).
+        if self.canvas.crop_mode.is_some() && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape) || i.consume_key(Modifiers::NONE, Key::Enter)) {
+            self.canvas.crop_mode = None;
+            return;
+        }
+        let was = self.arrangement();
+        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::L)) {
+            let lock = !set.iter().all(|l| self.settings.is_locked(*l));
+            for l in &set {
+                self.settings.set_locked(*l, lock);
+            }
+        }
+        let (remove, hide, dup, esc, back, forward, mods) = ctx.input_mut(|i| {
+            (
+                i.consume_key(Modifiers::NONE, Key::Delete) || i.consume_key(Modifiers::NONE, Key::Backspace),
+                i.consume_key(Modifiers::NONE, Key::H),
+                i.consume_key(Modifiers::COMMAND, Key::D),
+                i.consume_key(Modifiers::NONE, Key::Escape),
+                i.key_pressed(Key::OpenBracket) && i.modifiers.command,
+                i.key_pressed(Key::CloseBracket) && i.modifiers.command,
+                i.modifiers,
+            )
+        });
+        let step = if mods.shift { 10.0 } else { 1.0 };
+        let nudge = ctx.input(|i| {
+            let mut d = vec2(0.0, 0.0);
+            if !i.modifiers.command && !i.modifiers.alt {
+                if i.key_pressed(Key::ArrowLeft) {
+                    d.x -= step;
+                }
+                if i.key_pressed(Key::ArrowRight) {
+                    d.x += step;
+                }
+                if i.key_pressed(Key::ArrowUp) {
+                    d.y -= step;
+                }
+                if i.key_pressed(Key::ArrowDown) {
+                    d.y += step;
+                }
+            }
+            d
+        });
+        if esc {
+            self.canvas.selected = None;
+            self.canvas.picked.clear();
+            return;
+        }
+        if remove {
+            self.remove_layers(&set);
+        }
+        if hide {
+            // Any showing: all hidden; else all shown.
+            let on = !set.iter().any(|l| self.layer_enabled(*l));
+            for l in &set {
+                self.set_layer_enabled(*l, on);
+            }
+        }
+        if dup {
+            let visuals: Vec<Layer> = set.iter().copied().filter(|l| matches!(l, Layer::Visual(_))).collect();
+            if !visuals.is_empty() {
+                self.duplicate_layers(&visuals, aspect);
+            } else if set.iter().any(|l| matches!(l, Layer::Webcam(_))) {
+                self.toast_icon(icon::INFO, "A camera can be in a scene once");
+            }
+        }
+        if back || forward {
+            let step = match (forward, mods.shift) {
+                (true, true) => OrderStep::Front,
+                (true, false) => OrderStep::Forward,
+                (false, true) => OrderStep::Back,
+                (false, false) => OrderStep::Backward,
+            };
+            self.move_layers(&set, step);
+        }
+        if nudge != vec2(0.0, 0.0) {
+            let free: Vec<Layer> = set.iter().copied().filter(|l| !self.settings.is_locked(*l)).collect();
+            for l in free {
+                self.nudge_layer(l, nudge, aspect);
+            }
+        }
+        if self.arrangement() != was {
+            // Nudges in a row are one step.
+            if nudge != vec2(0.0, 0.0) && !remove && !hide && !dup {
+                self.keep_for_undo_as(was, format!("nudge {set:?}"));
+            } else {
+                self.keep_for_undo(was);
+            }
+        }
+    }
+
+    /// A source moved by `by` of the video's pixels (one not placed by hand
+    /// yet goes into a box of its own where it is, first).
+    pub(crate) fn nudge_layer(&mut self, layer: Layer, by: egui::Vec2, aspect: f32) {
+        let Some((vw, vh)) = capture::frame_size(&self.video_source(), self.settings.video_size()) else { return };
+        let d = vec2(by.x / vw.max(1) as f32, by.y / vh.max(1) as f32);
+        match layer {
+            Layer::Screen => {
+                let r = self.screen_rect(aspect).translate(d);
+                self.place_screen(r, aspect);
+            }
+            Layer::Webcam(key) => {
+                if let Some(w) = self.settings.webcam_mut(key) {
+                    w.placement.x += d.x;
+                    w.placement.y += d.y;
+                }
+            }
+            Layer::Visual(key) => {
+                let r = self.visual_rect(key, aspect).translate(d);
+                let picture = self.settings.visual(key).and_then(|v| v.placed).and_then(|b| b.picture_aspect).or_else(|| self.visual_size(key).map(|(w, h)| w as f32 / h.max(1) as f32));
+                let shapeless = self.settings.visual(key).is_some_and(|v| v.visual.shapeless());
+                if let Some(v) = self.settings.visual_mut(key) {
+                    v.placed = Some(BoxCfg::new([r.min.x, r.min.y, r.width(), r.height()], aspect, if shapeless { None } else { picture }));
+                }
+            }
+        }
+    }
+
+    /// A source put at place `to` in the order (0: in front).
+    pub(crate) fn move_layer(&mut self, layer: Layer, to: usize) {
+        let mut order = self.layer_order();
+        let Some(at) = order.iter().position(|l| *l == layer) else { return };
+        order.remove(at);
+        order.insert(to.min(order.len()), layer);
+        self.set_layer_order(&order);
+    }
+
+    /// Sources moved in the order together, each keeping its place among
+    /// them: all to the front or the back, or each a place forward or back
+    /// (past one that isn't moving).
+    pub(crate) fn move_layers(&mut self, set: &[Layer], step: OrderStep) {
+        let mut order = self.layer_order();
+        let moving: Vec<Layer> = order.iter().copied().filter(|l| set.contains(l)).collect();
+        match step {
+            OrderStep::Front | OrderStep::Back => {
+                order.retain(|l| !set.contains(l));
+                let at = if step == OrderStep::Front { 0 } else { order.len() };
+                order.splice(at..at, moving);
+            }
+            OrderStep::Forward => {
+                for i in 1..order.len() {
+                    if set.contains(&order[i]) && !set.contains(&order[i - 1]) {
+                        order.swap(i, i - 1);
+                    }
+                }
+            }
+            OrderStep::Backward => {
+                for i in (0..order.len().saturating_sub(1)).rev() {
+                    if set.contains(&order[i]) && !set.contains(&order[i + 1]) {
+                        order.swap(i, i + 1);
+                    }
+                }
+            }
+        }
+        self.set_layer_order(&order);
+    }
+
+    /// Sources taken out of the scene shown, each gone for good once no
+    /// other scene has it (but the screen, the preset's own: Add › From
+    /// other scenes puts it back). Ctrl+Z puts them back too.
+    pub(crate) fn remove_layers(&mut self, layers: &[Layer]) {
+        let name = match layers {
+            [] => return,
+            [one] => self.settings.layer_title(*one),
+            many => format!("{} sources", many.len()),
+        };
+        let mut gone = false;
+        for l in layers {
+            gone |= self.settings.remove_from_scene(*l);
+        }
+        self.forget_gone_selection();
+        let what = if gone { format!("Removed {name}") } else { format!("Took {name} out of this scene") };
+        self.toast_action(icon::TRASH, what, "Undo", crate::shell::ToastAction::UndoSources);
+    }
+
+    /// A copy of each of these boxed sources (see `duplicate_layer`), all
+    /// selected.
+    pub(crate) fn duplicate_layers(&mut self, layers: &[Layer], aspect: f32) {
+        let mut copies = Vec::new();
+        for l in layers {
+            self.duplicate_layer(*l, aspect);
+            copies.extend(self.selected_layer().filter(|s| s != l));
+        }
+        self.canvas.picked = if copies.len() > 1 { copies } else { Vec::new() };
+    }
+
+    /// A copy of a boxed source, in front of it, a little down and right,
+    /// selected.
+    pub(crate) fn duplicate_layer(&mut self, layer: Layer, aspect: f32) {
+        let Layer::Visual(key) = layer else { return };
+        let r = self.visual_rect(key, aspect);
+        let Some(mut copy) = self.settings.visual(key).cloned() else { return };
+        let new = self.settings.new_key();
+        copy.key = new;
+        copy.title = copy.title.map(|t| format!("{t} copy"));
+        let picture = copy.placed.and_then(|b| b.picture_aspect);
+        let moved = r.translate(vec2(0.02, 0.02 * aspect));
+        copy.placed = Some(BoxCfg::new([moved.min.x, moved.min.y, moved.width(), moved.height()], aspect, picture));
+        self.settings.visuals.push(copy);
+        let at = self.layer_order().iter().position(|l| *l == layer).unwrap_or(0);
+        let mut order = self.layer_order();
+        order.retain(|l| *l != Layer::Visual(new));
+        order.insert(at, Layer::Visual(new));
+        self.set_layer_order(&order);
+        self.select_layer(Layer::Visual(new));
+    }
+
+    /// How a source is mirrored and flipped.
+    pub(crate) fn layer_flips(&self, layer: Layer) -> (bool, bool) {
+        match layer {
             Layer::Screen => (self.settings.screen.flip_h, self.settings.screen.flip_v),
-            Layer::Webcam => self.webcam_placement().map_or((false, false), |p| (p.flip_h, p.flip_v)),
-        };
-        if Item::new("Mirror").icon(icon::FLIP_HORIZONTAL).check(mirrored).tip("Flip left to right").show(ui).clicked() {
-            self.flip_layer(layer, true, aspect);
-            ui.close();
+            Layer::Webcam(key) => self.webcam_placement(key).map_or((false, false), |p| (p.flip_h, p.flip_v)),
+            Layer::Visual(key) => self.settings.visual(key).map_or((false, false), |d| (d.flip_h, d.flip_v)),
         }
-        if Item::new("Flip upside down").icon(icon::FLIP_VERTICAL).check(upside_down).show(ui).clicked() {
-            self.flip_layer(layer, false, aspect);
-            ui.close();
+    }
+
+    /// How a source is turned, in quarters clockwise as it's seen.
+    pub(crate) fn layer_turns(&self, layer: Layer) -> u8 {
+        match layer {
+            Layer::Screen => self.settings.screen.turns % 4,
+            Layer::Webcam(key) => self.webcam_placement(key).map_or(0, |p| p.turns % 4),
+            Layer::Visual(key) => self.settings.visual(key).map_or(0, |d| d.turns % 4),
         }
-        // Which is in front: only with both in the video.
-        let both = self.settings.screen.enabled && self.settings.webcam.as_ref().is_some_and(|w| w.enabled);
-        if both {
-            crate::ui_kit::menu_sep(ui);
-            let in_front = (layer == Layer::Screen) == self.settings.screen.in_front;
-            let (label, ic) = if in_front { ("Send to back", icon::SELECTION_BACKGROUND) } else { ("Bring to front", icon::SELECTION_FOREGROUND) };
-            if Item::new(label).icon(ic).show(ui).clicked() {
-                self.settings.screen.in_front = !self.settings.screen.in_front;
-                ui.close();
+    }
+
+    /// Whether a source is cropped, when it can be (`None`: it can't, as
+    /// games and apps, a colour or words can't).
+    pub(crate) fn layer_cropped(&self, layer: Layer) -> Option<bool> {
+        match layer {
+            Layer::Screen => self.crop_whole().map(|_| self.settings.screen_crop.is_some_and(|c| !c.is_none())),
+            Layer::Webcam(key) => Some(self.webcam_placement(key).is_some_and(|p| p.crop.iter().any(|c| *c > 0.0))),
+            Layer::Visual(key) => self.settings.visual(key).filter(|v| v.visual.croppable()).map(|v| v.crop.is_some_and(|c| !c.is_none())),
+        }
+    }
+
+    /// All of a source's picture again.
+    pub(crate) fn layer_uncrop(&mut self, layer: Layer, aspect: f32) {
+        match layer {
+            Layer::Screen => self.settings.screen_crop = None,
+            Layer::Webcam(key) => self.webcam_uncropped(key, aspect),
+            Layer::Visual(key) => self.visual_uncrop(key, aspect),
+        }
+    }
+
+    /// Whether a source's position, and its size, can be reset.
+    pub(crate) fn layer_resettable(&mut self, layer: Layer, aspect: f32) -> (bool, bool) {
+        match layer {
+            Layer::Screen => self.screen_resettable(aspect),
+            Layer::Webcam(key) => self.webcam_resettable(key),
+            Layer::Visual(key) => {
+                if self.settings.visual(key).is_none_or(|d| d.placed.is_none()) {
+                    return (false, false);
+                }
+                let (r, first) = (self.visual_rect(key, aspect), self.visual_first_rect(key, aspect));
+                (!same(r, centred(r)), (r.size() - first.size()).length() > 1e-3)
             }
         }
-        if layer == Layer::Webcam {
-            crate::ui_kit::menu_sep(ui);
-            if Item::new("Remove the webcam").icon(icon::TRASH).danger().tip("Take it out of your clips, and forget its place").show(ui).clicked() {
-                self.settings.webcam = None;
-                ui.close();
+    }
+
+    /// A source back in the middle of the video (a webcam: its corner), its size kept.
+    pub(crate) fn layer_reset_position(&mut self, layer: Layer, aspect: f32) {
+        match layer {
+            Layer::Screen => self.screen_reset_position(aspect),
+            Layer::Webcam(key) => self.webcam_reset_position(key, aspect),
+            Layer::Visual(key) => {
+                let r = centred(self.visual_rect(key, aspect));
+                self.place_visual(key, r, aspect);
+            }
+        }
+    }
+
+    /// A source back to its first size, where it is.
+    pub(crate) fn layer_reset_size(&mut self, layer: Layer, aspect: f32) {
+        match layer {
+            Layer::Screen => self.screen_reset_size(aspect),
+            Layer::Webcam(key) => self.webcam_reset_size(key, aspect),
+            Layer::Visual(key) => {
+                let r = resized_in_place(self.visual_rect(key, aspect), self.visual_first_rect(key, aspect).size());
+                self.place_visual(key, r, aspect);
             }
         }
     }
@@ -951,10 +1935,17 @@ impl App {
     pub(crate) fn turn_layer(&mut self, layer: Layer, by: i8, aspect: f32) {
         match layer {
             Layer::Screen => self.screen_turn(by, aspect),
-            Layer::Webcam => {
-                if let Some(w) = self.settings.webcam.as_mut() {
+            Layer::Webcam(key) => {
+                if let Some(w) = self.settings.webcam_mut(key) {
                     let p: Placement = w.placement.into();
                     w.placement = PlacementCfg::laid_out(webcam_ui::contain(p.turn(by, aspect)), aspect);
+                }
+            }
+            Layer::Visual(key) => {
+                if let Some(d) = self.settings.visual_mut(key) {
+                    let by = if d.flip_h != d.flip_v { -by } else { by };
+                    d.turns = (d.turns as i8 + by).rem_euclid(4) as u8;
+                    d.placed = d.placed.map(|b| turned_box(b, aspect));
                 }
             }
         }
@@ -968,15 +1959,35 @@ impl App {
                 let s = &mut self.settings.screen;
                 if across { s.flip_h = !s.flip_h } else { s.flip_v = !s.flip_v }
             }
-            Layer::Webcam => {
-                if let Some(w) = self.settings.webcam.as_mut() {
+            Layer::Webcam(key) => {
+                if let Some(w) = self.settings.webcam_mut(key) {
                     let p: Placement = w.placement.into();
                     let p = if across { Placement { flip_h: !p.flip_h, ..p } } else { Placement { flip_v: !p.flip_v, ..p } };
                     w.placement = PlacementCfg::laid_out(p, aspect);
                 }
             }
+            Layer::Visual(key) => {
+                if let Some(d) = self.settings.visual_mut(key) {
+                    if across { d.flip_h = !d.flip_h } else { d.flip_v = !d.flip_v }
+                }
+            }
         }
     }
+}
+
+/// A box turned a quarter, for its picture turned: the new shape around its
+/// middle, shrunk to stay in the video if it was in it.
+fn turned_box(b: BoxCfg, aspect: f32) -> BoxCfg {
+    let r = Rect::from_min_size(Pos2::new(b.x, b.y), vec2(b.w, b.h));
+    let mut size = vec2(r.height() / aspect, r.width() * aspect);
+    if r.width() <= 1.0 + 1e-4 && r.height() <= 1.0 + 1e-4 {
+        size *= (1.0 / size.x).min(1.0 / size.y).min(1.0);
+    }
+    let mut t = Rect::from_center_size(r.center(), size);
+    if size.x <= 1.0 && size.y <= 1.0 {
+        t = t.translate(vec2((-t.min.x).max(0.0) - (t.max.x - 1.0).max(0.0), (-t.min.y).max(0.0) - (t.max.y - 1.0).max(0.0)));
+    }
+    BoxCfg::new([t.min.x, t.min.y, t.width(), t.height()], aspect, b.picture_aspect.map(|a| 1.0 / a))
 }
 
 #[cfg(test)]
@@ -994,12 +2005,35 @@ mod tests {
     /// The screen's box moves inside the video, snapping to its middle and
     /// to the webcam's edges; a corner scales it from the opposite one,
     /// keeping its shape, no smaller than the least.
+    /// Clicks at one place select the sources there in turn, front first,
+    /// round again from the back; the one selected is what's dragged there.
+    #[test]
+    fn clicks_go_down_through_the_sources() {
+        let (a, b, c) = (Layer::Webcam(1), Layer::Visual(2), Layer::Screen);
+        assert_eq!(clicked_through(&[a, b, c], None), Some(a));
+        assert_eq!(clicked_through(&[a, b, c], Some(&a)), Some(b));
+        assert_eq!(clicked_through(&[a, b, c], Some(&c)), Some(a));
+        assert_eq!(clicked_through(&[b, c], Some(&a)), Some(b), "one selected elsewhere: the one in front");
+        assert_eq!(clicked_through::<Layer>(&[], Some(&a)), None);
+        let layers = [(a, rect(0.5, 0.5, 0.3, 0.3)), (c, rect(0.0, 0.0, 1.0, 1.0))];
+        let shown = |r: Rect| Rect::from_min_max((r.min.to_vec2() * 1000.0).to_pos2(), (r.max.to_vec2() * 1000.0).to_pos2());
+        let p = Pos2::new(600.0, 600.0);
+        assert_eq!(hit(&layers, &shown, p, None), Some((a, Handle::Move)));
+        assert_eq!(hit(&layers, &shown, p, Some(c)), Some((c, Handle::Move)), "the screen, selected, under the webcam");
+        // In a group, the group first, then the source itself.
+        let groups = [crate::settings::GroupCfg { id: 7, name: "G".into(), members: vec![a], collapsed: false }];
+        assert_eq!(picks_at(&layers, &shown, p, &groups), vec![Selected::Group(7), Selected::Layer(a), Selected::Layer(c)]);
+        let moved = mapped(rect(0.5, 0.5, 0.2, 0.2), rect(0.5, 0.5, 0.4, 0.4), rect(0.0, 0.0, 0.8, 0.8));
+        assert!(close(moved, rect(0.0, 0.0, 0.4, 0.4)), "{moved:?}");
+    }
+
     #[test]
     fn the_screens_box() {
         let none = Lines::default();
         let start = rect(0.1, 0.1, 0.4, 0.4);
         assert!(close(screen_drag(start, Handle::Move, 0.1, 0.0, false, false, &none), rect(0.2, 0.1, 0.4, 0.4)));
-        assert!(close(screen_drag(start, Handle::Move, 0.9, 0.9, false, false, &none), rect(0.6, 0.6, 0.4, 0.4)));
+        // Past the video's edges, a sliver of it kept on.
+        assert!(close(screen_drag(start, Handle::Move, 0.9, 0.9, false, false, &none), rect(0.97, 0.97, 0.4, 0.4)));
         // Its middle onto the video's, from close by.
         assert!(close(screen_drag(start, Handle::Move, 0.195, 0.0, true, false, &none), rect(0.3, 0.1, 0.4, 0.4)));
         // Its right edge onto the webcam's left.
@@ -1008,15 +2042,20 @@ mod tests {
         // The bottom-right corner, dragged out: twice as big from the top-left.
         let r = screen_drag(start, Handle::SE, 0.4, 0.4, false, false, &none);
         assert!(close(r, rect(0.1, 0.1, 0.8, 0.8)), "{r:?}");
-        // Only as big as fits.
+        // As big as it's dragged, past the video's edges.
         let r = screen_drag(start, Handle::SE, 2.0, 2.0, false, false, &none);
+        assert!(close(r, rect(0.1, 0.1, 2.4, 2.4)), "{r:?}");
+        // Its corner, near the video's, snaps onto it (not with Ctrl).
+        let r = screen_drag(start, Handle::SE, 0.495, 0.495, true, false, &none);
         assert!(close(r, rect(0.1, 0.1, 0.9, 0.9)), "{r:?}");
+        let r = screen_drag(start, Handle::SE, 0.495, 0.495, false, false, &none);
+        assert!(close(r, rect(0.1, 0.1, 0.895, 0.895)), "{r:?}");
         // Never smaller than the least, the other corner where it was.
         let r = screen_drag(start, Handle::NW, 1.0, 1.0, false, false, &none);
         assert!((r.width() - MIN_SIZE).abs() < 1e-4 && (r.max - start.max).length() < 1e-4, "{r:?}");
-        // Shift: stretched, each side on its own, as far as the video's edges.
+        // Shift: stretched, each side on its own.
         let r = screen_drag(start, Handle::SE, 0.4, 2.0, false, true, &none);
-        assert!(close(r, rect(0.1, 0.1, 0.8, 0.9)), "{r:?}");
+        assert!(close(r, rect(0.1, 0.1, 0.8, 2.4)), "{r:?}");
         let r = screen_drag(start, Handle::E, 0.2, 0.3, false, true, &none);
         assert!(close(r, rect(0.1, 0.1, 0.6, 0.4)), "{r:?}");
     }
@@ -1052,18 +2091,13 @@ mod tests {
         // A 16:10 screen over a 16:9 video: past its top and bottom.
         let over = covering(1.6, 16.0 / 9.0);
         assert!(close(over, rect(0.0, -1.0 / 18.0, 1.0, 10.0 / 9.0)), "{over:?}");
-        // Down as far as it goes, its top at the video's; not sideways.
+        // Anywhere, a sliver of it kept on the video.
         let r = screen_drag(over, Handle::Move, 0.3, 0.5, false, false, &none);
-        assert!(close(r, rect(0.0, 0.0, 1.0, 10.0 / 9.0)), "{r:?}");
-        let r = screen_drag(over, Handle::Move, 0.0, -0.5, false, false, &none);
-        assert!(close(r, rect(0.0, -1.0 / 9.0, 1.0, 10.0 / 9.0)), "{r:?}");
+        assert!(close(r, rect(0.3, 0.5 - 1.0 / 18.0, 1.0, 10.0 / 9.0)), "{r:?}");
+        let r = screen_drag(over, Handle::Move, -2.0, 0.0, false, false, &none);
+        assert!(close(r, rect(-0.97, -1.0 / 18.0, 1.0, 10.0 / 9.0)), "{r:?}");
         // Its middle snaps back onto the video's.
         assert!(close(screen_drag(over, Handle::Move, 0.0, 0.005, true, false, &none), over));
-        // Hanging past the top (made smaller from below): it moves in, not out.
-        let hanging = rect(0.0, -0.05, 0.9, 1.0);
-        assert!(close(screen_drag(hanging, Handle::Move, 0.0, 0.0, false, false, &none), hanging));
-        assert!(close(screen_drag(hanging, Handle::Move, 0.0, -0.1, false, false, &none), hanging));
-        assert!(close(screen_drag(hanging, Handle::Move, 0.0, 0.2, false, false, &none), rect(0.0, 0.0, 0.9, 1.0)));
         // Its side handle: where it was, then smaller, keeping its shape.
         assert!(close(screen_drag(over, Handle::E, 0.0, 0.0, false, false, &none), over));
         let r = screen_drag(over, Handle::E, -0.5, 0.0, false, false, &none);
@@ -1071,28 +2105,28 @@ mod tests {
     }
 
     /// Cropped with Alt: the picture keeps its scale and place, the box
-    /// follows the crop's edge; it can't be uncropped past the display or
-    /// out of the video, and all of the display again is no crop.
+    /// follows the crop's edge; it can't be uncropped past the display, and
+    /// all of the display again is no crop.
     #[test]
     fn cropping_the_screen() {
         let crop = |w, h, x, y| Some(ScreenCrop { w, h, at: Some([x, y]) });
         // Filling the video: the middle 1920×1080 of a 2560×1440 display,
         // its left edge dragged a quarter of the video in.
-        let (b, c) = screen_crop_drag(rect(0.0, 0.0, 1.0, 1.0), rect(320.0, 180.0, 1920.0, 1080.0), (2560, 1440), Handle::W, 0.25, 0.0, false);
+        let (b, c) = screen_crop_drag(rect(0.0, 0.0, 1.0, 1.0), rect(320.0, 180.0, 1920.0, 1080.0), (2560, 1440), Handle::W, 0.25, 0.0, false, None);
         assert!(close(b, rect(0.25, 0.0, 0.75, 1.0)), "{b:?}");
         assert_eq!(c, crop(1440, 1080, 800, 180));
-        // Out past the video's edge: the box stays in the video.
-        let (b, c) = screen_crop_drag(rect(0.0, 0.0, 1.0, 1.0), rect(320.0, 180.0, 1920.0, 1080.0), (2560, 1440), Handle::W, -0.5, 0.0, false);
-        assert!(close(b, rect(0.0, 0.0, 1.0, 1.0)), "{b:?}");
-        assert_eq!(c, crop(1920, 1080, 320, 180));
+        // Out past the video's edge: as far as the display goes.
+        let (b, c) = screen_crop_drag(rect(0.0, 0.0, 1.0, 1.0), rect(320.0, 180.0, 1920.0, 1080.0), (2560, 1440), Handle::W, -0.5, 0.0, false, None);
+        assert!(close(b, rect(-1.0 / 6.0, 0.0, 7.0 / 6.0, 1.0)), "{b:?}");
+        assert_eq!(c, crop(2240, 1080, 0, 180));
         // In a box of its own: its right edge out to the display's, then all of it.
-        let (b, c) = screen_crop_drag(rect(0.1, 0.1, 0.4, 0.4), rect(0.0, 0.0, 1280.0, 1440.0), (2560, 1440), Handle::E, 0.9, 0.0, false);
+        let (b, c) = screen_crop_drag(rect(0.1, 0.1, 0.4, 0.4), rect(0.0, 0.0, 1280.0, 1440.0), (2560, 1440), Handle::E, 0.9, 0.0, false, None);
         assert!(close(b, rect(0.1, 0.1, 0.8, 0.4)), "{b:?}");
         assert_eq!(c, None);
         // Never less than 64 of its pixels, on even ones.
-        let (_, c) = screen_crop_drag(rect(0.0, 0.0, 1.0, 1.0), rect(0.0, 0.0, 2560.0, 1440.0), (2560, 1440), Handle::SE, -2.0, -2.0, false);
+        let (_, c) = screen_crop_drag(rect(0.0, 0.0, 1.0, 1.0), rect(0.0, 0.0, 2560.0, 1440.0), (2560, 1440), Handle::SE, -2.0, -2.0, false, None);
         assert_eq!(c, crop(64, 64, 0, 0));
-        let (_, c) = screen_crop_drag(rect(0.0, 0.0, 1.0, 1.0), rect(0.0, 0.0, 2560.0, 1440.0), (2560, 1440), Handle::N, 0.0, 0.10011, false);
+        let (_, c) = screen_crop_drag(rect(0.0, 0.0, 1.0, 1.0), rect(0.0, 0.0, 2560.0, 1440.0), (2560, 1440), Handle::N, 0.0, 0.10011, false, None);
         assert_eq!(c, crop(2560, 1296, 0, 144));
     }
 

@@ -1,5 +1,6 @@
 //! Back and forward, as in a browser: the mouse's side buttons step through the
-//! places visited — a library folder, a clip in the player, Sources, Settings.
+//! places visited — a library folder, a clip in the player, Sources, a
+//! Settings pane.
 //!
 //! The editor is no place: it may hold unsaved edits, so the buttons do nothing
 //! there, and going back never lands in it.
@@ -16,7 +17,7 @@ enum Place {
     Clips(library::Filter),
     View(PathBuf),
     Sources,
-    Settings,
+    Settings(crate::settings_ui::Pane),
 }
 
 #[derive(Default)]
@@ -32,7 +33,7 @@ impl App {
             Page::Clips => Place::Clips(self.library_filter.clone()),
             Page::View => Place::View(self.viewer.as_ref()?.clip().to_path_buf()),
             Page::Sources => Place::Sources,
-            Page::Settings => Place::Settings,
+            Page::Settings => Place::Settings(self.settings_pane),
             Page::Edit | Page::VoiceReview => return None,
         })
     }
@@ -83,7 +84,7 @@ impl App {
                 kept == *f
             }
             Place::View(p) => self.clips.iter().any(|c| &c.path == p),
-            Place::Sources | Place::Settings => true,
+            Place::Sources | Place::Settings(_) => true,
         }
     }
 
@@ -104,7 +105,7 @@ impl App {
             }
             Place::View(p) => self.open_viewer(p),
             Place::Sources => self.page = Page::Sources,
-            Place::Settings => self.page = Page::Settings,
+            Place::Settings(pane) => self.open_settings(pane),
         }
     }
 }

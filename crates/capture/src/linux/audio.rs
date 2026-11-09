@@ -14,7 +14,9 @@
 //!   the speakers' monitor, it hears apps whatever device they play on.
 //!
 //! A watcher on PipeWire's registry links and unlinks as apps open and close
-//! their sound, so an app source starts by itself when its app does.
+//! their sound, so an app source starts by itself when its app does. Sources
+//! can be added and taken out while it runs ([`SystemAudio::add`],
+//! [`SystemAudio::remove`]).
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -169,6 +171,10 @@ pub(crate) struct SystemAudio {
 enum Cmd {
     /// Point the mic source `id`'s stream at another device.
     SetMic { id: String, device: String },
+    /// Capture this source too, from now on.
+    Add(AudioSource, Arc<SourceFeed>, Arc<Channel>),
+    /// Stop capturing the source `id`.
+    Remove(String),
     Stop,
 }
 
@@ -192,6 +198,22 @@ impl SystemAudio {
     /// same track). False if `id` isn't a mic source.
     pub(crate) fn set_mic(&mut self, id: &str, device: &str) -> bool {
         self.mics.iter().any(|m| m == id) && self.tx.send(Cmd::SetMic { id: id.to_owned(), device: device.to_owned() }).is_ok()
+    }
+
+    /// Capture `source` too, into `feed`, while it runs: its stream made at
+    /// once (not waited for); the desktop leaves out an app added on its own
+    /// from then on, if it leaves those out.
+    pub(crate) fn add(&mut self, source: AudioSource, feed: Arc<SourceFeed>, channel: Arc<Channel>) {
+        if matches!(source.kind, SourceKind::Microphone { .. }) {
+            self.mics.push(source.id.clone());
+        }
+        let _ = self.tx.send(Cmd::Add(source, feed, channel));
+    }
+
+    /// Stop capturing the source `id`, while it runs (not waited for).
+    pub(crate) fn remove(&mut self, id: &str) {
+        self.mics.retain(|m| m != id);
+        let _ = self.tx.send(Cmd::Remove(id.to_owned()));
     }
 
     pub(crate) fn stop(self) {
@@ -236,34 +258,16 @@ fn run(sources: Vec<(AudioSource, Arc<SourceFeed>, Arc<Channel>)>, ready: &mpsc:
             .register()
     };
 
-    // App sources' apps, which a desktop source may leave out.
-    let app_ids: Vec<String> = sources
-        .iter()
-        .filter_map(|(s, ..)| match &s.kind {
-            SourceKind::App { bundle_id } => Some(bundle_id.clone()),
-            _ => None,
-        })
-        .collect();
-
     let mut captures = Vec::new();
     for (source, feed, channel) in sources {
-        match open_stream(&core, &source, feed.clone()) {
-            Ok((stream, listener)) => {
-                channel.set_status(match source.kind {
-                    SourceKind::App { .. } => SourceStatus::WaitingForApp,
-                    _ => SourceStatus::Live,
-                });
-                captures.push(Capture { source, feed, channel, stream, _listener: listener, links: HashMap::new() });
-            }
-            Err(e) => {
-                eprintln!("audio source \"{}\": {e:#}", source.name);
-                channel.set_status(SourceStatus::Unavailable);
-            }
+        if let Some(c) = start_capture(&core, source, feed, channel) {
+            captures.push(c);
         }
     }
     let captures = Rc::new(RefCell::new(captures));
 
-    // Relink a few times a second, when the registry changed.
+    // Relink a few times a second, when the registry changed (or a source
+    // was added or taken out).
     let timer = {
         let (graph, captures, core) = (graph.clone(), captures.clone(), core.clone());
         mainloop.loop_().add_timer(move |_| {
@@ -275,6 +279,8 @@ fn run(sources: Vec<(AudioSource, Arc<SourceFeed>, Arc<Channel>)>, ready: &mpsc:
                 return;
             }
             g.changed = false;
+            // App sources' apps, which a desktop source may leave out.
+            let app_ids = app_ids(&captures.borrow());
             for c in captures.borrow_mut().iter_mut() {
                 relink(&core, &g, c, &app_ids);
             }
@@ -291,6 +297,25 @@ fn run(sources: Vec<(AudioSource, Arc<SourceFeed>, Arc<Channel>)>, ready: &mpsc:
                 if let Some(l) = quit.upgrade() {
                     l.quit();
                 }
+            }
+            Cmd::Add(source, feed, channel) => {
+                let mut all = captures.borrow_mut();
+                if all.iter().any(|c| c.source.id == source.id) {
+                    return;
+                }
+                if let Some(c) = start_capture(&core, source, feed, channel) {
+                    all.push(c);
+                }
+                // Linked at the timer's next turn, the desktop's links again too.
+                graph.borrow_mut().changed = true;
+            }
+            Cmd::Remove(id) => {
+                let mut all = captures.borrow_mut();
+                let Some(at) = all.iter().position(|c| c.source.id == id) else { return };
+                let mut c = all.remove(at);
+                end_capture(&core, &mut c);
+                // The desktop takes back an app it left out for this one.
+                graph.borrow_mut().changed = true;
             }
             Cmd::SetMic { id, device } => {
                 for c in captures.borrow_mut().iter_mut().filter(|c| c.source.id == id) {
@@ -318,13 +343,49 @@ fn run(sources: Vec<(AudioSource, Arc<SourceFeed>, Arc<Channel>)>, ready: &mpsc:
     mainloop.run();
 
     for c in captures.borrow_mut().iter_mut() {
-        for (_, link) in c.links.drain() {
-            let _ = core.destroy_object(link);
-        }
-        let _ = c.stream.disconnect();
-        c.channel.set_status(SourceStatus::Off);
+        end_capture(&core, c);
     }
     Ok(())
+}
+
+/// A capture of `source` into `feed`: its stream made (and its status said);
+/// none if it couldn't be.
+fn start_capture(core: &pw::core::CoreRc, source: AudioSource, feed: Arc<SourceFeed>, channel: Arc<Channel>) -> Option<Capture> {
+    match open_stream(core, &source, feed.clone()) {
+        Ok((stream, listener)) => {
+            channel.set_status(match source.kind {
+                SourceKind::App { .. } => SourceStatus::WaitingForApp,
+                _ => SourceStatus::Live,
+            });
+            Some(Capture { source, feed, channel, stream, _listener: listener, links: HashMap::new() })
+        }
+        Err(e) => {
+            eprintln!("audio source \"{}\": {e:#}", source.name);
+            channel.set_status(SourceStatus::Unavailable);
+            None
+        }
+    }
+}
+
+/// A capture's links and stream let go of; its source off.
+fn end_capture(core: &pw::core::CoreRc, c: &mut Capture) {
+    for (_, link) in c.links.drain() {
+        let _ = core.destroy_object(link);
+    }
+    let _ = c.stream.disconnect();
+    c.channel.set_status(SourceStatus::Off);
+}
+
+/// The apps that are sources of their own, which a desktop source may
+/// leave out.
+fn app_ids(captures: &[Capture]) -> Vec<String> {
+    captures
+        .iter()
+        .filter_map(|c| match &c.source.kind {
+            SourceKind::App { bundle_id } => Some(bundle_id.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Our capture stream for `source`, feeding `feed`.
@@ -442,7 +503,7 @@ fn relink(core: &pw::core::CoreRc, g: &Graph, c: &mut Capture, app_ids: &[String
         match &c.source.kind {
             SourceKind::App { bundle_id } => app.is(bundle_id),
             SourceKind::Desktop { exclude_app_sources } => !*exclude_app_sources || !app_ids.iter().any(|a| app.is(a)),
-            SourceKind::Microphone { .. } => false,
+            SourceKind::Microphone { .. } | SourceKind::Video { .. } => false,
         }
     };
     let sources: Vec<u32> = g.playback().filter(|(_, n)| wanted_node(n)).map(|(id, _)| id).collect();
