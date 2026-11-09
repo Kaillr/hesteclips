@@ -150,6 +150,18 @@ pub struct Channel {
     /// Its two sides made one (a microphone's, see [`Mono`]): shared with
     /// its feed, like `denoise`.
     mono: Arc<AtomicBool>,
+    /// The programs a desktop source records right now (see [`Program`]).
+    programs: Mutex<Vec<Program>>,
+}
+
+/// A program a desktop source records: one with an audio session, so one
+/// that plays (or has played) sound.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Program {
+    /// Its executable, `FXSound.exe`: what a desktop source's `leave_out` takes.
+    pub exe: String,
+    /// What to call it: its file description ("FxSound"), else its executable.
+    pub name: String,
 }
 
 /// How much of a microphone's background noise is taken out.
@@ -194,7 +206,18 @@ impl Channel {
             tap: Mutex::new(None),
             denoise: Arc::new(AtomicU8::new(NoiseReduction::Off as u8)),
             mono: Arc::new(AtomicBool::new(false)),
+            programs: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The programs a desktop source records right now, by name (Windows,
+    /// [`crate::DESKTOP_PROGRAMS`]; empty while it isn't recording).
+    pub fn programs(&self) -> Vec<Program> {
+        self.programs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+
+    pub(crate) fn set_programs(&self, programs: Vec<Program>) {
+        *self.programs.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = programs;
     }
 
     /// Take background noise out of its sound: steady noise (fans, hum), or

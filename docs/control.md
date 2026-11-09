@@ -80,7 +80,7 @@ A sound:
 |---|---|---|
 | `id` | string | Its id. It stays the same when the sound is renamed. |
 | `name` | string | Its name. |
-| `kind` | string | `microphone`, `desktop`, `app` or `video`. |
+| `kind` | string | `microphone`, `desktop`, `output` (one output device, Windows), `app` or `video`. |
 | `on` | bool | Captured at all (its switch). |
 | `muted` | bool | Muted. |
 | `db` | number | Its volume, from −60 (silent) to +12. |
