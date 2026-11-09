@@ -1026,7 +1026,7 @@ impl DisplayCapture {
         let (method, why) = dupl::choose(choice, gpu, monitor);
         if method == dupl::Method::Wgc {
             eprintln!("recording the display with Windows' capture ({why})");
-            return Self::wgc(gpu, item, latest, fps, by, false);
+            return Self::wgc(gpu, item, monitor, latest, fps, by, false);
         }
         match Self::duplicate(gpu, monitor, latest, fps, by) {
             Ok(c) => {
@@ -1035,7 +1035,7 @@ impl DisplayCapture {
             }
             Err(e) => {
                 eprintln!("can't record the display with Desktop Duplication ({e:#}); using Windows' capture until it can");
-                Self::wgc(gpu, item, latest, fps, by, true)
+                Self::wgc(gpu, item, monitor, latest, fps, by, true)
             }
         }
     }
@@ -1047,8 +1047,8 @@ impl DisplayCapture {
     }
 
     /// Windows' capture, standing in for Desktop Duplication or not.
-    fn wgc(gpu: &d3d::Gpu, item: &windows::Graphics::Capture::GraphicsCaptureItem, latest: &Arc<d3d::Latest>, fps: u32, by: u64, stand_in: bool) -> Result<Self> {
-        let c = d3d::Capture::start(gpu, item, latest, None, fps)?;
+    fn wgc(gpu: &d3d::Gpu, item: &windows::Graphics::Capture::GraphicsCaptureItem, monitor: windows::Win32::Graphics::Gdi::HMONITOR, latest: &Arc<d3d::Latest>, fps: u32, by: u64, stand_in: bool) -> Result<Self> {
+        let c = d3d::Capture::start(gpu, item, latest, d3d::Of::Display(monitor), fps)?;
         set_in_use(by, crate::ScreenCaptureInUse { duplication: false, fell_back: stand_in });
         Ok(if stand_in { DisplayCapture::StandIn(c) } else { DisplayCapture::Wgc(c) })
     }
@@ -1227,7 +1227,7 @@ impl Video {
                                 let started = match plan {
                                     hook::Plan::Hook => hook::HookCapture::start(&gpu, h, &latest, fps).map(WindowCapture::Hook),
                                     p => d3d::window_item(h)
-                                        .and_then(|item| d3d::Capture::start(&gpu, &item, &latest, Some(h), fps))
+                                        .and_then(|item| d3d::Capture::start(&gpu, &item, &latest, d3d::Of::Window(h), fps))
                                         .map(|c| WindowCapture::Wgc(c, p == hook::Plan::Watch)),
                                 };
                                 match started {
@@ -1450,7 +1450,7 @@ impl Video {
                     && let Some(why) = c.ended()
                 {
                     eprintln!("desktop duplication stopped ({why}); recording the display with Windows' capture until it can start again");
-                    display = DisplayCapture::wgc(&gpu, &item, &latest, fps, by, true).map_err(|e| eprintln!("can't record the display: {e:#}")).ok();
+                    display = DisplayCapture::wgc(&gpu, &item, monitor, &latest, fps, by, true).map_err(|e| eprintln!("can't record the display: {e:#}")).ok();
                     retry.0 = Instant::now() + retry.1;
                 }
                 if hooked.is_none() && display.is_none() {
@@ -2985,7 +2985,7 @@ mod tests {
             let (dupl, wgc) = if duplication {
                 (Some(dupl::DuplCapture::start(&gpu, monitor, &latest, 30).unwrap()), None)
             } else {
-                (None, Some(d3d::Capture::start(&gpu, &d3d::monitor_item(monitor).unwrap(), &latest, None, 30).unwrap()))
+                (None, Some(d3d::Capture::start(&gpu, &d3d::monitor_item(monitor).unwrap(), &latest, d3d::Of::Display(monitor), 30).unwrap()))
             };
             let deadline = Instant::now() + Duration::from_secs(3);
             while !latest.has_frame() {
@@ -2998,5 +2998,56 @@ mod tests {
             eprintln!("{method}: {w}×{h} into {tw}×{th}, as {}×{}", fitted.0, fitted.1);
             drop((dupl, wgc));
         }
+    }
+
+    /// Issue #33: Windows' capture leaves the cursor out, and it's drawn on
+    /// here, so a cursor moving over a still picture brings no picture from
+    /// Windows. It's put up again with the cursor where it moved: pictures
+    /// keep coming while it moves, near the frame rate. Moves the cursor
+    /// about the middle of `SCREEN=<id>` for a second, then puts it back.
+    /// Nothing of the screen is kept.
+    #[test]
+    #[ignore = "moves the cursor on a display: SCREEN=\\\\.\\DISPLAY2 cargo test -p capture cursor_over_windows_capture -- --ignored --nocapture"]
+    fn cursor_over_windows_capture() {
+        use windows::Win32::Foundation::POINT;
+        use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, SetCursorPos};
+        let Ok(id) = std::env::var("SCREEN") else {
+            eprintln!("SCREEN not set: skipped");
+            return;
+        };
+        assert!(system::list_screens().iter().any(|s| s.id == id), "no display {id}");
+        unsafe { windows::Win32::UI::HiDpi::SetThreadDpiAwarenessContext(windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+        let monitor = system::find_monitor(&id);
+        let (w, h) = system::display_pixels(Some(&id)).expect("its size");
+        let mut info = windows::Win32::Graphics::Gdi::MONITORINFO { cbSize: std::mem::size_of::<windows::Win32::Graphics::Gdi::MONITORINFO>() as u32, ..Default::default() };
+        unsafe { windows::Win32::Graphics::Gdi::GetMonitorInfoW(monitor, &mut info) }.ok().unwrap();
+        let r = info.rcMonitor;
+        let (cx, cy) = ((r.left + r.right) / 2, (r.top + r.bottom) / 2);
+        let gpu = d3d::Gpu::new().unwrap();
+        let latest = d3d::Latest::new(&gpu, w, h).unwrap();
+        let capture = d3d::Capture::start(&gpu, &d3d::monitor_item(monitor).unwrap(), &latest, d3d::Of::Display(monitor), 30).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !latest.has_frame() {
+            assert!(Instant::now() < deadline, "no picture");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let mut was = POINT::default();
+        unsafe { GetCursorPos(&mut was) }.unwrap();
+        unsafe { SetCursorPos(cx, cy) }.unwrap();
+        thread::sleep(Duration::from_millis(300));
+        let before = latest.arrivals().0;
+        thread::sleep(Duration::from_secs(1));
+        let still = latest.arrivals().0 - before;
+        let before = latest.arrivals().0;
+        for i in 0..60 {
+            let a = i as f64 / 60.0 * std::f64::consts::TAU;
+            let _ = unsafe { SetCursorPos(cx + (80.0 * a.cos()) as i32, cy + (80.0 * a.sin()) as i32) };
+            thread::sleep(Duration::from_millis(16));
+        }
+        let moving = latest.arrivals().0 - before;
+        let _ = unsafe { SetCursorPos(was.x, was.y) };
+        drop(capture);
+        eprintln!("pictures in a second at 30 fps: {still} with the cursor still, {moving} with it moving");
+        assert!(moving >= 15, "the cursor moving brought {moving} pictures");
     }
 }

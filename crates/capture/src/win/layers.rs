@@ -540,16 +540,15 @@ impl CaptureFeed {
                 let started = match &target {
                     Target::Display(id) => system::connected_monitor(id)
                         .ok_or_else(|| anyhow::anyhow!("the display isn't connected"))
-                        .and_then(d3d::monitor_item)
-                        .and_then(|item| d3d::Capture::start(&gpu, &item, &latest2, None, fps))
+                        .and_then(|monitor| d3d::monitor_item(monitor).and_then(|item| d3d::Capture::start(&gpu, &item, &latest2, d3d::Of::Display(monitor), fps)))
                         .map(|c| (c, None)),
                     Target::Window(app) => system::find_app_window(app)
                         .ok_or_else(|| anyhow::anyhow!("{app} isn't open"))
-                        .and_then(|hwnd| d3d::window_item(hwnd).and_then(|item| d3d::Capture::start(&gpu, &item, &latest2, Some(hwnd), fps)).map(|c| (c, Some(hwnd)))),
+                        .and_then(|hwnd| d3d::window_item(hwnd).and_then(|item| d3d::Capture::start(&gpu, &item, &latest2, d3d::Of::Window(hwnd), fps)).map(|c| (c, Some(hwnd)))),
                     Target::Browser(host) => host
                         .window()
                         .ok_or_else(|| anyhow::anyhow!("the page isn't up yet"))
-                        .and_then(|hwnd| d3d::window_item(hwnd).and_then(|item| d3d::Capture::start(&gpu, &item, &latest2, Some(hwnd), fps)).map(|c| (c, Some(hwnd)))),
+                        .and_then(|hwnd| d3d::window_item(hwnd).and_then(|item| d3d::Capture::start(&gpu, &item, &latest2, d3d::Of::Page(hwnd), fps)).map(|c| (c, Some(hwnd)))),
                 };
                 match started {
                     Ok((capture, window)) => {

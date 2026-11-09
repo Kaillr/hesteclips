@@ -18,6 +18,22 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use super::d3d::{Gpu, Latest};
 use super::quad::{Placement, Quad};
 
+/// Where the cursor is (desktop pixels) and which it is, if Windows shows
+/// one: what gets drawn, to tell when that changed. With `focus`, only while
+/// that process (its id) is in focus, as [`CursorLayer::draw`] draws it.
+pub(crate) fn showing(focus: Option<u32>) -> Option<((i32, i32), isize)> {
+    if let Some(pid) = focus {
+        let mut focused = 0u32;
+        unsafe { GetWindowThreadProcessId(GetForegroundWindow(), Some(&mut focused)) };
+        if focused != pid {
+            return None;
+        }
+    }
+    let mut info = CURSORINFO { cbSize: std::mem::size_of::<CURSORINFO>() as u32, ..Default::default() };
+    unsafe { GetCursorInfo(&mut info) }.ok()?;
+    (info.flags.0 & CURSOR_SHOWING.0 != 0 && !info.hCursor.is_invalid()).then_some(((info.ptScreenPos.x, info.ptScreenPos.y), info.hCursor.0 as isize))
+}
+
 /// Draws the cursor into a [`Latest`].
 pub(crate) struct CursorLayer {
     /// The cursor image uploaded, by Windows' handle for it.
