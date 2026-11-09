@@ -458,6 +458,14 @@ fn line(value: &Value) -> String {
     text
 }
 
+/// Where `step` on from `at` lands among `n` (scenes), round the end. Any
+/// step a client sends: one near `i64::MAX` went past what an `i64` holds,
+/// which a development build stops on (the app quit).
+fn stepped(at: usize, n: usize, step: i64) -> usize {
+    let n = n as i64;
+    (at as i64 + step.rem_euclid(n)).rem_euclid(n) as usize
+}
+
 /// `db` within the fader's range, to a tenth, as the fader keeps it.
 fn fader_db(db: f32) -> f32 {
     (db.clamp(crate::sources_ui::FADER_MIN_DB, crate::sources_ui::FADER_MAX_DB) * 10.0).round() / 10.0
@@ -651,8 +659,8 @@ impl App {
         match (scene, step) {
             (Some(id), _) => scenes.iter().any(|s| s.id == id).then_some(id),
             (None, Some(step)) if !scenes.is_empty() => {
-                let at = scenes.iter().position(|s| s.id == self.settings.active_scene).unwrap_or(0) as i64;
-                Some(scenes[(at + step).rem_euclid(scenes.len() as i64) as usize].id)
+                let at = scenes.iter().position(|s| s.id == self.settings.active_scene).unwrap_or(0);
+                Some(scenes[stepped(at, scenes.len(), step)].id)
             }
             _ => None,
         }
@@ -934,6 +942,19 @@ mod tests {
         }
         assert_eq!(parse(r#"{"id":9,"do":"preset"}"#).map(|(_, r)| r), Err(Some(9)), "a preset needs its id");
         assert_eq!(parse("GET / HTTP/1.1").map(|(_, r)| r), Err(None));
+    }
+
+    /// The next scene and the one before go round the end, and a step of
+    /// any size lands on a scene: never past what an `i64` holds.
+    #[test]
+    fn a_step_goes_round_the_scenes() {
+        assert_eq!(stepped(0, 3, 1), 1);
+        assert_eq!(stepped(2, 3, 1), 0);
+        assert_eq!(stepped(0, 3, -1), 2);
+        assert_eq!(stepped(1, 3, 7), 2);
+        assert_eq!(stepped(0, 1, -5), 0);
+        assert_eq!(stepped(2, 3, i64::MAX), 0);
+        assert_eq!(stepped(0, 3, i64::MIN), 1);
     }
 
     #[test]
