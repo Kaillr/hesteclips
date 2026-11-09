@@ -30,6 +30,7 @@ mod webcam_ui;
 mod discord;
 mod editor;
 mod export_ui;
+mod feedback;
 mod filmstrip;
 mod free_up;
 mod logfile;
@@ -151,11 +152,19 @@ fn main() -> eframe::Result<()> {
     });
     // An installed app has no console: what it prints goes to its log file
     // (`HASTECLIP_LOG=1` does the same in a development build, or a test
-    // instance, to check it).
+    // instance, to check it). Not yet while another HasteClip runs: a log
+    // starting moves the one before aside, and a second launch (which only
+    // shows that one) left it logging to `hasteclip.previous.log`, with the
+    // second launch's few lines as the log. Once this one is sure to run.
     #[cfg(any(windows, target_os = "linux"))]
-    if (cfg!(not(debug_assertions)) && !test_instance) || std::env::var_os("HASTECLIP_LOG").is_some() {
-        logfile::start();
-    }
+    let log_later = {
+        let logs = (cfg!(not(debug_assertions)) && !test_instance) || std::env::var_os("HASTECLIP_LOG").is_some();
+        let later = logs && !test_instance && tray::another_running();
+        if logs && !later {
+            logfile::start();
+        }
+        later
+    };
     #[cfg(windows)]
     logfile::log_cursor();
     // The installer's hooks (install, update, uninstall) run the app with special
@@ -182,6 +191,11 @@ fn main() -> eframe::Result<()> {
             None => return Ok(()),
         }
     };
+    // It took over from the one running (a build of your own): its log now.
+    #[cfg(any(windows, target_os = "linux"))]
+    if log_later {
+        logfile::start();
+    }
     // Scrub frames kept from before scrubbing decoded live. (Not from a test
     // instance: the real one beside it may be an older build using them.)
     if !test_instance {
@@ -254,6 +268,9 @@ fn main() -> eframe::Result<()> {
                 shell::cloak(cc, true);
             }
             gpu_frames::init(cc.wgpu_render_state.as_ref(), &cc.egui_ctx);
+            if let Some(render) = cc.wgpu_render_state.as_ref() {
+                feedback::note_gpu(render.adapter.get_info().name);
+            }
             #[cfg(target_os = "macos")]
             shell::centre_window_buttons(cc);
             ui_kit::apply(&cc.egui_ctx);

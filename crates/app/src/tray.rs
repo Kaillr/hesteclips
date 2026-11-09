@@ -326,6 +326,13 @@ pub fn claim() -> Option<Option<std::net::TcpListener>> {
 /// (nothing special).
 const PORT: u16 = 52131;
 
+/// Another HasteClip runs (or something else has its port): asked before
+/// [`claim`], which may then show that one and exit.
+#[cfg(any(windows, target_os = "linux"))]
+pub fn another_running() -> bool {
+    std::net::TcpListener::bind(("127.0.0.1", PORT)).is_err()
+}
+
 fn claim_on(port: u16) -> Option<Option<std::net::TcpListener>> {
     use std::io::Write;
     match std::net::TcpListener::bind(("127.0.0.1", port)) {
@@ -347,7 +354,14 @@ fn claim_on(port: u16) -> Option<Option<std::net::TcpListener>> {
 /// Run from Cargo's build folder (`cargo run`, with `--release` or not): a
 /// build of your own, not an installed HasteClip.
 fn from_build_folder() -> bool {
-    std::env::current_exe().is_ok_and(|exe| exe.ancestors().skip(1).take(3).any(|dir| dir.join("CACHEDIR.TAG").is_file()))
+    build_folder().is_some()
+}
+
+/// The Cargo build folder (`target`) this copy runs from, if it's a build of
+/// your own.
+pub(crate) fn build_folder() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    exe.ancestors().skip(1).take(3).find(|dir| dir.join("CACHEDIR.TAG").is_file()).map(std::path::Path::to_path_buf)
 }
 
 /// A build of your own, started while another HasteClip runs (the installed
