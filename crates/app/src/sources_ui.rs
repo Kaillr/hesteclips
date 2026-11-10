@@ -19,7 +19,7 @@ use egui::{Color32, Sense};
 use crate::App;
 use crate::canvas_ui::Selected;
 use crate::meter::{self, MeterState};
-use crate::settings::{AudioSourceCfg, CaptureApp, CaptureTarget, SourceKind};
+use crate::settings::{AudioSourceCfg, CaptureApp, CaptureTarget, LeftOut, SourceKind};
 
 /// Fader range in dB.
 pub(crate) const FADER_MIN_DB: f32 = -60.0;
@@ -182,6 +182,7 @@ fn sound_icon(s: &AudioSourceCfg) -> &'static str {
     match &s.kind {
         SourceKind::Microphone { .. } => icon::MICROPHONE,
         SourceKind::Desktop { .. } => icon::SPEAKER_HIFI,
+        SourceKind::Output { .. } => icon::SPEAKER_SIMPLE_HIGH,
         SourceKind::App { app_name, .. } if app_name.to_lowercase().contains("discord") => icon::DISCORD_LOGO,
         SourceKind::App { .. } => icon::APP_WINDOW,
         SourceKind::Video { .. } => icon::FILM_STRIP,
@@ -1060,9 +1061,10 @@ impl App {
         if Item::new(if source.enabled { "Turn off" } else { "Turn on" }).icon(icon::POWER).enabled(fixed.is_none()).show(ui).clicked() {
             source.enabled = !source.enabled;
         }
-        if let SourceKind::Desktop { exclude_apps } = &mut source.kind {
+        if let SourceKind::Desktop { exclude_apps, .. } = &mut source.kind {
             crate::ui_kit::menu_sep(ui);
-            let item = Item::new("Leave out apps added below").check(*exclude_apps).enabled(has_app_sources && locked.is_none());
+            let live = locked.is_none() || capture::DESKTOP_CHANGES_WHILE_CAPTURING;
+            let item = Item::new("Leave out apps added below").check(*exclude_apps).enabled(has_app_sources && live);
             if item.tip("Apps you add as their own source won't also be heard here, so nothing plays twice").show(ui).clicked() {
                 *exclude_apps = !*exclude_apps;
             }
@@ -1123,6 +1125,7 @@ impl App {
             return;
         }
         let mut new_mic: Option<String> = None;
+        let mut new_output: Option<String> = None;
         let mut refresh = false;
         crate::ui_kit::menu_popup(&b, false, 230.0, |ui| {
             if Item::new("Microphone").icon(icon::MICROPHONE).tip("A microphone or audio interface").show(ui).clicked() {
@@ -1164,8 +1167,21 @@ impl App {
             let item = Item::new("Desktop sound").icon(icon::SPEAKER_HIFI).enabled(!has_desktop);
             let item = if has_desktop { item.tip("Already added") } else { item.tip("Everything your computer plays") };
             if item.show(ui).clicked() {
-                let s = AudioSourceCfg::new("Desktop sound", SourceKind::Desktop { exclude_apps: true });
+                let s = AudioSourceCfg::new("Desktop sound", SourceKind::Desktop { exclude_apps: true, leave_out: Vec::new() });
                 self.settings.audio_sources.push(s);
+            }
+            if capture::OUTPUT_SOURCES {
+                let tip = "What one speaker or headset plays, mixed: for audio routers that play your apps on another device";
+                if Item::new("Output device").icon(icon::SPEAKER_SIMPLE_HIGH).tip(tip).show(ui).clicked() {
+                    if !idle {
+                        self.refresh_audio_devices();
+                    }
+                    let n = self.settings.audio_sources.iter().filter(|s| matches!(s.kind, SourceKind::Output { .. })).count();
+                    let name = if n == 0 { "Output device".to_owned() } else { format!("Output device {}", n + 1) };
+                    let s = AudioSourceCfg::new(&name, SourceKind::Output { device: capture::audio::DEFAULT_DEVICE.into() });
+                    new_output = Some(s.id.clone());
+                    self.settings.audio_sources.push(s);
+                }
             }
             crate::ui_kit::menu_sep(ui);
             if Item::new("Look for microphones again").icon(icon::ARROWS_CLOCKWISE).tip("After you've plugged one in").show(ui).clicked() {
@@ -1176,7 +1192,7 @@ impl App {
             self.refresh_audio_devices();
             self.toast_icon(icon::ARROWS_CLOCKWISE, "Looked for microphones again");
         }
-        if let Some(id) = new_mic {
+        if let Some(id) = new_mic.or(new_output) {
             self.sources_view.editing = Some(crate::inspector_ui::Editing::Sound(id));
         }
     }
@@ -1195,7 +1211,15 @@ impl App {
         };
         let locked = (!self.rec_state.idle()).then(|| self.stop_first());
         let fixed = locked.clone().filter(|_| !capture::SOURCES_WHILE_CAPTURING);
-        let picker_locked = locked.clone().filter(|_| !matches!(self.settings.audio_sources[i].kind, SourceKind::Microphone { .. }));
+        // Changed as it runs: a microphone's device, and (where it can be) an
+        // output source's, and what a desktop leaves out.
+        let live_kind = capture::DESKTOP_CHANGES_WHILE_CAPTURING;
+        let picker_locked = locked.clone().filter(|_| match self.settings.audio_sources[i].kind {
+            SourceKind::Microphone { .. } => false,
+            SourceKind::Output { .. } => !live_kind,
+            _ => true,
+        });
+        let leave_out_locked = locked.clone().filter(|_| !live_kind);
         let note = self.added_note(&self.settings.audio_sources[i]);
         let has_app_sources = self.settings.audio_sources.iter().any(|s| matches!(s.kind, SourceKind::App { .. }));
         let channel = self.live_audio.channel(id);
@@ -1252,8 +1276,11 @@ impl App {
         });
         let source = &self.settings.audio_sources[i];
         let what = match &source.kind {
-            SourceKind::Desktop { exclude_apps: true } if has_app_sources => "Everything except apps added as their own source".to_owned(),
+            SourceKind::Desktop { exclude_apps: true, leave_out } if has_app_sources && !leave_out.is_empty() => "Everything except apps added as their own source and programs left out".to_owned(),
+            SourceKind::Desktop { exclude_apps: true, .. } if has_app_sources => "Everything except apps added as their own source".to_owned(),
+            SourceKind::Desktop { leave_out, .. } if !leave_out.is_empty() => "Everything your computer plays, except programs left out".to_owned(),
             SourceKind::Desktop { .. } => "Everything your computer plays".to_owned(),
+            SourceKind::Output { device } => format!("Everything that plays on {}, mixed", output_name(&self.audio, device)),
             SourceKind::App { app_name, .. } => format!("Only {app_name}"),
             SourceKind::Microphone { .. } => "Microphone".to_owned(),
             SourceKind::Video { .. } => "A video's sound, as it plays".to_owned(),
@@ -1266,6 +1293,12 @@ impl App {
             ui.horizontal(|ui| {
                 ui.add_space(26.0);
                 ui.add(egui::Label::new(theme::text(t, 12.5, W::Regular).color(c(pal))).wrap());
+            });
+        }
+        if let Some(twice) = heard_twice(&self.settings.audio_sources, i).filter(|_| source.enabled) {
+            ui.horizontal(|ui| {
+                ui.add_space(26.0);
+                ui.add(egui::Label::new(theme::text(twice, 12.5, W::Regular).color(pal.warn)).wrap());
             });
         }
         if let Some((n, leaves_out)) = &note {
@@ -1295,18 +1328,31 @@ impl App {
             let audio = self.audio.clone();
             match self.settings.audio_sources[i].kind.clone() {
                 SourceKind::Microphone { .. } => {
-                    let (a, _) = l.row(Row::new("Microphone"), |ui| mic_picker(ui, &mut self.settings.audio_sources[i], &audio, picker_locked.is_some()));
+                    let (a, _) = l.row(Row::new("Microphone"), |ui| match &mut self.settings.audio_sources[i].kind {
+                        SourceKind::Microphone { device } => device_picker(ui, device, &audio.inputs, audio.default_input.as_deref(), picker_locked.is_some()),
+                        _ => None,
+                    });
                     if let Some(a) = a {
                         action = Some(a);
                     }
                 }
-                SourceKind::Desktop { exclude_apps } => {
+                SourceKind::Output { .. } => {
+                    let note = "HasteClip's own sounds on it are recorded too: the clip-saved sound, a clip you play, a microphone you listen to";
+                    let (a, _) = l.row(Row::new("Device").note(note), |ui| match &mut self.settings.audio_sources[i].kind {
+                        SourceKind::Output { device } => device_picker(ui, device, &audio.outputs, audio.default_output.as_deref(), picker_locked.is_some()),
+                        _ => None,
+                    });
+                    if let Some(a) = a {
+                        action = Some(a);
+                    }
+                }
+                SourceKind::Desktop { exclude_apps, .. } => {
                     let note = if has_app_sources { "Apps added as their own source aren't heard here too" } else { "Once you add an app on its own" };
-                    let row = Row::new("Leave out apps added on their own").note(note).locked(locked.clone().filter(|_| has_app_sources));
+                    let row = Row::new("Leave out apps added on their own").note(note).locked(leave_out_locked.clone().filter(|_| has_app_sources));
                     let (_, clicked_locked) = l.row(row, |ui| {
                         let mut on = exclude_apps;
                         if crate::ui_kit::switch(ui, &mut on).changed()
-                            && let SourceKind::Desktop { exclude_apps } = &mut self.settings.audio_sources[i].kind
+                            && let SourceKind::Desktop { exclude_apps, .. } = &mut self.settings.audio_sources[i].kind
                         {
                             *exclude_apps = on;
                         }
@@ -1343,6 +1389,35 @@ impl App {
                 action = Some(CardAction::Locked);
             }
         });
+        // The programs a desktop records, each of which can be left out.
+        if capture::DESKTOP_PROGRAMS
+            && let SourceKind::Desktop { leave_out, .. } = &self.settings.audio_sources[i].kind
+        {
+            let rows = program_rows(&channel.programs(), leave_out);
+            if !rows.is_empty() {
+                let tip = "Every program playing sound is recorded here. Leave one out when its sound is heard twice: an audio router or sound enhancer (FXSound, Voicemeeter, EasyEffects) plays every other app's sound again, and both are recorded.";
+                crate::ui_kit::section_head(ui, "Programs", false, |ui| {
+                    crate::ui_kit::info(ui, "Programs", tip);
+                });
+                crate::ui_kit::list(ui, ("sound_programs", id), |l| {
+                    for row in rows {
+                        let r = Row::new(&row.name).note(row.exe.clone()).locked(leave_out_locked.clone());
+                        let (_, clicked_locked) = l.row(r, |ui| {
+                            let mut on = row.recorded;
+                            let tip = if on { "Recorded here. Off leaves it out" } else { "Left out. On records it again" };
+                            if crate::ui_kit::switch(ui, &mut on).on_hover_text(tip).changed()
+                                && let SourceKind::Desktop { leave_out, .. } = &mut self.settings.audio_sources[i].kind
+                            {
+                                set_left_out(leave_out, &row.exe, &row.name, !on);
+                            }
+                        });
+                        if clicked_locked {
+                            action = Some(CardAction::Locked);
+                        }
+                    }
+                });
+            }
+        }
         // A microphone's clean-up, and hearing it.
         if matches!(self.settings.audio_sources[i].kind, SourceKind::Microphone { .. }) {
             use crate::settings::NoiseReduction;
@@ -2526,19 +2601,19 @@ fn db_text(db: f32) -> String {
     }
 }
 
-/// A microphone's device: the current one, a menu of the others.
-fn mic_picker(ui: &mut egui::Ui, source: &mut AudioSourceCfg, audio: &capture::audio::AudioDevices, locked: bool) -> Option<CardAction> {
+/// A microphone's or output's device, of `devices` (`default` the OS
+/// default's id): the current one, a menu of the others.
+fn device_picker(ui: &mut egui::Ui, device: &mut String, devices: &[capture::Device], default: Option<&str>, locked: bool) -> Option<CardAction> {
     use crate::ui_kit::Item;
     use capture::audio::DEFAULT_DEVICE;
-    let SourceKind::Microphone { device } = &mut source.kind else { return None };
     // Devices by their names ("AT2020USB+ Analog Stereo"), not their ids
     // (on Linux, PipeWire's "alsa_input.usb-…").
-    let name_of = |id: &str| audio.inputs.iter().find(|d| d.id == id).map(|d| d.name.clone());
-    let default_label = match &audio.default_input {
-        Some(id) => format!("Default ({})", name_of(id).unwrap_or_else(|| id.clone())),
+    let name_of = |id: &str| devices.iter().find(|d| d.id == id).map(|d| d.name.clone());
+    let default_label = match default {
+        Some(id) => format!("Default ({})", name_of(id).unwrap_or_else(|| id.to_owned())),
         None => "Default".to_owned(),
     };
-    let selected = if device == DEFAULT_DEVICE {
+    let selected = if *device == DEFAULT_DEVICE {
         default_label.clone()
     } else if let Some(name) = name_of(device) {
         name
@@ -2556,17 +2631,67 @@ fn mic_picker(ui: &mut egui::Ui, source: &mut AudioSourceCfg, audio: &capture::a
         return None;
     }
     crate::ui_kit::menu_popup(&r, false, 260.0, |ui| {
-        if Item::new(default_label.clone()).check(device == DEFAULT_DEVICE).show(ui).clicked() {
+        if Item::new(default_label.clone()).check(*device == DEFAULT_DEVICE).show(ui).clicked() {
             *device = DEFAULT_DEVICE.to_owned();
         }
         crate::ui_kit::menu_sep(ui);
-        for d in &audio.inputs {
-            if Item::new(d.name.clone()).check(&d.id == device).show(ui).clicked() {
+        for d in devices {
+            if Item::new(d.name.clone()).check(d.id == *device).show(ui).clicked() {
                 *device = d.id.clone();
             }
         }
     });
     None
+}
+
+/// An output device's name: the default's (it's followed), or the one picked.
+fn output_name(audio: &capture::audio::AudioDevices, device: &str) -> String {
+    let id = audio.resolve_output(device).unwrap_or_else(|| "the default output device".to_owned());
+    audio.outputs.iter().find(|d| d.id == id).map_or(id, |d| d.name.clone())
+}
+
+/// What else, of the sources on, records the sound source `i` records,
+/// so it's in clips twice: an output device's and the desktop (or an app
+/// added on its own) both record what plays on it.
+fn heard_twice(sources: &[AudioSourceCfg], i: usize) -> Option<&'static str> {
+    let on = |f: fn(&SourceKind) -> bool| sources.iter().enumerate().any(|(k, s)| k != i && s.enabled && (s.in_mix || s.own_track) && f(&s.kind));
+    match &sources[i].kind {
+        SourceKind::Output { .. } if on(|k| matches!(k, SourceKind::Desktop { .. })) => Some("Desktop sound records this too, so it's heard twice in clips. Turn one of them off."),
+        SourceKind::Output { .. } if on(|k| matches!(k, SourceKind::App { .. })) => Some("Apps added on their own are in this too, so they're heard twice in clips."),
+        SourceKind::Output { .. } if on(|k| matches!(k, SourceKind::Output { .. })) => Some("Another output device source is on: if it's the same device, it's heard twice in clips."),
+        SourceKind::Desktop { .. } if on(|k| matches!(k, SourceKind::Output { .. })) => Some("An output device source records what plays there too, so it's heard twice in clips. Turn one of them off."),
+        _ => None,
+    }
+}
+
+/// A program in a desktop source's dialog.
+#[derive(Debug, PartialEq, Eq)]
+struct ProgramRow {
+    exe: String,
+    name: String,
+    /// On: recorded. Off: left out.
+    recorded: bool,
+}
+
+/// A desktop source's programs as its dialog lists them: those it records
+/// now (`recorded`, from its capture) and those it leaves out, running or
+/// not, in name order. One both left out and recorded (the capture hasn't
+/// caught up yet) is left out.
+fn program_rows(recorded: &[capture::mixer::Program], left_out: &[LeftOut]) -> Vec<ProgramRow> {
+    let is_out = |exe: &str| left_out.iter().any(|l| l.exe.eq_ignore_ascii_case(exe));
+    let mut rows: Vec<ProgramRow> = recorded.iter().filter(|p| !is_out(&p.exe)).map(|p| ProgramRow { exe: p.exe.clone(), name: p.name.clone(), recorded: true }).collect();
+    rows.extend(left_out.iter().map(|l| ProgramRow { exe: l.exe.clone(), name: l.name.clone(), recorded: false }));
+    rows.sort_by_key(|r| (r.name.to_lowercase(), r.exe.to_lowercase()));
+    rows
+}
+
+/// Leave the program `exe` (called `name`) out of a desktop source, or
+/// record it again.
+fn set_left_out(leave_out: &mut Vec<LeftOut>, exe: &str, name: &str, out: bool) {
+    leave_out.retain(|l| !l.exe.eq_ignore_ascii_case(exe));
+    if out {
+        leave_out.push(LeftOut { exe: exe.to_owned(), name: name.to_owned() });
+    }
 }
 
 /// `text`, shortened with … to fit `width` at the select's size.
@@ -2694,13 +2819,13 @@ mod tests {
 
     /// A source a capture started with.
     fn started(id: &str, in_mix: bool, own_track: bool) -> capture::sources::AudioSource {
-        let kind = capture::sources::SourceKind::Desktop { exclude_app_sources: true };
+        let kind = capture::sources::SourceKind::Desktop { exclude_app_sources: true, leave_out: Vec::new() };
         capture::sources::AudioSource { id: id.to_owned(), name: id.to_owned(), kind, in_mix, own_track }
     }
 
     /// A source added since.
     fn added(in_mix: bool, own_track: bool) -> AudioSourceCfg {
-        let mut s = AudioSourceCfg::new("Game", SourceKind::Desktop { exclude_apps: true });
+        let mut s = AudioSourceCfg::new("Game", SourceKind::Desktop { exclude_apps: true, leave_out: Vec::new() });
         (s.in_mix, s.own_track) = (in_mix, own_track);
         s
     }
@@ -2882,5 +3007,59 @@ mod tests {
             frame(t, vec![button(pressed)], &mut dbs);
         }
         assert_eq!(dbs, [0.0, 0.0]);
+    }
+
+    fn program(exe: &str, name: &str) -> capture::mixer::Program {
+        capture::mixer::Program { exe: exe.into(), name: name.into() }
+    }
+
+    fn left_out(exe: &str, name: &str) -> LeftOut {
+        LeftOut { exe: exe.into(), name: name.into() }
+    }
+
+    /// The desktop's dialog lists what it records and what it leaves out
+    /// (running or not), in name order; one left out that the capture still
+    /// says it records (it hasn't started again yet) shows as left out, once.
+    #[test]
+    fn the_programs_list_has_what_is_recorded_and_left_out() {
+        let recorded = [program("Spotify.exe", "Spotify"), program("cs2.exe", "Counter-Strike 2"), program("fxsound.exe", "FxSound")];
+        let out = [left_out("FXSound.exe", "FxSound"), left_out("Voicemeeter.exe", "VoiceMeeter")];
+        let rows = program_rows(&recorded, &out);
+        let rows: Vec<(&str, bool)> = rows.iter().map(|r| (r.exe.as_str(), r.recorded)).collect();
+        assert_eq!(rows, [("cs2.exe", true), ("FXSound.exe", false), ("Spotify.exe", true), ("Voicemeeter.exe", false)]);
+        assert!(program_rows(&[], &[]).is_empty());
+    }
+
+    /// Leaving a program out adds it once (any case), recording it again
+    /// takes it off.
+    #[test]
+    fn a_program_is_left_out_once_and_taken_back() {
+        let mut out = vec![left_out("Voicemeeter.exe", "VoiceMeeter")];
+        set_left_out(&mut out, "FXSound.exe", "FxSound", true);
+        set_left_out(&mut out, "fxsound.exe", "FxSound", true);
+        assert_eq!(out, [left_out("Voicemeeter.exe", "VoiceMeeter"), left_out("fxsound.exe", "FxSound")]);
+        set_left_out(&mut out, "FXSOUND.EXE", "FxSound", false);
+        assert_eq!(out, [left_out("Voicemeeter.exe", "VoiceMeeter")]);
+    }
+
+    /// An output device's source and the desktop (or an app on its own)
+    /// record the same sound: each says so while both are on and recorded.
+    #[test]
+    fn an_output_device_with_the_desktop_is_heard_twice() {
+        let output = AudioSourceCfg::new("Speakers", SourceKind::Output { device: capture::audio::DEFAULT_DEVICE.into() });
+        let desktop = AudioSourceCfg::new("Desktop", SourceKind::Desktop { exclude_apps: true, leave_out: Vec::new() });
+        let mic = AudioSourceCfg::new("Mic", SourceKind::Microphone { device: capture::audio::DEFAULT_DEVICE.into() });
+        let app = AudioSourceCfg::new("Discord", SourceKind::App { bundle_id: "Discord.exe".into(), app_name: "Discord".into() });
+        let mut sources = vec![output, desktop, mic];
+        assert!(heard_twice(&sources, 0).is_some_and(|w| w.starts_with("Desktop sound")));
+        assert!(heard_twice(&sources, 1).is_some());
+        assert_eq!(heard_twice(&sources, 2), None);
+        sources[1].enabled = false;
+        assert_eq!(heard_twice(&sources, 0), None);
+        sources.push(app);
+        assert!(heard_twice(&sources, 0).is_some_and(|w| w.starts_with("Apps")));
+        sources[3].in_mix = false;
+        sources[3].own_track = false;
+        assert_eq!(heard_twice(&sources, 0), None, "an app recorded nowhere doubles nothing");
     }
 }

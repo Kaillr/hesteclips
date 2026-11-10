@@ -30,7 +30,17 @@ pub enum SourceKind {
     Microphone { device: String },
     /// Everything the computer plays. With `exclude_app_sources`, apps that are
     /// also added as their own source are left out, so they aren't heard twice.
-    Desktop { exclude_app_sources: bool },
+    /// `leave_out`: programs, by executable (`FXSound.exe`; on Linux the
+    /// program's name, as an app source's), never recorded here, e.g. an
+    /// audio router that plays every app's sound again (where
+    /// [`crate::DESKTOP_PROGRAMS`]; what it records shows in its
+    /// [`Channel::programs`](crate::mixer::Channel::programs)).
+    Desktop { exclude_app_sources: bool, leave_out: Vec<String> },
+    /// What one output device plays, mixed, as you hear it (where
+    /// [`crate::OUTPUT_SOURCES`]): by device name (on Linux its node name), or
+    /// [`crate::audio::DEFAULT_DEVICE`] to follow the default one. HasteClip's
+    /// own sounds on it are in it too, as played (none are added to it).
+    Output { device: String },
     /// One application (and its helper processes), by bundle id on macOS,
     /// executable name (`Discord.exe`) on Windows, or program name
     /// (`Discord`, or `Game.exe` for one running in Wine/Proton) on Linux.
@@ -579,6 +589,9 @@ impl AudioCapture {
                     video_sound::listen(&source.id, feed);
                     channel.set_status(crate::mixer::SourceStatus::Live);
                 }
+                // Recorded from its device on Windows and Linux (`OUTPUT_SOURCES`).
+                #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+                SourceKind::Output { .. } => channel.set_status(crate::mixer::SourceStatus::Unavailable),
                 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
                 _ => system_sources.push((source.clone(), feed.clone(), channel)),
                 #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
@@ -608,7 +621,9 @@ impl AudioCapture {
         let own_source = self.captured.iter().any(|(s, _)| is_own_app(&s.kind, own.as_deref()));
         for (source, feed) in &self.captured {
             let takes = match source.kind {
-                SourceKind::Desktop { exclude_app_sources } => !(own_source && exclude_app_sources),
+                SourceKind::Desktop { exclude_app_sources, .. } => !(own_source && exclude_app_sources),
+                // Its device plays HasteClip's sound already.
+                SourceKind::Output { .. } => false,
                 ref kind => is_own_app(kind, own.as_deref()),
             };
             if takes {
@@ -640,6 +655,8 @@ impl AudioCapture {
             self.stop_one(source, feed);
         }
         let mut added = Vec::new();
+        #[cfg_attr(not(any(target_os = "windows", target_os = "linux")), allow(unused_mut))]
+        let mut set_anew = false;
         for source in sources {
             match self.captured.iter().position(|(s, _)| s.id == source.id) {
                 None => added.push((source.clone(), self.start_one(source, live))),
@@ -650,10 +667,26 @@ impl AudioCapture {
                     {
                         self.captured[at].0.kind = source.kind.clone();
                     }
+                    // A desktop leaving out other apps or programs, an
+                    // output source given another device: the same track,
+                    // other streams into it.
+                    #[cfg(any(target_os = "windows", target_os = "linux"))]
+                    if crate::DESKTOP_CHANGES_WHILE_CAPTURING
+                        && self.captured[at].0.kind != source.kind
+                        && matches!(
+                            (&self.captured[at].0.kind, &source.kind),
+                            (SourceKind::Desktop { .. }, SourceKind::Desktop { .. }) | (SourceKind::Output { .. }, SourceKind::Output { .. })
+                        )
+                        && let Some(system) = self.system.as_ref()
+                    {
+                        system.update(source.clone());
+                        self.captured[at].0.kind = source.kind.clone();
+                        set_anew = true;
+                    }
                 }
             }
         }
-        if !gone.is_empty() || !added.is_empty() {
+        if !gone.is_empty() || !added.is_empty() || set_anew {
             self.route_own_sound();
         }
         (added, gone.into_iter().map(|(s, _)| s).collect())
@@ -671,6 +704,8 @@ impl AudioCapture {
                 video_sound::listen(&source.id, &feed);
                 channel.set_status(crate::mixer::SourceStatus::Live);
             }
+            #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+            SourceKind::Output { .. } => channel.set_status(crate::mixer::SourceStatus::Unavailable),
             // Desktop or app sound (on Linux a mic too: a PipeWire stream
             // as they are), to a capture of it started now if there's none
             // (started empty: nothing's waited for).
@@ -1190,7 +1225,7 @@ mod tests {
         AudioSource {
             id: name.into(),
             name: name.into(),
-            kind: SourceKind::Desktop { exclude_app_sources: false },
+            kind: SourceKind::Desktop { exclude_app_sources: false, leave_out: Vec::new() },
             in_mix,
             own_track,
         }
@@ -1557,7 +1592,7 @@ mod tests {
         let mut playing = own_sound::Playing::at(44_100);
         let live = LiveAudio::new();
         let own = own_app_id().expect("HasteClip' own app id");
-        let desktop = AudioSource { kind: SourceKind::Desktop { exclude_app_sources: true }, ..src("Desktop", true, true) };
+        let desktop = AudioSource { kind: SourceKind::Desktop { exclude_app_sources: true, leave_out: Vec::new() }, ..src("Desktop", true, true) };
         let app = AudioSource { kind: SourceKind::App { bundle_id: own }, ..src("HasteClip", true, true) };
         let _monitor = LevelMonitor::start(&[desktop, app], live.clone()).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(500));

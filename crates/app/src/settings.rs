@@ -1075,14 +1075,33 @@ pub enum SourceKind {
     /// `capture::audio::DEFAULT_DEVICE` to follow the OS default.
     Microphone { device: String },
     /// Everything the computer plays. `exclude_apps` leaves out apps that are
-    /// added as their own source, so they aren't heard twice.
-    Desktop { exclude_apps: bool },
+    /// added as their own source, so they aren't heard twice. `leave_out`:
+    /// programs never recorded here, e.g. an audio router (FXSound) that
+    /// plays every app's sound again, which would be heard twice.
+    Desktop {
+        exclude_apps: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        leave_out: Vec<LeftOut>,
+    },
+    /// What one output device plays, mixed (Windows: `capture::OUTPUT_SOURCES`).
+    /// `device` is a device name, or `capture::audio::DEFAULT_DEVICE` to
+    /// follow the OS default.
+    Output { device: String },
     /// One application, by bundle id (macOS) / executable (Windows). `app_name`
     /// is what to call it while it isn't running.
     App { bundle_id: String, app_name: String },
     /// A video source's sound (the source `key`): there while the video is,
     /// and its sound's on (see `App::sync_video_sounds`).
     Video { key: u64 },
+}
+
+/// A program a desktop source leaves out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeftOut {
+    /// Its executable, `FXSound.exe`.
+    pub exe: String,
+    /// What it was called when it was left out, to show while it isn't running.
+    pub name: String,
 }
 
 /// The order the library shows clips in.
@@ -1286,7 +1305,7 @@ fn new_source_id() -> String {
 pub fn default_sources() -> Vec<AudioSourceCfg> {
     vec![
         AudioSourceCfg::new("Microphone", SourceKind::Microphone { device: capture::audio::DEFAULT_DEVICE.into() }),
-        AudioSourceCfg::new("Desktop", SourceKind::Desktop { exclude_apps: true }),
+        AudioSourceCfg::new("Desktop", SourceKind::Desktop { exclude_apps: true, leave_out: Vec::new() }),
     ]
 }
 
@@ -1313,7 +1332,7 @@ fn migrate(old: &[LegacyAudioTrack]) -> Vec<AudioSourceCfg> {
             LegacyKind::Input => SourceKind::Microphone { device: t.device_id.clone() },
             // There's one desktop capture whatever the output device; keep one.
             LegacyKind::Output if out.iter().any(|s| matches!(s.kind, SourceKind::Desktop { .. })) => continue,
-            LegacyKind::Output => SourceKind::Desktop { exclude_apps: true },
+            LegacyKind::Output => SourceKind::Desktop { exclude_apps: true, leave_out: Vec::new() },
         };
         let mut s = AudioSourceCfg::new(&t.name, kind);
         s.enabled = t.enabled;
@@ -4220,5 +4239,20 @@ mod scene_tests {
         assert_eq!((fresh.scenes.len(), fresh.webcams.len()), (2, 1));
         assert!(fresh.presets.iter().any(|x| x.id == p));
         assert!(fresh.preset().is_some_and(|x| x.setup.is_none()));
+    }
+
+    /// A desktop saved before programs could be left out reads as leaving
+    /// none out, and saves the same; one leaving some out, and an output
+    /// device's source, come back as they were.
+    #[test]
+    fn programs_left_out_and_output_sources_are_kept() {
+        let old: SourceKind = serde_json::from_str(r#"{"type":"desktop","exclude_apps":true}"#).unwrap();
+        assert_eq!(old, SourceKind::Desktop { exclude_apps: true, leave_out: Vec::new() });
+        assert_eq!(serde_json::to_string(&old).unwrap(), r#"{"type":"desktop","exclude_apps":true}"#);
+        let fx = SourceKind::Desktop { exclude_apps: false, leave_out: vec![LeftOut { exe: "FXSound.exe".into(), name: "FxSound".into() }] };
+        assert_eq!(serde_json::from_str::<SourceKind>(&serde_json::to_string(&fx).unwrap()).unwrap(), fx);
+        let output = SourceKind::Output { device: "Speakers (Realtek(R) Audio)".into() };
+        assert_eq!(serde_json::to_string(&output).unwrap(), r#"{"type":"output","device":"Speakers (Realtek(R) Audio)"}"#);
+        assert_eq!(serde_json::from_str::<SourceKind>(&serde_json::to_string(&output).unwrap()).unwrap(), output);
     }
 }

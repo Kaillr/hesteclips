@@ -1114,6 +1114,21 @@ pub const BLEND_WHILE_CAPTURING: bool = cfg!(any(target_os = "windows", target_o
 /// can't be, they're set when the capture starts.
 pub const SOURCES_WHILE_CAPTURING: bool = cfg!(any(target_os = "windows", target_os = "macos", target_os = "linux"));
 
+/// Whether an output device's sound can be a source
+/// ([`sources::SourceKind::Output`]): on Windows and Linux. Not yet on macOS.
+pub const OUTPUT_SOURCES: bool = cfg!(any(target_os = "windows", target_os = "linux"));
+
+/// Whether a desktop source says which programs it records, and can leave
+/// some out ([`sources::SourceKind::Desktop`]'s `leave_out`): on Windows and
+/// Linux. Not yet on macOS.
+pub const DESKTOP_PROGRAMS: bool = cfg!(any(target_os = "windows", target_os = "linux"));
+
+/// Whether what a desktop source leaves out (apps with their own source,
+/// programs), and which device an output source records, change in a
+/// running capture ([`Recorder::set_sources`]): its track goes on, other
+/// streams fill it. On Windows and Linux; on macOS they wait for the next start.
+pub const DESKTOP_CHANGES_WHILE_CAPTURING: bool = cfg!(any(target_os = "windows", target_os = "linux"));
+
 /// A capture device (screen, app, or audio device) as seen by the backend.
 #[derive(Debug, Clone)]
 pub struct Device {
