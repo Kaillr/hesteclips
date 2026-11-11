@@ -1,23 +1,29 @@
 //! "Hashtag HesteClip that": say it and a clip is saved, like pressing the
 //! save shortcut.
 //!
-//! A detector trained for this one phrase (`assets/wake`, 3 MB, built into
+//! A detector trained for this one phrase (`assets/wake`, 15 MB, built into
 //! the app) listens to the microphone on the Sources page, on this computer,
 //! only while the replay buffer runs and the setting is on. It knows nothing
 //! but the phrase, so talking doesn't save clips.
 //!
 //! General speech models never heard "HesteClip" (Norwegian "heste" + English
-//! "clip") and lost it when said fast: the keyword spotter this replaces
-//! caught 15 of 30 of the user's takes. This one learned the whole phrase's
-//! sound from thousands of synthetic voices, fast and slurred ones too, and
-//! against near misses: 24 of 30, and 8 of 8 fast, quiet ones said live.
-//! Only the whole phrase counts: "hashtag", "hashtag hesteclip" and "hesteclip
-//! that" don't save clips.
+//! "clip") and lose it when said fast. This detector learned the whole
+//! phrase's sound from ~30,000 synthetic takes (English, Norwegian, also in
+//! Norwegian spelling, Swedish, Danish and other accents; mostly fast and
+//! slurred, as people say it), the users' own takes and "ignore" clips
+//! (Settings > Voice > Review > Export), near misses, and ~390 hours of
+//! everyday speech, music and noise. Trained the same way without the users'
+//! last five days of samples, it heard all 53 of their takes from those days
+//! (the previous detector: 47) and fired on 3 of their 196 "ignore" clips
+//! (6), with as few false saves on everyday audio (0.04 an hour). Only the
+//! whole phrase counts: "hashtag", "hashtag hesteclip" and "hesteclip that"
+//! don't save clips.
 //!
 //! How: every 80 ms of sound becomes a frame of openWakeWord's speech features
 //! (a mel spectrogram, then Google's speech embedding); the last 16 frames
-//! (~2 s) go to our classifier. The phrase is heard when it's sure
-//! ([`THRESHOLD`]) for [`NEED`] frames in a row. A few % of one core.
+//! (~2 s) go to our classifier (three small networks, averaged). The phrase
+//! is heard when it's sure ([`THRESHOLD`]) for [`NEED`] frames in a row. A few
+//! % of one core.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -117,14 +123,18 @@ mod detector {
     const CLASSIFIER: &[u8] = include_bytes!("../assets/wake/hesteclip.onnx");
 
     /// How sure the classifier must be, frame by frame, and for how many
-    /// frames (80 ms each) in a row. One frame alone fired ~16 times an hour
-    /// on everyday audio; four in a row at 0.8: under one, with the same
-    /// takes caught (picked on half of openWakeWord's validation audio,
-    /// checked on the other half).
-    pub(super) const THRESHOLD: f32 = 0.8;
-    pub(super) const NEED: usize = 4;
-    /// After a clip is saved, the phrase isn't heard again for this long: one
-    /// take, one clip (the next take can come 1.6 s later).
+    /// frames (80 ms each) in a row: the setting that caught the most
+    /// held-out takes (the users' own, then voices it never heard) with
+    /// under 0.1 false saves an hour on 25 hours of everyday speech in 8
+    /// languages, and no more of the users' "ignore" clips firing than
+    /// before (`tools/wake`, `choose.py`).
+    pub(super) const THRESHOLD: f32 = 0.75;
+    pub(super) const NEED: usize = 3;
+    /// One take, one clip. The classifier stays sure as long as the whole
+    /// phrase is in the ~2 s it hears (up to ~1.5 s for a quick take), so a
+    /// clip is saved on the [`NEED`]th sure frame in a row and not again in
+    /// that run, nor within this long of the last save (a dip in the middle
+    /// of a take). The next take can come 1.6 s later.
     const QUIET_AFTER: f64 = 1.2;
     /// A snippet is kept for review when the classifier gets this sure without
     /// firing (a guess: low enough to catch the phrase said oddly, high enough
@@ -466,7 +476,7 @@ mod detector {
                 eprintln!("voice: t={:.2} p={p:.2} sure={}", self.clock, self.sure);
             }
             self.watch_burst(p);
-            if self.sure < NEED || self.said_at.is_some_and(|t| self.clock - t < QUIET_AFTER) {
+            if self.sure != NEED || self.said_at.is_some_and(|t| self.clock - t < QUIET_AFTER) {
                 return false;
             }
             self.said_at = Some(self.clock);
