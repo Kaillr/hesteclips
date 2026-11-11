@@ -827,9 +827,9 @@ enum Encoder {
 impl Encoder {
     fn start(job: &Job, gpu: &Gpu, partial: &Path) -> Result<Self> {
         let (w, h) = job.size;
-        // `HASTECLIP_ENCODER=x264` (or anything but `mf`) leaves the card's
+        // `HESTECLIPS_ENCODER=x264` (or anything but `mf`) leaves the card's
         // encoder out.
-        let card = std::env::var("HASTECLIP_ENCODER").ok().is_none_or(|o| o == "mf");
+        let card = std::env::var("HESTECLIPS_ENCODER").ok().is_none_or(|o| o == "mf");
         if !job.fit && card {
             let spec = Spec { width: w, height: h, fps: job.out_fps, audio_titles: Vec::new(), audio_bitrate: 0, comment: String::new(), mov: false, reorder: 0 };
             let writer = Writer::record(partial.to_path_buf(), Layout { spec }, job.out_fps);

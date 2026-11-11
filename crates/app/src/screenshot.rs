@@ -145,7 +145,7 @@ mod tests {
 
     /// A picture put on the clipboard is there to paste.
     #[test]
-    #[ignore = "replaces what's on the clipboard: cargo test -p hasteclip copies_a_picture -- --ignored"]
+    #[ignore = "replaces what's on the clipboard: cargo test -p hesteclips copies_a_picture -- --ignored"]
     fn copies_a_picture() {
         crate::share::copy_image(4, 2, [10, 200, 30, 255].repeat(8)).unwrap();
         #[cfg(windows)]

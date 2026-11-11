@@ -1846,7 +1846,7 @@ struct PacerCtl {
 }
 
 /// Where frames wait, logged for every 5 s in which frames were skipped
-/// (every 5 s with `HASTECLIP_ENCODE_LOG=1`), so a log from a PC that can't
+/// (every 5 s with `HESTECLIPS_ENCODE_LOG=1`), so a log from a PC that can't
 /// keep up says what it's short of: how late the pacer closed frames and how
 /// long closing took (CPU), and which of its steps the slowest one's time
 /// went to, how long the GPU took to finish a frame's work after it was
@@ -1905,7 +1905,7 @@ impl std::fmt::Display for CloseSteps {
 impl EncodeDiag {
     fn new() -> Self {
         Self {
-            verbose: std::env::var_os("HASTECLIP_ENCODE_LOG").is_some(),
+            verbose: std::env::var_os("HESTECLIPS_ENCODE_LOG").is_some(),
             since: Instant::now(),
             frames: 0,
             late_max: 0.0,
@@ -2439,7 +2439,7 @@ mod tests {
 
     /// With nothing running, a screenshot of the main screen is taken by a
     /// capture of its own: the screen's size, opaque, not all black.
-    /// `HASTECLIP_SHOT=<file.png>` keeps it to look at.
+    /// `HESTECLIPS_SHOT=<file.png>` keeps it to look at.
     #[test]
     #[ignore = "captures the screen: cargo test -p capture screenshot_of_the_screen -- --ignored"]
     fn screenshot_of_the_screen() {
@@ -2454,7 +2454,7 @@ mod tests {
         assert_eq!(img.bgra.len(), (w * h * 4) as usize);
         assert!(img.bgra.chunks_exact(4).all(|p| p[3] == 255));
         assert!(img.bgra.chunks_exact(4).any(|p| p[0] > 16 || p[1] > 16 || p[2] > 16), "all black");
-        if let Some(out) = std::env::var_os("HASTECLIP_SHOT") {
+        if let Some(out) = std::env::var_os("HESTECLIPS_SHOT") {
             let rgb: Vec<u8> = img.bgra.chunks_exact(4).flat_map(|p| [p[2], p[1], p[0]]).collect();
             let header = format!("P6\n{w} {h}\n255\n");
             std::fs::write(out, [header.as_bytes(), &rgb].concat()).unwrap();

@@ -69,10 +69,10 @@ fn show(visible: bool) {
 async fn run(script: &str) -> zbus::Result<()> {
     // KWin loads scripts from files: one of ours, gone once it's run.
     let dir = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir);
-    let path = dir.join(format!("hasteclip-window-{}.js", std::process::id()));
+    let path = dir.join(format!("hesteclips-window-{}.js", std::process::id()));
     std::fs::File::create(&path).and_then(|mut f| f.write_all(script.as_bytes())).map_err(|e| zbus::Error::Failure(e.to_string()))?;
     let conn = zbus::Connection::session().await?;
-    let name = "hasteclip-window";
+    let name = "hesteclips-window";
     let scripting = |method| (Some("org.kde.KWin"), "/Scripting", Some("org.kde.kwin.Scripting"), method);
     // A script of the same name still loaded (one run before) would be kept.
     let (dest, path_, iface, method) = scripting("unloadScript");

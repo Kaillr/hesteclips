@@ -7,7 +7,7 @@
 //! - **Mic**: connected to its device by the session manager (WirePlumber).
 //! - **Desktop and apps**: connected by us, the way a patchbay would — every
 //!   app's playback stream is linked straight into ours, and PipeWire adds up
-//!   what arrives. The desktop is every app except HasteClip itself (its
+//!   what arrives. The desktop is every app except HesteClips itself (its
 //!   clip previews and sounds), and, when asked, except the apps that are
 //!   sources of their own; an app source is the playback of programs by that
 //!   name. Like WASAPI's process loopback on Windows, and unlike recording
@@ -434,9 +434,9 @@ fn open_stream(core: &pw::core::CoreRc, source: &AudioSource, feed: Arc<SourceFe
         *pw::keys::MEDIA_TYPE => "Audio",
         *pw::keys::MEDIA_CATEGORY => "Capture",
         *pw::keys::MEDIA_ROLE => "Production",
-        *pw::keys::NODE_NAME => format!("hasteclip.{}", source.id),
-        *pw::keys::NODE_DESCRIPTION => format!("HasteClip: {}", source.name),
-        *pw::keys::APP_NAME => "HasteClip",
+        *pw::keys::NODE_NAME => format!("hesteclips.{}", source.id),
+        *pw::keys::NODE_DESCRIPTION => format!("HesteClips: {}", source.name),
+        *pw::keys::APP_NAME => "HesteClips",
         // Small packets, so the meters move smoothly.
         *pw::keys::NODE_LATENCY => format!("{}/{RATE}", RATE / 100),
     };
@@ -454,7 +454,7 @@ fn open_stream(core: &pw::core::CoreRc, source: &AudioSource, feed: Arc<SourceFe
     if monitor {
         props.insert("stream.capture.sink", "true");
     }
-    let stream = pw::stream::StreamRc::new(core.clone(), &format!("hasteclip-{}", source.id), props)?;
+    let stream = pw::stream::StreamRc::new(core.clone(), &format!("hesteclips-{}", source.id), props)?;
     let listener = stream
         .add_local_listener_with_user_data(())
         .process(move |stream, _| {
@@ -773,9 +773,9 @@ mod tests {
     /// A mic switched while capturing: our stream is linked to the new
     /// device, and its sound keeps coming into the same feed.
     #[test]
-    #[ignore = "needs two mics: HASTECLIP_MIC_A=<node name> HASTECLIP_MIC_B=<node name> cargo test -p capture switches_mic -- --ignored"]
+    #[ignore = "needs two mics: HESTECLIPS_MIC_A=<node name> HESTECLIPS_MIC_B=<node name> cargo test -p capture switches_mic -- --ignored"]
     fn switches_mic_while_capturing() {
-        let (a, b) = (std::env::var("HASTECLIP_MIC_A").unwrap(), std::env::var("HASTECLIP_MIC_B").unwrap());
+        let (a, b) = (std::env::var("HESTECLIPS_MIC_A").unwrap(), std::env::var("HESTECLIPS_MIC_B").unwrap());
         let clock = Arc::new(crate::mixer::Clock::default());
         clock.set(crate::linux::host_now());
         let feed = SourceFeed::new(RATE, clock);
@@ -791,7 +791,7 @@ mod tests {
             for line in text.lines() {
                 if !line.starts_with(' ') {
                     from = line.split(':').next().map(str::to_owned);
-                } else if line.contains("|-> hasteclip.mictest:") {
+                } else if line.contains("|-> hesteclips.mictest:") {
                     found.extend(from.clone());
                 }
             }

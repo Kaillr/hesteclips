@@ -839,7 +839,7 @@ struct Steps {
 }
 
 /// Where frames wait, logged for every 5 s in which frames were skipped
-/// (every 5 s with `HASTECLIP_ENCODE_LOG=1`), as on Windows, so a log from a
+/// (every 5 s with `HESTECLIPS_ENCODE_LOG=1`), as on Windows, so a log from a
 /// Mac that can't keep up says what it's short of: how late frames were made
 /// and how long making one took, and which of its steps the slowest one's
 /// time went to; how long after a blended frame was closed the graphics card
@@ -863,7 +863,7 @@ struct EncodeReport {
 impl EncodeReport {
     fn new() -> Self {
         Self {
-            verbose: std::env::var_os("HASTECLIP_ENCODE_LOG").is_some(),
+            verbose: std::env::var_os("HESTECLIPS_ENCODE_LOG").is_some(),
             since: Instant::now(),
             frames: 0,
             late_max: 0.0,

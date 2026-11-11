@@ -46,7 +46,7 @@ pub(crate) struct Track {
 pub(crate) struct Movie {
     pub seconds: f64,
     pub tracks: Vec<Track>,
-    /// The file's comment (ours: `hasteclip:mix=…`).
+    /// The file's comment (ours: `hesteclips:mix=…`).
     pub comment: Option<String>,
 }
 

@@ -1,10 +1,10 @@
-//! Control from other apps on this computer: HasteClip's Stream Deck
+//! Control from other apps on this computer: HesteClips' Stream Deck
 //! plugin, or anything else that speaks it (`docs/control.md` says what's
 //! said, line by line).
 //!
 //! It comes in on the app's own port (see `tray::claim`): a connection
 //! that opens with the word `ctrl`, where a later launch says `show` or
-//! `quit`. Only the HasteClip that runs has the port (a development test
+//! `quit`. Only the HesteClips that runs has the port (a development test
 //! instance beside it doesn't), so only it answers, and only to this
 //! computer. From then on each side writes one JSON object a line: the
 //! client says hello, then asks for things; the app says hello back, tells
@@ -396,7 +396,7 @@ fn serve(stream: TcpStream, hub: &Hub) {
     let _ = socket.set_read_timeout(None);
     let (out, queue) = mpsc::sync_channel(BACKLOG);
     spawn_writer(writer, queue);
-    let _ = out.try_send(line(&json!({ "hello": VERSION, "app": "HasteClip", "version": env!("CARGO_PKG_VERSION") })));
+    let _ = out.try_send(line(&json!({ "hello": VERSION, "app": "HesteClips", "version": env!("CARGO_PKG_VERSION") })));
     let id = hub.join(out.clone(), socket);
     while let Some(text) = read_line(&mut reader) {
         if text.trim().is_empty() {
@@ -787,7 +787,7 @@ mod tests {
         client.send("ctrl{\"hello\":1,\"client\":\"test\"}\n");
         let hello = client.next();
         assert_eq!(hello["hello"], VERSION);
-        assert_eq!(hello["app"], "HasteClip");
+        assert_eq!(hello["app"], "HesteClips");
         joined(control);
         client
     }

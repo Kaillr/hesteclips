@@ -159,10 +159,10 @@ impl AudioStream {
 }
 
 /// What's in a clip: MP4 and MOV (ours, and most others) read here from
-/// their index, anything else by ffprobe. HASTECLIP_FFPROBE=1 asks ffprobe
+/// their index, anything else by ffprobe. HESTECLIPS_FFPROBE=1 asks ffprobe
 /// every time, to compare.
 pub fn probe(source: &Path) -> Result<ClipInfo> {
-    if std::env::var_os("HASTECLIP_FFPROBE").is_none()
+    if std::env::var_os("HESTECLIPS_FFPROBE").is_none()
         && let Ok(info) = probe_mp4(source)
     {
         return Ok(info);
@@ -307,14 +307,15 @@ pub struct ClipTag {
     pub id: Option<String>,
 }
 
-/// What clips from the app's earlier name carry in front of the same fields.
-const LEGACY_TAG: &str = concat!("heste", "clips:");
+/// What clips from the public version of this app (HasteClip) carry in front
+/// of the same fields: clips imported from it read the same.
+const LEGACY_TAG: &str = concat!("haste", "clip:");
 
-/// The file comment for a clip: `hasteclip:mix=1,2 id=3f9c…`. Recordings start
+/// The file comment for a clip: `hesteclips:mix=1,2 id=3f9c…`. Recordings start
 /// with just the mix; the id is added the first time the clip is edited.
 pub fn clip_tag(mix: &[usize], id: Option<&str>) -> String {
     let list: Vec<String> = mix.iter().map(|n| n.to_string()).collect();
-    let mut tag = format!("hasteclip:mix={}", list.join(","));
+    let mut tag = format!("hesteclips:mix={}", list.join(","));
     if let Some(id) = id {
         tag += &format!(" id={id}");
     }
@@ -330,9 +331,9 @@ pub fn render_tag(edit: &Edit, id: Option<&str>) -> String {
 }
 
 pub fn parse_clip_tag(comment: &str) -> ClipTag {
-    // The older spelling of the tag (the first versions of this app, and the
-    // clips imported from them) reads the same.
-    let Some(rest) = comment.strip_prefix("hasteclip:").or_else(|| comment.strip_prefix(LEGACY_TAG)) else { return ClipTag::default() };
+    // The public version's spelling of the tag (clips imported from it)
+    // reads the same.
+    let Some(rest) = comment.strip_prefix("hesteclips:").or_else(|| comment.strip_prefix(LEGACY_TAG)) else { return ClipTag::default() };
     let mut tag = ClipTag::default();
     for field in rest.split_whitespace() {
         if let Some(list) = field.strip_prefix("mix=") {
@@ -1182,7 +1183,7 @@ pub fn render_with_progress(
     // new" of the same clip), and they must never share intermediate files.
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let work = std::env::temp_dir().join(format!("hasteclip-render-{}-{n}", std::process::id()));
+    let work = std::env::temp_dir().join(format!("hesteclips-render-{}-{n}", std::process::id()));
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(&work)?;
     let result = (|| -> Result<()> {
@@ -1449,7 +1450,7 @@ fn render_video(source: &Path, info: &ClipInfo, edit: &Edit, pieces: &[Piece], w
         let whole_rate = (rate - rate.round()).abs() < 1e-6 && rate >= 1.0;
         // A video to be shown turned (a phone's) ffmpeg turns as it renders
         // it; the card's frames are as stored, so it's left to ffmpeg.
-        if whole_rate && std::env::var_os("HASTECLIP_EXPORT_FFMPEG").is_none() && !mp4::turned(source) {
+        if whole_rate && std::env::var_os("HESTECLIPS_EXPORT_FFMPEG").is_none() && !mp4::turned(source) {
             let out_fps = rate.round() as u32;
             let job = capture::export::Job {
                 source,
@@ -1890,7 +1891,7 @@ mod tests {
             ("ours.mp4", vec![
                 "-f", "lavfi", "-i", "testsrc2=s=1280x720:r=60:d=2", "-f", "lavfi", "-i", &tone(440), "-f", "lavfi", "-i", &tone(660), "-f", "lavfi", "-i", &tone(880),
                 "-map", "0", "-map", "1", "-map", "2", "-map", "3", "-c:v", "libx264", "-bf", "0", "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-c:a", "aac",
-                "-metadata", "comment=hasteclip:mix=1,2 id=0123456789abcdef",
+                "-metadata", "comment=hesteclips:mix=1,2 id=0123456789abcdef",
                 "-metadata:s:a:0", "title=Mix", "-metadata:s:a:0", "handler_name=Mix",
                 "-metadata:s:a:1", "title=Desktop", "-metadata:s:a:1", "handler_name=Desktop",
                 "-metadata:s:a:2", "handler_name=Microphone",
@@ -1899,7 +1900,7 @@ mod tests {
             ("small709.mp4", ["-f", "lavfi", "-i", "testsrc2=s=640x360:r=30:d=1", "-c:v", "libx264", "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"].iter().map(|s| s.to_string()).collect()),
             ("big601.mp4", ["-f", "lavfi", "-i", "testsrc2=s=1280x720:r=30:d=1", "-c:v", "libx264", "-colorspace", "smpte170m", "-color_primaries", "smpte170m", "-color_trc", "smpte170m"].iter().map(|s| s.to_string()).collect()),
             ("colr.mp4", ["-f", "lavfi", "-i", "testsrc2=s=1280x720:r=30:d=1", "-c:v", "libx264", "-colorspace", "bt470bg", "-movflags", "+write_colr"].iter().map(|s| s.to_string()).collect()),
-            ("quicktime.mov", ["-f", "lavfi", "-i", "testsrc2=s=1920x1080:r=30:d=1", "-f", "lavfi", "-i", "sine=d=1", "-c:v", "libx264", "-c:a", "aac", "-metadata", "comment=hasteclip:mix=1", "-metadata:s:a:0", "title=Game"].iter().map(|s| s.to_string()).collect()),
+            ("quicktime.mov", ["-f", "lavfi", "-i", "testsrc2=s=1920x1080:r=30:d=1", "-f", "lavfi", "-i", "sine=d=1", "-c:v", "libx264", "-c:a", "aac", "-metadata", "comment=hesteclips:mix=1", "-metadata:s:a:0", "title=Game"].iter().map(|s| s.to_string()).collect()),
             ("film.mp4", ["-f", "lavfi", "-i", "testsrc2=s=1280x720:r=24000/1001:d=2", "-c:v", "libx264"].iter().map(|s| s.to_string()).collect()),
             // Copied from a keyframe (as freeing up space trims): the
             // picture edited to start late, its movie length longer than
@@ -2162,12 +2163,12 @@ mod tests {
 
     #[test]
     fn clip_tags() {
-        assert_eq!(clip_tag(&[1, 2], None), "hasteclip:mix=1,2");
-        assert_eq!(clip_tag(&[1], Some("ab12")), "hasteclip:mix=1 id=ab12");
-        assert_eq!(parse_clip_tag("hasteclip:mix=1,2,3"), ClipTag { mix: Some(vec![1, 2, 3]), id: None });
-        assert_eq!(parse_clip_tag(&format!("{LEGACY_TAG}mix=1 id=ab12")), ClipTag { mix: Some(vec![1]), id: Some("ab12".into()) }, "the older spelling");
-        assert_eq!(parse_clip_tag("hasteclip:mix=1 id=ab12"), ClipTag { mix: Some(vec![1]), id: Some("ab12".into()) });
-        assert_eq!(parse_clip_tag("hasteclip:mix="), ClipTag { mix: Some(vec![]), id: None });
+        assert_eq!(clip_tag(&[1, 2], None), "hesteclips:mix=1,2");
+        assert_eq!(clip_tag(&[1], Some("ab12")), "hesteclips:mix=1 id=ab12");
+        assert_eq!(parse_clip_tag("hesteclips:mix=1,2,3"), ClipTag { mix: Some(vec![1, 2, 3]), id: None });
+        assert_eq!(parse_clip_tag(&format!("{LEGACY_TAG}mix=1 id=ab12")), ClipTag { mix: Some(vec![1]), id: Some("ab12".into()) }, "the public version's spelling");
+        assert_eq!(parse_clip_tag("hesteclips:mix=1 id=ab12"), ClipTag { mix: Some(vec![1]), id: Some("ab12".into()) });
+        assert_eq!(parse_clip_tag("hesteclips:mix="), ClipTag { mix: Some(vec![]), id: None });
         assert_eq!(parse_clip_tag("made with something else"), ClipTag::default());
     }
 }
@@ -2425,7 +2426,7 @@ mod export_bench {
     /// same: as many frames, each showing the same moment (the pictures
     /// differ only by scaling and encoding: under a level in 8×8 blocks),
     /// the sound as long as the picture. HC_SRC: a 60 fps clip with sound;
-    /// HC_FAST: a 540 fps one. HASTECLIP_ENCODER picks the card's encoder.
+    /// HC_FAST: a 540 fps one. HESTECLIPS_ENCODER picks the card's encoder.
     #[test]
     #[ignore = "needs clips and a graphics card"]
     fn card_exports_match_ffmpegs() {
@@ -2467,11 +2468,11 @@ mod export_bench {
             render_to(source, &info, &edit, &card, None).unwrap();
             let card_s = t.elapsed().as_secs_f64();
             // SAFETY: the tests here run one at a time (--test-threads=1).
-            unsafe { std::env::set_var("HASTECLIP_EXPORT_FFMPEG", "1") };
+            unsafe { std::env::set_var("HESTECLIPS_EXPORT_FFMPEG", "1") };
             let t = std::time::Instant::now();
             render_to(source, &info, &edit, &theirs, None).unwrap();
             let ffmpeg_s = t.elapsed().as_secs_f64();
-            unsafe { std::env::remove_var("HASTECLIP_EXPORT_FFMPEG") };
+            unsafe { std::env::remove_var("HESTECLIPS_EXPORT_FFMPEG") };
             let (a, a_len) = frames_of(&card, 160);
             let (b, b_len) = frames_of(&theirs, 160);
             let diffs: Vec<f64> = a.iter().zip(&b).map(|(x, y)| x.iter().zip(y).map(|(p, q)| p.abs_diff(*q) as f64).sum::<f64>() / x.len() as f64).collect();

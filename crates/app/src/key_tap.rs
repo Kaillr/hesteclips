@@ -32,7 +32,7 @@ pub fn allowed() -> bool {
 }
 
 /// Ask for Input Monitoring. The first time, macOS shows its prompt and adds
-/// HasteClip to the list in System Settings; after that it only opens the
+/// HesteClips to the list in System Settings; after that it only opens the
 /// list's pane if it's still off. Whether it's granted now.
 pub fn request() -> bool {
     CGRequestListenEventAccess() || {

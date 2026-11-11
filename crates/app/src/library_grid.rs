@@ -76,8 +76,6 @@ pub struct Shown {
     /// Whether the library has any screenshots (then clips or screenshots
     /// can be chosen).
     pub any_shots: bool,
-    /// How many of the library's clips are shared with a link.
-    pub shared: usize,
     /// The clips shown, in order (indices into the library's list).
     pub clips: Vec<usize>,
     pub groups: Vec<Group>,
@@ -99,7 +97,6 @@ struct ShownKey {
     collections: u64,
     filter: Filter,
     kind: ShowKind,
-    links: u64,
     query: String,
     sort: LibrarySort,
     lengths: u64,
@@ -116,7 +113,6 @@ pub struct Inputs<'a> {
     pub collections: &'a Collections,
     pub filter: &'a Filter,
     pub kind: ShowKind,
-    pub links: &'a crate::links::Links,
     pub query: &'a str,
     pub sort: LibrarySort,
     pub lengths_version: u64,
@@ -138,7 +134,6 @@ impl Shown {
             collections: inp.collections.version(),
             filter: inp.filter.clone(),
             kind: inp.kind,
-            links: inp.links.changes,
             query: query.clone(),
             sort: inp.sort,
             lengths: if inp.sort == LibrarySort::Longest { inp.lengths_version } else { 0 },
@@ -153,7 +148,7 @@ impl Shown {
         let sets = inp.collections.sets();
         let in_place = |c: &Clip| match inp.filter {
             Filter::Collection(id) => sets.get(id).is_some_and(|s| s.contains(&c.path)),
-            f => f.matches(c, inp.collections, inp.links),
+            f => f.matches(c, inp.collections),
         };
         let in_filter = |c: &Clip| inp.kind.matches(c) && in_place(c);
         let matches = |c: &Clip| query.is_empty() || c.title().to_lowercase().contains(&query) || c.folder.as_ref().is_some_and(|f| f.to_lowercase().contains(&query));
@@ -185,7 +180,6 @@ impl Shown {
         self.shots_in_filter = filtered.iter().filter(|&&i| clips[i].is_image()).count();
         self.found = (found_clips, found_shots);
         self.any_shots = clips.iter().any(Clip::is_image);
-        self.shared = clips.iter().filter(|c| inp.links.get(&c.path).is_some()).count();
         self.clips = shown;
         let (games, collections) = views(clips, inp.collections, &sets);
         self.games = games;
@@ -607,7 +601,7 @@ mod tests {
     fn layout_of(clips: &[Clip], filter: &Filter, width: f32) -> (Shown, Layout) {
         let cols = Collections::default();
         let mut shown = Shown::default();
-        shown.update(Inputs { clips, library_version: 1, collections: &cols, filter, kind: ShowKind::All, links: &crate::links::Links::default(), query: "", sort: LibrarySort::Newest, lengths_version: 0, placeholders: 0, new_renders: Vec::new(), renders: &[] }, false, |_| None);
+        shown.update(Inputs { clips, library_version: 1, collections: &cols, filter, kind: ShowKind::All, query: "", sort: LibrarySort::Newest, lengths_version: 0, placeholders: 0, new_renders: Vec::new(), renders: &[] }, false, |_| None);
         let l = Layout::new(&shown.groups, Metrics::for_width(width), |_| 1.0, |it| key_for(it, clips, &[]));
         (shown, l)
     }
@@ -775,9 +769,8 @@ mod tests {
         clips.extend((5..8).map(|i| Clip { path: PathBuf::from(format!("/lib/osu!/screenshot_2026-01-01_12-00-{i:02}.png")), ..clip(i, "osu!") }));
         clips.push(clip(9, "CS2"));
         let cols = Collections::default();
-        let links = crate::links::Links::default();
         let osu = Filter::Folder("osu!".into());
-        let inp = |kind, q: &'static str| Inputs { clips: &clips, library_version: 1, collections: &cols, filter: &osu, kind, links: &links, query: q, sort: LibrarySort::Newest, lengths_version: 0, placeholders: 0, new_renders: Vec::new(), renders: &[] };
+        let inp = |kind, q: &'static str| Inputs { clips: &clips, library_version: 1, collections: &cols, filter: &osu, kind, query: q, sort: LibrarySort::Newest, lengths_version: 0, placeholders: 0, new_renders: Vec::new(), renders: &[] };
         let mut shown = Shown::default();
         for kind in [ShowKind::All, ShowKind::Clips, ShowKind::Screenshots] {
             shown.update(inp(kind, ""), false, |_| None);
@@ -794,8 +787,7 @@ mod tests {
         let clips: Vec<Clip> = (0..50).map(|i| clip(i, "osu!")).collect();
         let cols = Collections::default();
         let mut shown = Shown::default();
-        let links = crate::links::Links::default();
-        let inp = |q: &'static str| Inputs { clips: &clips, library_version: 1, collections: &cols, filter: &Filter::All, kind: ShowKind::All, links: &links, query: q, sort: LibrarySort::Newest, lengths_version: 0, placeholders: 0, new_renders: Vec::new(), renders: &[] };
+        let inp = |q: &'static str| Inputs { clips: &clips, library_version: 1, collections: &cols, filter: &Filter::All, kind: ShowKind::All, query: q, sort: LibrarySort::Newest, lengths_version: 0, placeholders: 0, new_renders: Vec::new(), renders: &[] };
         assert!(shown.update(inp(""), false, |_| None));
         assert!(!shown.update(inp(""), false, |_| None));
         assert!(shown.update(inp("12"), false, |_| None));

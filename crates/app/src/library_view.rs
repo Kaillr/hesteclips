@@ -62,7 +62,6 @@ impl App {
                 collections: &self.collections,
                 filter: &self.library_filter,
                 kind: self.library_kind,
-                links: &self.links,
                 query: &self.library_query,
                 sort: self.settings.library_sort,
                 lengths_version,
@@ -396,7 +395,6 @@ impl App {
             }
             .to_owned(),
             Filter::All => "All clips".to_owned(),
-            Filter::Shared => "Shared".to_owned(),
             Filter::Loose => "Other".to_owned(),
             Filter::Folder(name) => name.clone(),
             Filter::Collection(id) => self.collections.get(id).map(|c| c.name.clone()).unwrap_or_default(),
@@ -472,13 +470,6 @@ impl App {
             let all = View { filter: Filter::All, label: if self.shown.any_shots { "All" } else { "All clips" }.into(), count: self.clips.len() };
             if let Some(a) = self.filter_row(ui, &all) {
                 action = Some(a);
-            }
-            // What anyone with a link can watch, together.
-            if self.shown.shared > 0 {
-                let shared = View { filter: Filter::Shared, label: "Shared".into(), count: self.shown.shared };
-                if let Some(a) = self.filter_row(ui, &shared) {
-                    action = Some(a);
-                }
             }
             if !games.is_empty() {
                 group_label(ui, "Games");
@@ -567,11 +558,6 @@ impl App {
         };
         match filter {
             Filter::All => bare(egui_phosphor::fill::SQUARES_FOUR, 18.0),
-            // The chain as on a shared clip's card (filled, it's cut out of a
-            // square, and reads as a tile).
-            Filter::Shared => {
-                p.text(rect.center(), Align2::CENTER_CENTER, icon::LINK, FontId::proportional(18.0), color);
-            }
             Filter::Loose => bare(egui_phosphor::fill::FOLDER_SIMPLE, 17.0),
             Filter::Folder(name) => match self.folder_icon(ui.ctx(), name) {
                 Some(tex) => {
@@ -610,7 +596,7 @@ impl App {
             return false;
         }
         let label = match filter {
-            Filter::All | Filter::Shared => return false,
+            Filter::All => return false,
             Filter::Collection(id) if drag.files.iter().all(|p| self.collections.contains(id, p)) => return false,
             Filter::Collection(id) => format!("Add to {}", self.collections.get(id).map(|c| c.name.clone()).unwrap_or_default()),
             Filter::Folder(_) | Filter::Loose => {
@@ -719,9 +705,6 @@ impl App {
                 }
             };
             pick(ui, &all);
-            if self.shown.shared > 0 {
-                pick(ui, &View { filter: Filter::Shared, label: "Shared".into(), count: self.shown.shared });
-            }
             if !games.is_empty() {
                 ui_kit::menu_sep(ui);
                 ui_kit::menu_head(ui, "Games");
@@ -993,34 +976,19 @@ impl App {
 
         let mut action = None;
         let modifiers = ui.input(|i| i.modifiers);
-        // Shared with a link: "Shared", bottom left, in words (a link mark
-        // alone was easy to miss), opening its dialog. Uploading for one, or
-        // a new version under it: how far, and a bar along the bottom.
-        if render.is_none() && !image {
-            use crate::links::LinkState;
-            let pct = |f: f32| ((f * 100.0) as u32).min(99);
-            let state = self.link_state(&clip.path);
-            let (mark, upload) = match state {
-                Some(LinkState::Uploading(f)) => (Some((format!("{} {}%", icon::CLOUD_ARROW_UP, pct(f)), "Uploading for a link")), Some(f)),
-                Some(LinkState::Updating(f)) => (Some((format!("{} {}%", icon::CLOUD_ARROW_UP, pct(f)), "Updating its link to this version")), Some(f)),
-                Some(LinkState::Behind) => (
-                    Some((format!("{} Shared", icon::ARROWS_CLOCKWISE), "Shared with a link, which still shows an older version of it: it's brought up to date once HasteClip's server can be reached")),
-                    None,
-                ),
-                Some(LinkState::Shared) => (Some((format!("{} Shared", icon::LINK), "Shared with a link: click for it, and who's watched it")), None),
-                None => (None, None),
-            };
-            if let Some(f) = upload {
-                let bar = Rect::from_min_max(Pos2::new(thumb_rect.left(), thumb_rect.bottom() - 3.0), thumb_rect.max);
-                painter.rect_filled(bar, 0, Color32::from_white_alpha(46));
-                painter.rect_filled(Rect::from_min_max(bar.min, Pos2::new(bar.left() + bar.width() * f, bar.bottom())), 0, Color32::WHITE);
-            }
-            if let Some((text, tip)) = mark {
-                let r = pill(&painter, thumb_rect.left_bottom() + vec2(7.0, -7.0), Align2::LEFT_BOTTOM, &text);
-                if ui.interact(r, resp.id.with("link"), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tip).clicked() {
-                    action = Some(Action::Share(clip.path.clone(), crate::library::ShareChoice::Link));
-                }
-            }
+        // Uploading to HesteFiles: how far, bottom left, and a bar along the
+        // bottom.
+        if render.is_none()
+            && let Some(up) = self.cloud.upload_for(&clip.path)
+        {
+            let f = up.progress();
+            let text = if up.merging() { format!("{} Finishing…", icon::CLOUD_ARROW_UP) } else { format!("{} {}%", icon::CLOUD_ARROW_UP, ((f * 100.0) as u32).min(99)) };
+            let bar = Rect::from_min_max(Pos2::new(thumb_rect.left(), thumb_rect.bottom() - 3.0), thumb_rect.max);
+            painter.rect_filled(bar, 0, Color32::from_white_alpha(46));
+            painter.rect_filled(Rect::from_min_max(bar.min, Pos2::new(bar.left() + bar.width() * f, bar.bottom())), 0, Color32::WHITE);
+            let r = pill(&painter, thumb_rect.left_bottom() + vec2(7.0, -7.0), Align2::LEFT_BOTTOM, &text);
+            ui.interact(r, resp.id.with("upload"), Sense::hover()).on_hover_text("Uploading to HesteFiles");
+            ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
         // Selection circle: always while selecting, on hover otherwise.
         let show_check = theme::toggle(&ctx, resp.id.with("chk"), (hovered || selecting) && render.is_none(), theme::FAST);
@@ -1050,8 +1018,8 @@ impl App {
             }
             let sr = overlay_icon(&mut qui, icon::EXPORT, true, "Share");
             let sr = egui::Response { id: share_id, ..sr };
-            let linked = self.links.get(&clip.path).is_some();
-            if let Some(c) = ui_kit::menu_popup(&sr, false, 250.0, |ui| share_items(ui, sr.rect.left_bottom(), linked, image)).flatten() {
+            let uploading = self.cloud.upload_for(&clip.path).is_some();
+            if let Some(c) = ui_kit::menu_popup(&sr, false, 250.0, |ui| share_items(ui, sr.rect.left_bottom(), uploading, image)).flatten() {
                 action = Some(Action::Share(clip.path.clone(), c));
             }
         }
@@ -1163,7 +1131,7 @@ impl App {
                 });
             }
             if !paths.iter().any(|p| clips::is_image(p))
-                && Item::new(format!("Export {n} clips…")).icon(icon::PACKAGE).tip("To a file with their originals, markers and collections, to import into HasteClip on another computer").show(ui).clicked()
+                && Item::new(format!("Export {n} clips…")).icon(icon::PACKAGE).tip("To a file with their originals, markers and collections, to import into HesteClips on another computer").show(ui).clicked()
             {
                 action = Some(Action::Export(paths.clone()));
             }
@@ -1194,9 +1162,9 @@ impl App {
         }
         ui_kit::menu_sep(ui);
         let at = ui.ctx().pointer_latest_pos().unwrap_or_default();
-        let linked = self.links.get(&clip.path).is_some();
+        let uploading = self.cloud.upload_for(&clip.path).is_some();
         ui_kit::submenu(ui, Item::new("Share").icon(icon::EXPORT), |ui| {
-            if let Some(c) = share_items(ui, at, linked, image) {
+            if let Some(c) = share_items(ui, at, uploading, image) {
                 action = Some(Action::Share(clip.path.clone(), c));
             }
         });
@@ -1257,7 +1225,7 @@ impl App {
             }
         }
         ui_kit::menu_sep(ui);
-        if Item::new("Import clips…").icon(icon::DOWNLOAD_SIMPLE).tip("Clips exported from HasteClip on another computer (.hasteclip files). Or drop the files on the window").show(ui).clicked() {
+        if Item::new("Import clips…").icon(icon::DOWNLOAD_SIMPLE).tip("Clips exported from HesteClips on another computer (.hesteclips files). Or drop the files on the window").show(ui).clicked() {
             action = Some(Action::Import);
         }
         if Item::new(format!("Show clips folder in {}", crate::file_manager())).icon(icon::FOLDER_OPEN).show(ui).clicked()
@@ -1391,7 +1359,7 @@ impl App {
                 DropOn::View(Filter::Folder(f)) => self.move_clips(ctx, &files, Some(f)),
                 DropOn::View(Filter::Loose) => self.move_clips(ctx, &files, None),
                 DropOn::View(Filter::Collection(id)) => self.put_in_collection(&files, &id, true),
-                DropOn::View(Filter::All | Filter::Shared) => {}
+                DropOn::View(Filter::All) => {}
                 DropOn::NewCollection => self.new_collection_with(files),
             },
             Action::Edit(p) => self.open_editor(p),
@@ -1611,10 +1579,10 @@ fn vrule(ui: &mut egui::Ui) {
 }
 
 /// The ways to get a clip out, the same from the Share button and the
-/// right-click menu, and that it can be dragged out too. `linked`: the clip
-/// has a share link already. `image`: it's a screenshot (its picture, its
-/// file, or where it is).
-pub(crate) fn share_items(ui: &mut egui::Ui, anchor: Pos2, linked: bool, image: bool) -> Option<crate::library::ShareChoice> {
+/// right-click menu, and that it can be dragged out too. `uploading`: the
+/// clip is going up to HesteFiles now. `image`: it's a screenshot (its
+/// picture, its file, or where it is).
+pub(crate) fn share_items(ui: &mut egui::Ui, anchor: Pos2, uploading: bool, image: bool) -> Option<crate::library::ShareChoice> {
     use crate::library::ShareChoice;
     let mut choice = None;
     if image {
@@ -1637,15 +1605,12 @@ pub(crate) fn share_items(ui: &mut egui::Ui, anchor: Pos2, linked: bool, image: 
         }
         return choice;
     }
-    if linked {
-        if Item::new("Copy link").icon(icon::LINK).tip("Its link plays it in any browser and right in Discord").show(ui).clicked() {
-            choice = Some(ShareChoice::CopyLink);
+    if uploading {
+        if Item::new("Cancel upload").icon(icon::X_CIRCLE).show(ui).clicked() {
+            choice = Some(ShareChoice::CancelUpload);
         }
-        if Item::new("Shared link…").icon(icon::GLOBE).tip("Its link, how many have watched it, and Stop sharing").show(ui).clicked() {
-            choice = Some(ShareChoice::Link);
-        }
-    } else if Item::new("Share with a link…").icon(icon::LINK).tip("Uploads it to HasteClip for a link that plays it in any browser and right in Discord").show(ui).clicked() {
-        choice = Some(ShareChoice::Link);
+    } else if Item::new("Upload to HesteFiles…").icon(icon::CLOUD_ARROW_UP).tip("Into a folder of your HesteFiles storage, with a public link if you like").show(ui).clicked() {
+        choice = Some(ShareChoice::Upload);
     }
     ui_kit::menu_sep(ui);
     if Item::new("Copy clip").icon(icon::COPY).keys(Some(crate::shortcuts::command("C"))).tip(format!("Then paste it into Discord, a chat or a folder ({})", crate::hotkey_label_cmd("V"))).show(ui).clicked() {
@@ -1660,7 +1625,7 @@ pub(crate) fn share_items(ui: &mut egui::Ui, anchor: Pos2, linked: bool, image: 
     }
     if Item::new("Export with its edit…")
         .icon(icon::PACKAGE)
-        .tip("A file with the clip, its original, markers and collections, to import into HasteClip on another computer")
+        .tip("A file with the clip, its original, markers and collections, to import into HesteClips on another computer")
         .show(ui)
         .clicked()
     {
@@ -1743,7 +1708,7 @@ fn view_menu(ui: &mut egui::Ui, filter: &Filter) -> Option<Action> {
                 action = Some(Action::DeleteCollection(id.clone()));
             }
         }
-        Filter::All | Filter::Shared | Filter::Loose => {}
+        Filter::All | Filter::Loose => {}
     }
     action
 }

@@ -605,17 +605,17 @@ mod tests {
     }
 
     /// A video layer's decoding: to its end in order, then from frame 0
-    /// again and on (its loop). `HASTECLIP_TEST_VIDEO=<a video file>`, and
-    /// `HASTECLIP_TEST_VIDEO_FPS=<its rate>` where the decoder's is off (it
+    /// again and on (its loop). `HESTECLIPS_TEST_VIDEO=<a video file>`, and
+    /// `HESTECLIPS_TEST_VIDEO_FPS=<its rate>` where the decoder's is off (it
     /// said 20 for a 60 fps recording, each number three frames).
     #[test]
     #[ignore]
     fn a_video_plays_to_its_end_and_from_the_start_again() {
-        let Ok(path) = std::env::var("HASTECLIP_TEST_VIDEO") else { return };
+        let Ok(path) = std::env::var("HESTECLIPS_TEST_VIDEO") else { return };
         let path = std::path::Path::new(&path);
         assert!(crate::layers::video_size(path).is_some_and(|(w, h)| w > 0 && h > 0));
         let mut d = crate::decode::Decoder::open_rgba(path, 640).unwrap();
-        if let Ok(fps) = std::env::var("HASTECLIP_TEST_VIDEO_FPS") {
+        if let Ok(fps) = std::env::var("HESTECLIPS_TEST_VIDEO_FPS") {
             d.set_fps(fps.parse().unwrap());
         }
         let (mut last, mut n) = (None::<u64>, 0);
@@ -640,7 +640,7 @@ mod tests {
             frames += samples.len() / sound.channels as usize;
         }
         let secs = frames as f64 / f64::from(sound.rate);
-        let fps: f64 = std::env::var("HASTECLIP_TEST_VIDEO_FPS").ok().and_then(|f| f.parse().ok()).unwrap_or(d.fps);
+        let fps: f64 = std::env::var("HESTECLIPS_TEST_VIDEO_FPS").ok().and_then(|f| f.parse().ok()).unwrap_or(d.fps);
         let picture = n as f64 / fps;
         assert!((secs - picture).abs() < 0.5, "sound {secs:.2} s, picture {picture:.2} s");
         sound.rewind().unwrap();

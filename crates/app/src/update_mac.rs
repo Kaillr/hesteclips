@@ -1,9 +1,9 @@
 //! Updating the macOS app: the next release's `.app`, swapped in for this one.
 //!
-//! An update is the release's zipped app (`HasteClip-mac-arm64.zip`, beside
+//! An update is the release's zipped app (`HesteClips-mac-arm64.zip`, beside
 //! the `.dmg` people install from): found on GitHub, downloaded and checked
-//! against its `.sha256`, unzipped into HasteClip's cache folder, and
-//! accepted only if it's signed with HasteClip's own certificate. That
+//! against its `.sha256`, unzipped into HesteClips' cache folder, and
+//! accepted only if it's signed with HesteClips' own certificate. That
 //! certificate is what keeps macOS's permissions (Screen Recording, Input
 //! Monitoring) with the app from one version to the next, and what says the
 //! download is ours: the checksum comes from the same place as the download,
@@ -33,18 +33,18 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 
-const ZIP: &str = "HasteClip-mac-arm64.zip";
+const ZIP: &str = "HesteClips-mac-arm64.zip";
 /// GitHub's API for the repo's releases, newest first.
-const RELEASES: &str = "https://api.github.com/repos/hasteclip/hasteclip/releases?per_page=10";
+const RELEASES: &str = "https://api.github.com/repos/Kaillr/hesteclips/releases?per_page=10";
 /// What the new app's signature must say: our identifier, our certificate
 /// (`codesign -dr -` on a release). Anything else isn't put in place.
-const REQUIREMENT: &str = r#"=identifier "io.github.kaillr.HasteClip" and certificate root = H"57f24a68cb31a35998890f8b6f9b94b74918c2ea""#;
+const REQUIREMENT: &str = r#"=identifier "io.github.kaillr.HesteClips" and certificate root = H"57f24a68cb31a35998890f8b6f9b94b74918c2ea""#;
 
 /// The installed app bundle, if it's one we can update: signed as a release
 /// is, and somewhere that isn't a disk image or a build folder.
 pub fn install_dir() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
-    // …/HasteClip.app/Contents/MacOS/hasteclip
+    // …/HesteClips.app/Contents/MacOS/hesteclips
     let app = exe.parent()?.parent()?.parent()?.to_path_buf();
     if app.extension().is_none_or(|e| e != "app") {
         return None;
@@ -82,7 +82,7 @@ fn can_write(path: &Path) -> bool {
     CString::new(path.as_os_str().as_bytes()).is_ok_and(|p| unsafe { libc::access(p.as_ptr(), libc::W_OK) } == 0)
 }
 
-/// Whether `app` is signed with HasteClip's certificate and sealed whole.
+/// Whether `app` is signed with HesteClips' certificate and sealed whole.
 fn signed_by_us(app: &Path) -> bool {
     Command::new("codesign")
         .args(["--verify", "--deep", "--strict", "-R", REQUIREMENT])
@@ -113,10 +113,10 @@ pub fn check(current: &str) -> Result<Option<Release>> {
         prerelease: bool,
         assets: Vec<Asset>,
     }
-    // `HASTECLIP_RELEASES=<url>`: another list in GitHub's form, to try an update.
-    let url = std::env::var("HASTECLIP_RELEASES").unwrap_or_else(|_| RELEASES.to_owned());
+    // `HESTECLIPS_RELEASES=<url>`: another list in GitHub's form, to try an update.
+    let url = std::env::var("HESTECLIPS_RELEASES").unwrap_or_else(|_| RELEASES.to_owned());
     let releases: Vec<GhRelease> = ureq::get(&url)
-        .header("User-Agent", "HasteClip-updater")
+        .header("User-Agent", "HesteClips-updater")
         .header("Accept", "application/vnd.github+json")
         .call()
         .context("GitHub didn't answer")?
@@ -136,7 +136,7 @@ fn newer(a: &str, b: &str) -> bool {
     parts(a) > parts(b)
 }
 
-/// Where a downloaded update waits: in HasteClip's cache folder when that's
+/// Where a downloaded update waits: in HesteClips' cache folder when that's
 /// on the app's disk, as the update is moved into place and a move can't
 /// cross disks. Otherwise beside the app, hidden.
 fn staging(app: &Path) -> Option<PathBuf> {
@@ -144,9 +144,9 @@ fn staging(app: &Path) -> Option<PathBuf> {
     if let Some(cache) = dirs::cache_dir()
         && disk(&cache).is_some_and(|d| disk(app) == Some(d))
     {
-        return Some(cache.join("hasteclip").join("update"));
+        return Some(cache.join("hesteclips").join("update"));
     }
-    Some(app.parent()?.join(".hasteclip-update"))
+    Some(app.parent()?.join(".hesteclips-update"))
 }
 
 /// Download `release` for `app`, check it, unzip it and check its
@@ -156,13 +156,13 @@ pub fn download(release: &Release, app: &Path, mut progress: impl FnMut(u8)) -> 
     let _ = std::fs::remove_dir_all(&staging);
     std::fs::create_dir_all(&staging).with_context(|| format!("can't write to {}", staging.display()))?;
 
-    let expected = ureq::get(&release.checksum).header("User-Agent", "HasteClip-updater").call()?.body_mut().read_to_string()?;
+    let expected = ureq::get(&release.checksum).header("User-Agent", "HesteClips-updater").call()?.body_mut().read_to_string()?;
     let expected = expected.split_whitespace().next().unwrap_or_default().to_ascii_lowercase();
     if expected.len() != 64 {
         bail!("the release's checksum file is malformed");
     }
 
-    let mut response = ureq::get(&release.zip).header("User-Agent", "HasteClip-updater").call()?;
+    let mut response = ureq::get(&release.zip).header("User-Agent", "HesteClips-updater").call()?;
     let total = response.headers().get("content-length").and_then(|v| v.to_str().ok()?.parse::<u64>().ok());
     let mut body = response.body_mut().with_config().limit(1 << 30).reader();
     let zip = staging.join(ZIP);
@@ -199,12 +199,12 @@ pub fn download(release: &Release, app: &Path, mut progress: impl FnMut(u8)) -> 
     if !status.success() {
         bail!("couldn't unzip the update");
     }
-    let unzipped = partial.join("HasteClip.app");
+    let unzipped = partial.join("HesteClips.app");
     if !signed_by_us(&unzipped) {
         let _ = std::fs::remove_dir_all(&staging);
-        bail!("the update isn't signed by HasteClip, so it wasn't installed");
+        bail!("the update isn't signed by HesteClips, so it wasn't installed");
     }
-    let ready = staging.join("HasteClip.app");
+    let ready = staging.join("HesteClips.app");
     std::fs::rename(&unzipped, &ready)?;
     let _ = std::fs::remove_dir(&partial);
     Ok(ready)
@@ -218,7 +218,7 @@ pub fn pending(app: &Path) -> Option<(PathBuf, String)> {
 
 /// The update waiting in `staging`, if it's newer than this version and ours.
 fn waiting_in(staging: &Path) -> Option<(PathBuf, String)> {
-    let ready = staging.join("HasteClip.app");
+    let ready = staging.join("HesteClips.app");
     let version = bundle_version(&ready)?;
     (newer(&version, env!("CARGO_PKG_VERSION")) && signed_by_us(&ready)).then_some((ready, version))
 }
@@ -252,7 +252,7 @@ pub fn apply_pending_at_launch() -> bool {
 pub fn apply(ready: &Path, app: &Path, restart: bool) -> Result<()> {
     // Checked again: it waited on disk since it was downloaded.
     if !signed_by_us(ready) {
-        bail!("the update isn't signed by HasteClip");
+        bail!("the update isn't signed by HesteClips");
     }
     let staging = ready.parent().context("the update has no folder")?;
     if app.parent().is_some_and(can_write) {
@@ -327,20 +327,20 @@ mod tests {
     #[test]
     fn only_our_signature_is_taken() {
         let dir = std::env::temp_dir().join(format!("hc-mac-update-{}", std::process::id()));
-        let app = dir.join("HasteClip.app");
+        let app = dir.join("HesteClips.app");
         std::fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
-        std::fs::copy("/bin/echo", app.join("Contents/MacOS/hasteclip")).unwrap();
-        std::fs::write(app.join("Contents/Info.plist"), r#"<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>io.github.kaillr.HasteClip</string><key>CFBundleExecutable</key><string>hasteclip</string><key>CFBundleShortVersionString</key><string>99.0.0</string></dict></plist>"#).unwrap();
+        std::fs::copy("/bin/echo", app.join("Contents/MacOS/hesteclips")).unwrap();
+        std::fs::write(app.join("Contents/Info.plist"), r#"<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>io.github.kaillr.HesteClips</string><key>CFBundleExecutable</key><string>hesteclips</string><key>CFBundleShortVersionString</key><string>99.0.0</string></dict></plist>"#).unwrap();
         // Ad hoc, with our identifier: still not ours.
         assert!(Command::new("codesign").args(["--force", "--sign", "-"]).arg(&app).status().unwrap().success());
         assert!(!signed_by_us(&app));
         // Waiting as an update, it isn't taken for one.
-        let staged = dir.join("Apps").join(".hasteclip-update").join("HasteClip.app");
+        let staged = dir.join("Apps").join(".hesteclips-update").join("HesteClips.app");
         std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
         std::fs::rename(&app, &staged).unwrap();
         assert_eq!(bundle_version(&staged).as_deref(), Some("99.0.0"));
         assert!(waiting_in(staged.parent().unwrap()).is_none());
-        let installed = dir.join("Apps").join("HasteClip.app");
+        let installed = dir.join("Apps").join("HesteClips.app");
         std::fs::create_dir_all(&installed).unwrap();
         assert!(apply(&staged, &installed, false).is_err());
         assert!(installed.exists(), "the installed app stays");
@@ -359,20 +359,20 @@ mod tests {
     fn swaps_what_is_inside_when_the_folder_is_read_only() {
         let dir = std::env::temp_dir().join(format!("hc-mac-swap-{}", std::process::id()));
         let apps = dir.join("Apps");
-        let app = apps.join("HasteClip.app");
-        let ready = dir.join("update").join("HasteClip.app");
+        let app = apps.join("HesteClips.app");
+        let ready = dir.join("update").join("HesteClips.app");
         for (bundle, version) in [(&app, "old"), (&ready, "new")] {
             std::fs::create_dir_all(bundle.join("Contents/MacOS")).unwrap();
-            std::fs::write(bundle.join("Contents/MacOS/hasteclip"), version).unwrap();
+            std::fs::write(bundle.join("Contents/MacOS/hesteclips"), version).unwrap();
         }
         set_mode(&apps, 0o555);
         assert_eq!(blocker(&app), None);
         assert!(swap(&ready, &app).is_err(), "the whole app can't leave a folder that can't be written");
         swap(&ready.join("Contents"), &app.join("Contents")).unwrap();
-        let exe = |bundle: &Path| std::fs::read_to_string(bundle.join("Contents/MacOS/hasteclip")).unwrap();
+        let exe = |bundle: &Path| std::fs::read_to_string(bundle.join("Contents/MacOS/hesteclips")).unwrap();
         assert_eq!((exe(&app).as_str(), exe(&ready).as_str()), ("new", "old"));
         let beside: Vec<_> = std::fs::read_dir(&apps).unwrap().map(|e| e.unwrap().file_name()).collect();
-        assert_eq!(beside, ["HasteClip.app"]);
+        assert_eq!(beside, ["HesteClips.app"]);
         set_mode(&apps, 0o755);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -383,7 +383,7 @@ mod tests {
     fn says_what_isnt_ours_to_write() {
         let dir = std::env::temp_dir().join(format!("hc-mac-blocker-{}", std::process::id()));
         let apps = dir.join("Apps");
-        let app = apps.join("HasteClip.app");
+        let app = apps.join("HesteClips.app");
         std::fs::create_dir_all(app.join("Contents")).unwrap();
         assert_eq!(blocker(&app), None);
         set_mode(&app, 0o555);

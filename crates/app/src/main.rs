@@ -1,4 +1,4 @@
-//! HasteClip — a fast, no-nonsense clip recorder.
+//! HesteClips — a fast, no-nonsense clip recorder.
 //!
 //! The app opens on your clips. A slim capture bar on top always shows what's
 //! happening (buffer armed, recording, idle) and holds the one or two buttons that
@@ -17,6 +17,8 @@ mod away;
 mod canvas_ui;
 mod clipboard_ui;
 mod clips;
+mod cloud;
+mod cloud_ui;
 mod collections;
 mod control;
 mod crop_ui;
@@ -41,7 +43,6 @@ mod osu_plays;
 mod library;
 mod library_view;
 mod library_grid;
-mod links;
 mod glass;
 mod go_live;
 mod handoff;
@@ -86,7 +87,6 @@ mod ui_kit;
 mod update;
 #[cfg(target_os = "macos")]
 mod update_mac;
-mod upload_watch;
 #[cfg(target_os = "linux")]
 mod update_linux;
 mod gpu_frames;
@@ -111,7 +111,7 @@ use handoff::Handoff;
 use service::{CaptureService, Evt};
 use settings::{Encoder, RecordSettings, SourceKind};
 
-/// `HASTECLIP_DEBUG_GPU=1`: print the renderer's (wgpu's) warnings and
+/// `HESTECLIPS_DEBUG_GPU=1`: print the renderer's (wgpu's) warnings and
 /// errors, which are otherwise silent: a failed draw just leaves the window blank.
 struct GpuLog;
 
@@ -140,7 +140,7 @@ fn main() -> eframe::Result<()> {
     if capture::linux::kde_stream_helper() {
         return Ok(());
     }
-    if std::env::var_os("HASTECLIP_DEBUG_GPU").is_some() {
+    if std::env::var_os("HESTECLIPS_DEBUG_GPU").is_some() {
         static LOGGER: GpuLog = GpuLog;
         let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(log::LevelFilter::Warn));
     }
@@ -149,17 +149,17 @@ fn main() -> eframe::Result<()> {
     // and its kept files alone.
     let test_instance = std::env::vars_os().any(|(k, _)| {
         let k = k.to_string_lossy();
-        ["HASTECLIP_OPEN_", "HASTECLIP_DEMO_", "HASTECLIP_LIBRARY", "HASTECLIP_SETTINGS"].iter().any(|p| k.starts_with(p))
+        ["HESTECLIPS_OPEN_", "HESTECLIPS_DEMO_", "HESTECLIPS_LIBRARY", "HESTECLIPS_SETTINGS"].iter().any(|p| k.starts_with(p))
     });
     // An installed app has no console: what it prints goes to its log file
-    // (`HASTECLIP_LOG=1` does the same in a development build, or a test
-    // instance, to check it). Not yet while another HasteClip runs: a log
+    // (`HESTECLIPS_LOG=1` does the same in a development build, or a test
+    // instance, to check it). Not yet while another HesteClips runs: a log
     // starting moves the one before aside, and a second launch (which only
-    // shows that one) left it logging to `hasteclip.previous.log`, with the
+    // shows that one) left it logging to `hesteclips.previous.log`, with the
     // second launch's few lines as the log. Once this one is sure to run.
     #[cfg(any(windows, target_os = "linux"))]
     let log_later = {
-        let logs = (cfg!(not(debug_assertions)) && !test_instance) || std::env::var_os("HASTECLIP_LOG").is_some();
+        let logs = (cfg!(not(debug_assertions)) && !test_instance) || std::env::var_os("HESTECLIPS_LOG").is_some();
         let later = logs && !test_instance && tray::another_running();
         if logs && !later {
             logfile::start();
@@ -181,7 +181,7 @@ fn main() -> eframe::Result<()> {
     if update_mac::apply_pending_at_launch() {
         return Ok(());
     }
-    // One HasteClip at a time: another launch shows the running one and
+    // One HesteClips at a time: another launch shows the running one and
     // exits, and a build of your own takes over from it. (Not for
     // development test instances, which run beside it.)
     let instance = if test_instance {
@@ -216,8 +216,8 @@ fn main() -> eframe::Result<()> {
     // file before exiting, since destructors don't run on a signal.
     let _ = ctrlc::set_handler(quit_now);
 
-    // Dev aid: `HASTECLIP_WINDOW=WxH` opens at that size, to check layouts.
-    let size = std::env::var("HASTECLIP_WINDOW")
+    // Dev aid: `HESTECLIPS_WINDOW=WxH` opens at that size, to check layouts.
+    let size = std::env::var("HESTECLIPS_WINDOW")
         .ok()
         .and_then(|s| s.split_once('x').and_then(|(w, h)| Some([w.parse().ok()?, h.parse().ok()?])))
         .unwrap_or([1040.0, 700.0]);
@@ -228,7 +228,7 @@ fn main() -> eframe::Result<()> {
         .with_active(!(background && cfg!(windows)))
         .with_inner_size(size)
         .with_min_inner_size([560.0, 420.0])
-        .with_title("HasteClip")
+        .with_title("HesteClips")
         .with_icon(app_icon());
     // macOS: no title bar; the rail runs to the top, under the traffic lights.
     #[cfg(target_os = "macos")]
@@ -257,7 +257,7 @@ fn main() -> eframe::Result<()> {
     };
 
     let result = eframe::run_native(
-        "HasteClip",
+        "HesteClips",
         options,
         Box::new(move |cc| {
             // Started with the computer, the window goes straight to the
@@ -287,7 +287,7 @@ fn main() -> eframe::Result<()> {
         let text = format!("{e:?}");
         if let Some(lib) = text.split(|c: char| c.is_whitespace() || c == '(' || c == ':').find(|w| w.starts_with("lib") && w.contains(".so")) {
             eprintln!(
-                "HasteClip can't open its window: {lib} is missing. Install your distro's package for it \
+                "HesteClips can't open its window: {lib} is missing. Install your distro's package for it \
                  (libXcursor, libXrandr, libXi, libxkbcommon-x11 and Vulkan or OpenGL drivers are needed on X11)."
             );
         }
@@ -302,7 +302,7 @@ fn main() -> eframe::Result<()> {
 /// The renderer's setup. On Windows, D3D12, so decoded video frames can be
 /// shared with it straight from the GPU (`gpu_frames.rs`); wgpu's default
 /// pick could be Vulkan, which can't open them as simply. Elsewhere wgpu's
-/// pick. `HASTECLIP_WGPU_BACKEND` (e.g. "vulkan", "gl") overrides it, to
+/// pick. `HESTECLIPS_WGPU_BACKEND` (e.g. "vulkan", "gl") overrides it, to
 /// compare (or on Linux, where a GPU without a Vulkan driver gets Mesa's
 /// software one, "gl" draws on the GPU instead).
 fn wgpu_options() -> eframe::egui_wgpu::WgpuConfiguration {
@@ -322,16 +322,16 @@ fn wgpu_options() -> eframe::egui_wgpu::WgpuConfiguration {
         default(status)
     });
     if let eframe::egui_wgpu::WgpuSetup::CreateNew(new) = &mut options.wgpu_setup {
-        match std::env::var("HASTECLIP_WGPU_BACKEND") {
+        match std::env::var("HESTECLIPS_WGPU_BACKEND") {
             Ok(b) => new.instance_descriptor.backends = eframe::wgpu::Backends::from_comma_list(&b),
             Err(_) if cfg!(windows) => new.instance_descriptor.backends = eframe::wgpu::Backends::DX12,
             Err(_) => {}
         }
         // A development build has the GPU driver check every call (wgpu's
-        // default), but what it finds is only printed with HASTECLIP_DEBUG_GPU:
+        // default), but what it finds is only printed with HESTECLIPS_DEBUG_GPU:
         // without that, the checks just cost 170-190 MB of memory.
         // (`WGPU_VALIDATION=1` still turns them on.)
-        if std::env::var_os("HASTECLIP_DEBUG_GPU").is_none() {
+        if std::env::var_os("HESTECLIPS_DEBUG_GPU").is_none() {
             let checks = eframe::wgpu::InstanceFlags::VALIDATION | eframe::wgpu::InstanceFlags::GPU_BASED_VALIDATION;
             new.instance_descriptor.flags = eframe::wgpu::InstanceFlags::from_build_config().difference(checks).with_env();
         }
@@ -449,7 +449,7 @@ pub(crate) fn quit_now() {
 }
 
 /// The app icon (`assets/icon-mac.svg` rendered to PNG), shown in the Dock and taskbar
-/// while running. Release bundles use `assets/hasteclip.icns` instead. On
+/// while running. Release bundles use `assets/hesteclips.icns` instead. On
 /// Windows and Linux, where app icons aren't drawn on a plate, the glyph
 /// without the macOS one: with the plate, it looked small.
 pub(crate) fn app_icon() -> egui::IconData {
@@ -547,7 +547,7 @@ struct App {
     settings: RecordSettings,
     /// Last-saved settings JSON, to persist only when something changed.
     saved_settings: String,
-    /// False when launched through a dev hook (`HASTECLIP_OPEN_*`, `_DEMO_*`,
+    /// False when launched through a dev hook (`HESTECLIPS_OPEN_*`, `_DEMO_*`,
     /// `_LIBRARY`): a test instance next to the real one must never write its
     /// settings over the real ones.
     persist_settings: bool,
@@ -661,13 +661,17 @@ struct App {
     pub(crate) copy_rx: std::sync::mpsc::Receiver<Result<(), String>>,
     /// An export or import of clips running (see `transfer.rs`).
     transfer: Option<transfer::Transfer>,
-    /// The library's shared clips, the uploads and unshares running, the
-    /// server being asked about links, and the Share with a link dialog
-    /// (see `links.rs`).
-    links: links::Links,
-    link_jobs: Vec<links::Job>,
-    link_checks: Vec<links::Check>,
-    pub(crate) link_dialog: Option<links::Dialog>,
+    /// HesteFiles: the account, its settings and the uploads running (see
+    /// `cloud.rs`).
+    cloud: cloud::Cloud,
+    /// The HesteFiles dialog open, if any (see `cloud_ui.rs`).
+    dialog: Option<cloud_ui::Dialog>,
+    /// Public links of finished uploads, each shown in its own dialog once
+    /// nothing else is open: (clip, link).
+    public_links: std::collections::VecDeque<(PathBuf, String)>,
+    /// The "Connect HesteFiles" dialog, and whether its field has had focus.
+    pub(crate) connect_open: bool,
+    pub(crate) connect_focused: bool,
     next_render_id: u64,
     /// Open "Rename clip" dialog.
     pub(crate) rename: Option<library::Rename>,
@@ -759,7 +763,7 @@ struct App {
     pub(crate) library_filter: library::Filter,
     /// And whether clips, screenshots or both.
     pub(crate) library_kind: library::ShowKind,
-    /// Your own groups of clips, in the library's `.hasteclip`.
+    /// Your own groups of clips, in the library's `.hesteclips`.
     pub(crate) collections: collections::Collections,
     pub(crate) collection_dialog: Option<library::CollectionDialog>,
     /// Where the mouse's back/forward buttons go.
@@ -767,7 +771,7 @@ struct App {
     /// Games' icons.
     pub(crate) web_images: web_images::WebImages,
     pub(crate) updater: update::Updater,
-    /// A demo being recorded (`HASTECLIP_DEMO_SCRIPT`), see `demo.rs`.
+    /// A demo being recorded (`HESTECLIPS_DEMO_SCRIPT`), see `demo.rs`.
     demo: Option<demo::Demo>,
     pub(crate) presence: discord::Presence,
     /// Saves a clip as Save clip is pressed, frames or not.
@@ -775,7 +779,7 @@ struct App {
     /// A Stream Deck, or another app on this computer, controlling this one
     /// (see `control.rs`).
     control: control::Control,
-    /// Listens for "HasteClip that".
+    /// Listens for "hashtag HesteClip that".
     pub(crate) voice: voice::Voice,
     pub(crate) voice_review: voice_review::Review,
     /// The game being clipped, for Discord: its app's id, the game, and when
@@ -797,8 +801,8 @@ impl App {
         let screen_placement = std::sync::Arc::new(std::sync::Mutex::new(settings.screen_placement()));
         // egui keeps the window's frame in step (on Wayland, drawn by winit).
         ctx.set_theme(settings.theme.preference());
-        // Dev aid: `HASTECLIP_THEME=light|dark` for this launch only.
-        match std::env::var("HASTECLIP_THEME").as_deref() {
+        // Dev aid: `HESTECLIPS_THEME=light|dark` for this launch only.
+        match std::env::var("HESTECLIPS_THEME").as_deref() {
             Ok("light") => ctx.set_theme(egui::ThemePreference::Light),
             Ok("dark") => ctx.set_theme(egui::ThemePreference::Dark),
             _ => {}
@@ -813,7 +817,6 @@ impl App {
         }
         let mut collections = collections::Collections::load(&settings.output_dir);
         let folded = library::FoldedDays::load(&settings.output_dir);
-        let links = links::Links::load(&settings.output_dir);
         collections.reconnect(&clips);
         // Assets of clips deleted in Finder go to the Bin.
         store::sweep_orphans(&settings.output_dir, &clips);
@@ -863,7 +866,7 @@ impl App {
             saved_settings,
             persist_settings: !std::env::vars_os().any(|(k, _)| {
                 let k = k.to_string_lossy();
-                ["HASTECLIP_OPEN_", "HASTECLIP_DEMO_", "HASTECLIP_LIBRARY", "HASTECLIP_SETTINGS"].iter().any(|p| k.starts_with(p))
+                ["HESTECLIPS_OPEN_", "HESTECLIPS_DEMO_", "HESTECLIPS_LIBRARY", "HESTECLIPS_SETTINGS"].iter().any(|p| k.starts_with(p))
             }),
             service,
             voice: voice::Voice::new(quick_save.clone(), live_audio.clone(), ctx.clone()),
@@ -931,10 +934,11 @@ impl App {
             copy_tx,
             copy_rx,
             transfer: None,
-            links,
-            link_jobs: Vec::new(),
-            link_checks: Vec::new(),
-            link_dialog: None,
+            cloud: cloud::Cloud::new(ctx.clone()),
+            dialog: None,
+            public_links: Default::default(),
+            connect_open: false,
+            connect_focused: false,
             next_render_id: 0,
             rename: None,
             selection: library::Selection::default(),
@@ -993,20 +997,20 @@ impl App {
             sessions: Default::default(),
             presence_since: None,
         };
-        // Dev aid: `HASTECLIP_OPEN_EDITOR=<clip>` opens the editor at launch, so the
+        // Dev aid: `HESTECLIPS_OPEN_EDITOR=<clip>` opens the editor at launch, so the
         // editor can be checked without clicking through the library.
-        if let Some(clip) = std::env::var_os("HASTECLIP_OPEN_EDITOR") {
+        if let Some(clip) = std::env::var_os("HESTECLIPS_OPEN_EDITOR") {
             app.settings.auto_start_buffer = false;
             app.open_editor(PathBuf::from(clip));
         }
-        if let Some(clip) = std::env::var_os("HASTECLIP_OPEN_VIEWER") {
+        if let Some(clip) = std::env::var_os("HESTECLIPS_OPEN_VIEWER") {
             app.settings.auto_start_buffer = false;
             app.open_viewer(PathBuf::from(clip));
         }
-        // Dev aid: `HASTECLIP_DEMO_RENDER=<clip>` shows the library with a save
+        // Dev aid: `HESTECLIPS_DEMO_RENDER=<clip>` shows the library with a save
         // in progress (that clip's edit + a "save as new"), to check the progress UI.
-        // Point HASTECLIP_LIBRARY at a scratch folder holding a copy of the clip.
-        if let Some(dir) = std::env::var_os("HASTECLIP_LIBRARY") {
+        // Point HESTECLIPS_LIBRARY at a scratch folder holding a copy of the clip.
+        if let Some(dir) = std::env::var_os("HESTECLIPS_LIBRARY") {
             app.settings.auto_start_buffer = false;
             app.settings.output_dir = PathBuf::from(dir);
             // A demo's deletes are for good: the copy it runs on goes away
@@ -1014,7 +1018,7 @@ impl App {
             app.settings.delete_permanently = demo::on();
             app.refresh_clips();
         }
-        if let Some(clip) = std::env::var_os("HASTECLIP_DEMO_RENDER").map(PathBuf::from) {
+        if let Some(clip) = std::env::var_os("HESTECLIPS_DEMO_RENDER").map(PathBuf::from) {
             let target = store::EditTarget::of(&clip);
             if let Ok(info) = media::probe(&target.source) {
                 let mut edit = media::Edit::new(&info);
@@ -1024,66 +1028,66 @@ impl App {
                 app.start_render(target, info, edit, Some("Demo highlight".into()), None);
             }
         }
-        // `HASTECLIP_DEMO_COLLECTION=<name>` shows a collection; `…_NEW` adds
+        // `HESTECLIPS_DEMO_COLLECTION=<name>` shows a collection; `…_NEW` adds
         // the "New collection" dialog.
-        if let Some(name) = std::env::var("HASTECLIP_DEMO_COLLECTION").ok() {
+        if let Some(name) = std::env::var("HESTECLIPS_DEMO_COLLECTION").ok() {
             if let Some(c) = app.collections.list().iter().find(|c| c.name == name) {
                 app.library_filter = library::Filter::Collection(c.id.clone());
             }
-            if std::env::var_os("HASTECLIP_DEMO_COLLECTION_NEW").is_some() {
+            if std::env::var_os("HESTECLIPS_DEMO_COLLECTION_NEW").is_some() {
                 let first = app.clips.first().map(|c| c.path.clone()).into_iter().collect();
                 app.new_collection_with(first);
             }
         }
-        // `HASTECLIP_DEV_BUFFER_QUIT=<secs>`: start the replay buffer, quit
+        // `HESTECLIPS_DEV_BUFFER_QUIT=<secs>`: start the replay buffer, quit
         // after that long (to check quitting while capturing).
-        if std::env::var_os("HASTECLIP_DEV_BUFFER_QUIT").is_some() {
+        if std::env::var_os("HESTECLIPS_DEV_BUFFER_QUIT").is_some() {
             app.start_replay_buffer();
         }
-        // `HASTECLIP_DEMO_SAVING=<clip>` shows the player waiting for its edit.
-        if let Some(clip) = std::env::var_os("HASTECLIP_DEMO_SAVING").map(PathBuf::from) {
+        // `HESTECLIPS_DEMO_SAVING=<clip>` shows the player waiting for its edit.
+        if let Some(clip) = std::env::var_os("HESTECLIPS_DEMO_SAVING").map(PathBuf::from) {
             app.viewer = Some(viewer::Viewer::saving(&clip, None));
             app.page = Page::View;
         }
-        // `HASTECLIP_DEMO_DELETE=<clip>` asks to delete it (nothing is deleted
+        // `HESTECLIPS_DEMO_DELETE=<clip>` asks to delete it (nothing is deleted
         // unless the dialog is answered).
-        if let Some(clip) = std::env::var_os("HASTECLIP_DEMO_DELETE").map(PathBuf::from) {
+        if let Some(clip) = std::env::var_os("HESTECLIPS_DEMO_DELETE").map(PathBuf::from) {
             app.confirm_delete = Some(vec![clip]);
         }
-        // `HASTECLIP_DEMO_FREE_UP=<clips>` (separated as in PATH) asks how to free up their
+        // `HESTECLIPS_DEMO_FREE_UP=<clips>` (separated as in PATH) asks how to free up their
         // originals' space (nothing changes unless the dialog is answered).
-        if let Some(clips) = std::env::var_os("HASTECLIP_DEMO_FREE_UP") {
+        if let Some(clips) = std::env::var_os("HESTECLIPS_DEMO_FREE_UP") {
             let paths: Vec<PathBuf> = std::env::split_paths(&clips).collect();
             app.ask_free_up(&paths);
         }
-        if let Some(clip) = std::env::var_os("HASTECLIP_DEMO_RENAME").map(PathBuf::from) {
+        if let Some(clip) = std::env::var_os("HESTECLIPS_DEMO_RENAME").map(PathBuf::from) {
             app.rename_clip(clip);
         }
-        // `HASTECLIP_DEMO_LINK=<clip>` opens its Share with a link dialog.
-        if let Some(clip) = std::env::var_os("HASTECLIP_DEMO_LINK").map(PathBuf::from) {
-            app.open_link_dialog(clip);
+        // `HESTECLIPS_DEMO_LINK=<clip>` opens its Upload to HesteFiles dialog.
+        if let Some(clip) = std::env::var_os("HESTECLIPS_DEMO_LINK").map(PathBuf::from) {
+            app.open_share_dialog(clip);
         }
-        // `HASTECLIP_DEMO_PREBUILD=<clip>` builds its scrub frames in the
+        // `HESTECLIPS_DEMO_PREBUILD=<clip>` builds its scrub frames in the
         // background at launch, as after saving it.
-        if let Some(clip) = std::env::var_os("HASTECLIP_DEMO_PREBUILD").map(PathBuf::from) {
+        if let Some(clip) = std::env::var_os("HESTECLIPS_DEMO_PREBUILD").map(PathBuf::from) {
             proxy::prebuild(&app.ctx(), &clip);
         }
-        // `HASTECLIP_OPEN_SOURCES=1` opens on the Sources page; naming
+        // `HESTECLIPS_OPEN_SOURCES=1` opens on the Sources page; naming
         // sources (`=screen,webcam`) opens their cards too, `crop` the crop's page.
-        let open_sources = std::env::var_os("HASTECLIP_OPEN_SOURCES").is_some();
-        if let Some(v) = std::env::var_os("HASTECLIP_OPEN_SOURCES") {
+        let open_sources = std::env::var_os("HESTECLIPS_OPEN_SOURCES").is_some();
+        if let Some(v) = std::env::var_os("HESTECLIPS_OPEN_SOURCES") {
             app.page = Page::Sources;
             sources_ui::open_dev(&mut app, &v.to_string_lossy());
         }
-        // `HASTECLIP_OPEN_VOICE_REVIEW=1` opens the voice samples review.
-        let open_review = std::env::var_os("HASTECLIP_OPEN_VOICE_REVIEW").is_some();
+        // `HESTECLIPS_OPEN_VOICE_REVIEW=1` opens the voice samples review.
+        let open_review = std::env::var_os("HESTECLIPS_OPEN_VOICE_REVIEW").is_some();
         if open_review {
             app.open_voice_review();
         }
-        // `HASTECLIP_OPEN_SETTINGS=1` opens on Settings; `=video` (any
+        // `HESTECLIPS_OPEN_SETTINGS=1` opens on Settings; `=video` (any
         // pane's name) on that pane; `=names` on the Clips pane's
         // Clip names page, any other value searches for it.
-        if let Some(v) = std::env::var_os("HASTECLIP_OPEN_SETTINGS") {
+        if let Some(v) = std::env::var_os("HESTECLIPS_OPEN_SETTINGS") {
             app.page = Page::Settings;
             match v.to_string_lossy().as_ref() {
                 "1" | "" => {}
@@ -1121,15 +1125,12 @@ impl App {
         if self.collections.library() != self.settings.output_dir {
             self.collections = collections::Collections::load(&self.settings.output_dir);
         }
-        if self.links.library() != self.settings.output_dir {
-            self.links = links::Links::load(&self.settings.output_dir);
-        }
         if self.folded.library() != self.settings.output_dir {
             self.folded = library::FoldedDays::load(&self.settings.output_dir);
         }
         self.collections.reconnect(&self.clips);
         self.selection.retain(&self.clips);
-        self.library_filter.retain(&self.clips, &self.collections, &self.links);
+        self.library_filter.retain(&self.clips, &self.collections);
         // The last screenshot gone: the choice of clips or screenshots goes too.
         if !self.clips.iter().any(clips::Clip::is_image) {
             self.library_kind = library::ShowKind::All;
@@ -1560,7 +1561,8 @@ impl eframe::App for App {
             || self.collection_dialog.is_some()
             || self.confirm_delete.is_some()
             || self.free_up.is_some()
-            || self.link_dialog.is_some()
+            || self.dialog.is_some()
+            || self.connect_open
             || self.confirm_reset
             || self.close_dialog
             || self.setup_open
@@ -1614,7 +1616,7 @@ impl eframe::App for App {
         self.collection_dialog(&ctx);
         self.delete_dialog(&ctx);
         self.free_up_dialog(&ctx);
-        self.link_dialog(&ctx);
+        self.dialogs(&ctx);
         self.close_dialog(&ctx);
         self.keys_dialog(&ctx);
         self.go_live_dialog(&ctx);
@@ -1658,18 +1660,18 @@ impl eframe::App for App {
         crate::wayland_drag::prepare(_frame);
         static LAUNCHED: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
         let launched = *LAUNCHED.get_or_init(Instant::now);
-        if let Some(secs) = std::env::var("HASTECLIP_DEV_BUFFER_QUIT").ok().and_then(|s| s.parse::<f64>().ok())
+        if let Some(secs) = std::env::var("HESTECLIPS_DEV_BUFFER_QUIT").ok().and_then(|s| s.parse::<f64>().ok())
             && !self.quitting
             && launched.elapsed().as_secs_f64() > secs
         {
             eprintln!("dev: quitting");
             self.quit(ctx);
         }
-        // `HASTECLIP_DEV_SAVE=<secs>`: save a clip once, that long after
-        // opening (with the replay buffer running, as `HASTECLIP_DEV_BUFFER_QUIT`
+        // `HESTECLIPS_DEV_SAVE=<secs>`: save a clip once, that long after
+        // opening (with the replay buffer running, as `HESTECLIPS_DEV_BUFFER_QUIT`
         // starts it), to check what's recorded without a key press.
         static SAVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if let Some(secs) = std::env::var("HASTECLIP_DEV_SAVE").ok().and_then(|s| s.parse::<f64>().ok())
+        if let Some(secs) = std::env::var("HESTECLIPS_DEV_SAVE").ok().and_then(|s| s.parse::<f64>().ok())
             && launched.elapsed().as_secs_f64() > secs
             && self.rec_state.clipping
             && !SAVED.swap(true, std::sync::atomic::Ordering::Relaxed)
@@ -1677,25 +1679,25 @@ impl eframe::App for App {
             eprintln!("dev: saving a clip");
             self.save_clip();
         }
-        // `HASTECLIP_DEV_CAMERA_PANEL`: open on Sources with the camera panel
+        // `HESTECLIPS_DEV_CAMERA_PANEL`: open on Sources with the camera panel
         // (to look at it without clicking there); `=crop`, the webcam's crop page.
         static CAMERA_PANEL: std::sync::Once = std::sync::Once::new();
-        if std::env::var_os("HASTECLIP_DEV_CAMERA_PANEL").is_some()
+        if std::env::var_os("HESTECLIPS_DEV_CAMERA_PANEL").is_some()
             && let Some(w) = self.settings.first_webcam()
         {
             let id = w.id.clone();
             CAMERA_PANEL.call_once(|| {
                 self.page = Page::Sources;
-                if std::env::var("HASTECLIP_DEV_CAMERA_PANEL").is_ok_and(|v| v == "crop") {
+                if std::env::var("HESTECLIPS_DEV_CAMERA_PANEL").is_ok_and(|v| v == "crop") {
                     self.webcam_view.crop = Some(crate::webcam_ui::CameraPanel::cropping(&id));
                 } else {
                     self.camera_panel = Some(crate::webcam_ui::CameraPanel::open(&id));
                 }
             });
         }
-        // `HASTECLIP_DEV_PAGES=<secs>`: go round Clips, Sources and Settings,
-        // one every so many seconds (with `HASTECLIP_DEV_LAPS` to time it).
-        if let Some(every) = std::env::var("HASTECLIP_DEV_PAGES").ok().and_then(|s| s.parse::<f64>().ok()) {
+        // `HESTECLIPS_DEV_PAGES=<secs>`: go round Clips, Sources and Settings,
+        // one every so many seconds (with `HESTECLIPS_DEV_LAPS` to time it).
+        if let Some(every) = std::env::var("HESTECLIPS_DEV_PAGES").ok().and_then(|s| s.parse::<f64>().ok()) {
             static STEP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let step = (launched.elapsed().as_secs_f64() / every) as u64;
             if STEP.swap(step, std::sync::atomic::Ordering::Relaxed) != step && step > 0 {
@@ -1703,9 +1705,9 @@ impl eframe::App for App {
                 eprintln!("dev: to {:?}", self.page);
             }
         }
-        // `HASTECLIP_DEV_SCREENSHOT=<secs>`: take a screenshot every so many
+        // `HESTECLIPS_DEV_SCREENSHOT=<secs>`: take a screenshot every so many
         // seconds, as its shortcut does (to check them without a key press).
-        if let Some(every) = std::env::var("HASTECLIP_DEV_SCREENSHOT").ok().and_then(|s| s.parse::<f64>().ok()) {
+        if let Some(every) = std::env::var("HESTECLIPS_DEV_SCREENSHOT").ok().and_then(|s| s.parse::<f64>().ok()) {
             static STEP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let step = (launched.elapsed().as_secs_f64() / every) as u64;
             if STEP.swap(step, std::sync::atomic::Ordering::Relaxed) != step && step > 0 {
@@ -1715,11 +1717,11 @@ impl eframe::App for App {
                 }
             }
         }
-        // `HASTECLIP_DEV_SWITCH=<secs>` (with the above): switch between the
+        // `HESTECLIPS_DEV_SWITCH=<secs>` (with the above): switch between the
         // whole screen and games and apps every so many seconds while
         // clipping, and save a clip a second before quitting (to check
         // switching mid-clip).
-        if let Some(every) = std::env::var("HASTECLIP_DEV_SWITCH").ok().and_then(|s| s.parse::<f64>().ok())
+        if let Some(every) = std::env::var("HESTECLIPS_DEV_SWITCH").ok().and_then(|s| s.parse::<f64>().ok())
             && self.rec_state.clipping
         {
             static STEP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1729,18 +1731,18 @@ impl eframe::App for App {
                 eprintln!("dev: switching to {}", if apps { "the whole screen" } else { "games and apps" });
                 self.settings.capture = if apps { settings::CaptureTarget::Screen } else { settings::CaptureTarget::Apps { apps: vec![settings::CaptureApp { id: "com.apple.Terminal".into(), name: "Terminal".into() }], away_screen: true } };
             }
-            let quit_at = std::env::var("HASTECLIP_DEV_BUFFER_QUIT").ok().and_then(|s| s.parse::<f64>().ok()).unwrap_or(f64::MAX);
+            let quit_at = std::env::var("HESTECLIPS_DEV_BUFFER_QUIT").ok().and_then(|s| s.parse::<f64>().ok()).unwrap_or(f64::MAX);
             static SAVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if launched.elapsed().as_secs_f64() > quit_at - 1.5 && !SAVED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 eprintln!("dev: saving a clip");
                 self.save_clip();
             }
         }
-        // `HASTECLIP_DEV_SCENES=<secs>`: show the next scene every so many
+        // `HESTECLIPS_DEV_SCENES=<secs>`: show the next scene every so many
         // seconds while capturing (to check switching live: each switch is
         // said here, and no camera should open again). With
-        // `HASTECLIP_SETTINGS=<file>` it saves nothing.
-        if let Some(every) = std::env::var("HASTECLIP_DEV_SCENES").ok().and_then(|s| s.parse::<f64>().ok())
+        // `HESTECLIPS_SETTINGS=<file>` it saves nothing.
+        if let Some(every) = std::env::var("HESTECLIPS_DEV_SCENES").ok().and_then(|s| s.parse::<f64>().ok())
             && !self.rec_state.idle()
             && self.settings.scenes.len() > 1
         {
@@ -1947,7 +1949,7 @@ impl App {
         // below (and the boxes refitted), never mid-change on a page.
         self.apply_switch();
 
-        // "HasteClip that": saved already, as it was said.
+        // "hashtag HesteClip that": saved already, as it was said.
         for _ in 0..self.voice.heard() {
             self.clip_saving();
         }
@@ -1979,7 +1981,8 @@ impl App {
         self.pump_mp3s();
         self.import_dropped(ctx);
         self.pump_transfer();
-        self.pump_links();
+        self.cloud.poll();
+        self.pump_uploads();
         // Every frame, not just while the Sources page draws: leaving the page must
         // stop the meters' capture, or macOS keeps showing its recording indicator.
         self.ensure_level_monitor();
@@ -2166,7 +2169,7 @@ impl App {
         let (mut keep, mut quit, mut cancel) = (false, false, false);
         let modal = ui_kit::dialog(ctx, "close_dialog", 420.0, |ui| {
             let place = if cfg!(target_os = "macos") { "menu bar" } else { "tray" };
-            ui_kit::dialog_title(ui, "Keep HasteClip running?");
+            ui_kit::dialog_title(ui, "Keep HesteClips running?");
             ui_kit::dialog_text(ui, &format!("In the {place}, clipping and shortcuts keep working, so you can still save clips. You can change this in Settings."));
             ui_kit::dialog_buttons(ui, |ui| {
                 keep = ui.add(ui_kit::button("Keep running", true)).clicked();
@@ -2322,7 +2325,7 @@ impl App {
         }
     }
 
-    /// The microphone "HasteClip that" is heard through: the first
+    /// The microphone "hashtag HesteClip that" is heard through: the first
     /// one on the Sources page that's being captured.
     fn voice_mic(&self) -> Option<String> {
         self.settings.audio_sources.iter().find(|s| s.enabled && matches!(s.kind, settings::SourceKind::Microphone { .. })).map(|s| s.id.clone())
@@ -2376,14 +2379,14 @@ impl App {
         ui.add_space(4.0);
         let recording = self.rec_state.recording || self.rec_state.streaming;
         let tip = if self.rec_state.streaming {
-            format!("HasteClip {version} is ready. It installs when you quit, or restart once your stream is over.")
+            format!("HesteClips {version} is ready. It installs when you quit, or restart once your stream is over.")
         } else if recording {
-            format!("HasteClip {version} is ready. It installs when you quit, or restart once your recording is done.")
+            format!("HesteClips {version} is ready. It installs when you quit, or restart once your recording is done.")
         } else if self.rec_state.clipping {
             let after = if self.settings.auto_start_buffer { "starts again, empty" } else { "stops" };
-            format!("HasteClip {version} is ready. Click to restart into it now (clipping {after}), or it installs when you quit.")
+            format!("HesteClips {version} is ready. Click to restart into it now (clipping {after}), or it installs when you quit.")
         } else {
-            format!("HasteClip {version} is ready. Click to restart into it now, or it installs when you quit.")
+            format!("HesteClips {version} is ready. Click to restart into it now, or it installs when you quit.")
         };
         let b = ui_kit::Btn::ghost("Update ready").with_icon(egui_phosphor::regular::ARROW_CIRCLE_UP).tip(tip.clone()).locked(recording.then_some(tip));
         if b.show(ui).clicked() && self.updater.install_on_exit(true) {
@@ -2408,7 +2411,7 @@ impl App {
             ui.set_width(ui.available_width());
             ui.colored_label(
                 ui.visuals().warn_fg_color,
-                "HasteClip needs Screen Recording permission before it can capture.",
+                "HesteClips needs Screen Recording permission before it can capture.",
             );
             ui.horizontal(|ui| {
                 if ui.button("Grant permission").clicked() {
@@ -2476,15 +2479,11 @@ impl App {
     fn viewer_page(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
         let delete_label = self.delete_label(None);
         let saving = self.viewer.as_ref().and_then(|v| self.renders.iter().find(|j| !j.as_new && j.source == v.clip())).map(|j| j.progress());
-        let link = self.viewer.as_ref().and_then(|v| self.link_state(v.clip())).map(|s| {
-            use egui_phosphor::regular as icon;
-            let pct = |f: f32| ((f * 100.0) as u32).min(99);
-            match s {
-                links::LinkState::Uploading(f) => (icon::CLOUD_ARROW_UP, format!("Uploading {}%", pct(f)), "Uploading for a link"),
-                links::LinkState::Updating(f) => (icon::CLOUD_ARROW_UP, format!("Updating {}%", pct(f)), "Updating its link to this version"),
-                links::LinkState::Behind => (icon::ARROWS_CLOCKWISE, "Shared".to_owned(), "Shared with a link, which still shows an older version of it: it's brought up to date once HasteClip's server can be reached"),
-                links::LinkState::Shared => (icon::LINK, "Shared".to_owned(), "Shared with a link: its link, and who's watched it"),
-            }
+        let upload = self.viewer.as_ref().and_then(|v| self.cloud.upload_for(v.clip()));
+        let uploading = upload.is_some();
+        let link = upload.map(|up| {
+            let words = if up.merging() { "Finishing upload…".to_owned() } else { format!("Uploading {}%", ((up.progress() * 100.0) as u32).min(99)) };
+            (egui_phosphor::regular::CLOUD_ARROW_UP, words, "Uploading to HesteFiles")
         });
         let Some(v) = &mut self.viewer else {
             self.page = Page::Clips;
@@ -2494,7 +2493,7 @@ impl App {
         // collection's; clips, screenshots or both), newest first, to step
         // through; all clips when this one isn't among them (taken out of the
         // collection meanwhile).
-        let shown: Vec<&clips::Clip> = self.clips.iter().filter(|c| self.library_filter.matches(c, &self.collections, &self.links) && self.library_kind.matches(c)).collect();
+        let shown: Vec<&clips::Clip> = self.clips.iter().filter(|c| self.library_filter.matches(c, &self.collections) && self.library_kind.matches(c)).collect();
         let list: Vec<&clips::Clip> = if shown.iter().any(|c| c.path == v.clip()) { shown } else { self.clips.iter().collect() };
         let at = list.iter().position(|c| c.path == v.clip());
         let mut collections: Vec<(String, String, bool)> =
@@ -2507,7 +2506,7 @@ impl App {
             collections,
             delete_label,
             saving,
-            linked: self.links.get(v.clip()).is_some(),
+            uploading,
             link,
         };
         let from = v.at();
@@ -3191,7 +3190,7 @@ impl App {
                     let title = self.clips.iter().find(|c| c.path == path).map(|c| c.title()).unwrap_or_else(|| file_stem(&path));
                     self.toast_action(egui_phosphor::regular::CHECK_CIRCLE, format!("Saved {title}"), "Play", shell::ToastAction::Show(path.clone()));
                     // Showing another game's clips: show this one too.
-                    self.library_filter.reveal(&self.clips, &self.collections, &self.links, &path);
+                    self.library_filter.reveal(&self.clips, &self.collections, &path);
                 }
                 Evt::Shot(path, copied) => {
                     self.folded.set(chrono::Local::now().date_naive(), false);
@@ -3199,7 +3198,7 @@ impl App {
                     self.refresh_clips();
                     let copied = if copied { " and copied" } else { "" };
                     self.toast_action(egui_phosphor::regular::CAMERA, format!("Screenshot saved{copied}"), "View", shell::ToastAction::Show(path.clone()));
-                    self.library_filter.reveal(&self.clips, &self.collections, &self.links, &path);
+                    self.library_filter.reveal(&self.clips, &self.collections, &path);
                     if self.library_kind == library::ShowKind::Clips {
                         self.library_kind = library::ShowKind::All;
                     }
@@ -3252,8 +3251,8 @@ impl Laps {
 
     fn report(self) {
         let total = self.start.elapsed();
-        // `HASTECLIP_DEV_LAPS=<ms>`: log every update at least that slow.
-        let slow = std::env::var("HASTECLIP_DEV_LAPS").ok().and_then(|s| s.parse::<u64>().ok()).map_or(Self::SLOW, Duration::from_millis);
+        // `HESTECLIPS_DEV_LAPS=<ms>`: log every update at least that slow.
+        let slow = std::env::var("HESTECLIPS_DEV_LAPS").ok().and_then(|s| s.parse::<u64>().ok()).map_or(Self::SLOW, Duration::from_millis);
         if total < slow {
             return;
         }

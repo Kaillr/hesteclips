@@ -1,5 +1,5 @@
 {
-  "name": "hasteclip-release",
+  "name": "hesteclips-release",
   "private": true,
   "description": "Release tooling only (semantic-release); the app is Rust.",
   "devDependencies": {

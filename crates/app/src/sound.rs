@@ -3,8 +3,8 @@
 //!
 //! Sounds are decoded once (ffmpeg, so any audio file works) and kept in
 //! memory; playing one opens the default output for as long as it lasts.
-//! Desktop capture leaves out what HasteClip plays, so as it plays the cue is
-//! also handed to the sources recording HasteClip' sound
+//! Desktop capture leaves out what HesteClips plays, so as it plays the cue is
+//! also handed to the sources recording HesteClips' sound
 //! (`capture::sources::own_sound`), unless that's turned off: like any other
 //! app's sound, it's in the clips saved after it.
 
@@ -37,7 +37,7 @@ fn cache() -> &'static Mutex<HashMap<String, Pcm>> {
 
 /// The clip-saved sound, if it's on.
 pub fn play_saved(cfg: &SaveSound) {
-    // A demo recording or a muted test instance (`HASTECLIP_MUTE`) stays quiet.
+    // A demo recording or a muted test instance (`HESTECLIPS_MUTE`) stays quiet.
     if cfg.enabled && !crate::player::dev_muted() && !crate::demo::on() {
         play(&cfg.sound, cfg.volume, cfg.recorded);
     }
@@ -70,7 +70,7 @@ pub fn gain(volume: f32) -> f32 {
     v * v
 }
 
-/// Add a sound file: check it plays, then copy it into HasteClip' sounds
+/// Add a sound file: check it plays, then copy it into HesteClips' sounds
 /// folder so it keeps working if the original is moved.
 pub fn add_custom(from: &Path, existing: &[CustomSound]) -> Result<CustomSound, String> {
     decode(Source::File(from)).map_err(|e| format!("Couldn't read that sound: {e}"))?;
@@ -109,7 +109,7 @@ pub fn id_of(sound: &CustomSound) -> String {
 }
 
 fn sounds_dir() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("hasteclip").join("sounds"))
+    dirs::config_dir().map(|d| d.join("hesteclips").join("sounds"))
 }
 
 enum Source<'a> {

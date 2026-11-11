@@ -168,11 +168,11 @@ fn load_png(file: &Path, size: u32) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
 
-    /// Icons of programs installed here, written out with HASTECLIP_ICONS=<dir>.
+    /// Icons of programs installed here, written out with HESTECLIPS_ICONS=<dir>.
     #[test]
     #[ignore = "reads this computer's apps: cargo test -p capture icons_of_installed_apps -- --ignored"]
     fn icons_of_installed_apps() {
-        let out = std::env::var_os("HASTECLIP_ICONS").map(PathBuf::from);
+        let out = std::env::var_os("HESTECLIPS_ICONS").map(PathBuf::from);
         for id in ["firefox", "alacritty", "konsole", "steam", "dolphin", "not-a-program-xyz"] {
             let name = icon_name(id);
             let file = name.as_deref().and_then(|n| find(n, 64));

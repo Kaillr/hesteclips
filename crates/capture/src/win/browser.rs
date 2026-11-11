@@ -89,7 +89,7 @@ fn run(url: &str, width: u32, height: u32, css: &str, out: &AtomicIsize, stop: &
         let instance = GetModuleHandleW(None)?;
         static CLASS: Once = Once::new();
         CLASS.call_once(|| {
-            let class = WNDCLASSW { lpfnWndProc: Some(window_proc), hInstance: instance.into(), lpszClassName: w!("HasteClipBrowserSource"), ..Default::default() };
+            let class = WNDCLASSW { lpfnWndProc: Some(window_proc), hInstance: instance.into(), lpszClassName: w!("HesteClipsBrowserSource"), ..Default::default() };
             RegisterClassW(&class);
         });
         // Left of every display: drawn (and captured), never seen.
@@ -97,8 +97,8 @@ fn run(url: &str, width: u32, height: u32, css: &str, out: &AtomicIsize, stop: &
         let y = GetSystemMetrics(SM_YVIRTUALSCREEN);
         let hwnd = CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-            w!("HasteClipBrowserSource"),
-            w!("HasteClip browser source"),
+            w!("HesteClipsBrowserSource"),
+            w!("HesteClips browser source"),
             WS_POPUP,
             x,
             y,
@@ -166,9 +166,9 @@ fn run(url: &str, width: u32, height: u32, css: &str, out: &AtomicIsize, stop: &
 }
 
 /// WebView2's environment, its data (cookies, a page's storage) kept with
-/// the app's (`%LOCALAPPDATA%\HasteClip\Browser`), not beside it.
+/// the app's (`%LOCALAPPDATA%\HesteClips\Browser`), not beside it.
 fn environment() -> Result<ICoreWebView2Environment> {
-    let data = std::env::var_os("LOCALAPPDATA").map(|d| std::path::PathBuf::from(d).join("HasteClip").join("Browser")).context("no local app data folder")?;
+    let data = std::env::var_os("LOCALAPPDATA").map(|d| std::path::PathBuf::from(d).join("HesteClips").join("Browser")).context("no local app data folder")?;
     let _ = std::fs::create_dir_all(&data);
     let data = HSTRING::from(data.as_os_str());
     let options = CoreWebView2EnvironmentOptions::default();

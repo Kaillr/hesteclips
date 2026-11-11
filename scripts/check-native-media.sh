@@ -84,7 +84,7 @@ fi
 
 say "3. 144 fps saved at 60: ffmpeg's frames"
 START=1 END=9 "$render" "$dir/numbers144.mp4" "$dir/n144-app.mp4" - 60 2>&1 | tee -a "$log" | grep "^export:"
-START=1 END=9 HASTECLIP_EXPORT_FFMPEG=1 "$render" "$dir/numbers144.mp4" "$dir/n144-ffmpeg.mp4" - 60 >> "$log" 2>&1
+START=1 END=9 HESTECLIPS_EXPORT_FFMPEG=1 "$render" "$dir/numbers144.mp4" "$dir/n144-ffmpeg.mp4" - 60 >> "$log" 2>&1
 app=$("$py" scripts/frame-numbers.py read "$dir/n144-app.mp4")
 theirs=$("$py" scripts/frame-numbers.py read "$dir/n144-ffmpeg.mp4")
 echo "app:    ${app:0:120}…"
@@ -93,7 +93,7 @@ if [ -n "$app" ] && [ "$app" = "$theirs" ]; then pass "144 to 60: the same frame
 
 say "4. a BT.601 clip's colours"
 "$render" "$dir/bt601.mp4" "$dir/bt601-app.mp4" 360 - 4000 2>&1 | tee -a "$log" | grep "^export:"
-HASTECLIP_EXPORT_FFMPEG=1 "$render" "$dir/bt601.mp4" "$dir/bt601-ffmpeg.mp4" 360 - 4000 >> "$log" 2>&1
+HESTECLIPS_EXPORT_FFMPEG=1 "$render" "$dir/bt601.mp4" "$dir/bt601-ffmpeg.mp4" 360 - 4000 >> "$log" 2>&1
 # Each decoded by what it says it is: right, ~40 dB apart; a BT.601 picture
 # taken for BT.709 (its magenta pink), ~24.
 for side in app ffmpeg; do ffmpeg -v error -y -i "$dir/bt601-$side.mp4" -f rawvideo -pix_fmt rgb24 "$dir/bt601-$side.rgb"; done
@@ -106,11 +106,11 @@ if [ -n "$db" ] && "$py" -c "import sys; sys.exit(0 if float('$db'.replace('inf'
 say "5. export times (in the app, then by ffmpeg)"
 for way in app ffmpeg; do
   echo "-- $way"
-  if [ $way = ffmpeg ]; then export HASTECLIP_EXPORT_FFMPEG=1; else unset HASTECLIP_EXPORT_FFMPEG; fi
+  if [ $way = ffmpeg ]; then export HESTECLIPS_EXPORT_FFMPEG=1; else unset HESTECLIPS_EXPORT_FFMPEG; fi
   HC_SRC="$dir/src60.mp4" HC_FAST="$dir/fast540.mp4" cargo test --release -q -p media export_times -- --ignored --nocapture --test-threads=1 2>&1 \
     | tee -a "$log" | grep -E "^(trim|1080p|discord|blend)"
 done
-unset HASTECLIP_EXPORT_FFMPEG
+unset HESTECLIPS_EXPORT_FFMPEG
 
 echo
 echo "== results ($(uname -s), log in $log)"

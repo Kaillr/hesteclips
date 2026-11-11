@@ -50,8 +50,6 @@ pub(crate) enum Filter {
     Loose,
     /// One of your collections, by id.
     Collection(String),
-    /// The clips shared with a link: what anyone with their links can watch.
-    Shared,
 }
 
 /// Whether the library shows clips, screenshots or both: picked on the
@@ -75,23 +73,22 @@ impl ShowKind {
 }
 
 impl Filter {
-    pub(crate) fn matches(&self, clip: &clips::Clip, cols: &Collections, links: &crate::links::Links) -> bool {
+    pub(crate) fn matches(&self, clip: &clips::Clip, cols: &Collections) -> bool {
         match self {
             Filter::All => true,
             Filter::Folder(name) => clip.folder.as_ref() == Some(name),
             Filter::Loose => clip.folder.is_none(),
             Filter::Collection(id) => cols.contains(id, &clip.path),
-            Filter::Shared => links.get(&clip.path).is_some(),
         }
     }
 
     /// Back to all clips once there's nothing left to show: the last clip of a
-    /// game moved or deleted, the last link stopped, or the collection
-    /// deleted. (An emptied collection stays: you may be about to fill it.)
-    pub fn retain(&mut self, clips: &[clips::Clip], cols: &Collections, links: &crate::links::Links) {
+    /// game moved or deleted, or the collection deleted. (An emptied
+    /// collection stays: you may be about to fill it.)
+    pub fn retain(&mut self, clips: &[clips::Clip], cols: &Collections) {
         let gone = match self {
             Filter::Collection(id) => cols.get(id).is_none(),
-            _ => !clips.iter().any(|c| self.matches(c, cols, links)),
+            _ => !clips.iter().any(|c| self.matches(c, cols)),
         };
         if gone {
             *self = Filter::All;
@@ -99,8 +96,8 @@ impl Filter {
     }
 
     /// Make sure the clip at `path` is shown: all clips, if it isn't here.
-    pub fn reveal(&mut self, clips: &[clips::Clip], cols: &Collections, links: &crate::links::Links, path: &Path) {
-        if clips.iter().any(|c| c.path == path && !self.matches(c, cols, links)) {
+    pub fn reveal(&mut self, clips: &[clips::Clip], cols: &Collections, path: &Path) {
+        if clips.iter().any(|c| c.path == path && !self.matches(c, cols)) {
             *self = Filter::All;
         }
     }
@@ -239,9 +236,9 @@ pub(crate) enum Action {
     Drop(Vec<PathBuf>, DropOn),
     Share(PathBuf, ShareChoice),
     /// Write these clips, with their edits, markers and collections, to a
-    /// `.hasteclip` file (for another library).
+    /// `.hesteclips` file (for another library).
     Export(Vec<PathBuf>),
-    /// Ask for `.hasteclip` files and import their clips.
+    /// Ask for `.hesteclips` files and import their clips.
     Import,
     Rename(PathBuf),
     Open(PathBuf),
@@ -299,7 +296,6 @@ impl App {
             _ => None,
         };
         let what = if paths.len() == 1 { "it" } else { "them" };
-        let shared = paths.iter().filter(|p| self.links.get(p).is_some()).count();
         let title = match (permanently, paths.len()) {
             (true, 1) => "Delete for good?".to_owned(),
             (true, n) => format!("Delete {n} clips for good?"),
@@ -315,13 +311,6 @@ impl App {
                 ui.add_space(8.0);
             }
             ui_kit::dialog_text(ui, &if permanently { format!("You can't get {what} back.") } else { format!("You can get {what} back from the {bin}.") });
-            // Other people may be using its link.
-            match (shared, paths.len()) {
-                (0, _) => {}
-                (_, 1) => ui_kit::dialog_text(ui, "It's shared with a link: the link stops working too."),
-                (1, _) => ui_kit::dialog_text(ui, "One of them is shared with a link: that link stops working too."),
-                (n, _) => ui_kit::dialog_text(ui, &format!("{n} of them are shared with a link: those links stop working too.")),
-            }
             ui_kit::dialog_buttons(ui, |ui| {
                 let label = if permanently { "Delete".to_owned() } else { format!("Move to {bin}") };
                 yes = ui.add(ui_kit::danger_button(label)).clicked();
@@ -345,7 +334,7 @@ impl App {
         // Where the player goes if its clip goes: the next clip in what's
         // shown, else the one before.
         let after = self.viewer.as_ref().map(|v| v.clip().to_path_buf()).filter(|c| paths.contains(c)).map(|current| {
-            let shown: Vec<&clips::Clip> = self.clips.iter().filter(|c| self.library_filter.matches(c, &self.collections, &self.links)).collect();
+            let shown: Vec<&clips::Clip> = self.clips.iter().filter(|c| self.library_filter.matches(c, &self.collections)).collect();
             let at = shown.iter().position(|c| c.path == current);
             let left = |c: &&&clips::Clip| !paths.contains(&c.path);
             at.and_then(|i| shown[i + 1..].iter().find(left).or_else(|| shown[..i].iter().rev().find(left))).map(|c| c.path.clone())
@@ -390,29 +379,19 @@ impl App {
         }
         self.collections.forget(&moved);
         crate::moments::forget(&moved);
-        // Their links stop once Undo has had its moment.
-        let shared = moved.iter().filter(|p| self.links.get(p).is_some()).count();
-        for p in &moved {
-            self.links.deleted(p);
-        }
         let bin = store::bin_name();
         let what = match moved.as_slice() {
             [one] => crate::clips::title_for_stem(&one.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()),
             _ => format!("{} clips", moved.len()),
-        };
-        let links = match (shared, moved.len()) {
-            (0, _) => "",
-            (_, 1) => ". Its link stops working",
-            _ => ". Their links stop working",
         };
         if let Some(e) = error {
             self.toast_error(format!("Couldn't delete: {e}"));
         } else if busy > 0 {
             self.toast_error("Clips that are still saving an edit were kept.");
         } else if !moved.is_empty() && permanently {
-            self.toast_icon(egui_phosphor::regular::TRASH, format!("Deleted {what}{links}"));
+            self.toast_icon(egui_phosphor::regular::TRASH, format!("Deleted {what}"));
         } else if !moved.is_empty() {
-            self.toast_action(egui_phosphor::regular::TRASH, format!("Moved {what} to the {bin}{links}"), "Undo", crate::shell::ToastAction::Undelete(binned));
+            self.toast_action(egui_phosphor::regular::TRASH, format!("Moved {what} to the {bin}"), "Undo", crate::shell::ToastAction::Undelete(binned));
         }
         self.selection.clear();
         self.refresh_clips();
@@ -437,8 +416,6 @@ impl App {
                     for id in collections {
                         self.collections.add(&id, std::slice::from_ref(&path));
                     }
-                    // Its link too, if it hasn't stopped yet.
-                    self.links.undeleted(&path);
                 }
                 self.refresh_clips();
             }
@@ -539,7 +516,7 @@ impl App {
                 CollectionDialogKind::Delete(id) => {
                     let id = id.clone();
                     self.collections.delete(&id);
-                    self.library_filter.retain(&self.clips, &self.collections, &self.links);
+                    self.library_filter.retain(&self.clips, &self.collections);
                     close = true;
                 }
                 CollectionDialogKind::Rename(id) => match crate::collections::check_name(&self.collections, &d.name, Some(id)) {
@@ -628,7 +605,6 @@ impl App {
     pub(crate) fn follow_rename(&mut self, ctx: &egui::Context, from: &Path, to: &Path) {
         self.collections.follow(from, to);
         crate::moments::follow(from, to);
-        self.follow_links(from, to);
         if let Some((p, _)) = &mut self.last_saved
             && p == from
         {
@@ -780,10 +756,10 @@ pub(crate) fn clip_row(ui: &mut egui::Ui, clip: &clips::Clip, tex: Option<&egui:
 
 /// A way to get a clip out, picked from [`share_menu`].
 pub(crate) enum ShareChoice {
-    /// The Share with a link dialog: upload it for a link, or its link.
-    Link,
-    /// Copy its link (it's shared already).
-    CopyLink,
+    /// The Upload to HesteFiles dialog.
+    Upload,
+    /// Stop its upload to HesteFiles.
+    CancelUpload,
     Copy,
     /// A screenshot's picture on the clipboard (not its file).
     CopyImage,
@@ -791,23 +767,27 @@ pub(crate) enum ShareChoice {
     Sheet(Pos2),
     Reveal,
     Mp3,
-    /// To a `.hasteclip` file, with its edit, markers and collections.
+    /// To a `.hesteclips` file, with its edit, markers and collections.
     Export,
 }
 
 /// The ways to get a clip out, shared by the library's Share button and
-/// right-click menu and the player's Share button. `linked`: the clip has a
-/// share link. `image`: it's a screenshot.
-pub(crate) fn share_menu(ui: &mut egui::Ui, anchor: Pos2, linked: bool, image: bool) -> Option<ShareChoice> {
-    crate::library_view::share_items(ui, anchor, linked, image)
+/// right-click menu and the player's Share button. `uploading`: the clip is
+/// going up to HesteFiles. `image`: it's a screenshot.
+pub(crate) fn share_menu(ui: &mut egui::Ui, anchor: Pos2, uploading: bool, image: bool) -> Option<ShareChoice> {
+    crate::library_view::share_items(ui, anchor, uploading, image)
 }
 
 impl App {
     /// Do what was picked in [`share_menu`] for `file`.
     pub(crate) fn share(&mut self, frame: &eframe::Frame, file: PathBuf, choice: ShareChoice) {
         match choice {
-            ShareChoice::Link => self.open_link_dialog(file),
-            ShareChoice::CopyLink => self.copy_link(&file),
+            ShareChoice::Upload => self.open_share_dialog(file),
+            ShareChoice::CancelUpload => {
+                if let Some(up) = self.cloud.upload_for(&file) {
+                    up.cancel();
+                }
+            }
             ShareChoice::Copy => match share::copy_file(&file) {
                 Ok(()) => self.toast(format!("Copied — paste it into any app ({})", crate::hotkey_label_cmd("V"))),
                 Err(e) => self.toast_error(format!("Couldn't copy the {}: {e}", if clips::is_image(&file) { "file" } else { "clip" })),
@@ -951,7 +931,7 @@ mod tests {
     }
 }
 
-/// The days folded away in the library, kept in its `.hasteclip` folder so
+/// The days folded away in the library, kept in its `.hesteclips` folder so
 /// they stay folded next time. A new day starts open.
 pub(crate) struct FoldedDays {
     lib: PathBuf,
@@ -1042,7 +1022,7 @@ mod scale_tests {
     use std::time::{Instant, SystemTime};
 
     /// What the library does every frame, timed on a big library:
-    /// `cargo test -p hasteclip library_frame_cost -- --ignored --nocapture`.
+    /// `cargo test -p hesteclips library_frame_cost -- --ignored --nocapture`.
     #[test]
     #[ignore]
     fn library_frame_cost() {
@@ -1081,7 +1061,7 @@ mod scale_tests {
         let mut version = 0;
         let update = |shown: &mut crate::library_grid::Shown, f: &Filter, q: &str, v: u64| {
             shown.update(
-                crate::library_grid::Inputs { clips: &clips, library_version: v, collections: &cols, filter: f, kind: ShowKind::All, links: &crate::links::Links::default(), query: q, sort: crate::settings::LibrarySort::Newest, lengths_version: 0, placeholders: 0, new_renders: Vec::new(), renders: &[] },
+                crate::library_grid::Inputs { clips: &clips, library_version: v, collections: &cols, filter: f, kind: ShowKind::All, query: q, sort: crate::settings::LibrarySort::Newest, lengths_version: 0, placeholders: 0, new_renders: Vec::new(), renders: &[] },
                 false,
                 |_| None,
             )

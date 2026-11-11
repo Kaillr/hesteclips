@@ -1,5 +1,5 @@
 //! Short snippets of the microphone, kept (when the user opts in) to make the
-//! "HasteClip that" detector better: what it fired on, what it almost
+//! "hashtag HesteClip that" detector better: what it fired on, what it almost
 //! fired on, and what was heard around a clip saved by hand.
 //!
 //! Nothing here is sent anywhere. The snippets sit in a folder on this
@@ -56,7 +56,7 @@ impl Kind {
 pub enum Label {
     #[default]
     Unreviewed,
-    /// The trimmed part should save a clip: "HasteClip that", said
+    /// The trimmed part should save a clip: "hashtag HesteClip that", said
     /// well enough that the user wants it to count. ("phrase" in files made
     /// before it was asked as "should it save a clip".)
     #[serde(alias = "phrase")]
@@ -115,7 +115,7 @@ pub fn dir() -> Option<PathBuf> {
     if let Some(d) = TEST_DIR.lock().unwrap().clone() {
         return Some(d);
     }
-    dirs::data_local_dir().map(|d| d.join("hasteclip").join("voice-samples"))
+    dirs::data_local_dir().map(|d| d.join("hesteclips").join("voice-samples"))
 }
 
 fn paths(id: &str) -> Option<(PathBuf, PathBuf)> {
@@ -278,7 +278,7 @@ pub fn export(to: &Path, samples: &[Sample]) -> Result<usize, String> {
     Ok(index.samples.len())
 }
 
-const README: &str = "Voice samples from HasteClip, for improving the \"HasteClip that\" detector.\n\
+const README: &str = "Voice samples from HesteClips, for improving the \"hashtag HesteClip that\" detector.\n\
 \n\
 samples/*.wav   16 kHz mono sound, only the part the person trimmed it to\n\
 samples.json    for each: label (trigger = it should save a clip, ignore = it shouldn't),\n\

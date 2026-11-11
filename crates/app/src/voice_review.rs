@@ -1,7 +1,7 @@
 //! The page where the snippets the voice detector kept
 //! ([`crate::voice_samples`]) are listened to, trimmed to what matters and
-//! judged: should the highlighted part save a clip? It should when "HasteClip
-//! that" is said well enough that you'd want it to; a muddled try is a
+//! judged: should the highlighted part save a clip? It should when "hashtag
+//! HesteClip that" is said well enough that you'd want it to; a muddled try is a
 //! no.
 //! Nothing is assumed from what made the detector keep one: it may have fired
 //! on a laugh, and a near miss may be the phrase said in a way it didn't take.
@@ -301,7 +301,7 @@ impl App {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let label = if ready == 0 { "Export".to_owned() } else { format!("Export {ready}") };
                         if ui_kit::Btn::normal(label).enabled(ready > 0).show(ui).clicked() {
-                            let picked = rfd::FileDialog::new().set_file_name("hasteclip-voice-samples.zip").add_filter("Zip file", &["zip"]).save_file();
+                            let picked = rfd::FileDialog::new().set_file_name("hesteclips-voice-samples.zip").add_filter("Zip file", &["zip"]).save_file();
                             if let Some(path) = picked {
                                 say = Some(match voice_samples::export(&path, &r.list) {
                                     Ok(n) => (format!("Saved {n} samples to {}", path.display()), false),

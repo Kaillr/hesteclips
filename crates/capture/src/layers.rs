@@ -111,7 +111,7 @@ pub(crate) fn style_script(css: &str) -> Option<String> {
     }
     let text = serde_json::to_string(css).ok()?;
     Some(format!(
-        "(() => {{ const add = () => {{ if (document.getElementById('hasteclip-style')) return; const s = document.createElement('style'); s.id = 'hasteclip-style'; s.textContent = {text}; (document.head || document.documentElement).appendChild(s); }}; if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', add); else add(); }})();"
+        "(() => {{ const add = () => {{ if (document.getElementById('hesteclips-style')) return; const s = document.createElement('style'); s.id = 'hesteclips-style'; s.textContent = {text}; (document.head || document.documentElement).appendChild(s); }}; if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', add); else add(); }})();"
     ))
 }
 

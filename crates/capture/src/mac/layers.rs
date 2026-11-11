@@ -429,7 +429,7 @@ fn open(target: &Target, fps: u32, pictures: &Arc<Pictures>) -> Result<Running> 
     let stopped = Arc::new(crate::sck::Stopped::default());
     let watch = crate::sck::StreamWatch::new(stopped.clone());
     let stream = unsafe { SCStream::initWithFilter_configuration_delegate(SCStream::alloc(), &filter, &config, Some(ProtocolObject::from_ref(&*watch))) };
-    let queue = DispatchQueue::new("hasteclip.layer", None);
+    let queue = DispatchQueue::new("hesteclips.layer", None);
     unsafe { stream.addStreamOutput_type_sampleHandlerQueue_error(ProtocolObject::from_ref(&*output), SCStreamOutputType::Screen, Some(&queue)) }
         .map_err(|e| anyhow::anyhow!("can't capture it: {}", e.localizedDescription()))?;
     crate::sck::start_capture(&stream)?;

@@ -61,9 +61,9 @@ use capture::decode::{Decoder, Picture};
 
 /// Memory for decoded frames while scrubbing ([`platform_budget`]).
 /// Not scrubbing, it keeps less ([`Inner::idle_cap`]).
-/// `HASTECLIP_SCRUB_MEMORY_MB` overrides it.
+/// `HESTECLIPS_SCRUB_MEMORY_MB` overrides it.
 fn budget(gpu: &Gpu) -> u64 {
-    if let Some(mb) = std::env::var("HASTECLIP_SCRUB_MEMORY_MB").ok().and_then(|s| s.parse::<u64>().ok()) {
+    if let Some(mb) = std::env::var("HESTECLIPS_SCRUB_MEMORY_MB").ok().and_then(|s| s.parse::<u64>().ok()) {
         return mb << 20;
     }
     platform_budget(gpu)
@@ -111,10 +111,10 @@ fn meminfo(key: &str) -> Option<u64> {
     Some(kb * 1024)
 }
 
-/// How many decoders ([`platform_decoders`]). `HASTECLIP_SCRUB_DECODERS`
+/// How many decoders ([`platform_decoders`]). `HESTECLIPS_SCRUB_DECODERS`
 /// overrides it.
 fn decoders(gpu: &Gpu) -> usize {
-    if let Some(n) = std::env::var("HASTECLIP_SCRUB_DECODERS").ok().and_then(|s| s.parse::<usize>().ok()) {
+    if let Some(n) = std::env::var("HESTECLIPS_SCRUB_DECODERS").ok().and_then(|s| s.parse::<usize>().ok()) {
         return n.clamp(1, 32);
     }
     platform_decoders(gpu)
@@ -485,7 +485,7 @@ impl Shared {
 
 /// The last of the engine (it, its decoders' threads and its watcher) gone:
 /// its cache goes now, and with it the decoders' pools of textures, unless
-/// a frame is still held somewhere. Logged (`HASTECLIP_DEBUG_VIDEO`), to see
+/// a frame is still held somewhere. Logged (`HESTECLIPS_DEBUG_VIDEO`), to see
 /// that a clip let go of actually closed.
 impl Drop for Shared {
     fn drop(&mut self) {
@@ -1503,10 +1503,10 @@ fn trim_memory() {
     }
 }
 
-/// `HASTECLIP_DEBUG_SCRUB=1`: log what each decoder takes on and leaves.
+/// `HESTECLIPS_DEBUG_SCRUB=1`: log what each decoder takes on and leaves.
 fn debug_jobs() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("HASTECLIP_DEBUG_SCRUB").is_some())
+    *ON.get_or_init(|| std::env::var_os("HESTECLIPS_DEBUG_SCRUB").is_some())
 }
 
 /// Windows: another app keeping the card's video decoder at least this busy

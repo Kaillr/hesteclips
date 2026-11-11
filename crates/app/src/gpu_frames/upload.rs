@@ -82,13 +82,13 @@ fn copy_card_frame(encoder: &mut wgpu::CommandEncoder, f: &capture::decode::Card
 /// Decoding on the card, into the renderer's memory: made the first time
 /// it's asked for, if the renderer is on Vulkan on a card that decodes
 /// (NVIDIA's through CUDA, AMD's and Intel's through VA-API: see
-/// `capture::decode::Card`). `HASTECLIP_CPU_DECODE=1` decodes on the CPU
+/// `capture::decode::Card`). `HESTECLIPS_CPU_DECODE=1` decodes on the CPU
 /// anyway, to compare.
 #[cfg(target_os = "linux")]
 pub fn card() -> Option<std::sync::Arc<capture::decode::Card>> {
     static CARD: std::sync::OnceLock<Option<std::sync::Arc<capture::decode::Card>>> = std::sync::OnceLock::new();
     CARD.get_or_init(|| {
-        if std::env::var_os("HASTECLIP_CPU_DECODE").is_some() {
+        if std::env::var_os("HESTECLIPS_CPU_DECODE").is_some() {
             return None;
         }
         let rs = RENDER.get()?;

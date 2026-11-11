@@ -28,15 +28,15 @@ use super::gpu::{DRM_ABGR8888, DRM_ARGB8888};
 use super::web_wire::{MAX_MESSAGE, ToApp, ToHost, Wire};
 
 /// The argument the app starts its host with.
-pub(crate) const ARG: &str = "--hasteclip-web-host";
+pub(crate) const ARG: &str = "--hesteclips-web-host";
 /// The engine's folder (libcef.so and its files), for the host and CEF's
 /// own processes. Set for the app too, it's the engine used instead of the
 /// one fetched (`super::web_engine`).
-pub(crate) const ENGINE_ENV: &str = "HASTECLIP_WEB_ENGINE_DIR";
+pub(crate) const ENGINE_ENV: &str = "HESTECLIPS_WEB_ENGINE_DIR";
 /// Where pages keep their cookies and storage.
-pub(crate) const DATA_ENV: &str = "HASTECLIP_WEB_DATA";
+pub(crate) const DATA_ENV: &str = "HESTECLIPS_WEB_DATA";
 /// Set: without Chromium's sandbox (where the system can't make one).
-pub(crate) const NO_SANDBOX_ENV: &str = "HASTECLIP_WEB_NO_SANDBOX";
+pub(crate) const NO_SANDBOX_ENV: &str = "HESTECLIPS_WEB_NO_SANDBOX";
 /// The fd the socket to the app is handed over as.
 pub(crate) const SOCKET_FD: c_int = 3;
 
@@ -659,7 +659,7 @@ unsafe extern "C" fn on_paint(h: *mut cef_render_handler_t, browser: *mut cef_br
     let mut memory = page.memory.lock().unwrap();
     if memory.is_none() {
         // SAFETY: a name; a new file of ours.
-        let fd = unsafe { libc::memfd_create(c"hasteclip-page".as_ptr(), libc::MFD_CLOEXEC) };
+        let fd = unsafe { libc::memfd_create(c"hesteclips-page".as_ptr(), libc::MFD_CLOEXEC) };
         if fd < 0 {
             return;
         }

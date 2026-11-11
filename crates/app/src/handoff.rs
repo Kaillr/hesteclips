@@ -131,7 +131,7 @@ mod tests {
     fn what_is_kept_follows_a_rename() {
         let mut kept = Kept::default();
         let (from, to) = (Path::new("old.mp4"), Path::new("new.mp4"));
-        let original = Path::new(".hasteclip/1/original.mp4");
+        let original = Path::new(".hesteclips/1/original.mp4");
         let info = ClipInfo { duration: 2.0, fps: 60.0, width: 2, height: 2, video_kbps: None, audio: Vec::new(), id: None, bt601: false };
         kept.read.push((from.to_path_buf(), info.clone()));
         kept.read.push((original.to_path_buf(), info));

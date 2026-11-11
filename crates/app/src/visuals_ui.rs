@@ -603,7 +603,7 @@ mod tests {
     fn gifs_are_read_and_move() {
         use image::codecs::gif::GifEncoder;
         use image::{Delay, Frame, Rgba, RgbaImage};
-        let dir = std::env::temp_dir().join(format!("hasteclip-gif-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("hesteclips-gif-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let moving = dir.join("moving.gif");
         {

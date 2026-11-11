@@ -646,7 +646,7 @@ impl Default for GameHook {
 /// How a whole display is captured on Windows. Windows Graphics Capture draws
 /// a yellow border around the display on Windows 10 (Windows 11 lets us turn
 /// it off); Desktop Duplication draws none, but can only capture a display on
-/// the graphics card HasteClip uses. Games and apps are always recorded with
+/// the graphics card HesteClips uses. Games and apps are always recorded with
 /// Windows Graphics Capture (or the game capture hook): Desktop Duplication
 /// only captures whole displays.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1783,6 +1783,6 @@ mod app_icon_tests {
         assert_eq!(px.len(), 32 * 32 * 4);
         assert!(px.chunks_exact(4).any(|p| p[3] == 255), "some of it is opaque");
         assert!(px.chunks_exact(4).filter(|p| p[3] > 0).count() > 200, "it covers most of the square");
-        assert!(super::app_icon("no.such.app.hasteclip", 32).is_none());
+        assert!(super::app_icon("no.such.app.hesteclips", 32).is_none());
     }
 }

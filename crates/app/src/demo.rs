@@ -1,7 +1,7 @@
 //! Demo recordings: the real app, driven by a script and recorded to a video,
 //! for the website. Only in a build with the `demo` feature, and only on when
-//! `HASTECLIP_DEMO_SCRIPT=<script.json>` is set
-//! (with `HASTECLIP_LIBRARY` pointing at a copy of a library, so nothing real
+//! `HESTECLIPS_DEMO_SCRIPT=<script.json>` is set
+//! (with `HESTECLIPS_LIBRARY` pointing at a copy of a library, so nothing real
 //! changes); otherwise every call here is one cheap check.
 //!
 //! The script moves a drawn pointer, clicks, drags and presses keys, fed to
@@ -51,12 +51,12 @@ use std::sync::mpsc;
 use egui::{Color32, Context, Event, Id, Key, Modifiers, PointerButton, Pos2, Rect, pos2, vec2};
 use serde::Deserialize;
 
-/// The script, when `HASTECLIP_DEMO_SCRIPT` names one. Only in a build with
+/// The script, when `HESTECLIPS_DEMO_SCRIPT` names one. Only in a build with
 /// the `demo` feature: in any other, demos are off and all of this is unused.
 fn script_path() -> Option<&'static PathBuf> {
     static PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
     PATH.get_or_init(|| {
-        let path = std::env::var_os("HASTECLIP_DEMO_SCRIPT").map(PathBuf::from)?;
+        let path = std::env::var_os("HESTECLIPS_DEMO_SCRIPT").map(PathBuf::from)?;
         if !cfg!(feature = "demo") {
             fail(&format!("this build can't record demos ({}): build with `--features demo`", path.display()));
         }
@@ -812,14 +812,14 @@ fn draw_pointer(ctx: &Context, at: Pos2, down: bool) {
     painter.add(egui::Shape::line(outline, egui::Stroke::new(1.1, Color32::from_gray(20))));
 }
 
-/// The library the demo runs on (`HASTECLIP_LIBRARY`).
+/// The library the demo runs on (`HESTECLIPS_LIBRARY`).
 fn library() -> PathBuf {
-    std::env::var_os("HASTECLIP_LIBRARY").map(PathBuf::from).unwrap_or_else(|| fail("a demo runs on a copy of a library: set HASTECLIP_LIBRARY"))
+    std::env::var_os("HESTECLIPS_LIBRARY").map(PathBuf::from).unwrap_or_else(|| fail("a demo runs on a copy of a library: set HESTECLIPS_LIBRARY"))
 }
 
 /// Where the prepared clips wait, out of the library's sight.
 fn waiting_room() -> PathBuf {
-    std::env::temp_dir().join(format!("hasteclip-demo-saves-{}", std::process::id()))
+    std::env::temp_dir().join(format!("hesteclips-demo-saves-{}", std::process::id()))
 }
 
 /// The clips saving will hand over: moved out of the library now, in order.

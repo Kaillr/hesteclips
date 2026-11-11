@@ -238,7 +238,7 @@ impl Decoder {
     /// shareable textures instead of coming back as RGBA.
     ///
     /// Feeds the decoder directly when it can (see `direct`), else through the
-    /// file reader; `HASTECLIP_NO_DIRECT_DECODE=1` always uses the reader.
+    /// file reader; `HESTECLIPS_NO_DIRECT_DECODE=1` always uses the reader.
     pub fn open(path: &Path, width: u32, share_on: Option<u64>) -> Result<Self> {
         Self::open_with(path, width, kept(share_on), direct_wanted(), false)
     }
@@ -342,7 +342,7 @@ impl Decoder {
                 match super::direct::Stream::open(path, &manager, low_latency) {
                     Ok(d) => Some(d),
                     Err(e) => {
-                        if std::env::var_os("HASTECLIP_DEBUG_VIDEO").is_some() {
+                        if std::env::var_os("HESTECLIPS_DEBUG_VIDEO").is_some() {
                             eprintln!("decoder: through the file reader ({e:#})");
                         }
                         None
@@ -512,7 +512,7 @@ impl Decoder {
             let convert = Convert::new(&self.gpu, self.source, size, self.fps, self.bt601, out, pool.textures.clone())?;
             Ok((Arc::new(pool), convert))
         };
-        let nv12 = (shares_nv12(&self.gpu) && std::env::var_os("HASTECLIP_RGBA_FRAMES").is_none())
+        let nv12 = (shares_nv12(&self.gpu) && std::env::var_os("HESTECLIPS_RGBA_FRAMES").is_none())
             .then(|| make(SurfaceFormat::Nv12 { bt601: false }, 1.5, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709))
             .and_then(|r| r.inspect_err(|e| eprintln!("decoder: no small NV12 frames, RGBA instead: {e:#}")).ok());
         let small = match nv12 {
@@ -774,9 +774,9 @@ fn kept(share_on: Option<u64>) -> Kept {
 }
 
 /// Feed the decoder directly where it can (see `direct`);
-/// `HASTECLIP_NO_DIRECT_DECODE=1` always uses the file reader.
+/// `HESTECLIPS_NO_DIRECT_DECODE=1` always uses the file reader.
 fn direct_wanted() -> bool {
-    std::env::var_os("HASTECLIP_NO_DIRECT_DECODE").is_none()
+    std::env::var_os("HESTECLIPS_NO_DIRECT_DECODE").is_none()
 }
 
 /// Height for `width` keeping `source`'s aspect, even.
@@ -788,14 +788,14 @@ fn even_height(width: u32, source: (u32, u32)) -> u32 {
 /// and the conversion pass into them, if they're converted. Shared at the
 /// video's own size, they stay NV12 when the graphics card can share that:
 /// a copy instead of a conversion, and 1.5 bytes a pixel instead of 4.
-/// `HASTECLIP_RGBA_FRAMES=1` always converts. `pool_bytes`: how much the
+/// `HESTECLIPS_RGBA_FRAMES=1` always converts. `pool_bytes`: how much the
 /// shared pool holds (16 to 2048 frames), instead of playback's few dozen.
 fn outputs(gpu: &Gpu, shared: bool, source: (u32, u32), size: (u32, u32), fps: f64, bt601: bool, pool_bytes: Option<u64>) -> Result<(Option<Arc<Surfaces>>, Option<Convert>)> {
     let count = |bytes_per_pixel: f64| match pool_bytes {
         Some(bytes) => (bytes as f64 / (size.0 as f64 * size.1 as f64 * bytes_per_pixel).max(1.0)).clamp(16.0, 2048.0) as usize,
         None => pool_count(size, bytes_per_pixel),
     };
-    let nv12 = shared && size == source && size.0 % 2 == 0 && size.1 % 2 == 0 && shares_nv12(gpu) && std::env::var_os("HASTECLIP_RGBA_FRAMES").is_none();
+    let nv12 = shared && size == source && size.0 % 2 == 0 && size.1 % 2 == 0 && shares_nv12(gpu) && std::env::var_os("HESTECLIPS_RGBA_FRAMES").is_none();
     if nv12 {
         match surfaces(gpu, size.0, size.1, SurfaceFormat::Nv12 { bt601 }, count(1.5), false, true) {
             Ok(pool) => return Ok((Some(Arc::new(pool)), None)),

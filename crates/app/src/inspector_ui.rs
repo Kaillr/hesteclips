@@ -1022,7 +1022,7 @@ fn font_menu(ui: &mut egui::Ui, families: Option<&Vec<crate::fonts::Family>>, fo
             let own = f.name == crate::fonts::OWN;
             let on = if own { font.is_empty() || font.as_str() == crate::fonts::OWN } else { font.eq_ignore_ascii_case(&f.name) };
             let item = Item::new(f.name.clone()).check(on);
-            let item = if own { item.value("HasteClip's") } else { item };
+            let item = if own { item.value("HesteClips'") } else { item };
             if item.show(ui).clicked() {
                 *font = if own { String::new() } else { f.name.clone() };
             }

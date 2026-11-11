@@ -85,10 +85,10 @@ impl Inner {
             mft.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, manager.as_raw() as usize)?;
             // Best effort: a decoder without the mode decodes as it does.
             // (It takes the value as a VT_UI4, not a VT_BOOL.)
-            // `HASTECLIP_SCRUB_NORMAL_DECODE=1` keeps the normal mode, to compare.
-            if low_latency && !reordered && std::env::var_os("HASTECLIP_SCRUB_NORMAL_DECODE").is_none_or(|v| v == "0") {
+            // `HESTECLIPS_SCRUB_NORMAL_DECODE=1` keeps the normal mode, to compare.
+            if low_latency && !reordered && std::env::var_os("HESTECLIPS_SCRUB_NORMAL_DECODE").is_none_or(|v| v == "0") {
                 let set = mft.cast::<ICodecAPI>().and_then(|api| api.SetValue(&CODECAPI_AVLowLatencyMode, &windows::Win32::System::Variant::VARIANT::from(1u32)));
-                if std::env::var_os("HASTECLIP_DEBUG_VIDEO").is_some() {
+                if std::env::var_os("HESTECLIPS_DEBUG_VIDEO").is_some() {
                     match set {
                         Ok(()) => eprintln!("decoder: low-latency mode"),
                         Err(e) => eprintln!("decoder: no low-latency mode ({e})"),

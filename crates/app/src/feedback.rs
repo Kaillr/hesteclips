@@ -66,7 +66,7 @@ impl App {
                 if let Some(log) = crate::logfile::current()
                     && crate::clips::reveal_in_file_manager(log).is_ok()
                 {
-                    self.toast_icon(icon::FILE_TEXT, "Drag hasteclip.log from the folder that opened into the report");
+                    self.toast_icon(icon::FILE_TEXT, "Drag hesteclips.log from the folder that opened into the report");
                 }
                 bug_report_url(&version(&self.updater.version()), &setup(self.capture_summary()))
             }
@@ -191,10 +191,10 @@ mod tests {
     fn links() {
         assert_eq!(
             bug_report_url("0.4.0", "Windows 11 Pro 24H2 (build 26100.4061), NVIDIA GeForce RTX 4060 Ti"),
-            "https://github.com/hasteclip/hasteclip/issues/new?template=bug_report.yml&version=0.4.0&setup=Windows%2011%20Pro%2024H2%20%28build%2026100.4061%29%2C%20NVIDIA%20GeForce%20RTX%204060%20Ti"
+            "https://github.com/Kaillr/hesteclips/issues/new?template=bug_report.yml&version=0.4.0&setup=Windows%2011%20Pro%2024H2%20%28build%2026100.4061%29%2C%20NVIDIA%20GeForce%20RTX%204060%20Ti"
         );
-        assert_eq!(feature_request_url(), "https://github.com/hasteclip/hasteclip/issues/new?template=feature_request.yml");
-        assert_eq!(ideas_url(), "https://github.com/hasteclip/hasteclip/issues?q=is%3Aissue%20is%3Aopen%20label%3Aenhancement%20sort%3Areactions-%2B1-desc");
+        assert_eq!(feature_request_url(), "https://github.com/Kaillr/hesteclips/issues/new?template=feature_request.yml");
+        assert_eq!(ideas_url(), "https://github.com/Kaillr/hesteclips/issues?q=is%3Aissue%20is%3Aopen%20label%3Aenhancement%20sort%3Areactions-%2B1-desc");
         // Letters beyond ASCII as their UTF-8 bytes.
         assert_eq!(query("Kraków & ü"), "Krak%C3%B3w%20%26%20%C3%BC");
     }

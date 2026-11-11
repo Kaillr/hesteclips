@@ -55,8 +55,8 @@ enum Source {
 fn source() -> Option<Source> {
     static SOURCE: std::sync::OnceLock<Option<Source>> = std::sync::OnceLock::new();
     *SOURCE.get_or_init(|| {
-        // `HASTECLIP_APPS_X11`: the X server's windows even on KDE (to try them).
-        let x11_first = std::env::var_os("HASTECLIP_APPS_X11").is_some();
+        // `HESTECLIPS_APPS_X11`: the X server's windows even on KDE (to try them).
+        let x11_first = std::env::var_os("HESTECLIPS_APPS_X11").is_some();
         if x11_first && x11_windows::available() {
             Some(Source::X11)
         } else if kwin::available() && kwin_windows::following() {

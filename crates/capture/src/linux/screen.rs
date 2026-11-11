@@ -535,7 +535,7 @@ impl WindowInside {
 }
 
 /// The graphics card, when pictures are taken and worked on it (whenever
-/// Vulkan can import DMA-BUFs; `HASTECLIP_NO_GPU_CAPTURE` turns it off).
+/// Vulkan can import DMA-BUFs; `HESTECLIPS_NO_GPU_CAPTURE` turns it off).
 pub(crate) fn gpu_frames() -> Option<Arc<gpu::Gpu>> {
     gpu::gpu()
 }
@@ -552,7 +552,7 @@ fn run(fd: Option<OwnedFd>, node: u32, latest: &Arc<Latest>, inside: Option<Wind
     };
     let stream = pw::stream::StreamRc::new(
         core.clone(),
-        "hasteclip-screen",
+        "hesteclips-screen",
         pw::properties::properties! {
             *pw::keys::MEDIA_TYPE => "Video",
             *pw::keys::MEDIA_CATEGORY => "Capture",
@@ -838,7 +838,7 @@ mod gpu_tests {
         let px = card.read(&texture);
         let lit = px.chunks_exact(4).filter(|p| p[0] > 16 || p[1] > 16 || p[2] > 16).count();
         eprintln!("{}x{} {:?}: {rate:.1} pictures/s, {lit} lit pixels", texture.width(), texture.height(), texture.format());
-        if let Some(out) = std::env::var_os("HASTECLIP_SHOT") {
+        if let Some(out) = std::env::var_os("HESTECLIPS_SHOT") {
             let (w, h) = (texture.width(), texture.height());
             let rgb: Vec<u8> = px.chunks_exact(4).flat_map(|p| [p[2], p[1], p[0]]).collect();
             std::fs::write(out, [format!("P6\n{w} {h}\n255\n").as_bytes(), &rgb].concat()).unwrap();
@@ -892,7 +892,7 @@ mod window_tests {
     /// over its bottom right corner and past it, which KWin streams too:
     /// only the part over the inside shows.
     #[test]
-    #[ignore = "opens a window and captures it on KDE Plasma (HASTECLIP_NO_GPU_CAPTURE=1): cargo test -p capture window_inside -- --ignored"]
+    #[ignore = "opens a window and captures it on KDE Plasma (HESTECLIPS_NO_GPU_CAPTURE=1): cargo test -p capture window_inside -- --ignored"]
     fn window_inside() {
         let qml = std::env::temp_dir().join("hc-window-inside.qml");
         std::fs::write(
@@ -920,7 +920,7 @@ Window {
         let screen = open_kwin_window(&uuid).unwrap();
         let shot = |when: &str| {
             let (f, _) = screen.latest.get().expect("a picture");
-            assert!(f.texture.is_none(), "run with HASTECLIP_NO_GPU_CAPTURE=1 to read it");
+            assert!(f.texture.is_none(), "run with HESTECLIPS_NO_GPU_CAPTURE=1 to read it");
             let px = |x: u32, y: u32| {
                 let at = y as usize * f.stride + x as usize * 4;
                 let p = &f.data[at..at + 4];

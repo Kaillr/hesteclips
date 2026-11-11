@@ -594,7 +594,7 @@ fn make_audio_stream(
         // app: under `cargo run`, sounds played from the same terminal are muted too.
         config.setExcludesCurrentProcessAudio(true);
         let stream = SCStream::initWithFilter_configuration_delegate(SCStream::alloc(), &filter, &config, Some(ProtocolObject::from_ref(watch)));
-        let queue = DispatchQueue::new("hasteclip.sck.audio", None);
+        let queue = DispatchQueue::new("hesteclips.sck.audio", None);
         stream
             .addStreamOutput_type_sampleHandlerQueue_error(ProtocolObject::from_ref(output), SCStreamOutputType::Audio, Some(&queue))
             .map_err(|e| anyhow::anyhow!("can't capture audio: {}", e.localizedDescription()))?;
@@ -1296,7 +1296,7 @@ mod tests {
             }
             t.elapsed()
         };
-        let app = AudioSource { id: "app".into(), name: "No such app".into(), kind: SourceKind::App { bundle_id: "io.github.hasteclip.no-such-app".into() }, in_mix: true, own_track: false };
+        let app = AudioSource { id: "app".into(), name: "No such app".into(), kind: SourceKind::App { bundle_id: "io.github.hesteclips.no-such-app".into() }, in_mix: true, own_track: false };
         system.add(app, SourceFeed::new(mixer::RATE, Arc::new(Clock::default())), channel.clone());
         let took = until(&|s| s != SourceStatus::Off);
         assert!(took < Duration::from_millis(500), "added: taken up after {took:?}");

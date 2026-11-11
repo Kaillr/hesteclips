@@ -34,7 +34,7 @@ pub struct Clip {
     /// The library's folder it's in (its game's), if it isn't loose in the library.
     pub folder: Option<String>,
     /// What's kept beside it, in bytes: an edited clip's untouched original
-    /// and its edit (`.hasteclip/<id>/`). 0 for a clip never edited.
+    /// and its edit (`.hesteclips/<id>/`). 0 for a clip never edited.
     pub kept_bytes: u64,
 }
 
@@ -167,7 +167,7 @@ impl Ids {
     }
 }
 
-/// The library's folders, by name. Hidden ones (`.hasteclip`, the edits)
+/// The library's folders, by name. Hidden ones (`.hesteclips`, the edits)
 /// aren't clips.
 pub fn folders(lib: &Path) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(lib) else { return Vec::new() };
@@ -509,14 +509,14 @@ mod tests {
         let lib = std::env::temp_dir().join(format!("hc-scan-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&lib);
         std::fs::create_dir_all(lib.join("osu!")).unwrap();
-        std::fs::create_dir_all(lib.join(".hasteclip").join("abcdef12")).unwrap();
+        std::fs::create_dir_all(lib.join(".hesteclips").join("abcdef12")).unwrap();
         std::fs::write(lib.join("clip_2026-10-01_14-51-01.mp4"), b"x").unwrap();
         std::fs::write(lib.join("osu!").join("clip_2026-10-02_14-51-01.mp4"), b"x").unwrap();
         std::fs::write(lib.join("osu!").join(".clip_2026-10-02_14-52-01.mp4"), b"x").unwrap();
         std::fs::write(lib.join("osu!").join("screenshot_2026-10-02_14-53-01.png"), b"x").unwrap();
         std::fs::write(lib.join("osu!").join(".screenshot_2026-10-02_14-54-01.png"), b"x").unwrap();
         std::fs::write(lib.join("notes.txt"), b"x").unwrap();
-        std::fs::write(lib.join(".hasteclip").join("abcdef12").join("original.mp4"), b"x").unwrap();
+        std::fs::write(lib.join(".hesteclips").join("abcdef12").join("original.mp4"), b"x").unwrap();
         let found: Vec<(String, Option<String>)> = scan(&lib).into_iter().map(|c| (c.name, c.folder)).collect();
         assert_eq!(
             found,
@@ -549,16 +549,16 @@ mod tests {
         std::fs::create_dir_all(lib.join(crate::store::DIR)).unwrap();
         let clip = lib.join("clip_2026-10-01_14-51-01.mp4");
         let id = || scan(&lib).into_iter().find(|c| c.path == clip).and_then(|c| c.id);
-        std::fs::write(&clip, mp4_with_comment("hasteclip: id=aaaaaaaa")).unwrap();
+        std::fs::write(&clip, mp4_with_comment("hesteclips: id=aaaaaaaa")).unwrap();
         assert_eq!(id().as_deref(), Some("aaaaaaaa"));
         // Written over with as many bytes, and its time put back: the same
         // file as far as can be told, so not read.
         let modified = std::fs::metadata(&clip).unwrap().modified().unwrap();
-        std::fs::write(&clip, mp4_with_comment("hasteclip: id=bbbbbbbb")).unwrap();
+        std::fs::write(&clip, mp4_with_comment("hesteclips: id=bbbbbbbb")).unwrap();
         std::fs::File::options().write(true).open(&clip).unwrap().set_modified(modified).unwrap();
         assert_eq!(id().as_deref(), Some("aaaaaaaa"), "read again");
         // Another size: read.
-        std::fs::write(&clip, mp4_with_comment("hasteclip: id=cccccccccc")).unwrap();
+        std::fs::write(&clip, mp4_with_comment("hesteclips: id=cccccccccc")).unwrap();
         assert_eq!(id().as_deref(), Some("cccccccccc"));
         std::fs::remove_dir_all(&lib).unwrap();
     }

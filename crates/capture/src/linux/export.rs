@@ -47,7 +47,7 @@ pub(crate) fn render_video(job: &Job, dest: &Path, progress: &dyn Fn(f32)) -> Re
     // On the card where it can (the CPU free: ~11 ms a 1440p frame
     // there, every core busy), into our device's memory, which the frames
     // are read from where they are.
-    let on_card = Card::background().filter(|_| std::env::var_os("HASTECLIP_CPU_DECODE").is_none()).and_then(|c| Decoder::open_card(job.source, &c).ok());
+    let on_card = Card::background().filter(|_| std::env::var_os("HESTECLIPS_CPU_DECODE").is_none()).and_then(|c| Decoder::open_card(job.source, &c).ok());
     let Some(mut decoder) = on_card.or_else(|| Decoder::open_threads(job.source, Output::Screen, decode_threads()).ok()) else { return Ok(false) };
     eprintln!("export: decoding with {}", decoder.way());
     decoder.set_fps(job.fps);
@@ -668,7 +668,7 @@ impl Encoder {
                 let spec = Spec { width: w, height: h, fps: job.out_fps, audio_titles: Vec::new(), audio_bitrate: 0, comment: String::new(), mov: false, reorder };
                 Writer::record(partial.to_path_buf(), Layout { spec }, job.out_fps)
             };
-            let only = std::env::var("HASTECLIP_ENCODER").ok();
+            let only = std::env::var("HESTECLIPS_ENCODER").ok();
             let wanted = |name: &str| only.as_deref().is_none_or(|o| o == name);
             if wanted("nvenc") {
                 let wr = writer(3);

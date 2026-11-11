@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Builds the Linux release into Releases/: HasteClip-linux-x64.tar.gz, the app
+# Builds the Linux release into Releases/: HesteClips-linux-x64.tar.gz, the app
 # with its desktop entry and icon, and its checksum (.sha256, for the app's
-# updater). Unpack it anywhere and run ./hasteclip; on
+# updater). Unpack it anywhere and run ./hesteclips; on
 # first launch it adds itself to the desktop's apps (linux_desktop.rs).
 # ffmpeg is included, so there's nothing else to install.
-# Beside it, the web page engine (HasteClip-web-engine-linux-x64-<cef>.tar.xz
+# Beside it, the web page engine (HesteClips-web-engine-linux-x64-<cef>.tar.xz
 # and its .sha256), which the app fetches the first time a web page is shown.
 #
 # The release workflow runs this for each new version. It also runs locally:
@@ -30,7 +30,7 @@ ffmpeg_build="ffmpeg-n8.1.3-27-g8dca1586f4-linux64-gpl-shared-8.1"
 ffmpeg_url="https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-30-13-01/$ffmpeg_build.tar.xz"
 ffmpeg_sha256="bf4a4655c74faca6c6890ee68d2d61af54b1145efdb46d617cb26046f73eabf5"
 
-name="HasteClip-linux-x64"
+name="HesteClips-linux-x64"
 work="target/release-package"
 stage="$work/$name"
 out="Releases"
@@ -66,12 +66,12 @@ if [ "${nvenc_driver%%.*}" -gt 580 ]; then
 fi
 
 sed -i.bak -E "s/^version = \"[^\"]*\"/version = \"$version\"/" Cargo.toml && rm Cargo.toml.bak
-HASTECLIP_FFMPEG_INCLUDE="$root/$work/$ffmpeg_build/include" cargo build --release -p hasteclip
+HESTECLIPS_FFMPEG_INCLUDE="$root/$work/$ffmpeg_build/include" cargo build --release -p hesteclips
 restore
 trap - EXIT
 
-cp target/release/hasteclip "$stage/"
-strip "$stage/hasteclip"
+cp target/release/hesteclips "$stage/"
+strip "$stage/hesteclips"
 
 cp "$work/$ffmpeg_build/bin/ffmpeg" "$work/$ffmpeg_build/bin/ffprobe" "$stage/"
 mkdir -p "$stage/lib"
@@ -81,12 +81,12 @@ cp "$work/$ffmpeg_build/LICENSE.txt" "$stage/ffmpeg-LICENSE.txt"
 "$stage/ffmpeg" -hide_banner -version >/dev/null
 "$stage/ffprobe" -hide_banner -version >/dev/null
 
-cp crates/app/assets/io.github.kaillr.HasteClip.desktop "$stage/"
-cp crates/app/assets/glyph-icon/256.png "$stage/io.github.kaillr.HasteClip.png"
+cp crates/app/assets/io.github.kaillr.HesteClips.desktop "$stage/"
+cp crates/app/assets/glyph-icon/256.png "$stage/io.github.kaillr.HesteClips.png"
 cat > "$stage/README.txt" <<EOF
-HasteClip $version for Linux (x86-64)
+HesteClips $version for Linux (x86-64)
 
-Run ./hasteclip. The first time, it adds itself to your desktop's apps, so
+Run ./hesteclips. The first time, it adds itself to your desktop's apps, so
 after that you can start it from there (move this folder first if you want it
 somewhere else, then run it once from its new place). It keeps itself up to
 date, as long as this folder is yours to write to (in your home folder, not
@@ -96,11 +96,11 @@ Needs a recent Linux (glibc 2.39+: Ubuntu 24.04, Fedora 40, Debian 13, Arch,
 CachyOS or newer) with PipeWire, as desktops have them. ffmpeg is included
 (ffmpeg, ffprobe and lib/, GPL: see ffmpeg-LICENSE.txt). Web pages in the
 video are drawn by Chromium's engine (CEF), downloaded once the first time
-you add one (about 107 MB, kept in ~/.local/share/hasteclip). If it doesn't start,
+you add one (about 107 MB, kept in ~/.local/share/hesteclips). If it doesn't start,
 run it from a terminal: it says what's missing. Its log is in
-~/.local/share/hasteclip/logs.
+~/.local/share/hesteclips/logs.
 
-https://github.com/hasteclip/hasteclip
+https://github.com/Kaillr/hesteclips
 EOF
 
 tar -C "$work" -czf "$out/$name.tar.gz" "$name"
@@ -143,7 +143,7 @@ cp "$cef/LICENSE.txt" "$engine/CEF-LICENSE.txt"
 cp "$cef/CREDITS.html" "$engine/CREDITS.html"
 strip --strip-all "$engine/libcef.so"
 rm -rf "$cef"
-engine_name="HasteClip-web-engine-linux-x64-$cef_version.tar.xz"
+engine_name="HesteClips-web-engine-linux-x64-$cef_version.tar.xz"
 tar -C "$engine" -cf - . | xz -9 -T0 > "$out/$engine_name"
 (cd "$out" && sha256sum "$engine_name" > "$engine_name.sha256")
 echo "built $out/$engine_name"

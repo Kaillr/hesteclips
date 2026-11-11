@@ -49,7 +49,7 @@ impl Filmstrip {
 
     fn kind(ctx: &egui::Context, source: &Path, info: &ClipInfo) -> Kind {
         #[cfg(hw_decode)]
-        if std::env::var_os("HASTECLIP_NO_HW_DECODE").is_none() {
+        if std::env::var_os("HESTECLIPS_NO_HW_DECODE").is_none() {
             return Kind::Exact(exact::Exact::open(ctx, source, info));
         }
         let _ = info;
@@ -155,7 +155,7 @@ mod exact {
         fn open(path: &Path, width: u32, fps: f64) -> anyhow::Result<Self> {
             let mut d = Self { path: path.to_path_buf(), width, fps, card: None, cpu: None, cpu_failed: false };
             #[cfg(target_os = "linux")]
-            if std::env::var_os("HASTECLIP_CPU_DECODE").is_none()
+            if std::env::var_os("HESTECLIPS_CPU_DECODE").is_none()
                 && let Some(card) = capture::decode::Card::background()
             {
                 match Decoder::open_rgba_card(path, width, &card) {
@@ -259,7 +259,7 @@ mod exact {
                         let got = dec.frame(i);
                         match got {
                             Ok(Some(p)) => {
-                                if std::env::var_os("HASTECLIP_DEBUG_VIDEO").is_some() {
+                                if std::env::var_os("HESTECLIPS_DEBUG_VIDEO").is_some() {
                                     eprintln!("{:>8.3} filmstrip: frame {i}", crate::player::uptime());
                                 }
                                 if got_tx.send((i, p)).is_err() {

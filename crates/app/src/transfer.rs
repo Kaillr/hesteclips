@@ -1,4 +1,4 @@
-//! Exporting clips to a `.hasteclip` file and importing one (see
+//! Exporting clips to a `.hesteclips` file and importing one (see
 //! `archive.rs`): the dialogs, the work on a thread of its own, and a toast
 //! that shows how far it's come, then how it went.
 
@@ -29,7 +29,7 @@ enum Outcome {
 
 impl App {
     /// Ask where, then write these clips (with their edits, markers and
-    /// collections) to a `.hasteclip` file.
+    /// collections) to a `.hesteclips` file.
     pub(crate) fn export_clips(&mut self, paths: &[PathBuf]) {
         if self.transfer.is_some() {
             self.toast_error("Wait for the export or import that's running to finish");
@@ -43,7 +43,7 @@ impl App {
         let Some(mut out) = rfd::FileDialog::new()
             .set_title("Export clips")
             .set_file_name(format!("{name}.{}", archive::EXT))
-            .add_filter("HasteClip clips", &[archive::EXT])
+            .add_filter("HesteClips clips", &[archive::EXT])
             .save_file()
         else {
             return;
@@ -60,13 +60,13 @@ impl App {
         self.start_transfer(Kind::Export(n), move |progress| archive::export(&lib, &clips, &collections, &out, progress).map(|n| Outcome::Exported(n, out)));
     }
 
-    /// Ask for `.hasteclip` files, then import them.
+    /// Ask for `.hesteclips` files, then import them.
     pub(crate) fn import_clips_dialog(&mut self) {
-        let Some(files) = rfd::FileDialog::new().set_title("Import clips").add_filter("HasteClip clips", &[archive::EXT, archive::OTHER_EXT]).pick_files() else { return };
+        let Some(files) = rfd::FileDialog::new().set_title("Import clips").add_filter("HesteClips clips", &[archive::EXT, archive::OTHER_EXT]).pick_files() else { return };
         self.import_clips(files);
     }
 
-    /// Put the clips in these `.hasteclip` files into the library.
+    /// Put the clips in these `.hesteclips` files into the library.
     pub(crate) fn import_clips(&mut self, files: Vec<PathBuf>) {
         if files.is_empty() {
             return;
@@ -99,7 +99,7 @@ impl App {
         self.show_transfer();
     }
 
-    /// `.hasteclip` files dropped on the window are imported.
+    /// `.hesteclips` files dropped on the window are imported.
     pub(crate) fn import_dropped(&mut self, ctx: &egui::Context) {
         let files: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| archive::is_archive(p)).collect());
         self.import_clips(files);

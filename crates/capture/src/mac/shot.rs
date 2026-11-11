@@ -139,7 +139,7 @@ fn first_picture(filter: &SCContentFilter, config: &SCStreamConfiguration) -> Re
     let (got_tx, got) = mpsc::channel::<SendBuffer>();
     let output = ShotOutput::new(Arc::new(Mutex::new(Some(got_tx))));
     let stream = unsafe { SCStream::initWithFilter_configuration_delegate(SCStream::alloc(), filter, config, None) };
-    let queue = DispatchQueue::new("hasteclip.screenshot", None);
+    let queue = DispatchQueue::new("hesteclips.screenshot", None);
     unsafe { stream.addStreamOutput_type_sampleHandlerQueue_error(ProtocolObject::from_ref(&*output), SCStreamOutputType::Screen, Some(&queue)) }
         .map_err(|e| anyhow::anyhow!("can't take the screen: {}", e.localizedDescription()))?;
     crate::sck::start_capture(&stream)?;

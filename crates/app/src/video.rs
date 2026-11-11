@@ -19,7 +19,7 @@
 //!   with 480 frames between keyframes, 30-480 ms: decoded from the keyframe).
 //!   Every picture is the video itself, never scaled down.
 //!
-//!   Measured with `HASTECLIP_DEV_DRAG` (debug build; a release build is
+//!   Measured with `HESTECLIPS_DEV_DRAG` (debug build; a release build is
 //!   the same: the decoder sets the pace), frames behind the playhead once
 //!   steady: 1080p60 recording, 1-10× back 0.2-7, 1× back and forth 0.2,
 //!   30× forward 40; a 1440p clip with B-frames, 1-3× back 0.2-0.8, 30×
@@ -92,7 +92,7 @@ pub fn yield_to_scrub() {
 }
 
 /// This thread yields to the game, the app and playback (background decoding
-/// and compressing: scrub frames, the filmstrip; listening for "HasteClip
+/// and compressing: scrub frames, the filmstrip; listening for "HesteClips
 /// that").
 pub fn lower_priority() {
     #[cfg(windows)]
@@ -219,7 +219,7 @@ pub struct Video {
     state: Arc<Mutex<State>>,
 }
 
-/// Says (`HASTECLIP_DEBUG_VIDEO`) the playback decoder's thread is done.
+/// Says (`HESTECLIPS_DEBUG_VIDEO`) the playback decoder's thread is done.
 struct Closed;
 
 impl Drop for Closed {
@@ -240,7 +240,7 @@ impl Video {
         let (path, shared, ctx) = (path.to_path_buf(), state.clone(), ctx.clone());
         std::thread::spawn(move || {
             // Logged as the thread ends, after the decoder's gone
-            // (`HASTECLIP_DEBUG_VIDEO`): a player that let go of it closed it.
+            // (`HESTECLIPS_DEBUG_VIDEO`): a player that let go of it closed it.
             let _closed = Closed;
             let opened = open_decoder(&path);
             let mut dec = match opened {
@@ -833,7 +833,7 @@ fn open_decoder(path: &Path) -> anyhow::Result<Decoder> {
         let on_gpu = crate::gpu_frames::share_luid().and_then(|luid| {
             Decoder::open(path, u32::MAX, Some(luid)).inspect_err(|e| eprintln!("sharing decoded frames isn't possible, copying them: {e:#}")).ok()
         });
-        if std::env::var_os("HASTECLIP_DEBUG_VIDEO").is_some() {
+        if std::env::var_os("HESTECLIPS_DEBUG_VIDEO").is_some() {
             eprintln!("video: decoded frames {}", if on_gpu.is_some() { "drawn from the GPU" } else { "copied to the CPU" });
         }
         match on_gpu {

@@ -70,8 +70,8 @@ pub(crate) fn gpu() -> Option<Arc<Gpu>> {
 
 impl Gpu {
     fn new() -> Result<Self> {
-        if std::env::var_os("HASTECLIP_NO_GPU_CAPTURE").is_some() {
-            bail!("turned off by HASTECLIP_NO_GPU_CAPTURE");
+        if std::env::var_os("HESTECLIPS_NO_GPU_CAPTURE").is_some() {
+            bail!("turned off by HESTECLIPS_NO_GPU_CAPTURE");
         }
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor { backends: wgpu::Backends::VULKAN, ..wgpu::InstanceDescriptor::new_without_display_handle() });
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -151,7 +151,7 @@ impl Gpu {
         let (device, queue) = unsafe {
             adapter.create_device_from_hal(
                 open,
-                &wgpu::DeviceDescriptor { label: Some("hasteclip capture"), required_features: features, required_limits: adapter.limits(), ..Default::default() },
+                &wgpu::DeviceDescriptor { label: Some("hesteclips capture"), required_features: features, required_limits: adapter.limits(), ..Default::default() },
             )
         }
         .context("can't use the graphics card")?;

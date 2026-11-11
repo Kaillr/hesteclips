@@ -183,7 +183,7 @@ mod tests {
 
     #[test]
     fn recovers_only_unfinished_captures() {
-        let dir = std::env::temp_dir().join(format!("hasteclip-recover-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("hesteclips-recover-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let hidden = [
@@ -197,7 +197,7 @@ mod tests {
             std::fs::write(dir.join(name), b"x").unwrap();
         }
         // The app's asset folder (edited clips' originals) is never touched.
-        let assets = dir.join(".hasteclip").join("3f9c0000aaaa");
+        let assets = dir.join(".hesteclips").join("3f9c0000aaaa");
         std::fs::create_dir_all(&assets).unwrap();
         std::fs::write(assets.join("original.mp4"), b"x").unwrap();
         // A game's folder: a clip cut off while saving goes, finished ones stay.
@@ -220,7 +220,7 @@ mod tests {
 
     #[test]
     fn recovers_from_the_writing_folder() {
-        let dir = std::env::temp_dir().join(format!("hasteclip-recover-writing-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("hesteclips-recover-writing-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         // A recording cut off, and a clip, an edit and a screenshot half-written.
         let file = in_progress(&dir.join("recording_2026-10-22_14-00-00.mp4"));
@@ -245,7 +245,7 @@ mod tests {
 
     #[test]
     fn saves_overlap() {
-        let dir = std::env::temp_dir().join(format!("hasteclip-overlap-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("hesteclips-overlap-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         // The second is asked for before the first is written; its file is

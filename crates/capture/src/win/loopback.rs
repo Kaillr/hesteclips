@@ -4,9 +4,9 @@
 //!
 //! - **App source**: one include stream per top process of the app, so its
 //!   helpers (browser tabs, Discord's voice process) come along.
-//! - **Desktop**: everything except HasteClip itself (a mic you "Listen" to
+//! - **Desktop**: everything except HesteClips itself (a mic you "Listen" to
 //!   would be heard twice); what it plays for you is added back in by
-//!   `sources::own_sound`, as is a HasteClip app source's sound.
+//!   `sources::own_sound`, as is a HesteClips app source's sound.
 //! - **Desktop minus app sources** (or minus programs left out of it, e.g. an
 //!   audio router like FXSound that plays every app's sound again): WASAPI
 //!   can exclude only one tree, so while any of those runs, the desktop is
@@ -14,7 +14,7 @@
 //!   minus them, minus us. Which programs it records is shown on its
 //!   channel ([`Channel::programs`]).
 //! - **Output device**: one endpoint loopback stream, what that device plays,
-//!   mixed (HasteClip's own sounds on it too).
+//!   mixed (HesteClips' own sounds on it too).
 //!
 //! Each stream feeds a child of its source's [`SourceFeed`], placed on the QPC
 //! clock by its own timestamps. A thread rescans every second so app sources
@@ -400,7 +400,7 @@ fn sync_taps(taps: &mut [Tap], start: fn(Target, Arc<SourceFeed>) -> Result<Stre
         let wanted: Vec<Target> = match &tap.source.kind {
             SourceKind::App { bundle_id } => {
                 // Never this process (its sound comes from `own_sound`), but
-                // another HasteClip running, yes.
+                // another HesteClips running, yes.
                 let mut roots = tree.roots_of(bundle_id);
                 roots.retain(|&pid| pid != own);
                 let own_source = crate::sources::is_own_app(&tap.source.kind, own_app.as_deref());
@@ -585,14 +585,14 @@ struct DesktopPlan {
     recorded: Vec<u32>,
 }
 
-/// How to record the desktop minus HasteClip (`own`) and the programs `out`
+/// How to record the desktop minus HesteClips (`own`) and the programs `out`
 /// (executables: apps that are sources of their own, programs left out),
 /// given the processes with an audio session (`sessions`, sorted). While
 /// none of `out` runs, one stream of everything but us; else a stream per
 /// session process (see [`desktop_without`]). Either way, which of the
 /// sessions that adds up to.
 fn desktop_plan(tree: &ProcessTree, sessions: &[u32], own: u32, out: &[String]) -> DesktopPlan {
-    // HasteClip's whole tree, as an exclude stream leaves out: a web page
+    // HesteClips' whole tree, as an exclude stream leaves out: a web page
     // shown in the video plays from a child of ours.
     let ours = |pid: u32| pid == own || tree.ancestors(pid).any(|a| a.pid == own);
     let any_running = tree.iter().any(|p| out.iter().any(|exe| p.exe.eq_ignore_ascii_case(exe)));
@@ -688,7 +688,7 @@ mod tests {
         assert_eq!(TRIES.load(Ordering::SeqCst), 2);
     }
 
-    /// Explorer (1) started HasteClip (10, with a child of its own playing
+    /// Explorer (1) started HesteClips (10, with a child of its own playing
     /// sound, 11), a game (20), FXSound (30), Discord (40, playing from its
     /// child 41) and a launcher (50) playing sound that started another game
     /// (51). Every process but 1, 10 and 40 has an audio session.
@@ -696,7 +696,7 @@ mod tests {
         let p = |pid: u32, parent: u32, exe: &str| super::super::system::Process { pid, parent, exe: exe.into() };
         let tree = ProcessTree::of(vec![
             p(1, 0, "explorer.exe"),
-            p(10, 1, "hasteclip.exe"),
+            p(10, 1, "hesteclips.exe"),
             p(11, 10, "ffplay.exe"),
             p(20, 1, "cs2.exe"),
             p(30, 1, "FXSound.exe"),
@@ -713,7 +713,7 @@ mod tests {
     }
 
     /// Nothing left out (or what's left out isn't running): one stream of
-    /// everything but HasteClip's tree, which records every other program
+    /// everything but HesteClips' tree, which records every other program
     /// that has a session.
     #[test]
     fn a_desktop_leaving_nothing_out_records_everything_but_us() {
@@ -823,7 +823,7 @@ mod tests {
             }
             t.elapsed()
         };
-        system.add(app("app", "hasteclip-test-no-such-app.exe"), SourceFeed::new(RATE, Arc::new(Clock::default())), channel.clone());
+        system.add(app("app", "hesteclips-test-no-such-app.exe"), SourceFeed::new(RATE, Arc::new(Clock::default())), channel.clone());
         let took = until(SourceStatus::WaitingForApp);
         assert!(took < Duration::from_millis(500), "added: waiting for its app after {took:?}");
         system.remove("app");

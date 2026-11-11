@@ -1,6 +1,6 @@
 # Builds the Windows release into Releases/: the app with a pinned ffmpeg and
 # OBS Studio's game capture hook next to it, packed by Velopack into an
-# installer (HasteClip-win-Setup.exe), a portable zip, and the full + delta
+# installer (HesteClips-win-Setup.exe), a portable zip, and the full + delta
 # packages the installed app updates from.
 #
 # The release workflow runs this with the version semantic-release picked, and
@@ -15,7 +15,7 @@ $PSNativeCommandUseErrorActionPreference = $true
 
 $root = Split-Path $PSScriptRoot
 Set-Location $root
-$repo = 'https://github.com/hasteclip/hasteclip'
+$repo = 'https://github.com/Kaillr/hesteclips'
 
 # The editor, thumbnails and probing run ffmpeg; shipping it means nothing else
 # to install. Pinned, so an update only carries it when this changes.
@@ -34,12 +34,12 @@ $cargo = Get-Content Cargo.toml -Raw
 $lock = Get-Content Cargo.lock -Raw
 ($cargo -replace '(?m)^version = "[^"]*"', "version = `"$Version`"") | Set-Content Cargo.toml -NoNewline
 try {
-    cargo build --release -p hasteclip
+    cargo build --release -p hesteclips
 } finally {
     Set-Content Cargo.toml $cargo -NoNewline
     Set-Content Cargo.lock $lock -NoNewline
 }
-Copy-Item target\release\hasteclip.exe $stage
+Copy-Item target\release\hesteclips.exe $stage
 
 $zip = Join-Path $work "ffmpeg-$ffmpegVersion.zip"
 if (-not (Test-Path $zip) -or (Get-FileHash $zip -Algorithm SHA256).Hash -ne $ffmpegSha256) {
@@ -69,12 +69,12 @@ if ($env:GITHUB_TOKEN) {
 }
 
 vpk pack `
-    --packId HasteClip `
+    --packId HesteClips `
     --packVersion $Version `
     --packDir $stage `
-    --mainExe hasteclip.exe `
+    --mainExe hesteclips.exe `
     --runtime win-x64 `
-    --packTitle HasteClip `
+    --packTitle HesteClips `
     --packAuthors Kaillr `
     --icon crates\app\assets\icon.ico `
     --outputDir $out

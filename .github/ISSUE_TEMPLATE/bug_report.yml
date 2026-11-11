@@ -24,7 +24,7 @@ body:
   - type: input
     id: version
     attributes:
-      label: HasteClip version
+      label: HesteClips version
       description: You'll find it in Settings → App.
       placeholder: "0.4.0"
     validations:
@@ -56,10 +56,10 @@ body:
       description: |
         Drag the log file in here, if you can.
 
-        - Windows: `%LOCALAPPDATA%\hasteclip\logs\hasteclip.log`
-        - Linux: `~/.local/share/hasteclip/logs/hasteclip.log`
+        - Windows: `%LOCALAPPDATA%\hesteclips\logs\hesteclips.log`
+        - Linux: `~/.local/share/hesteclips/logs/hesteclips.log`
         - macOS: there's no log file, so skip this.
 
-        If HasteClip crashed, send `hasteclip.previous.log` too.
+        If HesteClips crashed, send `hesteclips.previous.log` too.
     validations:
       required: false

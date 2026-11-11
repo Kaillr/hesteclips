@@ -24,6 +24,8 @@ use crate::{App, Page, reveal_label, shortcuts};
 pub(crate) const REPLAY_CHOICES: [u32; 8] = [15, 30, 60, 120, 300, 600, 1200, 1800];
 /// The settings column's width.
 const COLUMN: f32 = 680.0;
+/// What the search finds HesteFiles' group by.
+const HESTEFILES_WORDS: &[&str] = &["hestefiles", "cloud", "upload", "account", "token", "public link", "default folder", "share"];
 
 /// A pane of Settings, as the panel lists them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -91,7 +93,7 @@ impl Pane {
             Pane::Shortcuts => &["Shortcuts"],
             #[cfg(target_os = "macos")]
             Pane::Permissions => &["Permissions"],
-            Pane::App => &["App", "About"],
+            Pane::App => &["App", "HesteFiles", "About"],
         }
     }
 }
@@ -112,7 +114,7 @@ impl Filter {
 /// it's on this system at all).
 fn group_matches(name: &str, f: &Filter) -> bool {
     match name {
-        "Clipping" => f.shows(&["clip length", "replay buffer duration", "start clipping when hasteclip opens", "auto start", "memory"]),
+        "Clipping" => f.shows(&["clip length", "replay buffer duration", "start clipping when hesteclips opens", "auto start", "memory"]),
         "Video" => f.shows(RESOLUTION_WORDS) || f.shows(SHAPE_WORDS),
         "Motion" => f.shows(FPS_WORDS) || capture::frame_blending() && f.shows(BLEND_WORDS),
         "File" => f.shows(QUALITY_WORDS) || f.shows(ENCODER_WORDS) || f.shows(FORMAT_WORDS),
@@ -124,8 +126,9 @@ fn group_matches(name: &str, f: &Filter) -> bool {
         "Shortcuts" => f.shows(&["shortcuts", "hotkey", "keyboard", "save clip", "take a screenshot", "start or stop clipping", "start or stop recording", "fullscreen games", "input monitoring", "permission", "system settings"]),
         #[cfg(target_os = "macos")]
         "Permissions" => crate::setup::Need::ALL.iter().any(|n| f.shows(n.words()) || f.shows(&[n.label()])) || f.shows(&["permissions", "privacy", "allow"]),
-        "Voice" => f.shows(&["save by voice", "hasteclip that", "speech", "command", "voice samples", "review", "keep", "improve"]),
+        "Voice" => f.shows(&["save by voice", "hashtag hesteclip that", "speech", "command", "voice samples", "review", "keep", "improve"]),
         "App" => f.shows(&["appearance", "theme", "dark", "light", "system", "open at login", "autostart", "startup", "start with", "closing the window", "tray", "menu bar", "quit", "discord", "activity", "rich presence"]),
+        "HesteFiles" => f.shows(HESTEFILES_WORDS),
         "About" => f.shows(&["update", "version", "what's new", "license", "licence", "about", "source code", "copyright", "open source", "reset", "defaults"]),
         _ => false,
     }
@@ -309,6 +312,7 @@ impl App {
             "Permissions" => self.permissions_group(ui, f),
             "Voice" => self.voice_group(ui, f),
             "App" => self.app_group(ui, f),
+            "HesteFiles" => self.hestefiles_group(ui, f),
             "About" => self.about_group(ui, f),
             _ => {}
         }
@@ -366,8 +370,8 @@ impl App {
                     self.length_field(ui);
                 });
             }
-            if f.shows(&["start clipping when hasteclip opens", "auto start"]) {
-                l.row(Row::new("Start clipping when HasteClip opens"), |ui| ui_kit::switch(ui, &mut self.settings.auto_start_buffer));
+            if f.shows(&["start clipping when hesteclips opens", "auto start"]) {
+                l.row(Row::new("Start clipping when HesteClips opens"), |ui| ui_kit::switch(ui, &mut self.settings.auto_start_buffer));
             }
         });
     }
@@ -873,7 +877,7 @@ impl App {
         });
     }
 
-    /// macOS: what HasteClip needs macOS to allow, whether it's allowed,
+    /// macOS: what HesteClips needs macOS to allow, whether it's allowed,
     /// and a way to allow what isn't. Nothing here nags: a permission left
     /// off only shows as off when someone looks.
     #[cfg(target_os = "macos")]
@@ -918,16 +922,16 @@ impl App {
             match (problem, self.voice_mic().is_none()) {
                 (Some(p), _) => format!("Can't listen: {p}"),
                 (None, true) => "Add a microphone on the Sources page to use it".to_owned(),
-                _ => "Say “HasteClip that”".to_owned(),
+                _ => "Say “hashtag HesteClip that”".to_owned(),
             }
         } else {
-            "Say “HasteClip that”".to_owned()
+            "Say “hashtag HesteClip that”".to_owned()
         };
         let (to_hear, all) = self.voice_review.summary();
         let mut review = false;
         ui_kit::list(ui, "voice", |l| {
-            if f.shows(&["save by voice", "hasteclip that", "speech", "command", "voice"]) {
-                l.row(Row::new("Save by voice").tip("Save by voice", "While clipping, say “HasteClip that” to save a clip; while recording, to mark the moment. Listening happens on this computer, for this phrase only.").note(note), |ui| ui_kit::switch(ui, &mut self.settings.voice_clip));
+            if f.shows(&["save by voice", "hashtag hesteclip that", "speech", "command", "voice"]) {
+                l.row(Row::new("Save by voice").tip("Save by voice", "While clipping, say “hashtag HesteClip that” to save a clip; while recording, to mark the moment. Listening happens on this computer, for this phrase only.").note(note), |ui| ui_kit::switch(ui, &mut self.settings.voice_clip));
             }
             if f.shows(&["voice samples", "keep", "review", "improve"]) {
                 l.row(Row::new("Keep voice samples").tip("Keep voice samples", "Keeps about 6 seconds of your microphone each time the command saves a clip or nearly does. You can listen to them and mark which should have saved a clip, to help improve the detector. They stay on this computer."), |ui| ui_kit::switch(ui, &mut self.settings.voice_samples));
@@ -985,10 +989,68 @@ impl App {
                     (true, true) if self.presence.connected() => "Showing on Discord",
                     (true, true) => "Discord isn't running",
                 };
-                let tip = "While HasteClip clips a game, your Discord profile shows “Clipping osu! with HasteClip”, with a button for others to get HasteClip. Needs Discord running.";
+                let tip = "While HesteClips clips a game, your Discord profile shows “Clipping osu! with HesteClips”, with a button for others to get HesteClips. Needs Discord running.";
                 l.row(Row::new("Discord activity").tip("Discord activity", tip).note(note), |ui| ui_kit::switch(ui, &mut self.settings.discord_presence));
             }
         });
+    }
+
+    /// HesteFiles: the account, and where and how clips upload.
+    fn hestefiles_group(&mut self, ui: &mut egui::Ui, f: &Filter) {
+        if !f.shows(HESTEFILES_WORDS) {
+            return;
+        }
+        let connected = self.cloud.is_connected();
+        let picture = self.cloud.profile_picture().and_then(|url| self.web_images.fresh(ui.ctx(), &url));
+        let mut disconnect = false;
+        let mut pick = false;
+        ui_kit::list(ui, "hestefiles", |l| {
+            let note = match &self.cloud.connection {
+                crate::cloud::Connection::Connected(account) => format!("Connected as {}", account.user_info.username),
+                crate::cloud::Connection::Connecting => "Checking your token…".to_owned(),
+                crate::cloud::Connection::Failed(e) => format!("Couldn't connect: {e}"),
+                crate::cloud::Connection::Disconnected => "Upload clips to your HesteFiles storage and share a link.".to_owned(),
+            };
+            let failed = matches!(self.cloud.connection, crate::cloud::Connection::Failed(_));
+            l.row(Row::new("HesteFiles account").note(note).warn(failed), |ui| {
+                if connected {
+                    disconnect = Btn::ghost("Disconnect").small().show(ui).clicked();
+                    if let Some(tex) = &picture {
+                        // Round, as HesteFiles shows it.
+                        ui.add(egui::Image::from_texture((tex.id(), egui::vec2(22.0, 22.0))).corner_radius(11));
+                    }
+                } else if !matches!(self.cloud.connection, crate::cloud::Connection::Connecting) && Btn::normal("Connect…").small().show(ui).clicked() {
+                    self.connect_open = true;
+                }
+            });
+            l.well("hestefiles_well", connected, |l| {
+                let folder = self.cloud.default_folder.as_ref().map_or("Not set".to_owned(), |f| format!("HesteFiles / {}", f.display()));
+                l.row(Row::new("Upload to").kid().tip("Upload to", "Where Upload to HesteFiles puts clips unless you pick another folder when uploading."), |ui| {
+                    pick = Btn::normal("Choose…").small().show(ui).clicked();
+                    ui.label(theme::text(&folder, 13.0, W::Regular).color(theme::pal(ui).text2));
+                });
+                l.row(Row::new("Put each clip in a folder for its game").kid(), |ui| {
+                    let mut on = self.cloud.game_folders;
+                    if ui_kit::switch(ui, &mut on).changed() {
+                        self.cloud.set_game_folders(on);
+                    }
+                });
+                l.row(Row::new("Make a public link").kid().note("Anyone with the link can watch and download."), |ui| {
+                    let mut on = self.cloud.public_links;
+                    if ui_kit::switch(ui, &mut on).changed() {
+                        self.cloud.set_public_links(on);
+                    }
+                });
+            });
+        });
+        if disconnect {
+            self.cloud.disconnect();
+            self.toast_icon(icon::SIGN_OUT, "Disconnected from HesteFiles");
+        }
+        if pick {
+            self.cloud.open_browser(self.cloud.default_folder.clone());
+            self.dialog = Some(crate::cloud_ui::Dialog::PickDefaultFolder);
+        }
     }
 
     /// The version and its updates, the license, and going back to the
@@ -1002,13 +1064,13 @@ impl App {
             Status::Checking => "Checking for updates…".to_owned(),
             Status::Downloading(p) => format!("Downloading an update… {p}%"),
             Status::UpToDate => "You have the latest version.".to_owned(),
-            Status::Ready(v) => format!("Version {v} is ready and installs when you quit HasteClip."),
+            Status::Ready(v) => format!("Version {v} is ready and installs when you quit HesteClips."),
             Status::Failed(e) => e.clone(),
         };
         let idle = self.rec_state.idle();
         ui_kit::list(ui, "about", |l| {
             if f.shows(&["update", "version", "what's new"]) {
-                let title = format!("HasteClip {}", self.updater.version());
+                let title = format!("HesteClips {}", self.updater.version());
                 l.row(Row::new(&title).note(line.clone()), |ui| {
                     if Btn::ghost("What's new").small().show(ui).clicked() {
                         ui.ctx().open_url(egui::OpenUrl::new_tab(format!("{}/releases", crate::update::REPO)));
@@ -1407,7 +1469,7 @@ impl App {
                 ui.set_width(width);
                 let p = theme::pal(ui);
                 let t = self.settings.game_titles.clone();
-                ui.add(egui::Label::new(theme::text("Clips get named after what happened in the game, for games that tell HasteClip. Clips where nothing happened keep their time.", 13.5, W::Regular).color(p.text2)).wrap());
+                ui.add(egui::Label::new(theme::text("Clips get named after what happened in the game, for games that tell HesteClips. Clips where nothing happened keep their time.", 13.5, W::Regular).color(p.text2)).wrap());
                 ui.add_space(18.0);
                 ui.label(theme::text("Your clips will be called", 13.0, W::Semibold).color(p.text2));
                 ui.add_space(6.0);
@@ -1722,7 +1784,7 @@ fn screen_capture_note(choice: settings::ScreenCapture, apps: bool, in_use: Opti
         Auto => "Uses Windows Graphics Capture here",
         Duplication => "No yellow border. Can't record a display on another graphics card",
         Wgc if auto_duplicates => "Windows 10 shows a yellow border around your screen with it",
-        Wgc => "What HasteClip has always used",
+        Wgc => "What HesteClips has always used",
     };
     (note.into(), false)
 }
@@ -1956,7 +2018,8 @@ mod search_tests {
             Pane::ALL.into_iter().filter(|p| p.groups().iter().any(|g| group_matches(g, &f))).map(Pane::label).collect()
         };
         assert_eq!(on("discord"), ["App"]);
-        assert_eq!(on("hasteclip that"), ["Clipping"]);
+        assert_eq!(on("hestefiles"), ["App"]);
+        assert_eq!(on("hashtag hesteclip that"), ["Clipping"]);
         assert_eq!(on("license"), ["App"]);
         assert_eq!(on("fps"), ["Video"]);
     }

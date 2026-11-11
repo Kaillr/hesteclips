@@ -3,11 +3,11 @@
 //! first time a page is shown. It comes from the app's releases on GitHub
 //! (the build of CEF this app speaks, [`CEF_VERSION`], stripped and packed
 //! by `scripts/release-linux.sh`), is checked against its checksum, and is
-//! unpacked with the app's data (`~/.local/share/hasteclip/web-engine/<version>`),
+//! unpacked with the app's data (`~/.local/share/hesteclips/web-engine/<version>`),
 //! where every version of the app on the same CEF uses it. Engines of other
 //! versions are taken out once this one's in.
 //!
-//! `HASTECLIP_WEB_ENGINE_DIR=<folder>` (`super::web_host::ENGINE_ENV`)
+//! `HESTECLIPS_WEB_ENGINE_DIR=<folder>` (`super::web_host::ENGINE_ENV`)
 //! uses an engine unpacked there instead.
 
 use std::io::Read;
@@ -25,11 +25,11 @@ use super::web_host::ENGINE_ENV;
 pub(crate) const CEF_VERSION: &str = "156.0.26";
 
 /// GitHub's API for the repo's releases, newest first.
-const RELEASES: &str = "https://api.github.com/repos/hasteclip/hasteclip/releases?per_page=30";
+const RELEASES: &str = "https://api.github.com/repos/Kaillr/hesteclips/releases?per_page=30";
 
 /// The engine's download, as a release has it.
 pub(crate) fn asset() -> String {
-    format!("HasteClip-web-engine-linux-x64-{CEF_VERSION}.tar.xz")
+    format!("HesteClips-web-engine-linux-x64-{CEF_VERSION}.tar.xz")
 }
 
 /// Where the engine stands.
@@ -55,7 +55,7 @@ pub(crate) fn data_dir() -> Option<PathBuf> {
 
 /// The folder engines are unpacked in.
 fn root() -> Option<PathBuf> {
-    Some(data_dir()?.join("hasteclip").join("web-engine"))
+    Some(data_dir()?.join("hesteclips").join("web-engine"))
 }
 
 /// The engine's folder, if it's here.
@@ -133,7 +133,7 @@ fn fetch() {
     with_state(|s| *s = result.map_or_else(|e| Engine::Failed(format!("Chromium couldn't be downloaded: {e:#}")), Engine::Ready));
 }
 
-const AGENT: &str = "HasteClip";
+const AGENT: &str = "HesteClips";
 
 fn fetch_into() -> Result<PathBuf> {
     let root = root().context("there's no home folder to keep it in")?;
@@ -163,9 +163,9 @@ fn fetch_into() -> Result<PathBuf> {
 /// The engine's download and its checksum, from the newest release that
 /// has this version of it.
 fn find_download() -> Result<(String, String)> {
-    // `HASTECLIP_RELEASES=<url>`: another list in GitHub's form (as the
+    // `HESTECLIPS_RELEASES=<url>`: another list in GitHub's form (as the
     // updater takes), to try it.
-    let url = std::env::var("HASTECLIP_RELEASES").unwrap_or_else(|_| RELEASES.to_owned());
+    let url = std::env::var("HESTECLIPS_RELEASES").unwrap_or_else(|_| RELEASES.to_owned());
     let text = ureq::get(&url)
         .header("User-Agent", AGENT)
         .header("Accept", "application/vnd.github+json")
@@ -247,7 +247,7 @@ mod tests {
         let releases = serde_json::json!([
             { "draft": true, "assets": [asset(1, &name), asset(1, &sum)] },
             { "draft": false, "assets": [asset(2, &name)] },
-            { "draft": false, "assets": [asset(3, "HasteClip-linux-x64.tar.gz"), asset(3, &name), asset(3, &sum)] },
+            { "draft": false, "assets": [asset(3, "HesteClips-linux-x64.tar.gz"), asset(3, &name), asset(3, &sum)] },
             { "draft": false, "assets": [asset(4, &name), asset(4, &sum)] },
         ]);
         assert_eq!(super::pick(&releases, &name), Some((format!("https://x/3/{name}"), format!("https://x/3/{sum}"))));

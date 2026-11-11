@@ -60,7 +60,7 @@ time. At the same bitrate the picture's a little better (35.5 dB against
 
 Measured on the Linux desktop (i7-8700K, RTX 4060 Ti) under Windows 11,
 1440p clips made by ffmpeg (`testsrc2`), test builds, against ffmpeg 9.0.2
-(the version the app ships), with the installed HasteClip recording a replay
+(the version the app ships), with the installed HesteClips recording a replay
 buffer meanwhile; runs alternated, card and ffmpeg. CPU in % of one core.
 
 | | ffmpeg | Now |
@@ -145,18 +145,18 @@ says what passed. Its log's `export:` lines say which way each export went.
 
 On Windows, `export_times` counts the CPU of the test and the ffmpegs it
 starts with a job object (Windows counts no child's time to its parent),
-and `HASTECLIP_ENCODER=x264` leaves the card's encoder out (`mf`, or
+and `HESTECLIPS_ENCODER=x264` leaves the card's encoder out (`mf`, or
 nothing, keeps it).
 
 On macOS, compare with the ffmpeg the app ships: Homebrew's has no `zscale`,
 so its blends mix pixel values, not light. A release build leaves it in
-`target/release-package/dmg/HasteClip.app/Contents/MacOS`; put that first on
+`target/release-package/dmg/HesteClips.app/Contents/MacOS`; put that first on
 `PATH`. And time release builds: in a debug build VideoToolbox's first
 decoder takes ~0.6 s to start (60 ms in release, 3 ms after).
 
-Switches for comparing paths: `HASTECLIP_EXPORT_FFMPEG=1` (exports by
-ffmpeg), `HASTECLIP_ENCODER`, `HASTECLIP_DECODE`, `HASTECLIP_CPU_DECODE=1`,
-`HASTECLIP_FFPROBE=1`, `HASTECLIP_SCRUB_ENGINE=0`.
+Switches for comparing paths: `HESTECLIPS_EXPORT_FFMPEG=1` (exports by
+ffmpeg), `HESTECLIPS_ENCODER`, `HESTECLIPS_DECODE`, `HESTECLIPS_CPU_DECODE=1`,
+`HESTECLIPS_FFPROBE=1`, `HESTECLIPS_SCRUB_ENGINE=0`.
 
 ## Lessons from Linux
 

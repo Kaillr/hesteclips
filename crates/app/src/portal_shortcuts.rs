@@ -38,7 +38,7 @@ use crate::settings::ShortcutAction;
 
 /// The app's id with the desktop: the portal keeps our shortcuts under it,
 /// and it names the `.desktop` file that says what we're called.
-pub const APP_ID: &str = "io.github.kaillr.HasteClip";
+pub const APP_ID: &str = "io.github.kaillr.HesteClips";
 
 /// Tell the desktop portal who we are, before anything else talks to it (it
 /// can't tell for an app that isn't sandboxed). Best effort: older portals
@@ -343,7 +343,7 @@ mod kde {
     }
 
     fn action_id(action: ShortcutAction) -> Vec<&'static str> {
-        vec![APP_ID, id(action), "HasteClip", action.label()]
+        vec![APP_ID, id(action), "HesteClips", action.label()]
     }
 
     /// The first keys a shortcut has there, if any.

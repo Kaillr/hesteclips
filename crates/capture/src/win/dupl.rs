@@ -116,7 +116,7 @@ struct Duplication {
 
 impl Duplication {
     fn open(gpu: &Gpu, monitor: HMONITOR) -> Result<Self> {
-        let output = output_for(gpu, monitor).context("the display isn't connected to the graphics card HasteClip uses")?;
+        let output = output_for(gpu, monitor).context("the display isn't connected to the graphics card HesteClips uses")?;
         let desc = unsafe { output.GetDesc() }?;
         // HDR is only told by the newer interfaces (Windows 10 1703 and later).
         let output6 = output.cast::<IDXGIOutput6>().ok();
@@ -263,7 +263,7 @@ impl Probe {
     /// compositor; Windows may refuse the duplication rather than start one
     /// and take it away).
     pub(crate) fn start(gpu: &Gpu, monitor: HMONITOR) -> Result<Self, String> {
-        let output = output_for(gpu, monitor).ok_or("the display isn't on the graphics card HasteClip uses")?;
+        let output = output_for(gpu, monitor).ok_or("the display isn't on the graphics card HesteClips uses")?;
         let dupl = match probe_duplicate(gpu, &output) {
             Ok(d) => Some(d),
             Err(e) if [E_INVALIDARG, DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, DXGI_ERROR_SESSION_DISCONNECTED].contains(&e.code()) => return Err(e.message()),
@@ -395,9 +395,9 @@ fn run(gpu: &Gpu, monitor: HMONITOR, latest: &Arc<Latest>, fps: u32, stop: &Atom
     // Its being lost was said, and its working again isn't yet (once it
     // lasts, see `STEADY`).
     let mut said_lost = false;
-    // `HASTECLIP_DUPL_LOG=1`: asks, new pictures, cursor-only updates, since `counted.0`.
+    // `HESTECLIPS_DUPL_LOG=1`: asks, new pictures, cursor-only updates, since `counted.0`.
     let mut counted = (Instant::now(), 0u32, 0u32, 0u32);
-    let log = std::env::var_os("HASTECLIP_DUPL_LOG").is_some();
+    let log = std::env::var_os("HESTECLIPS_DUPL_LOG").is_some();
     while !stop.load(Ordering::Relaxed) {
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut resource = None;

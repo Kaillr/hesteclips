@@ -73,12 +73,12 @@ impl App {
     pub(crate) fn projector_window(&mut self, ctx: &egui::Context) {
         let Some(p) = self.projector.as_ref() else { return };
         let bounds = capture::display_bounds(&p.display);
-        let id = egui::ViewportId::from_hash_of(("hasteclip_projector", &p.display));
+        let id = egui::ViewportId::from_hash_of(("hesteclips_projector", &p.display));
         // A window with a frame, hidden till it's fullscreen: winit draws a
         // frameless one a pixel down (its drop shadow's room), a light line
         // along its top, and fullscreen takes the frame off by itself.
         // Opened on its display (as near as points go).
-        let mut builder = egui::ViewportBuilder::default().with_title(format!("HasteClip preview: {}", p.name)).with_visible(false).with_inner_size([960.0, 540.0]);
+        let mut builder = egui::ViewportBuilder::default().with_title(format!("HesteClips preview: {}", p.name)).with_visible(false).with_inner_size([960.0, 540.0]);
         if let Some(m) = p.monitor {
             // Made fullscreen on its output as it opens: the only way onto a
             // display where windows aren't placed by position.

@@ -174,7 +174,7 @@ fn stream(feed: &CameraFeed) -> Result<()> {
         Some(want) => offered.iter().find(|(f, _)| *f == want).copied().ok_or_else(|| anyhow!("the camera doesn't offer {}", want.label()))?,
         None => offered.iter().max_by_key(|(f, _)| f.auto_rank()).copied().ok_or_else(|| anyhow!("the camera offers no picture format"))?,
     };
-    if std::env::var_os("HASTECLIP_WEBCAM_FFMPEG").is_none() {
+    if std::env::var_os("HESTECLIPS_WEBCAM_FFMPEG").is_none() {
         match Stream::open(&path, format, pixel) {
             Ok(s) => match stream_direct(feed, s)? {
                 Direct::Done => return Ok(()),
@@ -1092,9 +1092,9 @@ mod tests {
     /// Switching a camera's format reopens it without it being busy (the
     /// one before let go of first).
     #[test]
-    #[ignore = "uses a camera nothing else has open: HASTECLIP_WEBCAM=<device> cargo test -p capture switches_format -- --ignored"]
+    #[ignore = "uses a camera nothing else has open: HESTECLIPS_WEBCAM=<device> cargo test -p capture switches_format -- --ignored"]
     fn switches_format() {
-        let device = std::env::var("HASTECLIP_WEBCAM").unwrap();
+        let device = std::env::var("HESTECLIPS_WEBCAM").unwrap();
         let formats = formats_of(&std::fs::canonicalize(&device).unwrap()).unwrap();
         let (a, b) = (formats[0].0, formats[formats.len() / 2].0);
         let live = |want: (u32, u32)| {
@@ -1126,9 +1126,9 @@ mod tests {
     /// With a long exposure the camera repeats pictures: frames keep coming
     /// at its rate, new pictures far fewer.
     #[test]
-    #[ignore = "changes a camera's exposure for a moment: HASTECLIP_WEBCAM=<device> cargo test -p capture repeats_pictures -- --ignored"]
+    #[ignore = "changes a camera's exposure for a moment: HESTECLIPS_WEBCAM=<device> cargo test -p capture repeats_pictures -- --ignored"]
     fn repeats_pictures_with_a_long_exposure() {
-        let device = std::env::var("HASTECLIP_WEBCAM").unwrap();
+        let device = std::env::var("HESTECLIPS_WEBCAM").unwrap();
         let all = controls(&device);
         let auto = all.iter().find(|c| c.id == 0x9a0901).expect("auto exposure").clone();
         let time = all.iter().find(|c| c.id == 0x9a0902).expect("exposure time").clone();
@@ -1156,9 +1156,9 @@ mod tests {
 
     /// Settings remembered for a camera go back on when it's opened.
     #[test]
-    #[ignore = "uses a camera nothing else has open: HASTECLIP_WEBCAM=<device> cargo test -p capture remembered_settings -- --ignored"]
+    #[ignore = "uses a camera nothing else has open: HESTECLIPS_WEBCAM=<device> cargo test -p capture remembered_settings -- --ignored"]
     fn remembered_settings_go_back_on() {
-        let device = std::env::var("HASTECLIP_WEBCAM").unwrap();
+        let device = std::env::var("HESTECLIPS_WEBCAM").unwrap();
         let b = controls(&device).into_iter().find(|c| c.name.to_lowercase().contains("brightness")).expect("brightness");
         crate::webcam::remember_controls(&device, vec![(b.id, b.default + 7)]);
         keep_open(vec![(device.clone(), None)]);
@@ -1177,9 +1177,9 @@ mod tests {
 
     /// A camera's settings are listed with their values, and one set reads back.
     #[test]
-    #[ignore = "uses a camera: HASTECLIP_WEBCAM=<device> cargo test -p capture camera_settings -- --ignored"]
+    #[ignore = "uses a camera: HESTECLIPS_WEBCAM=<device> cargo test -p capture camera_settings -- --ignored"]
     fn camera_settings() {
-        let device = std::env::var("HASTECLIP_WEBCAM").unwrap();
+        let device = std::env::var("HESTECLIPS_WEBCAM").unwrap();
         let all = controls(&device);
         for c in &all {
             eprintln!("{:>10x} {:32} {:?} = {} (default {}){}", c.id, c.name, c.kind, c.value, c.default, if c.inactive { " inactive" } else { "" });
@@ -1255,9 +1255,9 @@ mod tests {
     /// against reading the camera through an ffmpeg process as before.
     /// Pictures are only compared in memory, never kept.
     #[test]
-    #[ignore = "uses a camera nothing else has open: HASTECLIP_WEBCAM=<device> cargo test --release -p capture streams_directly -- --ignored --nocapture"]
+    #[ignore = "uses a camera nothing else has open: HESTECLIPS_WEBCAM=<device> cargo test --release -p capture streams_directly -- --ignored --nocapture"]
     fn streams_directly() {
-        let device = std::env::var("HASTECLIP_WEBCAM").unwrap();
+        let device = std::env::var("HESTECLIPS_WEBCAM").unwrap();
         let path = std::fs::canonicalize(&device).unwrap();
         let offered = formats_of(&path).unwrap();
         let (format, pixel) = offered.iter().filter(|(_, p)| *p == "mjpeg").max_by_key(|(f, _)| f.auto_rank()).copied().expect("an MJPEG format");

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Builds the macOS release into Releases/: HasteClip-mac-arm64.dmg, holding
-# HasteClip.app with ffmpeg inside, so there's nothing else to install. Drag
+# Builds the macOS release into Releases/: HesteClips-mac-arm64.dmg, holding
+# HesteClips.app with ffmpeg inside, so there's nothing else to install. Drag
 # it to Applications and open it.
 #
-# Signed with HasteClip's own certificate, not an Apple Developer ID (there
+# Signed with HesteClips' own certificate, not an Apple Developer ID (there
 # isn't one), so the first launch has to be allowed in System Settings →
 # Privacy & Security (see the README).
 #
@@ -21,9 +21,9 @@ ffmpeg_url="https://ffmpeg.martin-riedl.de/download/macos/arm64/1789931890_9.0.2
 ffmpeg_sha256="c8ed4c4e6978a03c485edbfe4e0a5dc2380f8a30bba5150531b31b094492d924"
 ffprobe_sha256="fcbe839537485eaee7a7a8bc5cbc0f90d53617e80943e8a5b2e31cb851197ea6"
 
-name="HasteClip-mac-arm64"
+name="HesteClips-mac-arm64"
 work="target/release-package"
-app="$work/dmg/HasteClip.app"
+app="$work/dmg/HesteClips.app"
 out="Releases"
 rm -rf "$work/dmg" "$out"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources" "$out"
@@ -38,13 +38,13 @@ restore() {
 }
 trap restore EXIT
 sed -i.bak -E "s/^version = \"[^\"]*\"/version = \"$version\"/" Cargo.toml && rm Cargo.toml.bak
-MACOSX_DEPLOYMENT_TARGET=13.0 cargo build --release -p hasteclip --target aarch64-apple-darwin
+MACOSX_DEPLOYMENT_TARGET=13.0 cargo build --release -p hesteclips --target aarch64-apple-darwin
 restore
 trap - EXIT
 
-cp target/aarch64-apple-darwin/release/hasteclip "$app/Contents/MacOS/"
-strip -x "$app/Contents/MacOS/hasteclip"
-cp crates/app/assets/hasteclip.icns "$app/Contents/Resources/"
+cp target/aarch64-apple-darwin/release/hesteclips "$app/Contents/MacOS/"
+strip -x "$app/Contents/MacOS/hesteclips"
+cp crates/app/assets/hesteclips.icns "$app/Contents/Resources/"
 
 # Next to the app's binary, where media::tool looks first.
 fetch() { # name sha256
@@ -66,24 +66,24 @@ cat > "$app/Contents/Info.plist" <<PLIST
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>CFBundleName</key><string>HasteClip</string>
-    <key>CFBundleDisplayName</key><string>HasteClip</string>
-    <key>CFBundleIdentifier</key><string>io.github.kaillr.HasteClip</string>
-    <key>CFBundleExecutable</key><string>hasteclip</string>
-    <key>CFBundleIconFile</key><string>hasteclip</string>
+    <key>CFBundleName</key><string>HesteClips</string>
+    <key>CFBundleDisplayName</key><string>HesteClips</string>
+    <key>CFBundleIdentifier</key><string>io.github.kaillr.HesteClips</string>
+    <key>CFBundleExecutable</key><string>hesteclips</string>
+    <key>CFBundleIconFile</key><string>hesteclips</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>$version</string>
     <key>CFBundleVersion</key><string>$version</string>
     <key>LSMinimumSystemVersion</key><string>13.0</string>
     <key>LSApplicationCategoryType</key><string>public.app-category.video</string>
     <key>NSHighResolutionCapable</key><true/>
-    <key>NSMicrophoneUsageDescription</key><string>HasteClip records your microphone into your clips when you add it as a source.</string>
-    <key>NSCameraUsageDescription</key><string>HasteClip puts your webcam into your clips when you turn it on.</string>
+    <key>NSMicrophoneUsageDescription</key><string>HesteClips records your microphone into your clips when you add it as a source.</string>
+    <key>NSCameraUsageDescription</key><string>HesteClips puts your webcam into your clips when you turn it on.</string>
 </dict>
 </plist>
 PLIST
 
-# Signed with HasteClip's own certificate (MAC_SIGNING_P12, base64, and
+# Signed with HesteClips' own certificate (MAC_SIGNING_P12, base64, and
 # MAC_SIGNING_PASSWORD), the same for every release: macOS ties what it's
 # allowed (Screen Recording, Input Monitoring) to the app's identifier and
 # that certificate, so a new version keeps them. Ad hoc, each build is only
@@ -112,11 +112,11 @@ if [ -n "${MAC_SIGNING_P12:-}" ]; then
     security list-keychains -d user -s "$keychain" ${searched[@]+"${searched[@]}"}
     trap 'security list-keychains -d user -s ${searched[@]+"${searched[@]}"}; security delete-keychain "$keychain" 2>/dev/null || true' EXIT
     # Not trusted (it isn't Apple's), so it's found by its hash.
-    sign="$(security find-identity -p codesigning "$keychain" | awk '/"HasteClip"/ {print $2; exit}')"
+    sign="$(security find-identity -p codesigning "$keychain" | awk '/"HesteClips"/ {print $2; exit}')"
     [ -n "$sign" ] || { echo "the signing certificate wasn't found" >&2; exit 1; }
     echo "signing: with $sign"
 fi
-codesign --force --sign "$sign" ${keychain:+--keychain "$keychain"} "$app/Contents/MacOS/hasteclip"
+codesign --force --sign "$sign" ${keychain:+--keychain "$keychain"} "$app/Contents/MacOS/hesteclips"
 codesign --force --sign "$sign" ${keychain:+--keychain "$keychain"} "$app"
 codesign --verify --strict "$app"
 codesign -dr - "$app" 2>&1 | grep designated
@@ -127,5 +127,5 @@ ditto -c -k --keepParent "$app" "$out/$name.zip"
 (cd "$out" && shasum -a 256 "$name.zip" > "$name.zip.sha256")
 
 ln -s /Applications "$work/dmg/Applications"
-hdiutil create -volname HasteClip -srcfolder "$work/dmg" -fs HFS+ -format UDZO -ov "$out/$name.dmg" >/dev/null
+hdiutil create -volname HesteClips -srcfolder "$work/dmg" -fs HFS+ -format UDZO -ov "$out/$name.dmg" >/dev/null
 echo "built $out/$name.dmg and $out/$name.zip"

@@ -60,10 +60,10 @@ impl Video {
     fn set_skips(&self, _: Vec<(u64, u64)>) { match *self {} }
 }
 
-/// `HASTECLIP_DEBUG_VIDEO=1`: log what playback does, with times.
+/// `HESTECLIPS_DEBUG_VIDEO=1`: log what playback does, with times.
 pub fn debug() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("HASTECLIP_DEBUG_VIDEO").is_some())
+    *ON.get_or_init(|| std::env::var_os("HESTECLIPS_DEBUG_VIDEO").is_some())
 }
 
 macro_rules! trace {
@@ -549,10 +549,10 @@ impl Player {
 
         let video = open_video(ctx, source, info.fps);
         let proxy = video.is_none().then(|| Proxy::build(ctx, source, info.fps, total_frames(&info)));
-        // `HASTECLIP_SCRUB_ENGINE=0`: scrub through the playback decoder
+        // `HESTECLIPS_SCRUB_ENGINE=0`: scrub through the playback decoder
         // instead, to compare (as it does where the engine can't start).
         #[cfg(hw_decode)]
-        let scrub_opening = video.as_ref().filter(|_| scrubs && std::env::var_os("HASTECLIP_SCRUB_ENGINE").is_none_or(|v| v != "0")).map(|_| open_engine(ctx, source, &info));
+        let scrub_opening = video.as_ref().filter(|_| scrubs && std::env::var_os("HESTECLIPS_SCRUB_ENGINE").is_none_or(|v| v != "0")).map(|_| open_engine(ctx, source, &info));
         #[cfg(not(hw_decode))]
         let _ = scrubs;
         Self {
@@ -788,11 +788,11 @@ impl Player {
         self.gpu_frames = Default::default();
         #[cfg(windows)]
         self.engine_pools.clear();
-        // Dev aid: `HASTECLIP_DEV_DROP_PICTURE=1` lets go of the picture on
+        // Dev aid: `HESTECLIPS_DEV_DROP_PICTURE=1` lets go of the picture on
         // screen too (what draws it holds its texture; it comes back from the
         // playback decoder as the window does), to see whether that's what
         // keeps a clip's memory held.
-        if dev_flag("HASTECLIP_DEV_DROP_PICTURE") && matches!(self.display, Some(Display::Gpu(..))) {
+        if dev_flag("HESTECLIPS_DEV_DROP_PICTURE") && matches!(self.display, Some(Display::Gpu(..))) {
             self.display = None;
             self.shown_frame = None;
             self.screen_index = None;
@@ -1217,8 +1217,8 @@ impl Player {
     /// The picture's colours, blurred very wide, over `cover` (clipped to
     /// `painter`): the light the stage around it takes. `id`: which stage.
     pub fn paint_glow(&self, painter: &egui::Painter, cover: egui::Rect, id: egui::Id) -> bool {
-        // Dev aid: `HASTECLIP_DEV_NO_GLOW=1` draws no light, to measure its cost.
-        if dev_flag("HASTECLIP_DEV_NO_GLOW") {
+        // Dev aid: `HESTECLIPS_DEV_NO_GLOW=1` draws no light, to measure its cost.
+        if dev_flag("HESTECLIPS_DEV_NO_GLOW") {
             return false;
         }
         match &self.display {
@@ -1507,7 +1507,7 @@ impl Player {
         let wanted = p.index;
         #[cfg(target_os = "linux")]
         let got = {
-            if self.uploader.is_none() && !dev_flag("HASTECLIP_DEV_NO_UPLOADER") {
+            if self.uploader.is_none() && !dev_flag("HESTECLIPS_DEV_NO_UPLOADER") {
                 self.uploader = self.scrub.as_ref().and_then(|e| crate::scrub::Uploader::new(e, p.width, p.height));
             }
             let near = (speed.abs() * self.redraw_secs / 2.0).floor() as u64;
@@ -1612,9 +1612,9 @@ impl Player {
     #[cfg_attr(not(windows), allow(dead_code))]
     fn put_picture(&mut self, ctx: &egui::Context, p: Picture) {
         let idx = p.index;
-        // Dev aid: `HASTECLIP_DEV_NO_UPLOAD=1` keeps the picture on screen
+        // Dev aid: `HESTECLIPS_DEV_NO_UPLOAD=1` keeps the picture on screen
         // as it is, to measure what showing a new one costs.
-        if dev_flag("HASTECLIP_DEV_NO_UPLOAD") {
+        if dev_flag("HESTECLIPS_DEV_NO_UPLOAD") {
             let _ = ctx;
             self.shown_frame = Some(idx);
             self.screen_index = Some(idx);
@@ -1768,11 +1768,11 @@ fn open_engine(ctx: &egui::Context, source: &Path, info: &ClipInfo) -> Receiver<
     rx
 }
 
-/// The in-process decoder for `source` (unless `HASTECLIP_NO_HW_DECODE` is
+/// The in-process decoder for `source` (unless `HESTECLIPS_NO_HW_DECODE` is
 /// set, to compare with the ffmpeg path).
 fn open_video(ctx: &egui::Context, source: &Path, fps: f64) -> Option<Video> {
     #[cfg(hw_decode)]
-    if std::env::var_os("HASTECLIP_NO_HW_DECODE").is_none() {
+    if std::env::var_os("HESTECLIPS_NO_HW_DECODE").is_none() {
         return Some(Video::open(ctx, source, fps));
     }
     let _ = (ctx, source, fps);
@@ -2183,7 +2183,7 @@ fn start_audio(shared: Arc<Shared>) -> Result<cpal::Stream, String> {
         }
     };
     let muted = dev_muted();
-    // Recorded like any other app's sound (desktop capture leaves HasteClip
+    // Recorded like any other app's sound (desktop capture leaves HesteClips
     // out, see `capture::sources::own_sound`).
     let mut recorded = capture::sources::own_sound::Playing::at(out_rate as u32);
     let stream = device
@@ -2226,11 +2226,11 @@ fn dev_flag(name: &'static str) -> bool {
     }
 }
 
-/// Dev aid: `HASTECLIP_MUTE=1` plays everything silently, with the same
+/// Dev aid: `HESTECLIPS_MUTE=1` plays everything silently, with the same
 /// timing (test instances that play and scrub clips).
 pub(crate) fn dev_muted() -> bool {
     static MUTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *MUTED.get_or_init(|| std::env::var_os("HASTECLIP_MUTE").is_some())
+    *MUTED.get_or_init(|| std::env::var_os("HESTECLIPS_MUTE").is_some())
 }
 
 /// Only the sound of a short clip, through the same engine as the editor's

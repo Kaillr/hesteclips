@@ -1,8 +1,8 @@
-# Working on HasteClip
+# Working on HesteClips
 
 ## Platforms
 
-HasteClip is made for Windows, macOS and Linux, and every feature is meant for
+HesteClips is made for Windows, macOS and Linux, and every feature is meant for
 all three. Whichever machine you're working on, the other two count as much.
 
 - **Plan all three before you start.** Say how the feature works on each: what
@@ -47,5 +47,5 @@ rather than inventing a new kind of input. In short:
 - Free text (a name, a search) is the only place letters are typed.
 
 `clippy.toml` turns away egui's own `DragValue`, `Slider` and bare `TextEdit`
-in the app. Run `cargo clippy -p hasteclip` after UI changes; a box that really
+in the app. Run `cargo clippy -p hesteclips` after UI changes; a box that really
 is for free text says so with `#[allow(clippy::disallowed_methods)]` and why.

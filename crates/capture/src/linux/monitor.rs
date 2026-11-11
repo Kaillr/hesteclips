@@ -73,8 +73,8 @@ fn run(device: &str, channel: Arc<Channel>, latency_us: Arc<AtomicU32>, ready: &
             *pw::keys::MEDIA_TYPE => "Audio",
             *pw::keys::MEDIA_CATEGORY => category,
             *pw::keys::MEDIA_ROLE => "Production",
-            *pw::keys::APP_NAME => "HasteClip",
-            *pw::keys::NODE_DESCRIPTION => "HasteClip: Listen",
+            *pw::keys::APP_NAME => "HesteClips",
+            *pw::keys::NODE_DESCRIPTION => "HesteClips: Listen",
             *pw::keys::NODE_LATENCY => format!("{QUANTUM}/{RATE}"),
         }
     };
@@ -82,7 +82,7 @@ fn run(device: &str, channel: Arc<Channel>, latency_us: Arc<AtomicU32>, ready: &
     // The mic, as it's recorded: Mono and noise removal (a frame, 10 ms, later).
     let mut input_props = props("Capture");
     input_props.insert("target.object", device);
-    let input = pw::stream::StreamRc::new(core.clone(), "hasteclip-listen-in", input_props)?;
+    let input = pw::stream::StreamRc::new(core.clone(), "hesteclips-listen-in", input_props)?;
     let mut sides = crate::mixer::Mono::new(channel.mono_flag());
     let mut denoise = crate::mixer::Denoise::new(channel.denoise_mode());
     let mut frames = Vec::new();
@@ -109,7 +109,7 @@ fn run(device: &str, channel: Arc<Channel>, latency_us: Arc<AtomicU32>, ready: &
         .register()?;
 
     // To the default output, at the source's volume.
-    let output = pw::stream::StreamRc::new(core.clone(), "hasteclip-listen-out", props("Playback"))?;
+    let output = pw::stream::StreamRc::new(core.clone(), "hesteclips-listen-out", props("Playback"))?;
     let mut last = 0.0f32;
     let mut smooth = 0.0f32;
     let q = queue.clone();

@@ -141,7 +141,7 @@ pub struct Channel {
     /// Before volume and mute: what the source delivers (shows a muted mic is live).
     pub input: Meter,
     /// Gets the source's sound as it arrives (before volume and mute), mono at
-    /// [`RATE`], when set: for listening to the microphone ("HasteClip
+    /// [`RATE`], when set: for listening to the microphone ("HesteClips
     /// that").
     tap: Mutex<Option<std::sync::mpsc::Sender<Vec<f32>>>>,
     /// Noise removal on its sound (a microphone's), a [`NoiseReduction`]:

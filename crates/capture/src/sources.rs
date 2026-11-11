@@ -38,7 +38,7 @@ pub enum SourceKind {
     Desktop { exclude_app_sources: bool, leave_out: Vec<String> },
     /// What one output device plays, mixed, as you hear it (where
     /// [`crate::OUTPUT_SOURCES`]): by device name (on Linux its node name), or
-    /// [`crate::audio::DEFAULT_DEVICE`] to follow the default one. HasteClip's
+    /// [`crate::audio::DEFAULT_DEVICE`] to follow the default one. HesteClips'
     /// own sounds on it are in it too, as played (none are added to it).
     Output { device: String },
     /// One application (and its helper processes), by bundle id on macOS,
@@ -67,7 +67,7 @@ pub struct AudioSource {
 
 /// Tag stored on recordings listing which audio streams are part of the mix
 /// (comma-separated stream indices), so the editor can rebuild track 1 exactly.
-pub const MIX_TAG_PREFIX: &str = "hasteclip:mix=";
+pub const MIX_TAG_PREFIX: &str = "hesteclips:mix=";
 
 /// Name of the track holding sources that are in the clip without a track of
 /// their own.
@@ -613,7 +613,7 @@ impl AudioCapture {
         Ok(capture)
     }
 
-    /// HasteClip' own sound into the sources that take it: its app source
+    /// HesteClips' own sound into the sources that take it: its app source
     /// if it has one, else the desktop (unless the desktop leaves out apps
     /// with their own source).
     fn route_own_sound(&self) {
@@ -622,7 +622,7 @@ impl AudioCapture {
         for (source, feed) in &self.captured {
             let takes = match source.kind {
                 SourceKind::Desktop { exclude_app_sources, .. } => !(own_source && exclude_app_sources),
-                // Its device plays HasteClip's sound already.
+                // Its device plays HesteClips' sound already.
                 SourceKind::Output { .. } => false,
                 ref kind => is_own_app(kind, own.as_deref()),
             };
@@ -916,13 +916,13 @@ pub(crate) fn quiet_xruns(name: String) -> impl FnMut(cpal::Error) + Send + 'sta
     }
 }
 
-/// HasteClip' own sounds (the clip-saved cue) in desktop audio.
+/// HesteClips' own sounds (the clip-saved cue) in desktop audio.
 ///
-/// Desktop capture leaves out everything HasteClip plays, so a mic you
+/// Desktop capture leaves out everything HesteClips plays, so a mic you
 /// "Listen" to never ends up in a clip twice. What it plays for you (clips,
 /// scrubbing, the clip sound) is added here instead, as it plays, so it's in
 /// the recording like any other app's: in the desktop source, or in a
-/// HasteClip app source when there's one (and the desktop leaves apps with
+/// HesteClips app source when there's one (and the desktop leaves apps with
 /// their own source out).
 pub mod own_sound {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -930,14 +930,14 @@ pub mod own_sound {
 
     use crate::mixer::{RATE, SourceFeed};
 
-    /// The sources HasteClip' sound goes into; bumped generation on change.
+    /// The sources HesteClips' sound goes into; bumped generation on change.
     fn listeners() -> &'static Mutex<Vec<Weak<SourceFeed>>> {
         static LISTENERS: Mutex<Vec<Weak<SourceFeed>>> = Mutex::new(Vec::new());
         &LISTENERS
     }
     static GENERATION: AtomicU64 = AtomicU64::new(0);
 
-    /// `feed` takes HasteClip' sound (once, however often it's said).
+    /// `feed` takes HesteClips' sound (once, however often it's said).
     pub(crate) fn listen(feed: &Arc<SourceFeed>) {
         let mut d = listeners().lock().unwrap();
         d.retain(|w| w.strong_count() > 0);
@@ -947,7 +947,7 @@ pub mod own_sound {
         }
     }
 
-    /// `feed` doesn't take HasteClip' sound (any more).
+    /// `feed` doesn't take HesteClips' sound (any more).
     pub(crate) fn forget(feed: &Arc<SourceFeed>) {
         let mut d = listeners().lock().unwrap();
         let had = d.len();
@@ -958,7 +958,7 @@ pub mod own_sound {
     }
 
     /// One sound being played: what it pushes goes into every source taking
-    /// HasteClip' sound, including ones that start while it plays (the
+    /// HesteClips' sound, including ones that start while it plays (the
     /// player stays open across recordings).
     pub struct Playing {
         rate: u32,
@@ -979,7 +979,7 @@ pub mod own_sound {
             playing
         }
 
-        /// Into the sources taking HasteClip' sound right now.
+        /// Into the sources taking HesteClips' sound right now.
         fn follow(&mut self) {
             let generation = GENERATION.load(Ordering::Relaxed);
             if generation == self.generation {
@@ -1115,7 +1115,7 @@ pub mod video_sound {
     }
 }
 
-/// HasteClip' own id as an app source ([`SourceKind::App`]): its executable
+/// HesteClips' own id as an app source ([`SourceKind::App`]): its executable
 /// on Windows, its bundle id on macOS. None on Linux, where it isn't listed.
 pub fn own_app_id() -> Option<String> {
     #[cfg(target_os = "windows")]
@@ -1132,7 +1132,7 @@ pub fn own_app_id() -> Option<String> {
     }
 }
 
-/// `kind` is HasteClip itself, added as an app.
+/// `kind` is HesteClips itself, added as an app.
 pub(crate) fn is_own_app(kind: &SourceKind, own: Option<&str>) -> bool {
     matches!((kind, own), (SourceKind::App { bundle_id }, Some(own)) if bundle_id.eq_ignore_ascii_case(own))
 }
@@ -1235,7 +1235,7 @@ mod tests {
     fn layout_puts_mix_first_and_tags_members() {
         let (titles, tag, rest) = track_layout(&[src("Mic", true, true), src("Discord", false, true)]);
         assert_eq!(titles, ["Mix", "Mic", "Discord"]);
-        assert_eq!(tag, "hasteclip:mix=1");
+        assert_eq!(tag, "hesteclips:mix=1");
         assert!(!rest);
     }
 
@@ -1243,7 +1243,7 @@ mod tests {
     fn mix_only_sources_get_a_shared_track() {
         let (titles, tag, rest) = track_layout(&[src("Mic", true, true), src("Music", true, false), src("Game", true, false)]);
         assert_eq!(titles, ["Mix", "Mic", REST_TRACK]);
-        assert_eq!(tag, "hasteclip:mix=1,2");
+        assert_eq!(tag, "hesteclips:mix=1,2");
         assert!(rest);
         // No own tracks at all: the mix is the only track.
         assert_eq!(track_layout(&[src("Music", true, false)]).0, ["Mix"]);
@@ -1356,7 +1356,7 @@ mod tests {
         assert!(list[0].watch.new && list[0].watch.retry.is_none(), "the one taken out's open was taken for it: {:?}", list[0].watch);
     }
 
-    /// HasteClip' sound goes into a source that takes it once, however often
+    /// HesteClips' sound goes into a source that takes it once, however often
     /// that's said (the sources are routed again whenever one is added or
     /// taken out while capturing), and none goes in once it's forgotten.
     #[test]
@@ -1591,12 +1591,12 @@ mod tests {
         // A player open before the capture starts (at 44.1 kHz, 4 channels).
         let mut playing = own_sound::Playing::at(44_100);
         let live = LiveAudio::new();
-        let own = own_app_id().expect("HasteClip' own app id");
+        let own = own_app_id().expect("HesteClips' own app id");
         let desktop = AudioSource { kind: SourceKind::Desktop { exclude_app_sources: true, leave_out: Vec::new() }, ..src("Desktop", true, true) };
-        let app = AudioSource { kind: SourceKind::App { bundle_id: own }, ..src("HasteClip", true, true) };
+        let app = AudioSource { kind: SourceKind::App { bundle_id: own }, ..src("HesteClips", true, true) };
         let _monitor = LevelMonitor::start(&[desktop, app], live.clone()).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(500));
-        let (desktop, app) = (live.channel("Desktop"), live.channel("HasteClip"));
+        let (desktop, app) = (live.channel("Desktop"), live.channel("HesteClips"));
         let _ = (desktop.input.take(), app.input.take());
         let block: Vec<f32> = (0..441).flat_map(|i| [0.8 * (i as f32 * 0.1).sin(); 4]).collect();
         for _ in 0..50 {

@@ -80,7 +80,7 @@ impl App {
         match place {
             Place::Clips(f) => {
                 let mut kept = f.clone();
-                kept.retain(&self.clips, &self.collections, &self.links);
+                kept.retain(&self.clips, &self.collections);
                 kept == *f
             }
             Place::View(p) => self.clips.iter().any(|c| &c.path == p),

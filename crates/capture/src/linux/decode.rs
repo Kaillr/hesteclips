@@ -223,11 +223,11 @@ impl Card {
     /// it's an NVIDIA card whose memory CUDA can share, else where VA-API
     /// decodes on it and Vulkan takes in its frames; either way, where a
     /// clip decoded on it comes out as on the CPU ([`Self::check`]).
-    /// `HASTECLIP_DECODE=nvidia` (or `vaapi`) tries only that way.
+    /// `HESTECLIPS_DECODE=nvidia` (or `vaapi`) tries only that way.
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<Arc<Self>> {
         load()?;
         type Open = fn(&wgpu::Device, &wgpu::Queue) -> Result<Arc<Card>>;
-        let only = std::env::var("HASTECLIP_DECODE").unwrap_or_default();
+        let only = std::env::var("HESTECLIPS_DECODE").unwrap_or_default();
         let mut why = Vec::new();
         for (key, name, open) in [("nvidia", "NVIDIA's", Self::nvidia as Open), ("vaapi", "VA-API", Self::vaapi)] {
             if !only.is_empty() && only != key {
@@ -245,7 +245,7 @@ impl Card {
             }
         }
         if why.is_empty() {
-            bail!("HASTECLIP_DECODE={only} isn't a way (nvidia, vaapi)");
+            bail!("HESTECLIPS_DECODE={only} isn't a way (nvidia, vaapi)");
         }
         bail!("{}", why.join("; "))
     }
@@ -265,7 +265,7 @@ impl Card {
     fn vaapi(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<Arc<Self>> {
         let importer = Arc::new(Importer::new(device, queue)?);
         let va = VaDevice::on(&super::dmabuf::render_node(device)?)?;
-        if nvidia_va(&va) && std::env::var("HASTECLIP_DECODE").as_deref() != Ok("vaapi") {
+        if nvidia_va(&va) && std::env::var("HESTECLIPS_DECODE").as_deref() != Ok("vaapi") {
             bail!("NVIDIA's VA-API driver hands frames over before they're finished ({})", va.vendor);
         }
         Ok(Arc::new(Self { device: device.clone(), queue: queue.clone(), way: Way::Vaapi(va, importer), shrink: OnceLock::new() }))
@@ -282,7 +282,7 @@ impl Card {
         const FRAMES: usize = 12;
         // In memory, opened by its path (`/proc/self/fd/…`).
         // SAFETY: a name; the fd is ours.
-        let fd = unsafe { libc::memfd_create(c"hasteclip-check".as_ptr(), libc::MFD_CLOEXEC) };
+        let fd = unsafe { libc::memfd_create(c"hesteclips-check".as_ptr(), libc::MFD_CLOEXEC) };
         ensure!(fd >= 0, "no memory file for the check: {}", std::io::Error::last_os_error());
         // SAFETY: a new fd, ours.
         let mut file = File::from(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
@@ -658,7 +658,7 @@ fn nvidia_va(va: &VaDevice) -> bool {
 }
 
 /// How long NVIDIA's VA-API driver gets to finish a frame it said was
-/// finished, decoding that way to try it (`HASTECLIP_DECODE=vaapi`): 1 ms
+/// finished, decoding that way to try it (`HESTECLIPS_DECODE=vaapi`): 1 ms
 /// was always enough on an RTX 4060 Ti, none wasn't.
 const NVIDIA_VA_SETTLE: std::time::Duration = std::time::Duration::from_millis(2);
 
@@ -1477,7 +1477,7 @@ mod tests {
     /// asked for: reading on, jumps back and ahead, the last. A clip with
     /// B-frames, its height not a whole number of macroblocks.
     #[test]
-    #[ignore = "needs a card that decodes: cargo test -p capture card_frames -- --ignored (HASTECLIP_DECODE=vaapi for VA-API)"]
+    #[ignore = "needs a card that decodes: cargo test -p capture card_frames -- --ignored (HESTECLIPS_DECODE=vaapi for VA-API)"]
     fn card_frames_match_the_cpus() {
         if let Err(e) = load() {
             eprintln!("skipped: {e:#}");
@@ -1529,7 +1529,7 @@ mod tests {
     /// filmstrip's) are the CPU's ([`Decoder::open_rgba`]), within a level
     /// (the card's arithmetic may round a hair differently).
     #[test]
-    #[ignore = "needs a card that decodes: cargo test -p capture small_card -- --ignored (HASTECLIP_DECODE=vaapi for VA-API)"]
+    #[ignore = "needs a card that decodes: cargo test -p capture small_card -- --ignored (HESTECLIPS_DECODE=vaapi for VA-API)"]
     fn small_card_pictures_match_the_cpus() {
         if let Err(e) = load() {
             eprintln!("skipped: {e:#}");
@@ -1573,7 +1573,7 @@ mod tests {
     }
 
     /// A whole clip decoded on the card is the CPU's, frame by frame (to try
-    /// a card and driver: HASTECLIP_DECODE=vaapi, say). HC_CLIP: the clip;
+    /// a card and driver: HESTECLIPS_DECODE=vaapi, say). HC_CLIP: the clip;
     /// HC_FRAMES: how many frames (600).
     #[test]
     #[ignore = "needs a card that decodes and a clip: HC_CLIP=<mp4> cargo test --release -p capture card_through_a_clip -- --ignored --nocapture"]
@@ -1660,12 +1660,12 @@ mod tests {
     }
 
     /// A real recording decodes as ffmpeg decodes it, at a few places, read
-    /// on and jumped to: `HASTECLIP_TEST_CLIP=<mp4> cargo test -p capture
+    /// on and jumped to: `HESTECLIPS_TEST_CLIP=<mp4> cargo test -p capture
     /// real_clip -- --ignored --nocapture`.
     #[test]
     #[ignore = "needs a recording"]
     fn real_clip_matches_ffmpeg() {
-        let clip = std::path::PathBuf::from(std::env::var("HASTECLIP_TEST_CLIP").expect("HASTECLIP_TEST_CLIP"));
+        let clip = std::path::PathBuf::from(std::env::var("HESTECLIPS_TEST_CLIP").expect("HESTECLIPS_TEST_CLIP"));
         let mut dec = Decoder::open(&clip, Output::Screen).unwrap();
         let fps = dec.fps;
         let ffmpeg_at = |i: u64| -> Vec<u8> {

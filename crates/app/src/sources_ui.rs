@@ -113,7 +113,7 @@ pub(crate) struct SourcesView {
     pub(crate) editing: Option<crate::inspector_ui::Editing>,
 }
 
-/// Dev aid: `HASTECLIP_OPEN_SOURCES` names whose settings are open
+/// Dev aid: `HESTECLIPS_OPEN_SOURCES` names whose settings are open
 /// (`screen`, `webcam`: the first one, `page`: the first web page, `mix`,
 /// `video`) or the crop's page (`crop`).
 pub(crate) fn open_dev(app: &mut App, names: &str) {
@@ -1337,7 +1337,7 @@ impl App {
                     }
                 }
                 SourceKind::Output { .. } => {
-                    let note = "HasteClip's own sounds on it are recorded too: the clip-saved sound, a clip you play, a microphone you listen to";
+                    let note = "HesteClips' own sounds on it are recorded too: the clip-saved sound, a clip you play, a microphone you listen to";
                     let (a, _) = l.row(Row::new("Device").note(note), |ui| match &mut self.settings.audio_sources[i].kind {
                         SourceKind::Output { device } => device_picker(ui, device, &audio.outputs, audio.default_output.as_deref(), picker_locked.is_some()),
                         _ => None,
@@ -2091,7 +2091,7 @@ impl App {
             ui.set_min_height(GROUP_ROW_H);
             ui.spacing_mut().item_spacing.x = 6.0;
             ui.label(theme::text("Show “Tabbed out” when you leave it", 13.5, W::Regular).color(pal.text));
-            crate::ui_kit::info(ui, "Tabbed out", "When the game you were in stops showing (most games minimize when you alt-tab), or none of yours is open, clips show the HasteClip logo with “Tabbed out”. Off: they keep the game's last picture, or show black when none is open. A window that's still on screen keeps being recorded either way.");
+            crate::ui_kit::info(ui, "Tabbed out", "When the game you were in stops showing (most games minimize when you alt-tab), or none of yours is open, clips show the HesteClips logo with “Tabbed out”. Off: they keep the game's last picture, or show black when none is open. A window that's still on screen keeps being recorded either way.");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 crate::ui_kit::switch(ui, &mut away);
             });
@@ -2101,7 +2101,7 @@ impl App {
             ui.set_min_height(GROUP_ROW_H);
             ui.spacing_mut().item_spacing.x = 6.0;
             ui.label(theme::text("Record the whole time a game is open", 13.5, W::Regular).color(pal.text));
-            crate::ui_kit::info(ui, "Whole sessions", "When a game or app on this list opens, HasteClip records until it closes, then saves the recording. Clipping waits meanwhile, and starts again after. While it records, Save clip and “HasteClip that” mark the moment in the recording. Stop the recording yourself and it waits until the game opens again.");
+            crate::ui_kit::info(ui, "Whole sessions", "When a game or app on this list opens, HesteClips records until it closes, then saves the recording. Clipping waits meanwhile, and starts again after. While it records, Save clip and “HesteClips that” mark the moment in the recording. Stop the recording yourself and it waits until the game opens again.");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 crate::ui_kit::switch(ui, &mut self.settings.record_sessions);
             });

@@ -1,10 +1,10 @@
 //! The installed app's log. A release build on Windows has no console, and on
 //! Linux an app started from the app menu has nowhere to print, so what it
 //! prints (errors, what audio sources are doing, panics) would go nowhere: it
-//! goes to `%LOCALAPPDATA%\hasteclip\logs\hasteclip.log` on Windows,
-//! `~/.local/share/hasteclip/logs/hasteclip.log` on Linux, for someone to
-//! send when something doesn't work. Each HasteClip that runs starts it
-//! afresh; the one before is kept as `hasteclip.previous.log`. (A launch that
+//! goes to `%LOCALAPPDATA%\hesteclips\logs\hesteclips.log` on Windows,
+//! `~/.local/share/hesteclips/logs/hesteclips.log` on Linux, for someone to
+//! send when something doesn't work. Each HesteClips that runs starts it
+//! afresh; the one before is kept as `hesteclips.previous.log`. (A launch that
 //! only shows the one running leaves its log alone: see `main`.)
 
 #![cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
@@ -13,18 +13,18 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 pub fn dir() -> Option<PathBuf> {
-    dirs::data_local_dir().map(|d| d.join("hasteclip").join("logs"))
+    dirs::data_local_dir().map(|d| d.join("hesteclips").join("logs"))
 }
 
-/// The file this HasteClip logs to, once it does (a release build; a
-/// development build with `HASTECLIP_LOG`).
+/// The file this HesteClips logs to, once it does (a release build; a
+/// development build with `HESTECLIPS_LOG`).
 static CURRENT: OnceLock<PathBuf> = OnceLock::new();
 
 pub fn current() -> Option<&'static Path> {
     CURRENT.get().map(PathBuf::as_path)
 }
 
-/// What HasteClip runs on, as the log's first line says it ("Windows 11
+/// What HesteClips runs on, as the log's first line says it ("Windows 11
 /// 24H2 (build 26100.4061)").
 pub fn system() -> String {
     #[cfg(windows)]
@@ -60,8 +60,8 @@ pub fn start() {
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
-    let path = dir.join("hasteclip.log");
-    let _ = std::fs::rename(&path, dir.join("hasteclip.previous.log"));
+    let path = dir.join("hesteclips.log");
+    let _ = std::fs::rename(&path, dir.join("hesteclips.previous.log"));
     let Ok(file) = std::fs::File::create(&path) else { return };
     // A release build has no console of its own, but one run from a
     // terminal (`cargo run --release`) is handed the terminal's.
@@ -80,7 +80,7 @@ pub fn start() {
     }
     let _ = CURRENT.set(path);
     eprintln!(
-        "HasteClip {} on {}, started {}",
+        "HesteClips {} on {}, started {}",
         env!("CARGO_PKG_VERSION"),
         windows_version(),
         chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
@@ -116,8 +116,8 @@ pub fn start() {
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
-    let path = dir.join("hasteclip.log");
-    let _ = std::fs::rename(&path, dir.join("hasteclip.previous.log"));
+    let path = dir.join("hesteclips.log");
+    let _ = std::fs::rename(&path, dir.join("hesteclips.previous.log"));
     let Ok(mut file) = std::fs::File::create(&path) else { return };
     // stderr becomes a pipe, read by a thread that writes each piece to the
     // file and to wherever stderr went before. Panics included, since they
@@ -156,7 +156,7 @@ pub fn start() {
     }
     let _ = CURRENT.set(path);
     eprintln!(
-        "HasteClip {} on {} ({}), started {}",
+        "HesteClips {} on {} ({}), started {}",
         env!("CARGO_PKG_VERSION"),
         linux_version(),
         linux_session(),
@@ -183,12 +183,12 @@ fn linux_session() -> String {
     format!("{desktop} on {session}")
 }
 
-/// `HASTECLIP_CURSOR_LOG=1`: log the cursor ten times a second when it
+/// `HESTECLIPS_CURSOR_LOG=1`: log the cursor ten times a second when it
 /// changes — shown or not, which image, which app has focus — to find out why
-/// it vanishes in some games while HasteClip runs.
+/// it vanishes in some games while HesteClips runs.
 #[cfg(windows)]
 pub fn log_cursor() {
-    if std::env::var_os("HASTECLIP_CURSOR_LOG").is_none() {
+    if std::env::var_os("HESTECLIPS_CURSOR_LOG").is_none() {
         return;
     }
     std::thread::spawn(|| {

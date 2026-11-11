@@ -53,7 +53,7 @@ pub fn centre_window_buttons(window: &impl raw_window_handle::HasWindowHandle) {
     // this runs on the main thread (checked above).
     let view: &NSView = unsafe { h.ns_view.cast::<NSView>().as_ref() };
     let Some(window) = view.window() else { return };
-    let toolbar = NSToolbar::initWithIdentifier(mtm.alloc(), &NSString::from_str("hasteclip"));
+    let toolbar = NSToolbar::initWithIdentifier(mtm.alloc(), &NSString::from_str("hesteclips"));
     window.setToolbar(Some(&toolbar));
     window.setToolbarStyle(NSWindowToolbarStyle::Unified);
     place_window_buttons(view);
@@ -320,8 +320,6 @@ pub enum ToastAction {
     Show(std::path::PathBuf),
     /// Put clips just moved to the Bin back.
     Undelete(crate::library::Binned),
-    /// Copy the clip's share link.
-    CopyLink(std::path::PathBuf),
     /// Undo the last change to the Sources page's sources (one removed).
     UndoSources,
 }
@@ -881,7 +879,6 @@ impl App {
                     self.open_viewer(clip);
                 }
                 ToastAction::Undelete(binned) => self.undelete(binned),
-                ToastAction::CopyLink(clip) => self.copy_link(&clip),
                 ToastAction::UndoSources => self.undo_arrangement(),
             }
         }

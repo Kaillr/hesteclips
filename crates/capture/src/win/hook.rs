@@ -77,9 +77,9 @@ pub(crate) fn plan(exe: &str, window: HWND, settings: &crate::GameHook) -> (Plan
     if !available() {
         return (Plan::Wgc, "the hook's files aren't there; a build of your own gets them with scripts/fetch-game-hook.ps1".into());
     }
-    // For testing: `HASTECLIP_FORCE_HOOK=<exe>[,…]` hooks those whatever they are.
-    if std::env::var("HASTECLIP_FORCE_HOOK").is_ok_and(|v| v.split(',').any(|e| e.eq_ignore_ascii_case(exe))) {
-        return (Plan::Hook, "forced (HASTECLIP_FORCE_HOOK)".into());
+    // For testing: `HESTECLIPS_FORCE_HOOK=<exe>[,…]` hooks those whatever they are.
+    if std::env::var("HESTECLIPS_FORCE_HOOK").is_ok_and(|v| v.split(',').any(|e| e.eq_ignore_ascii_case(exe))) {
+        return (Plan::Hook, "forced (HESTECLIPS_FORCE_HOOK)".into());
     }
     if !settings.auto {
         return (Plan::Wgc, "the hook is off".into());
@@ -526,7 +526,7 @@ fn run(dir: &Path, gpu: &Gpu, window: HWND, latest: &Arc<Latest>, fps: u32, stop
 /// The number of the picture the hook copies the game's into, once it has
 /// one: it goes up each time the hook starts over. Told by the hook's info,
 /// not its "ready" signal: only one capturer gets that, and with another one
-/// capturing the game too (OBS, or another HasteClip), this one waited for a
+/// capturing the game too (OBS, or another HesteClips), this one waited for a
 /// picture that never came, and the recording stayed frozen (issue #11).
 fn picture_number(info: *const HookInfo) -> Option<u32> {
     // Written by the hook, in the game's process, at any time.

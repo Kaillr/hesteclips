@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use crate::portal_shortcuts::APP_ID;
 
-const DESKTOP_FILE: &str = include_str!("../assets/io.github.kaillr.HasteClip.desktop");
+const DESKTOP_FILE: &str = include_str!("../assets/io.github.kaillr.HesteClips.desktop");
 /// The glyph without the macOS plate, as on Windows, at each size of the
 /// icon theme's (made by scripts/icons.sh). PNGs, not an SVG: KDE draws an
 /// SVG icon with Qt, which ignores paint-order (the glyph's keyline covered
@@ -38,7 +38,7 @@ pub fn integrate() {
     }
     let Some(home) = data_home() else { return };
     let Ok(exe) = std::env::current_exe() else { return };
-    let entry = DESKTOP_FILE.replace("Exec=hasteclip", &format!("Exec={}", quote_exec(&exe)));
+    let entry = DESKTOP_FILE.replace("Exec=hesteclips", &format!("Exec={}", quote_exec(&exe)));
     let desktop = home.join("applications").join(format!("{APP_ID}.desktop"));
     let mut wrote = write_if_changed(&desktop, entry.as_bytes());
     for (size, png) in ICONS {
@@ -49,7 +49,7 @@ pub fn integrate() {
     let old = home.join("icons/hicolor/scalable/apps").join(format!("{APP_ID}.svg"));
     wrote |= std::fs::remove_file(old).is_ok();
     if wrote {
-        eprintln!("added HasteClip to the desktop's apps ({})", desktop.display());
+        eprintln!("added HesteClips to the desktop's apps ({})", desktop.display());
     }
 }
 
@@ -91,8 +91,8 @@ mod tests {
 
     #[test]
     fn exec_paths_are_quoted_when_needed() {
-        assert_eq!(quote_exec(Path::new("/opt/hasteclip/hasteclip")), "/opt/hasteclip/hasteclip");
-        assert_eq!(quote_exec(Path::new("/home/a b/hasteclip")), "\"/home/a b/hasteclip\"");
+        assert_eq!(quote_exec(Path::new("/opt/Kaillr/hesteclips")), "/opt/Kaillr/hesteclips");
+        assert_eq!(quote_exec(Path::new("/home/a b/hesteclips")), "\"/home/a b/hesteclips\"");
         assert_eq!(quote_exec(Path::new("/x/$y")), "\"/x/\\\\$y\"");
     }
 }

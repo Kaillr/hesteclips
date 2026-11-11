@@ -1,20 +1,18 @@
-//! "HasteClip that": say it and a clip is saved, like pressing the save
-//! shortcut.
+//! "Hashtag HesteClip that": say it and a clip is saved, like pressing the
+//! save shortcut.
 //!
-//! A detector trained for this one phrase (`assets/wake`, 6.5 MB, built into
+//! A detector trained for this one phrase (`assets/wake`, 3 MB, built into
 //! the app) listens to the microphone on the Sources page, on this computer,
 //! only while the replay buffer runs and the setting is on. It knows nothing
 //! but the phrase, so talking doesn't save clips.
 //!
-//! General speech models don't know the made-up word "HasteClip", so this one
-//! learned the phrase's sound from ~35 000 synthetic takes (Piper and Kokoro
-//! voices, native and accented English, fast, slurred, deep, mid-sentence)
-//! heard through simulated mics and rooms, against ~35 000 near misses and
-//! ~390 h of speech in 8 languages, music and noise (tools/wake). On voices
-//! it never trained on, through harsh mics: 86 % of takes saved, 0.08 false
-//! saves an hour of everyday audio; none of 71 real snippets the old detector
-//! fired on. Only the whole phrase counts: "HasteClip", "clip that" and "hey,
-//! clip that" don't save clips; rhymes ("paste clip that") sometimes do.
+//! General speech models never heard "HesteClip" (Norwegian "heste" + English
+//! "clip") and lost it when said fast: the keyword spotter this replaces
+//! caught 15 of 30 of the user's takes. This one learned the whole phrase's
+//! sound from thousands of synthetic voices, fast and slurred ones too, and
+//! against near misses: 24 of 30, and 8 of 8 fast, quiet ones said live.
+//! Only the whole phrase counts: "hashtag", "hashtag hesteclip" and "hesteclip
+//! that" don't save clips.
 //!
 //! How: every 80 ms of sound becomes a frame of openWakeWord's speech features
 //! (a mel spectrogram, then Google's speech embedding); the last 16 frames
@@ -116,14 +114,14 @@ mod detector {
     /// The models, built into the app (`assets/wake`, see its README).
     const MELSPECTROGRAM: &[u8] = include_bytes!("../assets/wake/melspectrogram.onnx");
     const EMBEDDING: &[u8] = include_bytes!("../assets/wake/embedding_model.onnx");
-    const CLASSIFIER: &[u8] = include_bytes!("../assets/wake/hasteclip.onnx");
+    const CLASSIFIER: &[u8] = include_bytes!("../assets/wake/hesteclip.onnx");
 
     /// How sure the classifier must be, frame by frame, and for how many
-    /// frames (80 ms each) in a row. Picked on held-out voices and 25 h of
-    /// held-out everyday audio (tools/wake/src/choose.py): 0.6 x 4 saves 86 %
-    /// of takes at 0.08 false saves an hour; 0.5 x 4 saves 88.5 % but fires
-    /// on more near misses (18 % against 14 %) and twice the false saves.
-    pub(super) const THRESHOLD: f32 = 0.6;
+    /// frames (80 ms each) in a row. One frame alone fired ~16 times an hour
+    /// on everyday audio; four in a row at 0.8: under one, with the same
+    /// takes caught (picked on half of openWakeWord's validation audio,
+    /// checked on the other half).
+    pub(super) const THRESHOLD: f32 = 0.8;
     pub(super) const NEED: usize = 4;
     /// After a clip is saved, the phrase isn't heard again for this long: one
     /// take, one clip (the next take can come 1.6 s later).
@@ -238,7 +236,7 @@ mod detector {
                 })
             })()
             .map_err(|e| format!("the voice model didn't load: {e}"))?;
-            eprintln!("voice: listening for \"HasteClip that\" (model loaded in {} ms)", started.elapsed().as_millis());
+            eprintln!("voice: listening for \"hashtag HesteClip that\" (model loaded in {} ms)", started.elapsed().as_millis());
             Ok(models)
         }
 
@@ -266,12 +264,12 @@ mod detector {
         sure: usize,
         /// When the phrase was last heard (a clip saved).
         said_at: Option<f64>,
-        /// `HASTECLIP_DEBUG_VOICE=1`: the loudest sample and the surest
+        /// `HESTECLIPS_DEBUG_VOICE=1`: the loudest sample and the surest
         /// frame since they were last logged, and when that was.
         peak: f32,
         best: f32,
         logged_at: f64,
-        /// `HASTECLIP_VOICE_DUMP=<file.wav>`: everything heard, kept to
+        /// `HESTECLIPS_VOICE_DUMP=<file.wav>`: everything heard, kept to
         /// replay through the tests (written when listening stops).
         dump: Option<(std::path::PathBuf, Vec<f32>)>,
         /// Whether to keep snippets to review; set by the app.
@@ -286,15 +284,15 @@ mod detector {
         snippet_at: f64,
     }
 
-    /// `HASTECLIP_VOICE_TRACE=1`: every frame's confidence, to see why a take wasn't heard.
+    /// `HESTECLIPS_VOICE_TRACE=1`: every frame's confidence, to see why a take wasn't heard.
     fn trace() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("HASTECLIP_VOICE_TRACE").is_some())
+        *ON.get_or_init(|| std::env::var_os("HESTECLIPS_VOICE_TRACE").is_some())
     }
 
     fn debug() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("HASTECLIP_DEBUG_VOICE").is_some())
+        *ON.get_or_init(|| std::env::var_os("HESTECLIPS_DEBUG_VOICE").is_some())
     }
 
     impl Drop for Listening {
@@ -330,7 +328,7 @@ mod detector {
 
     impl Listening {
         pub(super) fn new(mic: String, sound: Receiver<Vec<f32>>) -> Self {
-            let dump = std::env::var_os("HASTECLIP_VOICE_DUMP").map(|p| (std::path::PathBuf::from(p), Vec::new()));
+            let dump = std::env::var_os("HESTECLIPS_VOICE_DUMP").map(|p| (std::path::PathBuf::from(p), Vec::new()));
             Self {
                 mic,
                 sound,
@@ -472,7 +470,7 @@ mod detector {
                 return false;
             }
             self.said_at = Some(self.clock);
-            eprintln!("voice: heard \"HasteClip that\"");
+            eprintln!("voice: heard \"hashtag HesteClip that\"");
             self.note(Kind::Fired, self.burst.unwrap_or(p));
             true
         }
@@ -598,21 +596,25 @@ mod detector {
             std::fs::create_dir_all(&dir).unwrap();
             let mut wrong = Vec::new();
             for (text, wanted) in [
-                ("HasteClip that", true),
-                ("okay that was insane. HasteClip that!", true),
+                ("hashtag hesteclip that", true),
+                // Said in one go. A pause after "hashtag" (this voice makes
+                // 0.45 s of a comma) isn't heard: the phrase no longer fits
+                // the ~2 s the detector looks at, and it never heard one.
+                ("okay that was insane. hashtag heste clip that!", true),
                 ("I love this game, let's go again", false),
+                ("hashtag blessed, clip it later", false),
+                ("has the clip that we made been saved yet", false),
                 ("can you clip that for me", false),
                 ("that was a nice clip", false),
-                ("hey, clip that", false),
-                // Rhymes one sound away ("paste clip that", "taste clip
-                // that") can save a clip: telling them apart cost a third of
-                // the real takes when tried (tools/wake/README.md).
-                ("haste makes waste", false),
+                ("hashtag gaming", false),
+                ("check the hashtag on twitter", false),
+                ("stag party this weekend", false),
                 ("he has to clip through the wall", false),
                 // Parts of the phrase: only the whole of it counts.
-                ("HasteClip", false),
-                ("clip that", false),
-                ("HasteClip is recording", false),
+                ("hashtag", false),
+                ("hashtag hesteclip", false),
+                ("hesteclip that", false),
+                ("hashtag clip that", false),
             ] {
                 let file = dir.join("speech.wav");
                 speak(text, &file);
@@ -654,7 +656,7 @@ mod detector {
             let models = Models::load().expect("load the model");
             let file = dir.join("speech.wav");
             std::fs::create_dir_all(&dir).unwrap();
-            speak("okay that was insane. HasteClip that!", &file);
+            speak("okay that was insane. hashtag heste clip that!", &file);
             let (samples, rate) = read(&file);
             assert!(collect_from(&models, &samples, rate, None), "fired");
             let kept = vs::list();
@@ -684,13 +686,13 @@ mod detector {
         }
 
         /// How often a long recording (many takes, some talk) triggers it, for
-        /// tuning: `HASTECLIP_VOICE_SESSION=session.wav cargo test -- --ignored
+        /// tuning: `HESTECLIPS_VOICE_SESSION=session.wav cargo test -- --ignored
         /// --nocapture counts_a_session` (16 or 48 kHz).
         #[test]
         #[ignore]
         fn counts_a_session() {
             let models = Models::load().expect("load the model");
-            let file = std::env::var("HASTECLIP_VOICE_SESSION").expect("HASTECLIP_VOICE_SESSION");
+            let file = std::env::var("HESTECLIPS_VOICE_SESSION").expect("HESTECLIPS_VOICE_SESSION");
             let (samples, rate) = read(std::path::Path::new(&file));
             let t = std::time::Instant::now();
             let at = heard_in(&models, &samples, rate);
@@ -718,13 +720,13 @@ mod detector {
         }
 
         /// Recordings of real people saying the phrase, kept out of the repo:
-        /// `HASTECLIP_VOICE_TAKES=a.wav;b.wav cargo test -- --ignored voice`
+        /// `HESTECLIPS_VOICE_TAKES=a.wav;b.wav cargo test -- --ignored voice`
         /// (WAV, e.g. `ffmpeg -i take.mp3 -ac 1 -ar 16000 take.wav`).
         #[test]
         #[ignore]
         fn hears_real_takes() {
             let models = Models::load().expect("load the model");
-            let takes = std::env::var("HASTECLIP_VOICE_TAKES").expect("HASTECLIP_VOICE_TAKES");
+            let takes = std::env::var("HESTECLIPS_VOICE_TAKES").expect("HESTECLIPS_VOICE_TAKES");
             for file in takes.split(';') {
                 let (samples, rate) = read(std::path::Path::new(file));
                 assert!(!heard_in(&models, &samples, rate).is_empty(), "not heard in {file}");

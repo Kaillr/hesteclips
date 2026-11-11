@@ -1,8 +1,8 @@
-//! macOS: what HasteClip needs macOS to allow, shown once at launch so
+//! macOS: what HesteClips needs macOS to allow, shown once at launch so
 //! nobody has to find it in Settings after something didn't work.
 //!
 //! - **Screen Recording**: without it nothing can be clipped.
-//! - **Input Monitoring**: without it, shortcuts don't reach HasteClip while
+//! - **Input Monitoring**: without it, shortcuts don't reach HesteClips while
 //!   a game in true fullscreen holds the screen (see `key_tap`).
 //!
 //! Both are granted in System Settings, which macOS opens from here; neither
@@ -14,7 +14,7 @@ use crate::theme::{self, W, icon};
 /// The permissions screen shows at launch until it's been closed in this
 /// round. Raised when a release needs everyone to allow them again.
 /// 1: the first, with the switch from ad hoc signing (macOS forgot what
-/// each version was allowed) to HasteClip's own certificate (it doesn't).
+/// each version was allowed) to HesteClips' own certificate (it doesn't).
 pub(crate) const SETUP_ROUND: u32 = 1;
 use crate::ui_kit::{self, Btn, Dismissed as _};
 use crate::App;
@@ -36,7 +36,7 @@ impl App {
         let modal = ui_kit::dialog(ctx, "setup", 460.0, |ui| {
             let p = theme::pal(ui);
             ui_kit::dialog_title(ui, "Before you start");
-            ui_kit::dialog_text(ui, "HasteClip needs macOS to allow two things. You can change them later in System Settings, under Privacy & Security.");
+            ui_kit::dialog_text(ui, "HesteClips needs macOS to allow two things. You can change them later in System Settings, under Privacy & Security.");
             ui.add_space(10.0);
             ask_screen = permission_row(ui, icon::MONITOR, "Screen Recording", "Needed to clip anything.", screen);
             ui.add_space(10.0);
@@ -53,7 +53,7 @@ impl App {
             }
             if !screen || !keys {
                 ui.add_space(10.0);
-                ui.add(egui::Label::new(theme::text("macOS may ask you to quit and reopen HasteClip after you allow something.", 12.5, W::Regular).color(p.text3)).wrap());
+                ui.add(egui::Label::new(theme::text("macOS may ask you to quit and reopen HesteClips after you allow something.", 12.5, W::Regular).color(p.text3)).wrap());
             }
             ui_kit::dialog_buttons(ui, |ui| {
                 // Without Screen Recording there's nothing to start: the
@@ -89,7 +89,7 @@ impl App {
     }
 }
 
-/// What HasteClip may need macOS to allow, for Settings' Permissions.
+/// What HesteClips may need macOS to allow, for Settings' Permissions.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Need {
     Screen,

@@ -333,13 +333,13 @@ fn start_host(dir: &Path, no_sandbox: bool) -> Result<Arc<Conn>> {
     let (ours, theirs) = Wire::pair().context("can't make a socket for the web page host")?;
     // The pages' lock is held while the host's told things: never for long.
     ours.send_timeout(Duration::from_secs(2));
-    // `HASTECLIP_WEB_HOST_EXE=<the app>`: the host for tests, which run in
+    // `HESTECLIPS_WEB_HOST_EXE=<the app>`: the host for tests, which run in
     // a binary of their own.
-    let exe = match std::env::var_os("HASTECLIP_WEB_HOST_EXE") {
+    let exe = match std::env::var_os("HESTECLIPS_WEB_HOST_EXE") {
         Some(exe) => exe.into(),
         None => std::env::current_exe().context("no path to the app")?,
     };
-    let base = web_engine::data_dir().context("no home folder")?.join("hasteclip");
+    let base = web_engine::data_dir().context("no home folder")?.join("hesteclips");
     let data = base.join("web-pages");
     let _ = std::fs::create_dir_all(&data);
     let _ = std::fs::create_dir_all(base.join("logs"));
@@ -545,9 +545,9 @@ mod tests {
     /// A page drawn by the engine reaches its layer: its own colours where
     /// it draws, transparent where it's half clear (premultiplied, as
     /// Chromium draws it), its style over the page's. Needs the engine and
-    /// the app built: `HASTECLIP_WEB_ENGINE_DIR=<engine> HASTECLIP_WEB_HOST_EXE=<the app>
+    /// the app built: `HESTECLIPS_WEB_ENGINE_DIR=<engine> HESTECLIPS_WEB_HOST_EXE=<the app>
     /// cargo test -p capture a_page_draws -- --ignored` (with
-    /// `HASTECLIP_NO_GPU_CAPTURE=1` too: its frames in memory).
+    /// `HESTECLIPS_NO_GPU_CAPTURE=1` too: its frames in memory).
     #[test]
     #[ignore = "needs the web page engine and the app"]
     fn a_page_draws_with_its_transparency() {
@@ -596,8 +596,8 @@ mod tests {
     }
 
     /// A page that moves comes at the rate asked for, through the host and
-    /// the copy each frame waits on (`HASTECLIP_WEB_ENGINE_DIR`,
-    /// `HASTECLIP_WEB_HOST_EXE` as above).
+    /// the copy each frame waits on (`HESTECLIPS_WEB_ENGINE_DIR`,
+    /// `HESTECLIPS_WEB_HOST_EXE` as above).
     #[test]
     #[ignore = "needs the web page engine and the app"]
     fn a_moving_page_comes_at_its_rate() {
