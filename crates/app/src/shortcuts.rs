@@ -27,60 +27,104 @@ pub struct Registered {
     mgr: Option<GlobalHotKeyManager>,
     #[cfg(target_os = "linux")]
     portal: Option<crate::portal_shortcuts::Portal>,
+    /// How the portal's presses save a clip or take a screenshot at once.
+    #[cfg(target_os = "linux")]
+    quick: Option<crate::service::QuickSave>,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     ctx: egui::Context,
     /// What's registered now, with the action each id triggers.
     active: Vec<(HotKey, ShortcutAction)>,
     /// The same by id, for the shortcut event handler.
     ids: Arc<Mutex<Vec<(u32, ShortcutAction)>>>,
-    /// Presses from the handler, and whether it saved the clip itself.
+    /// Presses from the handler, and whether it saved the clip (or took the
+    /// screenshot) itself.
     presses: Receiver<(ShortcutAction, bool)>,
     /// What `active` was built from, to re-register only on change.
     from: Option<Shortcuts>,
     /// Shortcuts that couldn't be registered (taken by another app, invalid).
     pub errors: Vec<(ShortcutAction, String)>,
+    /// What a press does, for the key tap to hand its presses to as well.
+    #[cfg(target_os = "macos")]
+    press: Arc<dyn Fn(u32) + Send + Sync>,
 }
 
 impl Registered {
     /// `ctx` is woken when a shortcut is pressed (where the backend can). Save
-    /// clip saves through `quick` as the key is pressed, frames or not.
+    /// clip saves and Take a screenshot takes it through `quick` as the key is
+    /// pressed, frames or not.
     pub fn new(ctx: egui::Context, quick: crate::service::QuickSave) -> Result<Self, String> {
         let ids: Arc<Mutex<Vec<(u32, ShortcutAction)>>> = Default::default();
         let (tx, presses) = channel();
         #[cfg(target_os = "linux")]
         if crate::portal_shortcuts::wanted() {
             if crate::portal_shortcuts::available() {
-                let _ = (quick, tx);
-                return Ok(Self { mgr: None, portal: None, ctx, active: Vec::new(), ids, presses, from: None, errors: Vec::new() });
+                let _ = tx;
+                return Ok(Self { mgr: None, portal: None, quick: Some(quick), ctx, active: Vec::new(), ids, presses, from: None, errors: Vec::new() });
             }
             eprintln!("the desktop has no GlobalShortcuts portal: shortcuts only work while an X11 app is focused");
         }
         let mgr = GlobalHotKeyManager::new().map_err(|e| e.to_string())?;
+        // The shortcut with this id was pressed: save the clip (or take the
+        // screenshot) right away, and tell the app.
+        let (handler_ids, wake) = (ids.clone(), ctx.clone());
+        let tx = Mutex::new(tx);
+        let press: Arc<dyn Fn(u32) + Send + Sync> = Arc::new(move |id: u32| {
+            let action = handler_ids.lock().ok().and_then(|ids| ids.iter().find(|(i, _)| *i == id).map(|(_, a)| *a));
+            if let Some(action) = action {
+                let saved = match action {
+                    ShortcutAction::SaveClip => quick.save(),
+                    ShortcutAction::Screenshot => quick.screenshot(),
+                    _ => false,
+                };
+                let _ = tx.lock().unwrap().send((action, saved));
+                wake.request_repaint();
+            }
+        });
         // Runs as the OS delivers the key, on the thread pumping the window's
         // messages, whether the app is drawing frames or not.
-        let (handler_ids, wake) = (ids.clone(), ctx.clone());
+        let regular = press.clone();
         GlobalHotKeyEvent::set_event_handler(Some(move |ev: GlobalHotKeyEvent| {
             if ev.state != HotKeyState::Pressed {
                 return;
             }
-            let action = handler_ids.lock().ok().and_then(|ids| ids.iter().find(|(id, _)| *id == ev.id).map(|(_, a)| *a));
-            if let Some(action) = action {
-                let saved = action == ShortcutAction::SaveClip && quick.save();
-                let _ = tx.send((action, saved));
-                wake.request_repaint();
+            // The key tap has it (and saw it too): one press, one clip.
+            #[cfg(target_os = "macos")]
+            if crate::key_tap::watches(ev.id) && !crate::key_tap::keys_hidden() {
+                return;
             }
+            regular(ev.id);
         }));
         Ok(Self {
             mgr: Some(mgr),
             #[cfg(target_os = "linux")]
             portal: None,
+            #[cfg(target_os = "linux")]
+            quick: None,
             ctx,
             active: Vec::new(),
             ids,
             presses,
             from: None,
             errors: Vec::new(),
+            #[cfg(target_os = "macos")]
+            press,
         })
+    }
+
+    /// macOS: start the key tap, if Input Monitoring is granted, so the
+    /// shortcuts also work while a game holds the screen. Cheap to call again.
+    /// Whether it runs.
+    #[cfg(target_os = "macos")]
+    pub fn start_key_tap(&mut self) -> bool {
+        if crate::key_tap::running() {
+            return true;
+        }
+        let press = self.press.clone();
+        if !crate::key_tap::start(Box::new(move |id| press(id))) {
+            return false;
+        }
+        crate::key_tap::watch(&self.active.iter().map(|(h, _)| *h).collect::<Vec<_>>());
+        true
     }
 
     /// Make the OS shortcuts match `wanted`. Cheap when nothing changed.
@@ -95,7 +139,7 @@ impl Registered {
         }
         self.errors.clear();
         let mut valid = Vec::new();
-        for action in ShortcutAction::ALL {
+        for action in ShortcutAction::ALL.into_iter().filter(|a| a.available()) {
             let text = wanted.get(action);
             if text.is_empty() {
                 continue;
@@ -117,27 +161,82 @@ impl Registered {
         #[cfg(target_os = "linux")]
         if self.mgr.is_none() {
             // The old set goes (dropping it unbinds them), the new one is bound.
+            // Changed in Settings (not starting up): ours win in the desktop.
+            let ours = self.from.is_some();
             self.portal = None;
             let list = valid.iter().map(|(_, a)| (*a, wanted.get(*a).to_owned())).collect();
-            self.portal = Some(crate::portal_shortcuts::Portal::bind(list, self.ctx.clone()));
+            if let Some(quick) = self.quick.clone() {
+                self.portal = Some(crate::portal_shortcuts::Portal::bind(list, ours, self.ctx.clone(), quick));
+            }
         }
         let _ = valid;
         if let Ok(mut ids) = self.ids.lock() {
             *ids = self.active.iter().map(|(h, a)| (h.id(), *a)).collect();
         }
+        #[cfg(target_os = "macos")]
+        crate::key_tap::watch(&self.active.iter().map(|(h, _)| *h).collect::<Vec<_>>());
         self.from = Some(wanted.clone());
     }
 
-    /// Shortcuts pressed since the last call, and whether the clip was saved
-    /// already (Save clip, as it was pressed).
+    /// Shortcuts pressed since the last call, and whether it was done
+    /// already (Save clip, Take a screenshot: as it was pressed).
     pub fn pressed(&mut self) -> Vec<(ShortcutAction, bool)> {
         #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
         let mut out: Vec<(ShortcutAction, bool)> = self.presses.try_iter().collect();
         #[cfg(target_os = "linux")]
         if let Some(p) = &self.portal {
-            out.extend(p.pressed().into_iter().map(|a| (a, false)));
+            out.extend(p.pressed());
         }
         out
+    }
+
+    /// Keys changed in the desktop's own settings (KDE Plasma), for Settings
+    /// to take: already in place, so they aren't bound again.
+    pub fn adopted(&mut self) -> Vec<(ShortcutAction, String)> {
+        #[cfg(target_os = "linux")]
+        if let Some(p) = &self.portal {
+            let list = p.adopted();
+            if let Some(from) = &mut self.from {
+                for (a, keys) in &list {
+                    from.set(*a, keys.clone());
+                }
+            }
+            return list;
+        }
+        Vec::new()
+    }
+
+    /// Whether the keys set in Settings are the ones that work: always, but
+    /// on a Wayland desktop that keeps its own (not KDE Plasma, where they're
+    /// set from here).
+    pub fn keys_set_here(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        if let Some(p) = &self.portal {
+            return p.managed();
+        }
+        self.mgr.is_some()
+    }
+
+    /// Open the desktop's editor for its shortcuts, where it keeps theirs
+    /// (Wayland, through the portal). False where it can't.
+    pub fn configure_desktop(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        if let Some(p) = &self.portal
+            && crate::portal_shortcuts::can_configure()
+        {
+            p.configure();
+            return true;
+        }
+        false
+    }
+
+    /// Whether the desktop's own shortcut editor can be opened for them.
+    pub fn desktop_configurable(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        if let Some(p) = &self.portal {
+            return !p.managed() && crate::portal_shortcuts::can_configure();
+        }
+        false
     }
 
     pub fn error_for(&self, action: ShortcutAction) -> Option<String> {
@@ -149,8 +248,12 @@ impl Registered {
             use crate::portal_shortcuts::State;
             return match p.state() {
                 State::Failed(e) => Some(format!("the desktop didn't take it ({e})")),
-                State::Bound(list) if list.iter().any(|(a, keys)| *a == action && keys.trim().is_empty()) => {
-                    Some("the desktop gave it no keys — set them in its keyboard settings".into())
+                State::Bound(list) if !p.managed() && list.iter().any(|(a, keys)| *a == action && keys.trim().is_empty()) => {
+                    Some(if crate::portal_shortcuts::can_configure() {
+                        "no key yet. Your desktop gives the keys: use Set up keys below".into()
+                    } else {
+                        "no key yet. Your desktop gives the keys: add one in its keyboard settings".into()
+                    })
                 }
                 _ => None,
             };
@@ -200,7 +303,18 @@ pub fn label(text: &str) -> String {
 /// The platform's command key plus `key`, for in-app shortcuts: "Cmd + A" on a
 /// Mac, "Ctrl + A" elsewhere.
 pub fn command(key: &str) -> Vec<String> {
-    vec![if cfg!(target_os = "macos") { "Cmd" } else { "Ctrl" }.to_owned(), key.to_owned()]
+    vec![cmd_name().to_owned(), key.to_owned()]
+}
+
+/// The keys as the platform names them, for hints in words. The command key
+/// (egui's `command`): Cmd on a Mac, Ctrl elsewhere.
+pub fn cmd_name() -> &'static str {
+    if cfg!(target_os = "macos") { "Cmd" } else { "Ctrl" }
+}
+
+/// Alt (egui's `alt`): Option on a Mac.
+pub fn alt_name() -> &'static str {
+    if cfg!(target_os = "macos") { "Option" } else { "Alt" }
 }
 
 fn key_name(code: Code) -> String {
@@ -353,10 +467,15 @@ mod tests {
 
     #[test]
     fn defaults_parse_and_display() {
+        // Only Save clip has a key to begin with.
         for a in ShortcutAction::ALL {
             let text = Shortcuts::default().get(a).to_owned();
-            assert!(HotKey::from_str(&text).is_ok(), "{text}");
-            assert!(keys(&text).is_some());
+            if a == ShortcutAction::SaveClip {
+                assert!(HotKey::from_str(&text).is_ok(), "{text}");
+                assert!(keys(&text).is_some());
+            } else {
+                assert_eq!(label(&text), "Off", "{a:?}");
+            }
         }
         let alt = if cfg!(target_os = "macos") { "Option" } else { "Alt" };
         assert_eq!(keys("alt+F10").unwrap(), vec![alt.to_owned(), "F10".to_owned()]);

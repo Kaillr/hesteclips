@@ -28,8 +28,8 @@ use crate::moments::Moments;
 
 /// The file's extension.
 pub const EXT: &str = "hesteclips";
-/// The public version's: its files hold the same, and import here.
-pub const OTHER_EXT: &str = "hasteclip";
+/// The public version's (HasteClip): its files hold the same, and import here.
+pub const OTHER_EXT: &str = concat!("haste", "clip");
 
 /// Whether a path is a clips file of either version.
 pub fn is_archive(path: &Path) -> bool {
@@ -236,17 +236,17 @@ fn extract<R: Read + std::io::Seek>(zip: &mut zip::ZipArchive<R>, name: &str, to
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
     // Written aside, then moved in: the library never sees half a clip.
-    let partial = to.with_file_name(format!(".{}.importing", to.file_name().unwrap_or_default().to_string_lossy()));
+    let partial = capture::output::in_progress(to);
     let result = (|| {
         let mut out = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(&partial)?);
         copy(&mut entry, &mut out, progress)?;
         out.flush()?;
         std::fs::rename(&partial, to)
     })();
-    result.map_err(|e| {
+    if result.is_err() {
         let _ = std::fs::remove_file(&partial);
-        format!("Couldn't write {}: {e}", to.display())
-    })
+    }
+    result.map_err(|e| format!("Couldn't write {}: {e}", to.display()))
 }
 
 /// Copy, counting the bytes into `progress`.
@@ -348,7 +348,7 @@ mod tests {
         std::fs::write(&path, vec![7u8; bytes]).unwrap();
         let modified = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_760_000_000);
         std::fs::File::options().write(true).open(&path).unwrap().set_modified(modified).unwrap();
-        Clip { path, name: name.into(), modified, created: None, size_bytes: bytes as u64, id: None, original: None, folder: folder.map(str::to_owned) }
+        Clip { path, name: name.into(), modified, created: None, size_bytes: bytes as u64, id: None, original: None, folder: folder.map(str::to_owned), kept_bytes: 0 }
     }
 
     fn temp(name: &str) -> PathBuf {
@@ -426,7 +426,7 @@ mod tests {
                 continue;
             }
             let folder = p.parent().filter(|d| *d != lib).and_then(|d| d.file_name()).map(|n| n.to_string_lossy().into_owned());
-            clips.push(Clip { id, path: p, name: String::new(), modified: m.modified().unwrap(), created: None, size_bytes: m.len(), original: None, folder });
+            clips.push(Clip { id, path: p, name: String::new(), modified: m.modified().unwrap(), created: None, size_bytes: m.len(), original: None, folder, kept_bytes: 0 });
         }
         assert!(!clips.is_empty(), "no clips found");
         let out = temp("real").join("all.hesteclips");
@@ -479,29 +479,34 @@ mod tests {
         assert!(!safe_name("a/b").contains('/'));
     }
 
-    /// Writes the real library's small clips (edited ones too) to the file
-    /// named by `HESTECLIPS_EXPORT_TO`: for checking that the other version
-    /// imports it. `cargo test --release archive::tests::export_real -- --ignored`.
+    /// A file exported by the other version (`HESTECLIPS_IMPORT_FROM`) comes
+    /// in: edited clips are edited here (their edit folder found, original
+    /// included), markers and collections kept.
+    /// `cargo test --release archive::tests::import_other -- --ignored`.
     #[test]
-    #[ignore = "writes a file"]
-    fn export_real() {
+    #[ignore = "needs a file from the other version"]
+    fn import_other() {
         let _turn = crate::store::LIBRARY_TURN.lock().unwrap_or_else(|e| e.into_inner());
-        let lib = PathBuf::from(std::env::var("HESTECLIPS_TEST_LIBRARY").expect("HESTECLIPS_TEST_LIBRARY"));
-        let out = PathBuf::from(std::env::var("HESTECLIPS_EXPORT_TO").expect("HESTECLIPS_EXPORT_TO"));
-        crate::store::set_library(&lib);
-        let mut clips = Vec::new();
-        for entry in std::fs::read_dir(lib.join("Desktop")).unwrap().flatten() {
-            let p = entry.path();
-            let m = std::fs::metadata(&p).unwrap();
-            if p.extension().is_none_or(|e| e != "mp4") || m.len() > 60 << 20 {
-                continue;
+        let file = PathBuf::from(std::env::var("HESTECLIPS_IMPORT_FROM").expect("HESTECLIPS_IMPORT_FROM"));
+        let into = temp("other-into");
+        crate::store::set_library(&into);
+        let mut cols = Collections::load(&into);
+        let done = import(&file, &into, &progress()).unwrap();
+        done.collect(&mut cols);
+        let (mut edited, mut with_original) = (0, 0);
+        for (clip, _) in &done.added {
+            if let Some(id) = crate::store::read_id(clip) {
+                edited += 1;
+                if crate::store::find_original(&into, &id).is_some() {
+                    with_original += 1;
+                }
             }
-            let id = crate::store::read_id(&p);
-            clips.push(Clip { id, path: p, name: String::new(), modified: m.modified().unwrap(), created: None, size_bytes: m.len(), original: None, folder: Some("Desktop".into()) });
         }
-        let names: Vec<Vec<String>> = clips.iter().map(|_| vec!["From the friends' version".to_owned()]).collect();
-        export(&lib, &clips, &names, &out, &progress()).unwrap();
-        eprintln!("{} clips ({} edited) → {}", clips.len(), clips.iter().filter(|c| c.id.is_some()).count(), out.display());
+        eprintln!("{} clips in, {} skipped; {edited} edited here, {with_original} with their original; collections: {:?}", done.added.len(), done.skipped, cols.list().iter().map(|c| c.name.clone()).collect::<Vec<_>>());
+        assert!(edited > 0, "no edited clips were recognised as edited");
+        assert_eq!(edited, with_original, "an edited clip lost its original");
+        assert_eq!(cols.list().len(), 1);
+        let _ = std::fs::remove_dir_all(&into);
     }
 
     /// Either version's extension is a clips file.
@@ -509,6 +514,7 @@ mod tests {
     fn both_extensions_import() {
         assert!(is_archive(Path::new("a.hesteclips")));
         assert!(is_archive(Path::new(&format!("a.{OTHER_EXT}"))));
+        assert!(is_archive(Path::new("A.HESTECLIPS")));
         assert!(!is_archive(Path::new("a.mp4")));
     }
 

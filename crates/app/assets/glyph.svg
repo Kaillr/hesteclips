@@ -1,8 +1,8 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="204.95 213.2 560 560">
-  <!-- Menu bar / tray glyph: icon-windows.svg's horse and clapperboard as one
-       colour, the outlines that keep the shapes apart cut out (transparent)
-       instead of painted black, so it reads on any bar. Made by
-       scripts/tray-icons.sh. -->
+  <!-- The glyph alone: glyph-keyline.svg's horse and clapperboard in one
+       colour, the strokes that keep the shapes apart cut out (transparent)
+       instead of painted black. The app icon (with a shadow), macOS's menu
+       bar and the empty library page are made from it by scripts/icons.sh. -->
   <defs>
     <mask id="glyph" maskUnits="userSpaceOnUse" x="0" y="0" width="1024" height="1024">
       <g transform="translate(218.87 249.73) scale(1.93084)">

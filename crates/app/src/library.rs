@@ -52,6 +52,26 @@ pub(crate) enum Filter {
     Collection(String),
 }
 
+/// Whether the library shows clips, screenshots or both: picked on the
+/// heading's count where both are (see `App::kind_counts`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ShowKind {
+    #[default]
+    All,
+    Clips,
+    Screenshots,
+}
+
+impl ShowKind {
+    pub(crate) fn matches(self, clip: &clips::Clip) -> bool {
+        match self {
+            ShowKind::All => true,
+            ShowKind::Clips => !clip.is_image(),
+            ShowKind::Screenshots => clip.is_image(),
+        }
+    }
+}
+
 impl Filter {
     pub(crate) fn matches(&self, clip: &clips::Clip, cols: &Collections) -> bool {
         match self {
@@ -63,8 +83,8 @@ impl Filter {
     }
 
     /// Back to all clips once there's nothing left to show: the last clip of a
-    /// game moved or deleted, or the collection deleted. (An emptied collection
-    /// stays: you may be about to fill it.)
+    /// game moved or deleted, or the collection deleted. (An emptied
+    /// collection stays: you may be about to fill it.)
     pub fn retain(&mut self, clips: &[clips::Clip], cols: &Collections) {
         let gone = match self {
             Filter::Collection(id) => cols.get(id).is_none(),
@@ -230,6 +250,8 @@ pub(crate) enum Action {
     MoveTo(Vec<PathBuf>, Option<String>),
     MoveSelectedTo(Option<String>),
     Filter(Filter),
+    /// Show clips, screenshots or both.
+    Kind(ShowKind),
     RenameFolder(String),
     RevealFolder(String),
     /// Ask for a name, then make a collection with these clips in it.
@@ -244,7 +266,8 @@ pub(crate) enum Action {
     Deselect,
     /// Delete the selected clips.
     TrashSelected,
-    CancelUpload(PathBuf),
+    /// Ask how to free up the space these edited clips' originals take.
+    FreeUp(Vec<PathBuf>),
 }
 
 impl App {
@@ -284,20 +307,7 @@ impl App {
         let modal = ui_kit::dialog(ctx, "confirm_delete", 380.0, |ui| {
             ui_kit::dialog_title(ui, &title);
             if let Some(c) = &one {
-                ui.horizontal(|ui| {
-                    let (r, _) = ui.allocate_exact_size(egui::vec2(80.0, 45.0), Sense::hover());
-                    match &tex {
-                        Some(t) => {
-                            let uv = crate::filmstrip::crop_uv(t.size_vec2(), r.size());
-                            egui::Image::from_texture((t.id(), r.size())).uv(uv).corner_radius(4).paint_at(ui, r);
-                        }
-                        None => {
-                            ui.painter().rect_filled(r, 4, theme::pal(ui).raise2);
-                        }
-                    }
-                    ui.add_space(4.0);
-                    ui.add(egui::Label::new(theme::text(c.title(), 13.5, theme::W::Medium).color(theme::pal(ui).text)).truncate());
-                });
+                clip_row(ui, c, tex.as_ref(), None);
                 ui.add_space(8.0);
             }
             ui_kit::dialog_text(ui, &if permanently { format!("You can't get {what} back.") } else { format!("You can get {what} back from the {bin}.") });
@@ -562,7 +572,7 @@ impl App {
             if path.parent() == Some(dir.as_path()) {
                 continue;
             }
-            if self.renders.iter().any(|j| &j.source == path) || self.cloud.upload_for(path).is_some() {
+            if self.renders.iter().any(|j| &j.source == path) {
                 busy += 1;
                 continue;
             }
@@ -719,12 +729,42 @@ impl App {
     }
 }
 
+/// A clip in a dialog: its picture and name, and `under` the name when given.
+pub(crate) fn clip_row(ui: &mut egui::Ui, clip: &clips::Clip, tex: Option<&egui::TextureHandle>, under: Option<&str>) {
+    let p = theme::pal(ui);
+    ui.horizontal(|ui| {
+        let (r, _) = ui.allocate_exact_size(egui::vec2(80.0, 45.0), Sense::hover());
+        match tex {
+            Some(t) => {
+                let uv = crate::filmstrip::crop_uv(t.size_vec2(), r.size());
+                egui::Image::from_texture((t.id(), r.size())).uv(uv).corner_radius(4).paint_at(ui, r);
+            }
+            None => {
+                ui.painter().rect_filled(r, 4, p.raise2);
+            }
+        }
+        ui.add_space(4.0);
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            ui.add(egui::Label::new(theme::text(clip.title(), 13.5, theme::W::Medium).color(p.text)).truncate());
+            if let Some(under) = under {
+                ui.add(egui::Label::new(theme::text(under, 12.5, theme::W::Regular).color(p.text3)).truncate());
+            }
+        });
+    });
+}
+
 /// A way to get a clip out, picked from [`share_menu`].
 pub(crate) enum ShareChoice {
+    /// The Upload to HesteFiles dialog.
+    Upload,
+    /// Stop its upload to HesteFiles.
+    CancelUpload,
     Copy,
+    /// A screenshot's picture on the clipboard (not its file).
+    CopyImage,
     /// The system share sheet, at this window position.
     Sheet(Pos2),
-    Upload,
     Reveal,
     Mp3,
     /// To a `.hesteclips` file, with its edit, markers and collections.
@@ -732,25 +772,40 @@ pub(crate) enum ShareChoice {
 }
 
 /// The ways to get a clip out, shared by the library's Share button and
-/// right-click menu and the player's Share button.
-pub(crate) fn share_menu(ui: &mut egui::Ui, anchor: Pos2) -> Option<ShareChoice> {
-    crate::library_view::share_items(ui, anchor, false)
+/// right-click menu and the player's Share button. `uploading`: the clip is
+/// going up to HesteFiles. `image`: it's a screenshot.
+pub(crate) fn share_menu(ui: &mut egui::Ui, anchor: Pos2, uploading: bool, image: bool) -> Option<ShareChoice> {
+    crate::library_view::share_items(ui, anchor, uploading, image)
 }
 
 impl App {
     /// Do what was picked in [`share_menu`] for `file`.
     pub(crate) fn share(&mut self, frame: &eframe::Frame, file: PathBuf, choice: ShareChoice) {
         match choice {
+            ShareChoice::Upload => self.open_share_dialog(file),
+            ShareChoice::CancelUpload => {
+                if let Some(up) = self.cloud.upload_for(&file) {
+                    up.cancel();
+                }
+            }
             ShareChoice::Copy => match share::copy_file(&file) {
                 Ok(()) => self.toast(format!("Copied — paste it into any app ({})", crate::hotkey_label_cmd("V"))),
-                Err(e) => self.toast_error(format!("Couldn't copy the clip: {e}")),
+                Err(e) => self.toast_error(format!("Couldn't copy the {}: {e}", if clips::is_image(&file) { "file" } else { "clip" })),
             },
+            // Read and put on the clipboard in the background: a 4K PNG takes
+            // a moment.
+            ShareChoice::CopyImage => {
+                let (tx, ctx) = (self.copy_tx.clone(), self.ctx());
+                std::thread::spawn(move || {
+                    let _ = tx.send(crate::screenshot::copy_file(&file));
+                    ctx.request_repaint();
+                });
+            }
             ShareChoice::Sheet(at) => {
                 if let Err(e) = share::share_sheet(frame, &file, at) {
                     self.toast_error(format!("Couldn't open sharing: {e}"));
                 }
             }
-            ShareChoice::Upload => self.open_share_dialog(file),
             ShareChoice::Reveal => {
                 if let Err(e) = clips::reveal_in_file_manager(&file) {
                     self.toast_error(format!("Couldn't show the file: {e}"));
@@ -783,12 +838,18 @@ impl App {
         });
     }
 
-    /// Finished MP3s: say so.
+    /// Finished MP3s and pictures copied: say so.
     pub(crate) fn pump_mp3s(&mut self) {
         while let Ok(result) = self.mp3_rx.try_recv() {
             match result {
                 Ok(out) => self.toast(format!("Saved “{}”", out.file_name().unwrap_or_default().to_string_lossy())),
                 Err(e) => self.toast_error(format!("Couldn't save the MP3: {e}")),
+            }
+        }
+        while let Ok(result) = self.copy_rx.try_recv() {
+            match result {
+                Ok(()) => self.toast(format!("Copied — paste it into any app ({})", crate::hotkey_label_cmd("V"))),
+                Err(e) => self.toast_error(format!("Couldn't copy the picture: {e}")),
             }
         }
     }
@@ -844,6 +905,7 @@ mod tests {
             id: None,
             original: None,
             folder: None,
+            kept_bytes: 0,
         }
     }
 
@@ -979,6 +1041,7 @@ mod scale_tests {
                     id: None,
                     original: None,
                     folder: Some(folder),
+                    kept_bytes: 0,
                 }
             })
             .collect();
@@ -998,7 +1061,7 @@ mod scale_tests {
         let mut version = 0;
         let update = |shown: &mut crate::library_grid::Shown, f: &Filter, q: &str, v: u64| {
             shown.update(
-                crate::library_grid::Inputs { clips: &clips, library_version: v, collections: &cols, filter: f, query: q, sort: crate::settings::LibrarySort::Newest, lengths_version: 0, placeholders: 0, new_renders: Vec::new(), renders: &[] },
+                crate::library_grid::Inputs { clips: &clips, library_version: v, collections: &cols, filter: f, kind: ShowKind::All, query: q, sort: crate::settings::LibrarySort::Newest, lengths_version: 0, placeholders: 0, new_renders: Vec::new(), renders: &[] },
                 false,
                 |_| None,
             )

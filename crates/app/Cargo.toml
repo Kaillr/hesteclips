@@ -15,7 +15,9 @@ log = "0.4"
 bytemuck = "1"
 capture = { path = "../capture" }
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
-clipboard-rs = { version = "0.3", default-features = false }
+# Images on the clipboard (screenshots) are PNG and a bitmap: the bitmap needs
+# image's "bmp".
+clipboard-rs = { version = "0.3", default-features = false, features = ["image"] }
 cpal = "0.18"
 ctrlc = { version = "3.5.2", features = ["termination"] }
 dirs = "6.0.0"
@@ -23,16 +25,20 @@ eframe = "0.36.1"
 epaint_default_fonts = "0.36"
 egui = "0.36.1"
 global-hotkey = "0.8.0"
-hestefiles = { path = "../hestefiles" }
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
-keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
+# Screenshots as JPG with every pixel's colour (image's own halves it, which
+# blurs coloured text).
+jpeg-encoder = "0.6"
 media = { path = "../media" }
+hestefiles = { path = "../hestefiles" }
+# The HesteFiles account token, in the system keychain (cloud.rs).
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
 raw-window-handle = "0.6"
 rfd = "0.17.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 trash = "5"
-# "Hashtag HesteClip that" (voice.rs): runs its small ONNX models, pure Rust.
+# "hashtag HesteClip that" (voice.rs): runs its small ONNX models, pure Rust.
 tract-onnx = "0.23.8"
 uuid = { version = "1", features = ["v4"] }
 discord-rich-presence = "1.1.0"
@@ -50,20 +56,24 @@ tray-icon = "0.21"
 # Linux: global shortcuts through the desktop portal (Wayland has no other
 # way), showing a clip in the file manager, the log file (libc), and checking
 # downloaded updates (sha2), and the tray icon (ksni: StatusNotifierItem over
-# D-Bus, no GTK).
+# D-Bus, no GTK), and setting the shortcuts' keys in KDE Plasma (zbus).
 [target.'cfg(target_os = "linux")'.dependencies]
 ashpd = { version = "0.13", default-features = false, features = ["async-io", "global_shortcuts"] }
 async-io = "2"
 futures-util = { version = "0.3", default-features = false }
 ksni = { version = "0.3", default-features = false, features = ["async-io", "blocking"] }
 libc = "0.2"
+zbus = { version = "5", default-features = false, features = ["async-io"] }
+# Dragging clips out under Wayland, on the window's own connection (winit's).
+wayland-client = "0.31"
+wayland-backend = { version = "0.3", features = ["client_system"] }
 pollster = "1"
 sha2 = "0.11"
 
 # Windows-only: drawing decoded frames straight from the GPU (gpu_frames.rs).
 [target.'cfg(windows)'.dependencies]
 velopack = "1.2.161"
-windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Direct3D12", "Win32_Graphics_Dwm", "Win32_System_Console", "Win32_System_Registry", "Win32_System_Threading"] }
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Direct3D12", "Win32_Graphics_Dwm", "Win32_Networking_WinSock", "Win32_System_Console", "Win32_System_IO", "Win32_System_Registry", "Win32_System_Threading"] }
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1.31"
@@ -77,9 +87,18 @@ objc2 = "0.6.4"
 objc2-io-surface = { version = "0.3.2", default-features = false, features = ["std", "IOSurfaceRef", "objc2"] }
 objc2-metal = { version = "0.3.2", default-features = false, features = ["std", "MTLAllocation", "MTLDevice", "MTLPixelFormat", "MTLResource", "MTLTexture", "objc2-io-surface"] }
 objc2-foundation = { version = "0.3.2", features = ["NSArray", "NSString", "NSURL", "NSGeometry", "NSFileManager", "NSError"] }
-objc2-app-kit = { version = "0.3.2", features = ["NSSharingService", "NSView", "NSResponder", "NSWindow", "NSToolbar", "NSButton", "NSControl"] }
+objc2-app-kit = { version = "0.3.2", features = ["NSSharingService", "NSView", "NSResponder", "NSWindow", "NSToolbar", "NSButton", "NSControl", "NSEvent"] }
+# Checking a downloaded update (update_mac.rs).
+sha2 = "0.11"
+# Shortcuts while a game holds the screen: a listen-only key tap (key_tap.rs).
+objc2-core-foundation = { version = "0.3.2", features = ["CFMachPort", "CFRunLoop"] }
+objc2-core-graphics = { version = "0.3.2", features = ["CGEvent", "CGEventTypes"] }
+# Started with the computer, the app doesn't take the focus as it starts
+# (main.rs): winit's option for it, in the winit eframe uses.
+winit = { version = "0.30", default-features = false }
 
-# Windows-only: the system Share UI, and opening files with their default app.
+# Windows-only: the system Share UI, opening files with their default app, and
+# the window brought to the front (shell.rs).
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-collections = "0.3"
 windows-core = "0.62"
@@ -90,7 +109,9 @@ windows = { version = "0.62", features = [
     "Storage",
     "Storage_Streams",
     "Win32_Foundation",
+    "Win32_Graphics_Gdi",
     "Win32_Storage_FileSystem",
+    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
@@ -99,3 +120,8 @@ windows = { version = "0.62", features = [
 hound = "3"
 naga = { version = "30", features = ["wgsl-in"] }
 pollster = "1"
+
+[features]
+# Scripted demo recordings for the website (src/demo.rs): `cargo build
+# --release --features demo`. Without it, HESTECLIPS_DEMO_SCRIPT says it can't.
+demo = []

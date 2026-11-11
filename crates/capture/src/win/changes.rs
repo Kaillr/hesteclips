@@ -35,12 +35,30 @@ use super::quad::{self, Quad};
 use super::system::host_now;
 
 /// Looks kept while their comparisons are on their way (full-size picture
-/// slots, filled only when a look brought a new picture). A guess: at 1200
-/// looks a second, 12 are 10 ms.
+/// slots, filled only when a look brought a new picture), to begin with. A
+/// guess: at 1200 looks a second, 12 are 10 ms.
 const RING: usize = 12;
+/// The most slots the ring grows to while every one is waiting on its
+/// comparison (a graphics card kept busy by the game answers late). Geometry
+/// Dash at 1000 fps got answers about 13 ms late: 12 slots held the looks to
+/// about 850 a second, fewer than its pictures, in bursts (looks skipped till
+/// answers came), and blended frames got anywhere from 1 to 8 different
+/// pictures. 40 hold 20 ms at 2000 looks a second, only for a game that needs
+/// them; fewer for a bigger picture (`RING_BYTES`).
+const RING_MAX: usize = 40;
+/// The most graphics memory the ring grows to: at 1080p, 40 slots; at 1440p,
+/// 22; at 4K it doesn't grow past `RING`. Windows doesn't refuse a texture
+/// when the card's memory is full, it moves some of the game's to the
+/// computer's memory instead (the game slows down), so this is the limit, not
+/// an allocation that fails.
+const RING_BYTES: u64 = 320 << 20;
 /// With no change seen for this long, the next look copies the picture
 /// anyway (a change the signature missed goes up then). A guess.
 const FORCE_AFTER: f64 = 0.1;
+/// A comparison still unanswered after this long is given up on: its picture
+/// would be too old to belong in a frame anyway, and a driver that loses an
+/// answer must not hold the ring for good.
+const GIVE_UP: f64 = 0.25;
 /// The signature reads every this many rows.
 const SIGNATURE_ROWS: u32 = 2;
 /// The comparison's size, in blocks.
@@ -70,6 +88,25 @@ enum Check {
     Predicate,
 }
 
+impl Slot {
+    fn new(gpu: &Gpu, width: u32, height: u32) -> Result<Self> {
+        let float = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32B32A32_FLOAT;
+        let bind = (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32;
+        let picture = Latest::new(gpu, width, height)?;
+        let signature = gpu.texture(BLOCKS.0, BLOCKS.1, float, bind, D3D11_USAGE_DEFAULT, 0)?;
+        let mut predicate = None;
+        unsafe { gpu.device.CreatePredicate(&D3D11_QUERY_DESC { Query: D3D11_QUERY_OCCLUSION_PREDICATE, MiscFlags: 0 }, Some(&mut predicate))? };
+        Ok(Slot {
+            target: quad::target_view(gpu, &picture.texture)?,
+            view: quad::shader_view(gpu, &picture.texture)?,
+            staging: gpu.texture(BLOCKS.0, BLOCKS.1, DXGI_FORMAT_B8G8R8A8_UNORM, 0, D3D11_USAGE_STAGING, D3D11_CPU_ACCESS_READ.0 as u32)?,
+            signature: (quad::target_view(gpu, &signature)?, quad::shader_view(gpu, &signature)?),
+            predicate: predicate.context("no predicate")?,
+            picture,
+        })
+    }
+}
+
 struct Pending {
     slot: usize,
     /// When this look, and the one before it, were made.
@@ -82,6 +119,10 @@ struct Pending {
 
 pub(crate) struct Changes {
     ring: Vec<Slot>,
+    /// The most slots the ring may grow to (`RING_MAX`, fewer for a big
+    /// picture, `RING_BYTES`, or once the graphics card had no room for
+    /// another).
+    max_slots: usize,
     next: usize,
     /// The slot of the last look, its valid size and when it was made.
     before: Option<(usize, (u32, u32), f64)>,
@@ -98,33 +139,20 @@ pub(crate) struct Changes {
     last_new: f64,
     /// How long without a new picture before the cursor moving counts as one.
     quiet: f64,
-    /// `HESTECLIPS_HOOK_LOG=1`: looks, new pictures, comparisons dropped unread, since `counted.0`.
-    counted: (std::time::Instant, u32, u32, u32),
+    /// `HESTECLIPS_HOOK_LOG=1`: looks, new pictures, comparisons dropped unread,
+    /// looks skipped for a full ring, and the most that were waiting, since
+    /// `counted.0`.
+    counted: (std::time::Instant, u32, u32, u32, u32, usize),
 }
 
 impl Changes {
     /// `look_every`: seconds between looks.
     pub(crate) fn new(gpu: &Gpu, width: u32, height: u32, look_every: f64) -> Result<Self> {
-        let mut ring = Vec::new();
-        let float = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32B32A32_FLOAT;
-        let bind = (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32;
-        for _ in 0..RING {
-            let picture = Latest::new(gpu, width, height)?;
-            let signature = gpu.texture(BLOCKS.0, BLOCKS.1, float, bind, D3D11_USAGE_DEFAULT, 0)?;
-            let mut predicate = None;
-            unsafe { gpu.device.CreatePredicate(&D3D11_QUERY_DESC { Query: D3D11_QUERY_OCCLUSION_PREDICATE, MiscFlags: 0 }, Some(&mut predicate))? };
-            ring.push(Slot {
-                target: quad::target_view(gpu, &picture.texture)?,
-                view: quad::shader_view(gpu, &picture.texture)?,
-                staging: gpu.texture(BLOCKS.0, BLOCKS.1, DXGI_FORMAT_B8G8R8A8_UNORM, 0, D3D11_USAGE_STAGING, D3D11_CPU_ACCESS_READ.0 as u32)?,
-                signature: (quad::target_view(gpu, &signature)?, quad::shader_view(gpu, &signature)?),
-                predicate: predicate.context("no predicate")?,
-                picture,
-            });
-        }
+        let ring = (0..RING).map(|_| Slot::new(gpu, width, height)).collect::<Result<Vec<_>>>()?;
         let blocks_texture = gpu.texture(BLOCKS.0, BLOCKS.1, DXGI_FORMAT_B8G8R8A8_UNORM, D3D11_BIND_RENDER_TARGET.0 as u32, D3D11_USAGE_DEFAULT, 0)?;
         Ok(Self {
             ring,
+            max_slots: ((RING_BYTES / (width as u64 * height as u64 * 4).max(1)) as usize).clamp(RING, RING_MAX),
             next: 0,
             before: None,
             blocks: quad::target_view(gpu, &blocks_texture)?,
@@ -136,20 +164,59 @@ impl Changes {
             last_new: 0.0,
             // A guess: four looks, two game pictures at the blend rate.
             quiet: look_every * 4.0,
-            counted: (std::time::Instant::now(), 0, 0, 0),
+            counted: (std::time::Instant::now(), 0, 0, 0, 0, 0),
         })
     }
 
     /// Where the next look's picture goes: the slot's number, and what to
-    /// draw into.
-    pub(crate) fn slot(&mut self) -> (usize, Arc<Latest>, ID3D11RenderTargetView) {
-        // Never reuse a slot whose comparison hasn't been read.
-        while self.pending.len() >= RING - 1 {
+    /// draw into. While every slot is waiting on its comparison (the graphics
+    /// card is behind), the ring grows by one, up to `max_slots`; past that it's
+    /// `None`: the look is skipped and taken again next time instead, so the
+    /// pictures already on their way are kept.
+    ///
+    /// Dropping the oldest unread comparison instead (as this did) loses
+    /// pictures by the hundred once a comparison takes longer than the ring
+    /// holds: the capture then only puts up the one `FORCE_AFTER` copies every
+    /// 100 ms, and frame blending repeats a single picture for a third of a
+    /// second, which looks like a freeze. A game at 1000 fps looked at 960
+    /// times a second found that out on a card that answers in more than 5 ms.
+    pub(crate) fn slot(&mut self, gpu: &Gpu) -> Option<(usize, Arc<Latest>, ID3D11RenderTargetView)> {
+        let now = host_now();
+        while self.pending.front().is_some_and(|p| now - p.at > GIVE_UP) {
             self.pending.pop_front();
+            crate::count_missed(1);
             self.counted.3 += 1;
         }
-        let i = self.next;
-        (i, self.ring[i].picture.clone(), self.ring[i].target.clone())
+        // A slot neither waiting on its comparison nor the last look's (the
+        // next one is compared with its signature).
+        let len = self.ring.len();
+        let before = self.before.map(|(b, _, _)| b);
+        let free = (0..len).map(|n| (self.next + n) % len).find(|&j| Some(j) != before && !self.pending.iter().any(|p| p.slot == j));
+        let i = match free {
+            Some(i) => i,
+            None if len < self.max_slots => {
+                let (w, h) = (self.ring[0].picture.width, self.ring[0].picture.height);
+                match Slot::new(gpu, w, h) {
+                    Ok(slot) => {
+                        self.ring.push(slot);
+                        len
+                    }
+                    Err(e) => {
+                        eprintln!("game hook: no more room for looks: {e:#}");
+                        self.max_slots = len;
+                        self.counted.4 += 1;
+                        return None;
+                    }
+                }
+            }
+            None => {
+                self.counted.4 += 1;
+                return None;
+            }
+        };
+        self.counted.5 = self.counted.5.max(self.pending.len());
+        self.next = i;
+        Some((i, self.ring[i].picture.clone(), self.ring[i].target.clone()))
     }
 
     /// The picture drawn into slot `i` (`size` of it valid) is done: compare it
@@ -213,12 +280,20 @@ impl Changes {
         if self.counted.0.elapsed() >= std::time::Duration::from_secs(5) {
             if std::env::var_os("HESTECLIPS_HOOK_LOG").is_some() {
                 let secs = self.counted.0.elapsed().as_secs_f64();
-                eprintln!("game hook: {:.0} looks/s, {:.0} new pictures/s, {} comparisons unread", self.counted.1 as f64 / secs, self.counted.2 as f64 / secs, self.counted.3);
+                eprintln!(
+                    "game hook: {:.0} looks/s, {:.0} new pictures/s, {} comparisons unread, {} looks skipped (every slot waiting), up to {} waiting of {} slots",
+                    self.counted.1 as f64 / secs,
+                    self.counted.2 as f64 / secs,
+                    self.counted.3,
+                    self.counted.4,
+                    self.counted.5,
+                    self.ring.len()
+                );
             }
-            self.counted = (std::time::Instant::now(), 0, 0, 0);
+            self.counted = (std::time::Instant::now(), 0, 0, 0, 0, 0);
         }
         self.before = Some((i, compare_size, at));
-        self.next = (i + 1) % RING;
+        self.next = (i + 1) % self.ring.len();
     }
 
     /// The comparisons that have arrived: a look that brought a new picture

@@ -32,9 +32,16 @@ pub struct Frames {
     opened: HashMap<(usize, usize), (Vec<wgpu::Texture>, Planes)>,
     /// Each pool's shared fence, opened on D3D12.
     fences: HashMap<usize, ID3D12Fence>,
-    /// Pools seen, oldest first (a decoder makes a new one if reopened).
+    /// Pools seen, the one shown longest ago first (a decoder makes a new
+    /// one if reopened; each of the scrub engine's decoders has its own).
     pools: Vec<usize>,
 }
+
+/// Pools whose textures stay open: playback's, the scrub engine's
+/// decoders' (whose frames take turns on screen while scrubbing: opening a
+/// texture again each time cost every new picture the time to open it),
+/// and a couple more.
+const POOLS: usize = 8;
 
 impl Frames {
     /// `s`, ready to draw (opened the first time it's seen). Call it each
@@ -68,15 +75,29 @@ impl Frames {
         Some(Shown { key: s.key(), planes })
     }
 
-    /// Keep the current pool's textures and the one before it (its frames can
-    /// still be on screen for a moment); free older ones.
-    fn forget_old_pools(&mut self, rs: &RenderState, pool: usize) {
-        if self.pools.contains(&pool) {
+    /// Let go of these pools' textures (their decoders are closing): what
+    /// draws a frame of theirs already on screen keeps that one.
+    pub fn forget(&mut self, pools: &[usize]) {
+        if pools.is_empty() {
             return;
         }
+        self.pools.retain(|p| !pools.contains(p));
+        self.fences.retain(|p, _| !pools.contains(p));
+        self.opened.retain(|(p, _), _| !pools.contains(p));
+        super::forget_pools(pools);
+    }
+
+    /// Keep the textures of the [`POOLS`] pools shown last, this one now
+    /// (a pool shown before can still be on screen for a moment); free those
+    /// of the one shown longest ago.
+    fn forget_old_pools(&mut self, rs: &RenderState, pool: usize) {
+        if self.pools.last() == Some(&pool) {
+            return;
+        }
+        self.pools.retain(|&p| p != pool);
         self.pools.push(pool);
         let _ = rs;
-        while self.pools.len() > 2 {
+        while self.pools.len() > POOLS {
             let old = self.pools.remove(0);
             self.fences.remove(&old);
             // Dropped, not destroyed: a frame drawn this pass may still use

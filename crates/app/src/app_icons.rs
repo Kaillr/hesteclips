@@ -51,7 +51,7 @@ impl AppIcons {
     /// The icon of app `id` (an app source's id), if it's been read; starts
     /// reading it if not.
     pub fn get(&mut self, ctx: &egui::Context, id: &str) -> Option<egui::TextureHandle> {
-        if !capture::APP_CAPTURE {
+        if !capture::app_capture() {
             return None;
         }
         let finished: Vec<_> = std::mem::take(&mut *self.done.lock().unwrap());

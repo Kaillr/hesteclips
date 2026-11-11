@@ -2,6 +2,11 @@
 //! `OUTPUT` (default 0) for `SECS` (default 8) and counts the frames whose
 //! picture actually changed (a 256×256 patch at the centre, compared).
 //! `WAIT_FOR=<process name>` starts once that process's window is in front.
+//! `ASK_EVERY=<ms>`: asks without waiting, that often, and copies nothing, as
+//! the probe that tells whether a fullscreen game reaches Windows' capture
+//! does (to measure what keeping one open costs); `LOOK_EVERY=<ms>`: short
+//! looks that often instead, as the probe makes them (what starting one
+//! costs a game).
 #[cfg(windows)]
 fn main() -> anyhow::Result<()> {
     use std::time::{Duration, Instant};
@@ -94,13 +99,42 @@ fn main() -> anyhow::Result<()> {
         let start = Instant::now();
         let (mut frames, mut changed, mut lost, mut timeouts) = (0u32, 0u32, 0u32, 0u32);
         let mut last_hash = 0u64;
+        let ask_every = std::env::var("ASK_EVERY").ok().and_then(|v| v.parse::<u64>().ok());
+        // LOOK_EVERY=<ms>: short looks instead, as the probe makes them: a
+        // duplication started that often, asked for 200 ms, then let go (to
+        // measure what starting one costs a game).
+        if let Some(every) = std::env::var("LOOK_EVERY").ok().and_then(|v| v.parse::<u64>().ok()) {
+            drop(dupl);
+            let mut looks = 0;
+            while start.elapsed().as_secs_f64() < secs {
+                let opened = Instant::now();
+                if let Ok(d) = duplicate() {
+                    looks += 1;
+                    while opened.elapsed() < Duration::from_millis(200) {
+                        let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
+                        let mut res = None;
+                        if d.AcquireNextFrame(0, &mut info, &mut res).is_ok() {
+                            frames += (info.LastPresentTime != 0) as u32;
+                            let _ = d.ReleaseFrame();
+                        }
+                        std::thread::sleep(Duration::from_millis(ask_every.unwrap_or(100)));
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(every).saturating_sub(opened.elapsed()));
+            }
+            println!("{looks} looks, {frames} new frames in {secs} s");
+            return Ok(());
+        }
         while start.elapsed().as_secs_f64() < secs {
             let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
             let mut res = None;
-            match dupl.AcquireNextFrame(100, &mut info, &mut res) {
+            match dupl.AcquireNextFrame(if ask_every.is_some() { 0 } else { 100 }, &mut info, &mut res) {
                 Ok(()) => {}
                 Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => {
                     timeouts += 1;
+                    if let Some(ms) = ask_every {
+                        std::thread::sleep(Duration::from_millis(ms));
+                    }
                     continue;
                 }
                 Err(e) if e.code() == DXGI_ERROR_ACCESS_LOST || e.code() == DXGI_ERROR_INVALID_CALL => {
@@ -120,6 +154,8 @@ fn main() -> anyhow::Result<()> {
             }
             if info.LastPresentTime != 0 {
                 frames += 1;
+            }
+            if info.LastPresentTime != 0 && ask_every.is_none() {
                 let tex: ID3D11Texture2D = res.unwrap().cast()?;
                 let region = D3D11_BOX { left: cx, top: cy, front: 0, right: cx + patch, bottom: cy + patch, back: 1 };
                 context.CopySubresourceRegion(&staging, 0, 0, 0, 0, &tex, 0, Some(&region));

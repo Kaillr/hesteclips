@@ -44,8 +44,18 @@ pub fn save_mp3(clip: &Path, out: &Path) -> Result<(), String> {
     Err(why.lines().last().unwrap_or("ffmpeg failed").to_owned())
 }
 
-/// Whether clips can be dragged out of the window into other apps.
-pub const CAN_DRAG_OUT: bool = cfg!(any(target_os = "macos", target_os = "windows"));
+/// Whether clips can be dragged out of the window into other apps: on
+/// Windows and macOS, and on Linux under Wayland (`wayland_drag`).
+pub fn can_drag_out() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        crate::wayland_drag::available()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        cfg!(any(target_os = "macos", target_os = "windows"))
+    }
+}
 
 /// Start a native drag of `files` out of the window. The drag image is the
 /// first clip's thumbnail (a JPEG on disk) when we have one, as a little stack
@@ -63,7 +73,12 @@ pub fn start_drag(frame: &eframe::Frame, files: Vec<PathBuf>, preview: Option<Pa
     .map_err(|e| e.to_string())
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[cfg(target_os = "linux")]
+pub fn start_drag(frame: &eframe::Frame, files: Vec<PathBuf>, _preview: Option<PathBuf>) -> Result<(), String> {
+    crate::wayland_drag::start(frame, &files)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 pub fn start_drag(_frame: &eframe::Frame, _files: Vec<PathBuf>, _preview: Option<PathBuf>) -> Result<(), String> {
     Err("dragging clips out isn't available here — use Copy clip".into())
 }
@@ -99,6 +114,42 @@ pub fn copy_file(file: &Path) -> Result<(), String> {
     {
         let ctx = clipboard_rs::ClipboardContext::new().map_err(|e| e.to_string())?;
         ctx.set_files(vec![entry]).map_err(|e| e.to_string())
+    }
+}
+
+/// Put a picture on the clipboard, `width`×`height` RGBA: ready to paste
+/// into Discord, a chat or an image editor.
+pub fn copy_image(width: u32, height: u32, rgba: Vec<u8>) -> Result<(), String> {
+    use clipboard_rs::Clipboard;
+    use clipboard_rs::common::RustImage;
+    let img = image::DynamicImage::ImageRgba8(image::RgbaImage::from_raw(width, height, rgba).ok_or("the picture's size isn't right")?);
+    // As for files: on Linux one context serves what's copied.
+    #[cfg(target_os = "linux")]
+    {
+        static CTX: std::sync::Mutex<Option<clipboard_rs::ClipboardContext>> = std::sync::Mutex::new(None);
+        let mut ctx = CTX.lock().unwrap();
+        if ctx.is_none() {
+            *ctx = Some(clipboard_rs::ClipboardContext::new().map_err(|e| e.to_string())?);
+        }
+        return ctx.as_ref().unwrap().set_image(clipboard_rs::RustImageData::from_dynamic_image(img)).map_err(|e| e.to_string());
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let ctx = clipboard_rs::ClipboardContext::new().map_err(|e| e.to_string())?;
+        // Another app can have the clipboard open for a moment (one that
+        // keeps a history of what's copied reads each copy): try again for
+        // a while, not just the few microseconds clipboard-rs does.
+        let mut tries = 0;
+        loop {
+            match ctx.set_image(clipboard_rs::RustImageData::from_dynamic_image(img.clone())) {
+                Ok(()) => return Ok(()),
+                Err(_) if tries < 20 => {
+                    tries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Err(e) => return Err(e.to_string()),
+            }
+        }
     }
 }
 

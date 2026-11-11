@@ -558,6 +558,7 @@ impl Cloud {
 
     /// "New folder" under the list: a name field, made in `at` on Create (and
     /// opened, so it's picked).
+    #[allow(clippy::disallowed_methods)] // a folder's name: free text
     fn new_folder_ui(&mut self, ui: &mut egui::Ui, at: &FolderRef) {
         ui.add_space(4.0);
         let p = crate::theme::pal(ui);

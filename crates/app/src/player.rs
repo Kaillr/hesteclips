@@ -4,12 +4,13 @@
 //! and mixed live in the cpal callback at the current gains, so moving a slider is
 //! heard instantly. The playhead is however many samples the callback has played.
 //!
-//! Video follows the clock. On Windows and macOS it comes from the in-process
-//! hardware decoder (`video.rs`), which keeps the next frames decoded so play
-//! starts at once; if that can't open a file (or elsewhere), an ffmpeg process streams
-//! scaled RGBA frames from the playhead onward, and single exact frames are
-//! decoded on demand when paused. Either way the UI shows whichever decoded
-//! frame matches the clock. While scrubbing, frames come from the hardware
+//! Video follows the clock. It comes from the in-process decoder (`video.rs`:
+//! the GPU's on Windows and macOS, libavcodec on Linux), which keeps the next
+//! frames decoded so play starts at once; if that can't open a file, an ffmpeg process streams
+//! frames from the playhead onward (NV12 at the video's own size, uploaded to
+//! draw with the same sharp filter), and single exact frames are decoded on
+//! demand when paused. Either way the UI shows whichever decoded frame
+//! matches the clock. While scrubbing, frames come from the hardware
 //! decoder, live (`video.rs`); without one, from the scrub proxy, small
 //! frames built ahead in the background (`proxy.rs`).
 
@@ -48,7 +49,7 @@ enum Video {}
 impl Video {
     fn failed(&self) -> bool { match *self {} }
     fn show(&self, _: u64) { match *self {} }
-    fn scrub(&self, _: u64) { match *self {} }
+    fn scrub(&self, _: u64, _: Option<u64>) { match *self {} }
     fn take_scrub(&self) -> Option<Scrubbed> { match *self {} }
     fn play(&self, _: u64) { match *self {} }
     fn pause(&self) { match *self {} }
@@ -56,6 +57,7 @@ impl Video {
     fn take_upto(&self, _: u64) -> Option<Picture> { match *self {} }
     fn has(&self, _: u64) -> bool { match *self {} }
     fn open_for(&self) -> Option<std::time::Duration> { match *self {} }
+    fn set_skips(&self, _: Vec<(u64, u64)>) { match *self {} }
 }
 
 /// `HESTECLIPS_DEBUG_VIDEO=1`: log what playback does, with times.
@@ -71,6 +73,71 @@ macro_rules! trace {
         }
     };
 }
+
+/// How evenly new frames reach the screen while playing, for the debug log:
+/// the time from one frame to the next, each second. Even playback of a 60
+/// fps clip is 16.7 ms apart, give or take a display refresh.
+#[derive(Default)]
+struct Pacing {
+    last: Option<(std::time::Instant, u64)>,
+    since: Option<std::time::Instant>,
+    /// Milliseconds between frames that follow each other.
+    gaps: Vec<f64>,
+    /// Frames never shown.
+    skipped: u64,
+}
+
+impl Pacing {
+    /// Frame `idx` just went on screen. Once a second: how it's been.
+    fn frame(&mut self, idx: u64, fps: f64) -> Option<String> {
+        let now = std::time::Instant::now();
+        match self.last {
+            Some((at, i)) if idx == i + 1 => self.gaps.push((now - at).as_secs_f64() * 1000.0),
+            Some((_, i)) if idx > i + 1 => self.skipped += idx - i - 1,
+            _ => {}
+        }
+        self.last = Some((now, idx));
+        let since = *self.since.get_or_insert(now);
+        if now - since < std::time::Duration::from_secs(1) || self.gaps.is_empty() {
+            return None;
+        }
+        let n = self.gaps.len() as f64;
+        let mean = self.gaps.iter().sum::<f64>() / n;
+        let sd = (self.gaps.iter().map(|g| (g - mean).powi(2)).sum::<f64>() / n).sqrt();
+        let (min, max) = self.gaps.iter().fold((f64::MAX, 0.0f64), |(a, b), g| (a.min(*g), b.max(*g)));
+        let line = format!(
+            "pacing {} frames {mean:.1} ± {sd:.1} ms apart ({min:.1}–{max:.1}, even is {:.1}), {} skipped",
+            self.gaps.len(),
+            1000.0 / fps.max(1.0),
+            self.skipped
+        );
+        *self = Self { last: self.last, ..Self::default() };
+        Some(line)
+    }
+}
+
+/// What the window is doing, for what a player keeps open meanwhile
+/// ([`Player::set_window`]). An open clip held 756 MB of the graphics card
+/// (a 1440p 60 fps one, measured), minimized or not, until it was closed:
+/// beside a game short of its own, the game's would go to the system's
+/// memory, and it would stutter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Window {
+    /// In use: everything's open.
+    InUse,
+    /// On screen, but other windows have been in front of it a while (a
+    /// game): the scrub engine goes.
+    Behind,
+    /// Out of sight (minimized, in the tray): the playback decoder goes too,
+    /// once the player's paused and hasn't been drawn for [`UNSEEN`].
+    Hidden,
+}
+
+/// Out of sight, a paused player lets go of its playback decoder once it
+/// hasn't been drawn for this long: a window still drawn while it's hidden
+/// (as some desktops do) keeps it, instead of opening it again every frame.
+#[cfg(hw_decode)]
+const UNSEEN: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Seconds since the app started, for debug logs.
 pub fn uptime() -> f64 {
@@ -104,27 +171,42 @@ pub fn paint_proxy_bar(ui: &egui::Ui, player: &crate::player::Player, lane: egui
 
 /// What's on screen, with its size in pixels.
 enum Display {
-    /// An uploaded image: scrub proxy frames, frames that came back to the CPU.
+    /// An image through egui: scrub proxy frames, frames that came back to
+    /// the CPU.
     Image(egui::TextureId, egui::Vec2),
-    /// A decoded frame on the GPU, drawn with the sharp filter.
-    #[cfg(hw_decode)]
+    /// A frame on the GPU, drawn with the sharp filter: the hardware
+    /// decoder's, or one ffmpeg decoded, uploaded.
     Gpu(crate::gpu_frames::Shown, egui::Vec2),
 }
 
 impl Display {
     fn size(&self) -> egui::Vec2 {
         match self {
-            Display::Image(_, s) => *s,
-            #[cfg(hw_decode)]
-            Display::Gpu(_, s) => *s,
+            Display::Image(_, s) | Display::Gpu(_, s) => *s,
         }
     }
 }
 
+/// A frame from ffmpeg: NV12 at the video's own size, to upload and draw
+/// with the sharp filter; RGBA at [`PREVIEW_WIDTH`] where that can't be.
+enum Decoded {
+    Nv12(Vec<u8>),
+    Rgba(media::Frame),
+}
+
 /// Play waits at most this long for its first frame before the sound starts anyway.
 const START_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
+/// The same when the decoder had to go to the playhead first (after a
+/// scrub or a paused jump): it decodes from the keyframe before, up to a
+/// second of frames.
+#[cfg(hw_decode)]
+const CATCH_UP_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+/// The same for ffmpeg's first frame, which takes longer: it starts from the
+/// keyframe before (~170 ms for 1440p60).
+const FFMPEG_START_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// Preview frames are decoded at this width; plenty for an in-app viewer.
+/// Frames from ffmpeg are decoded at this width when they can't be drawn
+/// with the sharp filter.
 pub const PREVIEW_WIDTH: u32 = 1280;
 
 /// Live mix state shared with the audio callback.
@@ -147,6 +229,7 @@ struct Shared {
     /// Where playback stops (in stereo frames).
     end: AtomicU64,
     mix: Mutex<Mix>,
+    pcm: Mutex<Arc<Pcm>>,
     /// When the audio callback last moved `pos` ([`uptime`], µs), and how
     /// much it moves it each time (µs of sound): the clock only moves in
     /// those steps, so this says when the next frame can come up.
@@ -154,19 +237,59 @@ struct Shared {
     step_us: AtomicU64,
     /// How fast it plays (1.0 = as recorded), as `f32` bits.
     speed: AtomicU32,
+    /// How loud you listen (the volume and mute shared by the player and the
+    /// editor), as `f32` bits: applied to what's heard after the meters, so
+    /// they show the edit's own levels.
+    listen: AtomicU32,
+    /// The stretches cut out of the clip, which playing jumps over.
+    skips: Mutex<Vec<Skip>>,
+}
+
+/// A stretch cut out of the clip, in stereo frames: playing jumps from
+/// `from` to `to`, the sound crossfading over `fade` either side of the join
+/// as the saved clip's does (`media::join_fades`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Skip {
+    from: u64,
+    to: u64,
+    fade: u64,
+}
+
+impl Skip {
+    /// Playing at `pos`, within this join's crossfade: where the other side
+    /// of the join is, and how much of it is heard (half, at the join).
+    /// Before it, what comes after it fades in; after it, what came before
+    /// fades out.
+    fn across(&self, pos: u64) -> Option<(u64, f32)> {
+        if self.fade == 0 {
+            return None;
+        }
+        if pos < self.from && pos + self.fade >= self.from {
+            let left = self.from - pos;
+            Some((self.to - left, 0.5 * (1.0 - left as f32 / self.fade as f32)))
+        } else if pos >= self.to && pos < self.to + self.fade {
+            let past = pos - self.to;
+            Some((self.from + past, 0.5 * (1.0 - past as f32 / self.fade as f32)))
+        } else {
+            None
+        }
+    }
 }
 
 impl Shared {
-    fn new(mix: Mix) -> Self {
+    fn new(mix: Mix, pcm: Arc<Pcm>) -> Self {
         Self {
             pos: AtomicU64::new(0),
             playing: AtomicBool::new(false),
             scrubbing: AtomicBool::new(false),
             end: AtomicU64::new(u64::MAX),
             mix: Mutex::new(mix),
+            pcm: Mutex::new(pcm),
             moved_at_us: AtomicU64::new(0),
             step_us: AtomicU64::new(0),
             speed: AtomicU32::new(1.0f32.to_bits()),
+            listen: AtomicU32::new(1.0f32.to_bits()),
+            skips: Mutex::new(Vec::new()),
         }
     }
 
@@ -174,23 +297,34 @@ impl Shared {
         f64::from(f32::from_bits(self.speed.load(Ordering::Relaxed)))
     }
 
-    /// How long until the clock (`pos`) shows `t` seconds or later: the first
-    /// audio callback after it gets there, plus a little. Playing only.
+    /// The playhead, in seconds. Playing, it moves smoothly: the audio
+    /// callback moves `pos` a buffer at a time (480 frames, 10 ms), and the
+    /// picture timed by those steps changed 8 to 23 ms apart at 60 fps
+    /// instead of every 16.7 (a stutter frame blending shows up). So between
+    /// steps it's carried on by the time since the last one, from a step
+    /// behind: it gets where the callback put it just as the next one comes,
+    /// and never jumps or goes back. A late callback holds it there.
+    fn now(&self) -> f64 {
+        let pos = self.pos.load(Ordering::Relaxed) as f64;
+        let step_us = self.step_us.load(Ordering::Relaxed) as f64;
+        if !self.playing.load(Ordering::Relaxed) || step_us <= 0.0 {
+            return pos / PREVIEW_RATE as f64;
+        }
+        let since = (uptime() * 1e6 - self.moved_at_us.load(Ordering::Relaxed) as f64).clamp(0.0, step_us);
+        // Source frames per µs.
+        let rate = PREVIEW_RATE as f64 * self.speed() / 1e6;
+        let behind = (pos - (step_us - since) * rate).max(0.0);
+        // A step behind a jump over a cut lands in what's cut out: it's at
+        // the frame after the cut by then.
+        let cut = self.skips.lock().ok().and_then(|s| s.iter().find(|s| (s.from as f64..s.to as f64).contains(&behind)).copied());
+        cut.map_or(behind, |s| s.to as f64) / PREVIEW_RATE as f64
+    }
+
+    /// How long until the playhead ([`Self::now`]) shows `t` seconds.
+    /// Playing only.
     fn until(&self, t: f64) -> std::time::Duration {
-        let now = uptime();
-        let pos = self.pos.load(Ordering::Relaxed) as f64 / PREVIEW_RATE as f64;
-        let ahead = (t - pos).max(0.0) / self.speed().max(0.01);
-        let step = self.step_us.load(Ordering::Relaxed) as f64 / 1e6;
-        let wake = if step > 0.0 {
-            // The callback that moved it to `pos`, then whole steps on.
-            let moved = self.moved_at_us.load(Ordering::Relaxed) as f64 / 1e6;
-            moved + (ahead / step).ceil().max(1.0) * step
-        } else {
-            now + ahead
-        };
-        // A guess: callbacks come a little late now and then; waking 2 ms
-        // after one is due finds it done.
-        std::time::Duration::from_secs_f64((wake - now + 0.002).clamp(0.001, 0.1))
+        let ahead = (t - self.now()).max(0.0) / self.speed().max(0.01);
+        std::time::Duration::from_secs_f64(ahead.clamp(0.001, 0.1))
     }
 }
 
@@ -211,14 +345,21 @@ pub struct Player {
     on_screen: Option<Picture>,
     /// GPU frames just taken off screen, held a few more frames: the GPU may
     /// still be drawing them, and the decoder reuses a released texture.
-    retired: std::collections::VecDeque<(u64, Picture)>,
+    /// With the pass each left the screen in, and whether it was the scrub
+    /// engine's.
+    retired: std::collections::VecDeque<(u64, Picture, bool)>,
     /// GPU frames opened for drawing (see `gpu_frames.rs`).
     #[cfg(hw_decode)]
     gpu_frames: crate::gpu_frames::Frames,
+    /// Frames from ffmpeg, uploaded for drawing.
+    uploads: crate::gpu_frames::Uploads,
     shown_frame: Option<u64>,
     decoder: Option<FrameStream>,
+    /// Playing up to a cut: frames read from just after it (from the frame
+    /// numbered here), ready for when the playhead jumps there.
+    after_cut: Option<(u64, FrameStream)>,
     still_tx: Sender<(u64, f64)>,
-    still_rx: Receiver<(u64, media::Frame)>,
+    still_rx: Receiver<(u64, Decoded)>,
     /// Frame index the last on-demand still was requested for.
     still_wanted: Option<u64>,
     /// Every frame, small, for instant scrubbing, built in the background:
@@ -233,8 +374,69 @@ pub struct Player {
     stand_in: Option<u64>,
     /// The hardware decoder, while it works.
     video: Option<Video>,
+    /// Live scrubbing (`scrub.rs`): frames decoded ahead of the playhead
+    /// by several decoders, read on every redraw.
+    #[cfg(hw_decode)]
+    scrub: Option<crate::scrub::Engine>,
+    /// The engine while it opens, on a thread of its own: it waits for the
+    /// graphics card's decoder, which the first clip of a run starts
+    /// (~150 ms: the UI was held that long). Until it's there, scrubbing
+    /// goes through the playback decoder.
+    #[cfg(hw_decode)]
+    scrub_opening: Option<Receiver<Option<crate::scrub::Engine>>>,
+    /// The picture on screen is the scrub engine's (it holds one of its
+    /// decoders' textures).
+    #[cfg(hw_decode)]
+    engine_on_screen: bool,
+    /// Windows: the scrub engine's pools whose frames went on screen, so
+    /// were opened for drawing (`gpu_frames`).
+    #[cfg(all(hw_decode, windows))]
+    engine_pools: Vec<usize>,
+    /// The engine, and the playback decoder, were let go of while the
+    /// window wasn't in use ([`Self::set_window`]): opened again once it is.
+    #[cfg(hw_decode)]
+    engine_let_go: bool,
+    #[cfg(hw_decode)]
+    video_let_go: bool,
+    /// The cuts, as frames (`from..to`), as the playback decoder was told
+    /// them: told again when it's opened again.
+    #[cfg(hw_decode)]
+    video_skips: Vec<(u64, u64)>,
+    /// When the picture was last brought up to date ([`Self::update`]):
+    /// while it's drawn, it's seen.
+    #[cfg(hw_decode)]
+    drawn_at: Option<std::time::Instant>,
+    /// What the window was doing, as last told ([`Self::set_window`]).
+    #[cfg(hw_decode)]
+    window: Window,
+    /// The playhead's motion while scrubbing.
+    #[cfg(hw_decode)]
+    motion: Option<Motion>,
+    /// How long a redraw takes while scrubbing (s), smoothed.
+    #[cfg(hw_decode)]
+    redraw_secs: f64,
+    /// The engine's frames uploaded ahead of the playhead (`scrub.rs`).
+    #[cfg(all(hw_decode, target_os = "linux"))]
+    uploader: Option<crate::scrub::Uploader>,
+    /// The playhead frame a stand-in (the nearest frame decoded, its own
+    /// not being yet) was put on screen for: one per frame the playhead is
+    /// at, then only its own. (Each frame decoded on the way to it showed
+    /// as it came, nearer and nearer: stopped, the picture played on a
+    /// few frames.)
+    #[cfg(hw_decode)]
+    stood_in_for: Option<u64>,
+    /// The playback decoder isn't at the playhead yet: scrubbing left it
+    /// elsewhere, or it's still decoding the frame it was asked for. Play
+    /// waits for it rather than start the sound over a still picture.
+    #[cfg(hw_decode)]
+    catching_up: bool,
+    /// How long play waits for its first frame before the sound starts
+    /// anyway (longer while the decoder is catching up: it decodes from
+    /// the keyframe before).
+    pending_wait: std::time::Duration,
     /// Play was pressed; the sound starts with the first frame (or after
-    /// [`START_WAIT`]), so picture and sound start together.
+    /// [`START_WAIT`], [`FFMPEG_START_WAIT`] for ffmpeg's), so picture and
+    /// sound start together.
     pending_start: Option<std::time::Instant>,
     /// The decoder was told to play (to tell it to stop when playback ends).
     video_playing: bool,
@@ -243,7 +445,8 @@ pub struct Player {
     /// When the full-quality frame was last asked for (debug log).
     asked_at: Option<std::time::Instant>,
     /// Frames shown while playing, per second (debug log).
-    shown_count: Option<(std::time::Instant, u32)>,
+    /// How evenly new frames reach the screen while playing (debug log).
+    pacing: Pacing,
     /// The frame whose picture is on screen, whatever kind (debug log).
     screen_index: Option<u64>,
     /// How the picture keeps up while scrubbing (debug log).
@@ -252,6 +455,28 @@ pub struct Player {
     /// it does scrubbing (no sound).
     stepping: bool,
 }
+
+/// How the playhead moves while it's scrubbed (with the scrub engine).
+#[cfg(hw_decode)]
+#[derive(Clone, Copy)]
+struct Motion {
+    /// Where it was at the last redraw, and when that was.
+    at: u64,
+    seen: std::time::Instant,
+    /// Frames a second (below zero going back), smoothed.
+    speed: f64,
+    /// When it got where it is, and whether by a jump (a click) rather
+    /// than moving there.
+    moved: std::time::Instant,
+    jumped: bool,
+}
+
+/// Scrubbing, the playhead that hasn't moved for this long is held still:
+/// the scrub engine decodes around it, and the picture settles. (A pointer
+/// held still sends nothing: the UI redraws this long after it last moved
+/// to see that.)
+#[cfg(hw_decode)]
+const HELD: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Debug log: while scrubbing, once a second, how many new pictures came
 /// up, how many redraws showed the frame wanted, and how far behind it the
@@ -265,9 +490,18 @@ struct ScrubStats {
     behind: u64,
     worst: u64,
     last: Option<u64>,
+    /// Time putting new pictures on screen (s), in all and the longest.
+    showing: f64,
+    showing_max: f64,
 }
 
 impl ScrubStats {
+    #[cfg(hw_decode)]
+    fn showed(&mut self, secs: f64) {
+        self.showing += secs;
+        self.showing_max = self.showing_max.max(secs);
+    }
+
     fn note(&mut self, want: u64, on_screen: Option<u64>, exact: bool) {
         let since = *self.since.get_or_insert_with(std::time::Instant::now);
         self.redraws += 1;
@@ -281,12 +515,14 @@ impl ScrubStats {
         self.worst = self.worst.max(off);
         if since.elapsed().as_secs_f64() >= 1.0 {
             trace!(
-                "scrubbing: {} new pictures/s, {} of {} redraws exact, behind by {:.1} frames on average (at most {})",
+                "scrubbing: {} new pictures/s, {} of {} redraws exact, behind by {:.1} frames on average (at most {}), showing a picture took {:.2} ms (at most {:.2})",
                 self.pictures,
                 self.exact,
                 self.redraws,
                 self.behind as f64 / self.redraws as f64,
-                self.worst
+                self.worst,
+                self.showing * 1000.0 / self.pictures.max(1) as f64,
+                self.showing_max * 1000.0
             );
             *self = Self { last: self.last, ..Self::default() };
         }
@@ -297,21 +533,28 @@ impl Player {
     /// `pcm` track `i` is source track `i` as interleaved stereo at
     /// [`PREVIEW_RATE`]; it may still be filling in (it plays as it's decoded).
     pub fn new(ctx: &egui::Context, source: &Path, info: ClipInfo, pcm: Arc<Pcm>, gains: Vec<TrackEdit>) -> Self {
-        Self::with_pcm(ctx, source, info, pcm, gains)
+        Self::with_pcm(ctx, source, info, pcm, gains, true)
     }
 
-    fn with_pcm(ctx: &egui::Context, source: &Path, info: ClipInfo, pcm: Arc<Pcm>, gains: Vec<TrackEdit>) -> Self {
-        let n = pcm.len();
-        let shared = Arc::new(Shared::new(Mix { tracks: gains, track_levels: vec![(0.0, 0.0); n], master_level: (0.0, 0.0), master_stereo: Default::default() }));
-        let (stream, audio_error) = match start_audio(shared.clone(), pcm.clone()) {
-            Ok(s) => (Some(s), None),
-            Err(e) => (None, Some(e)),
-        };
+    /// A player that only plays (a card's preview in the library): no
+    /// scrub engine, whose decoders and kept frames would go unused.
+    pub fn preview(ctx: &egui::Context, source: &Path, info: ClipInfo, pcm: Arc<Pcm>, gains: Vec<TrackEdit>) -> Self {
+        Self::with_pcm(ctx, source, info, pcm, gains, false)
+    }
 
-        let (still_tx, still_rx) = still_worker(ctx, source);
+    fn with_pcm(ctx: &egui::Context, source: &Path, info: ClipInfo, pcm: Arc<Pcm>, gains: Vec<TrackEdit>, scrubs: bool) -> Self {
+        let (shared, stream, audio_error) = sound(pcm, gains);
+
+        let (still_tx, still_rx) = still_worker(ctx, source, nv12_size(&info));
 
         let video = open_video(ctx, source, info.fps);
         let proxy = video.is_none().then(|| Proxy::build(ctx, source, info.fps, total_frames(&info)));
+        // `HESTECLIPS_SCRUB_ENGINE=0`: scrub through the playback decoder
+        // instead, to compare (as it does where the engine can't start).
+        #[cfg(hw_decode)]
+        let scrub_opening = video.as_ref().filter(|_| scrubs && std::env::var_os("HESTECLIPS_SCRUB_ENGINE").is_none_or(|v| v != "0")).map(|_| open_engine(ctx, source, &info));
+        #[cfg(not(hw_decode))]
+        let _ = scrubs;
         Self {
             source: source.to_path_buf(),
             info,
@@ -325,8 +568,10 @@ impl Player {
             retired: Default::default(),
             #[cfg(hw_decode)]
             gpu_frames: Default::default(),
+            uploads: Default::default(),
             shown_frame: None,
             decoder: None,
+            after_cut: None,
             still_tx,
             still_rx,
             still_wanted: None,
@@ -335,10 +580,39 @@ impl Player {
             showing_proxy: false,
             stand_in: None,
             video,
+            #[cfg(hw_decode)]
+            scrub: None,
+            #[cfg(hw_decode)]
+            scrub_opening,
+            #[cfg(hw_decode)]
+            engine_on_screen: false,
+            #[cfg(all(hw_decode, windows))]
+            engine_pools: Vec::new(),
+            #[cfg(hw_decode)]
+            engine_let_go: false,
+            #[cfg(hw_decode)]
+            video_let_go: false,
+            #[cfg(hw_decode)]
+            video_skips: Vec::new(),
+            #[cfg(hw_decode)]
+            drawn_at: None,
+            #[cfg(hw_decode)]
+            window: Window::InUse,
+            #[cfg(hw_decode)]
+            motion: None,
+            #[cfg(hw_decode)]
+            redraw_secs: 1.0 / 240.0,
+            #[cfg(all(hw_decode, target_os = "linux"))]
+            uploader: None,
+            #[cfg(hw_decode)]
+            stood_in_for: None,
+            #[cfg(hw_decode)]
+            catching_up: false,
+            pending_wait: START_WAIT,
             pending_start: None,
             video_playing: false,
             played_at: None,
-            shown_count: None,
+            pacing: Pacing::default(),
             asked_at: None,
             screen_index: None,
             scrub_stats: ScrubStats::default(),
@@ -352,11 +626,227 @@ impl Player {
     /// reloads, nothing stops.
     pub fn renamed(&mut self, ctx: &egui::Context, to: &Path) {
         self.source = to.to_path_buf();
-        (self.still_tx, self.still_rx) = still_worker(ctx, to);
+        (self.still_tx, self.still_rx) = still_worker(ctx, to, nv12_size(&self.info));
+    }
+
+    /// Take over the other screen's player (see `handoff.rs`), if it plays
+    /// `source` (a clip never edited: the player and the editor play the
+    /// same file): it plays on, with `pcm`'s tracks mixed by `gains`; speed,
+    /// scrubbing and cuts start afresh. Its file is as it was: the handoff is
+    /// dropped when the clip's files change.
+    pub fn adopt(&mut self, source: &Path, pcm: Arc<Pcm>, gains: Vec<TrackEdit>) -> bool {
+        if self.source != source {
+            return false;
+        }
+        let n = pcm.len();
+        if let Ok(mut playing) = self.shared.pcm.lock() {
+            *playing = pcm;
+        }
+        if let Ok(mut mix) = self.shared.mix.lock() {
+            mix.tracks = gains;
+            mix.track_levels = vec![(0.0, 0.0); n];
+        }
+        self.shared.speed.store(1.0f32.to_bits(), Ordering::Relaxed);
+        self.shared.scrubbing.store(false, Ordering::Relaxed);
+        self.stepping = false;
+        self.set_cuts(&[]);
+        // Hushed for a curtain and handed straight back (a quick switch
+        // back): its sound comes back. The sound is what moves the clock;
+        // without it, it would stand still, saying it plays.
+        if self._stream.is_none() {
+            (self._stream, self.audio_error) = match start_audio(self.shared.clone()) {
+                Ok(s) => (Some(s), None),
+                Err(e) => (None, Some(e)),
+            };
+        }
+        true
+    }
+
+    /// Pause and let go of the sound output: a curtain only shows its
+    /// picture, while the player taking its place starts.
+    pub fn hush(&mut self) {
+        self.pause();
+        self._stream = None;
+        self.stepping = false;
+    }
+
+    /// What the window is doing ([`Window`]), each frame. While it isn't
+    /// in use the scrub engine is let go of, and out of sight the playback
+    /// decoder too (paused, and not drawn for [`UNSEEN`]); each is opened
+    /// again once it's back. The clip, the playhead, the sound and the
+    /// picture on screen stay as they are. Whether it let go of either just
+    /// now.
+    pub fn set_window(&mut self, ctx: &egui::Context, window: Window) -> bool {
+        #[cfg(hw_decode)]
+        {
+            if window != self.window {
+                trace!("window {}", match window {
+                    Window::InUse => "in use",
+                    Window::Behind => "not in use",
+                    Window::Hidden => "out of sight",
+                });
+                self.window = window;
+            }
+            let held = (self.engine_let_go, self.video_let_go);
+            match window {
+                // The playback decoder first: the engine opens only beside it.
+                Window::InUse => {
+                    self.open_video_again(ctx);
+                    self.open_engine_again(ctx);
+                }
+                Window::Behind => {
+                    self.let_go_of_engine();
+                    self.open_video_again(ctx);
+                }
+                // The engine first: what it keeps can be on screen.
+                Window::Hidden => {
+                    self.let_go_of_engine();
+                    if !self.is_playing() && self.drawn_at.is_none_or(|t| t.elapsed() >= UNSEEN) {
+                        self.let_go_of_video();
+                    }
+                }
+            }
+            (!held.0 && self.engine_let_go) || (!held.1 && self.video_let_go)
+        }
+        #[cfg(not(hw_decode))]
+        {
+            let _ = (ctx, window);
+            false
+        }
+    }
+
+    /// Let go of the scrub engine: its decoders and their textures (on
+    /// Windows made as they open, up to a sixth of the card's memory: 512 MB
+    /// to 1.5 GB), and its watcher reading the card's counters every second.
+    /// Scrubbing goes through the playback decoder until it's back.
+    #[cfg(hw_decode)]
+    fn let_go_of_engine(&mut self) {
+        if self.scrub.is_none() && self.scrub_opening.is_none() {
+            return;
+        }
+        trace!("scrub engine let go of: the window isn't in use");
+        // Still opening: it stops as it drops, once it's open.
+        self.scrub_opening = None;
+        self.scrub = None;
+        #[cfg(target_os = "linux")]
+        {
+            self.uploader = None;
+        }
+        self.motion = None;
+        self.stood_in_for = None;
+        self.engine_let_go = true;
+        // Windows: its frames on screen and just off it hold its decoders'
+        // textures (a pool each), and so does what opened them for drawing.
+        // They go: no decoder of its writes them again, and what draws the
+        // picture on screen keeps that one. Elsewhere the engine keeps
+        // playback's frames too (`scrub::KEEPS_PLAYBACK`): one taken for its
+        // own may be playback's, which would get it back to write over while
+        // it's still on screen. They stay till they're off it.
+        #[cfg(windows)]
+        {
+            if std::mem::take(&mut self.engine_on_screen) {
+                self.on_screen = None;
+            }
+            self.retired.retain(|(_, _, engine)| !engine);
+            self.gpu_frames.forget(&std::mem::take(&mut self.engine_pools));
+        }
+    }
+
+    /// The scrub engine again, after [`Self::let_go_of_engine`]: opening
+    /// on a thread of its own, as when the clip opened.
+    #[cfg(hw_decode)]
+    fn open_engine_again(&mut self, ctx: &egui::Context) {
+        if !self.engine_let_go || self.hw().is_none() {
+            return;
+        }
+        trace!("scrub engine opened again");
+        self.engine_let_go = false;
+        self.scrub_opening = Some(open_engine(ctx, &self.source, &self.info));
+    }
+
+    /// Let go of the playback decoder, paused while the window's out of
+    /// sight (after the engine: no decoder is left to write a frame again):
+    /// its own textures (16 to 24 frames at the video's size: 133 MB at
+    /// 1440p) and its decoder's, every frame held, and what opened them for
+    /// drawing. The picture on screen stays (what draws it is kept).
+    #[cfg(hw_decode)]
+    fn let_go_of_video(&mut self) {
+        // None (let go of already), or broken: ffmpeg's frames meanwhile.
+        if self.hw().is_none() {
+            return;
+        }
+        trace!("playback decoder let go of: the window's out of sight");
+        self.video = None;
+        self.video_let_go = true;
+        self.video_playing = false;
+        self.still_wanted = None;
+        self.scrub_asked = None;
+        self.catching_up = false;
+        self.on_screen = None;
+        self.engine_on_screen = false;
+        self.retired.clear();
+        self.gpu_frames = Default::default();
+        #[cfg(windows)]
+        self.engine_pools.clear();
+        // Dev aid: `HESTECLIPS_DEV_DROP_PICTURE=1` lets go of the picture on
+        // screen too (what draws it holds its texture; it comes back from the
+        // playback decoder as the window does), to see whether that's what
+        // keeps a clip's memory held.
+        if dev_flag("HESTECLIPS_DEV_DROP_PICTURE") && matches!(self.display, Some(Display::Gpu(..))) {
+            self.display = None;
+            self.shown_frame = None;
+            self.screen_index = None;
+        }
+    }
+
+    /// The playback decoder again, after [`Self::let_go_of_video`], told
+    /// the cuts and asked at once for the frame at the playhead and the few
+    /// after it: play waits for them, as after a scrub.
+    #[cfg(hw_decode)]
+    fn open_video_again(&mut self, ctx: &egui::Context) {
+        if !std::mem::take(&mut self.video_let_go) {
+            return;
+        }
+        trace!("playback decoder opened again");
+        self.video = open_video(ctx, &self.source, self.info.fps);
+        if let Some(v) = &self.video {
+            v.set_skips(self.video_skips.clone());
+        }
+        self.ask_exact(self.info.frame_index(self.time()));
+    }
+
+    /// The player for `source`: `handoff` (the other screen's) taken over
+    /// if it can be (see [`Player::adopt`]), else a new one, with the
+    /// handoff hushed into its curtain if it has a picture to show. Says
+    /// whether it was taken over: then it's still where it was, and playing
+    /// if it was.
+    pub fn handed_over(
+        ctx: &egui::Context,
+        source: &Path,
+        info: &ClipInfo,
+        pcm: Arc<Pcm>,
+        gains: Vec<TrackEdit>,
+        handoff: Option<Self>,
+    ) -> (Self, Option<Self>, bool) {
+        let mut handoff = handoff;
+        let taken = handoff.as_mut().is_some_and(|p| p.adopt(source, pcm.clone(), gains.clone()));
+        if taken {
+            return (handoff.expect("just taken over"), None, true);
+        }
+        let curtain = handoff.filter(|p| p.size().is_some()).map(|mut p| {
+            p.hush();
+            p
+        });
+        (Self::new(ctx, source, info.clone(), pcm, gains), curtain, false)
+    }
+
+    /// The picture's size, once there's one on screen.
+    pub fn size(&self) -> Option<egui::Vec2> {
+        self.display.as_ref().map(Display::size)
     }
 
     pub fn time(&self) -> f64 {
-        self.shared.pos.load(Ordering::Relaxed) as f64 / PREVIEW_RATE as f64
+        self.shared.now()
     }
 
     /// Playing, or about to (waiting for the first frame).
@@ -378,6 +868,7 @@ impl Player {
         let t = t.clamp(0.0, self.info.duration);
         self.shared.pos.store(to_samples(t), Ordering::Relaxed);
         self.decoder = None; // restarts from the new position if playing
+        self.after_cut = None;
         if self.is_playing() {
             if let Some(v) = self.hw() {
                 v.play(self.info.frame_index(t));
@@ -390,19 +881,49 @@ impl Player {
         trace!("play at frame {} (showing {:?}{})", self.info.frame_index(self.time()), self.shown_frame, if self.showing_proxy { ", proxy" } else { "" });
         self.played_at = Some(std::time::Instant::now());
         self.shared.end.store((until * PREVIEW_RATE as f64) as u64, Ordering::Relaxed);
+        // The playback decoder still on its way to the playhead (scrubbing
+        // left it elsewhere, or it's decoding the frame asked for): play
+        // waits for it.
+        #[cfg(hw_decode)]
+        let behind = std::mem::take(&mut self.catching_up);
+        #[cfg(not(hw_decode))]
+        let behind = false;
+        // Asked for this frame, it decodes the next few after it too.
+        let asked = std::mem::take(&mut self.still_wanted);
+        self.pending_wait = START_WAIT;
         if let Some(v) = self.hw() {
             // Showing the frame under the playhead already: carry on from the
             // next, which was decoded while paused. Otherwise wait for this one.
             let want = self.info.frame_index(self.time());
             let showing = self.shown_frame == Some(want) && !self.showing_proxy;
-            v.play(if showing { want + 1 } else { want });
+            v.play(if showing && (!behind || asked == Some(want)) { want + 1 } else { want });
             self.video_playing = true;
-            if !showing {
+            if !showing || behind {
+                #[cfg(hw_decode)]
+                if behind {
+                    self.pending_wait = CATCH_UP_WAIT;
+                }
                 self.pending_start = Some(std::time::Instant::now());
                 return;
             }
+        } else {
+            // ffmpeg's frames: the sound waits for the first (`update`
+            // starts it). Starting together, the picture stood still while
+            // ffmpeg started, then jumped ahead.
+            self.pending_start = Some(std::time::Instant::now());
+            return;
         }
         self.shared.playing.store(true, Ordering::Relaxed);
+    }
+
+    /// Play until `until` seconds: playing already (taken over from the
+    /// other screen), it carries on, only stopping there instead.
+    pub fn play_on(&mut self, until: f64) {
+        if self.is_playing() {
+            self.shared.end.store((until * PREVIEW_RATE as f64) as u64, Ordering::Relaxed);
+        } else {
+            self.play(until);
+        }
     }
 
     /// How fast it plays: 1.0 as recorded, 0.5 half speed.
@@ -411,9 +932,17 @@ impl Player {
     }
 
     pub fn pause(&mut self) {
+        // Stopped where the picture is, the smooth playhead (`Shared::now`),
+        // not up to a buffer ahead where the callback last put it: the frame
+        // on screen stays.
+        let at = self.sound_playing().then(|| (self.time() * PREVIEW_RATE as f64) as u64);
         self.shared.playing.store(false, Ordering::Relaxed);
+        if let Some(at) = at {
+            self.shared.pos.store(at, Ordering::Relaxed);
+        }
         self.pending_start = None;
         self.decoder = None;
+        self.after_cut = None;
         // Only when it was playing: the decoder acts on its newest command, so
         // a needless pause right after asking for a frame would cancel that.
         if self.video_playing {
@@ -444,10 +973,57 @@ impl Player {
         self.proxy.as_ref()?.frame(idx)
     }
 
+    /// What's kept of the clip: these parts (in order, apart, as
+    /// `media::Edit::kept` has them). Playing jumps over what's cut out
+    /// between them, the sound crossfading at each join as the saved clip's
+    /// does.
+    pub fn set_cuts(&mut self, kept: &[(f64, f64)]) {
+        let fades = media::join_fades(kept);
+        let skips: Vec<Skip> = kept
+            .windows(2)
+            .zip(&fades)
+            .map(|(w, f)| Skip { from: to_samples(w[0].1), to: to_samples(w[1].0), fade: (f * PREVIEW_RATE as f64) as u64 })
+            .collect();
+        let Ok(mut now) = self.shared.skips.lock() else { return };
+        if *now == skips {
+            return;
+        }
+        // Playing in what's just been cut out: on from its end at once, the
+        // picture too (read on to there, it would stand still meanwhile).
+        let pos = self.shared.pos.load(Ordering::Relaxed);
+        let into = skips.iter().find(|s| (s.from..s.to).contains(&pos)).map(|s| s.to as f64 / PREVIEW_RATE as f64);
+        *now = skips;
+        drop(now);
+        // Frames read ahead from after a cut may be for one that's gone.
+        self.after_cut = None;
+        let frames: Vec<(u64, u64)> = kept.windows(2).map(|w| (self.info.frame_index(w[0].1), self.info.frame_index(w[1].0))).collect();
+        if let Some(v) = self.hw() {
+            v.set_skips(frames.clone());
+        }
+        #[cfg(hw_decode)]
+        {
+            self.video_skips = frames;
+        }
+        if let Some(to) = into.filter(|_| self.is_playing()) {
+            self.seek(to);
+        }
+    }
+
+    /// The next stretch cut out after `t` seconds, if one is.
+    fn next_cut(&self, t: f64) -> Option<Skip> {
+        let pos = to_samples(t);
+        self.shared.skips.lock().ok()?.iter().find(|s| s.from > pos).copied()
+    }
+
     pub fn set_mix(&self, gains: Vec<TrackEdit>) {
         if let Ok(mut m) = self.shared.mix.lock() {
             m.tracks = gains;
         }
+    }
+
+    /// How loud you listen, 0 (muted) to 1: the mix as it is, quieter.
+    pub fn set_listening(&self, gain: f32) {
+        self.shared.listen.store(gain.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
     }
 
     /// Current meter readings: per track, then master.
@@ -468,10 +1044,26 @@ impl Player {
     /// Returns the size of what's on screen (in pixels, to fit it); draw it
     /// with [`Self::paint`].
     pub fn update(&mut self, ctx: &egui::Context, scrubbing: bool) -> Option<egui::Vec2> {
+        #[cfg(hw_decode)]
+        {
+            self.drawn_at = Some(std::time::Instant::now());
+            // Drawn: the playback decoder, if it was let go of meanwhile
+            // (else it would count as broken, just below).
+            self.open_video_again(ctx);
+        }
         // The hardware decoder broke (or can't read this file): scrub from a
         // proxy after all.
         if self.proxy.is_none() && self.hw().is_none() {
             self.proxy = Some(Proxy::build(ctx, &self.source, self.info.fps, total_frames(&self.info)));
+            #[cfg(hw_decode)]
+            {
+                #[cfg(target_os = "linux")]
+                {
+                    self.uploader = None;
+                }
+                self.scrub = None;
+                self.scrub_opening = None;
+            }
         }
         if let Some(proxy) = &self.proxy {
             proxy.set_focus(self.info.frame_index(self.time()));
@@ -496,10 +1088,34 @@ impl Player {
         if !self.is_playing() {
             // Stopped by itself at the out point: the stream is now stale.
             self.decoder = None;
+            self.after_cut = None;
         }
         if self.is_playing() {
+            // Over a cut: on with the frames read from after it.
+            if self.after_cut.as_ref().is_some_and(|(from, _)| want >= *from) {
+                self.decoder = self.after_cut.take().map(|(_, s)| s);
+            }
             if self.decoder.is_none() {
                 self.decoder = FrameStream::start(ctx, &self.source, &self.info, t).ok();
+            }
+            // Nearing a cut: start reading from after it, so its first frame
+            // is there when the playhead jumps (ffmpeg takes a moment to
+            // start, and reading on through what's cut out takes longer).
+            if let Some(cut) = self.next_cut(t).filter(|c| c.from as f64 / PREVIEW_RATE as f64 - t < 1.0) {
+                let at = cut.to as f64 / PREVIEW_RATE as f64;
+                let from = self.info.frame_index(at);
+                if self.after_cut.as_ref().is_none_or(|(f, _)| *f != from) {
+                    self.after_cut = FrameStream::start(ctx, &self.source, &self.info, at).ok().map(|s| (from, s));
+                }
+            }
+            // Waiting to start: the sound goes once the first frame is here.
+            if let Some(since) = self.pending_start {
+                let ready = self.decoder.as_mut().is_none_or(|d| d.peek().is_some());
+                if ready || since.elapsed() >= FFMPEG_START_WAIT {
+                    trace!("sound starts after {:.0} ms (frame ready: {ready})", since.elapsed().as_secs_f64() * 1000.0);
+                    self.pending_start = None;
+                    self.shared.playing.store(true, Ordering::Relaxed);
+                }
             }
             if let Some(dec) = &mut self.decoder {
                 // Drop frames we're already past; show the newest one not in the future.
@@ -511,6 +1127,11 @@ impl Player {
                     best = dec.next();
                 }
                 if let Some((idx, frame)) = best {
+                    if debug() && self.sound_playing() {
+                        if let Some(line) = self.pacing.frame(idx, self.info.fps) {
+                            trace!("playing: {line}, now {idx} with the clock at {want}");
+                        }
+                    }
                     self.show(ctx, idx, frame);
                 }
             }
@@ -548,7 +1169,7 @@ impl Player {
             }
         }
         self.note_scrub(scrubbing);
-        self.display.as_ref().map(Display::size)
+        self.size()
     }
 
     /// A key held to step back frame by frame (see `stepping`).
@@ -579,13 +1200,16 @@ impl Player {
         crate::ui_kit::repaint_after(ctx, self.shared.until(next));
     }
 
-    /// Draw the picture into `rect`: a decoded frame through the sharp
-    /// filter (`gpu_frames.rs`), anything else as an image.
-    pub fn paint(&self, ui: &egui::Ui, rect: egui::Rect) {
+    /// Draw the picture into `rect`, cut to `painter`'s clip: a decoded frame
+    /// through the sharp filter (`gpu_frames.rs`), anything else as an image.
+    pub fn paint(&self, painter: &egui::Painter, rect: egui::Rect) {
         match &self.display {
-            Some(Display::Image(id, _)) => egui::Image::from_texture((*id, rect.size())).paint_at(ui, rect),
-            #[cfg(hw_decode)]
-            Some(Display::Gpu(shown, _)) => shown.paint(ui, rect),
+            Some(Display::Image(id, _)) => {
+                use egui::emath::GuiRounding as _;
+                let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+                painter.image(*id, rect.round_to_pixels(painter.pixels_per_point()), uv, egui::Color32::WHITE);
+            }
+            Some(Display::Gpu(shown, _)) => shown.paint(painter, rect),
             None => {}
         }
     }
@@ -593,6 +1217,10 @@ impl Player {
     /// The picture's colours, blurred very wide, over `cover` (clipped to
     /// `painter`): the light the stage around it takes. `id`: which stage.
     pub fn paint_glow(&self, painter: &egui::Painter, cover: egui::Rect, id: egui::Id) -> bool {
+        // Dev aid: `HESTECLIPS_DEV_NO_GLOW=1` draws no light, to measure its cost.
+        if dev_flag("HESTECLIPS_DEV_NO_GLOW") {
+            return false;
+        }
         match &self.display {
             Some(Display::Image(..)) => match &self.glow {
                 Some(tex) => {
@@ -601,7 +1229,6 @@ impl Player {
                 }
                 None => false,
             },
-            #[cfg(hw_decode)]
             Some(Display::Gpu(shown, _)) => {
                 shown.paint_glow(painter, cover, id);
                 true
@@ -615,13 +1242,45 @@ impl Player {
     fn update_hw(&mut self, ctx: &egui::Context, scrubbing: bool) {
         let Some(v) = self.video.as_ref() else { return };
         let want = self.info.frame_index(self.time());
+        #[cfg(hw_decode)]
+        {
+            // The engine, once it's open.
+            if let Some(rx) = &self.scrub_opening {
+                match rx.try_recv() {
+                    Ok(engine) => {
+                        self.scrub = engine;
+                        self.scrub_opening = None;
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => self.scrub_opening = None,
+                    Err(mpsc::TryRecvError::Empty) => {}
+                }
+            }
+            // Its decoders gone: its frames and textures go too (scrubbing
+            // carries on through the playback decoder).
+            if self.scrub.as_ref().is_some_and(|e| e.failed()) {
+                #[cfg(target_os = "linux")]
+                {
+                    self.uploader = None;
+                }
+                self.scrub = None;
+            }
+            if let Some(engine) = self.scrub.as_ref().filter(|_| self.is_playing()) {
+                engine.rest(want);
+            }
+            // Nothing to upload ahead unless scrubbing (playing on from a
+            // scrub, it kept going).
+            #[cfg(target_os = "linux")]
+            if let Some(u) = self.uploader.as_ref().filter(|_| self.is_playing() || !scrubbing) {
+                u.rest();
+            }
+        }
         // Waiting to start: the sound goes once the first frame is here.
         if let Some(since) = self.pending_start {
             // The wait counts from when the decoder opened (a few hundred ms
             // after a clip opens), so picture and sound start together then
             // too; at most 1.5 s in all.
             let waited = v.open_for().map_or(std::time::Duration::ZERO, |open| open.min(since.elapsed()));
-            if v.has(want) || waited >= START_WAIT || since.elapsed() >= std::time::Duration::from_millis(1500) {
+            if v.has(want) || waited >= self.pending_wait || since.elapsed() >= std::time::Duration::from_millis(1500) {
                 trace!("sound starts after {:.0} ms (frame ready: {})", since.elapsed().as_secs_f64() * 1000.0, v.has(want));
                 self.pending_start = None;
                 self.shared.playing.store(true, Ordering::Relaxed);
@@ -648,6 +1307,11 @@ impl Player {
                 }
             }
             if let Some(p) = v.take_upto(want) {
+                // Kept for scrubbing back over it, at no cost.
+                #[cfg(hw_decode)]
+                if let Some(engine) = &self.scrub {
+                    engine.offer(p.clone());
+                }
                 self.show_picture(ctx, p);
             }
             self.repaint_at_next_frame(ctx, want);
@@ -659,9 +1323,45 @@ impl Player {
             self.video_playing = false;
             self.still_wanted = None;
         }
+        // Scrubbing with the scrub engine: the picture at the playhead (or
+        // the nearest decoded) out of its cache, on this very redraw. Paused,
+        // it decodes around the playhead for the next drag.
+        #[cfg(hw_decode)]
+        if self.scrub.as_ref().is_some_and(|e| !e.failed()) {
+            if scrubbing {
+                self.scrub_engine(ctx, want);
+                return;
+            }
+            // Not (or no longer) scrubbing: the engine decodes around the
+            // playhead for the next drag, and its frame shows if the engine
+            // has it.
+            let was_scrubbing = self.motion.take().is_some();
+            self.stood_in_for = None;
+            let found = {
+                let engine = self.scrub.as_ref().expect("checked above");
+                engine.idle_at(want);
+                engine.frame_for(want)
+            };
+            let showed = match found.filter(|_| self.shown_frame != Some(want)) {
+                Some((p, true)) => {
+                    self.show_scrubbed(ctx, p, Some(want), 0.0);
+                    true
+                }
+                _ => false,
+            };
+            // The playback decoder isn't where a scrub, or a jump the engine
+            // showed at once, left the playhead: asked once, it decodes this
+            // frame (on screen already) and the next few, ready for play.
+            // (Not asked, play started the sound over the frame standing
+            // still while the decoder went there from the keyframe before.)
+            if (was_scrubbing || showed) && self.still_wanted != Some(want) {
+                self.ask_exact(want);
+            }
+        }
         // Scrubbing: what the decoder found for the newest frame asked (the
         // keyframe on the way there, or the frame itself); then the exact
         // frame asked once paused, which is newer.
+        let v = self.video.as_ref().expect("checked above");
         let (found, exact) = (v.take_scrub(), v.take_exact(want));
         if let Some(found) = found {
             // Kept small while scrubbing back: sharp again once it stops.
@@ -678,7 +1378,14 @@ impl Player {
             if let Some(at) = self.asked_at.take() {
                 trace!("sharp frame {want} (picture {}) {:.0} ms after asking", p.index, at.elapsed().as_secs_f64() * 1000.0);
             }
-            self.show_picture(ctx, p);
+            #[cfg(hw_decode)]
+            {
+                self.catching_up = false;
+            }
+            // On screen already (the scrub engine had it): nothing to redraw.
+            if self.screen_index != Some(p.index) || self.showing_proxy {
+                self.show_picture(ctx, p);
+            }
             // It's the picture for `want` even when its own number is lower (a
             // dropped frame's slot).
             self.shown_frame = Some(want);
@@ -694,17 +1401,190 @@ impl Player {
                 self.scrub_asked = Some(want);
                 // Stopping here again asks for the exact frame again.
                 self.still_wanted = None;
-                v.scrub(want);
+                v.scrub(want, self.screen_index);
             }
         } else if self.still_wanted != Some(want) {
             // Paused somewhere new, or a scrub stopped (the mouse let go, the
             // wheel settled) before its frame came: that frame, exactly.
             // Asked once per frame wanted.
-            self.still_wanted = Some(want);
-            self.scrub_asked = None;
-            self.asked_at = Some(std::time::Instant::now());
+            self.ask_exact(want);
+        }
+    }
+
+    /// Ask the playback decoder for frame `want`, exactly (asked once per
+    /// frame wanted): it decodes it with all its threads, then the next few
+    /// frames, ready for play.
+    fn ask_exact(&mut self, want: u64) {
+        self.still_wanted = Some(want);
+        self.scrub_asked = None;
+        self.asked_at = Some(std::time::Instant::now());
+        // On its way there until the frame comes back (`take_exact`).
+        #[cfg(hw_decode)]
+        {
+            self.catching_up = true;
+        }
+        if let Some(v) = self.video.as_ref() {
             v.show(want);
         }
+    }
+
+    /// Scrubbing with the scrub engine, the playhead at frame `want`: its
+    /// picture out of the engine's cache, on this very redraw.
+    ///
+    /// Moving, it's the playhead's own frame if it's decoded, else the
+    /// nearest that is: one per frame the playhead is at, then only its own
+    /// (each frame decoded on the way to it showed as it came, nearer and
+    /// nearer: stopped, the picture played on a few frames).
+    ///
+    /// Held still, the engine decodes around it, and its own frame comes in
+    /// one step, the engine's or the playback decoder's (all its threads on
+    /// the one frame: soonest). (A picture near it used to stay put while
+    /// held, letting go moving the playhead to it: up to half a second off
+    /// where it was put, and the playhead not where it was let go.)
+    #[cfg(hw_decode)]
+    fn scrub_engine(&mut self, ctx: &egui::Context, want: u64) {
+        let m = self.motion_at(want);
+        let held = m.moved.elapsed() >= HELD;
+        let speed = if held { 0.0 } else { m.speed };
+        let found = {
+            let engine = self.scrub.as_ref().expect("the scrub engine");
+            engine.scrub_to(want, speed, held || m.jumped);
+            engine.frame_for(want)
+        };
+        #[cfg(target_os = "linux")]
+        if let Some(u) = &self.uploader {
+            u.steer(want, speed, self.redraw_secs);
+        }
+        if !held {
+            self.catching_up = true;
+            // Stopping here asks for its frame again.
+            self.still_wanted = None;
+            // Drawn again once it's been still a moment, to see that it's
+            // stopped (a pointer held still sends nothing).
+            ctx.request_repaint_after(HELD.saturating_sub(m.moved.elapsed()) + std::time::Duration::from_millis(2));
+        }
+        if self.shown_frame == Some(want) {
+            return;
+        }
+        match found {
+            Some((p, true)) => {
+                self.show_scrubbed(ctx, p, Some(want), speed);
+                return;
+            }
+            Some((p, false)) if self.stood_in_for != Some(want) => {
+                if self.screen_index != Some(p.index) {
+                    self.show_scrubbed(ctx, p, None, speed);
+                }
+                self.stood_in_for = Some(want);
+            }
+            _ => {}
+        }
+        if held {
+            match self.video.as_ref().and_then(|v| v.take_exact(want)) {
+                Some(p) => {
+                    if let Some(at) = self.asked_at.take() {
+                        trace!("sharp frame {want} (picture {}) {:.0} ms after asking, held still", p.index, at.elapsed().as_secs_f64() * 1000.0);
+                    }
+                    self.catching_up = false;
+                    self.show_picture(ctx, p);
+                    self.shown_frame = Some(want);
+                }
+                None if self.still_wanted != Some(want) => self.ask_exact(want),
+                None => {}
+            }
+        }
+    }
+
+    /// Put picture `p` from the scrub engine on screen. Linux: from the
+    /// uploader's textures if it's uploaded already (or one within half a
+    /// redraw's travel at `speed` that's nearer than what's on screen), else
+    /// uploaded now. Elsewhere it's on the GPU already, drawn from where it
+    /// is. `exact_for`: the playhead frame it's the picture of (when it's
+    /// that, a dropped frame's slot showing the frame before).
+    #[cfg(hw_decode)]
+    fn show_scrubbed(&mut self, ctx: &egui::Context, p: Picture, exact_for: Option<u64>, speed: f64) {
+        let t = std::time::Instant::now();
+        let wanted = p.index;
+        #[cfg(target_os = "linux")]
+        let got = {
+            if self.uploader.is_none() && !dev_flag("HESTECLIPS_DEV_NO_UPLOADER") {
+                self.uploader = self.scrub.as_ref().and_then(|e| crate::scrub::Uploader::new(e, p.width, p.height));
+            }
+            let near = (speed.abs() * self.redraw_secs / 2.0).floor() as u64;
+            let ready = self.uploader.as_ref().filter(|u| u.size() == (p.width, p.height)).and_then(|u| u.find(p.index, near, self.screen_index));
+            match ready {
+                Some((shown, idx)) => {
+                    self.display = Some(Display::Gpu(shown, egui::vec2(p.width as f32, p.height as f32)));
+                    self.retire(ctx, Some(p));
+                    self.screen_index = Some(idx);
+                    self.showing_proxy = false;
+                    self.stand_in = None;
+                    idx
+                }
+                None => {
+                    self.put_picture(ctx, p);
+                    wanted
+                }
+            }
+        };
+        // Windows: its pool, opened for drawing as it goes on screen.
+        #[cfg(windows)]
+        let pool = p.gpu.as_ref().map(|s| s.key().0);
+        #[cfg(not(target_os = "linux"))]
+        let got = {
+            let _ = speed;
+            self.put_picture(ctx, p);
+            wanted
+        };
+        self.engine_on_screen = true;
+        #[cfg(windows)]
+        if let Some(pool) = pool.filter(|p| !self.engine_pools.contains(p)) {
+            self.engine_pools.push(pool);
+        }
+        if debug() {
+            self.scrub_stats.showed(t.elapsed().as_secs_f64());
+        }
+        // One near it instead isn't the frame asked.
+        self.shown_frame = exact_for.filter(|_| got == wanted);
+    }
+
+    /// The playhead's motion while scrubbing, it being at frame `want`
+    /// now: how fast (smoothed over the last few redraws), and since when
+    /// it's been where it is. Over ten seconds of video at once, or faster
+    /// than 300× real time since it last moved, is a jump (a click), not
+    /// motion: the speed starts over from nothing, then from the first
+    /// step's own pace. (Judged by distance alone, a fast drag on a slow
+    /// display moved over a second a redraw and counted as clicks.)
+    #[cfg(hw_decode)]
+    fn motion_at(&mut self, want: u64) -> Motion {
+        /// Smoothing time (s): about a dozen redraws at 144 Hz.
+        const TAU: f64 = 0.08;
+        let now = std::time::Instant::now();
+        let fps = self.info.fps;
+        let m = match self.motion {
+            // The first redraw of a scrub: where a press put it.
+            None => Motion { at: want, seen: now, speed: 0.0, moved: now, jumped: true },
+            Some(m) => {
+                let dt = now.duration_since(m.seen).as_secs_f64();
+                if dt > 0.0 && dt < 0.1 {
+                    self.redraw_secs += (dt - self.redraw_secs) * 0.1;
+                }
+                let d = want as f64 - m.at as f64;
+                let speed = if dt > 0.0 { m.speed + (d / dt - m.speed) * (1.0 - (-dt / TAU).exp()) } else { m.speed };
+                let since = now.duration_since(m.moved).as_secs_f64().max(1e-3);
+                if want == m.at {
+                    Motion { seen: now, speed, ..m }
+                } else if d.abs() > 10.0 * fps || d.abs() / since > 300.0 * fps {
+                    Motion { at: want, seen: now, speed: 0.0, moved: now, jumped: true }
+                } else {
+                    // Moving off from where a click put it: at its own pace.
+                    let speed = if m.jumped { d / since } else { speed };
+                    Motion { at: want, seen: now, speed, moved: now, jumped: false }
+                }
+            }
+        };
+        self.motion = Some(m);
+        m
     }
 
     #[cfg_attr(not(windows), allow(dead_code))]
@@ -717,14 +1597,12 @@ impl Player {
         if let Some(at) = self.played_at.take() {
             trace!("first frame after play: {idx}, {:.0} ms after pressing", at.elapsed().as_secs_f64() * 1000.0);
         }
-        // Counts frames that change the picture, not frames handed over.
+        // Frames that change the picture, not frames handed over: how evenly
+        // they come, each second.
         if debug() && self.sound_playing() && self.shown_frame != Some(idx) {
-            let (now, ready) = (self.time(), self.proxy.as_ref().map_or(0, |p| p.ready()));
-            let (since, n) = self.shown_count.get_or_insert((std::time::Instant::now(), 0));
-            *n += 1;
-            if since.elapsed().as_secs_f64() >= 1.0 {
-                trace!("playing: {n} new frames in the last second, now {idx} at {now:.2} s (proxy {ready} ready)");
-                self.shown_count = None;
+            let fps = self.info.fps;
+            if let Some(line) = self.pacing.frame(idx, fps) {
+                trace!("playing: {line}, now {idx} at {:.2} s", self.time());
             }
         }
         self.put_picture(ctx, p);
@@ -734,6 +1612,16 @@ impl Player {
     #[cfg_attr(not(windows), allow(dead_code))]
     fn put_picture(&mut self, ctx: &egui::Context, p: Picture) {
         let idx = p.index;
+        // Dev aid: `HESTECLIPS_DEV_NO_UPLOAD=1` keeps the picture on screen
+        // as it is, to measure what showing a new one costs.
+        if dev_flag("HESTECLIPS_DEV_NO_UPLOAD") {
+            let _ = ctx;
+            self.shown_frame = Some(idx);
+            self.screen_index = Some(idx);
+            self.showing_proxy = false;
+            self.stand_in = None;
+            return;
+        }
         #[cfg(hw_decode)]
         {
             // On the GPU: draw its texture as it is.
@@ -774,9 +1662,16 @@ impl Player {
         }
     }
 
-    fn show(&mut self, ctx: &egui::Context, idx: u64, frame: media::Frame) {
-        let img = egui::ColorImage::from_rgba_unmultiplied([frame.width as usize, frame.height as usize], &frame.rgba);
-        self.set_texture(ctx, img);
+    fn show(&mut self, ctx: &egui::Context, idx: u64, frame: Decoded) {
+        match frame {
+            Decoded::Nv12(data) => {
+                let (w, h) = (self.info.width, self.info.height);
+                let Some(shown) = self.uploads.show(w, h, &data, self.info.bt601) else { return };
+                self.display = Some(Display::Gpu(shown, egui::vec2(w as f32, h as f32)));
+                self.retire(ctx, None);
+            }
+            Decoded::Rgba(f) => self.set_texture(ctx, egui::ColorImage::from_rgba_unmultiplied([f.width as usize, f.height as usize], &f.rgba)),
+        }
         self.shown_frame = Some(idx);
         self.screen_index = Some(idx);
         self.showing_proxy = false;
@@ -789,11 +1684,17 @@ impl Player {
         /// Passes to hold a frame after it leaves the screen: more than the
         /// GPU ever runs behind.
         const HOLD: u64 = 4;
+        // Whether the one going was the scrub engine's; the next says so
+        // once it's on (`show_scrubbed`).
+        #[cfg(hw_decode)]
+        let engine = std::mem::take(&mut self.engine_on_screen);
+        #[cfg(not(hw_decode))]
+        let engine = false;
         let pass = ctx.cumulative_pass_nr();
         if let Some(old) = std::mem::replace(&mut self.on_screen, next) {
-            self.retired.push_back((pass, old));
+            self.retired.push_back((pass, old, engine));
         }
-        while self.retired.front().is_some_and(|(at, _)| pass >= at + HOLD) {
+        while self.retired.front().is_some_and(|(at, ..)| pass >= at + HOLD) {
             self.retired.pop_front();
         }
     }
@@ -814,9 +1715,16 @@ impl Player {
     }
 }
 
+/// The video's size, when frames from ffmpeg come as NV12 at that size: when
+/// they can be drawn with the sharp filter.
+fn nv12_size(info: &ClipInfo) -> Option<(u32, u32)> {
+    (crate::gpu_frames::can_upload() && info.width > 0 && info.height > 0).then_some((info.width, info.height))
+}
+
 /// On-demand exact stills (paused/scrubbing): one worker, the newest
-/// request wins. It opens the file by name for each still.
-fn still_worker(ctx: &egui::Context, source: &Path) -> (Sender<(u64, f64)>, Receiver<(u64, media::Frame)>) {
+/// request wins. It opens the file by name for each still. NV12 at `nv12`
+/// (the video's size), else RGBA.
+fn still_worker(ctx: &egui::Context, source: &Path, nv12: Option<(u32, u32)>) -> (Sender<(u64, f64)>, Receiver<(u64, Decoded)>) {
     let (still_tx, job_rx) = mpsc::channel::<(u64, f64)>();
     let (done_tx, still_rx) = mpsc::channel();
     let src = source.to_path_buf();
@@ -826,7 +1734,11 @@ fn still_worker(ctx: &egui::Context, source: &Path) -> (Sender<(u64, f64)>, Rece
             while let Ok(newer) = job_rx.try_recv() {
                 job = newer;
             }
-            if let Ok(frame) = media::frame_at(&src, job.1, PREVIEW_WIDTH) {
+            let frame = match nv12 {
+                Some(size) => media::nv12_at(&src, job.1, size).map(Decoded::Nv12),
+                None => media::frame_at(&src, job.1, PREVIEW_WIDTH).map(Decoded::Rgba),
+            };
+            if let Ok(frame) = frame {
                 if done_tx.send((job.0, frame)).is_err() {
                     break;
                 }
@@ -837,8 +1749,27 @@ fn still_worker(ctx: &egui::Context, source: &Path) -> (Sender<(u64, f64)>, Rece
     (still_tx, still_rx)
 }
 
-/// The hardware decoder for `source`, on Windows and macOS (unless
-/// `HESTECLIPS_NO_HW_DECODE` is set, to compare with the ffmpeg path).
+/// The scrub engine for `source`, opening on a thread of its own (see
+/// `Player::scrub_opening`).
+#[cfg(hw_decode)]
+fn open_engine(ctx: &egui::Context, source: &Path, info: &ClipInfo) -> Receiver<Option<crate::scrub::Engine>> {
+    let (tx, rx) = mpsc::channel();
+    let (ctx, source, fps, total) = (ctx.clone(), source.to_path_buf(), info.fps, total_frames(info) as u64);
+    let opened = std::thread::Builder::new().name("scrub engine".into()).spawn(move || {
+        // Gone already (the clip closed, or the window's no longer in use):
+        // the engine stops as it drops.
+        if tx.send(crate::scrub::Engine::open(&ctx, &source, fps, total)).is_ok() {
+            ctx.request_repaint();
+        }
+    });
+    if let Err(e) = opened {
+        eprintln!("scrubbing through the playback decoder: no thread for the scrub engine ({e})");
+    }
+    rx
+}
+
+/// The in-process decoder for `source` (unless `HESTECLIPS_NO_HW_DECODE` is
+/// set, to compare with the ffmpeg path).
 fn open_video(ctx: &egui::Context, source: &Path, fps: f64) -> Option<Video> {
     #[cfg(hw_decode)]
     if std::env::var_os("HESTECLIPS_NO_HW_DECODE").is_none() {
@@ -1085,8 +2016,20 @@ impl Scrub {
     }
 }
 
+/// What the audio callback and the player share, for `pcm`'s tracks mixed
+/// by `gains`, and the sound output playing it (or why there's none).
+fn sound(pcm: Arc<Pcm>, gains: Vec<TrackEdit>) -> (Arc<Shared>, Option<cpal::Stream>, Option<String>) {
+    let n = pcm.len();
+    let shared = Arc::new(Shared::new(Mix { tracks: gains, track_levels: vec![(0.0, 0.0); n], master_level: (0.0, 0.0), master_stereo: Default::default() }, pcm));
+    let (stream, audio_error) = match start_audio(shared.clone()) {
+        Ok(s) => (Some(s), None),
+        Err(e) => (None, Some(e)),
+    };
+    (shared, stream, audio_error)
+}
+
 /// Opens the default output device and mixes the tracks into it.
-fn start_audio(shared: Arc<Shared>, pcm: Arc<Pcm>) -> Result<cpal::Stream, String> {
+fn start_audio(shared: Arc<Shared>) -> Result<cpal::Stream, String> {
     let device = cpal::default_host().default_output_device().ok_or("no audio output device")?;
     let supported = device.default_output_config().map_err(|e| e.to_string())?;
     let channels = supported.channels() as usize;
@@ -1096,13 +2039,18 @@ fn start_audio(shared: Arc<Shared>, pcm: Arc<Pcm>) -> Result<cpal::Stream, Strin
     // device runs at 48 kHz).
     let base_step = PREVIEW_RATE as f64 / out_rate;
     let mut frac = 0.0f64;
-    let n_tracks = pcm.len();
     let mut was_playing = false;
     let mut scrub = Scrub::new(out_rate);
+    let listen = shared.clone();
     trace!("audio output: {} Hz, {} channels, buffer {:?}", out_rate, channels, supported.buffer_size());
 
     let mut mix = move |out: &mut [f32], info: &cpal::OutputCallbackInfo| {
         out.fill(0.0);
+        let pcm = match shared.pcm.lock() {
+            Ok(p) => p.clone(),
+            Err(_) => return,
+        };
+        let n_tracks = pcm.len();
         let playing = shared.playing.load(Ordering::Relaxed);
         if playing != was_playing {
             was_playing = playing;
@@ -1141,6 +2089,7 @@ fn start_audio(shared: Arc<Shared>, pcm: Arc<Pcm>) -> Result<cpal::Stream, Strin
             Ok(m) => m.tracks.clone(),
             Err(_) => return,
         };
+        let skips: Vec<Skip> = shared.skips.lock().map(|s| s.clone()).unwrap_or_default();
         // Volume can ramp (keyframes): evaluate it every 256 samples (~5 ms)
         // and interpolate in between, which is smooth and cheap.
         let mut gains: Vec<f32> = Vec::new();
@@ -1156,7 +2105,22 @@ fn start_audio(shared: Arc<Shared>, pcm: Arc<Pcm>) -> Result<cpal::Stream, Strin
         // follows, like tape).
         let step = base_step * shared.speed();
 
+        // A track's sound at `pos` (between it and the next sample by `frac`).
+        let read = |track: &media::pcm::PcmTrack, pos: u64, frac: f64| -> Option<(f32, f32)> {
+            let (a, b) = track.frame(pos as usize)?;
+            Some(match track.frame(pos as usize + 1).filter(|_| frac > 0.0) {
+                Some((a2, b2)) => (a + (a2 - a) * frac as f32, b + (b2 - b) * frac as f32),
+                None => (a, b),
+            })
+        };
+
         for frame in out.chunks_mut(channels) {
+            // Into a stretch that's cut out: on from its end, as far past it
+            // as the step went.
+            if let Some(s) = skips.iter().find(|s| (s.from..s.to).contains(&pos)) {
+                pos = s.to + (pos - s.from);
+                next_eval = 0;
+            }
             if pos >= end {
                 shared.playing.store(false, Ordering::Relaxed);
                 break;
@@ -1166,16 +2130,19 @@ fn start_audio(shared: Arc<Shared>, pcm: Arc<Pcm>) -> Result<cpal::Stream, Strin
                 gains = tracks.iter().map(|tr| tr.gain_at(t)).collect();
                 next_eval = pos + 256;
             }
+            // Either side of a join, the other side of it too, crossfading.
+            let across = skips.iter().find_map(|s| s.across(pos));
             let (mut l, mut r) = (0.0f32, 0.0f32);
             for (t, track) in pcm.tracks().iter().enumerate() {
                 // Not decoded yet (just opened, jumped far ahead): silence.
-                if let Some((a, b)) = track.frame(pos as usize) {
-                    let (a, b) = match track.frame(pos as usize + 1).filter(|_| frac > 0.0) {
-                        Some((a2, b2)) => (a + (a2 - a) * frac as f32, b + (b2 - b) * frac as f32),
-                        None => (a, b),
-                    };
+                if let Some((a, b)) = read(track, pos, frac) {
                     let g = gains.get(t).copied().unwrap_or(1.0);
-                    let (tl, tr) = (a * g, b * g);
+                    let (mut tl, mut tr) = (a * g, b * g);
+                    if let Some((other, w)) = across {
+                        let g = tracks.get(t).map_or(1.0, |e| e.gain_at(other as f64 / PREVIEW_RATE as f64));
+                        let (a, b) = read(track, other, frac).unwrap_or_default();
+                        (tl, tr) = (tl * (1.0 - w) + a * g * w, tr * (1.0 - w) + b * g * w);
+                    }
                     l += tl;
                     r += tr;
                     let a = tl.abs().max(tr.abs());
@@ -1224,8 +2191,11 @@ fn start_audio(shared: Arc<Shared>, pcm: Arc<Pcm>) -> Result<cpal::Stream, Strin
             config,
             move |out: &mut [f32], info: &cpal::OutputCallbackInfo| {
                 mix(out, info);
-                if muted {
+                let gain = f32::from_bits(listen.listen.load(Ordering::Relaxed));
+                if muted || gain == 0.0 {
                     out.fill(0.0);
+                } else if gain < 1.0 {
+                    out.iter_mut().for_each(|x| *x *= gain);
                 }
                 // Silence needn't be handed over: a gap is silent.
                 if out.iter().any(|&x| x != 0.0) {
@@ -1240,6 +2210,20 @@ fn start_audio(shared: Arc<Shared>, pcm: Arc<Pcm>) -> Result<cpal::Stream, Strin
         .map_err(|e| e.to_string())?;
     stream.play().map_err(|e| e.to_string())?;
     Ok(stream)
+}
+
+/// Whether the dev aid `name` (an environment variable) is set, read once.
+fn dev_flag(name: &'static str) -> bool {
+    static FLAGS: std::sync::Mutex<Vec<(&'static str, bool)>> = std::sync::Mutex::new(Vec::new());
+    let mut flags = FLAGS.lock().unwrap();
+    match flags.iter().find(|(n, _)| *n == name) {
+        Some((_, on)) => *on,
+        None => {
+            let on = std::env::var_os(name).is_some();
+            flags.push((name, on));
+            on
+        }
+    }
 }
 
 /// Dev aid: `HESTECLIPS_MUTE=1` plays everything silently, with the same
@@ -1263,8 +2247,8 @@ impl SoundPlayer {
     /// `pcm`'s one track is stereo at [`PREVIEW_RATE`], `duration` seconds long.
     pub fn new(pcm: Arc<Pcm>, duration: f64) -> Self {
         let tracks = vec![TrackEdit { index: 0, gain: 1.0, muted: false, points: Vec::new() }];
-        let shared = Arc::new(Shared::new(Mix { tracks, track_levels: vec![(0.0, 0.0)], master_level: (0.0, 0.0), master_stereo: Default::default() }));
-        let (stream, error) = match start_audio(shared.clone(), pcm) {
+        let shared = Arc::new(Shared::new(Mix { tracks, track_levels: vec![(0.0, 0.0)], master_level: (0.0, 0.0), master_stereo: Default::default() }, pcm));
+        let (stream, error) = match start_audio(shared.clone()) {
             Ok(s) => (Some(s), None),
             Err(e) => (None, Some(e)),
         };
@@ -1300,21 +2284,28 @@ impl SoundPlayer {
     }
 }
 
-/// Streams consecutive preview frames from a start time via one ffmpeg process.
+/// Streams consecutive frames from a start time via one ffmpeg process.
 struct FrameStream {
     child: Child,
-    rx: Receiver<(u64, media::Frame)>,
-    peeked: Option<(u64, media::Frame)>,
+    rx: Receiver<(u64, Decoded)>,
+    peeked: Option<(u64, Decoded)>,
 }
 
 impl FrameStream {
     fn start(ctx: &egui::Context, source: &Path, info: &ClipInfo, t: f64) -> std::io::Result<Self> {
-        let w = PREVIEW_WIDTH;
-        let h = (((w as f64) * info.height as f64 / info.width.max(1) as f64 / 2.0).round() as u32 * 2).max(2);
+        let nv12 = nv12_size(info);
+        let (w, h) = nv12.unwrap_or_else(|| (PREVIEW_WIDTH, (((PREVIEW_WIDTH as f64) * info.height as f64 / info.width.max(1) as f64 / 2.0).round() as u32 * 2).max(2)));
+        let scale = format!("scale={w}:{h}:flags=bilinear");
+        let out = match nv12 {
+            Some(_) => media::NV12_OUT.to_vec(),
+            None => vec!["-vf", &scale, "-f", "rawvideo", "-pix_fmt", "rgba"],
+        };
         let mut child = media::ffmpeg()
             .args(["-hide_banner", "-loglevel", "error", "-ss", &format!("{t:.4}"), "-i"])
             .arg(source)
-            .args(["-an", "-vf", &format!("scale={w}:{h}:flags=bilinear"), "-f", "rawvideo", "-pix_fmt", "rgba", "-"])
+            .arg("-an")
+            .args(out)
+            .arg("-")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -1325,14 +2316,15 @@ impl FrameStream {
         let first = info.frame_index(t);
         let repaint = ctx.clone();
         std::thread::spawn(move || {
-            let size = (w * h * 4) as usize;
+            let size = if nv12.is_some() { media::nv12_len(w, h) } else { (w * h * 4) as usize };
             let mut idx = first;
             loop {
                 let mut buf = vec![0u8; size];
                 if stdout.read_exact(&mut buf).is_err() {
                     break;
                 }
-                if tx.send((idx, media::Frame { width: w, height: h, rgba: buf })).is_err() {
+                let frame = if nv12.is_some() { Decoded::Nv12(buf) } else { Decoded::Rgba(media::Frame { width: w, height: h, rgba: buf }) };
+                if tx.send((idx, frame)).is_err() {
                     break;
                 }
                 repaint.request_repaint();
@@ -1349,7 +2341,7 @@ impl FrameStream {
         self.peeked.as_ref().map(|(i, _)| (*i, ()))
     }
 
-    fn next(&mut self) -> Option<(u64, media::Frame)> {
+    fn next(&mut self) -> Option<(u64, Decoded)> {
         self.peek();
         self.peeked.take()
     }
@@ -1379,13 +2371,30 @@ mod tests {
     #[test]
     fn seeking_to_a_frame_lands_on_it() {
         for fps in [60.0, 107760.0 / 1799.0, 43128.0 / 719.0, 30000.0 / 1001.0, 144.0] {
-            let info = ClipInfo { duration: 120.0, fps, width: 2, height: 2, video_kbps: None, audio: Vec::new(), id: None };
+            let info = ClipInfo { duration: 120.0, fps, width: 2, height: 2, video_kbps: None, audio: Vec::new(), id: None, bt601: false };
             for k in 0..(120.0 * fps) as u64 - 1 {
                 let t = info.snap(k as f64 / fps + 1e-9) + 1e-6;
                 let back = to_samples(t) as f64 / PREVIEW_RATE as f64;
                 assert_eq!(info.frame_index(back), k, "frame {k} at {fps} fps");
             }
         }
+    }
+
+    /// Either side of a join, what's on the other side of it is heard too:
+    /// none of it at the crossfade's ends, half at the join itself, read from
+    /// just past where each side leaves off (as the saved clip's crossfade).
+    #[test]
+    fn joins_crossfade() {
+        let s = Skip { from: 1000, to: 5000, fade: 100 };
+        assert_eq!(s.across(899), None);
+        assert_eq!(s.across(900), Some((4900, 0.0)));
+        let (other, w) = s.across(999).unwrap();
+        assert!(other == 4999 && (w - 0.495).abs() < 1e-6, "{other} {w}");
+        assert_eq!(s.across(5000), Some((1000, 0.5)));
+        let (other, w) = s.across(5099).unwrap();
+        assert!(other == 1099 && w < 0.01, "{other} {w}");
+        assert_eq!(s.across(5100), None);
+        assert_eq!(Skip { fade: 0, ..s }.across(999), None);
     }
 
     /// A stereo tone at `hz`, `secs` long, at the source rate.
@@ -1463,6 +2472,45 @@ mod tests {
         assert!((hz - 880.0).abs() < 30.0, "after the jump: {hz:.0} Hz");
     }
 
+    /// A player hushed into a curtain and handed straight back (switching
+    /// back before the new screen's picture came up) is taken over with its
+    /// sound back: its clock moves, as a player handed over as it is does.
+    #[test]
+    #[ignore = "needs a sound output"]
+    fn a_curtain_handed_back_plays() {
+        let clip = std::env::temp_dir().join(format!("hc-curtain-{}.mp4", std::process::id()));
+        let made = media::ffmpeg()
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=320x240:rate=30:duration=3"])
+            .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
+            .arg(&clip)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let ctx = egui::Context::default();
+        let info = media::probe(&clip).unwrap();
+        let pcm = Pcm::from_tracks(vec![tone(440.0, 3.0)]);
+        // What `update` does once the first frame is there: the sound starts.
+        let moves = |p: &Player| {
+            p.shared.playing.store(true, Ordering::Relaxed);
+            let t0 = p.time();
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            let moved = p.time() - t0;
+            p.shared.playing.store(false, Ordering::Relaxed);
+            moved
+        };
+        let player = Player::new(&ctx, &clip, info.clone(), pcm.clone(), Vec::new());
+        let (mut player, _, taken) = Player::handed_over(&ctx, &clip, &info, pcm.clone(), Vec::new(), Some(player));
+        assert!(taken, "the same file is taken over");
+        let moved = moves(&player);
+        assert!(moved > 0.2, "handed over as it is, its clock moved {moved:.3} s in 0.4 s");
+        player.hush();
+        let (player, _, taken) = Player::handed_over(&ctx, &clip, &info, pcm, Vec::new(), Some(player));
+        assert!(taken, "a curtain on the same file is taken over");
+        let moved = moves(&player);
+        assert!(moved > 0.2, "handed back from a curtain, its clock moved {moved:.3} s in 0.4 s");
+        std::fs::remove_file(&clip).unwrap();
+    }
+
     /// Noise (like game sound: no two slices alike), stereo, at the source rate.
     fn noise(secs: f64) -> Vec<f32> {
         let mut x = 12345u32;
@@ -1502,12 +2550,36 @@ mod tests {
     #[test]
     fn scrubbing_is_cheap_enough_for_the_audio_callback() {
         // Six tracks (an editor clip), one second of output: well under a
-        // second even unoptimized.
+        // second even unoptimized (half of it, here). Timed by the work this
+        // thread does, not the clock: with the other tests running beside it,
+        // the clock said 2.5 times as long. Its work grows too, as they share
+        // the cores (measured unoptimized: 140 ms alone, up to 270 ms
+        // beside them).
         let pcm: Vec<Vec<f32>> = (0..6).map(|_| tone(440.0, 20.0)).collect();
-        let t = std::time::Instant::now();
+        let t = thread_cpu();
         let _ = scrub(&pcm, 1.5, 1.0, 5.0 * PREVIEW_RATE as f64);
-        let took = t.elapsed();
-        eprintln!("one second of scrub sound, 6 tracks: {took:?}");
-        assert!(took.as_secs_f64() < 0.25, "took {took:?}");
+        let took = thread_cpu() - t;
+        eprintln!("one second of scrub sound, 6 tracks: {took:?} of work");
+        assert!(took.as_secs_f64() < 0.5, "took {took:?}");
+    }
+
+    /// The CPU time this thread has used so far.
+    fn thread_cpu() -> std::time::Duration {
+        #[cfg(windows)]
+        {
+            use windows::Win32::Foundation::FILETIME;
+            use windows::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
+            let (mut created, mut exited, mut kernel, mut user) = (FILETIME::default(), FILETIME::default(), FILETIME::default(), FILETIME::default());
+            unsafe { GetThreadTimes(GetCurrentThread(), &mut created, &mut exited, &mut kernel, &mut user) }.expect("the thread's times");
+            let ticks = |f: FILETIME| (f.dwHighDateTime as u64) << 32 | f.dwLowDateTime as u64;
+            // In 100 ns ticks.
+            std::time::Duration::from_nanos((ticks(kernel) + ticks(user)) * 100)
+        }
+        #[cfg(unix)]
+        {
+            let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+            unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+            std::time::Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+        }
     }
 }

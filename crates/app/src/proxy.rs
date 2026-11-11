@@ -1,9 +1,9 @@
 //! Scrub proxy: every frame of the clip as a small JPEG, in a file.
 //!
-//! Only where there's no hardware decoder to scrub with (`hw_decode`: Linux,
-//! or a file it can't read): with one, scrubbing decodes live (`video.rs`),
-//! keyframes while the playhead moves fast and every frame when it's slow,
-//! with nothing built beforehand.
+//! Only where there's no in-process decoder to scrub with (a file it can't
+//! read, a Linux build without libavcodec): with one, scrubbing decodes live
+//! (`video.rs`), keyframes while the playhead moves fast and every frame
+//! when it's slow, with nothing built beforehand.
 //!
 //! Seeking the real file through ffmpeg costs 50-200 ms a frame, far too
 //! slow to follow a drag. One pass decodes every frame at a small size; after that any frame

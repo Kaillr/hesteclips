@@ -2,12 +2,39 @@
 
 use std::path::{Path, PathBuf};
 
-/// Hidden sibling a file is written to until it's complete: `dir/.name.ext`.
-/// The leading dot hides it from Finder and from our clip scan; keeping the
-/// extension keeps the container obvious.
+/// The hidden folder next to a file where it's written until it's complete.
+pub const WRITING: &str = ".writing";
+
+/// Where a file is written until it's complete: `dir/.writing/name.ext`. The
+/// folder is hidden from Finder and from our clip scan; the file keeps its
+/// real name, so it never has a leading dot of its own. (In iCloud Drive,
+/// macOS sometimes marks a dot-named file hidden a few seconds after it's
+/// made, and the mark stays when it's renamed: clips written as `.name.ext`
+/// came out hidden in Finder.) Makes the folder.
 pub fn in_progress(file: &Path) -> PathBuf {
-    let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    file.with_file_name(format!(".{name}"))
+    let dir = file.parent().unwrap_or(Path::new(".")).join(WRITING);
+    if std::fs::create_dir_all(&dir).is_ok() {
+        mark_hidden(&dir);
+    }
+    dir.join(file.file_name().unwrap_or_default())
+}
+
+/// A leading dot hides a folder on macOS and Linux; Windows needs it marked.
+#[cfg_attr(not(windows), allow(unused_variables))]
+fn mark_hidden(path: &Path) {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_HIDDEN, FILE_FLAGS_AND_ATTRIBUTES, GetFileAttributesW, INVALID_FILE_ATTRIBUTES, SetFileAttributesW};
+        use windows::core::HSTRING;
+        let path = HSTRING::from(path.as_os_str());
+        // SAFETY: a valid path string for both calls.
+        unsafe {
+            let current = GetFileAttributesW(&path);
+            if current != INVALID_FILE_ATTRIBUTES && current & FILE_ATTRIBUTE_HIDDEN.0 == 0 {
+                let _ = SetFileAttributesW(&path, FILE_FLAGS_AND_ATTRIBUTES(current | FILE_ATTRIBUTE_HIDDEN.0));
+            }
+        }
+    }
 }
 
 /// A name for a new replay clip in `dir`: `clip_<timestamp>.<ext>`, with
@@ -25,7 +52,7 @@ pub(crate) fn new_clip_path(dir: &Path, ext: &str) -> PathBuf {
     loop {
         let name = if n == 1 { format!("clip_{ts}.{ext}") } else { format!("clip_{ts}-{n}.{ext}") };
         let path = dir.join(name);
-        if !path.exists() && !in_progress(&path).exists() {
+        if !path.exists() && !dir.join(WRITING).join(path.file_name().unwrap_or_default()).exists() {
             *last = Some((ts, n));
             return path;
         }
@@ -73,21 +100,28 @@ pub(crate) fn timestamp() -> String {
 
 /// Recordings a previous run didn't get to finish (crash, force quit, power
 /// loss) are still playable up to the last second — they're fragmented MP4. Give
-/// them their real names so they show up in the library. Clips being saved are
-/// written in one go and are useless half-done, so those are removed. Returns the
-/// recovered files.
+/// them their real names so they show up in the library. Anything else left
+/// half-written (a clip being saved, an edit being rendered, a screenshot) is
+/// useless half-done, so it's removed. Returns the recovered files.
 pub fn recover_unfinished(dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
     let mut recovered = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
         let path = entry.path();
+        if name == WRITING {
+            recovered.extend(finish_writing_dir(dir));
+            continue;
+        }
         // Clips are saved straight into their game's folder: one cut off there
         // is removed the same way. (Recordings are written in the library itself.)
         if !name.starts_with('.') && entry.file_type().is_ok_and(|t| t.is_dir()) {
-            remove_unfinished_clips(&path);
+            let _ = finish_writing_dir(&path);
+            remove_old_unfinished_clips(&path);
             continue;
         }
+        // Before `.writing`, files were written as `.name.ext` next to their
+        // place (0.4 and earlier).
         let Some(real) = name.strip_prefix('.') else { continue };
         // Only exact capture names: the editor keeps hidden files next to clips too
         // (`.recording_….mp4.edit.json`, `.….edited.mp4`), and those must stay hidden.
@@ -103,7 +137,29 @@ pub fn recover_unfinished(dir: &Path) -> Vec<PathBuf> {
     recovered
 }
 
-fn remove_unfinished_clips(dir: &Path) {
+/// `dir/.writing`: recordings in it go to `dir`, everything else is removed,
+/// and so is the folder once it's empty. The recordings moved.
+fn finish_writing_dir(dir: &Path) -> Vec<PathBuf> {
+    let writing = dir.join(WRITING);
+    let Ok(entries) = std::fs::read_dir(&writing) else { return Vec::new() };
+    let mut recovered = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let path = entry.path();
+        if is_capture_name(&name, "recording_") && entry.metadata().is_ok_and(|m| m.len() > 0) {
+            let target = dir.join(&name);
+            if !target.exists() && std::fs::rename(&path, &target).is_ok() {
+                recovered.push(target);
+                continue;
+            }
+        }
+        let _ = if path.is_dir() { std::fs::remove_dir_all(&path) } else { std::fs::remove_file(&path) };
+    }
+    let _ = std::fs::remove_dir(&writing);
+    recovered
+}
+
+fn remove_old_unfinished_clips(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -159,6 +215,48 @@ mod tests {
             assert!(dir.join(name).exists(), "{name} stays hidden");
         }
         assert!(assets.join("original.mp4").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recovers_from_the_writing_folder() {
+        let dir = std::env::temp_dir().join(format!("hesteclips-recover-writing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // A recording cut off, and a clip, an edit and a screenshot half-written.
+        let file = in_progress(&dir.join("recording_2026-10-22_14-00-00.mp4"));
+        assert!(file.parent().unwrap().ends_with(WRITING));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&file, b"x").unwrap();
+        std::fs::write(in_progress(&dir.join("clip_2026-10-22_14-01-00.mp4")), b"x").unwrap();
+        std::fs::write(in_progress(&dir.join("deagle clutch.mp4")), b"x").unwrap();
+        // The same in a game's folder.
+        let game = dir.join("osu!");
+        std::fs::create_dir_all(&game).unwrap();
+        std::fs::write(in_progress(&game.join("clip_2026-10-22_14-02-00.mp4")), b"x").unwrap();
+        std::fs::write(in_progress(&game.join("screenshot_2026-10-22_14-03-00.png")), b"x").unwrap();
+        std::fs::write(game.join("clip_2026-10-22_13-00-00.mp4"), b"x").unwrap();
+
+        let recovered = recover_unfinished(&dir);
+        assert_eq!(recovered, vec![dir.join("recording_2026-10-22_14-00-00.mp4")]);
+        assert!(!dir.join(WRITING).exists() && !game.join(WRITING).exists(), "nothing half-written is left");
+        assert!(game.join("clip_2026-10-22_13-00-00.mp4").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saves_overlap() {
+        let dir = std::env::temp_dir().join(format!("hesteclips-overlap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // The second is asked for before the first is written; its file is
+        // only made after the first is done.
+        let (a, b) = (dir.join("clip_a.mp4"), dir.join("clip_b.mp4"));
+        let (pa, pb) = (in_progress(&a), in_progress(&b));
+        std::fs::write(&pa, b"a").unwrap();
+        finish_rename(&pa, &a).unwrap();
+        std::fs::write(&pb, b"b").unwrap();
+        finish_rename(&pb, &b).unwrap();
+        assert_eq!((std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap()), (b"a".to_vec(), b"b".to_vec()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -46,6 +46,8 @@ pub struct Pal {
     pub primary_fg: Color32,
     pub live: Color32,
     pub rec: Color32,
+    /// Streaming: live for everyone watching.
+    pub stream: Color32,
     pub warn: Color32,
     pub danger: Color32,
     /// Settings that open under a switch sit in this, recessed.
@@ -96,6 +98,7 @@ pub const DARK: Pal = Pal {
     primary_fg: rgb(0x141518),
     live: rgb(0x3DD68C),
     rec: rgb(0xFF5050),
+    stream: rgb(0xA970FF),
     warn: rgb(0xF2B544),
     danger: rgb(0xFF6B6B),
     well: rgba(0x000000, 0.22),
@@ -131,6 +134,7 @@ pub const LIGHT: Pal = Pal {
     primary_fg: rgb(0xFFFFFF),
     live: rgb(0x12A467),
     rec: rgb(0xE0362F),
+    stream: rgb(0x7C3AED),
     warn: rgb(0xB07615),
     danger: rgb(0xD23B3B),
     well: rgb(0xF3F4F6),
@@ -211,11 +215,13 @@ pub fn ic(name: &str, size: f32) -> egui::RichText {
 }
 
 
+/// The app's typeface, Hanken Grotesk (variable: its weight's an axis).
+pub(crate) static HANKEN: &[u8] = include_bytes!("../assets/fonts/HankenGrotesk.ttf");
+
 /// Install the typeface and icon fonts. egui's own fonts and the system's
 /// symbol font stay as fallbacks for characters Hanken Grotesk lacks.
 pub fn install_fonts(ctx: &egui::Context) {
     use egui::epaint::text::{FontTweak, VariationCoords};
-    static HANKEN: &[u8] = include_bytes!("../assets/fonts/HankenGrotesk.ttf");
     let mut fonts = egui::FontDefinitions::default();
     let weight = |w: f32| egui::FontData::from_static(HANKEN).tweak(FontTweak { coords: VariationCoords::new([(b"wght", w)]), ..Default::default() });
     fonts.font_data.insert("hanken-400".into(), weight(400.0).into());
@@ -290,6 +296,11 @@ pub fn value(ctx: &egui::Context, id: Id, target: f32, secs: f32) -> f32 {
         ctx.request_repaint();
     }
     v
+}
+
+/// Forget `id`'s [`value`]: asked about again, it's simply its target.
+pub fn forget_value(ctx: &egui::Context, id: Id) {
+    ctx.data_mut(|d| d.remove::<Tween>(id.with("tween")));
 }
 
 /// 0 to 1 as `on` turns on, back as it turns off, eased.

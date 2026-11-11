@@ -1,24 +1,102 @@
-//! The Settings page, grouped by what you're trying to do rather than by codec
-//! jargon. Changes apply (and save) immediately; there's no Save button.
+//! The Settings page: a panel of panes on the left, as Clips has its games,
+//! and the chosen pane's settings beside it. Panes are grouped by what you're
+//! trying to do rather than by codec jargon, and a pane's settings come in
+//! groups under headings, each short enough to take in at once (Video's:
+//! the picture's size, its motion, the file, and how it's captured).
+//! Changes apply (and save) immediately; there's no Save button.
 //!
 //! Each setting is a row: what it is (and a line on why you'd change it) on the
 //! left, the control on the right. In a narrow window the control moves under
-//! its label. Things that reset or remove live in their own section at the end.
+//! its label, and the panes move into a menu on the heading. The search looks
+//! through every pane: what it finds shows under its group's name, and the
+//! panel dims the panes with nothing found. Things that reset or remove come
+//! last on their pane.
 
 use crate::ui_kit::Dismissed as _;
-use egui::Color32;
+use egui::{Align2, Color32, FontId, Pos2, Rect, vec2};
 
-use crate::settings::{self, Container, Encoder, OutputResolution, ShortcutAction};
+use crate::settings::{self, Container, Encoder, OutputResolution, ShortcutAction, StreamDestination, StreamService};
 use crate::theme::{self, W, icon};
-use crate::ui_kit::{self, Btn, Item, Kind, Row, Seg, Typed, ValueField};
-use crate::{App, RecState, reveal_label, shortcuts};
+use crate::ui_kit::{self, Btn, Choice, ChoiceField, Chosen, Item, Kind, Preset, Row, Seg, ValueField};
+use crate::{App, Page, reveal_label, shortcuts};
 
 /// Replay lengths offered as one-click choices (seconds).
 pub(crate) const REPLAY_CHOICES: [u32; 8] = [15, 30, 60, 120, 300, 600, 1200, 1800];
 /// The settings column's width.
 const COLUMN: f32 = 680.0;
-/// The groups, in order, for the section list.
-const SECTIONS: [&str; 8] = ["Clipping", "Video", "Clips", "Sharing", "Saved sound", "Shortcuts", "Voice", "App"];
+/// What the search finds HesteFiles' group by.
+const HESTEFILES_WORDS: &[&str] = &["hestefiles", "cloud", "upload", "account", "token", "public link", "default folder", "share"];
+
+/// A pane of Settings, as the panel lists them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Pane {
+    #[default]
+    Clipping,
+    Video,
+    /// Going live: where to, and the stream's picture (where it's here:
+    /// `capture::STREAMING`).
+    Streaming,
+    Clips,
+    Shortcuts,
+    #[cfg(target_os = "macos")]
+    Permissions,
+    App,
+}
+
+impl Pane {
+    #[cfg(target_os = "macos")]
+    pub(crate) const ALL: [Pane; 7] = [Pane::Clipping, Pane::Video, Pane::Streaming, Pane::Clips, Pane::Shortcuts, Pane::Permissions, Pane::App];
+    #[cfg(not(target_os = "macos"))]
+    pub(crate) const ALL: [Pane; 6] = [Pane::Clipping, Pane::Video, Pane::Streaming, Pane::Clips, Pane::Shortcuts, Pane::App];
+
+    /// The panes there are here (Streaming only where it streams).
+    pub(crate) fn here() -> impl Iterator<Item = Pane> {
+        Self::ALL.into_iter().filter(|p| *p != Pane::Streaming || capture::STREAMING)
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Pane::Clipping => "Clipping",
+            Pane::Video => "Video",
+            Pane::Streaming => "Streaming",
+            Pane::Clips => "Clips",
+            Pane::Shortcuts => "Shortcuts",
+            #[cfg(target_os = "macos")]
+            Pane::Permissions => "Permissions",
+            Pane::App => "App",
+        }
+    }
+
+    /// Its icon in the panel (filled, as the library's are).
+    fn icon(self) -> &'static str {
+        use egui_phosphor::fill as f;
+        match self {
+            Pane::Clipping => f::TIMER,
+            Pane::Video => f::VIDEO_CAMERA,
+            Pane::Streaming => f::BROADCAST,
+            Pane::Clips => f::FOLDER_SIMPLE,
+            Pane::Shortcuts => f::KEYBOARD,
+            #[cfg(target_os = "macos")]
+            Pane::Permissions => f::SHIELD_CHECK,
+            Pane::App => f::APP_WINDOW,
+        }
+    }
+
+    /// Its groups, top to bottom: the first goes by the pane's name (on
+    /// the heading), the others under their own.
+    fn groups(self) -> &'static [&'static str] {
+        match self {
+            Pane::Clipping => &["Clipping", "Saved sound", "Voice"],
+            Pane::Video => &["Video", "Motion", "File", "Capture"],
+            Pane::Streaming => &["Streaming"],
+            Pane::Clips => &["Clips", "Screenshots"],
+            Pane::Shortcuts => &["Shortcuts"],
+            #[cfg(target_os = "macos")]
+            Pane::Permissions => &["Permissions"],
+            Pane::App => &["App", "HesteFiles", "About"],
+        }
+    }
+}
 
 /// A group's rows, filtered by the search: each row says its words, and the
 /// group shows only matching rows.
@@ -32,157 +110,253 @@ impl Filter {
     }
 }
 
+/// Whether a group has rows the search finds (with nothing typed, whether
+/// it's on this system at all).
+fn group_matches(name: &str, f: &Filter) -> bool {
+    match name {
+        "Clipping" => f.shows(&["clip length", "replay buffer duration", "start clipping when hesteclips opens", "auto start", "memory"]),
+        "Video" => f.shows(RESOLUTION_WORDS) || f.shows(SHAPE_WORDS),
+        "Motion" => f.shows(FPS_WORDS) || capture::frame_blending() && f.shows(BLEND_WORDS),
+        "File" => f.shows(QUALITY_WORDS) || f.shows(ENCODER_WORDS) || f.shows(FORMAT_WORDS),
+        "Capture" => capture::game_hook_available() && f.shows(GAME_CAPTURE_WORDS) || SCREEN_CAPTURE && f.shows(SCREEN_CAPTURE_WORDS),
+        "Streaming" => capture::STREAMING && f.shows(STREAM_WORDS),
+        "Clips" => f.shows(&["clips folder", "location", "directory", "folder per game", "name clips after what happened", "game events", "osu", "names", "delete", "trash", "permanently", "output", "titles", "recycle"]),
+        "Screenshots" => capture::SCREENSHOTS && f.shows(&["screenshots", "take a screenshot", "shortcut", "hotkey", "format", "png", "jpg", "jpeg", "copy", "clipboard", "paste", "keyboard"]),
+        "Saved sound" => f.shows(&["play a sound when a clip is saved", "sound", "volume", "record the sound", "in clip", "add your own"]),
+        "Shortcuts" => f.shows(&["shortcuts", "hotkey", "keyboard", "save clip", "take a screenshot", "start or stop clipping", "start or stop recording", "fullscreen games", "input monitoring", "permission", "system settings"]),
+        #[cfg(target_os = "macos")]
+        "Permissions" => crate::setup::Need::ALL.iter().any(|n| f.shows(n.words()) || f.shows(&[n.label()])) || f.shows(&["permissions", "privacy", "allow"]),
+        "Voice" => f.shows(&["save by voice", "hashtag hesteclip that", "speech", "command", "voice samples", "review", "keep", "improve"]),
+        "App" => f.shows(&["appearance", "theme", "dark", "light", "system", "open at login", "autostart", "startup", "start with", "closing the window", "tray", "menu bar", "quit", "discord", "activity", "rich presence"]),
+        "HesteFiles" => f.shows(HESTEFILES_WORDS),
+        "About" => f.shows(&["update", "version", "what's new", "license", "licence", "about", "source code", "copyright", "open source", "reset", "defaults"]),
+        _ => false,
+    }
+}
+
 impl App {
+    /// Settings at `pane`, as the panel opens it: the search cleared and
+    /// Clip names closed.
+    pub(crate) fn open_settings(&mut self, pane: Pane) {
+        self.page = Page::Settings;
+        self.settings_pane = pane;
+        self.settings_query.clear();
+        self.naming_open = false;
+    }
+
     pub(crate) fn settings_page(&mut self, ui: &mut egui::Ui) {
-        if self.page == crate::Page::Settings && self.naming_open {
-            self.naming_page(ui);
-            return;
-        }
         // ⌘F: search.
         if !ui_kit::overlay_open(ui.ctx()) && ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
             ui.memory_mut(|m| m.request_focus(egui::Id::new("settings_search")));
         }
-        // The column, and room for the section list beside it when it fits;
-        // without the list the column takes the whole page.
-        let page_w = ui.available_width();
-        let width = if page_w >= COLUMN + 180.0 { COLUMN } else { page_w };
-        self.page_head(ui, "Settings", |app, ui| {
-            ui.allocate_ui(egui::vec2(ui_kit::SEARCH_W.min(ui.available_width()), ui_kit::CONTROL_H), |ui| {
-                crate::library_view::search_field(ui, "settings_search", &mut app.settings_query, "Search");
-            });
+        let f = Filter { q: self.settings_query.trim().to_lowercase() };
+        let searching = !f.q.is_empty();
+        // The panel where Clips has its own, from the rail's edge (the
+        // page's margin is inside it); the pane beside it.
+        let full = ui.max_rect();
+        let wide = full.width() >= crate::library_view::PANEL_FROM;
+        let edge = full.left() - ui_kit::PAGE_MARGIN as f32;
+        let panel = Rect::from_min_max(Pos2::new(edge, full.top()), Pos2::new(edge + crate::library_view::PANEL_W, full.bottom()));
+        let page = Rect::from_min_max(Pos2::new(if wide { panel.right() + 24.0 } else { full.left() }, full.top()), full.max);
+        let mut page_ui = ui.new_child(egui::UiBuilder::new().max_rect(page).layout(egui::Layout::top_down(egui::Align::Min)));
+        self.settings_head(&mut page_ui, wide, searching);
+        ui_kit::arrive(&mut page_ui, |ui| {
+            if self.naming_open && !searching {
+                self.naming_page(ui);
+            } else {
+                self.settings_content(ui, &f);
+            }
         });
-        ui_kit::arrive(ui, |ui| self.settings_content(ui, width));
+        if wide {
+            let mut panel_ui = ui.new_child(egui::UiBuilder::new().max_rect(panel).layout(egui::Layout::top_down(egui::Align::Min)));
+            self.settings_panel(&mut panel_ui, &f);
+        }
         self.reset_dialog(ui.ctx());
     }
 
-    /// Settings under the heading: the groups, and the section list.
-    fn settings_content(&mut self, ui: &mut egui::Ui, width: f32) {
-        let filter = Filter { q: self.settings_query.trim().to_lowercase() };
-        let wide = ui.available_width() >= width + 180.0;
-        let page = ui.available_rect_before_wrap();
-        let jump_to = self.settings_jump.take();
-        let mut tops: Vec<(&'static str, f32)> = Vec::new();
-        let mut any = false;
-        let scroll = ui_kit::scroll(ui, "settings_page", |ui| {
-            let origin = ui.cursor().top();
-            // On the page's margin, as every page's content is (the section
-            // list sits on the right).
-            ui.horizontal_top(|ui| {
+    /// The panel: the title and search, then the card of panes. While
+    /// searching, none is chosen and those with nothing found are dimmed.
+    fn settings_panel(&mut self, ui: &mut egui::Ui, f: &Filter) {
+        let p = theme::pal(ui);
+        let rect = ui.max_rect();
+        ui.painter().rect_filled(rect, 0, p.base);
+        // As the library's: the card's rows line up with the page title,
+        // the same gap below the card as beside it.
+        let side = ui_kit::PAGE_MARGIN as f32 - 10.0;
+        let inner = Rect::from_min_max(rect.min + vec2(side, 0.0), rect.max - vec2(0.0, side));
+        let head = Rect::from_min_size(inner.min, vec2(inner.width(), crate::shell::HEAD_H));
+        crate::shell::drag_window_area(ui, Rect::from_min_size(head.min, vec2(70.0, head.height())), "settings_panel_head");
+        let title_x = rect.left() + ui_kit::PAGE_MARGIN as f32;
+        let mut hui = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_max(Pos2::new(title_x, head.top()), head.max)).layout(egui::Layout::left_to_right(egui::Align::Center)));
+        hui.label(theme::text("Settings", 20.0, W::Semibold).color(p.text));
+        hui.add_space(6.0);
+        hui.allocate_ui(vec2(ui_kit::SEARCH_W.min(hui.available_width()), ui_kit::CONTROL_H), |ui| crate::library_view::search_field(ui, "settings_search", &mut self.settings_query, "Search"));
+        let card = Rect::from_min_max(Pos2::new(inner.left(), head.bottom()), inner.max);
+        ui.painter().rect_filled(card, ui_kit::CARD_RADIUS, p.raise);
+        let mut cui = ui.new_child(egui::UiBuilder::new().max_rect(card.shrink(6.0)).layout(egui::Layout::top_down(egui::Align::Min)));
+        cui.spacing_mut().item_spacing.y = 2.0;
+        let searching = !f.q.is_empty();
+        let locked = self.locked_while();
+        for pane in Pane::here() {
+            let chosen = !searching && self.settings_pane == pane;
+            let found = searching.then(|| pane.groups().iter().any(|g| group_matches(g, f)));
+            let lock = if pane == Pane::Video { locked.as_deref() } else { None };
+            if pane_row(&mut cui, pane, chosen, found, lock).clicked() {
+                self.open_settings(pane);
+            }
+        }
+    }
+
+    /// The heading beside the panel: the pane's name (Video's says it's
+    /// locked while capturing), Clip names with the way back, or Results
+    /// while searching. Narrow, the panes are in a menu on it, beside the
+    /// search.
+    fn settings_head(&mut self, ui: &mut egui::Ui, wide: bool, searching: bool) {
+        let mut back = false;
+        self.page_head_folding(ui, "", |app, ui, tight| {
+            let p = theme::pal(ui);
+            if app.naming_open && !searching {
+                back = Btn::icon(Kind::Ghost, icon::CARET_LEFT).tip("Back  (Esc)").show(ui).clicked();
+                ui.label(theme::text("Clip names", 15.0, W::Semibold).color(p.text));
+                return;
+            }
+            let title = if searching { "Results" } else { app.settings_pane.label() };
+            if wide {
+                ui.label(theme::text(title, 15.0, W::Semibold).color(p.text));
+            } else {
+                app.pane_menu(ui, title);
+                ui.allocate_ui(vec2(ui_kit::SEARCH_W.min(ui.available_width()), ui_kit::CONTROL_H), |ui| crate::library_view::search_field(ui, "settings_search", &mut app.settings_query, "Search"));
+            }
+            if !searching && app.settings_pane == Pane::Video {
+                app.video_lock(ui, tight);
+            }
+        });
+        if back {
+            self.naming_open = false;
+        }
+    }
+
+    /// The panes in a menu on the heading, when the window is too narrow for
+    /// the panel.
+    fn pane_menu(&mut self, ui: &mut egui::Ui, title: &str) {
+        let r = Btn::ghost(title).trail(icon::CARET_DOWN).id("settings_pane_menu").show(ui);
+        let searching = !self.settings_query.trim().is_empty();
+        let mut picked = None;
+        ui_kit::menu_popup(&r, true, 200.0, |ui| {
+            for pane in Pane::here() {
+                if Item::new(pane.label()).check(!searching && self.settings_pane == pane).show(ui).clicked() {
+                    picked = Some(pane);
+                }
+            }
+        });
+        if let Some(pane) = picked {
+            self.open_settings(pane);
+        }
+    }
+
+    /// The pane's groups, or what the search finds in every pane, each group
+    /// under its name.
+    fn settings_content(&mut self, ui: &mut egui::Ui, f: &Filter) {
+        let searching = !f.q.is_empty();
+        // Each pane keeps its place, and the results theirs.
+        let id = if searching { "settings_results".to_owned() } else { format!("settings_{}", self.settings_pane.label()) };
+        ui_kit::scroll(ui, &id, |ui| {
+            let width = ui.available_width().min(COLUMN);
             ui.vertical(|ui| {
                 ui.set_width(width);
-                for name in SECTIONS {
-                    let top = ui.cursor().top();
-                    let shown = self.settings_group(ui, name, &filter, jump_to == Some(name));
-                    if shown {
-                        any = true;
-                        tops.push((name, top - origin));
+                if searching {
+                    let found: Vec<&str> = Pane::here().flat_map(|p| p.groups().iter().copied()).filter(|g| group_matches(g, f)).collect();
+                    // Video's lock by the first of its groups found, as on its pane's heading.
+                    let locked_at = found.iter().position(|g| Pane::Video.groups().contains(g));
+                    for (i, name) in found.iter().enumerate() {
+                        self.group_head(ui, name, i == 0, locked_at == Some(i));
+                        self.settings_group(ui, name, f);
                     }
-                }
-                if !any {
-                    ui.add_space(40.0);
-                    ui.vertical_centered(|ui| {
-                        let p = theme::pal(ui);
-                        ui.label(theme::text(format!("No settings match “{}”", self.settings_query.trim()), 15.0, W::Semibold).color(p.text));
-                        ui.add_space(4.0);
-                        ui.label(theme::text("Try a word like frame rate, folder or shortcut.", 13.5, W::Regular).color(p.text3));
-                    });
+                    if found.is_empty() {
+                        ui.add_space(40.0);
+                        ui.vertical_centered(|ui| {
+                            let p = theme::pal(ui);
+                            ui.label(theme::text(format!("No settings match “{}”", self.settings_query.trim()), 15.0, W::Semibold).color(p.text));
+                            ui.add_space(4.0);
+                            ui.label(theme::text("Try a word like frame rate, folder or shortcut.", 13.5, W::Regular).color(p.text3));
+                        });
+                    }
+                } else {
+                    ui_kit::gap(ui, 4.0);
+                    for (i, name) in self.settings_pane.groups().iter().filter(|g| group_matches(g, f)).enumerate() {
+                        if i > 0 {
+                            self.group_head(ui, name, false, false);
+                        }
+                        self.settings_group(ui, name, f);
+                    }
                 }
                 ui.add_space(28.0);
             });
-            });
-            ui.cursor().top() - origin
         });
-        let _ = scroll;
-        // The section list: right-aligned under the recorder, its marker on
-        // the right; the one you're at follows as you scroll.
-        if wide && any {
-            let offset = ui_kit::scroll_offset(ui.ctx(), "settings_page");
-            let at = tops.iter().rev().find(|(_, y)| *y <= offset + 40.0).map(|(n, _)| *n).or(tops.first().map(|(n, _)| *n));
-            let x = page.right();
-            let mut y = page.top() + 4.0;
-            let p = theme::pal(ui);
-            let line_top = y;
-            for (name, _) in &tops {
-                let g = ui.painter().layout_no_wrap(name.to_string(), theme::font(13.0, if at == Some(*name) { W::Medium } else { W::Regular }), Color32::PLACEHOLDER);
-                let r = egui::Rect::from_min_max(egui::pos2(x - 12.0 - g.size().x - 12.0, y), egui::pos2(x, y + 28.0));
-                let resp = ui.interact(r, egui::Id::new(("jump", *name)), egui::Sense::click());
-                let on = at == Some(*name);
-                let hv = theme::toggle(ui.ctx(), resp.id.with("hv"), resp.hovered(), theme::FAST);
-                let c = if on { p.text } else { theme::mix(p.text3, p.text, hv) };
-                ui.painter().galley(egui::pos2(x - 12.0 - g.size().x, r.center().y - g.size().y / 2.0), g, c);
-                if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                    self.settings_jump = Some(name);
-                }
-                y += 28.0;
-            }
-            ui.painter().vline(x - 0.75, line_top..=y, egui::Stroke::new(1.5, p.line2));
-            // The marker slides to the section you're at (which section eases,
-            // not where it is: the list moving with the window takes it along).
-            if let Some(i) = tops.iter().position(|(n, _)| Some(*n) == at) {
-                let my = line_top + theme::value(ui.ctx(), egui::Id::new("settings_marker"), i as f32, theme::NORMAL) * 28.0;
-                ui.painter().vline(x - 0.75, my..=my + 28.0, egui::Stroke::new(1.5, p.text));
-            }
-        }
     }
 
-    /// One group of settings, filtered by the search. Returns whether it shows.
-    fn settings_group(&mut self, ui: &mut egui::Ui, name: &'static str, f: &Filter, jump: bool) -> bool {
-        // Measure first: a group with no matching rows doesn't show at all.
-        let matches = match name {
-            "Clipping" => f.shows(&["clip length", "replay buffer duration", "start clipping when hesteclips opens", "auto start"]),
-            "Video" => f.shows(&["resolution", "height", "size", "frame rate", "fps", "quality", "bitrate", "mbps", "frame blending", "motion blur", "encoder", "hardware", "software", "file format", "mp4", "mov", "game capture", "anti-cheat", "obs"]),
-            "Clips" => f.shows(&["clips folder", "location", "directory", "folder per game", "name clips after what happened", "game events", "osu", "names", "delete", "trash", "permanently"]),
-            "Sharing" => f.shows(&["hestefiles", "cloud", "upload", "account", "token", "public link", "default folder", "discord", "activity", "rich presence"]),
-            "Saved sound" => f.shows(&["play a sound when a clip is saved", "sound", "volume", "record the sound", "in clip", "add your own"]),
-            "Shortcuts" => f.shows(&["shortcuts", "hotkey", "keyboard", "save clip", "start or stop clipping", "start or stop recording"]),
-            "Voice" => f.shows(&["save by voice", "hashtag", "speech", "command", "voice samples", "review"]),
-            "App" => f.shows(&["appearance", "theme", "dark", "light", "open at login", "autostart", "startup", "closing the window", "tray", "menu bar", "update", "version", "license", "licence", "about", "source code", "copyright", "open source", "reset"]),
-            _ => false,
-        };
-        if !matches {
-            return false;
-        }
-        let head = self.group_head(ui, name);
-        if jump {
-            head.scroll_to_me(Some(egui::Align::TOP));
-        }
+    /// One group's rows, filtered by the search.
+    fn settings_group(&mut self, ui: &mut egui::Ui, name: &str, f: &Filter) {
         match name {
             "Clipping" => self.clipping_group(ui, f),
             "Video" => self.video_group(ui, f),
+            "Motion" => self.motion_group(ui, f),
+            "File" => self.file_group(ui, f),
+            "Capture" => self.capture_group(ui, f),
+            "Streaming" => self.streaming_group(ui, f),
             "Clips" => self.clips_group(ui, f),
-            "Sharing" => self.sharing_group(ui, f),
+            "Screenshots" => self.screenshots_group(ui, f),
             "Saved sound" => self.sound_group(ui, f),
             "Shortcuts" => self.shortcuts_group(ui, f),
+            #[cfg(target_os = "macos")]
+            "Permissions" => self.permissions_group(ui, f),
             "Voice" => self.voice_group(ui, f),
             "App" => self.app_group(ui, f),
+            "HesteFiles" => self.hestefiles_group(ui, f),
+            "About" => self.about_group(ui, f),
             _ => {}
         }
-        true
     }
 
-    /// A group's heading. Video says it's locked while capturing, with the
-    /// button to stop.
-    fn group_head(&mut self, ui: &mut egui::Ui, name: &str) -> egui::Response {
+    /// A group's heading (a pane's first group has the pane's own). `lock`:
+    /// Video's lock beside it, saying why.
+    fn group_head(&mut self, ui: &mut egui::Ui, name: &str, first: bool, lock: bool) {
+        ui_kit::section_head(ui, name, first, |ui| {
+            if lock {
+                self.video_lock(ui, false);
+            }
+        });
+    }
+
+    /// Video's settings are fixed when capture starts: while capturing, by
+    /// its name, the lock and why (`tight`: the lock, why on hover). Stopping
+    /// is the clipping bar's, not here too.
+    fn video_lock(&self, ui: &mut egui::Ui, tight: bool) {
+        let Some(why) = self.locked_while() else { return };
         let p = theme::pal(ui);
-        ui_kit::section_head(ui, name, name == SECTIONS[0], |ui| {
-                if name == "Video" && self.rec_state != RecState::Idle {
-                    let what = if self.rec_state == RecState::Recording { "recording" } else { "clipping" };
-                    ui.label(theme::text(format!("{}  Locked while {what}", icon::LOCK_SIMPLE), 12.5, W::Regular).color(p.text3));
-                    let stop = if self.rec_state == RecState::Recording { "Stop recording" } else { "Stop clipping" };
-                    if Btn::ghost(stop).small().show(ui).clicked() {
-                        self.stop();
-                    }
-                }
-        })
+        ui.add_space(4.0);
+        if tight {
+            ui.label(theme::ic(icon::LOCK_SIMPLE, 13.0).color(p.text3)).on_hover_text(why);
+        } else {
+            ui.label(theme::text(format!("{}  {why}", icon::LOCK_SIMPLE), 12.5, W::Regular).color(p.text3));
+        }
+    }
+
+    /// "Locked while clipping" (or recording, or streaming), while a
+    /// setting fixed at capture start can't change.
+    fn locked_while(&self) -> Option<String> {
+        (!self.rec_state.idle()).then(|| format!("Locked while {}", self.rec_state.words()))
     }
 
     /// Why a setting fixed at capture start is locked now, if it is.
     fn lock(&self) -> Option<String> {
-        match self.rec_state {
-            RecState::Idle => None,
-            RecState::Buffering => Some("Stop clipping to change this".into()),
-            RecState::Recording => Some("Stop recording to change this".into()),
-        }
+        (!self.rec_state.idle()).then(|| format!("Stop {} to change this", self.rec_state.words()))
+    }
+
+    /// Frame blending's lock: none where it changes while capturing (it's
+    /// taken up at the next frame), else as the rest of Video's.
+    fn blend_lock(&self) -> Option<String> {
+        if capture::BLEND_WHILE_CAPTURING { None } else { self.lock() }
     }
 
     fn clipping_group(&mut self, ui: &mut egui::Ui, f: &Filter) {
@@ -202,20 +376,81 @@ impl App {
         });
     }
 
+    /// Video's first group: the picture's size and shape.
     fn video_group(&mut self, ui: &mut egui::Ui, f: &Filter) {
         let lock = self.lock();
-        let mut said = false;
         let size = self.recorded_size();
-        let native = capture::frame_size(&self.video_source(), None);
+        let native = capture::frame_size(&self.video_source(), capture::VideoSize { shape: self.settings.capture_shape(), ..Default::default() });
+        let screen = capture::frame_size(&self.video_source(), Default::default());
         let res_note = match (size, native) {
-            (Some((w, h)), Some((_, nh))) if self.settings.resolution.height().is_some_and(|t| t > nh) => format!("Records at {w}×{h}: your display's size, it isn't made bigger"),
+            // A custom size: its boxes say it.
+            _ if self.settings.resolution.exact().is_some() => String::new(),
+            (Some((w, h)), Some((nw, nh))) if self.settings.resolution.short_side().is_some_and(|t| t > nw.min(nh)) => format!("Records at {w}×{h}: your display's size, it isn't made bigger"),
             (Some((w, h)), _) => format!("Records at {w}×{h}"),
             _ => String::new(),
         };
+        let mut locked_click = false;
+        ui_kit::list(ui, "video", |l| {
+            if f.shows(RESOLUTION_WORDS) {
+                let (_, c) = l.row(Row::new("Resolution").tip("Resolution", RESOLUTION_TIP).note(res_note.clone()).locked(lock.clone()), |ui| self.resolution_field(ui));
+                locked_click |= c;
+            }
+            // What Fit, Fill or Stretch does to the screen, said, and where
+            // that's changed: how it sits in the video is the screen's, on
+            // Sources. In the screen's own shape, for when it changes.
+            if f.shows(SHAPE_WORDS) {
+                let placed = self.settings.screen.placed.is_some();
+                let what = if self.settings.screen_placement().crop.is_some() { "crop" } else { "screen" };
+                let framing = (!placed).then_some(self.settings.framing);
+                let apps = matches!(self.settings.capture, settings::CaptureTarget::Apps { .. });
+                // The video's shape: one of its own, else the screen's.
+                let own = self.settings.capture_shape();
+                let video = own.or_else(|| screen.map(|(w, h)| capture::Shape { w, h, framing: capture::Framing::Fill }));
+                let shaped = video.zip(self.screen_picture());
+                let note = match shaped {
+                    Some((shape, size)) if own.is_none() && same_shape(shape, size) => changed_shape_note(framing, apps),
+                    Some((shape, size)) => framing_note(framing, shape, size, what),
+                    None => String::new(),
+                };
+                let go = shaped.is_some_and(|(shape, size)| own.is_none() || !same_shape(shape, size)).then_some(SHAPE_GO);
+                let (_, c) = l.row(Row::new("Aspect ratio").tip("Aspect ratio", SHAPE_TIP).note(note).go(go).locked(lock.clone()), |ui| self.shape_field(ui, screen));
+                locked_click |= c;
+                if ui_kit::take_row_go(l.ui.ctx(), "Aspect ratio") {
+                    self.show_screen_card();
+                }
+            }
+        });
+        self.say_locked(locked_click, lock);
+    }
+
+    /// The video's size and frame rate, as this page's Video pane has them:
+    /// the Sources page's video dialog shows them (the size over its
+    /// preview opens it).
+    /// Frame blending stays here.
+    pub(crate) fn video_size_rows(&mut self, ui: &mut egui::Ui) {
+        let all = Filter { q: String::new() };
+        self.video_group(ui, &all);
+        ui_kit::gap(ui, 8.0);
+        let lock = self.lock();
+        let mut locked_click = false;
+        ui_kit::list(ui, "scene_fps", |l| {
+            let (_, c) = l.row(Row::new("Frame rate").locked(lock.clone()), |ui| self.fps_field(ui));
+            locked_click |= c;
+        });
+        self.say_locked(locked_click, lock);
+    }
+
+    /// Video's motion: the frame rate, and frame blending's motion blur
+    /// made from faster captures than it.
+    fn motion_group(&mut self, ui: &mut egui::Ui, f: &Filter) {
+        let lock = self.lock();
+        let blend_lock = self.blend_lock();
         let max_blend = capture::max_blend_rate(&self.video_source());
         let blends = settings::blend_choices(self.settings.fps, max_blend);
         let samples = self.settings.blend_samples();
-        let blend_note = if samples > 1 {
+        let blend_note = if samples > 1 && !self.rec_state.idle() && capture::BLEND_WHILE_CAPTURING {
+            format!("Captured at {} fps, blended down to {}. Changes take effect at once", self.settings.fps * samples, self.settings.fps)
+        } else if samples > 1 {
             format!("Captured at {} fps, blended down to {}", self.settings.fps * samples, self.settings.fps)
         } else if blends.is_empty() {
             max_blend.map_or(String::new(), |hz| format!("Your display shows {hz} pictures a second: blending needs {} fps or less", hz / 2))
@@ -223,29 +458,44 @@ impl App {
             String::new()
         };
         let fps_note = max_blend.filter(|hz| self.settings.fps > *hz).map_or(String::new(), |hz| format!("More than your display shows ({hz} Hz). Fine for games running faster."));
+        let mut locked_click = false;
+        ui_kit::list(ui, "video_motion", |l| {
+            if f.shows(FPS_WORDS) {
+                let (_, c) = l.row(Row::new("Frame rate").note(fps_note.clone()).locked(lock.clone()), |ui| self.fps_field(ui));
+                locked_click |= c;
+            }
+            if capture::frame_blending() && f.shows(BLEND_WORDS) {
+                let (_, c) = l.row(Row::new("Frame blending").tip("Frame blending", "Captures faster than the frame rate and averages the pictures into each frame, for smooth motion like motion blur. It goes into clips, recordings and the stream alike. On macOS and Linux, up to your display's refresh rate.").note(blend_note.clone()).locked(blend_lock.clone()), |ui| self.blend_field(ui, &blends));
+                locked_click |= c;
+                let on = samples > 1;
+                l.well("blend_well", on, |l| {
+                    let (_, c) = l.row(Row::new("Blend").tip("Blend", BLEND_TIP).kid().locked(blend_lock.clone()), |ui| {
+                        if let Some(s) = blend_shape_field(ui, self.settings.blend_shape) {
+                            self.settings.blend_shape = s;
+                        }
+                    });
+                    locked_click |= c;
+                });
+            }
+        });
+        self.say_locked(locked_click, lock);
+    }
+
+    /// Video's file: how much detail it keeps (and so how big it is), what
+    /// encodes it, and its format.
+    fn file_group(&mut self, ui: &mut egui::Ui, f: &Filter) {
+        let lock = self.lock();
         let per_min = human_bytes(self.estimated_bytes(60.0));
         let rec = self.recommended_mbps();
         let preset = rec.and_then(|r| [("Smaller", round_mbps(r as f64 * 0.5)), ("Balanced", r), ("High", round_mbps(r as f64 * 2.0))].into_iter().position(|(_, m)| m == self.settings.video_bitrate_mbps));
         let quality_note = format!("{}about {per_min} per minute", if preset.is_some() { "" } else { "Your own bitrate, " });
         let mut locked_click = false;
-        ui_kit::list(ui, "video", |l| {
-            if f.shows(&["resolution", "height", "size", "native"]) {
-                let (_, c) = l.row(Row::new("Resolution").tip("Resolution", "Lower makes smaller files that are quicker to share. Native keeps every pixel of your display.").note(res_note.clone()).locked(lock.clone()), |ui| self.resolution_field(ui));
-                locked_click |= c;
-            }
-            if f.shows(&["frame rate", "fps"]) {
-                let (_, c) = l.row(Row::new("Frame rate").note(fps_note.clone()).locked(lock.clone()), |ui| self.fps_field(ui));
-                locked_click |= c;
-            }
-            if f.shows(&["quality", "bitrate", "mbps"]) {
+        ui_kit::list(ui, "video_file", |l| {
+            if f.shows(QUALITY_WORDS) {
                 let (_, c) = l.row(Row::new("Quality").tip("Quality", "How much detail each second gets. Fast motion needs more, and files grow with it. Balanced looks good in fast motion at this size and frame rate.").note(quality_note.clone()).locked(lock.clone()), |ui| self.quality_field(ui, rec, preset));
                 locked_click |= c;
             }
-            if cfg!(any(windows, target_os = "macos")) && f.shows(&["frame blending", "motion blur"]) {
-                let (_, c) = l.row(Row::new("Frame blending").tip("Frame blending", "Captures faster than the frame rate and averages the pictures into each frame, for smooth motion like motion blur. On macOS, up to your display's refresh rate.").note(blend_note.clone()).locked(lock.clone()), |ui| self.blend_field(ui, &blends));
-                locked_click |= c;
-            }
-            if f.shows(&["encoder", "hardware", "software", "gpu"]) {
+            if f.shows(ENCODER_WORDS) {
                 let (_, c) = l.row(Row::new("Encoder").tip("Encoder", "Hardware encoding barely affects your game's frame rate. Software is slower and uses the CPU.").locked(lock.clone()), |ui| {
                     let r = ui_kit::select(ui, self.settings.encoder.label(), 150.0);
                     ui_kit::menu_popup(&r, false, 260.0, |ui| {
@@ -258,7 +508,7 @@ impl App {
                 });
                 locked_click |= c;
             }
-            if f.shows(&["file format", "mp4", "mov", "container"]) {
+            if f.shows(FORMAT_WORDS) {
                 let (_, c) = l.row(Row::new("File format").tip("File format", "MP4 plays everywhere. MOV is for QuickTime and Final Cut.").locked(lock.clone()), |ui| {
                     let chosen = usize::from(self.settings.container == Container::Mov);
                     if let Some(i) = ui_kit::segmented_opts(ui, "container", &[Seg::from("MP4"), Seg::from("MOV")], chosen, None, ui.is_enabled()) {
@@ -267,7 +517,17 @@ impl App {
                 });
                 locked_click |= c;
             }
-            if capture::game_hook_available() && f.shows(&["game capture", "anti-cheat", "anticheat", "obs", "fullscreen"]) {
+        });
+        self.say_locked(locked_click, lock);
+    }
+
+    /// How the picture's captured (Windows): game capture, for games
+    /// Windows' own capture can't record properly, and the screen's way.
+    fn capture_group(&mut self, ui: &mut egui::Ui, f: &Filter) {
+        let lock = self.lock();
+        let mut locked_click = false;
+        ui_kit::list(ui, "video_capture", |l| {
+            if capture::game_hook_available() && f.shows(GAME_CAPTURE_WORDS) {
                 let (_, c) = l.row(Row::new("Game capture").tip("Game capture", "For games Windows can't record properly, like exclusive fullscreen games that record frozen, or that lose their cursor. Uses OBS Studio's game capture, only where it's needed.").note("For games that record frozen or without a cursor").locked(lock.clone()), |ui| ui_kit::switch(ui, &mut self.settings.game_capture));
                 locked_click |= c;
                 let on = self.settings.game_capture;
@@ -276,12 +536,137 @@ impl App {
                     locked_click |= c;
                 });
             }
+            if SCREEN_CAPTURE && f.shows(SCREEN_CAPTURE_WORDS) {
+                let apps = matches!(self.settings.capture, settings::CaptureTarget::Apps { .. });
+                let (note, warn) = screen_capture_note(self.settings.screen_capture, apps, capture::screen_capture_in_use(), capture::screen_capture_auto_duplicates());
+                let (_, c) = l.row(Row::new("Screen capture").tip("Screen capture", SCREEN_CAPTURE_TIP).note(note).warn(warn).locked(lock.clone()), |ui| {
+                    let r = ui_kit::select(ui, self.settings.screen_capture.label(), 150.0);
+                    ui_kit::menu_popup(&r, false, 260.0, |ui| {
+                        for m in settings::ScreenCapture::ALL {
+                            if Item::new(m.label()).check(self.settings.screen_capture == m).show(ui).clicked() {
+                                self.settings.screen_capture = m;
+                            }
+                        }
+                    });
+                });
+                locked_click |= c;
+            }
         });
-        if locked_click && !said {
-            said = true;
-            self.toast_icon(icon::LOCK_SIMPLE, lock.clone().unwrap_or_default());
+        self.say_locked(locked_click, lock);
+    }
+
+    /// Where Go live streams to: each place with its stream key (dots
+    /// unless shown), on or off, and what it's sent (its own size, frame
+    /// rate and bitrate: Twitch takes less than YouTube), then adding one.
+    /// Locked while live: what the stream was started with stays.
+    fn streaming_group(&mut self, ui: &mut egui::Ui, f: &Filter) {
+        let live = self.rec_state.streaming;
+        let lock = live.then(|| "End the stream to change this".to_owned());
+        let status = if live { self.stream_status.get() } else { Vec::new() };
+        let recorded = self.recorded_size();
+        let rec_fps = self.settings.fps;
+        let rates = capture::stream::stream_rates(rec_fps);
+        let looks = self.settings.blend_samples();
+        let mut remove = None;
+        let mut add = None;
+        let mut locked_click = false;
+        // Two of a service are told apart: "Twitch", "Twitch 2".
+        let names: Vec<String> = {
+            let ds = &self.settings.stream.destinations;
+            ds.iter()
+                .enumerate()
+                .map(|(i, d)| {
+                    let n = ds[..i].iter().filter(|e| e.name() == d.name()).count();
+                    if n == 0 { d.name() } else { format!("{} {}", d.name(), n + 1) }
+                })
+                .collect()
+        };
+        // Going live takes all of the bitrate, for each place at once.
+        let upload: u32 = self.settings.stream.ready().map(|d| d.kbps + 192).sum();
+        let places = self.settings.stream.ready().count();
+        // The stream's destinations, in order: the ready ones went.
+        let mut sent = status.iter();
+        ui_kit::list(ui, "streaming", |l| {
+            if !f.shows(STREAM_WORDS) {
+                return;
+            }
+            if self.settings.stream.destinations.is_empty() {
+                l.row(Row::new("Nowhere to stream to yet").note("Add Twitch, YouTube, Kick or a server of your own, with its stream key. Go live sends to all of them at once."), |_| {});
+            }
+            for (i, d) in self.settings.stream.destinations.iter_mut().enumerate() {
+                let went = (live && d.enabled && d.missing().is_none()).then(|| sent.next()).flatten();
+                let note = match (went, d.missing()) {
+                    (Some(s), _) => crate::shell::link_words(s),
+                    (None, Some(what)) => format!("Add {what}, from {}", d.service.key_from()),
+                    (None, None) if d.enabled => "Goes live with Go live".to_owned(),
+                    (None, None) => "Off: Go live leaves it out".to_owned(),
+                };
+                let warn = went.is_some_and(|s| matches!(s.link, capture::stream::Link::Waiting { .. }));
+                let (_, c) = l.row(Row::new(&names[i]).note(note).warn(warn).locked(lock.clone()), |ui| {
+                    if Btn::icon(Kind::Ghost, icon::TRASH).small().tip("Remove").show(ui).clicked() {
+                        remove = Some(i);
+                    }
+                    ui_kit::switch(ui, &mut d.enabled);
+                    let shown_id = egui::Id::new(("stream_key_shown", i));
+                    let shown = ui.data(|m| m.get_temp::<bool>(shown_id)).unwrap_or(false);
+                    if Btn::icon(Kind::Ghost, if shown { icon::EYE_SLASH } else { icon::EYE }).small().tip(if shown { "Hide the key" } else { "Show the key" }).show(ui).clicked() {
+                        ui.data_mut(|m| m.insert_temp(shown_id, !shown));
+                    }
+                    let width = (ui.available_width() - 8.0).clamp(120.0, 220.0);
+                    ui_kit::secret_field(ui, egui::Id::new(("stream_key", i)), &mut d.key, "Stream key", shown, width);
+                });
+                locked_click |= c;
+                // Where it goes (Kick's and another server's own), and what
+                // it's sent: under it while it's on.
+                l.well(("stream_well", i), d.enabled, |l| {
+                    if d.service.server(false).is_none() {
+                        let hint = if d.service == StreamService::Kick { "rtmps://….live-video.net/app" } else { "rtmp://server/app" };
+                        let (_, c) = l.row(Row::new("Server").kid().locked(lock.clone()), |ui| {
+                            let width = (ui.available_width() - 8.0).clamp(160.0, 300.0);
+                            ui.allocate_ui(vec2(width, ui_kit::CONTROL_H), |ui| ui_kit::text_field(ui, &mut d.server, hint));
+                        });
+                        locked_click |= c;
+                    }
+                    let size = recorded.map(|(w, h)| capture::output_size(w, h, d.quality().short_side));
+                    let res_note = size.map_or(String::new(), |(w, h)| format!("Streams at {w}×{h}"));
+                    let (_, c) = l.row(Row::new("Resolution").kid().note(res_note).locked(lock.clone()), |ui| stream_resolution_field(ui, i, d, recorded));
+                    locked_click |= c;
+                    let fps = capture::stream::stream_rate(rec_fps, d.fps);
+                    let (_, c) = l.row(Row::new("Frame rate").tip("Stream frame rate", STREAM_FPS_TIP).kid().note(stream_fps_note(rec_fps, fps, looks)).locked(lock.clone()), |ui| stream_fps_field(ui, i, d, &rates, rec_fps));
+                    locked_click |= c;
+                    let (note, over) = stream_bitrate_note(d);
+                    let (_, c) = l.row(Row::new("Bitrate").tip("Stream bitrate", STREAM_BITRATE_TIP).kid().note(note).warn(over).locked(lock.clone()), |ui| stream_bitrate_field(ui, i, d));
+                    locked_click |= c;
+                });
+            }
+            let note = (places > 1).then(|| format!("Going live takes about {} Mbps of your upload in all", mbps_words(f64::from(upload) / 1000.0)));
+            let (_, c) = l.row(Row::new("Add a place to stream to").note(note.unwrap_or_default()).locked(lock.clone()), |ui| {
+                let r = Btn::normal("Add").with_icon(icon::PLUS).trail(icon::CARET_DOWN).small().id("add_stream_destination").show(ui);
+                ui_kit::menu_popup(&r, false, 200.0, |ui| {
+                    for s in StreamService::ALL {
+                        if Item::new(s.label()).show(ui).clicked() {
+                            add = Some(s);
+                        }
+                    }
+                });
+            });
+            locked_click |= c;
+        });
+        if let Some(i) = remove {
+            let gone = self.settings.stream.destinations.remove(i);
+            self.toast_icon(icon::TRASH, format!("Removed {}", gone.name()));
         }
-        let _ = said;
+        if let Some(s) = add {
+            self.settings.stream.destinations.push(StreamDestination::new(s));
+        }
+        self.say_locked(locked_click, lock);
+    }
+
+    /// A locked row's control was clicked: why it's locked, in a toast.
+    pub(crate) fn say_locked(&mut self, clicked: bool, why: Option<String>) {
+        if clicked && let Some(why) = why {
+            self.toast_icon(icon::LOCK_SIMPLE, why);
+        }
     }
 
     fn clips_group(&mut self, ui: &mut egui::Ui, f: &Filter) {
@@ -305,8 +690,10 @@ impl App {
                         self.refresh_clips();
                     }
                     let room = (ui.available_width() - 8.0).clamp(60.0, 240.0);
-                    let job = ui_kit::single_line_job(&short, theme::font(13.0, W::Regular), p.text2, room);
-                    ui.label(job).on_hover_text(&path);
+                    // Laid out here: a label would lay a job out again with
+                    // its own wrapping, and show all of a long path.
+                    let shown = ui.painter().layout_job(ui_kit::single_line_job(&short, theme::font(13.0, W::Regular), p.text2, room));
+                    ui.label(shown).on_hover_text(&path);
                 });
             }
             if f.shows(&["folder per game"]) {
@@ -314,7 +701,7 @@ impl App {
             }
             if f.shows(&["name clips after what happened", "game events", "osu", "names", "titles", "tosu"]) {
                 let note = if self.settings.game_details { format!("Like “{example}”") } else { "Clips are named by the time they were saved".to_owned() };
-                l.row(Row::new("Name clips after what happened").tip("Name clips after what happened", "Clips get names like “3 kills on Mirage” or “412pp · 98.52% FC · FREEDOM DiVE”. Clips where nothing happened keep their time.").note(note), |ui| {
+                l.row(Row::new("Name clips after what happened").tip("Name clips after what happened", "Clips get names like “3 kills on Mirage” or “412pp 98.52% FC FREEDOM DiVE”. Clips where nothing happened keep their time.").note(note), |ui| {
                     ui_kit::switch(ui, &mut self.settings.game_details);
                     let shown = theme::toggle(ui.ctx(), egui::Id::new("names_customize"), self.settings.game_details, theme::NORMAL);
                     if shown > 0.0 {
@@ -337,122 +724,41 @@ impl App {
         });
     }
 
-    fn sharing_group(&mut self, ui: &mut egui::Ui, f: &Filter) {
-        let connected = self.cloud.is_connected();
-        let picture = self.cloud.profile_picture().and_then(|url| self.web_images.fresh(ui.ctx(), &url));
-        let mut disconnect = false;
-        let mut pick = false;
-        ui_kit::list(ui, "sharing", |l| {
-            if f.shows(&["hestefiles", "cloud", "upload", "account", "token", "public link", "default folder", "share"]) {
-                let note = match &self.cloud.connection {
-                    crate::cloud::Connection::Connected(account) => format!("Connected as {}", account.user_info.username),
-                    crate::cloud::Connection::Connecting => "Checking your token…".to_owned(),
-                    crate::cloud::Connection::Failed(e) => format!("Couldn't connect: {e}"),
-                    crate::cloud::Connection::Disconnected => "Upload clips to your HesteFiles storage and share a link.".to_owned(),
-                };
-                let failed = matches!(self.cloud.connection, crate::cloud::Connection::Failed(_));
-                l.row(Row::new("HesteFiles").note(note).warn(failed), |ui| {
-                    if connected {
-                        disconnect = Btn::ghost("Disconnect").small().show(ui).clicked();
-                        if let Some(tex) = &picture {
-                            // Round, as HesteFiles shows it.
-                            ui.add(egui::Image::from_texture((tex.id(), egui::vec2(22.0, 22.0))).corner_radius(11));
-                        }
-                    } else if !matches!(self.cloud.connection, crate::cloud::Connection::Connecting) && Btn::normal("Connect…").small().show(ui).clicked() {
-                        self.connect_open = true;
+    fn screenshots_group(&mut self, ui: &mut egui::Ui, f: &Filter) {
+        use crate::settings::ScreenshotFormat;
+        ui_kit::list(ui, "screenshots", |l| {
+            // The key is set under Shortcuts, with the others; it's off
+            // until chosen, so it's shown here too, a click from choosing it.
+            if f.shows(&["screenshots", "shortcut", "hotkey", "keyboard"]) {
+                let action = ShortcutAction::Screenshot;
+                let keys = self.shortcut_keys(action);
+                // Off says itself (its button reads Choose a key).
+                let note = if keys.is_none() { "" } else { "Set under Shortcuts" };
+                l.row(Row::new("Shortcut").note(note), |ui| {
+                    if Btn::normal(if keys.is_none() { "Choose a key" } else { "Change" }).small().show(ui).clicked() {
+                        self.recording_shortcut = Some((action, None));
+                        self.open_settings(Pane::Shortcuts);
+                    }
+                    if let Some(k) = &keys {
+                        ui_kit::keycaps(ui, k, false);
                     }
                 });
-                l.well("hestefiles_well", connected, |l| {
-                    let folder = self.cloud.default_folder.as_ref().map_or("Not set".to_owned(), |f| format!("HesteFiles / {}", f.display()));
-                    l.row(Row::new("Upload to").kid().tip("Upload to", "Where Upload to HesteFiles puts clips unless you pick another folder when uploading."), |ui| {
-                        pick = Btn::normal("Choose…").small().show(ui).clicked();
-                        ui.label(theme::text(&folder, 13.0, W::Regular).color(theme::pal(ui).text2));
-                    });
-                    l.row(Row::new("Put each clip in a folder for its game").kid(), |ui| {
-                        let mut on = self.cloud.game_folders;
-                        if ui_kit::switch(ui, &mut on).changed() {
-                            self.cloud.set_game_folders(on);
-                        }
-                    });
-                    l.row(Row::new("Make a public link").kid().note("Anyone with the link can watch and download."), |ui| {
-                        let mut on = self.cloud.public_links;
-                        if ui_kit::switch(ui, &mut on).changed() {
-                            self.cloud.set_public_links(on);
-                        }
-                    });
+            }
+            if f.shows(&["screenshots", "format", "png", "jpg", "jpeg"]) {
+                let jpg = self.settings.screenshot_format == ScreenshotFormat::Jpg;
+                let note = if jpg { "About a quarter of the size, for sharing" } else { "Every pixel as it was" };
+                let tip = "Screenshots go in your clips folder, with the game's clips. PNG keeps every pixel as it was. JPG files are about a quarter of the size, and keep every pixel's colour so text stays sharp.";
+                l.row(Row::new("Format").tip("Format", tip).note(note), |ui| {
+                    let opts = [Seg::from("PNG"), Seg::from("JPG")];
+                    if let Some(i) = ui_kit::segmented_opts(ui, "screenshot_format", &opts, usize::from(jpg), None, true) {
+                        self.settings.screenshot_format = if i == 1 { ScreenshotFormat::Jpg } else { ScreenshotFormat::Png };
+                    }
                 });
             }
-            if f.shows(&["discord", "activity", "rich presence"]) {
-                let note = if self.settings.discord_presence && self.rec_state != RecState::Idle {
-                    if self.presence.connected() { "Showing on Discord" } else { "Discord isn't running" }
-                } else {
-                    ""
-                };
-                l.row(Row::new("Discord activity").tip("Discord activity", "Your Discord profile shows “Clipping osu!” while HesteClips captures. Needs Discord running.").note(note), |ui| ui_kit::switch(ui, &mut self.settings.discord_presence));
+            if f.shows(&["screenshots", "copy", "clipboard", "paste"]) {
+                l.row(Row::new("Also copy it").tip("Also copy it", "A screenshot also goes on the clipboard as you take it, to paste right away.").note("Paste it straight into Discord or a chat"), |ui| ui_kit::switch(ui, &mut self.settings.copy_screenshots));
             }
         });
-        if disconnect {
-            self.cloud.disconnect();
-            self.toast_icon(icon::SIGN_OUT, "Disconnected from HesteFiles");
-        }
-        if pick {
-            self.cloud.open_browser(self.cloud.default_folder.clone());
-            self.dialog = Some(crate::cloud_ui::Dialog::PickDefaultFolder);
-        }
-        self.connect_dialog(ui.ctx());
-    }
-
-    /// "Connect HesteFiles": paste a token.
-    fn connect_dialog(&mut self, ctx: &egui::Context) {
-        if !self.connect_open {
-            return;
-        }
-        if self.cloud.is_connected() {
-            self.connect_open = false;
-            if let crate::cloud::Connection::Connected(a) = &self.cloud.connection {
-                let name = a.user_info.username.clone();
-                self.toast(format!("Connected as {name}"));
-            }
-            return;
-        }
-        let mut close = false;
-        let modal = ui_kit::dialog(ctx, "hestefiles_connect", 420.0, |ui| {
-            ui_kit::dialog_title(ui, "Connect HesteFiles");
-            ui_kit::dialog_text(ui, "Create an account token on the HesteFiles website and paste it here.");
-            ui.add_space(4.0);
-            let mut out = egui::TextEdit::singleline(&mut self.cloud.token_input).password(true);
-            out = out.hint_text("Paste account token").desired_width(f32::INFINITY);
-            let p = theme::pal(ui);
-            let field = egui::Frame::new().fill(p.control).corner_radius(ui_kit::RADIUS).inner_margin(egui::Margin::symmetric(10, 7)).show(ui, |ui| ui.add(out.frame(egui::Frame::NONE))).inner;
-            if !self.connect_focused {
-                field.request_focus();
-                self.connect_focused = true;
-            }
-            let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            match &self.cloud.connection {
-                crate::cloud::Connection::Failed(e) => {
-                    ui.add_space(4.0);
-                    ui.label(theme::text(format!("Couldn't connect: {e}"), 12.5, W::Regular).color(p.danger));
-                }
-                crate::cloud::Connection::Connecting => {
-                    ui.add_space(4.0);
-                    ui.label(theme::text("Checking…", 12.5, W::Regular).color(p.text3));
-                }
-                _ => {}
-            }
-            ui_kit::dialog_buttons(ui, |ui| {
-                let can = !self.cloud.token_input.trim().is_empty();
-                if (ui.add(ui_kit::button("Connect", true)).clicked() || enter) && can {
-                    let token = self.cloud.token_input.clone();
-                    self.cloud.connect(&token);
-                }
-                close = ui.add(ui_kit::button("Cancel", false).ghost()).clicked();
-            });
-        });
-        if close || modal.dismissed() {
-            self.connect_open = false;
-            self.connect_focused = false;
-        }
     }
 
     fn sound_group(&mut self, ui: &mut egui::Ui, f: &Filter) {
@@ -536,22 +842,78 @@ impl App {
             ui.label(theme::text(format!("Shortcuts are unavailable: {e}"), 12.5, W::Regular).color(p.warn));
             ui.add_space(6.0);
         }
-        let desktop = self.hotkeys.as_ref().is_ok_and(|h| h.via_desktop());
+        // The desktop keeps the keys (Wayland, but KDE Plasma, where they're
+        // set from here): it may ask to confirm them, and has the last word.
+        let desktop = self.hotkeys.as_ref().is_ok_and(|h| h.via_desktop() && !h.keys_set_here());
         ui_kit::list(ui, "shortcuts", |l| {
-            for action in ShortcutAction::ALL {
+            for action in ShortcutAction::ALL.into_iter().filter(|a| a.available()) {
                 if !f.shows(&[action.label(), "shortcut", "hotkey", "keyboard"]) {
                     continue;
                 }
+                let off = self.settings.shortcuts.get(action).is_empty();
                 let note = match action {
-                    ShortcutAction::SaveClip if desktop => "Works everywhere. Your desktop looks after it, and may ask you to confirm.",
-                    ShortcutAction::SaveClip => "Works everywhere, even in a game",
+                    ShortcutAction::SaveClip if desktop => "Works everywhere. Your desktop looks after it, and may ask you to confirm. While recording, it marks the moment.",
+                    ShortcutAction::SaveClip => "Works everywhere, even in a game. While recording, it marks the moment.",
+                    // Off says itself: its keys read Off.
+                    ShortcutAction::Screenshot if off => "",
+                    ShortcutAction::Screenshot => "Works everywhere, even in a game",
                     _ => "",
                 };
                 let problem = self.shortcut_problem(action);
                 let note = problem.clone().unwrap_or_else(|| note.to_owned());
                 l.row(Row::new(action.label()).note(note).warn(problem.is_some()), |ui| self.shortcut_editor(ui, action));
             }
+            // On Wayland the desktop keeps the keys (the user's, once set):
+            // they're changed in its own editor.
+            if desktop && self.hotkeys.as_ref().is_ok_and(|h| h.desktop_configurable()) && f.shows(&["shortcut", "hotkey", "keyboard", "system settings"]) {
+                let mut open = false;
+                l.row(Row::new("Keys").note("Your desktop decides these shortcuts' keys. Set or change them in its window, opened from here."), |ui| {
+                    open = Btn::normal("Set up keys").small().show(ui).clicked();
+                });
+                if open && let Ok(h) = &self.hotkeys {
+                    h.configure_desktop();
+                }
+            }
         });
+    }
+
+    /// macOS: what HesteClips needs macOS to allow, whether it's allowed,
+    /// and a way to allow what isn't. Nothing here nags: a permission left
+    /// off only shows as off when someone looks.
+    #[cfg(target_os = "macos")]
+    fn permissions_group(&mut self, ui: &mut egui::Ui, f: &Filter) {
+        use crate::setup::Need;
+        let p = theme::pal(ui);
+        let mut ask = None;
+        let mut all = true;
+        ui_kit::list(ui, "permissions", |l| {
+            for need in Need::ALL {
+                let mut words = vec![need.label(), "permission", "privacy", "allow"];
+                words.extend_from_slice(need.words());
+                if !f.shows(&words) {
+                    continue;
+                }
+                let allowed = need.allowed();
+                all &= allowed;
+                l.row(Row::new(need.label()).note(need.why()), |ui| {
+                    if allowed {
+                        ui.label(theme::text(format!("{}  Allowed", icon::CHECK), 13.0, W::Medium).color(p.text2));
+                    } else if Btn::normal("Allow").small().show(ui).clicked() {
+                        ask = Some(need);
+                    }
+                });
+            }
+        });
+        if let Some(need) = ask {
+            need.ask();
+            if need == Need::Keys {
+                self.start_key_tap();
+            }
+        }
+        if !all {
+            // Back from System Settings, it shows as allowed.
+            ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+        }
     }
 
     fn voice_group(&mut self, ui: &mut egui::Ui, f: &Filter) {
@@ -568,8 +930,8 @@ impl App {
         let (to_hear, all) = self.voice_review.summary();
         let mut review = false;
         ui_kit::list(ui, "voice", |l| {
-            if f.shows(&["save by voice", "hashtag", "speech", "command", "voice"]) {
-                l.row(Row::new("Save by voice").tip("Save by voice", "While clipping, say “hashtag HesteClip that” to save a clip. Listening happens on this computer, for this phrase only.").note(note), |ui| ui_kit::switch(ui, &mut self.settings.voice_clip));
+            if f.shows(&["save by voice", "hashtag hesteclip that", "speech", "command", "voice"]) {
+                l.row(Row::new("Save by voice").tip("Save by voice", "While clipping, say “hashtag HesteClip that” to save a clip; while recording, to mark the moment. Listening happens on this computer, for this phrase only.").note(note), |ui| ui_kit::switch(ui, &mut self.settings.voice_clip));
             }
             if f.shows(&["voice samples", "keep", "review", "improve"]) {
                 l.row(Row::new("Keep voice samples").tip("Keep voice samples", "Keeps about 6 seconds of your microphone each time the command saves a clip or nearly does. You can listen to them and mark which should have saved a clip, to help improve the detector. They stay on this computer."), |ui| ui_kit::switch(ui, &mut self.settings.voice_samples));
@@ -588,18 +950,6 @@ impl App {
     }
 
     fn app_group(&mut self, ui: &mut egui::Ui, f: &Filter) {
-        use crate::update::Status;
-        let status = self.updater.status();
-        let line = match &status {
-            Status::Unavailable => "Development build: updates only come to the installed app.".to_owned(),
-            Status::Idle => "Updates install when you quit, never mid-game.".to_owned(),
-            Status::Checking => "Checking for updates…".to_owned(),
-            Status::Downloading(p) => format!("Downloading an update… {p}%"),
-            Status::UpToDate => "You have the latest version.".to_owned(),
-            Status::Ready(v) => format!("Version {v} is ready and installs when you quit HesteClips."),
-            Status::Failed(e) => e.clone(),
-        };
-        let idle = self.rec_state == RecState::Idle;
         ui_kit::list(ui, "app", |l| {
             if f.shows(&["appearance", "theme", "dark", "light", "system"]) {
                 l.row(Row::new("Appearance"), |ui| {
@@ -631,6 +981,94 @@ impl App {
                     }
                 });
             }
+            if f.shows(&["discord", "activity", "rich presence"]) {
+                let clipping_a_game = !self.rec_state.idle() && self.clipped_game.is_some();
+                let note = match (self.settings.discord_presence, clipping_a_game) {
+                    (false, _) => "",
+                    (true, false) => "Shows while you clip a game",
+                    (true, true) if self.presence.connected() => "Showing on Discord",
+                    (true, true) => "Discord isn't running",
+                };
+                let tip = "While HesteClips clips a game, your Discord profile shows “Clipping osu! with HesteClips”, with a button for others to get HesteClips. Needs Discord running.";
+                l.row(Row::new("Discord activity").tip("Discord activity", tip).note(note), |ui| ui_kit::switch(ui, &mut self.settings.discord_presence));
+            }
+        });
+    }
+
+    /// HesteFiles: the account, and where and how clips upload.
+    fn hestefiles_group(&mut self, ui: &mut egui::Ui, f: &Filter) {
+        if !f.shows(HESTEFILES_WORDS) {
+            return;
+        }
+        let connected = self.cloud.is_connected();
+        let picture = self.cloud.profile_picture().and_then(|url| self.web_images.fresh(ui.ctx(), &url));
+        let mut disconnect = false;
+        let mut pick = false;
+        ui_kit::list(ui, "hestefiles", |l| {
+            let note = match &self.cloud.connection {
+                crate::cloud::Connection::Connected(account) => format!("Connected as {}", account.user_info.username),
+                crate::cloud::Connection::Connecting => "Checking your token…".to_owned(),
+                crate::cloud::Connection::Failed(e) => format!("Couldn't connect: {e}"),
+                crate::cloud::Connection::Disconnected => "Upload clips to your HesteFiles storage and share a link.".to_owned(),
+            };
+            let failed = matches!(self.cloud.connection, crate::cloud::Connection::Failed(_));
+            l.row(Row::new("HesteFiles account").note(note).warn(failed), |ui| {
+                if connected {
+                    disconnect = Btn::ghost("Disconnect").small().show(ui).clicked();
+                    if let Some(tex) = &picture {
+                        // Round, as HesteFiles shows it.
+                        ui.add(egui::Image::from_texture((tex.id(), egui::vec2(22.0, 22.0))).corner_radius(11));
+                    }
+                } else if !matches!(self.cloud.connection, crate::cloud::Connection::Connecting) && Btn::normal("Connect…").small().show(ui).clicked() {
+                    self.connect_open = true;
+                }
+            });
+            l.well("hestefiles_well", connected, |l| {
+                let folder = self.cloud.default_folder.as_ref().map_or("Not set".to_owned(), |f| format!("HesteFiles / {}", f.display()));
+                l.row(Row::new("Upload to").kid().tip("Upload to", "Where Upload to HesteFiles puts clips unless you pick another folder when uploading."), |ui| {
+                    pick = Btn::normal("Choose…").small().show(ui).clicked();
+                    ui.label(theme::text(&folder, 13.0, W::Regular).color(theme::pal(ui).text2));
+                });
+                l.row(Row::new("Put each clip in a folder for its game").kid(), |ui| {
+                    let mut on = self.cloud.game_folders;
+                    if ui_kit::switch(ui, &mut on).changed() {
+                        self.cloud.set_game_folders(on);
+                    }
+                });
+                l.row(Row::new("Make a public link").kid().note("Anyone with the link can watch and download."), |ui| {
+                    let mut on = self.cloud.public_links;
+                    if ui_kit::switch(ui, &mut on).changed() {
+                        self.cloud.set_public_links(on);
+                    }
+                });
+            });
+        });
+        if disconnect {
+            self.cloud.disconnect();
+            self.toast_icon(icon::SIGN_OUT, "Disconnected from HesteFiles");
+        }
+        if pick {
+            self.cloud.open_browser(self.cloud.default_folder.clone());
+            self.dialog = Some(crate::cloud_ui::Dialog::PickDefaultFolder);
+        }
+    }
+
+    /// The version and its updates, the license, and going back to the
+    /// defaults, last.
+    fn about_group(&mut self, ui: &mut egui::Ui, f: &Filter) {
+        use crate::update::Status;
+        let status = self.updater.status();
+        let line = match &status {
+            Status::Unavailable => "Development build: updates only come to the installed app.".to_owned(),
+            Status::Idle => "Updates install when you quit, never mid-game.".to_owned(),
+            Status::Checking => "Checking for updates…".to_owned(),
+            Status::Downloading(p) => format!("Downloading an update… {p}%"),
+            Status::UpToDate => "You have the latest version.".to_owned(),
+            Status::Ready(v) => format!("Version {v} is ready and installs when you quit HesteClips."),
+            Status::Failed(e) => e.clone(),
+        };
+        let idle = self.rec_state.idle();
+        ui_kit::list(ui, "about", |l| {
             if f.shows(&["update", "version", "what's new"]) {
                 let title = format!("HesteClips {}", self.updater.version());
                 l.row(Row::new(&title).note(line.clone()), |ui| {
@@ -639,8 +1077,12 @@ impl App {
                     }
                     match status {
                         Status::Ready(_) => {
-                            let recording = self.rec_state == RecState::Recording;
-                            if Btn::normal("Restart now").small().enabled(!recording).tip(if recording { "Finish your recording first" } else { "Restart into the new version" }).show(ui).clicked() && self.updater.install_on_exit(true) {
+                            let busy = if self.rec_state.streaming {
+                                Some("End your stream first".to_owned())
+                            } else {
+                                self.rec_state.recording.then(|| "Finish your recording first".to_owned())
+                            };
+                            if Btn::normal("Restart now").small().tip("Restart into the new version").locked(busy).show(ui).clicked() && self.updater.install_on_exit(true) {
                                 self.quit(ui.ctx());
                             }
                         }
@@ -664,8 +1106,8 @@ impl App {
                 });
             }
             if f.shows(&["reset", "defaults"]) {
-                l.row(Row::new("Reset all settings").note("Your clips, folders, sources and HesteFiles account are kept."), |ui| {
-                    let b = Btn::new(Kind::DangerText, "Reset…").small().enabled(idle).tip(if idle { "Back to the defaults" } else { "Stop capturing first" });
+                l.row(Row::new("Reset all settings").note("Your clips, folders, sources and stream keys are kept."), |ui| {
+                    let b = Btn::new(Kind::DangerText, "Reset…").small().tip("Back to the defaults").locked((!idle).then(|| "Stop capturing first".to_owned()));
                     if b.show(ui).clicked() {
                         self.confirm_reset = true;
                     }
@@ -677,51 +1119,75 @@ impl App {
     /// The clip length: type any length (digits fill the clock: "230" is 2:30)
     /// or pick one.
     fn length_field(&mut self, ui: &mut egui::Ui) {
-        let secs = self.settings.replay_seconds;
-        let presets: Vec<(String, String, String)> = REPLAY_CHOICES.iter().map(|&s| (length_words(s), clock_label(s), String::new())).collect();
-        let current = REPLAY_CHOICES.iter().position(|&s| s == secs);
-        let field = ValueField { id: egui::Id::new("vf_length"), text: clock_label(secs), unit: "", width: 116.0, hint: "Type the digits: 230 is 2:30. ↑ ↓ change the part chosen", presets, current, range: "5 s – 1 h" };
-        match field.show_time(ui, f64::from(secs), 5.0, 3600.0) {
-            Typed::Preset(i) => self.settings.replay_seconds = REPLAY_CHOICES[i],
-            Typed::Secs(v) if (5.0..=3600.0).contains(&v.round()) => self.settings.replay_seconds = v.round() as u32,
-            Typed::Secs(v) => self.toast_error(format!("{} isn't a length from 5 seconds to an hour", length_words(v.round() as u32))),
-            Typed::Text(t) => self.toast_error(format!("“{}” isn't a length from 5 seconds to an hour", t.trim())),
-            Typed::None => {}
+        let field = ValueField {
+            id: egui::Id::new("vf_length"),
+            value: f64::from(self.settings.replay_seconds),
+            decimals: 0,
+            range: 5.0..=3600.0,
+            unit: "",
+            width: 116.0,
+            hint: "Type the digits: 230 is 2:30. ↑ ↓ change the part chosen",
+            presets: REPLAY_CHOICES.iter().map(|&s| Preset::new(length_words(s), f64::from(s))).collect(),
+        };
+        if let Some(v) = field.show_time(ui) {
+            self.settings.replay_seconds = v.round() as u32;
         }
     }
 
+    /// The aspect ratio recordings are made in: picked, nothing to type (the
+    /// screen's, or a common one), or two numbers of your own (Custom), each
+    /// in its own box.
+    fn shape_field(&mut self, ui: &mut egui::Ui, screen: Option<(u32, u32)>) {
+        // A custom size is its own shape: shown, not picked.
+        if let Some((w, h)) = self.settings.resolution.exact() {
+            ui.add_enabled_ui(false, |ui| ui_kit::select(ui, &ratio_label(w, h), 150.0)).inner.on_disabled_hover_text("Your custom size sets it. Pick a resolution in p to choose one.");
+            return;
+        }
+        // Custom starts from the screen's own shape: nothing changes till it's typed.
+        let same = screen.map_or(String::new(), |(w, h)| format!("{w}×{h}"));
+        let from = screen.map_or([16, 9], |(w, h)| ui_kit::ratio_of(w as f64 / h.max(1) as f64));
+        if let Some(shape) = ui_kit::ratio_field(ui, "video_shape", (SAME_AS_SCREEN, &same), self.settings.shape, from) {
+            self.settings.shape = shape;
+        }
+    }
+
+    /// The resolution: Native or one in p, in the aspect ratio chosen,
+    /// picked from its menu; or a size of its own, its width and height in
+    /// boxes beside it (the shape kept, if its link's on).
     fn resolution_field(&mut self, ui: &mut egui::Ui) {
         let r = self.settings.resolution;
-        let native = capture::frame_size(&self.video_source(), None);
-        let presets: Vec<(String, String, String)> = OutputResolution::PRESETS
-            .iter()
-            .map(|p| {
+        let exact = r.exact();
+        // Native in the aspect ratio chosen (a custom size isn't one).
+        let aspect = capture::VideoSize { shape: self.settings.aspect_shape(), ..Default::default() };
+        let native = capture::frame_size(&self.video_source(), aspect);
+        let shown = if exact.is_some() { "Custom".to_owned() } else { r.label() };
+        let menu = ui_kit::select(ui, &shown, if exact.is_some() { 110.0 } else { 150.0 });
+        let mut picked = None;
+        ui_kit::menu_popup(&menu, false, 260.0, |ui| {
+            for p in OutputResolution::PRESETS {
                 let note = match (p, native) {
                     (OutputResolution::Native, Some((w, h))) => format!("{w}×{h}"),
                     _ => p.note().to_owned(),
                 };
-                (p.label(), p.height().map_or("Native".into(), |h| h.to_string()), note)
-            })
-            .collect();
-        let current = OutputResolution::PRESETS.iter().position(|p| *p == r || (p.height() == r.height()));
-        let text = r.height().map_or("Native".to_owned(), |h| h.to_string());
-        let field = ValueField { id: egui::Id::new("vf_res"), text, unit: if r.height().is_some() { "p" } else { "" }, width: 116.0, hint: "Type any height from 144 to 4320, or Native", presets, current, range: "144–4320" };
-        match field.show(ui) {
-            Typed::Preset(i) => self.settings.resolution = OutputResolution::PRESETS[i],
-            Typed::Text(t) => {
-                let t = t.trim().trim_end_matches(['p', 'P']).trim();
-                if t.to_lowercase().starts_with('n') {
-                    self.settings.resolution = OutputResolution::Native;
-                } else {
-                    match t.parse::<u32>() {
-                        Ok(h) if (144..=4320).contains(&h) => {
-                            self.settings.resolution = OutputResolution::PRESETS.iter().copied().find(|p| p.height() == Some(h)).unwrap_or(OutputResolution::Custom(h));
-                        }
-                        _ => self.toast_error(format!("“{t}” isn't a height from 144 to 4320")),
-                    }
+                if Item::new(p.label()).check(exact.is_none() && p.short_side() == r.short_side()).value(note).show(ui).clicked() {
+                    picked = Some(p);
                 }
             }
-            Typed::None | Typed::Secs(_) => {}
+            ui_kit::menu_sep(ui);
+            // From the size it records at now, the width chosen to type over.
+            if Item::new("Custom size…").check(exact.is_some()).value("any width and height").show(ui).clicked() && exact.is_none() {
+                let (w, h) = self.recorded_size().unwrap_or((1920, 1080));
+                picked = Some(OutputResolution::Exact(w & !1, h & !1));
+                ui_kit::type_in_size(ui.ctx(), "res_size");
+            }
+        });
+        if let Some(p) = picked {
+            self.settings.resolution = p;
+        }
+        if let Some(size) = self.settings.resolution.exact()
+            && let Some((w, h)) = ui_kit::size_field(ui, "res_size", size, 144..=capture::MAX_SIDE, 144..=capture::MAX_SIDE)
+        {
+            self.settings.resolution = OutputResolution::Exact(w, h);
         }
     }
 
@@ -729,22 +1195,20 @@ impl App {
         let fps = self.settings.fps;
         let hz = capture::display_refresh(&self.video_source());
         let choices = settings::fps_choices(hz);
-        let presets: Vec<(String, String, String)> = choices
-            .iter()
-            .map(|&f| (format!("{f} fps"), f.to_string(), hz.filter(|hz| f > *hz).map_or(String::new(), |hz| format!("above {hz} Hz"))))
-            .collect();
-        let current = choices.iter().position(|&f| f == fps);
         let max = settings::MAX_FPS;
-        let hint = format!("Type any frame rate from 10 to {max}");
-        let range = format!("10–{max}");
-        let field = ValueField { id: egui::Id::new("vf_fps"), text: fps.to_string(), unit: "fps", width: 104.0, hint: &hint, presets, current, range: &range };
-        match field.show(ui) {
-            Typed::Preset(i) => self.settings.fps = choices[i],
-            Typed::Text(t) => match t.trim().trim_end_matches("fps").trim().parse::<u32>() {
-                Ok(v) if (10..=max).contains(&v) => self.settings.fps = v,
-                _ => self.toast_error(format!("“{}” isn't a frame rate from 10 to {max}", t.trim())),
-            },
-            Typed::None | Typed::Secs(_) => {}
+        let hint = format!("Any frame rate from 10 to {max}");
+        let field = ValueField {
+            id: egui::Id::new("vf_fps"),
+            value: f64::from(fps),
+            decimals: 0,
+            range: 10.0..=f64::from(max),
+            unit: "fps",
+            width: 104.0,
+            hint: &hint,
+            presets: choices.iter().map(|&f| Preset::new(format!("{f} fps"), f64::from(f)).note(hz.filter(|hz| f > *hz).map_or(String::new(), |hz| format!("above {hz} Hz")))).collect(),
+        };
+        if let Some(v) = field.show(ui) {
+            self.settings.fps = v as u32;
         }
     }
 
@@ -755,21 +1219,16 @@ impl App {
         let presets: Vec<(&str, u32)> = rec.map_or(Vec::new(), |r| vec![("Smaller", round_mbps(r as f64 * 0.5)), ("Balanced", r), ("High", round_mbps(r as f64 * 2.0))]);
         let field = ValueField {
             id: egui::Id::new("vf_mbps"),
-            text: mbps.to_string(),
+            value: f64::from(mbps),
+            decimals: 0,
+            range: 1.0..=300.0,
             unit: "Mbps",
             width: 104.0,
-            hint: "Type any bitrate from 1 to 300 Mbps",
-            presets: presets.iter().map(|(n, m)| (n.to_string(), m.to_string(), format!("{m} Mbps"))).collect(),
-            current: preset,
-            range: "1–300",
+            hint: "Any bitrate from 1 to 300 Mbps",
+            presets: presets.iter().map(|&(n, m)| Preset::new(n, f64::from(m)).note(format!("{m} Mbps"))).collect(),
         };
-        match field.show(ui) {
-            Typed::Preset(i) => self.settings.video_bitrate_mbps = presets[i].1,
-            Typed::Text(t) => match t.trim().trim_end_matches("Mbps").trim().parse::<f64>() {
-                Ok(v) if (1.0..=300.0).contains(&v) => self.settings.video_bitrate_mbps = v.round() as u32,
-                _ => self.toast_error(format!("“{}” isn't a bitrate from 1 to 300 Mbps", t.trim())),
-            },
-            Typed::None | Typed::Secs(_) => {}
+        if let Some(v) = field.show(ui) {
+            self.settings.video_bitrate_mbps = v as u32;
         }
         if !presets.is_empty() {
             let opts: Vec<Seg> = presets.iter().map(|(n, _)| Seg { icon: None, label: n, tip: None }).collect();
@@ -779,6 +1238,9 @@ impl App {
         }
     }
 
+    /// Frame blending: Off, or one of the rates it can capture at, picked.
+    /// They're whole multiples of the frame rate, so there's nothing of your
+    /// own to type.
     fn blend_field(&mut self, ui: &mut egui::Ui, choices: &[u32]) {
         let fps = self.settings.fps;
         let samples = self.settings.blend_samples();
@@ -787,37 +1249,14 @@ impl App {
             self.settings.blend_fps = fps * samples;
         }
         let used = choices.iter().copied().filter(|&r| r <= fps * samples).max().filter(|_| samples > 1);
-        let mut presets = vec![("Off".to_owned(), "Off".to_owned(), String::new())];
-        presets.extend(choices.iter().map(|r| (format!("From {r} fps"), r.to_string(), String::new())));
-        let current = match used {
-            None => Some(0),
-            Some(r) => choices.iter().position(|c| *c == r).map(|i| i + 1),
-        };
-        let text = used.map_or("Off".to_owned(), |r| r.to_string());
-        let unit = if used.is_some() { "fps" } else { "" };
-        let field = ValueField { id: egui::Id::new("vf_blend"), text, unit, width: 104.0, hint: "Type a capture rate (a multiple of the frame rate), or Off", presets, current, range: "" };
-        match field.show(ui) {
-            Typed::Preset(0) => self.settings.blend_fps = 0,
-            Typed::Preset(i) => self.settings.blend_fps = choices[i - 1],
-            Typed::Text(t) => {
-                let t = t.trim().trim_end_matches("fps").trim();
-                if t.to_lowercase().starts_with('o') || t == "0" {
-                    self.settings.blend_fps = 0;
-                } else {
-                    match t.parse::<u32>() {
-                        Ok(v) if choices.contains(&v) => self.settings.blend_fps = v,
-                        Ok(v) => match choices.iter().copied().min_by_key(|c| c.abs_diff(v)) {
-                            Some(c) => {
-                                self.settings.blend_fps = c;
-                                self.toast_icon(icon::INFO, format!("Blending goes in steps of the frame rate: {c} fps"));
-                            }
-                            None => self.toast_error("Blending needs a lower frame rate on this display"),
-                        },
-                        Err(_) => self.toast_error(format!("“{t}” isn't a capture rate")),
-                    }
-                }
-            }
-            Typed::None | Typed::Secs(_) => {}
+        let mut list = vec![Choice::new("Off")];
+        list.extend(choices.iter().map(|r| Choice::new(format!("From {r} fps"))));
+        let now = used.and_then(|r| choices.iter().position(|c| *c == r)).map_or(0, |i| i + 1);
+        let field = ChoiceField { id: "vf_blend", choices: list, custom: None, width: 150.0 };
+        match field.show(ui, Some(now), 0) {
+            Some(Chosen::Choice(0)) => self.settings.blend_fps = 0,
+            Some(Chosen::Choice(i)) => self.settings.blend_fps = choices[i - 1],
+            _ => {}
         }
     }
 
@@ -876,7 +1315,11 @@ impl App {
                 if let Some(e) = self.hotkeys.as_ref().ok().and_then(|h| h.error_for(action)) {
                     return Some(format!("Not working: {e}."));
                 }
-                // The desktop has the last word on Wayland: say if it chose differently.
+                // The desktop has the last word on Wayland: say if it chose
+                // differently (where it isn't told from here).
+                if self.hotkeys.as_ref().is_ok_and(|h| h.keys_set_here()) {
+                    return None;
+                }
                 let current = self.settings.shortcuts.get(action).to_owned();
                 let keys = self.hotkeys.as_ref().ok().and_then(|h| h.assigned(action))?;
                 let asked = shortcuts::label(&current);
@@ -889,8 +1332,8 @@ impl App {
 
     /// The size recordings come out at with the chosen resolution, when the
     /// display is known.
-    fn recorded_size(&self) -> Option<(u32, u32)> {
-        capture::frame_size(&self.video_source(), self.settings.resolution.height())
+    pub(crate) fn recorded_size(&self) -> Option<(u32, u32)> {
+        capture::frame_size(&self.video_source(), self.settings.video_size())
     }
 
     /// A bitrate that looks good for the recorded size and frame rate, in
@@ -912,18 +1355,19 @@ impl App {
                 self.recording_shortcut = None;
             }
         } else {
-            let more = Btn::icon(Kind::Ghost, icon::DOTS_THREE).small().tip("Turn off, or back to the default").show(ui);
+            // Off by default: turning it off is going back.
+            let more = Btn::icon(Kind::Ghost, icon::DOTS_THREE).small().tip(if default.is_empty() { "Turn off" } else { "Turn off, or back to the default" }).show(ui);
             ui_kit::menu_popup(&more, false, 240.0, |ui| {
                 if Item::new("Turn off").icon(icon::PROHIBIT).enabled(!current.is_empty()).show(ui).clicked() {
                     self.settings.shortcuts.set(action, String::new());
                 }
                 let def = shortcuts::keys(&default).map(|k| ui_kit::key_text(&k)).unwrap_or_default();
-                if Item::new("Back to the default").icon(icon::ARROW_COUNTER_CLOCKWISE).enabled(current != default).value(def).show(ui).clicked() {
+                if !default.is_empty() && Item::new("Back to the default").icon(icon::ARROW_COUNTER_CLOCKWISE).enabled(current != default).value(def).show(ui).clicked() {
                     self.settings.shortcuts.set(action, default.clone());
                 }
             });
         }
-        let keys = shortcuts::keys(&current).unwrap_or_else(|| vec!["Off".to_owned()]);
+        let keys = shortcuts::keys(&current).unwrap_or_default();
         let tip = if listening { "Press the new shortcut. Esc cancels." } else { "Click, then press the new shortcut" };
         let r = ui_kit::keycaps(ui, &keys, listening).on_hover_text(tip);
         if r.clicked() {
@@ -984,20 +1428,17 @@ impl App {
         }
         let modal = ui_kit::dialog(ctx, "reset_settings", 400.0, |ui| {
             ui_kit::dialog_title(ui, "Reset all settings?");
-            ui_kit::dialog_text(ui, "Clipping, video, saving and shortcuts go back to their defaults. Your clips, folders, sources and HesteFiles account are kept.");
+            ui_kit::dialog_text(ui, "Clipping, video, saving and shortcuts go back to their defaults. Your clips, folders, presets with their scenes, sources and sound, and where you stream to are kept.");
             ui_kit::dialog_buttons(ui, |ui| {
                 if ui.add(ui_kit::danger_button("Reset")).clicked() {
                     let mut fresh = settings::RecordSettings::default();
                     fresh.output_dir = self.settings.output_dir.clone();
                     fresh.game_folders = std::mem::take(&mut self.settings.game_folders);
-                    fresh.audio_sources = std::mem::take(&mut self.settings.audio_sources);
-                    fresh.capture = std::mem::take(&mut self.settings.capture);
-                    fresh.idle_apps = self.settings.idle_apps.take();
-                    fresh.webcam = self.settings.webcam.take();
-                    fresh.display_index = self.settings.display_index;
-                    fresh.limiter = self.settings.limiter;
+                    fresh.keep_presets_from(&mut self.settings);
+                    fresh.camera_controls = std::mem::take(&mut self.settings.camera_controls);
                     fresh.save_sound.custom = std::mem::take(&mut self.settings.save_sound.custom);
                     fresh.library_sort = self.settings.library_sort;
+                    fresh.stream.destinations = std::mem::take(&mut self.settings.stream.destinations);
                     self.settings = fresh;
                     self.confirm_reset = false;
                     ui.ctx().set_theme(self.settings.theme.preference());
@@ -1013,31 +1454,17 @@ impl App {
         }
     }
 
-    /// Clip names, its own page: what your clips will be called, then a card
-    /// per game you turn on, with what it needs; osu!'s parts in the order
-    /// they're joined, dragged or moved with the arrows, each on or off.
+    /// Clip names, a page of the Clips pane's (its heading has the way
+    /// back): what your clips will be called, then a card per game you turn
+    /// on, with what it needs; osu!'s parts in the order they're joined,
+    /// dragged or moved with the arrows, each on or off.
     fn naming_page(&mut self, ui: &mut egui::Ui) {
-        // Esc, or the rail, goes back.
+        // Esc, or the panel, goes back.
         if !ui_kit::overlay_open(ui.ctx()) && !ui.ctx().egui_wants_keyboard_input() && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
             self.naming_open = false;
-            return;
-        }
-        let mut back = false;
-        self.page_head(
-            ui,
-            "",
-            |_, ui| {
-                back = Btn::icon(Kind::Ghost, icon::CARET_LEFT).tip("Back to Settings  (Esc)").show(ui).clicked();
-                let p = theme::pal(ui);
-                ui.label(theme::text("Clip names", 20.0, W::Semibold).color(p.text));
-            },
-        );
-        if back {
-            self.naming_open = false;
-            return;
         }
         let width = ui.available_width().min(COLUMN);
-        ui_kit::arrive(ui, |ui| ui_kit::scroll(ui, "naming_page", |ui| {
+        ui_kit::scroll(ui, "naming_page", |ui| {
             ui.vertical(|ui| {
                 ui.set_width(width);
                 let p = theme::pal(ui);
@@ -1093,7 +1520,41 @@ impl App {
                 }
                 ui.add_space(28.0);
             });
-        }));
+        });
+    }
+}
+
+/// A pane in the panel: its icon and name, as Clips lists its games, the
+/// chosen one a shade darker than the card. `found`, while searching: whether
+/// the search found something in it (it's lit, else dimmed). `locked`: why
+/// its settings can't change now (a lock at its end).
+fn pane_row(ui: &mut egui::Ui, pane: Pane, chosen: bool, found: Option<bool>, locked: Option<&str>) -> egui::Response {
+    let p = theme::pal(ui);
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 36.0), egui::Sense::hover());
+    let resp = ui.interact(rect, egui::Id::new(("settings_pane", pane.label())), egui::Sense::click());
+    let hv = theme::toggle(ui.ctx(), resp.id.with("hv"), resp.hovered(), theme::FAST);
+    let on = theme::toggle(ui.ctx(), resp.id.with("on"), chosen, theme::NORMAL);
+    let lit = theme::toggle(ui.ctx(), resp.id.with("lit"), found == Some(true), theme::FAST);
+    let dim = theme::toggle(ui.ctx(), resp.id.with("dim"), found == Some(false), theme::FAST);
+    if hv > 0.0 && !chosen {
+        ui.painter().rect_filled(rect, ui_kit::RADIUS, theme::fade(p.sb_hover, hv));
+    }
+    if on > 0.0 {
+        ui.painter().rect_filled(rect, ui_kit::RADIUS, theme::fade(p.sb_sel, on));
+    }
+    let rest = theme::mix(theme::mix(p.text2, p.text3, dim), p.text, lit);
+    let text = theme::mix(theme::mix(rest, p.text, hv), p.text, on);
+    let lead = Pos2::new(rect.left() + 8.0 + 11.0, rect.center().y);
+    ui.painter().text(lead, Align2::CENTER_CENTER, pane.icon(), FontId::new(17.0, theme::fill_family()), text);
+    let w = if chosen { W::Medium } else { W::Regular };
+    ui.painter().text(Pos2::new(lead.x + 22.0, rect.center().y), Align2::LEFT_CENTER, pane.label(), theme::font(13.5, w), text);
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    match locked {
+        Some(why) => {
+            ui.painter().text(Pos2::new(rect.right() - 12.0, rect.center().y), Align2::RIGHT_CENTER, icon::LOCK_SIMPLE, FontId::proportional(13.0), p.text3);
+            resp.on_hover_text(why)
+        }
+        None => resp,
     }
 }
 
@@ -1248,7 +1709,220 @@ fn osu_parts_editor(ui: &mut egui::Ui, t: &mut crate::settings::GameTitles) {
     });
 }
 
+/// Blend's tips: how each frame's pictures are weighed (Settings, and Export
+/// in the editor).
+pub const BLEND_TIP: &str = "How the pictures in each frame are weighed. Even: all the same, so a frame shows just its own moment, and a moving thing's trail ends sharply where the next frame's starts. Soft: the middle of the frame's moment counts most, fading out into the frames either side, so one frame hands over smoothly to the next, a little blurrier.";
+pub const BLEND_EVEN_TIP: &str = "Every picture counts the same: each frame's trail ends sharply";
+pub const BLEND_SOFT_TIP: &str = "The middle of each frame counts most, fading into the frames either side: smoother, a little blurrier";
+
+/// Resolution's tip.
+const RESOLUTION_TIP: &str = "Lower makes smaller files that are quicker to share. Native keeps every pixel of your display. 1080p is 1920×1080 widescreen and 1080×1920 upright. A custom size records at exactly the width and height you give it, whatever your display is.";
+
+/// A custom size's shape, as a ratio when it's a readable one ("16:9",
+/// "64:27"), else to two places ("1.78:1").
+fn ratio_label(w: u32, h: u32) -> String {
+    let gcd = |mut a: u32, mut b: u32| {
+        while b != 0 {
+            (a, b) = (b, a % b);
+        }
+        a.max(1)
+    };
+    let g = gcd(w, h);
+    let (rw, rh) = (w / g, h / g);
+    if rw <= 99 && rh <= 99 { format!("{rw}:{rh}") } else { format!("{:.2}:1", w as f64 / h.max(1) as f64) }
+}
+
+/// Aspect ratio's way to Sources, where the screen's put in the video.
+const SHAPE_GO: &str = "Fit, fill or stretch it on Sources";
+
+/// Aspect ratio's tip.
+const SHAPE_TIP: &str = "Record in another aspect ratio than your screen's: 16:9 out of an ultrawide screen, say, or 9:16 for phones. Every recording and clip is made in it. A custom size has a shape of its own. How your screen sits in it is on the Sources page: drag it on the preview to show another part of it or make it smaller (Shift stretches it), or right-click it to fit all of it in, fill the video, or stretch it. With Same as screen, Fit, Fill and Stretch are for when a game changes your screen's resolution while recording, as playing at a stretched resolution does.";
+
+/// What finds Resolution in the search.
+const RESOLUTION_WORDS: &[&str] = &["resolution", "height", "width", "size", "custom size", "native"];
+/// What finds Aspect ratio in the search.
+const SHAPE_WORDS: &[&str] = &["aspect ratio", "shape", "same as screen", "16:9", "21:9", "9:16", "4:3", "ultrawide", "vertical", "crop", "fill", "fit", "stretched res", "stretch res", "black bars"];
+/// What finds Frame rate in the search.
+const FPS_WORDS: &[&str] = &["frame rate", "fps"];
+/// What finds Quality in the search.
+const QUALITY_WORDS: &[&str] = &["quality", "bitrate", "mbps"];
+/// What finds Frame blending in the search.
+const BLEND_WORDS: &[&str] = &["frame blending", "motion blur"];
+/// What finds where to stream, and what each place is sent, in the search.
+const STREAM_WORDS: &[&str] = &["streaming", "go live", "live", "twitch", "youtube", "kick", "stream key", "rtmp", "rtmps", "server", "multistream", "restream", "broadcast", "stream quality", "stream resolution", "stream frame rate", "stream bitrate", "kbps"];
+/// What finds Encoder in the search.
+const ENCODER_WORDS: &[&str] = &["encoder", "hardware", "software", "gpu"];
+/// What finds File format in the search.
+const FORMAT_WORDS: &[&str] = &["file format", "mp4", "mov", "container"];
+/// What finds Game capture in the search.
+const GAME_CAPTURE_WORDS: &[&str] = &["game capture", "anti-cheat", "anticheat", "obs", "fullscreen"];
+
+/// The screen capture setting shows: Windows, where there's a choice.
+const SCREEN_CAPTURE: bool = cfg!(target_os = "windows");
+const SCREEN_CAPTURE_WORDS: &[&str] = &["screen capture", "desktop duplication", "dxgi", "windows graphics capture", "yellow border", "capture method"];
+const SCREEN_CAPTURE_TIP: &str = "How your screen is recorded. Automatic uses Desktop Duplication on Windows 10, so there's no yellow border, and Windows Graphics Capture on Windows 11, which hides the border itself. Desktop Duplication can't record a display connected to another graphics card (common on laptops); then Windows Graphics Capture is used. Only for recording the screen: games and apps are always recorded with Windows Graphics Capture.";
+
+/// The screen capture setting's note, and whether it's a warning: how the
+/// screen is being recorded (`in_use`, while it is), else what the choice
+/// means here (`auto_duplicates`: Windows 10, where Automatic picks Desktop
+/// Duplication). Recording games and apps (`apps`), the setting doesn't apply.
+fn screen_capture_note(choice: settings::ScreenCapture, apps: bool, in_use: Option<capture::ScreenCaptureInUse>, auto_duplicates: bool) -> (String, bool) {
+    use settings::ScreenCapture::*;
+    if let Some(u) = in_use {
+        return match (u.duplication, u.fell_back) {
+            (true, _) => ("Recording with Desktop Duplication: no yellow border".into(), false),
+            (false, true) => ("Desktop Duplication can't record this display right now, so Windows Graphics Capture is used until it can".into(), true),
+            (false, false) if auto_duplicates => ("Recording with Windows Graphics Capture: Windows 10 shows a yellow border".into(), false),
+            (false, false) => ("Recording with Windows Graphics Capture".into(), false),
+        };
+    }
+    if apps {
+        return ("For recording the screen. Games and apps always use Windows Graphics Capture".into(), false);
+    }
+    let note = match choice {
+        Auto if auto_duplicates => "Uses Desktop Duplication here: no yellow border",
+        Auto => "Uses Windows Graphics Capture here",
+        Duplication => "No yellow border. Can't record a display on another graphics card",
+        Wgc if auto_duplicates => "Windows 10 shows a yellow border around your screen with it",
+        Wgc => "What HesteClips has always used",
+    };
+    (note.into(), false)
+}
+
+/// What going into a video of `shape` as `framing` says (`None`: placed by
+/// hand) does to a `w`×`h` screen (`what` it is: "screen", "crop"), in
+/// words: its middle and what's cut off, or where the bars are.
+fn framing_note(framing: Option<settings::Framing>, shape: capture::Shape, (w, h): (u32, u32), what: &str) -> String {
+    let Some(framing) = framing else { return "Your screen's placed by hand on the Sources page".to_owned() };
+    if same_shape(shape, (w, h)) {
+        return format!("Your {w}×{h} {what} is already the video's shape");
+    }
+    let wider = w as f64 / h.max(1) as f64 > shape.w as f64 / shape.h.max(1) as f64;
+    match framing {
+        settings::Framing::Fill => {
+            let (sw, sh) = capture::Shape { framing: capture::Framing::Fill, ..shape }.of(w, h);
+            let cut = if wider { "sides are" } else { "top and bottom are" };
+            format!("The middle {sw}×{sh} of your {w}×{h} {what}: its {cut} cut off")
+        }
+        settings::Framing::Fit => format!("All of your {w}×{h} {what}, with black bars {}", if wider { "above and below" } else { "at its sides" }),
+        settings::Framing::Stretch => format!("All of your {w}×{h} {what}, {} to the video's shape", if wider { "squeezed" } else { "stretched" }),
+    }
+}
+
+/// What Fit, Fill or Stretch (`None`: placed by hand) does in a video of
+/// the screen's own shape, in words: it's for a game that changes the
+/// screen's resolution while it's recorded, or for a game's window of
+/// another shape (recording games and apps, `apps`).
+fn changed_shape_note(framing: Option<settings::Framing>, apps: bool) -> String {
+    let Some(framing) = framing else { return "Your screen's placed by hand on the Sources page".to_owned() };
+    let game = if apps { "A game's window of another shape than your screen" } else { "A game that changes your screen's resolution while recording" };
+    let how = match framing {
+        settings::Framing::Fit => "is fitted in, with black bars",
+        settings::Framing::Fill => "fills the video, its edges cut off",
+        settings::Framing::Stretch => "is stretched to fill the video",
+    };
+    format!("{game} {how}")
+}
+
+/// Whether a `w`×`h` picture is the shape's shape, near enough.
+fn same_shape(shape: capture::Shape, (w, h): (u32, u32)) -> bool {
+    let wanted = shape.w as f64 / shape.h.max(1) as f64;
+    (w as f64 / h.max(1) as f64 / wanted - 1.0).abs() < 0.01
+}
+
+/// Even or Soft: the one clicked, if one was.
+fn blend_shape_field(ui: &mut egui::Ui, now: settings::BlendShape) -> Option<settings::BlendShape> {
+    let opts = [Seg { icon: None, label: "Even", tip: Some(BLEND_EVEN_TIP) }, Seg { icon: None, label: "Soft", tip: Some(BLEND_SOFT_TIP) }];
+    let chosen = usize::from(now == settings::BlendShape::Soft);
+    ui_kit::segmented_opts(ui, "blend_shape", &opts, chosen, None, ui.is_enabled()).map(|i| if i == 0 { settings::BlendShape::Even } else { settings::BlendShape::Soft })
+}
+
+/// What the aspect ratio is called when it's the screen's own.
+const SAME_AS_SCREEN: &str = "Same as screen";
+
 /// "48 MB", "1.2 GB".
+/// The stream's frame rate, explained.
+const STREAM_FPS_TIP: &str = "The stream's frames are your recording's own frames (or, with frame blending, the blend of all of them in each), so only rates your frame rate divides into evenly are offered: anything else would show some frames longer than others, and motion would stutter. Change the frame rate in Video to have others.";
+/// The stream's bitrate, explained.
+const STREAM_BITRATE_TIP: &str = "How much the stream sends each second, all the time. More looks better in fast motion, but your upload has to keep up with all of it, for every place at once, with room to spare. It doesn't change the stream's size or frame rate.";
+
+/// A place's picture size: as clips are, or a height of its own.
+fn stream_resolution_field(ui: &mut egui::Ui, i: usize, d: &mut StreamDestination, recorded: Option<(u32, u32)>) {
+    const HEIGHTS: [u32; 5] = [1440, 1080, 900, 720, 480];
+    let mut choices = vec![Choice::new("As clips are").note(recorded.map_or(String::new(), |(w, h)| format!("{w}×{h}")))];
+    choices.extend(HEIGHTS.iter().map(|h| Choice::new(format!("{h}p"))));
+    let now = if d.height == 0 { Some(0) } else { HEIGHTS.iter().position(|h| *h == d.height).map(|i| i + 1) };
+    let number = if d.height == 0 { recorded.map_or(1080, |(w, h)| w.min(h)) } else { d.height };
+    let id = format!("stream_resolution_{i}");
+    let field = ChoiceField { id: &id, choices, custom: Some(ui_kit::Custom { unit: "p", range: 144..=2160, note: "any height" }), width: 150.0 };
+    match field.show(ui, now, number) {
+        Some(Chosen::Choice(0)) => d.height = 0,
+        Some(Chosen::Choice(k)) => d.height = HEIGHTS[k - 1],
+        Some(Chosen::Number(h)) => d.height = h & !1,
+        None => {}
+    }
+}
+
+/// A place's frame rate: only the rates the recording's divides into
+/// evenly (`capture::stream::stream_rates`), so each stream frame is one of
+/// its frames (or their blend) and motion stays even.
+fn stream_fps_field(ui: &mut egui::Ui, i: usize, d: &mut StreamDestination, rates: &[u32], rec_fps: u32) {
+    let now = capture::stream::stream_rate(rec_fps, d.fps);
+    let choices = rates.iter().map(|r| Choice::new(format!("{r} fps"))).collect();
+    let id = format!("stream_fps_{i}");
+    let field = ChoiceField { id: &id, choices, custom: None, width: 110.0 };
+    if let Some(Chosen::Choice(k)) = field.show(ui, rates.iter().position(|r| *r == now), now) {
+        d.fps = rates[k];
+    }
+}
+
+/// What a place's frame rate is, in a few words: what it's made of.
+fn stream_fps_note(rec_fps: u32, fps: u32, looks: u32) -> String {
+    let every = rec_fps / fps.max(1);
+    match (every > 1, looks > 1) {
+        (false, true) => format!("Blended from {} fps, as your clips are", rec_fps * looks),
+        (false, false) => "As your clips are".to_owned(),
+        (true, true) => format!("Each frame blends {every} of your {rec_fps} fps"),
+        (true, false) => format!("Each frame one in {every} of your {rec_fps} fps"),
+    }
+}
+
+/// A place's bitrate: typed, or one of the usual ones.
+fn stream_bitrate_field(ui: &mut egui::Ui, i: usize, d: &mut StreamDestination) {
+    let field = ValueField {
+        id: egui::Id::new(("vf_stream_kbps", i)),
+        value: f64::from(d.kbps),
+        decimals: 0,
+        range: 500.0..=51_000.0,
+        unit: "kbps",
+        width: 124.0,
+        hint: "Any bitrate from 500 to 51,000 kbps",
+        presets: [3000, 4500, 6000, 8000, 12_000, 20_000].into_iter().map(|k| Preset::new(format!("{k} kbps"), f64::from(k))).collect(),
+    };
+    if let Some(v) = field.show(ui) {
+        d.kbps = v as u32;
+    }
+}
+
+/// What a place's bitrate takes of your upload (all of it, the whole
+/// time, with its sound), and whether it's more than its service takes.
+fn stream_bitrate_note(d: &StreamDestination) -> (String, bool) {
+    let most = match d.service {
+        StreamService::Twitch => Some(6000),
+        StreamService::Kick => Some(8000),
+        StreamService::YouTube | StreamService::Custom => None,
+    };
+    match most.filter(|m| d.kbps > *m) {
+        Some(m) => (format!("{} takes up to {} kbps from most channels: more may not get through", d.service.label(), m), true),
+        None => (format!("Takes about {} Mbps of your upload", mbps_words(f64::from(d.kbps + 192) / 1000.0)), false),
+    }
+}
+
+/// Megabits a second, as said: "6.2", "18".
+fn mbps_words(v: f64) -> String {
+    if v < 10.0 { format!("{v:.1}") } else { format!("{v:.0}") }
+}
+
 fn human_bytes(b: f64) -> String {
     const MB: f64 = 1024.0 * 1024.0;
     const GB: f64 = MB * 1024.0;
@@ -1269,13 +1943,8 @@ pub(crate) fn length_words(secs: u32) -> String {
     if parts.is_empty() { "0 seconds".into() } else { parts.join(" ") }
 }
 
-/// A length as minutes and seconds ("2:30"), for the typed-in value.
-fn clock_label(secs: u32) -> String {
-    format!("{}:{:02}", secs / 60, secs % 60)
-}
-
 /// A bitrate rounded to something readable: whole Mbps under 20, else to 5.
-fn round_mbps(mbps: f64) -> u32 {
+pub(crate) fn round_mbps(mbps: f64) -> u32 {
     if mbps < 20.0 { (mbps.round() as u32).max(2) } else { ((mbps / 5.0).round() * 5.0) as u32 }
 }
 
@@ -1285,9 +1954,6 @@ mod length_tests {
 
     #[test]
     fn typed_lengths() {
-        assert_eq!(clock_label(30), "0:30");
-        assert_eq!(clock_label(1200), "20:00");
-        assert_eq!(clock_label(75), "1:15");
         assert_eq!(length_words(150), "2 minutes 30 seconds");
         assert_eq!(length_words(3600), "1 hour");
         assert_eq!(length_words(1), "1 second");
@@ -1298,5 +1964,105 @@ mod length_tests {
         assert_eq!(round_mbps(12.4), 12);
         assert_eq!(round_mbps(26.5), 25);
         assert_eq!(round_mbps(0.4), 2);
+    }
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::*;
+
+    /// What a stretched-res player types finds the aspect ratio, in the
+    /// Video group (the group used to have a list of its own, without it).
+    #[test]
+    fn searching_finds_the_aspect_ratio() {
+        for q in ["aspect", "4:3", "stretched", "stretch res", "black bars"] {
+            let f = Filter { q: q.to_owned() };
+            assert!(f.shows(SHAPE_WORDS) && group_matches("Video", &f), "{q}");
+        }
+        // Nothing of Video's finds it.
+        let f = Filter { q: "discord".to_owned() };
+        assert!(!Pane::Video.groups().iter().any(|g| group_matches(g, &f)));
+    }
+
+    /// Video's settings are found in the group they're in on its pane.
+    #[test]
+    fn video_rows_are_found_in_their_groups() {
+        let found = |q: &str| -> Vec<&str> {
+            let f = Filter { q: q.to_owned() };
+            Pane::Video.groups().iter().copied().filter(|g| group_matches(g, &f)).collect()
+        };
+        assert_eq!(found("resolution"), ["Video"]);
+        assert_eq!(found("fps"), ["Motion"]);
+        assert_eq!(found("bitrate"), ["File"]);
+        assert_eq!(found("hardware"), ["File"]);
+        assert_eq!(found("mp4"), ["File"]);
+        if capture::frame_blending() {
+            assert_eq!(found("motion blur"), ["Motion"]);
+        }
+        if SCREEN_CAPTURE {
+            assert_eq!(found("yellow border"), ["Capture"]);
+        }
+    }
+
+    /// Every group is on one pane, and the search finds what moved in with
+    /// another group's: Discord activity on App, saving by voice on Clipping.
+    #[test]
+    fn panes_hold_every_group_once() {
+        let groups: Vec<&str> = Pane::ALL.iter().flat_map(|p| p.groups().iter().copied()).collect();
+        let mut unique = groups.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), groups.len());
+        let on = |q: &str| -> Vec<&str> {
+            let f = Filter { q: q.to_owned() };
+            Pane::ALL.into_iter().filter(|p| p.groups().iter().any(|g| group_matches(g, &f))).map(Pane::label).collect()
+        };
+        assert_eq!(on("discord"), ["App"]);
+        assert_eq!(on("hestefiles"), ["App"]);
+        assert_eq!(on("hashtag hesteclip that"), ["Clipping"]);
+        assert_eq!(on("license"), ["App"]);
+        assert_eq!(on("fps"), ["Video"]);
+    }
+
+    /// One aspect ratio and a screen of another shape: the way to Sources.
+    #[test]
+    fn shapes_alike_or_not() {
+        let wide = capture::Shape { w: 16, h: 9, framing: capture::Framing::Fill };
+        assert!(same_shape(wide, (1920, 1080)) && same_shape(wide, (1366, 768)));
+        assert!(!same_shape(wide, (1280, 960)));
+    }
+}
+
+#[cfg(test)]
+mod ratio_tests {
+    use super::*;
+
+    #[test]
+    fn exact_sizes_name_their_shape() {
+        assert_eq!(ratio_label(1920, 1080), "16:9");
+        assert_eq!(ratio_label(1080, 1350), "4:5");
+        assert_eq!(ratio_label(2560, 1080), "64:27");
+        assert_eq!(ratio_label(1366, 768), "1.78:1");
+    }
+}
+
+#[cfg(test)]
+mod screen_capture_tests {
+    use super::*;
+    use settings::ScreenCapture::*;
+
+    /// While the screen is recorded, the note says how, and warns when
+    /// Desktop Duplication couldn't be used; else what the choice does here.
+    #[test]
+    fn note_says_what_is_used() {
+        let using = |duplication, fell_back| Some(capture::ScreenCaptureInUse { duplication, fell_back });
+        assert_eq!(screen_capture_note(Auto, false, using(true, false), true).0, "Recording with Desktop Duplication: no yellow border");
+        let (note, warn) = screen_capture_note(Duplication, false, using(false, true), true);
+        assert!(warn && note.starts_with("Desktop Duplication can't"), "{note}");
+        assert!(screen_capture_note(Wgc, false, using(false, false), true).0.contains("yellow border"));
+        assert_eq!(screen_capture_note(Auto, false, None, true).0, "Uses Desktop Duplication here: no yellow border");
+        assert_eq!(screen_capture_note(Auto, false, None, false).0, "Uses Windows Graphics Capture here");
+        assert!(screen_capture_note(Duplication, true, None, true).0.contains("Games and apps"));
+        assert!(!screen_capture_note(Duplication, false, None, false).1);
     }
 }

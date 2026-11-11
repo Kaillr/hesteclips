@@ -64,7 +64,7 @@ impl HoverPlay {
                     Ok(Some(info)) => {
                         let duration = info.duration;
                         // No sound: the clock runs on, silent.
-                        let mut player = Player::new(ctx, &self.clip, info, media::pcm::Pcm::from_tracks(Vec::new()), Vec::new());
+                        let mut player = Player::preview(ctx, &self.clip, info, media::pcm::Pcm::from_tracks(Vec::new()), Vec::new());
                         player.play(duration);
                         self.state = State::Playing(Box::new(player), duration);
                     }
@@ -92,9 +92,7 @@ impl HoverPlay {
         // Cover the card: the picture scaled to fill it, what's past it cut off.
         let scale = (rect.width() / size.x).max(rect.height() / size.y);
         let r = egui::Rect::from_center_size(rect.center(), size * scale);
-        let mut clipped = ui.new_child(egui::UiBuilder::new().max_rect(rect));
-        clipped.set_clip_rect(rect.intersect(ui.clip_rect()));
-        player.paint(&clipped, r);
+        player.paint(&ui.painter_at(rect), r);
         true
     }
 }

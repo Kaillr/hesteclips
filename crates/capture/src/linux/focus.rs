@@ -199,7 +199,7 @@ fn our_processes() -> Vec<u32> {
 /// The process with this Wayland app id: its desktop file's name
 /// (`org.mozilla.firefox`) or its program's (`firefox`), as Wayland apps set
 /// it. The newest such process, the one most likely in front.
-fn pid_of_app_id(app_id: &str) -> Option<u32> {
+pub(crate) fn pid_of_app_id(app_id: &str) -> Option<u32> {
     let want = app_id.to_ascii_lowercase();
     let last = want.rsplit('.').next().unwrap_or(&want).to_owned();
     let mut found: Option<u32> = None;

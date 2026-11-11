@@ -267,8 +267,8 @@ pub(crate) fn run(mut grab: Grab, id: &str, latest: &Latest, stop: &AtomicBool) 
 }
 
 /// Anonymous shared memory, mapped.
-struct Map {
-    fd: OwnedFd,
+pub(crate) struct Map {
+    pub fd: OwnedFd,
     addr: *mut u8,
     size: usize,
 }
@@ -277,7 +277,7 @@ struct Map {
 unsafe impl Send for Map {}
 
 impl Map {
-    fn new(size: usize) -> Result<Self> {
+    pub(crate) fn new(size: usize) -> Result<Self> {
         // SAFETY: a fresh anonymous file, ours alone.
         let fd = unsafe { libc::memfd_create(c"hesteclips-screen".as_ptr(), libc::MFD_CLOEXEC) };
         if fd < 0 {
@@ -297,7 +297,7 @@ impl Map {
         Ok(Self { fd, addr: addr.cast(), size })
     }
 
-    fn bytes(&self) -> &[u8] {
+    pub(crate) fn bytes(&self) -> &[u8] {
         // SAFETY: mapped for `size` bytes for as long as self lives.
         unsafe { std::slice::from_raw_parts(self.addr, self.size) }
     }

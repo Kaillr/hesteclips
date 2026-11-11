@@ -5,7 +5,7 @@
 FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y \
-    build-essential curl pkg-config libclang-dev libpipewire-0.3-dev libdbus-1-dev libasound2-dev patchelf \
+    build-essential curl pkg-config libclang-dev libpipewire-0.3-dev libdbus-1-dev libasound2-dev libavcodec-dev libswresample-dev patchelf \
     xserver-xorg-core xserver-xorg-video-dummy x11-xserver-utils x11-utils x11-apps xterm openbox wmctrl \
     libxkbcommon-x11-0 libgl1 libegl1 mesa-vulkan-drivers \
     sway foot \

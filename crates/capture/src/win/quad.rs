@@ -1,6 +1,8 @@
 //! Drawing one texture onto another with the GPU: a rectangle of it, placed
 //! anywhere, optionally blended over what's there. For the game capture
-//! hook's pictures (any format, upside down from OpenGL, shrunk to fit) and
+//! hook's pictures (any format, upside down from OpenGL), a duplicated
+//! display's (turned upright, an HDR one brought to SDR), each shrunk to fit
+//! when it's too big for where it goes, as Windows' capture's are too, and
 //! the cursor drawn over them.
 
 use anyhow::{Context, Result};
@@ -14,7 +16,7 @@ use windows::core::{PCSTR, s};
 use super::d3d::Gpu;
 
 const SHADER: &str = r"
-cbuffer Place : register(b0) { float4 rect; float4 uv_rect; };
+cbuffer Place : register(b0) { float4 rect; float4 uv_rect; float4 turn; };
 Texture2D image : register(t0);
 Texture2D other : register(t1);
 cbuffer Block : register(b1) { float4 area; };
@@ -22,9 +24,12 @@ SamplerState linear_clamp : register(s0);
 struct V { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
 V vs(uint id : SV_VertexID) {
     float2 corner = float2(id & 1, id >> 1);
+    // The source's corner at this one, turned clockwise a quarter at a time.
+    float2 c = corner;
+    [unroll] for (int i = 0; i < 3; i++) { if (i < (int)turn.x) c = float2(c.y, 1 - c.x); }
     V o;
     o.pos = float4(lerp(rect.x, rect.z, corner.x), lerp(rect.y, rect.w, corner.y), 0, 1);
-    o.uv = float2(lerp(uv_rect.x, uv_rect.z, corner.x), lerp(uv_rect.y, uv_rect.w, corner.y));
+    o.uv = float2(lerp(uv_rect.x, uv_rect.z, c.x), lerp(uv_rect.y, uv_rect.w, c.y));
     return o;
 }
 float4 ps(V i) : SV_Target { return image.Sample(linear_clamp, i.uv); }
@@ -76,6 +81,9 @@ float3 to_light(float3 c) { return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 
 float3 from_light(float3 c) { c = saturate(c); return c <= 0.0031308 ? c * 12.92 : 1.055 * pow(c, 1.0 / 2.4) - 0.055; }
 float4 ps_to_light(V i) : SV_Target { return float4(to_light(image.Sample(linear_clamp, i.uv).rgb), 1); }
 float4 ps_from_light(V i) : SV_Target { return float4(from_light(image.Sample(linear_clamp, i.uv).rgb), 1); }
+// An HDR desktop's light (scRGB: 1 is 80 nits), `turn.y` of it, back as sRGB:
+// with `turn.y` 80 over the SDR white level, SDR white comes out white.
+float4 ps_from_hdr(V i) : SV_Target { return float4(from_light(image.Sample(linear_clamp, i.uv).rgb * turn.y), 1); }
 ";
 
 /// Which pixel shader a draw uses.
@@ -89,6 +97,8 @@ enum Shader {
     ToLight,
     /// Turned from light back into sRGB, replacing.
     FromLight,
+    /// Scaled light (an HDR desktop's) turned into sRGB, replacing.
+    FromHdr(f32),
 }
 
 /// The shaders and states for drawing textured rectangles.
@@ -101,6 +111,7 @@ pub(crate) struct Quad {
     ps_changed: ID3D11PixelShader,
     ps_to_light: ID3D11PixelShader,
     ps_from_light: ID3D11PixelShader,
+    ps_from_hdr: ID3D11PixelShader,
     block: ID3D11Buffer,
     blend: ID3D11BlendState,
     /// Mixes by a constant (the blend factor) instead of the picture's alpha.
@@ -134,6 +145,9 @@ pub(crate) struct Placement {
     pub uv: [f32; 4],
     /// Only this part of the target is drawn on.
     pub clip: RECT,
+    /// Quarter turns clockwise of the source within `dest` (0–3): `uv` is
+    /// of the source as it is, before it's turned.
+    pub turns: u32,
 }
 
 impl Quad {
@@ -147,6 +161,7 @@ impl Quad {
         let ps_changed_code = compile(s!("ps_changed"), s!("ps_4_0"))?;
         let ps_to_light_code = compile(s!("ps_to_light"), s!("ps_4_0"))?;
         let ps_from_light_code = compile(s!("ps_from_light"), s!("ps_4_0"))?;
+        let ps_from_hdr_code = compile(s!("ps_from_hdr"), s!("ps_4_0"))?;
         unsafe {
             let mut vs = None;
             dev.CreateVertexShader(bytes(&vs_code), None, Some(&mut vs))?;
@@ -164,6 +179,8 @@ impl Quad {
             dev.CreatePixelShader(bytes(&ps_to_light_code), None, Some(&mut ps_to_light))?;
             let mut ps_from_light = None;
             dev.CreatePixelShader(bytes(&ps_from_light_code), None, Some(&mut ps_from_light))?;
+            let mut ps_from_hdr = None;
+            dev.CreatePixelShader(bytes(&ps_from_hdr_code), None, Some(&mut ps_from_hdr))?;
             let block_desc = D3D11_BUFFER_DESC { ByteWidth: 16, Usage: D3D11_USAGE_DEFAULT, BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32, ..Default::default() };
             let mut block = None;
             dev.CreateBuffer(&block_desc, None, Some(&mut block))?;
@@ -195,7 +212,7 @@ impl Quad {
             };
             let mut sampler = None;
             dev.CreateSamplerState(&sampler_desc, Some(&mut sampler))?;
-            let buffer_desc = D3D11_BUFFER_DESC { ByteWidth: 32, Usage: D3D11_USAGE_DEFAULT, BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32, ..Default::default() };
+            let buffer_desc = D3D11_BUFFER_DESC { ByteWidth: 48, Usage: D3D11_USAGE_DEFAULT, BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32, ..Default::default() };
             let mut place = None;
             dev.CreateBuffer(&buffer_desc, None, Some(&mut place))?;
             Ok(Self {
@@ -207,6 +224,7 @@ impl Quad {
                 ps_changed: ps_changed.context("no pixel shader")?,
                 ps_to_light: ps_to_light.context("no pixel shader")?,
                 ps_from_light: ps_from_light.context("no pixel shader")?,
+                ps_from_hdr: ps_from_hdr.context("no pixel shader")?,
                 block: block.context("no constant buffer")?,
                 blend: blend.context("no blend state")?,
                 mix: mix.context("no blend state")?,
@@ -228,6 +246,13 @@ impl Quad {
     /// what a screen showing them in turn gives off.
     pub(crate) fn average_light(&self, gpu: &Gpu, target: &ID3D11RenderTargetView, size: (u32, u32), source: &ID3D11ShaderResourceView, weight: f32) {
         self.run(gpu, target, size, source, &whole(size), Shader::ToLight, Some(weight));
+    }
+
+    /// Draw `source`, an HDR desktop's light (scRGB), where `at` says, as
+    /// sRGB: `scale` of its light (80 nits over the SDR white level puts SDR
+    /// white at white; brighter than that is clipped).
+    pub(crate) fn draw_hdr(&self, gpu: &Gpu, target: &ID3D11RenderTargetView, size: (u32, u32), source: &ID3D11ShaderResourceView, at: &Placement, scale: f32) {
+        self.run(gpu, target, size, source, at, Shader::FromHdr(scale), None);
     }
 
     /// Draw all of `source` (light) into `target`, back as sRGB.
@@ -261,7 +286,7 @@ impl Quad {
     /// (and `other`), with `area` in its constant buffer.
     #[allow(clippy::too_many_arguments)]
     fn blocks(&self, gpu: &Gpu, target: &ID3D11RenderTargetView, out: (u32, u32), ps: &ID3D11PixelShader, image: &ID3D11ShaderResourceView, other: Option<&ID3D11ShaderResourceView>, area: [f32; 4]) {
-        let place = [-1.0f32, 1.0, 1.0, -1.0, 0.0, 0.0, 1.0, 1.0];
+        let place = [-1.0f32, 1.0, 1.0, -1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0];
         let _lock = gpu.exclusive();
         let ctx = &gpu.context;
         unsafe {
@@ -288,7 +313,8 @@ impl Quad {
     fn run(&self, gpu: &Gpu, target: &ID3D11RenderTargetView, size: (u32, u32), source: &ID3D11ShaderResourceView, at: &Placement, shader: Shader, weight: Option<f32>) {
         let (w, h) = (size.0 as f32, size.1 as f32);
         let [l, t, r, b] = at.dest;
-        let place = [l / w * 2.0 - 1.0, 1.0 - t / h * 2.0, r / w * 2.0 - 1.0, 1.0 - b / h * 2.0, at.uv[0], at.uv[1], at.uv[2], at.uv[3]];
+        let scale = if let Shader::FromHdr(s) = shader { s } else { 1.0 };
+        let place = [l / w * 2.0 - 1.0, 1.0 - t / h * 2.0, r / w * 2.0 - 1.0, 1.0 - b / h * 2.0, at.uv[0], at.uv[1], at.uv[2], at.uv[3], (at.turns % 4) as f32, scale, 0.0, 0.0];
         let _lock = gpu.exclusive();
         let ctx = &gpu.context;
         unsafe {
@@ -309,8 +335,11 @@ impl Quad {
                 Shader::Opaque => &self.ps_opaque,
                 Shader::ToLight => &self.ps_to_light,
                 Shader::FromLight => &self.ps_from_light,
+                Shader::FromHdr(_) => &self.ps_from_hdr,
             };
             ctx.PSSetShader(ps, None);
+            // The HDR scale is read there (`turn.y`).
+            ctx.PSSetConstantBuffers(0, Some(&[Some(self.place.clone())]));
             ctx.PSSetShaderResources(0, Some(&[Some(source.clone())]));
             ctx.PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
             ctx.Draw(4, 0);
@@ -321,12 +350,22 @@ impl Quad {
     }
 }
 
+/// `w`×`h` shrunk (keeping its shape) to fit in `max_w`×`max_h`, if it's bigger.
+pub(crate) fn fit_within(w: u32, h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
+    if w <= max_w && h <= max_h {
+        return (w, h);
+    }
+    let scale = (max_w as f64 / w as f64).min(max_h as f64 / h as f64);
+    (((w as f64 * scale) as u32).max(2) & !1, ((h as f64 * scale) as u32).max(2) & !1)
+}
+
 /// All of a target `size` pixels big.
 fn whole(size: (u32, u32)) -> Placement {
     Placement {
         dest: [0.0, 0.0, size.0 as f32, size.1 as f32],
         uv: [0.0, 0.0, 1.0, 1.0],
         clip: RECT { left: 0, top: 0, right: size.0 as i32, bottom: size.1 as i32 },
+        turns: 0,
     }
 }
 
@@ -357,4 +396,20 @@ pub(crate) fn target_view(gpu: &Gpu, texture: &ID3D11Texture2D) -> Result<ID3D11
     let mut view = None;
     unsafe { gpu.device.CreateRenderTargetView(texture, None, Some(&mut view)) }?;
     view.context("no render target view")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fit_within;
+
+    #[test]
+    fn fits() {
+        assert_eq!(fit_within(1920, 1080, 2560, 1440), (1920, 1080));
+        assert_eq!(fit_within(3840, 2160, 1920, 1080), (1920, 1080));
+        // A display whose mode grew past what was made for it: from
+        // 1440×1080 to 1920×1080, and a portrait one from 1080×1440 to
+        // 1080×1920 beside a 2560×1440 one.
+        assert_eq!(fit_within(1920, 1080, 1440, 1080), (1440, 810));
+        assert_eq!(fit_within(1080, 1920, 2560, 1440), (810, 1440));
+    }
 }

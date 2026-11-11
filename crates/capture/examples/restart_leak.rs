@@ -14,14 +14,18 @@ fn main() -> anyhow::Result<()> {
         container_ext: "mp4".into(),
         fps: num("FPS", 60),
         blend_samples: num("BLEND", 3),
+        blend_shape: Default::default(),
         video_bitrate_kbps: 20000,
-        target_height: Some(num("HEIGHT", 1080)),
+        size: capture::VideoSize { short_side: Some(num("HEIGHT", 1080)), ..Default::default() },
         use_hardware: true,
         replay_seconds: 30,
-        video: capture::VideoSource::Screen { id: String::new(), hook: capture::GameHook { auto: false, allowed: Vec::new() } },
+        video: capture::VideoSource::Screen { id: String::new(), hook: capture::GameHook { auto: false, allowed: Vec::new() }, method: Default::default() },
         away_screen: None,
         webcam: None,
+        layers: capture::layers::main_only(),
+        screen: std::sync::Arc::new(std::sync::Mutex::new(capture::ScreenPlacement::whole(capture::Framing::Fill))),
         sources: Vec::new(),
+        stream: None,
     };
     crash_report();
     println!("before: {}", memory());
@@ -34,7 +38,7 @@ fn main() -> anyhow::Result<()> {
         if env("SAVE").is_some() {
             println!("  saved: {:?}", rec.save_clip(&out).and_then(|p| p.finish()));
         }
-        rec.stop(None)?;
+        rec.stop(Mode::ReplayBuffer, None)?;
         std::thread::sleep(std::time::Duration::from_millis(500));
         println!("round {round}: while recording {running}; after stop {}", memory());
     }

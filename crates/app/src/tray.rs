@@ -55,7 +55,7 @@ struct Inner {
 
 /// The tray / menu bar icon: the logo's glyph alone, as the bar's other icons
 /// are (the app icon, with its dark plate, looked small and boxed in there).
-/// Made from its SVG by `scripts/tray-icons.sh`.
+/// Made from its SVG by `scripts/icons.sh`.
 #[cfg(any(windows, target_os = "macos"))]
 fn tray_image() -> Option<tray_icon::Icon> {
     // macOS: 18 points high on a 2x display; macOS sizes it to the bar.
@@ -70,14 +70,14 @@ fn tray_image() -> Option<tray_icon::Icon> {
         // SAFETY: no arguments to get wrong.
         let want = unsafe { GetSystemMetrics(SM_CXSMICON) }.max(16);
         const SIZES: [(i32, &[u8]); 8] = [
-            (16, include_bytes!("../assets/tray/windows-16.png")),
-            (20, include_bytes!("../assets/tray/windows-20.png")),
-            (24, include_bytes!("../assets/tray/windows-24.png")),
-            (28, include_bytes!("../assets/tray/windows-28.png")),
-            (32, include_bytes!("../assets/tray/windows-32.png")),
-            (40, include_bytes!("../assets/tray/windows-40.png")),
-            (48, include_bytes!("../assets/tray/windows-48.png")),
-            (64, include_bytes!("../assets/tray/windows-64.png")),
+            (16, include_bytes!("../assets/tray/glyph-16.png")),
+            (20, include_bytes!("../assets/tray/glyph-20.png")),
+            (24, include_bytes!("../assets/tray/glyph-24.png")),
+            (28, include_bytes!("../assets/tray/glyph-28.png")),
+            (32, include_bytes!("../assets/tray/glyph-32.png")),
+            (40, include_bytes!("../assets/tray/glyph-40.png")),
+            (48, include_bytes!("../assets/tray/glyph-48.png")),
+            (64, include_bytes!("../assets/tray/glyph-64.png")),
         ];
         // The size asked for, else the next bigger one (scaled down a little,
         // which stays smooth), else the biggest.
@@ -91,19 +91,22 @@ fn tray_image() -> Option<tray_icon::Icon> {
 impl Tray {
     /// The tray icon, or `None` where there's none. `tx`: commands from
     /// elsewhere too (another launch asking to be shown).
-    pub fn new(ctx: &egui::Context, icon: &egui::IconData, tx: mpsc::Sender<Cmd>, rx: Receiver<Cmd>) -> Option<Self> {
+    /// `quick`: saves a clip from the tray's own thread (Linux: the UI's
+    /// doesn't run while the window's hidden).
+    pub fn new(ctx: &egui::Context, tx: mpsc::Sender<Cmd>, rx: Receiver<Cmd>, quick: crate::service::QuickSave) -> Option<Self> {
         #[cfg(any(windows, target_os = "macos"))]
         {
+            // Their UI runs while the window's hidden: the tray's commands wait for it.
+            let _ = quick;
             use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
             use tray_icon::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 
             let open = MenuItem::new("Open HesteClips", true, None);
             let save = MenuItem::new("Save clip", false, None);
-            let buffer = MenuItem::new("Start replay buffer", true, None);
+            let buffer = MenuItem::new("Start clipping", true, None);
             let quit = MenuItem::new("Quit HesteClips", true, None);
             let menu = Menu::new();
             menu.append_items(&[&open, &PredefinedMenuItem::separator(), &save, &buffer, &PredefinedMenuItem::separator(), &quit]).ok()?;
-            let _ = icon;
             let image = tray_image()?;
             // macOS: a template image, tinted by macOS to suit the menu bar
             // (white on a dark one, black on a light one), as its own icons.
@@ -140,12 +143,12 @@ impl Tray {
         }
         #[cfg(target_os = "linux")]
         {
-            let inner = linux::spawn(ctx, icon, tx)?;
+            let inner = linux::spawn(ctx, tx, quick)?;
             Some(Self { rx, inner, buffering: Default::default() })
         }
         #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
         {
-            let _ = (ctx, icon, tx, rx);
+            let _ = (ctx, tx, rx, quick);
             None
         }
     }
@@ -163,7 +166,7 @@ impl Tray {
             if i.buffering.get() != Some(buffering) {
                 i.buffering.set(Some(buffering));
                 i.save.set_enabled(buffering);
-                i.buffer.set_text(if buffering { "Stop replay buffer" } else { "Start replay buffer" });
+                i.buffer.set_text(if buffering { "Stop clipping" } else { "Start clipping" });
             }
         }
         // Only when it changed: each update tells the desktop to redraw the menu.
@@ -204,11 +207,28 @@ mod linux {
         icon: Vec<ksni::Icon>,
         tx: mpsc::Sender<Cmd>,
         ctx: egui::Context,
+        quick: crate::service::QuickSave,
         pub buffering: bool,
     }
 
     impl Item {
+        /// Do `cmd`. While the window's hidden (KDE under Wayland), the app's
+        /// UI doesn't run: opening it, saving a clip and quitting are done
+        /// from here; starting or stopping clipping brings the window back to
+        /// do it.
         fn send(&self, cmd: Cmd) {
+            if crate::kwin_window::hidden() {
+                match cmd {
+                    Cmd::Open | Cmd::ToggleBuffer => {
+                        crate::kwin_window::bring_back();
+                    }
+                    Cmd::SaveClip => {
+                        self.quick.save();
+                        return;
+                    }
+                    Cmd::Quit => crate::quit_now(),
+                }
+            }
             let _ = self.tx.send(cmd);
             self.ctx.request_repaint();
         }
@@ -240,7 +260,7 @@ mod linux {
                 item("Open HesteClips", true, Cmd::Open),
                 ksni::MenuItem::Separator,
                 item("Save clip", self.buffering, Cmd::SaveClip),
-                item(if self.buffering { "Stop replay buffer" } else { "Start replay buffer" }, true, Cmd::ToggleBuffer),
+                item(if self.buffering { "Stop clipping" } else { "Start clipping" }, true, Cmd::ToggleBuffer),
                 ksni::MenuItem::Separator,
                 item("Quit HesteClips", true, Cmd::Quit),
             ]
@@ -253,21 +273,34 @@ mod linux {
     }
 
     /// Put the item in the tray. `None` where nothing shows tray icons.
-    pub fn spawn(ctx: &egui::Context, icon: &egui::IconData, tx: mpsc::Sender<Cmd>) -> Option<ksni::blocking::Handle<Item>> {
+    pub fn spawn(ctx: &egui::Context, tx: mpsc::Sender<Cmd>, quick: crate::service::QuickSave) -> Option<ksni::blocking::Handle<Item>> {
         if !host_present() {
             eprintln!("no tray icon: this desktop doesn't show tray icons (on GNOME, the AppIndicator extension adds them); closing the window quits");
             return None;
         }
-        // Trays show 16–48 px: a few sizes (sent again with every change, so
-        // not the 1024 px original), ARGB32 in network byte order as
-        // StatusNotifierItem wants it.
-        let full = image::RgbaImage::from_raw(icon.width, icon.height, icon.rgba.clone())?;
-        let sizes = [22, 32, 48, 64].map(|size| {
-            let small = image::imageops::resize(&full, size, size, image::imageops::FilterType::Lanczos3);
-            let data = small.pixels().flat_map(|p| [p[3], p[0], p[1], p[2]]).collect();
-            ksni::Icon { width: size as i32, height: size as i32, data }
-        });
-        let item = Item { icon: sizes.to_vec(), tx, ctx: ctx.clone(), buffering: false };
+        // The glyph alone, as the tray's other icons are (and as on Windows),
+        // drawn at the sizes trays show (16–64 px), for the tray to pick
+        // from; ARGB32 in network byte order as StatusNotifierItem wants it.
+        const SIZES: [&[u8]; 8] = [
+            include_bytes!("../assets/tray/glyph-16.png"),
+            include_bytes!("../assets/tray/glyph-20.png"),
+            include_bytes!("../assets/tray/glyph-24.png"),
+            include_bytes!("../assets/tray/glyph-28.png"),
+            include_bytes!("../assets/tray/glyph-32.png"),
+            include_bytes!("../assets/tray/glyph-40.png"),
+            include_bytes!("../assets/tray/glyph-48.png"),
+            include_bytes!("../assets/tray/glyph-64.png"),
+        ];
+        let sizes: Vec<ksni::Icon> = SIZES
+            .iter()
+            .filter_map(|png| image::load_from_memory_with_format(png, image::ImageFormat::Png).ok())
+            .map(|img| {
+                let img = img.to_rgba8();
+                let data = img.pixels().flat_map(|p| [p[3], p[0], p[1], p[2]]).collect();
+                ksni::Icon { width: img.width() as i32, height: img.height() as i32, data }
+            })
+            .collect();
+        let item = Item { icon: sizes, tx, ctx: ctx.clone(), quick, buffering: false };
         match item.spawn() {
             Ok(handle) => Some(handle),
             Err(e) => {
@@ -280,20 +313,36 @@ mod linux {
 
 /// One HesteClips at a time: opening it again (a shortcut, a second click)
 /// shows the one already running, in the tray maybe. The first listens on a
-/// local port; a later one tells it to show itself and exits.
+/// local port; a later one tells it to show itself and exits. A build of
+/// your own takes over instead (see [`take_over`]).
 ///
 /// Called first thing: `Some(listener)` to run (hand it to [`serve`]),
-/// `None` when another one was asked to show itself and this one should exit.
+/// `None` when another one runs and this one should exit.
 pub fn claim() -> Option<Option<std::net::TcpListener>> {
+    claim_on(PORT)
+}
+
+/// Where the first one listens. Fixed, so a later one knows where to knock
+/// (nothing special).
+const PORT: u16 = 52131;
+
+/// Another HesteClips runs (or something else has its port): asked before
+/// [`claim`], which may then show that one and exit.
+#[cfg(any(windows, target_os = "linux"))]
+pub fn another_running() -> bool {
+    std::net::TcpListener::bind(("127.0.0.1", PORT)).is_err()
+}
+
+fn claim_on(port: u16) -> Option<Option<std::net::TcpListener>> {
     use std::io::Write;
-    // Fixed, so a second launch knows where to knock (nothing special).
-    const PORT: u16 = 52131;
-    match std::net::TcpListener::bind(("127.0.0.1", PORT)) {
+    match std::net::TcpListener::bind(("127.0.0.1", port)) {
         Ok(listener) => Some(Some(listener)),
-        // Taken: one is running. Ask it to show itself.
-        Err(_) => match std::net::TcpStream::connect(("127.0.0.1", PORT)) {
-            Ok(mut s) => {
-                let _ = s.write_all(b"show");
+        // Taken: one is running.
+        Err(_) => match std::net::TcpStream::connect(("127.0.0.1", port)) {
+            Ok(running) if from_build_folder() => take_over(running, port),
+            Ok(mut running) => {
+                let _ = running.write_all(b"show");
+                eprintln!("HesteClips is already running: showed that one instead");
                 None
             }
             // Something else has the port: run anyway, alone.
@@ -302,17 +351,157 @@ pub fn claim() -> Option<Option<std::net::TcpListener>> {
     }
 }
 
-/// Answer later launches: each asks this one to show itself.
-pub fn serve(listener: std::net::TcpListener, ctx: &egui::Context, tx: mpsc::Sender<Cmd>) {
-    use std::io::Read;
+/// Run from Cargo's build folder (`cargo run`, with `--release` or not): a
+/// build of your own, not an installed HesteClips.
+fn from_build_folder() -> bool {
+    build_folder().is_some()
+}
+
+/// The Cargo build folder (`target`) this copy runs from, if it's a build of
+/// your own.
+pub(crate) fn build_folder() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    exe.ancestors().skip(1).take(3).find(|dir| dir.join("CACHEDIR.TAG").is_file()).map(std::path::Path::to_path_buf)
+}
+
+/// A build of your own, started while another HesteClips runs (the installed
+/// one, in the tray): that one is asked to quit (finishing a recording
+/// first, as when it's quit from the tray), and this one runs once it has.
+/// It used to be shown instead, as for a second launch of the same app,
+/// which looked like the build starting while the installed one went on
+/// recording. One that doesn't answer (0.4.0 and before don't know how) is
+/// left running, and this one says why it can't.
+fn take_over(mut running: std::net::TcpStream, port: u16) -> Option<Option<std::net::TcpListener>> {
+    use std::io::{Read, Write};
+    use std::time::{Duration, Instant};
+    let _ = running.write_all(b"quit");
+    let _ = running.set_read_timeout(Some(Duration::from_secs(2)));
+    let mut answer = [0u8; 4];
+    if running.read_exact(&mut answer).is_ok() && &answer == b"okay" {
+        // Stopping a capture may take 10 s, and the app a little more.
+        let until = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(100));
+            if let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", port)) {
+                crate::logfile::tell("HesteClips was already running: it quit, so this one runs");
+                return Some(Some(listener));
+            }
+        }
+    }
+    crate::logfile::tell("HesteClips is already running, and this build of your own can't start beside it. Quit HesteClips from the tray, then run this again.");
+    None
+}
+
+/// Answer later launches: each asks this one to show itself, or (a build of
+/// your own, see [`take_over`]) to quit. And a control (a Stream Deck)
+/// that says `ctrl` goes to `control`, to be served on its own thread.
+pub fn serve(listener: std::net::TcpListener, ctx: &egui::Context, tx: mpsc::Sender<Cmd>, control: Option<crate::control::Door>) {
+    use std::io::{Read, Write};
     let ctx = ctx.clone();
     let _ = std::thread::Builder::new().name("single instance".into()).spawn(move || {
         for mut stream in listener.incoming().flatten() {
+            // One that connects and says nothing doesn't hold up the next.
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
             let mut word = [0u8; 4];
-            if stream.read_exact(&mut word).is_ok() && &word == b"show" {
-                let _ = tx.send(Cmd::Open);
-                ctx.request_repaint();
+            if stream.read_exact(&mut word).is_err() {
+                continue;
             }
+            match &word {
+                b"ctrl" => {
+                    if let Some(door) = &control {
+                        door.open(stream);
+                    }
+                    continue;
+                }
+                b"show" => {
+                    // Hidden (KDE under Wayland): the UI doesn't run to hear it.
+                    #[cfg(target_os = "linux")]
+                    crate::kwin_window::bring_back();
+                    let _ = tx.send(Cmd::Open);
+                }
+                b"quit" => {
+                    let _ = stream.write_all(b"okay");
+                    // Hidden (KDE under Wayland): quit from here.
+                    #[cfg(target_os = "linux")]
+                    {
+                        if crate::kwin_window::hidden() {
+                            crate::quit_now();
+                        }
+                    }
+                    let _ = tx.send(Cmd::Quit);
+                }
+                _ => continue,
+            }
+            ctx.request_repaint();
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::time::{Duration, Instant};
+
+    /// A port of the test's own, for a HesteClips "already running" on it.
+    fn spare_port() -> u16 {
+        TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port()
+    }
+
+    /// One already running answers "show" by showing itself, and "quit" by
+    /// saying it will and quitting.
+    #[test]
+    fn answers_show_and_quit() {
+        let port = spare_port();
+        let (tx, rx) = mpsc::channel();
+        serve(TcpListener::bind(("127.0.0.1", port)).unwrap(), &egui::Context::default(), tx, None);
+        let mut show = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        show.write_all(b"show").unwrap();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(Cmd::Open));
+        let mut quit = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        quit.write_all(b"quit").unwrap();
+        let mut answer = [0u8; 4];
+        quit.read_exact(&mut answer).unwrap();
+        assert_eq!(&answer, b"okay");
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(Cmd::Quit));
+    }
+
+    /// A build of your own (tests run from the build folder) takes over from
+    /// one that answers: it's asked to quit, and gets the port once that one
+    /// lets go of it (here half a second later).
+    #[test]
+    fn a_build_of_your_own_takes_over() {
+        assert!(from_build_folder());
+        let port = spare_port();
+        let running = TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let quitting = std::thread::spawn(move || {
+            let (mut stream, _) = running.accept().unwrap();
+            let mut word = [0u8; 4];
+            stream.read_exact(&mut word).unwrap();
+            stream.write_all(b"okay").unwrap();
+            std::thread::sleep(Duration::from_millis(500));
+            word
+        });
+        let claimed = claim_on(port);
+        assert_eq!(&quitting.join().unwrap(), b"quit");
+        assert!(claimed.is_some_and(|l| l.is_some()), "didn't run once the other one quit");
+    }
+
+    /// One that doesn't know how to hand over (0.4.0 reads the word, and only
+    /// knows "show") is left running, and the build of your own exits, at once.
+    #[test]
+    fn an_older_one_is_left_running() {
+        let port = spare_port();
+        let running = TcpListener::bind(("127.0.0.1", port)).unwrap();
+        std::thread::spawn(move || {
+            for mut stream in running.incoming().flatten() {
+                let mut word = [0u8; 4];
+                let _ = stream.read_exact(&mut word);
+            }
+        });
+        let t = Instant::now();
+        assert!(claim_on(port).is_none());
+        assert!(t.elapsed() < Duration::from_secs(1), "took {:?}", t.elapsed());
+    }
 }

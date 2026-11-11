@@ -1,0 +1,65 @@
+name: Bug report
+description: Something doesn't work as it should.
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What went wrong, and what you expected instead. Screenshots or a short clip help.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open …
+        2. Click …
+        3. See the problem
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: HesteClips version
+      description: You'll find it in Settings → App.
+      placeholder: "0.4.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: system
+    attributes:
+      label: System
+      options:
+        - Windows
+        - macOS
+        - Linux
+    validations:
+      required: true
+
+  - type: input
+    id: setup
+    attributes:
+      label: System version and graphics card
+      placeholder: Windows 11, RTX 4070
+    validations:
+      required: false
+
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: |
+        Drag the log file in here, if you can.
+
+        - Windows: `%LOCALAPPDATA%\hesteclips\logs\hesteclips.log`
+        - Linux: `~/.local/share/hesteclips/logs/hesteclips.log`
+        - macOS: there's no log file, so skip this.
+
+        If HesteClips crashed, send `hesteclips.previous.log` too.
+    validations:
+      required: false

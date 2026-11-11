@@ -67,10 +67,11 @@ pub(crate) struct PreviewCapture {
 impl PreviewCapture {
     pub(crate) fn start(
         source: VideoSource,
-        target_height: Option<u32>,
+        size: crate::VideoSize,
         fps: u32,
         away: Option<Arc<StillImage>>,
-        webcam: Option<crate::webcam::Webcam>,
+        layers: crate::SharedLayers,
+        screen: crate::SharedScreen,
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let error = Arc::new(Mutex::new(None));
@@ -80,19 +81,21 @@ impl PreviewCapture {
         let apps = matches!(source, VideoSource::Apps { .. });
         thread::spawn(move || {
             let opened = (|| -> Result<(Picture, Frames)> {
-                let (content, display, size) = video::plan(&source, target_height)?;
+                let (content, display, frame) = video::plan(&source, size)?;
                 let away = match &away {
-                    Some(img) => Some(Arc::new(video::still_buffer(Some(img), size.0, size.1)?)),
+                    Some(img) => Some(Arc::new(video::still_buffer(Some(img), frame.0, frame.1)?)),
                     None => None,
                 };
-                let picture = Picture::start(&source, &content, &display, size, fps, away)?;
-                let frames = Frames::new(picture.latest.clone(), webcam.as_ref(), size.0, size.1, generation)?;
+                let placed = *screen.lock().unwrap();
+                let picture = Picture::start(&source, &content, &display, frame, fps, away, placed)?;
+                let frames = Frames::new(picture.latest.clone(), layers.clone(), screen.clone(), Some(picture.ctl()), frame.0, frame.1, fps, generation)?;
                 Ok((picture, frames))
             })();
             let (mut picture, mut frames) = match opened {
                 Ok(p) => p,
                 Err(e) => {
                     *error2.lock().unwrap() = Some(format!("{e:#}"));
+                    crate::preview::clear(generation);
                     return;
                 }
             };

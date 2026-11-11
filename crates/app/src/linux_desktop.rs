@@ -12,7 +12,22 @@ use std::path::{Path, PathBuf};
 use crate::portal_shortcuts::APP_ID;
 
 const DESKTOP_FILE: &str = include_str!("../assets/io.github.kaillr.HesteClips.desktop");
-const ICON: &[u8] = include_bytes!("../assets/icon.svg");
+/// The glyph without the macOS plate, as on Windows, at each size of the
+/// icon theme's (made by scripts/icons.sh). PNGs, not an SVG: KDE draws an
+/// SVG icon with Qt, which ignores paint-order (the glyph's keyline covered
+/// it), and the bigger sizes' soft shadow is a blur no SVG icon can count on.
+const ICONS: [(u32, &[u8]); 10] = [
+    (16, include_bytes!("../assets/glyph-icon/16.png")),
+    (22, include_bytes!("../assets/glyph-icon/22.png")),
+    (24, include_bytes!("../assets/glyph-icon/24.png")),
+    (32, include_bytes!("../assets/glyph-icon/32.png")),
+    (48, include_bytes!("../assets/glyph-icon/48.png")),
+    (64, include_bytes!("../assets/glyph-icon/64.png")),
+    (96, include_bytes!("../assets/glyph-icon/96.png")),
+    (128, include_bytes!("../assets/glyph-icon/128.png")),
+    (192, include_bytes!("../assets/glyph-icon/192.png")),
+    (256, include_bytes!("../assets/glyph-icon/256.png")),
+];
 
 /// Make sure the desktop can find us. Call before talking to the portal.
 pub fn integrate() {
@@ -25,8 +40,14 @@ pub fn integrate() {
     let Ok(exe) = std::env::current_exe() else { return };
     let entry = DESKTOP_FILE.replace("Exec=hesteclips", &format!("Exec={}", quote_exec(&exe)));
     let desktop = home.join("applications").join(format!("{APP_ID}.desktop"));
-    let icon = home.join("icons/hicolor/scalable/apps").join(format!("{APP_ID}.svg"));
-    let wrote = write_if_changed(&desktop, entry.as_bytes()) | write_if_changed(&icon, ICON);
+    let mut wrote = write_if_changed(&desktop, entry.as_bytes());
+    for (size, png) in ICONS {
+        wrote |= write_if_changed(&home.join(format!("icons/hicolor/{size}x{size}/apps/{APP_ID}.png")), png);
+    }
+    // The SVG earlier versions put there: the desktop would draw it at any
+    // size the PNGs don't have.
+    let old = home.join("icons/hicolor/scalable/apps").join(format!("{APP_ID}.svg"));
+    wrote |= std::fs::remove_file(old).is_ok();
     if wrote {
         eprintln!("added HesteClips to the desktop's apps ({})", desktop.display());
     }
@@ -70,7 +91,7 @@ mod tests {
 
     #[test]
     fn exec_paths_are_quoted_when_needed() {
-        assert_eq!(quote_exec(Path::new("/opt/hesteclips/hesteclips")), "/opt/hesteclips/hesteclips");
+        assert_eq!(quote_exec(Path::new("/opt/Kaillr/hesteclips")), "/opt/Kaillr/hesteclips");
         assert_eq!(quote_exec(Path::new("/home/a b/hesteclips")), "\"/home/a b/hesteclips\"");
         assert_eq!(quote_exec(Path::new("/x/$y")), "\"/x/\\\\$y\"");
     }

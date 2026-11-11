@@ -211,6 +211,36 @@ pub enum FreeUp {
 /// Seconds kept after the edit's end when trimming the original.
 const TRIM_MARGIN: f64 = 1.0;
 
+/// About how many bytes [`FreeUp::Trim`] frees of an original of
+/// `original_bytes` and `duration` seconds: its share outside what the edit
+/// keeps. (The trim starts on the keyframe before the edit, which only
+/// reading the file tells, so it's a little less in practice.) 0 when the
+/// original is already about as short as the edit, as [`free_up`] sees it.
+pub fn trim_frees(original_bytes: u64, duration: f64, edit: &Edit) -> u64 {
+    let from = edit.start.max(0.0);
+    let to = (edit.end + TRIM_MARGIN).min(duration);
+    if duration <= 0.0 || (from < 0.5 && to >= duration - 0.5) {
+        return 0;
+    }
+    let kept = ((to - from) / duration).clamp(0.0, 1.0);
+    (original_bytes as f64 * (1.0 - kept)) as u64
+}
+
+/// What freeing up an edited clip's original would free: deleting it (all
+/// it keeps beside the clip), and about what trimming it would. `None` when
+/// it has no original.
+pub fn free_up_sizes(target: &EditTarget) -> Option<(u64, u64)> {
+    let id = target.id.as_deref()?;
+    let original = find_original(target.library(), id)?;
+    let size = |p: &Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+    let all = std::fs::read_dir(assets_dir(target.library(), id)).map(|d| d.flatten().map(|e| size(&e.path())).sum()).unwrap_or(0);
+    let trim = match (load_edit(target), media::probe(&original)) {
+        (Some(edit), Ok(info)) => trim_frees(size(&original), info.duration, &edit),
+        _ => 0,
+    };
+    Some((all, trim))
+}
+
 /// Free up the space an edited clip's original takes (see [`FreeUp`]).
 /// Returns how many bytes it freed. `permanently`: deleting skips the Bin.
 pub fn free_up(target: &EditTarget, how: FreeUp, permanently: bool) -> Result<u64, String> {
@@ -223,7 +253,7 @@ pub fn free_up(target: &EditTarget, how: FreeUp, permanently: bool) -> Result<u6
             // The saved clip becomes the recording: its moments are now
             // counted from its own start.
             if let (Some(edit), Ok(info)) = (load_edit(target), media::probe(&original)) {
-                crate::moments::rebase(&target.clip, &target.clip, info.duration, edit.start, edit.end - edit.start);
+                crate::moments::rebase(&target.clip, &target.clip, info.duration, &edit.kept());
             }
             let dir = assets_dir(lib, id);
             let freed = std::fs::read_dir(&dir).map(|d| d.flatten().map(|e| size(&e.path())).sum()).unwrap_or(0);
@@ -263,7 +293,7 @@ pub fn free_up(target: &EditTarget, how: FreeUp, permanently: bool) -> Result<u6
             };
             let before = size(&original);
             let edit = edit.shifted(from - at);
-            crate::moments::rebase(&target.clip, &target.clip, info.duration, from - at, to - from + at);
+            crate::moments::rebase(&target.clip, &target.clip, info.duration, &[(from - at, to)]);
             // The edit first: should the swap fail, the old edit goes back.
             let old = std::fs::read(edit_path(lib, id)).map_err(|e| e.to_string())?;
             std::fs::write(edit_path(lib, id), serde_json::to_vec_pretty(&edit).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
@@ -429,7 +459,7 @@ mod tests {
         let clip = |name: &str, id: &str| {
             let path = dir.join(name);
             std::fs::write(&path, b"x").unwrap();
-            Clip { path, name: name.into(), modified: std::time::SystemTime::UNIX_EPOCH, created: None, size_bytes: 1, id: Some(id.into()), original: None, folder: None }
+            Clip { path, name: name.into(), modified: std::time::SystemTime::UNIX_EPOCH, created: None, size_bytes: 1, id: Some(id.into()), original: None, folder: None, kept_bytes: 0 }
         };
         let (a, b, c) = (clip("a.mp4", "1111"), clip("b.mp4", "1111"), clip("c.mp4", "2222"));
         for id in ["1111", "2222"] {
@@ -454,7 +484,7 @@ mod tests {
         let made = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_790_000_000);
         std::fs::File::options().write(true).open(&original).unwrap().set_modified(made).unwrap();
         let modified = std::fs::metadata(&clip_path).unwrap().modified().unwrap();
-        let clip = Clip { path: clip_path.clone(), name: "a.mp4".into(), modified, created: None, size_bytes: 4, id: None, original: Some(original), folder: None };
+        let clip = Clip { path: clip_path.clone(), name: "a.mp4".into(), modified, created: None, size_bytes: 4, id: None, original: Some(original), folder: None, kept_bytes: 0 };
         assert_eq!(restore_edit_dates(std::slice::from_ref(&clip)), 1);
         assert_eq!(std::fs::metadata(&clip_path).unwrap().modified().unwrap(), made);
         // Already right: left alone.
@@ -464,7 +494,7 @@ mod tests {
     }
 
     fn edit(end: f64) -> Edit {
-        Edit { start: 1.0, end, tracks: Vec::new(), output: Default::default() }
+        Edit { start: 1.0, end, cuts: Vec::new(), tracks: Vec::new(), output: Default::default() }
     }
 
     /// Stand-in for a render: write the staged file the way the app would.
@@ -603,12 +633,38 @@ mod free_up_tests {
         let edit = Edit {
             start: 4.3,
             end: 6.0,
+            cuts: vec![media::Cut { from: 5.2, to: 5.5 }],
             tracks: vec![media::TrackEdit { index: 1, gain: 1.0, muted: false, points: vec![media::VolumePoint { t: 5.0, db: -6.0 }] }],
             output: Default::default(),
         };
         std::fs::write(edit_path(&dir, id), serde_json::to_vec(&edit).unwrap()).unwrap();
         let target = EditTarget { clip: clip.clone(), source: assets.join("original.mp4"), id: Some(id.into()), library: dir.clone() };
         (dir, target)
+    }
+
+    /// The dialog's sizes: deleting frees all that's kept, trimming about
+    /// what's outside the edit; and nothing once it's been trimmed.
+    #[test]
+    fn sizes_before_and_after_a_trim() {
+        let (dir, target) = setup("sizes");
+        let original = std::fs::metadata(find_original(&dir, "abcdef12").unwrap()).unwrap().len();
+        let (all, trim) = free_up_sizes(&target).unwrap();
+        assert!(all > original, "the edit counts too");
+        // 4.3 s to 7 s of 10 s is kept: about 73% goes.
+        let share = trim as f64 / original as f64;
+        assert!((share - 0.73).abs() < 0.02, "trim frees {share}");
+        free_up(&target, FreeUp::Trim, true).unwrap();
+        assert_eq!(free_up_sizes(&target).unwrap().1, 0, "already trimmed");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn trim_frees_nothing_of_a_whole_edit() {
+        let edit = |start, end| Edit { start, end, cuts: vec![], tracks: vec![], output: Default::default() };
+        assert_eq!(trim_frees(1000, 10.0, &edit(0.0, 10.0)), 0);
+        assert_eq!(trim_frees(1000, 10.0, &edit(0.2, 9.0)), 0, "within half a second of both ends");
+        assert_eq!(trim_frees(1000, 10.0, &edit(5.0, 9.5)), 500);
+        assert_eq!(trim_frees(1000, 0.0, &edit(0.0, 0.0)), 0);
     }
 
     /// Trimming keeps the keyframe before the cut to a second after it, and
@@ -626,6 +682,7 @@ mod free_up_tests {
         let at = media::keyframe_times(&original).unwrap()[0];
         assert!((edit.start - (0.3 + at)).abs() < 0.02, "start {}", edit.start);
         assert!((edit.end - (2.0 + at)).abs() < 0.02, "end {}", edit.end);
+        assert!((edit.cuts[0].from - (1.2 + at)).abs() < 0.02 && (edit.cuts[0].to - (1.5 + at)).abs() < 0.02, "the cut moves along: {:?}", edit.cuts);
         assert!((edit.tracks[0].points[0].t - (1.0 + at)).abs() < 0.02);
         // Again: nothing more to cut.
         assert_eq!(free_up(&target, FreeUp::Trim, true).unwrap(), 0);

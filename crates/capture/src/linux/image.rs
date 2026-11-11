@@ -1,12 +1,13 @@
-//! Picture work on the CPU: fitting the screen into the recording's frame,
-//! drawing the webcam over it, and converting to NV12 for the encoder (and to
-//! RGBA for the preview).
+//! Picture work on the CPU: putting the screen into the recording's frame,
+//! drawing the other layers (webcams, pictures, …) under it and over it,
+//! and converting to NV12 for the encoder (and to RGBA for the preview).
 //!
 //! Each step splits the picture into bands across the CPU's cores. At 1080p
 //! that's a millisecond or two a frame; a 4K screen recorded at 1080p is
 //! averaged down (every source pixel counts, so text stays legible rather
 //! than shimmering).
 
+use super::layers::{Pixels, Place, Shown};
 use super::screen::{Frame, Order};
 use crate::webcam::Placement;
 
@@ -15,18 +16,147 @@ pub(crate) struct Canvas {
     pub width: u32,
     pub height: u32,
     pub bgra: Vec<u8>,
+    /// A picture fitted inside the canvas, scaled before it's put in its place.
+    part: Vec<u8>,
+    /// Layers' pictures scaled to their places, kept while they stay (most
+    /// don't move or change every frame, as the screen does).
+    parts: Vec<(PartKey, Vec<u8>)>,
 }
+
+/// What a layer's scaled picture was made from: the layer, its picture,
+/// the part of it used, its size scaled, and whether it's blended (and
+/// with its colours premultiplied already).
+type PartKey = (u64, u64, [u32; 4], (usize, usize), bool, bool);
+
+/// Layers' scaled pictures kept at most.
+const PARTS_KEPT: usize = 16;
 
 impl Canvas {
     pub(crate) fn new(width: u32, height: u32) -> Self {
-        Self { width, height, bgra: vec![0; width as usize * height as usize * 4] }
+        Self { width, height, bgra: vec![0; width as usize * height as usize * 4], part: Vec::new(), parts: Vec::new() }
     }
 
-    /// Fill with a still picture (the same layout), scaled to fit.
-    pub(crate) fn fill_from(&mut self, src: &Frame) {
-        let size = (src.width as usize, src.height as usize);
-        let to = (self.width as usize, self.height as usize);
-        resample(&src.data, size, src.stride, src.order == Order::Rgb, &mut self.bgra, to);
+    /// Draw a layer other than the screen where it goes: a webcam as
+    /// [`Self::draw_camera`] does; anything else into its box as the screen
+    /// is (on any pixel), blended by its alpha over what's there when it's
+    /// blended, else covering it.
+    pub(crate) fn draw_layer(&mut self, l: &Shown) {
+        match (&l.place, &l.pixels) {
+            (Place::Camera(p), Pixels::Camera(c)) => self.draw_camera(c, p),
+            (Place::Camera(_), _) => {}
+            (Place::Boxed(place), pixels) => {
+                let Some((rows, stride, order)) = pixels.rows() else { return };
+                let size = pixels.size();
+                let ([sx, sy, sw, sh], [dx, dy, dw, dh]) = place.place_on(size, (self.width, self.height), false);
+                if dw == 0 || dh == 0 || sw == 0 || sh == 0 || rows.len() < stride * (size.1 as usize - 1) + size.0 as usize * 4 {
+                    return;
+                }
+                // Scaled its own way round, then put in its place turned and flipped.
+                let (pw, ph) = if place.turns % 2 == 1 { (dh as usize, dw as usize) } else { (dw as usize, dh as usize) };
+                let premultiplied = pixels.premultiplied();
+                let key = (l.id, l.seq, [sx, sy, sw, sh], (pw, ph), l.blended, premultiplied);
+                let at = match self.parts.iter().position(|(k, _)| *k == key) {
+                    Some(at) => at,
+                    None => {
+                        let data = &rows[sy as usize * stride + sx as usize * 4..];
+                        let blend = match (l.blended, premultiplied) {
+                            (false, _) => Blend::Covers,
+                            (true, false) => Blend::Alpha,
+                            (true, true) => Blend::Premultiplied,
+                        };
+                        let part = scaled_part(data, (sw as usize, sh as usize), stride, order == Order::Rgb, (pw, ph), blend);
+                        self.parts.retain(|(k, _)| k.0 != l.id);
+                        if self.parts.len() >= PARTS_KEPT {
+                            self.parts.remove(0);
+                        }
+                        self.parts.push((key, part));
+                        self.parts.len() - 1
+                    }
+                };
+                let part = &self.parts[at].1;
+                let (dx, dy, dw, dh, w) = (dx as usize, dy as usize, dw as usize, dh as usize, self.width as usize);
+                let turned = place.transformed();
+                for y in 0..dh {
+                    for x in 0..dw {
+                        let from = if turned {
+                            let (s, t) = place.unturn(((x as f32 + 0.5) / dw as f32, (y as f32 + 0.5) / dh as f32));
+                            let (px, py) = (((s * pw as f32) as usize).min(pw - 1), ((t * ph as f32) as usize).min(ph - 1));
+                            (py * pw + px) * 4
+                        } else {
+                            (y * pw + x) * 4
+                        };
+                        let src = &part[from..from + 4];
+                        let to = &mut self.bgra[((dy + y) * w + dx + x) * 4..][..4];
+                        if l.blended {
+                            // Premultiplied: its colour, and what's under it where it's clear.
+                            let a = src[3] as u32;
+                            for k in 0..3 {
+                                to[k] = (src[k] as u32 + (to[k] as u32 * (255 - a) + 127) / 255).min(255) as u8;
+                            }
+                        } else {
+                            to[..3].copy_from_slice(&src[..3]);
+                        }
+                        to[3] = 255;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Fill with a picture, put in as `framing` says (see `crate::placement`):
+    /// its middle filling the canvas, all of it with black bars, or all of
+    /// it stretched.
+    #[cfg(test)]
+    pub(crate) fn fill_from(&mut self, src: &Frame, framing: crate::Framing) {
+        self.draw_screen(src, &crate::ScreenPlacement::whole(framing), false);
+    }
+
+    /// Draw a picture where `place` puts it (its crop, into its box as its
+    /// framing says; nothing when hidden). `over` what's drawn already, the
+    /// rest is left as it is; else the rest is black.
+    pub(crate) fn draw_screen(&mut self, src: &Frame, place: &crate::ScreenPlacement, over: bool) {
+        let ([sx, sy, sw, sh], [dx, dy, dw, dh]) = place.place((src.width, src.height), (self.width, self.height));
+        if dw == 0 || dh == 0 || sw == 0 || sh == 0 {
+            if !over {
+                self.clear();
+            }
+            return;
+        }
+        let data = &src.data[sy as usize * src.stride + sx as usize * 4..];
+        let (size, to) = ((sw as usize, sh as usize), (dw as usize, dh as usize));
+        let swap = src.order == Order::Rgb;
+        let turned = place.transformed();
+        if !over && !turned && (dx, dy, dw, dh) == (0, 0, self.width, self.height) {
+            resample(data, size, src.stride, swap, &mut self.bgra, to);
+            return;
+        }
+        // Smaller than the canvas, or turned or flipped: scaled on its own
+        // (its own way round), then put in its place, turned and flipped (on
+        // black, unless it's over what's there).
+        let (pw, ph) = if place.turns % 2 == 1 { (dh as usize, dw as usize) } else { (dw as usize, dh as usize) };
+        self.part.resize(pw * ph * 4, 0);
+        resample(data, size, src.stride, swap, &mut self.part, (pw, ph));
+        if !over {
+            self.clear();
+        }
+        let (dx, dy, dw, dh) = (dx as usize, dy as usize, dw as usize, dh as usize);
+        if !turned {
+            let row = dw * 4;
+            for (y, line) in self.part.chunks_exact(row).enumerate() {
+                let at = ((dy + y) * self.width as usize + dx) * 4;
+                self.bgra[at..at + row].copy_from_slice(line);
+            }
+            return;
+        }
+        // Each pixel from the one it shows of the picture its own way round.
+        for y in 0..dh {
+            for x in 0..dw {
+                let (s, t) = place.unturn(((x as f32 + 0.5) / dw as f32, (y as f32 + 0.5) / dh as f32));
+                let (px, py) = (((s * pw as f32) as usize).min(pw - 1), ((t * ph as f32) as usize).min(ph - 1));
+                let (from, at) = ((py * pw + px) * 4, ((dy + y) * self.width as usize + dx + x) * 4);
+                self.bgra[at..at + 4].copy_from_slice(&self.part[from..from + 4]);
+            }
+        }
     }
 
     /// Fill with black.
@@ -134,11 +264,63 @@ impl Canvas {
     }
 }
 
+/// How a layer's picture goes over what's under it.
+#[derive(Clone, Copy, PartialEq)]
+enum Blend {
+    /// Covering its box.
+    Covers,
+    /// Blended by its alpha.
+    Alpha,
+    /// Blended by its alpha, its colours premultiplied by it already (a web
+    /// page's, as Chromium draws them).
+    Premultiplied,
+}
+
+/// A picture (`size`, rows `stride` bytes apart, B, G, R, A, or R, G, B,
+/// A with `swap`) scaled to `to`, each pixel the average of the area it
+/// covers: opaque, or when blended its colour premultiplied by its alpha
+/// and its alpha kept (each averaged on its own).
+fn scaled_part(data: &[u8], size: (usize, usize), stride: usize, swap: bool, to: (usize, usize), blend: Blend) -> Vec<u8> {
+    let mut out = vec![0u8; to.0 * to.1 * 4];
+    if blend == Blend::Covers {
+        resample(data, size, stride, swap, &mut out, to);
+        return out;
+    }
+    let (w, h) = size;
+    let mut colour = vec![0u8; w * h * 4];
+    let mut alpha = vec![0u8; w * h * 4];
+    for y in 0..h {
+        for x in 0..w {
+            let p = &data[y * stride + x * 4..][..4];
+            let a = p[3] as u32;
+            let at = (y * w + x) * 4;
+            if blend == Blend::Premultiplied {
+                colour[at..at + 3].copy_from_slice(&p[..3]);
+            } else {
+                for k in 0..3 {
+                    colour[at + k] = ((p[k] as u32 * a + 127) / 255) as u8;
+                }
+            }
+            alpha[at..at + 3].fill(p[3]);
+        }
+    }
+    let mut a = vec![0u8; to.0 * to.1 * 4];
+    resample(&colour, size, w * 4, swap, &mut out, to);
+    resample(&alpha, size, w * 4, false, &mut a, to);
+    for (o, a) in out.chunks_exact_mut(4).zip(a.chunks_exact(4)) {
+        o[3] = a[0];
+    }
+    out
+}
+
 /// A webcam picture: B, G, R, A rows, packed.
 pub(crate) struct CameraPicture {
     pub width: u32,
     pub height: u32,
     pub bgra: Vec<u8>,
+    /// Which picture it is, a new number each (pictures' memory is used
+    /// again, so where one is says nothing).
+    pub seq: u64,
 }
 
 impl CameraPicture {
@@ -188,7 +370,7 @@ fn bands(buf: &mut [u8], row: usize, f: impl Fn(usize, &mut [u8]) + Sync) {
 /// Scale a picture of 4-byte pixels (`size`, rows `stride` bytes apart) into
 /// `out` (`to`, rows packed), averaging the area each output pixel covers;
 /// swapping the first and third bytes (red and blue) if asked. Alpha opaque.
-fn resample(src: &[u8], size: (usize, usize), stride: usize, swap: bool, out: &mut [u8], to: (usize, usize)) {
+pub(crate) fn resample(src: &[u8], size: (usize, usize), stride: usize, swap: bool, out: &mut [u8], to: (usize, usize)) {
     let ((sw, sh), (dw, dh)) = (size, to);
     if size == to {
         bands(out, dw * 4, |y0, rows| {
@@ -202,19 +384,27 @@ fn resample(src: &[u8], size: (usize, usize), stride: usize, swap: bool, out: &m
     let xs = Taps::new(sw, dw);
     let ys = Taps::new(sh, dh);
     bands(out, dw * 4, |y0, rows| {
-        // One horizontally scaled source row at a time, weighted into the
-        // output row: each source row is scaled once per output row it
-        // touches (once or twice when shrinking).
+        let n = rows.len() / (dw * 4);
+        if n == 0 {
+            return;
+        }
+        // Each source row this band covers, scaled across once (×256, which
+        // still fits 16 bits), then the output rows weighted from those.
+        let top = ys.first[y0];
+        let bottom = ys.first[y0 + n - 1] + ys.n;
+        let mut scaled = vec![0u16; (bottom - top) * dw * 3];
+        for (k, line) in scaled.chunks_exact_mut(dw * 3).enumerate() {
+            let at = (top + k) * stride;
+            scale_row(&src[at..at + sw * 4], &xs, line);
+        }
         let mut acc = vec![0u32; dw * 3];
-        let mut line = vec![0u32; dw * 3];
         for (i, row) in rows.chunks_exact_mut(dw * 4).enumerate() {
             acc.iter_mut().for_each(|a| *a = 0);
             let (first, weights) = ys.of(y0 + i);
-            for (k, &wy) in weights.iter().enumerate() {
-                let at = (first + k) * stride;
-                scale_row(&src[at..at + sw * 4], &xs, &mut line);
-                for (a, l) in acc.iter_mut().zip(&line) {
-                    *a += l * wy;
+            for (k, &wy) in weights.iter().enumerate().filter(|&(_, &w)| w > 0) {
+                let line = &scaled[(first + k - top) * dw * 3..][..dw * 3];
+                for (a, &l) in acc.iter_mut().zip(line) {
+                    *a += l as u32 * wy;
                 }
             }
             // Each pass's weights add up to 256: two passes, 65536.
@@ -240,20 +430,19 @@ fn copy_row(src: &[u8], out: &mut [u8], swap: bool) {
 
 /// Area-average resampling weights, from `src` samples to `dst`: for each
 /// output sample, the first source sample it covers and how much of each
-/// (out of 256).
+/// (out of 256). Every output sample has the same number of weights (`n`,
+/// the unused ones 0), so the loops over them are plain.
 struct Taps {
     first: Vec<usize>,
-    /// Concatenated weights; `span[i]` is where output `i`'s start.
+    /// `n` weights for each output sample.
     weights: Vec<u32>,
-    span: Vec<(usize, usize)>,
+    n: usize,
 }
 
 impl Taps {
     fn new(src: usize, dst: usize) -> Self {
         let scale = src as f64 / dst.max(1) as f64;
-        let mut first = Vec::with_capacity(dst);
-        let mut weights = Vec::new();
-        let mut span = Vec::with_capacity(dst);
+        let mut each = Vec::with_capacity(dst);
         for i in 0..dst {
             // The source interval this output sample covers (at least one
             // sample wide, so enlarging picks the nearest).
@@ -273,31 +462,65 @@ impl Taps {
             let sum: u32 = w.iter().sum();
             let biggest = (0..w.len()).max_by_key(|&k| w[k]).unwrap_or(0);
             w[biggest] = (w[biggest] + 256).saturating_sub(sum);
-            first.push(lo);
-            span.push((weights.len(), w.len()));
-            weights.extend(w);
+            each.push((lo, w));
         }
-        Self { first, weights, span }
+        let n = each.iter().map(|(_, w)| w.len()).max().unwrap_or(1).min(src.max(1));
+        let mut first = Vec::with_capacity(dst);
+        let mut weights = Vec::with_capacity(dst * n);
+        for (lo, w) in each {
+            // Padded to `n` with zeros, after it, or before it where that
+            // would run past the last source sample.
+            let start = lo.min(src - n);
+            first.push(start);
+            weights.extend(std::iter::repeat_n(0, lo - start));
+            weights.extend(&w);
+            weights.extend(std::iter::repeat_n(0, n - w.len() - (lo - start)));
+        }
+        Self { first, weights, n }
     }
 
     fn of(&self, i: usize) -> (usize, &[u32]) {
-        let (at, n) = self.span[i];
-        (self.first[i], &self.weights[at..at + n])
+        (self.first[i], &self.weights[i * self.n..(i + 1) * self.n])
     }
 }
 
 /// One source row scaled to the output width: 3 channels a pixel, ×256.
-fn scale_row(src: &[u8], xs: &Taps, out: &mut [u32]) {
-    for (i, o) in out.chunks_exact_mut(3).enumerate() {
-        let (first, weights) = xs.of(i);
+fn scale_row(src: &[u8], xs: &Taps, out: &mut [u16]) {
+    // The common tap counts get their own copy of the loop, unrolled.
+    match xs.n {
+        1 => scale_row_n::<1>(src, xs, out),
+        2 => scale_row_n::<2>(src, xs, out),
+        3 => scale_row_n::<3>(src, xs, out),
+        4 => scale_row_n::<4>(src, xs, out),
+        _ => scale_row_any(src, xs, out),
+    }
+}
+
+fn scale_row_n<const N: usize>(src: &[u8], xs: &Taps, out: &mut [u16]) {
+    for ((o, &first), weights) in out.chunks_exact_mut(3).zip(&xs.first).zip(xs.weights.chunks_exact(N)) {
+        let px = &src[first * 4..][..N * 4];
         let (mut c0, mut c1, mut c2) = (0u32, 0u32, 0u32);
-        for (k, &w) in weights.iter().enumerate() {
-            let p = &src[(first + k) * 4..];
+        for k in 0..N {
+            let w = weights[k];
+            c0 += px[k * 4] as u32 * w;
+            c1 += px[k * 4 + 1] as u32 * w;
+            c2 += px[k * 4 + 2] as u32 * w;
+        }
+        o.copy_from_slice(&[c0 as u16, c1 as u16, c2 as u16]);
+    }
+}
+
+fn scale_row_any(src: &[u8], xs: &Taps, out: &mut [u16]) {
+    let n = xs.n;
+    for ((o, &first), weights) in out.chunks_exact_mut(3).zip(&xs.first).zip(xs.weights.chunks_exact(n)) {
+        let px = &src[first * 4..(first + n) * 4];
+        let (mut c0, mut c1, mut c2) = (0u32, 0u32, 0u32);
+        for (p, &w) in px.chunks_exact(4).zip(weights) {
             c0 += p[0] as u32 * w;
             c1 += p[1] as u32 * w;
             c2 += p[2] as u32 * w;
         }
-        o.copy_from_slice(&[c0, c1, c2]);
+        o.copy_from_slice(&[c0 as u16, c1 as u16, c2 as u16]);
     }
 }
 
@@ -333,19 +556,101 @@ fn nv12_pair(top: &[u8], bottom: &[u8], y2: &mut [u8], uv: &mut [u8], w: usize) 
 mod tests {
     use super::*;
 
+    /// Layers go over one another in order on the CPU too: a half-clear
+    /// picture over a webcam lets half of it through; the screen between
+    /// the layers under it and over it; a colour over it only where it is;
+    /// a picture turned a quarter lands turned.
+    #[test]
+    fn layers_over_one_another() {
+        use std::sync::Arc;
+        let (w, h) = (64u32, 36u32);
+        let cam = CameraPicture { width: 16, height: 9, bgra: [200u8, 200, 200, 255].repeat(16 * 9), seq: 1 };
+        let all = Placement { x: 0.0, y: 0.0, w: 1.0, h: 1.0, crop: [0.0; 4], flip_h: false, flip_v: false, turns: 0, stretch: 1.0 };
+        let still = |v: u8, a: u8| Pixels::Still(Arc::new(crate::StillImage { width: 2, height: 2, bgra: [v, v, v, a].repeat(4) }));
+        let boxed = |rect| crate::ScreenPlacement { rect, ..crate::ScreenPlacement::whole(crate::Framing::Stretch) };
+        let black = Frame { width: 16, height: 9, stride: 64, order: Order::Bgr, data: [0u8, 0, 0, 255].repeat(16 * 9), texture: None };
+        let mut canvas = Canvas::new(w, h);
+        canvas.clear();
+        canvas.draw_layer(&Shown { id: 1, seq: 1, pixels: Pixels::Camera(Arc::new(cam)), place: Place::Camera(all), blended: false });
+        canvas.draw_layer(&Shown { id: 2, seq: 1, pixels: still(0, 128), place: Place::Boxed(boxed([0.0, 0.0, 0.25, 1.0])), blended: true });
+        canvas.draw_screen(&black, &boxed([0.5, 0.0, 0.5, 1.0]), true);
+        canvas.draw_layer(&Shown { id: 3, seq: 1, pixels: still(255, 255), place: Place::Boxed(boxed([0.75, 0.0, 0.25, 0.5])), blended: true });
+        let at = |c: &Canvas, x: u32, y: u32| c.bgra[((y * w + x) * 4) as usize];
+        let at_now = |x, y| at(&canvas, x, y);
+        assert!(at_now(4, 18).abs_diff(100) <= 1, "half through: {}", at_now(4, 18));
+        assert_eq!(at_now(24, 18), 200, "the camera alone");
+        assert_eq!(at_now(40, 30), 0, "the screen over the camera");
+        assert_eq!(at_now(60, 4), 255, "the colour over the screen");
+        assert_eq!(at_now(60, 30), 0, "the screen where the colour isn't");
+        // A 2×1 picture (left dark, right light) turned a quarter clockwise
+        // into a box as tall as it's wide: dark on top, light below.
+        let pair = Pixels::Still(Arc::new(crate::StillImage { width: 2, height: 1, bgra: vec![10, 10, 10, 255, 250, 250, 250, 255] }));
+        let turned = crate::ScreenPlacement { turns: 1, ..boxed([0.0, 0.0, 0.5, 1.0]) };
+        canvas.draw_layer(&Shown { id: 4, seq: 1, pixels: pair, place: Place::Boxed(turned), blended: false });
+        let (top, bottom) = (at(&canvas, 16, 2), at(&canvas, 16, 33));
+        assert!(top < 60 && bottom > 200, "turned: top {top}, bottom {bottom}");
+    }
+
     fn frame(w: u32, h: u32, px: [u8; 4], order: Order) -> Frame {
-        Frame { width: w, height: h, stride: w as usize * 4, order, data: px.repeat((w * h) as usize) }
+        Frame { width: w, height: h, stride: w as usize * 4, order, data: px.repeat((w * h) as usize), texture: None }
     }
 
     #[test]
     fn flat_colours_survive_scaling() {
         for (sw, sh, dw, dh) in [(64, 36, 64, 36), (64, 36, 32, 18), (96, 54, 64, 36), (40, 30, 64, 48)] {
             let mut c = Canvas::new(dw, dh);
-            c.fill_from(&frame(sw, sh, [10, 120, 250, 0], Order::Bgr));
+            c.fill_from(&frame(sw, sh, [10, 120, 250, 0], Order::Bgr), crate::Framing::Fit);
             assert!(c.bgra.chunks_exact(4).all(|p| p == [10, 120, 250, 255]), "{sw}x{sh} -> {dw}x{dh}");
-            c.fill_from(&frame(sw, sh, [250, 120, 10, 0], Order::Rgb));
+            c.fill_from(&frame(sw, sh, [250, 120, 10, 0], Order::Rgb), crate::Framing::Fit);
             assert!(c.bgra.chunks_exact(4).all(|p| p == [10, 120, 250, 255]), "rgb {sw}x{sh} -> {dw}x{dh}");
         }
+    }
+
+    /// The screen in a box: on black, or over what's drawn (the webcam,
+    /// when the screen's in front), which shows around it.
+    #[test]
+    fn the_screen_in_its_box() {
+        let px = |c: &Canvas, x: u32, y: u32| {
+            let at = ((y * c.width + x) * 4) as usize;
+            c.bgra[at..at + 3].to_vec()
+        };
+        let white = frame(16, 8, [255, 255, 255, 0], Order::Bgr);
+        let left = crate::ScreenPlacement { rect: [0.0, 0.0, 0.5, 1.0], ..crate::ScreenPlacement::whole(crate::Framing::Fill) };
+        let mut c = Canvas::new(16, 8);
+        c.draw_screen(&white, &left, false);
+        assert_eq!((px(&c, 2, 4), px(&c, 12, 4)), (vec![255, 255, 255], vec![0, 0, 0]));
+        let grey = CameraPicture { width: 4, height: 2, bgra: [40, 40, 40, 255].repeat(8), seq: 1 };
+        let all = Placement { x: 0.0, y: 0.0, w: 1.0, h: 1.0, crop: [0.0; 4], flip_h: false, flip_v: false, turns: 0, stretch: 1.0 };
+        c.clear();
+        c.draw_camera(&grey, &all);
+        c.draw_screen(&white, &left, true);
+        assert_eq!((px(&c, 2, 4), px(&c, 12, 4)), (vec![255, 255, 255], vec![40, 40, 40]));
+        // Hidden: nothing of it, over the webcam or on black.
+        c.draw_screen(&white, &crate::ScreenPlacement { hidden: true, ..left }, false);
+        assert!(c.bgra.chunks_exact(4).all(|p| p == [0, 0, 0, 255]));
+    }
+
+    /// Turned a quarter clockwise, the screen's left (white) is the top;
+    /// mirrored, it's on the right.
+    #[test]
+    fn the_screen_turned_and_mirrored() {
+        let px = |c: &Canvas, x: u32, y: u32| {
+            let at = ((y * c.width + x) * 4) as usize;
+            c.bgra[at..at + 3].to_vec()
+        };
+        let mut f = frame(8, 4, [0, 0, 0, 0], Order::Bgr);
+        for y in 0..4 {
+            for x in 0..4 {
+                f.data[(y * 8 + x) * 4..(y * 8 + x) * 4 + 3].copy_from_slice(&[255, 255, 255]);
+            }
+        }
+        let whole = crate::ScreenPlacement::whole(crate::Framing::Stretch);
+        let mut c = Canvas::new(4, 8);
+        c.draw_screen(&f, &crate::ScreenPlacement { turns: 1, ..whole }, false);
+        assert_eq!((px(&c, 2, 1), px(&c, 2, 6)), (vec![255, 255, 255], vec![0, 0, 0]));
+        let mut c = Canvas::new(8, 4);
+        c.draw_screen(&f, &crate::ScreenPlacement { flip_h: true, ..whole }, false);
+        assert_eq!((px(&c, 1, 2), px(&c, 6, 2)), (vec![0, 0, 0], vec![255, 255, 255]));
     }
 
     #[test]
@@ -358,8 +663,34 @@ mod tests {
             }
         }
         let mut c = Canvas::new(2, 1);
-        c.fill_from(&f);
+        c.fill_from(&f, crate::Framing::Stretch);
         assert!(c.bgra.chunks_exact(4).all(|p| (127..=128).contains(&p[0])), "{:?}", c.bgra);
+    }
+
+    /// A wide picture into a square: its middle (Fill), all of it squeezed
+    /// (Stretch), or all of it between black bars (Fit).
+    #[test]
+    fn framings() {
+        // Three columns, red, green and blue (B, G, R), each 4 wide.
+        let mut f = frame(12, 4, [0, 0, 0, 0], Order::Bgr);
+        for y in 0..4 {
+            for x in 0..12 {
+                let px = [[0, 0, 255], [0, 255, 0], [255, 0, 0]][x / 4];
+                f.data[(y * 12 + x) * 4..(y * 12 + x) * 4 + 3].copy_from_slice(&px);
+            }
+        }
+        let px = |c: &Canvas, x: u32, y: u32| {
+            let at = ((y * c.width + x) * 4) as usize;
+            c.bgra[at..at + 3].to_vec()
+        };
+        let mut c = Canvas::new(4, 4);
+        c.fill_from(&f, crate::Framing::Fill);
+        assert!((0..4).all(|x| px(&c, x, 0) == [0, 255, 0]), "the green middle: {:?}", c.bgra);
+        c.fill_from(&f, crate::Framing::Stretch);
+        assert_eq!((px(&c, 0, 2), px(&c, 3, 2)), (vec![0, 0, 255], vec![255, 0, 0]));
+        let mut c = Canvas::new(12, 12);
+        c.fill_from(&f, crate::Framing::Fit);
+        assert_eq!((px(&c, 0, 0), px(&c, 0, 6), px(&c, 11, 6)), (vec![0, 0, 0], vec![0, 0, 255], vec![255, 0, 0]));
     }
 
     #[test]
@@ -381,8 +712,8 @@ mod tests {
     fn camera_fills_its_box() {
         let mut c = Canvas::new(100, 50);
         c.clear();
-        let cam = CameraPicture { width: 16, height: 9, bgra: [200, 100, 50, 255].repeat(16 * 9) };
-        let place = Placement { x: 0.5, y: 0.5, w: 0.5, h: 0.5, crop: [0.0; 4], flip_h: true, flip_v: false, turns: 0 };
+        let cam = CameraPicture { width: 16, height: 9, bgra: [200, 100, 50, 255].repeat(16 * 9), seq: 1 };
+        let place = Placement { x: 0.5, y: 0.5, w: 0.5, h: 0.5, crop: [0.0; 4], flip_h: true, flip_v: false, turns: 0, stretch: 1.0 };
         c.draw_camera(&cam, &place);
         let at = |x: usize, y: usize| &c.bgra[(y * 100 + x) * 4..(y * 100 + x) * 4 + 4];
         assert_eq!(at(75, 37), [200, 100, 50, 255]);

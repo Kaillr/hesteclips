@@ -209,7 +209,7 @@ pub(crate) fn run(mut grab: Grab, id: &str, latest: &Latest, stop: &AtomicBool) 
 
 /// Blend the pointer's image (premultiplied ARGB) over the picture of the
 /// monitor at `origin`.
-fn draw_pointer(data: &mut [u8], (w, h): (usize, usize), order: Order, p: &GetCursorImageReply, origin: (i32, i32)) {
+pub(crate) fn draw_pointer(data: &mut [u8], (w, h): (usize, usize), order: Order, p: &GetCursorImageReply, origin: (i32, i32)) {
     let left = p.x as i32 - p.xhot as i32 - origin.0;
     let top = p.y as i32 - p.yhot as i32 - origin.1;
     let (ri, bi) = match order {
@@ -243,17 +243,23 @@ fn draw_pointer(data: &mut [u8], (w, h): (usize, usize), order: Order, p: &GetCu
 }
 
 /// A shared memory segment the X server writes pictures into.
-struct Shm {
-    seg: u32,
-    addr: *const u8,
-    size: usize,
+pub(crate) struct Shm {
+    pub seg: u32,
+    pub addr: *const u8,
+    pub size: usize,
 }
 
 // SAFETY: the mapping is plain memory, read only by the thread that owns the Grab.
 unsafe impl Send for Shm {}
 
 impl Shm {
-    fn attach(conn: &RustConnection, size: usize) -> Result<Self> {
+    /// Unmap it (the server let go of it first).
+    pub(crate) fn detach(self) {
+        // SAFETY: mapped in `attach`; nothing reads it anymore.
+        unsafe { libc::shmdt(self.addr.cast()) };
+    }
+
+    pub(crate) fn attach(conn: &RustConnection, size: usize) -> Result<Self> {
         if conn.extension_information(x11rb::protocol::shm::X11_EXTENSION_NAME)?.is_none() {
             bail!("the X server doesn't have it");
         }

@@ -27,6 +27,36 @@ pub fn request_screen_recording() -> bool {
     CGRequestScreenCaptureAccess()
 }
 
+/// Microphone or camera access, as macOS has it. Cheap, never prompts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Access {
+    Allowed,
+    /// Turned off in System Settings (or blocked by a profile).
+    Denied,
+    /// Never asked: macOS asks the first time it's used.
+    NotAsked,
+}
+
+/// Microphone access (`camera`: false) or camera access.
+pub fn media_access(camera: bool) -> Access {
+    use objc2_av_foundation::{AVAuthorizationStatus, AVCaptureDevice, AVMediaTypeAudio, AVMediaTypeVideo};
+    let Some(media) = (unsafe { if camera { AVMediaTypeVideo } else { AVMediaTypeAudio } }) else { return Access::NotAsked };
+    match unsafe { AVCaptureDevice::authorizationStatusForMediaType(media) } {
+        AVAuthorizationStatus::Authorized => Access::Allowed,
+        AVAuthorizationStatus::NotDetermined => Access::NotAsked,
+        _ => Access::Denied,
+    }
+}
+
+/// Ask for microphone or camera access: macOS's prompt the first time,
+/// nothing after (it's changed in System Settings then).
+pub fn request_media_access(camera: bool) {
+    use objc2_av_foundation::{AVCaptureDevice, AVMediaTypeAudio, AVMediaTypeVideo};
+    let Some(media) = (unsafe { if camera { AVMediaTypeVideo } else { AVMediaTypeAudio } }) else { return };
+    let handler = RcBlock::new(|_granted: objc2::runtime::Bool| {});
+    unsafe { AVCaptureDevice::requestAccessForMediaType_completionHandler(media, &handler) };
+}
+
 /// Ask ScreenCaptureKit for the displays and applications available to capture.
 ///
 /// Requires Screen Recording permission for real results; without it macOS returns

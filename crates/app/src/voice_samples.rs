@@ -312,7 +312,7 @@ mod tests {
 
     #[test]
     fn wav_round_trips() {
-        let samples: Vec<f32> = (0..1000).map(|i| (i as f32 / 1000.0 * 6.28).sin() * 0.5).collect();
+        let samples: Vec<f32> = (0..1000).map(|i| (i as f32 / 1000.0 * std::f32::consts::TAU).sin() * 0.5).collect();
         let bytes = wav_bytes(&samples);
         let back: Vec<f32> = bytes[44..].chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0).collect();
         assert_eq!(back.len(), samples.len());

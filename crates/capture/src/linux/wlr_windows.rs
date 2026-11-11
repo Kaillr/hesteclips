@@ -1,8 +1,8 @@
 //! The window list of Sway, Hyprland and their kin
-//! (`zwlr_foreign_toplevel_manager_v1`): which window is active and its app
-//! id. Followed by a background thread from the first time it's asked, so
-//! asking is instant. It has no process ids: `super::focus` finds the
-//! process by the app id.
+//! (`zwlr_foreign_toplevel_manager_v1`): each window's app id, title, and
+//! whether it's active or minimized. Followed by a background thread from
+//! the first time it's asked, so asking is instant. It has no process ids:
+//! `super::focus` finds the process by the app id.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -16,24 +16,46 @@ use wayland_protocols_wlr::foreign_toplevel::v1::client::{
     zwlr_foreign_toplevel_handle_v1 as handle, zwlr_foreign_toplevel_manager_v1 as manager,
 };
 
-/// Each window's app id and whether it's active, by its handle; the pending
-/// changes are applied on `done`, as the protocol says.
+/// A window, as the compositor describes it.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Window {
+    pub app_id: String,
+    pub title: String,
+    pub active: bool,
+    pub minimized: bool,
+}
+
+/// What a `done` brings: the changes since the last.
+#[derive(Default)]
+struct Pending {
+    app_id: Option<String>,
+    title: Option<String>,
+    state: Option<(bool, bool)>,
+}
+
+/// Each window, by its handle; the pending changes are applied on `done`,
+/// as the protocol says.
 #[derive(Default)]
 struct Known {
-    windows: HashMap<ObjectId, (String, bool)>,
-    pending: HashMap<ObjectId, (Option<String>, Option<bool>)>,
+    windows: HashMap<ObjectId, Window>,
+    pending: HashMap<ObjectId, Pending>,
 }
 
 static KNOWN: Mutex<Option<Known>> = Mutex::new(None);
 
-/// The active window's app id, if the compositor lists its windows.
-pub(crate) fn active_app_id() -> Option<String> {
+/// Every window, if the compositor lists them.
+pub(crate) fn windows() -> Option<Vec<Window>> {
     static STARTED: OnceLock<bool> = OnceLock::new();
     if !*STARTED.get_or_init(start) {
         return None;
     }
     let known = KNOWN.lock().unwrap();
-    known.as_ref()?.windows.values().find(|(_, active)| *active).map(|(id, _)| id.clone()).filter(|id| !id.is_empty())
+    Some(known.as_ref()?.windows.values().cloned().collect())
+}
+
+/// The active window's app id, if the compositor lists its windows.
+pub(crate) fn active_app_id() -> Option<String> {
+    windows()?.into_iter().find(|w| w.active).map(|w| w.app_id).filter(|id| !id.is_empty())
 }
 
 /// Connect, and follow the windows on a thread. False if there's no such list.
@@ -68,7 +90,7 @@ impl Dispatch<manager::ZwlrForeignToplevelManagerV1, ()> for State {
         if let manager::Event::Toplevel { toplevel } = event
             && let Some(k) = KNOWN.lock().unwrap().as_mut()
         {
-            k.pending.insert(toplevel.id(), (None, None));
+            k.pending.insert(toplevel.id(), Pending::default());
         }
     }
 
@@ -82,20 +104,25 @@ impl Dispatch<handle::ZwlrForeignToplevelHandleV1, ()> for State {
         let mut known = KNOWN.lock().unwrap();
         let Some(k) = known.as_mut() else { return };
         match event {
-            handle::Event::AppId { app_id } => k.pending.entry(h.id()).or_default().0 = Some(app_id),
+            handle::Event::AppId { app_id } => k.pending.entry(h.id()).or_default().app_id = Some(app_id),
+            handle::Event::Title { title } => k.pending.entry(h.id()).or_default().title = Some(title),
             handle::Event::State { state } => {
-                // An array of native-endian u32 states; 2 is "activated".
-                let active = state.chunks_exact(4).any(|c| u32::from_ne_bytes([c[0], c[1], c[2], c[3]]) == handle::State::Activated as u32);
-                k.pending.entry(h.id()).or_default().1 = Some(active);
+                // An array of native-endian u32 states.
+                let has = |s: handle::State| state.chunks_exact(4).any(|c| u32::from_ne_bytes([c[0], c[1], c[2], c[3]]) == s as u32);
+                k.pending.entry(h.id()).or_default().state = Some((has(handle::State::Activated), has(handle::State::Minimized)));
             }
             handle::Event::Done => {
-                if let Some((app_id, active)) = k.pending.remove(&h.id()) {
+                if let Some(p) = k.pending.remove(&h.id()) {
                     let entry = k.windows.entry(h.id()).or_default();
-                    if let Some(app_id) = app_id {
-                        entry.0 = app_id;
+                    if let Some(app_id) = p.app_id {
+                        entry.app_id = app_id;
                     }
-                    if let Some(active) = active {
-                        entry.1 = active;
+                    if let Some(title) = p.title {
+                        entry.title = title;
+                    }
+                    if let Some((active, minimized)) = p.state {
+                        entry.active = active;
+                        entry.minimized = minimized;
                     }
                 }
             }

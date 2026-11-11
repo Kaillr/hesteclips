@@ -11,9 +11,11 @@ use windows::Win32::Graphics::Gdi::{
     DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplayMonitors, EnumDisplaySettingsW, GetMonitorInfoW, HDC, HMONITOR,
     MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MONITORINFOEXW, MonitorFromPoint,
 };
+use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Media::Audio::{
-    DEVICE_STATE_ACTIVE, IAudioSessionControl2, IAudioSessionManager2, IMMDeviceEnumerator, MMDeviceEnumerator, eRender,
+    DEVICE_STATE_ACTIVE, IAudioSessionControl2, IAudioSessionManager2, IMMDeviceEnumerator, MMDeviceEnumerator, eConsole, eRender,
 };
+use windows::Win32::System::Com::STGM_READ;
 use windows::Win32::Media::MediaFoundation::{MF_VERSION, MFSTARTUP_FULL, MFStartup};
 use windows::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
 use windows::Win32::System::Com::{CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoIncrementMTAUsage, CoInitializeEx};
@@ -55,14 +57,16 @@ pub(crate) fn com_init() {
 /// ("Audio", "Capture": tasks Windows defines): it's woken on time even
 /// while a game keeps every core busy. For threads that mostly sleep: a
 /// thread that doesn't is held back by the scheduler. Lasts as long as the
-/// thread. `HESTECLIPS_NO_MMCSS=1` leaves threads as they are.
+/// thread. `HESTECLIPS_NO_MMCSS=1` leaves threads as they are. A failure
+/// goes to the log through [`crate::log_later`]: this is called from the
+/// threads that can't wait for stderr (audio, the frame pacer).
 pub(crate) fn multimedia_thread(task: &str) {
     if std::env::var_os("HESTECLIPS_NO_MMCSS").is_some() {
         return;
     }
     let mut index = 0u32;
     if let Err(e) = unsafe { windows::Win32::System::Threading::AvSetMmThreadCharacteristicsW(&windows::core::HSTRING::from(task), &mut index) } {
-        eprintln!("thread priority ({task}): {e}");
+        crate::eprintln_later!("thread priority ({task}): {e}");
     }
 }
 
@@ -167,6 +171,105 @@ pub(crate) fn display_pixels(id: Option<&str>) -> Option<(u32, u32)> {
     Some((m.width, m.height))
 }
 
+/// Display `id` (a GDI device name), if it's connected: not while it's gone
+/// (a monitor that sleeps can go, as if unplugged).
+pub(crate) fn connected_monitor(id: &str) -> Option<HMONITOR> {
+    monitors().into_iter().find(|m| m.device == id).map(|m| m.handle)
+}
+
+/// The time of day, as the log's lines start with it.
+pub(crate) fn time_of_day() -> impl std::fmt::Display {
+    chrono::Local::now().format("%H:%M:%S")
+}
+
+/// How many times the displays have turned back on after Windows turned them
+/// off (to save power, or with the PC asleep), or the PC woke from sleep,
+/// from when this was first asked. Each of those, and the displays turning
+/// off and the PC going to sleep, is said in the log as it happens, with its
+/// time: what a recording that froze after one went through (issue #34).
+pub(crate) fn display_wakes() -> u64 {
+    use std::ffi::c_void;
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+    use windows::Win32::System::Power::{DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS, POWERBROADCAST_SETTING, PowerRegisterSuspendResumeNotification, PowerSettingRegisterNotification};
+    use windows::Win32::UI::WindowsAndMessaging::{DEVICE_NOTIFY_CALLBACK, PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND, PBT_POWERSETTINGCHANGE};
+    // The displays' state as Windows tells it: 0 off, 1 on, 2 dimmed
+    // (`GUID_CONSOLE_DISPLAY_STATE`, without the big module it's in).
+    const DISPLAY_STATE: windows::core::GUID = windows::core::GUID::from_u128(0x6fe69556_704a_47a0_8f24_c28d936fda47);
+    static STATE: AtomicU32 = AtomicU32::new(1);
+    static WAKES: AtomicU64 = AtomicU64::new(0);
+    static ASKED: std::sync::Once = std::sync::Once::new();
+    unsafe extern "system" fn told(_: *const c_void, kind: u32, setting: *const c_void) -> u32 {
+        if kind != PBT_POWERSETTINGCHANGE || setting.is_null() {
+            return 0;
+        }
+        let s = setting as *const POWERBROADCAST_SETTING;
+        // SAFETY: Windows hands a setting with `DataLength` bytes of data.
+        unsafe {
+            if (*s).PowerSetting == DISPLAY_STATE && (*s).DataLength >= 4 {
+                let data = (s as *const u8).add(std::mem::offset_of!(POWERBROADCAST_SETTING, Data));
+                let now = std::ptr::read_unaligned(data as *const u32);
+                match (STATE.swap(now, Ordering::AcqRel), now) {
+                    (was, 0) if was != 0 => eprintln!("{} the displays turned off", time_of_day()),
+                    (0, now) if now != 0 => {
+                        eprintln!("{} the displays turned back on", time_of_day());
+                        WAKES.fetch_add(1, Ordering::AcqRel);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        0
+    }
+    unsafe extern "system" fn slept(_: *const c_void, kind: u32, _: *const c_void) -> u32 {
+        match kind {
+            PBT_APMSUSPEND => eprintln!("{} the PC is going to sleep", time_of_day()),
+            // Sent at every wake (and another one too when it's by a person).
+            PBT_APMRESUMEAUTOMATIC => {
+                eprintln!("{} the PC woke up", time_of_day());
+                WAKES.fetch_add(1, Ordering::AcqRel);
+            }
+            _ => {}
+        }
+        0
+    }
+    ASKED.call_once(|| {
+        // Kept for good: Windows is told where they are.
+        let recipient = |callback: unsafe extern "system" fn(*const c_void, u32, *const c_void) -> u32| {
+            let params = Box::leak(Box::new(DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS { Callback: Some(callback), Context: std::ptr::null_mut() }));
+            windows::Win32::Foundation::HANDLE(params as *mut DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS as *mut c_void)
+        };
+        let mut handle = std::ptr::null_mut();
+        if let Err(e) = unsafe { PowerSettingRegisterNotification(&DISPLAY_STATE, DEVICE_NOTIFY_CALLBACK, recipient(told), &mut handle) }.ok() {
+            eprintln!("can't tell when the displays turn back on: {e}");
+        }
+        let mut handle = std::ptr::null_mut();
+        if let Err(e) = unsafe { PowerRegisterSuspendResumeNotification(DEVICE_NOTIFY_CALLBACK, recipient(slept), &mut handle) }.ok() {
+            eprintln!("can't tell when the PC sleeps: {e}");
+        }
+    });
+    WAKES.load(Ordering::Acquire)
+}
+
+/// Whether this session is locked (its lock screen up), if Windows says.
+pub(crate) fn session_locked() -> Option<bool> {
+    use windows::Win32::System::RemoteDesktop::{WTS_CURRENT_SESSION, WTS_SESSIONSTATE_LOCK, WTS_SESSIONSTATE_UNLOCK, WTSFreeMemory, WTSINFOEXW, WTSQuerySessionInformationW, WTSSessionInfoEx};
+    let mut buf = windows::core::PWSTR::null();
+    let mut bytes = 0u32;
+    unsafe { WTSQuerySessionInformationW(None, WTS_CURRENT_SESSION, WTSSessionInfoEx, &mut buf, &mut bytes) }.ok()?;
+    // SAFETY: Windows hands a WTSINFOEXW of `bytes`, freed below.
+    let flags = unsafe {
+        let info = buf.0 as *const WTSINFOEXW;
+        let flags = (!info.is_null() && bytes as usize >= std::mem::size_of::<WTSINFOEXW>() && (*info).Level == 1).then(|| (*info).Data.WTSInfoExLevel1.SessionFlags as u32);
+        WTSFreeMemory(buf.0 as *mut std::ffi::c_void);
+        flags
+    };
+    match flags? {
+        WTS_SESSIONSTATE_LOCK => Some(true),
+        WTS_SESSIONSTATE_UNLOCK => Some(false),
+        _ => None,
+    }
+}
+
 /// The monitor with this device name, else the main one.
 pub(crate) fn find_monitor(id: &str) -> HMONITOR {
     monitors()
@@ -174,6 +277,16 @@ pub(crate) fn find_monitor(id: &str) -> HMONITOR {
         .find(|m| m.device == id)
         .map(|m| m.handle)
         .unwrap_or_else(|| unsafe { MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY) })
+}
+
+/// Where a display is on the desktop, by device name: its left, top, width
+/// and height, in the desktop's pixels. `None` if it isn't there.
+pub fn display_bounds(id: &str) -> Option<[i32; 4]> {
+    let m = monitors().into_iter().find(|m| m.device == id)?;
+    let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+    unsafe { GetMonitorInfoW(m.handle, &mut info) }.ok().ok()?;
+    let r = info.rcMonitor;
+    Some([r.left, r.top, r.right - r.left, r.bottom - r.top])
 }
 
 // ---------------------------------------------------------------------------
@@ -209,7 +322,11 @@ pub(crate) struct ProcessTree {
 
 impl ProcessTree {
     pub(crate) fn snapshot() -> Self {
-        Self { by_pid: processes().into_iter().map(|p| (p.pid, p)).collect() }
+        Self::of(processes())
+    }
+
+    pub(crate) fn of(processes: Vec<Process>) -> Self {
+        Self { by_pid: processes.into_iter().map(|p| (p.pid, p)).collect() }
     }
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = &Process> {
@@ -290,6 +407,41 @@ pub(crate) fn audio_session_pids() -> Vec<u32> {
     pids.sort_unstable();
     pids.dedup();
     pids
+}
+
+/// The id of the output device called `name` (its name as
+/// [`crate::audio::list_audio_devices`] gives it, which is cpal's: the
+/// endpoint's friendly name), or of the default one for
+/// [`crate::audio::DEFAULT_DEVICE`]. None if it isn't connected.
+pub(crate) fn render_device_id(name: &str) -> Option<String> {
+    let enumerator: IMMDeviceEnumerator = unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }.ok()?;
+    let id_of = |device: &windows::Win32::Media::Audio::IMMDevice| -> Option<String> {
+        let id = unsafe { device.GetId() }.ok()?;
+        let text = unsafe { id.to_string() }.ok();
+        unsafe { windows::Win32::System::Com::CoTaskMemFree(Some(id.0 as *const _)) };
+        text
+    };
+    if name == crate::audio::DEFAULT_DEVICE {
+        return id_of(&unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole) }.ok()?);
+    }
+    let devices = unsafe { enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE) }.ok()?;
+    for i in 0..unsafe { devices.GetCount() }.ok()? {
+        let Ok(device) = (unsafe { devices.Item(i) }) else { continue };
+        let Ok(props) = (unsafe { device.OpenPropertyStore(STGM_READ) }) else { continue };
+        let Ok(value) = (unsafe { props.GetValue(&PKEY_Device_FriendlyName) }) else { continue };
+        if value.to_string() == name {
+            return id_of(&device);
+        }
+    }
+    None
+}
+
+/// What to call the program `exe`, running as `pid`: its file description
+/// ("FxSound"), else its executable without ".exe".
+pub(crate) fn program_name(pid: u32, exe: &str) -> String {
+    image_path(pid)
+        .and_then(|path| file_description(&path))
+        .unwrap_or_else(|| exe.strip_suffix(".exe").or_else(|| exe.strip_suffix(".EXE")).unwrap_or(exe).to_owned())
 }
 
 // ---------------------------------------------------------------------------
@@ -547,6 +699,14 @@ pub(crate) fn client_area_in_capture(hwnd: HWND) -> Option<(u32, u32, u32, u32)>
     }
 }
 
+/// App `exe`'s main window's inside (see [`find_app_window`]), in pixels,
+/// if it's open and not minimized.
+pub fn app_window_size(exe: &str) -> Option<(u32, u32)> {
+    let hwnd = find_app_window(exe).filter(|h| !window_minimized(*h))?;
+    let (_, _, w, h) = client_area_in_capture(hwnd)?;
+    (w >= 2 && h >= 2).then_some((w, h))
+}
+
 /// The full path of a running app, by executable name.
 pub(crate) fn running_app_path(exe: &str) -> Option<std::path::PathBuf> {
     processes().iter().filter(|p| p.exe.eq_ignore_ascii_case(exe)).find_map(|p| image_path(p.pid)).map(Into::into)
@@ -564,6 +724,20 @@ pub(crate) fn window_pid(hwnd: HWND) -> u32 {
     let mut pid = 0;
     unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
     pid
+}
+
+/// Where a window is on the desktop (left, top, right, bottom), to tell
+/// whether it moved or changed size.
+pub(crate) fn window_place(hwnd: HWND) -> (i32, i32, i32, i32) {
+    let mut r = RECT::default();
+    let _ = unsafe { GetWindowRect(hwnd, &mut r) };
+    (r.left, r.top, r.right, r.bottom)
+}
+
+/// The display a window is on (most of it).
+pub(crate) fn window_monitor(hwnd: HWND) -> HMONITOR {
+    use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromWindow};
+    unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) }
 }
 
 /// Whether a window covers `monitor` (a fullscreen game on it).
@@ -649,15 +823,28 @@ fn read_file_description(path: &str) -> Option<String> {
         let candidates = translations.chunks_exact(2).map(|t| (t[0], t[1])).chain([(0x0409, 0x04B0), (0x0409, 0x04E4)]);
         for (lang, cp) in candidates {
             if let Some((ptr, len)) = query(&format!(r"\StringFileInfo\{lang:04x}{cp:04x}\FileDescription")) {
-                let text = std::slice::from_raw_parts(ptr as *const u16, len as usize);
-                let s = String::from_utf16_lossy(text).trim_end_matches('\0').trim().to_owned();
-                if !s.is_empty() {
+                // The length said can be too long (see `version_string`):
+                // never read past the end of `data` for it.
+                let room = (data.as_ptr_range().end as usize).saturating_sub(ptr as usize) / 2;
+                let text = std::slice::from_raw_parts(ptr as *const u16, (len as usize).min(room));
+                if let Some(s) = version_string(text) {
                     return Some(s);
                 }
             }
         }
         None
     }
+}
+
+/// A string from an executable's version info, as `VerQueryValueW` gives it:
+/// up to its NUL, trimmed; `None` if that leaves nothing. The length it says
+/// can run past the NUL: Spotify's is in bytes, not characters (16 for
+/// "Spotify"), so the start of the next entry came with it ("Spotify\0" then
+/// "8\u{16}\u{1}FileV") and was saved as the app's name.
+fn version_string(text: &[u16]) -> Option<String> {
+    let s = from_wide(text);
+    let s = s.trim();
+    (!s.is_empty()).then(|| s.to_owned())
 }
 
 /// A NUL-terminated UTF-16 buffer as a String.
@@ -747,5 +934,28 @@ pub fn app_icon(exe: &str, size: u32) -> Option<Vec<u8>> {
             }
         }
         Some(px)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().collect()
+    }
+
+    /// A description ends at its NUL, whatever length was said; one with
+    /// nothing in it is none (the exe's name is used then).
+    #[test]
+    fn a_description_ends_at_its_nul() {
+        // Spotify's: 16 characters said for "Spotify", the next entry after it.
+        assert_eq!(version_string(&wide("Spotify\u{0}8\u{16}\u{1}FileV")).as_deref(), Some("Spotify"));
+        // Its length exactly, with no NUL in it.
+        assert_eq!(version_string(&wide("Discord")).as_deref(), Some("Discord"));
+        assert_eq!(version_string(&wide(" Discord \u{0}\u{0}")).as_deref(), Some("Discord"));
+        assert_eq!(version_string(&wide("\u{0}8\u{16}\u{1}FileV")), None);
+        assert_eq!(version_string(&wide("  ")), None);
+        assert_eq!(version_string(&[]), None);
     }
 }

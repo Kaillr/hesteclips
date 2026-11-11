@@ -8,7 +8,10 @@
 //!
 //! On Linux there's no installer: the release tarball, unpacked anywhere the
 //! user can write to, updates its own folder the same way
-//! (`crate::update_linux`).
+//! (`crate::update_linux`). On macOS the app in Applications is replaced by
+//! the release's, once it's checked to be signed with HesteClips'
+//! certificate, or only what's inside it when the account can't write to
+//! Applications (`crate::update_mac`).
 //!
 //! A copy run from the build folder (`cargo run`) isn't installed, so it has
 //! nothing to update: [`Status::Unavailable`].
@@ -20,8 +23,8 @@
 //! mid-way through stopping a capture and finishing its file, looked like a
 //! crash.
 
-// The installed Windows app and the unpacked Linux one update themselves.
-#![cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
+// The installed app updates itself on all three.
+#![cfg_attr(not(any(windows, target_os = "linux", target_os = "macos")), allow(dead_code))]
 
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
@@ -69,8 +72,8 @@ struct Shared {
     /// The downloaded update.
     #[cfg(windows)]
     ready: Option<velopack::VelopackAsset>,
-    /// The downloaded update, unpacked.
-    #[cfg(target_os = "linux")]
+    /// The downloaded update, unpacked (Linux), or the new app (macOS).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     ready: Option<std::path::PathBuf>,
 }
 
@@ -78,8 +81,9 @@ struct Shared {
 /// the new version after.
 #[cfg(windows)]
 static QUEUED: Mutex<Option<(velopack::UpdateManager, velopack::VelopackAsset, bool)>> = Mutex::new(None);
-/// On Linux: the unpacked update, the folder it replaces, and whether to restart.
-#[cfg(target_os = "linux")]
+/// On Linux: the unpacked update, the folder it replaces, and whether to
+/// restart. On macOS: the new app, the one it replaces, and the same.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 static QUEUED: Mutex<Option<(std::path::PathBuf, std::path::PathBuf, bool)>> = Mutex::new(None);
 
 impl Updater {
@@ -87,7 +91,7 @@ impl Updater {
         let shared = Arc::new(Mutex::new(Shared {
             status: Status::Unavailable,
             auto,
-            #[cfg(any(windows, target_os = "linux"))]
+            #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
             ready: None,
         }));
         #[cfg(windows)]
@@ -138,7 +142,31 @@ impl Updater {
             });
             Self { shared, check_now }
         }
-        #[cfg(not(any(windows, target_os = "linux")))]
+        #[cfg(target_os = "macos")]
+        {
+            let check_now = crate::update_mac::install_dir().map(|app| {
+                {
+                    let mut s = shared.lock().unwrap();
+                    s.status = Status::Idle;
+                    if let Some(path) = crate::update_mac::blocker(&app) {
+                        s.status = Status::Failed(format!("Can't update here: {} isn't yours to write to", path.display()));
+                    } else if let Some((ready, version)) = crate::update_mac::pending(&app) {
+                        // Downloaded last time, but the app didn't quit normally.
+                        s.status = Status::Ready(version);
+                        s.ready = Some(ready);
+                    }
+                }
+                let (tx, rx) = mpsc::channel();
+                let shared = shared.clone();
+                std::thread::Builder::new()
+                    .name("updates".into())
+                    .spawn(move || run_mac(app, shared, rx, ctx))
+                    .expect("spawn update thread");
+                tx
+            });
+            Self { shared, check_now }
+        }
+        #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
         {
             let _ = ctx;
             Self { shared, check_now: None }
@@ -194,6 +222,16 @@ impl Updater {
                 return true;
             }
         }
+        #[cfg(target_os = "macos")]
+        {
+            let s = self.shared.lock().unwrap();
+            if let (Some(ready), Some(app)) = (&s.ready, crate::update_mac::install_dir()) {
+                let mut queued = QUEUED.lock().unwrap();
+                let restart = restart || queued.as_ref().is_some_and(|(_, _, r)| *r);
+                *queued = Some((ready.clone(), app, restart));
+                return true;
+            }
+        }
         let _ = restart;
         false
     }
@@ -213,6 +251,12 @@ pub fn apply_queued() {
     #[cfg(target_os = "linux")]
     if let Some((unpacked, dir, restart)) = QUEUED.lock().ok().and_then(|mut q| q.take())
         && let Err(e) = crate::update_linux::apply(&unpacked, &dir, restart)
+    {
+        eprintln!("couldn't install the update: {e:#}");
+    }
+    #[cfg(target_os = "macos")]
+    if let Some((ready, app, restart)) = QUEUED.lock().ok().and_then(|mut q| q.take())
+        && let Err(e) = crate::update_mac::apply(&ready, &app, restart)
     {
         eprintln!("couldn't install the update: {e:#}");
     }
@@ -351,8 +395,69 @@ fn run_linux(dir: std::path::PathBuf, shared: Arc<Mutex<Shared>>, check_now: mps
     }
 }
 
+/// The background thread on macOS: like [`run_linux`], with the release's app.
+#[cfg(target_os = "macos")]
+fn run_mac(app: std::path::PathBuf, shared: Arc<Mutex<Shared>>, check_now: mpsc::Receiver<()>, ctx: egui::Context) {
+    let set = |status: Status| {
+        shared.lock().unwrap().status = status;
+        ctx.request_repaint();
+    };
+    let mut wait = FIRST_CHECK_AFTER;
+    loop {
+        let asked = match check_now.recv_timeout(wait) {
+            Ok(()) => true,
+            Err(mpsc::RecvTimeoutError::Timeout) => false,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        };
+        wait = CHECK_EVERY;
+        {
+            let s = shared.lock().unwrap();
+            if (!asked && !s.auto) || s.ready.is_some() {
+                continue;
+            }
+        }
+        if let Some(path) = crate::update_mac::blocker(&app) {
+            set(Status::Failed(format!("Can't update here: {} isn't yours to write to", path.display())));
+            continue;
+        }
+        set(Status::Checking);
+        let current = env!("CARGO_PKG_VERSION");
+        let release = match crate::update_mac::check(current) {
+            Ok(Some(r)) => {
+                eprintln!("{} update check: {} is out, downloading it", clock(), r.version);
+                r
+            }
+            Ok(None) => {
+                eprintln!("{} update check: up to date ({current})", clock());
+                set(Status::UpToDate);
+                continue;
+            }
+            Err(e) => {
+                eprintln!("{} update check failed: {e:#}", clock());
+                set(Status::Failed(format!("Couldn't check for updates: {e:#}")));
+                wait = RETRY_AFTER;
+                continue;
+            }
+        };
+        set(Status::Downloading(0));
+        match crate::update_mac::download(&release, &app, |p| set(Status::Downloading(p))) {
+            Ok(ready) => {
+                let mut s = shared.lock().unwrap();
+                s.status = Status::Ready(release.version.clone());
+                s.ready = Some(ready);
+                ctx.request_repaint();
+            }
+            Err(e) => {
+                eprintln!("{} update download failed: {e:#}", clock());
+                set(Status::Failed(format!("Couldn't download the update: {e:#}")));
+                wait = RETRY_AFTER;
+            }
+        }
+    }
+}
+
 /// The time of day, for the log.
-#[cfg(any(windows, target_os = "linux"))]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 fn clock() -> String {
     chrono::Local::now().format("%H:%M:%S").to_string()
 }

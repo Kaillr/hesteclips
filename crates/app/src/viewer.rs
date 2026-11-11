@@ -17,6 +17,9 @@
 //! Previous clip / Next clip (P / N) step through the library in its order
 //! without going back to it, and F, double-click or ⛶ go fullscreen, so a
 //! session's clips can be reviewed one after another.
+//!
+//! A screenshot opens here too, as a picture to look at (`picture.rs`): the
+//! arrow keys step through as well, and Ctrl+C copies it.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -25,9 +28,10 @@ use std::time::{Duration, Instant};
 
 use egui::{Align2, Color32, FontId, Key, Pos2, Rect, Sense, Stroke, Vec2};
 use media::pcm::Pcm;
-use media::{ClipInfo, TrackEdit};
+use media::ClipInfo;
 
 use crate::filmstrip::Filmstrip;
+use crate::handoff::{Handoff, Kept};
 use crate::player::Player;
 
 /// The timeline: ruler, filmstrip and sound, and the space under it.
@@ -51,6 +55,8 @@ pub enum ViewerOutcome {
     NewCollection,
     /// Delete the clip (to the Recycle Bin, or for good after asking).
     Delete,
+    /// Ask how to free up the space its original takes.
+    FreeUp,
     /// The picture was dragged: hand the clip to the OS to drop into an app.
     DragOut,
     /// Play it in the OS default video player instead.
@@ -73,39 +79,100 @@ pub struct Nav {
     pub delete_label: String,
     /// The clip's edit being saved, 0..=1.
     pub saving: Option<f32>,
+    /// The clip has a share link.
+    pub uploading: bool,
+    /// How its link is, for the header: icon, words and what they mean.
+    pub link: Option<(&'static str, String, &'static str)>,
 }
 
 struct Loaded {
     info: ClipInfo,
     /// The mix, filling in as it's decoded (it plays from the start at once).
     pcm: Arc<Pcm>,
-    /// Where this file starts in the recording and how long that was: an
-    /// edited clip is part of its original (moments are kept for that).
-    span: (f64, f64),
+    /// Where this file is in the recording: an edited clip is parts of its
+    /// original (moments are kept for that).
+    span: Span,
+}
+
+/// Whether opening the clip would wait on nothing: it's been read, and so
+/// has its original (an edited clip reads both: the file, and where it sits
+/// in the recording), as when it's back from the editor.
+fn already_read(path: &Path, kept: &Kept) -> bool {
+    if kept.info(path).is_none() {
+        return false;
+    }
+    let target = crate::store::EditTarget::of(path);
+    target.source == path || kept.info(&target.source).is_some()
+}
+
+/// Read the clip and start decoding its sound, but for what's `kept`.
+fn load(source: &Path, kept: &mut Kept) -> Result<Loaded, String> {
+    let info = kept.probe(source).map_err(|e| e.to_string())?;
+    // Track 1 is the mix in our clips; in any other file it's simply the
+    // first. Playing starts with what's decoded: no waiting for the whole
+    // file to be read.
+    let tracks: Vec<usize> = info.audio.first().map(|a| a.index).into_iter().collect();
+    if crate::player::debug() {
+        eprintln!("{:>8.3} viewer: clip read", crate::player::uptime());
+    }
+    let pcm = kept.sound(source, &tracks, || {
+        media::pcm::decode_streaming(source, &tracks, info.duration, |_, result| {
+            if let Err(e) = result {
+                eprintln!("decoding the sound: {e:#}");
+            }
+            if crate::player::debug() {
+                eprintln!("{:>8.3} viewer: sound all decoded", crate::player::uptime());
+            }
+        })
+    });
+    let span = recording_span(source, info.duration, kept);
+    Ok(Loaded { info, pcm, span })
 }
 
 enum State {
     /// The clip's edit is being saved: it opens once it's done (its file
     /// is about to be replaced, which an open file would block).
     Saving,
-    Loading(Receiver<Result<Loaded, String>>),
+    /// Being read (what's kept comes back with it).
+    Loading(Receiver<(Result<Loaded, String>, Kept)>),
     Failed(String),
     Ready(Box<Ready>),
+    /// A screenshot, being read, and shown.
+    LoadingPicture(Receiver<Result<crate::picture::Loaded, String>>),
+    Picture(Box<crate::picture::Picture>),
 }
 
 pub struct Viewer {
     clip: PathBuf,
     state: State,
+    resume: Option<Resume>,
+    /// What the editor handed over, until the clip has loaded; then what's
+    /// kept, to hand on again.
+    handoff: Handoff,
+}
+
+/// A player opening again: the moment to carry on at (the recording's time),
+/// and whether it was playing then.
+#[derive(Clone, Copy)]
+pub struct Resume {
+    pub at: f64,
+    pub playing: bool,
 }
 
 struct Ready {
     info: ClipInfo,
     player: Player,
+    /// The last screen's player, hushed: its picture shows until this one
+    /// has one (see `handoff.rs`).
+    curtain: Option<Player>,
     strip: Filmstrip,
     /// The mix's waveform, growing as the sound is decoded.
     wave: Arc<crate::waveform::Live>,
     /// Dragging on the timeline, and whether it was playing when the drag began.
     dragging: Option<bool>,
+    /// The drag is `HESTECLIPS_DEV_DRAG`'s: no button is down, and that
+    /// doesn't end it.
+    dev_dragging: bool,
     /// Last scroll-scrub, and whether it was playing before scrolling began.
     scrolled: Option<(Instant, bool)>,
     /// `,` held down (repeating): stepping back goes as a scrub does, with
@@ -118,10 +185,12 @@ struct Ready {
     /// Where the wheel has taken the playhead, unsnapped: the glide's last
     /// small steps add up instead of each being rounded back to its frame.
     scroll_to: Option<f64>,
+    /// Where the timeline was laid out last frame (not at all, the
+    /// fullscreen controls hidden): its clicks and drags are read there,
+    /// first thing in the next.
+    timeline_at: Option<Rect>,
     /// Hover preview: the frame shown and its texture.
     hover: Option<(u64, egui::TextureHandle)>,
-    volume: f32,
-    muted: bool,
     /// How fast it plays (1.0 as recorded).
     speed: f32,
     /// The picture was dragged this frame: share the clip by drag and drop.
@@ -133,56 +202,91 @@ struct Ready {
     /// The clip's kills and your markers (see `moments.rs`), and where this
     /// file sits in the recording they're kept for.
     moments: crate::moments::Moments,
-    span: (f64, f64),
+    span: Span,
     clip: PathBuf,
 }
 
 impl Viewer {
-    pub fn open(ctx: &egui::Context, clip: &Path) -> Self {
+    /// Play `clip`: at `resume` (opened from the editor, or after its edit
+    /// was saved), else from the start; with what the editor handed over.
+    pub fn open(ctx: &egui::Context, clip: &Path, resume: Option<Resume>, mut handoff: Handoff) -> Self {
+        if crate::clips::is_image(clip) {
+            return Self { clip: clip.to_path_buf(), state: State::LoadingPicture(crate::picture::load(ctx, clip)), resume: None, handoff: Handoff::default() };
+        }
         if crate::player::debug() {
             eprintln!("{:>8.3} viewer: opening {}", crate::player::uptime(), clip.display());
         }
-        let (tx, rx) = mpsc::channel();
-        let src = clip.to_path_buf();
-        let repaint = ctx.clone();
-        std::thread::spawn(move || {
-            let result = (|| -> Result<Loaded, String> {
-                let info = media::probe(&src).map_err(|e| e.to_string())?;
-                // Track 1 is the mix in our clips; in any other file it's simply
-                // the first. Playing starts with what's decoded: no waiting for
-                // the whole file to be read.
-                let tracks: Vec<usize> = info.audio.first().map(|a| a.index).into_iter().collect();
-                if crate::player::debug() {
-                    eprintln!("{:>8.3} viewer: clip read", crate::player::uptime());
+        let state = if already_read(clip, &handoff.kept) {
+            match load(clip, &mut handoff.kept) {
+                Ok(l) => State::Ready(Box::new(Ready::new(ctx, clip, l, resume, &mut handoff))),
+                Err(e) => {
+                    handoff.let_go();
+                    State::Failed(e)
                 }
-                let pcm = media::pcm::decode_streaming(&src, &tracks, info.duration, move |_, result| {
-                    if let Err(e) = result {
-                        eprintln!("decoding the sound: {e:#}");
-                    }
-                    if crate::player::debug() {
-                        eprintln!("{:>8.3} viewer: sound all decoded", crate::player::uptime());
-                    }
-                });
-                let span = recording_span(&src, info.duration);
-                Ok(Loaded { info, pcm, span })
-            })();
-            if let Err(e) = &result {
-                eprintln!("couldn't open {} in the player: {e}", src.display());
             }
-            let _ = tx.send(result);
-            repaint.request_repaint();
-        });
-        Self { clip: clip.to_path_buf(), state: State::Loading(rx) }
+        } else {
+            let (tx, rx) = mpsc::channel();
+            let src = clip.to_path_buf();
+            let repaint = ctx.clone();
+            let mut kept = std::mem::take(&mut handoff.kept);
+            std::thread::spawn(move || {
+                let result = load(&src, &mut kept);
+                if let Err(e) = &result {
+                    eprintln!("couldn't open {} in the player: {e}", src.display());
+                }
+                let _ = tx.send((result, kept));
+                repaint.request_repaint();
+            });
+            State::Loading(rx)
+        };
+        Self { clip: clip.to_path_buf(), state, resume, handoff }
+    }
+
+    /// Opening the editor from here: what it takes over (see `handoff.rs`).
+    pub fn into_handoff(self) -> Handoff {
+        let mut handoff = self.handoff;
+        match self.state {
+            State::Ready(r) => Handoff::from_screen(Some(r.player), r.curtain, r.strip, handoff.kept),
+            _ => {
+                handoff.let_go();
+                handoff
+            }
+        }
     }
 
     pub fn clip(&self) -> &Path {
         &self.clip
     }
 
+    /// What the window is doing, for what the player keeps open (see
+    /// [`crate::player::Window`]). Not in use, the last screen's player
+    /// standing in until this one has a picture goes, with all it has open.
+    /// Whether anything was let go of just now.
+    pub fn set_window(&mut self, ctx: &egui::Context, window: crate::player::Window) -> bool {
+        let State::Ready(r) = &mut self.state else { return false };
+        let curtain = window != crate::player::Window::InUse && r.curtain.take().is_some();
+        r.player.set_window(ctx, window) || curtain
+    }
+
+    /// Where it is (in the recording) and whether it's playing: for the
+    /// editor opened from here to carry on there.
+    pub fn at(&self) -> Option<Resume> {
+        match &self.state {
+            State::Ready(r) => Some(Resume { at: media::source_time(&r.span.parts, r.player.time()), playing: r.player.is_playing() }),
+            _ => None,
+        }
+    }
+
+    /// Where it was opened to carry on: kept while its edit saves, to open
+    /// there once it's done.
+    pub fn resume(&self) -> Option<Resume> {
+        self.resume
+    }
+
     /// The clip, while its edit is being saved: the app opens it with
     /// [`Viewer::open`] when that's done.
-    pub fn saving(clip: &Path) -> Self {
-        Self { clip: clip.to_path_buf(), state: State::Saving }
+    pub fn saving(clip: &Path, resume: Option<Resume>) -> Self {
+        Self { clip: clip.to_path_buf(), state: State::Saving, resume, handoff: Handoff::default() }
     }
 
     pub fn is_saving(&self) -> bool {
@@ -196,27 +300,57 @@ impl Viewer {
             return;
         }
         self.clip = to.to_path_buf();
+        self.handoff.kept.renamed(from, to);
         match &mut self.state {
             // Everything open keeps playing; only reopening by name follows.
             State::Ready(r) => {
                 r.player.renamed(ctx, to);
                 r.strip.renamed(to);
             }
+            // On screen already: nothing reads it again.
+            State::Picture(_) => {}
             // Still loading from the old name: start again.
-            _ => *self = Self::open(ctx, to),
+            _ => *self = Self::open(ctx, to, self.resume, Handoff::default()),
+        }
+    }
+
+    /// `clip`'s original was trimmed or deleted to free up space: the file
+    /// plays on as it is, but where it sits in the recording and the
+    /// moments (kept in the recording's time) are read again.
+    pub fn original_changed(&mut self, clip: &Path) {
+        if self.clip != clip {
+            return;
+        }
+        self.handoff.kept.keep_only(clip);
+        if let State::Ready(r) = &mut self.state {
+            r.span = recording_span(clip, r.info.duration, &self.handoff.kept);
+            r.moments = crate::moments::of(clip);
         }
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui, nav: &Nav) -> ViewerOutcome {
         if let State::Loading(rx) = &self.state {
-            if let Ok(result) = rx.try_recv() {
+            if let Ok((result, kept)) = rx.try_recv() {
+                self.handoff.kept = kept;
                 self.state = match result {
-                    Ok(l) => State::Ready(Box::new(Ready::new(ui.ctx(), &self.clip, l))),
-                    Err(e) => State::Failed(e),
+                    Ok(l) => State::Ready(Box::new(Ready::new(ui.ctx(), &self.clip, l, self.resume, &mut self.handoff))),
+                    Err(e) => {
+                        self.handoff.let_go();
+                        State::Failed(e)
+                    }
                 };
             }
         }
+        if let State::LoadingPicture(rx) = &self.state
+            && let Ok(result) = rx.try_recv()
+        {
+            self.state = match result {
+                Ok(l) => State::Picture(Box::new(crate::picture::Picture::new(ui.ctx(), &self.clip, l))),
+                Err(e) => State::Failed(e),
+            };
+        }
         let ctx = ui.ctx().clone();
+        let image = crate::clips::is_image(&self.clip);
         let mut out = if is_fullscreen(&ctx) { ViewerOutcome::Stay } else { self.header(ui, nav) };
         match &mut self.state {
             State::Saving => {
@@ -235,7 +369,7 @@ impl Viewer {
                 });
                 ctx.request_repaint_after(Duration::from_millis(100));
             }
-            State::Loading(_) => {
+            State::Loading(_) | State::LoadingPicture(_) => {
                 let rect = ui.available_rect_before_wrap();
                 ui.painter().rect_filled(rect, 0, crate::theme::pal(ui).stage);
                 ui.put(Rect::from_center_size(rect.center(), Vec2::splat(24.0)), egui::Spinner::new().size(22.0).color(Color32::from_white_alpha(170)));
@@ -244,28 +378,39 @@ impl Viewer {
                 let p = crate::theme::pal(ui);
                 ui.vertical_centered(|ui| {
                     ui.add_space(80.0);
-                    ui.label(crate::theme::text("Couldn't play this clip", 15.0, crate::theme::W::Semibold).color(p.text));
+                    ui.label(crate::theme::text(if image { "Couldn't open this screenshot" } else { "Couldn't play this clip" }, 15.0, crate::theme::W::Semibold).color(p.text));
                     ui.add_space(4.0);
                     ui.label(crate::theme::text(e.as_str(), 13.0, crate::theme::W::Regular).color(p.text3));
                 });
             }
             State::Ready(r) => r.ui(ui),
+            State::Picture(pic) => {
+                if pic.ui(ui, is_fullscreen(&ctx)) {
+                    set_fullscreen(&ctx, true);
+                }
+            }
         }
         if !ctx.egui_wants_keyboard_input() && !crate::ui_kit::overlay_open(&ctx) {
             let none = egui::Modifiers::NONE;
-            let (esc, prev, next, f, f2, delete, keys) = ctx.input_mut(|i| {
+            let picture = matches!(self.state, State::Picture(_));
+            let (esc, prev, next, f, f2, delete, keys, copy) = ctx.input_mut(|i| {
                 (
                     i.consume_key(none, Key::Escape),
-                    i.consume_key(none, Key::Q),
-                    i.consume_key(none, Key::E),
+                    // A picture has no time to jump through: the arrows step too.
+                    i.consume_key(none, Key::Q) || (picture && i.consume_key(none, Key::ArrowLeft)),
+                    i.consume_key(none, Key::E) || (picture && i.consume_key(none, Key::ArrowRight)),
                     i.consume_key(none, Key::F),
                     i.consume_key(none, Key::F2),
                     i.consume_key(none, Key::Delete) || i.consume_key(egui::Modifiers::COMMAND, Key::Backspace),
-                    i.consume_key(egui::Modifiers::SHIFT, Key::Slash) || i.consume_key(none, Key::Questionmark),
+                    !picture && (i.consume_key(egui::Modifiers::SHIFT, Key::Slash) || i.consume_key(none, Key::Questionmark)),
+                    picture && (i.consume_key(egui::Modifiers::COMMAND, Key::C) || i.events.iter().any(|e| matches!(e, egui::Event::Copy))),
                 )
             });
             if keys {
                 out = ViewerOutcome::Keys;
+            }
+            if copy {
+                out = ViewerOutcome::Share(crate::library::ShareChoice::CopyImage);
             }
             if f2 {
                 out = ViewerOutcome::Rename;
@@ -299,6 +444,11 @@ impl Viewer {
                 out = ViewerOutcome::DragOut;
             }
         }
+        if let State::Picture(pic) = &mut self.state
+            && std::mem::take(&mut pic.drag_out)
+        {
+            out = ViewerOutcome::DragOut;
+        }
         if matches!(out, ViewerOutcome::Close | ViewerOutcome::Edit) {
             set_fullscreen(&ctx, false);
         }
@@ -313,6 +463,8 @@ impl Viewer {
         let mut out = ViewerOutcome::Stay;
         let stem = self.clip.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
         let title = crate::clips::title_for_stem(&stem);
+        let image = crate::clips::is_image(&self.clip);
+        let (prev_tip, next_tip) = if image { ("Previous  (←)", "Next  (→)") } else { ("Previous clip  (Q)", "Next clip  (E)") };
         // While its edit saves, the clip's file is about to change.
         let ready = !matches!(self.state, State::Saving);
         let wait = "Wait for the edit to finish saving";
@@ -327,7 +479,7 @@ impl Viewer {
             crate::transport::Part::Centre => {
                 let p = crate::theme::pal(ui);
                 ui.spacing_mut().item_spacing.x = 2.0;
-                if Btn::icon(Kind::Ghost, icon::CARET_LEFT).small().enabled(nav.previous.is_some()).tip("Previous clip  (Q)").show(ui).clicked() {
+                if Btn::icon(Kind::Ghost, icon::CARET_LEFT).small().enabled(nav.previous.is_some()).tip(prev_tip).show(ui).clicked() {
                     out = nav.previous.clone().map_or(ViewerOutcome::Stay, ViewerOutcome::Open);
                 }
                 if let Some((i, n)) = nav.position.filter(|_| ui.ctx().content_rect().width() >= 560.0) {
@@ -336,7 +488,7 @@ impl Viewer {
                     let (r, _) = ui.allocate_exact_size(egui::vec2(120.0 - 2.0 * 26.0 - 4.0, 26.0), Sense::hover());
                     ui.painter().galley(r.center() - g.size() / 2.0, g, p.text3);
                 }
-                if Btn::icon(Kind::Ghost, icon::CARET_RIGHT).small().enabled(nav.next.is_some()).tip("Next clip  (E)").show(ui).clicked() {
+                if Btn::icon(Kind::Ghost, icon::CARET_RIGHT).small().enabled(nav.next.is_some()).tip(next_tip).show(ui).clicked() {
                     out = nav.next.clone().map_or(ViewerOutcome::Stay, ViewerOutcome::Open);
                 }
             }
@@ -361,33 +513,52 @@ impl Viewer {
                     if Item::new("Rename…").icon(icon::PENCIL_SIMPLE).keys(Some(vec!["F2".into()])).show(ui).clicked() {
                         out = ViewerOutcome::Rename;
                     }
-                    if Item::new("Add a marker here").icon(icon::BOOKMARK_SIMPLE).keys(Some(vec!["B".into()])).enabled(matches!(self.state, State::Ready(_))).tip("A pin on the timeline to come back to: [ and ] jump between them").show(ui).clicked() {
+                    if !image && Item::new("Add a marker here").icon(icon::BOOKMARK_SIMPLE).keys(Some(vec!["B".into()])).enabled(matches!(self.state, State::Ready(_))).tip("A pin on the timeline to come back to: [ and ] jump between them").show(ui).clicked() {
                         mark = true;
                     }
-                    if Item::new("Open in another player").icon(icon::ARROW_SQUARE_OUT).show(ui).clicked() {
+                    if Item::new(if image { "Open in another app" } else { "Open in another player" }).icon(icon::ARROW_SQUARE_OUT).show(ui).clicked() {
                         out = ViewerOutcome::OpenExternal;
                     }
-                    crate::ui_kit::menu_sep(ui);
-                    if Item::new("Keyboard shortcuts").icon(icon::KEYBOARD).keys(Some(vec!["?".into()])).show(ui).clicked() {
-                        out = ViewerOutcome::Keys;
+                    if !image && Item::new("Free up space…").icon(icon::HARD_DRIVE).enabled(ready).tip(crate::library_view::FREE_UP_TIP).show(ui).clicked() {
+                        out = ViewerOutcome::FreeUp;
                     }
                     crate::ui_kit::menu_sep(ui);
+                    if !image {
+                        if Item::new("Keyboard shortcuts").icon(icon::KEYBOARD).keys(Some(vec!["?".into()])).show(ui).clicked() {
+                            out = ViewerOutcome::Keys;
+                        }
+                        crate::ui_kit::menu_sep(ui);
+                    }
                     let del_key = Some(vec![if cfg!(target_os = "macos") { icon::BACKSPACE.to_owned() } else { "Del".to_owned() }]);
                     if Item::new(nav.delete_label.clone()).icon(icon::TRASH).danger().enabled(ready).keys(del_key).show(ui).clicked() {
                         out = ViewerOutcome::Delete;
                     }
                 });
-                let share_tip = if crate::share::CAN_DRAG_OUT { "Copy it, send it or upload it, or drag the picture into any app" } else { "Copy it, send it or upload it" };
+                let share_tip = match (image, crate::share::can_drag_out()) {
+                    (true, true) => "Copy it or send it, or drag the picture into any app",
+                    (true, false) => "Copy it or send it",
+                    (false, true) => "Copy it, send it or upload it, or drag the picture into any app",
+                    (false, false) => "Copy it, send it or upload it",
+                };
                 // Narrow: Share and Edit as their icons.
                 let narrow = ui.ctx().content_rect().width() < 700.0;
                 let share = if narrow { Btn::icon(Kind::Primary, icon::EXPORT).tip("Share") } else { Btn::primary("Share").with_icon(icon::EXPORT) };
                 let share = share.enabled(ready).tip(if ready { share_tip } else { wait }).show(ui);
-                if let Some(c) = crate::ui_kit::menu_popup(&share, false, 250.0, |ui| crate::library::share_menu(ui, share.rect.left_bottom())).flatten() {
+                if let Some(c) = crate::ui_kit::menu_popup(&share, false, 250.0, |ui| crate::library::share_menu(ui, share.rect.left_bottom(), nav.uploading, image)).flatten() {
                     out = ViewerOutcome::Share(c);
                 }
                 let edit = if narrow { Btn::icon(Kind::Normal, icon::SCISSORS) } else { Btn::normal("Edit").with_icon(icon::SCISSORS) };
-                if edit.enabled(ready).tip(if ready { "Trim it, adjust its sound, or save it smaller" } else { wait }).show(ui).clicked() {
+                if !image && edit.enabled(ready).tip(if ready { "Trim it, adjust its sound, or save it smaller" } else { wait }).show(ui).clicked() {
                     out = ViewerOutcome::Edit;
+                }
+                // Shared: says so left of the buttons (laid out right to left),
+                // so Share and Edit stay put whether the clip's shared or not.
+                // It opens its link.
+                if let Some((glyph, words, tip)) = &nav.link {
+                    let b = if narrow { Btn::icon(Kind::Ghost, glyph) } else { Btn::ghost(words.clone()).with_icon(glyph) };
+                    if b.tip(*tip).show(ui).clicked() {
+                        out = ViewerOutcome::Share(crate::library::ShareChoice::Upload);
+                    }
                 }
             }
             crate::transport::Part::Left => {}
@@ -407,31 +578,42 @@ impl Viewer {
 }
 
 impl Ready {
-    fn new(ctx: &egui::Context, clip: &Path, l: Loaded) -> Self {
-        let volume = volume(ctx).unwrap_or((1.0, false));
+    fn new(ctx: &egui::Context, clip: &Path, l: Loaded, resume: Option<Resume>, handoff: &mut Handoff) -> Self {
         let wave = crate::waveform::follow(l.pcm.clone(), 0, ctx);
-        let mut player = Player::new(ctx, clip, l.info.clone(), l.pcm, Vec::new());
+        let (mut player, curtain, taken) = Player::handed_over(ctx, clip, &l.info, l.pcm, Vec::new(), handoff.player.take());
         // Dev aid: `HESTECLIPS_START_AT=<seconds>` starts there (to check a
         // stretch of a clip without scrubbing to it).
         if let Some(t) = std::env::var("HESTECLIPS_START_AT").ok().and_then(|s| s.parse::<f64>().ok()) {
             player.seek(t);
         }
-        // Opened to watch: start right away.
-        player.play(l.info.duration);
+        if let Some(r) = resume
+            && let Some(at) = media::output_time(&l.span.parts, r.at)
+        {
+            if !taken {
+                player.seek(at.min(l.info.duration));
+            }
+            if r.playing {
+                player.play_on(l.info.duration);
+            }
+        } else {
+            // Opened to watch: start right away.
+            player.play_on(l.info.duration);
+        }
         let r = Self {
-            strip: Filmstrip::build(ctx, clip, &l.info),
+            strip: handoff.strip(clip).unwrap_or_else(|| Filmstrip::build(ctx, clip, &l.info)),
             info: l.info,
             player,
+            curtain,
             wave,
             dragging: None,
+            dev_dragging: false,
             scrolled: None,
             stepping_back: false,
             glide: Default::default(),
             last_activity: Instant::now(),
             scroll_to: None,
+            timeline_at: None,
             hover: None,
-            volume: volume.0,
-            muted: volume.1,
             speed: speed(ctx),
             drag_out: false,
             show_frames: false,
@@ -440,7 +622,7 @@ impl Ready {
             span: l.span,
             clip: clip.to_path_buf(),
         };
-        r.apply_volume(ctx);
+        r.player.set_listening(crate::transport::listening_gain(ctx));
         r.player.set_speed(r.speed);
         r
     }
@@ -455,12 +637,14 @@ impl Ready {
 
     /// The clip's moments as pins on this file's timeline.
     fn pins(&self) -> Vec<crate::transport::Moment> {
-        let (start, recording) = self.span;
-        let mut pins = self.moments.pins(recording);
-        for m in &mut pins {
-            m.t -= start;
-        }
-        pins.retain(|m| (0.0..=self.info.duration).contains(&m.t));
+        let mut pins = self.moments.pins(self.span.recording);
+        pins.retain_mut(|m| match media::output_time(&self.span.parts, m.t) {
+            Some(t) => {
+                m.t = t;
+                (0.0..=self.info.duration).contains(&t)
+            }
+            None => false,
+        });
         pins
     }
 
@@ -468,7 +652,7 @@ impl Ready {
     /// that's there.
     fn toggle_marker(&mut self) {
         let t = self.info.snap(self.player.time());
-        let at = t + self.span.0;
+        let at = media::source_time(&self.span.parts, t);
         if let Some(&m) = self.moments.markers.iter().find(|m| (*m - at).abs() < self.info.frame_duration().max(0.02)) {
             crate::moments::remove_marker(&self.clip, m);
         } else {
@@ -486,11 +670,6 @@ impl Ready {
         }
     }
 
-    fn apply_volume(&self, ctx: &egui::Context) {
-        let gain = if self.muted { 0.0 } else { self.volume * self.volume }; // a squared slider feels even
-        self.player.set_mix(vec![TrackEdit { index: 0, gain, muted: false, points: Vec::new() }]);
-        set_volume(ctx, (self.volume, self.muted));
-    }
 
     fn ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
@@ -508,36 +687,77 @@ impl Ready {
                 ctx.request_repaint_after(SCROLL_SETTLE);
             }
         }
-        match dev_drag() {
+        match dev_drag(&ctx) {
             Some(Some(t)) => {
                 if self.dragging.is_none() {
                     self.dragging = Some(self.player.is_playing());
                     self.player.pause();
                 }
+                self.dev_dragging = true;
                 self.seek(t);
                 ctx.request_repaint();
             }
             Some(None) => {
+                self.dev_dragging = false;
                 if self.dragging.take() == Some(true) {
                     self.play();
                 }
             }
             None => {}
         }
-        let scrubbing = self.dragging.is_some() || self.scrolled.is_some();
 
         let full = is_fullscreen(&ctx);
 
         // --- Picture: everything above the transport and timeline; in
         // fullscreen the whole screen, with them floating over it ---
         let controls_h = crate::transport::BAR_H + TIMELINE_H + 14.0;
-        let preview_h = if full { ui.available_height() } else { (ui.available_height() - controls_h).max(160.0) };
+        // The transport starts right at the picture's edge, as the picture
+        // starts at the header's: a strip of the page and a line under the
+        // dark stage read as a second edge. The picture takes the gap's room,
+        // so the timeline stays where it was.
+        let gap = if full { 0.0 } else { ui.spacing().item_spacing.y };
+        let preview_h = if full { ui.available_height() } else { (ui.available_height() - controls_h + gap).max(160.0) };
         // Click to play or pause; drag out of the window to share the clip.
         let (preview, preview_resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), preview_h), Sense::click_and_drag());
+        ui.add_space(-gap);
+
+        // A click or drag on the timeline, and the wheel, before anything
+        // that shows where the playhead is: the picture, the time and the
+        // playhead itself follow the pointer on the frame it moves. (Read
+        // after them, every frame of a drag showed where the move before had
+        // put it.) The timeline is taken where it was laid out last frame, as
+        // egui finds what's under the pointer; over the picture, as in
+        // fullscreen, it's on top (taken after it).
+        let timeline = self.timeline_at.take().map(|outer| (outer, ui.interact(outer, egui::Id::new("viewer_timeline"), Sense::click_and_drag())));
+        if let Some((outer, resp)) = &timeline {
+            self.timeline_input(ui, resp, timeline_lanes(*outer));
+        }
+        let timeline_w = timeline.as_ref().map_or(preview.width(), |(outer, _)| timeline_lanes(*outer).width());
+        self.wheel(&ctx, preview, timeline_w);
+        let scrubbing = self.dragging.is_some() || self.scrolled.is_some();
+
         self.player.set_stepping(self.stepping_back);
         let size = self.player.update(&ctx, scrubbing);
+        if size.is_some() {
+            self.curtain = None;
+        }
+        let curtain = self.curtain.as_ref().filter(|_| size.is_none());
+        let size = curtain.and_then(Player::size).or(size);
         let player = &self.player;
-        crate::transport::stage(ui, preview, size, |p, cover| player.paint_glow(p, cover, egui::Id::new("viewer_stage")), |r| player.paint(ui, r));
+        let stage = egui::Id::new("viewer_stage");
+        let glow = |p: &egui::Painter, cover: Rect| match curtain {
+            Some(c) => c.paint_glow(p, cover, stage),
+            None => player.paint_glow(p, cover, stage),
+        };
+        let picture = crate::transport::stage(ui, preview, size, glow, |r| match curtain {
+            Some(c) => c.paint(ui.painter(), r),
+            None => player.paint(ui.painter(), r),
+        });
+        // As loud as you listen, in the editor too (they share it).
+        self.player.set_listening(crate::transport::listening_gain(&ctx));
+        if let Some(picture) = picture.filter(|_| self.player.is_playing()) {
+            crate::transport::muted_note(ui, picture);
+        }
         if let Some(f) = self.flash_play.filter(|(_, at)| at.elapsed() < Duration::from_millis(450)) {
             // A big play / pause sign that grows and fades where you clicked.
             let t = f.1.elapsed().as_secs_f32() / 0.45;
@@ -549,7 +769,7 @@ impl Ready {
             ctx.request_repaint();
         }
 
-        let mut timeline_w = preview.width();
+        let timeline = timeline.as_ref().map(|(_, resp)| resp);
         if full {
             // Over the bottom of the picture while the mouse moves (and a few
             // seconds after) or rests on them; hidden otherwise, cursor too,
@@ -582,16 +802,16 @@ impl Ready {
                 child.multiply_opacity(shown);
                 // White on the shade, whatever the look.
                 child.visuals_mut().dark_mode = true;
-                timeline_w = self.controls(&mut child, preview, true);
+                self.controls(&mut child, preview, timeline);
             } else if pointer_over(&ctx, preview) {
                 ctx.set_cursor_icon(egui::CursorIcon::None);
             }
         } else {
-            timeline_w = self.controls(ui, preview, false);
+            self.controls(ui, preview, timeline);
         }
 
         let preview_resp = preview_resp.on_hover_cursor(if full { egui::CursorIcon::Default } else { egui::CursorIcon::PointingHand });
-        if crate::share::CAN_DRAG_OUT && preview_resp.drag_started() {
+        if crate::share::can_drag_out() && preview_resp.drag_started() {
             self.drag_out = true;
         }
         if preview_resp.double_clicked() {
@@ -602,28 +822,6 @@ impl Ready {
         } else if preview_resp.clicked() {
             self.toggle_play();
             self.flash_play = Some((self.player.is_playing(), Instant::now()));
-        }
-
-        // Scroll over the picture (or the timeline, over or under it) to
-        // scrub through the clip.
-        let over = pointer_over(&ctx, preview) || (!crate::ui_kit::overlay_open(&ctx) && ctx.pointer_hover_pos().is_some_and(|p| p.y > preview.bottom()));
-        let mut input = if over { crate::wheel::read(&ctx).scroll } else { Vec2::ZERO };
-        input.y += dev_wheel();
-        // Down or left (towards you, or swiping left) goes forward, like reading on.
-        let d = self.glide.step(&ctx, input);
-        let px = -(d.x + d.y);
-        if px.abs() > 0.0 {
-            let was = match self.scrolled {
-                Some((_, was)) => was,
-                None => self.player.is_playing(),
-            };
-            self.player.pause();
-            let dt = px as f64 / timeline_w.max(1.0) as f64 * self.info.duration;
-            // Unsnapped, so the glide's last small steps add up.
-            let to = (self.scroll_to.unwrap_or_else(|| self.player.time()) + dt).clamp(0.0, self.info.duration);
-            self.scroll_to = Some(to);
-            self.seek(to);
-            self.scrolled = Some((Instant::now(), was));
         }
         if let Some(e) = &self.player.audio_error {
             ui.colored_label(ui.visuals().warn_fg_color, format!("No sound: {e}"));
@@ -649,8 +847,9 @@ impl Ready {
     }
 
     /// The transport bar and the timeline under it, from the top of `ui`.
-    /// Returns the timeline's width (wheel scrubbing scales by it).
-    fn controls(&mut self, ui: &mut egui::Ui, preview: Rect, over_picture: bool) -> f32 {
+    /// `timeline`: what the pointer does on the timeline (read at the start
+    /// of the frame, see [`Ready::ui`]).
+    fn controls(&mut self, ui: &mut egui::Ui, preview: Rect, timeline: Option<&egui::Response>) {
         use crate::ui_kit::{Btn, Kind};
         let ctx = ui.ctx().clone();
         let bar = Rect::from_min_size(ui.cursor().min, Vec2::new(ui.available_width(), crate::transport::BAR_H));
@@ -664,7 +863,10 @@ impl Ready {
         let mut frames = self.show_frames;
         crate::transport::bar(
             ui,
-            if over_picture { bar.with_min_y(bar.top() + 1.0) } else { bar },
+            bar,
+            // No line on top: in the window the picture's edge is the line,
+            // and in fullscreen the bar is over the picture.
+            false,
             150.0,
             |ui, part| match part {
             crate::transport::Part::Left => crate::transport::timecode(ui, t, self.info.duration, self.info.fps, &mut frames),
@@ -684,18 +886,7 @@ impl Ready {
                 if Btn::icon(Kind::Ghost, fs_icon).tip(if full { "Exit fullscreen  (F or Esc)" } else { "Fullscreen  (F, or double-click the picture)" }).show(ui).clicked() {
                     set_fullscreen(ui.ctx(), !full);
                 }
-                let mut v = if self.muted { 0.0 } else { self.volume };
-                let changed = crate::transport::slider(ui, &mut v, 100.0).on_hover_text("Volume").changed();
-                if changed {
-                    self.volume = v;
-                    self.muted = false;
-                    self.apply_volume(ui.ctx());
-                }
-                let speaker = if self.muted || self.volume == 0.0 { egui_phosphor::regular::SPEAKER_X } else { egui_phosphor::regular::SPEAKER_HIGH };
-                if Btn::icon(Kind::Ghost, speaker).small().tip(if self.muted { "Unmute  (M)" } else { "Mute  (M)" }).show(ui).clicked() {
-                    self.muted = !self.muted;
-                    self.apply_volume(ui.ctx());
-                }
+                crate::transport::volume(ui, Some(100.0));
                 // How fast it plays: lit when it isn't as recorded.
                 let kind = if self.speed == 1.0 { Kind::Ghost } else { Kind::On };
                 let r = Btn::new(kind, speed_label(self.speed)).small().id("viewer_speed").tip("Playback speed  (< >)").show(ui);
@@ -722,16 +913,72 @@ impl Ready {
             self.seek(t);
         }
         let _ = ctx;
-        let (outer, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), TIMELINE_H), Sense::click_and_drag());
-        let lanes = outer.shrink2(Vec2::new(14.0, 0.0)).with_max_y(outer.bottom() - 14.0);
-        self.timeline(ui, lanes, &resp, preview, &moments);
-        lanes.width()
+        // Laid out here, where it's drawn; what the pointer does on it is read
+        // at the start of the next frame, here (`timeline_at`).
+        let (_, outer) = ui.allocate_space(Vec2::new(ui.available_width(), TIMELINE_H));
+        self.timeline_at = Some(outer);
+        self.timeline(ui, timeline_lanes(outer), timeline, preview, &moments);
+    }
+
+    /// A press or a drag on the timeline (`resp`; `lanes` where it was
+    /// drawn) goes there. Click or drag below the ruler, whose pins are
+    /// clicked; a drag follows the pointer wherever it goes until it's let
+    /// go, over the picture or out of the window too. Playing pauses while
+    /// the button's held and carries on after.
+    fn timeline_input(&mut self, ui: &egui::Ui, resp: &egui::Response, lanes: Rect) {
+        let dur = self.info.duration.max(1e-6);
+        let t_of = |x: f32| ((x - lanes.left()) / lanes.width()).clamp(0.0, 1.0) as f64 * dur;
+        let below_ruler = |pos: Pos2| pos.y > lanes.top() + crate::transport::RULER_H - 6.0;
+        // The playhead goes there as the button goes down, and it's held
+        // there (paused) until it's let go, a click as a drag: not when it's
+        // let go or a drag gets going.
+        if resp.is_pointer_button_down_on()
+            && let Some(pos) = ui.input(|i| i.pointer.primary_pressed().then(|| i.pointer.press_origin()).flatten())
+            && below_ruler(pos)
+        {
+            self.dragging = Some(self.player.is_playing());
+            self.player.pause();
+            self.seek(t_of(pos.x));
+        }
+        if let Some(pos) = resp.interact_pointer_pos()
+            && self.dragging.is_some()
+            && resp.dragged()
+        {
+            self.seek(t_of(pos.x));
+        }
+        if self.dragging.is_some() && !self.dev_dragging && !ui.input(|i| i.pointer.primary_down()) && self.dragging.take() == Some(true) {
+            self.play();
+        }
+    }
+
+    /// Scroll over the picture (or the timeline, over or under it) to scrub
+    /// through the clip: `timeline_w` points of scrolling go through all of it.
+    fn wheel(&mut self, ctx: &egui::Context, preview: Rect, timeline_w: f32) {
+        let over = pointer_over(ctx, preview) || (!crate::ui_kit::overlay_open(ctx) && ctx.pointer_hover_pos().is_some_and(|p| p.y > preview.bottom()));
+        let mut input = if over { crate::wheel::read(ctx).scroll } else { Vec2::ZERO };
+        input.y += dev_wheel();
+        // Down or left (towards you, or swiping left) goes forward, like reading on.
+        let d = self.glide.step(ctx, input);
+        let px = -(d.x + d.y);
+        if px.abs() > 0.0 {
+            let was = match self.scrolled {
+                Some((_, was)) => was,
+                None => self.player.is_playing(),
+            };
+            self.player.pause();
+            let dt = px as f64 / timeline_w.max(1.0) as f64 * self.info.duration;
+            // Unsnapped, so the glide's last small steps add up.
+            let to = (self.scroll_to.unwrap_or_else(|| self.player.time()) + dt).clamp(0.0, self.info.duration);
+            self.scroll_to = Some(to);
+            self.seek(to);
+            self.scrolled = Some((Instant::now(), was));
+        }
     }
 
     /// The ruler with the clip's moments, the filmstrip, then the sound,
     /// with the playhead through them all. The played part is bright, the
-    /// rest dimmed. Hover to see a moment; click or drag to go there.
-    fn timeline(&mut self, ui: &mut egui::Ui, outer: Rect, resp: &egui::Response, preview: Rect, moments: &[crate::transport::Moment]) {
+    /// rest dimmed. Hover to see a moment (`resp`, the pointer on it).
+    fn timeline(&mut self, ui: &mut egui::Ui, outer: Rect, resp: Option<&egui::Response>, preview: Rect, moments: &[crate::transport::Moment]) {
         let p = crate::theme::pal(ui);
         let painter = ui.painter_at(outer.expand(8.0));
         let dur = self.info.duration.max(1e-6);
@@ -744,11 +991,12 @@ impl Ready {
         match crate::transport::ruler(ui, ruler, (0.0, dur), self.info.fps, self.show_frames, moments, true) {
             Some(crate::transport::Pinned::Go(t)) => self.seek(t),
             Some(crate::transport::Pinned::Remove(t)) => {
-                crate::moments::remove_marker(&self.clip, t + self.span.0);
+                crate::moments::remove_marker(&self.clip, media::source_time(&self.span.parts, t));
                 self.moments = crate::moments::of(&self.clip);
             }
             None => {}
         }
+
         painter.rect_filled(video, 5, p.raise2);
         self.strip.paint(ui, video, 0.0, dur, dur);
         painter.rect_filled(audio, 5, p.raise);
@@ -769,7 +1017,8 @@ impl Ready {
         painter.rect_filled(rest.intersect(audio), egui::CornerRadius { nw: 0, sw: 0, ne: 5, se: 5 }, dim);
 
         // Hover: a line, and that moment's picture and time.
-        if let Some(pos) = resp.hover_pos().filter(|_| self.dragging.is_none() && pos_in(video.union(audio), resp.hover_pos())) {
+        let hover = resp.and_then(egui::Response::hover_pos);
+        if let Some(pos) = hover.filter(|_| self.dragging.is_none() && pos_in(video.union(audio), hover)) {
             let t = self.info.snap(t_of(pos.x));
             self.hover_preview(ui, t, pos.x, video, preview);
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -779,22 +1028,6 @@ impl Ready {
 
         // Playhead.
         crate::transport::playhead(&painter, xp, ruler.bottom() - 4.0, audio.bottom(), p.text);
-
-        // Click or drag to go there. Playing pauses while you drag and carries on after.
-        if resp.drag_started() {
-            self.dragging = Some(self.player.is_playing());
-            self.player.pause();
-        }
-        if let Some(pos) = resp.interact_pointer_pos() {
-            if (resp.dragged() || resp.drag_started() || resp.clicked()) && pos.y > ruler.bottom() - 6.0 {
-                self.seek(t_of(pos.x));
-            }
-        }
-        if resp.drag_stopped() {
-            if self.dragging.take() == Some(true) {
-                self.play();
-            }
-        }
     }
 
     /// The picture at `t` in a small frame over the bottom of the preview, above
@@ -916,8 +1149,7 @@ impl Ready {
             self.seek(self.info.duration - self.info.frame_duration());
         }
         if m {
-            self.muted = !self.muted;
-            self.apply_volume(ctx);
+            crate::transport::toggle_mute(ctx);
         }
     }
 
@@ -946,6 +1178,12 @@ impl Ready {
 
 fn pos_in(rect: Rect, pos: Option<Pos2>) -> bool {
     pos.is_some_and(|p| rect.contains(p))
+}
+
+/// The timeline's lanes (ruler, filmstrip, sound) in the space laid out for
+/// it: in from the sides, clear of the bottom.
+fn timeline_lanes(outer: Rect) -> Rect {
+    outer.shrink2(Vec2::new(14.0, 0.0)).with_max_y(outer.bottom() - 14.0)
 }
 
 fn is_fullscreen(ctx: &egui::Context) -> bool {
@@ -979,8 +1217,9 @@ fn dev_wheel() -> f32 {
 /// from 10 s to 20 s of the clip between 4 and 6 s after start, then from
 /// 30 s back to 25 s, as the mouse would, to reproduce drag scrubbing
 /// without touching the mouse. `Some(Some(t))`: dragging to `t` now;
-/// `Some(None)`: a drag just ended.
-fn dev_drag() -> Option<Option<f64>> {
+/// `Some(None)`: a drag just ended. Wakes the UI for the next drag (paused,
+/// nothing else may redraw it).
+fn dev_drag(ctx: &egui::Context) -> Option<Option<f64>> {
     type Plan = (Vec<[f64; 4]>, bool);
     static PLAN: std::sync::OnceLock<std::sync::Mutex<Plan>> = std::sync::OnceLock::new();
     let plan = PLAN.get_or_init(|| {
@@ -1004,6 +1243,9 @@ fn dev_drag() -> Option<Option<f64>> {
         return None;
     }
     let now = crate::player::uptime();
+    if let Some(next) = plan.0.iter().map(|s| s[0]).filter(|&t0| t0 > now).reduce(f64::min) {
+        ctx.request_repaint_after(std::time::Duration::from_secs_f64(next - now));
+    }
     if let Some(&[t0, t1, a, b]) = plan.0.iter().find(|s| s[0] <= now && now < s[1]) {
         plan.1 = true;
         return Some(Some(a + (b - a) * (now - t0) / (t1 - t0).max(1e-3)));
@@ -1065,16 +1307,30 @@ fn volume_id() -> egui::Id {
     egui::Id::new("viewer_volume")
 }
 
-/// Where the clip at `path` starts in its recording, and how long that
-/// recording is: `(0, duration)` unless it's been trimmed.
-fn recording_span(path: &Path, duration: f64) -> (f64, f64) {
+/// Where a clip's file is in its recording: the parts of the recording
+/// it's made of (in order), and how long the recording is.
+#[derive(Clone)]
+struct Span {
+    parts: Vec<(f64, f64)>,
+    recording: f64,
+}
+
+/// Where the clip at `path` is in its recording: all of it, `duration`
+/// long, unless it's been edited. The original is read for it, not kept
+/// (unless the editor kept it): freeing up space trims it with the player
+/// open, and the editor would then find what it was.
+fn recording_span(path: &Path, duration: f64, kept: &Kept) -> Span {
+    let whole = Span { parts: vec![(0.0, duration)], recording: duration };
     let target = crate::store::EditTarget::of(path);
     if target.source == target.clip {
-        return (0.0, duration);
+        return whole;
     }
-    let Some(edit) = crate::store::load_edit(&target) else { return (0.0, duration) };
-    let whole = media::probe(&target.source).map_or(edit.end, |i| i.duration);
-    (edit.start, whole)
+    let Some(edit) = crate::store::load_edit(&target) else { return whole };
+    let recording = match kept.info(&target.source) {
+        Some(info) => info.duration,
+        None => media::probe(&target.source).map_or(edit.end, |i| i.duration),
+    };
+    Span { parts: edit.kept(), recording }
 }
 
 /// The speeds offered.

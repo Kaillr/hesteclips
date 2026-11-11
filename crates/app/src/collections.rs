@@ -233,6 +233,7 @@ mod tests {
             id: None,
             original: None,
             folder: None,
+            kept_bytes: 0,
         }
     }
 

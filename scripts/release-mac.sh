@@ -3,9 +3,9 @@
 # HesteClips.app with ffmpeg inside, so there's nothing else to install. Drag
 # it to Applications and open it.
 #
-# Not signed with a Developer ID (there isn't one), only ad hoc, which Apple
-# Silicon needs to run it at all; so the first launch has to be allowed in
-# System Settings → Privacy & Security (see the README).
+# Signed with HesteClips' own certificate, not an Apple Developer ID (there
+# isn't one), so the first launch has to be allowed in System Settings →
+# Privacy & Security (see the README).
 #
 # The release workflow runs this for each new version. It also runs locally:
 #   scripts/release-mac.sh 0.0.1-local
@@ -83,11 +83,49 @@ cat > "$app/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-# Ad hoc: ffmpeg keeps its own signature; the app is sealed around it.
-codesign --force --sign - "$app/Contents/MacOS/hesteclips"
-codesign --force --sign - "$app"
+# Signed with HesteClips' own certificate (MAC_SIGNING_P12, base64, and
+# MAC_SIGNING_PASSWORD), the same for every release: macOS ties what it's
+# allowed (Screen Recording, Input Monitoring) to the app's identifier and
+# that certificate, so a new version keeps them. Ad hoc, each build is only
+# itself and loses them. It isn't Apple's, so Gatekeeper still asks the first
+# time. Without the certificate (a local build), ad hoc. ffmpeg keeps its own
+# signature; the app is sealed around it.
+sign=-
+if [ -n "${MAC_SIGNING_P12:-}" ]; then
+    echo "signing: making a keychain with the certificate"
+    keychain="$PWD/$work/signing.keychain-db"
+    kc_pass="$(openssl rand -hex 16)"
+    rm -f "$keychain"
+    security create-keychain -p "$kc_pass" "$keychain"
+    security set-keychain-settings "$keychain"
+    security unlock-keychain -p "$kc_pass" "$keychain"
+    echo "$MAC_SIGNING_P12" | base64 --decode > "$work/signing.p12"
+    security import "$work/signing.p12" -k "$keychain" -P "$MAC_SIGNING_PASSWORD" -T /usr/bin/codesign >/dev/null
+    rm "$work/signing.p12"
+    security set-key-partition-list -S apple-tool:,apple: -s -k "$kc_pass" "$keychain" >/dev/null
+    # On the search list too, ahead of the others: codesign on GitHub's
+    # macOS 15 runners didn't find the key with --keychain alone ("The
+    # specified item could not be found in the keychain"). The list is put
+    # back as it was afterwards.
+    searched=()
+    while IFS= read -r k; do searched+=("$k"); done < <(security list-keychains -d user | sed -E 's/^[[:space:]]*"(.*)"$/\1/')
+    security list-keychains -d user -s "$keychain" ${searched[@]+"${searched[@]}"}
+    trap 'security list-keychains -d user -s ${searched[@]+"${searched[@]}"}; security delete-keychain "$keychain" 2>/dev/null || true' EXIT
+    # Not trusted (it isn't Apple's), so it's found by its hash.
+    sign="$(security find-identity -p codesigning "$keychain" | awk '/"HesteClips"/ {print $2; exit}')"
+    [ -n "$sign" ] || { echo "the signing certificate wasn't found" >&2; exit 1; }
+    echo "signing: with $sign"
+fi
+codesign --force --sign "$sign" ${keychain:+--keychain "$keychain"} "$app/Contents/MacOS/hesteclips"
+codesign --force --sign "$sign" ${keychain:+--keychain "$keychain"} "$app"
 codesign --verify --strict "$app"
+codesign -dr - "$app" 2>&1 | grep designated
+
+# What the installed app updates itself from (update_mac.rs): the app,
+# zipped with ditto (which keeps its signature), and its checksum.
+ditto -c -k --keepParent "$app" "$out/$name.zip"
+(cd "$out" && shasum -a 256 "$name.zip" > "$name.zip.sha256")
 
 ln -s /Applications "$work/dmg/Applications"
 hdiutil create -volname HesteClips -srcfolder "$work/dmg" -fs HFS+ -format UDZO -ov "$out/$name.dmg" >/dev/null
-echo "built $out/$name.dmg"
+echo "built $out/$name.dmg and $out/$name.zip"

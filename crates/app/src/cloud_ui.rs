@@ -4,7 +4,12 @@
 use crate::ui_kit::Dismissed as _;
 use std::path::PathBuf;
 
-use crate::{App, file_name};
+use crate::App;
+
+/// Just the file name of a path, for status messages.
+pub(crate) fn file_name(path: &std::path::Path) -> String {
+    path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+}
 
 pub(crate) enum Dialog {
     /// Folders-only browser for choosing the default clips folder.
@@ -28,6 +33,22 @@ pub(crate) struct ShareDialog {
 }
 
 impl App {
+    /// Tell the user how background uploads ended.
+    pub(crate) fn pump_uploads(&mut self) {
+        for done in self.cloud.take_finished() {
+            match done {
+                crate::cloud::UploadDone::Uploaded { clip, to, link: None } => {
+                    self.toast(format!("Uploaded {} to {}", file_name(&clip), to.display()));
+                }
+                crate::cloud::UploadDone::Uploaded { clip, link: Some(link), .. } => self.public_links.push_back((clip, link)),
+                crate::cloud::UploadDone::Failed { clip, error } => {
+                    self.toast_error(format!("Couldn't upload {}: {error}", file_name(&clip)));
+                }
+                crate::cloud::UploadDone::Cancelled { clip } => self.toast(format!("Upload of {} cancelled", file_name(&clip))),
+            }
+        }
+    }
+
     pub(crate) fn open_share_dialog(&mut self, clip: PathBuf) {
         let target = if self.cloud.default_folder.is_some() {
             ShareTarget::DefaultFolder
@@ -42,6 +63,7 @@ impl App {
     }
 
     pub(crate) fn dialogs(&mut self, ctx: &egui::Context) {
+        self.connect_dialog(ctx);
         if self.dialog.is_none() {
             self.dialog = self.public_links.pop_front().map(|(clip, link)| Dialog::PublicLink { clip, link, copied: false });
         }
@@ -171,14 +193,14 @@ impl App {
             ui.add_space(6.0);
             if let Some(game) = &game {
                 let mut on = self.cloud.game_folders;
-                crate::ui_kit::checkbox(ui, &mut on, &format!("Put it in a folder for {game}")).on_hover_text("Inside the folder above. It's made the first time.");
+                checkbox(ui, &mut on, &format!("Put it in a folder for {game}")).on_hover_text("Inside the folder above. It's made the first time.");
                 self.cloud.set_game_folders(on);
                 if on {
                     subfolder = Some(game.clone());
                 }
             }
             let mut public = self.cloud.public_links;
-            crate::ui_kit::checkbox(ui, &mut public, "Make a public link").on_hover_text("Anyone with the link can watch and download the clip. It's shown when the upload is done.");
+            checkbox(ui, &mut public, "Make a public link").on_hover_text("Anyone with the link can watch and download the clip. It's shown when the upload is done.");
             self.cloud.set_public_links(public);
             ui.add_space(4.0);
             crate::ui_kit::hint(ui, "If a file with this name is already there, HesteFiles keeps both.");
@@ -200,6 +222,89 @@ impl App {
         });
         (keep_open && !resp.dismissed()).then_some(share)
     }
+}
+
+impl App {
+    /// "Connect HesteFiles": paste an account token.
+    fn connect_dialog(&mut self, ctx: &egui::Context) {
+        use crate::theme::{self, W};
+        if !self.connect_open {
+            return;
+        }
+        if self.cloud.is_connected() {
+            self.connect_open = false;
+            self.connect_focused = false;
+            if let crate::cloud::Connection::Connected(a) = &self.cloud.connection {
+                let name = a.user_info.username.clone();
+                self.toast(format!("Connected as {name}"));
+            }
+            return;
+        }
+        let mut close = false;
+        let modal = crate::ui_kit::dialog(ctx, "hestefiles_connect", 420.0, |ui| {
+            crate::ui_kit::dialog_title(ui, "Connect HesteFiles");
+            crate::ui_kit::dialog_text(ui, "Create an account token on the HesteFiles website and paste it here.");
+            ui.add_space(4.0);
+            let id = egui::Id::new("hestefiles_token");
+            let field = crate::ui_kit::secret_field(ui, id, &mut self.cloud.token_input, "Paste account token", false, ui.available_width());
+            if !self.connect_focused {
+                field.request_focus();
+                self.connect_focused = true;
+            }
+            let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let p = theme::pal(ui);
+            match &self.cloud.connection {
+                crate::cloud::Connection::Failed(e) => {
+                    ui.add_space(4.0);
+                    ui.label(theme::text(format!("Couldn't connect: {e}"), 12.5, W::Regular).color(p.danger));
+                }
+                crate::cloud::Connection::Connecting => {
+                    ui.add_space(4.0);
+                    ui.label(theme::text("Checking…", 12.5, W::Regular).color(p.text3));
+                }
+                _ => {}
+            }
+            crate::ui_kit::dialog_buttons(ui, |ui| {
+                let can = !self.cloud.token_input.trim().is_empty();
+                if (ui.add(crate::ui_kit::button("Connect", true)).clicked() || enter) && can {
+                    let token = self.cloud.token_input.clone();
+                    self.cloud.connect(&token);
+                }
+                close = ui.add(crate::ui_kit::button("Cancel", false).ghost()).clicked();
+            });
+        });
+        if close || modal.dismissed() {
+            self.connect_open = false;
+            self.connect_focused = false;
+        }
+    }
+}
+
+/// A box to tick, with its words: for options in a dialog.
+fn checkbox(ui: &mut egui::Ui, on: &mut bool, label: &str) -> egui::Response {
+    use crate::theme::{self, W};
+    use egui::{Pos2, Rect, Sense, Stroke, StrokeKind, vec2};
+    let p = theme::pal(ui);
+    let g = ui.painter().layout_no_wrap(label.to_owned(), theme::font(13.5, W::Regular), p.text);
+    let (rect, mut resp) = ui.allocate_exact_size(vec2(16.0 + 9.0 + g.size().x, 28.0), Sense::click());
+    if resp.clicked() {
+        *on = !*on;
+        resp.mark_changed();
+    }
+    let t = theme::toggle(ui.ctx(), resp.id, *on, theme::FAST);
+    let hv = theme::toggle(ui.ctx(), resp.id.with("hv"), resp.hovered(), theme::FAST);
+    let b = Rect::from_min_size(Pos2::new(rect.left(), rect.center().y - 8.0), vec2(16.0, 16.0));
+    if t < 1.0 {
+        ui.painter().rect_stroke(b, 4, Stroke::new(1.5, theme::mix(p.text3, p.text2, hv)), StrokeKind::Inside);
+    }
+    if t > 0.0 {
+        ui.painter().rect_filled(b, 4, theme::fade(p.primary, t));
+        let c = b.center();
+        let tick = vec![c + vec2(-3.5, 0.2), c + vec2(-1.0, 2.8), c + vec2(3.8, -2.6)];
+        ui.painter().add(egui::Shape::line(tick, Stroke::new(1.8, theme::fade(p.primary_fg, t))));
+    }
+    ui.painter().galley(Pos2::new(b.right() + 9.0, rect.center().y - g.size().y / 2.0), g, p.text);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 /// An upload is done and has a public link: show it, with a button to copy it.

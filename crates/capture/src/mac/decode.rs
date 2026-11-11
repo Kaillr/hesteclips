@@ -197,10 +197,10 @@ impl Decoder {
                 (w, even_height(w, (sw, sh)))
             }
         };
-        // BT.601 only when the file says so, as other players do.
-        let bt601 = matches!(index.matrix, Some(5 | 6));
+        // As the file says, else as players take its size (`colours`).
+        let bt601 = crate::colours::bt601(index.matrix, index.width, index.height);
 
-        let format = format_description(&index)?;
+        let format = format_description(&index, bt601)?;
         let shared = Box::into_raw(Box::new(Shared { out: Mutex::new(Out::default()), ready: Condvar::new() }));
         let session = match create_session(&format, output, width, height, shared) {
             Ok(s) => s,
@@ -250,6 +250,11 @@ impl Decoder {
         self.source
     }
 
+    /// Its colours are BT.601 (the file says so), else BT.709.
+    pub fn bt601(&self) -> bool {
+        self.bt601
+    }
+
     /// The keyframes' numbers, ascending.
     pub fn keyframes(&self) -> Vec<u64> {
         let mut k: Vec<u64> = self.keys.iter().map(|&i| self.index_of(self.pts_sec(i))).collect();
@@ -271,18 +276,25 @@ impl Decoder {
         None
     }
 
-    /// Smaller frames for scrubbing: none here (the buffers come from a pool
-    /// that grows as needed: scrubbing keeps a few full-size ones instead).
-    pub fn small_frames(&mut self, _width: u32, _bytes: u64) -> Result<usize> {
-        bail!("no small frames on macOS")
+    /// Frames kept for scrubbing back and forth: here full size, the
+    /// decoder's own buffers (nothing is scaled down; they come from a pool
+    /// that grows as needed), as many as were asked for (in frames of
+    /// `width`, in `bytes`) that fit in a share of the memory.
+    pub fn small_frames(&mut self, width: u32, bytes: u64) -> Result<usize> {
+        let w = width.min(self.source.0).max(2);
+        let asked = (bytes as f64 / (w as f64 * even_height(w, self.source) as f64 * 1.5)).round() as u64;
+        let full = (self.source.0 as u64 * self.source.1 as u64 * 3 / 2).max(1);
+        // A sixteenth of the memory, from 256 MB to 2 GB: a 1440p frame is 5.5 MB.
+        let budget = crate::total_memory().map_or(1 << 30, |m| (m / 16).clamp(256 << 20, 2 << 30));
+        Ok(asked.min(budget / full).max(16) as usize)
     }
 
-    /// [`Self::frame`] (no small frames here).
+    /// [`Self::frame`] (frames kept scrubbing are full size here).
     pub fn frame_small(&mut self, index: u64) -> Result<Option<Picture>> {
         self.frame(index)
     }
 
-    /// [`Self::next`] (no small frames here).
+    /// [`Self::next`] (frames kept scrubbing are full size here).
     pub fn next_small(&mut self) -> Result<Option<Picture>> {
         self.next()
     }
@@ -300,10 +312,14 @@ impl Decoder {
     /// and playback do). Decoded on from where the decoder is when that's
     /// close, else from the keyframe before it. `None` past the end.
     pub fn frame(&mut self, index: u64) -> Result<Option<Picture>> {
-        // The last frame (presentation order) starting before the slot ends;
-        // before the first frame, the first one shows.
-        let end = self.time_of(index + 1) - 1e-9;
-        let pos = self.by_pts.partition_point(|&i| self.pts_sec(i) < end).saturating_sub(1);
+        // The last frame (presentation order) numbered at or before the slot,
+        // numbered as frames are handed out (`index_of`); before the first
+        // frame, the first one shows. (Cut at the slot's end in seconds
+        // instead, a frame starting a hair before the next slot came out
+        // for this one numbered as the next: in a recording with a dropped
+        // frame or two, frame 0 came out as frame 1, and the scrub engine
+        // asked for frame 0 again and again. As on Linux.)
+        let pos = self.by_pts.partition_point(|&i| self.index_of(self.pts_sec(i)) <= index).saturating_sub(1);
         self.at(pos)
     }
 
@@ -460,11 +476,6 @@ impl Decoder {
         ((secs - self.start()) * self.fps + 1e-3).floor().max(0.0) as u64
     }
 
-    /// Frame `index`'s start, in seconds on the file's clock.
-    fn time_of(&self, index: u64) -> f64 {
-        index as f64 / self.fps + self.start()
-    }
-
     /// The first frame's time: frame 0.
     fn start(&self) -> f64 {
         self.pts_sec(self.by_pts[0])
@@ -477,23 +488,16 @@ fn even_height(width: u32, source: (u32, u32)) -> u32 {
 }
 
 /// The decoder's description of the stream: H.264 with the file's own
-/// `avcC` (its parameter sets, profile and NAL length).
-fn format_description(index: &Index) -> Result<CFRetained<CMFormatDescription>> {
+/// `avcC` (its parameter sets, profile and NAL length), and its colour
+/// matrix, BT.601's or BT.709's, as decided: said outright, so its frames
+/// made RGBA (thumbnails, the filmstrip) are made by it, not by a guess of
+/// VideoToolbox's.
+fn format_description(index: &Index, bt601: bool) -> Result<CFRetained<CMFormatDescription>> {
     let avcc = objc2_core_foundation::CFData::from_bytes(&index.avcc);
     let atoms = CFDictionary::<CFString, CFType>::from_slices(&[&*CFString::from_static_str("avcC")], &[avcc.as_ref()]);
-    // The colour matrix the file states (`colr`), which overrides the
-    // stream's own; BT.601 only when it says so.
-    let matrix = match index.matrix {
-        Some(5 | 6) => Some(unsafe { kCVImageBufferYCbCrMatrix_ITU_R_601_4 }),
-        Some(1) => Some(unsafe { kCVImageBufferYCbCrMatrix_ITU_R_709_2 }),
-        _ => None,
-    };
-    let mut keys = vec![unsafe { kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms }];
-    let mut values: Vec<&CFType> = vec![atoms.as_ref()];
-    if let Some(m) = matrix {
-        keys.push(unsafe { kCMFormatDescriptionExtension_YCbCrMatrix });
-        values.push(m.as_ref());
-    }
+    let matrix = if bt601 { unsafe { kCVImageBufferYCbCrMatrix_ITU_R_601_4 } } else { unsafe { kCVImageBufferYCbCrMatrix_ITU_R_709_2 } };
+    let keys = [unsafe { kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms }, unsafe { kCMFormatDescriptionExtension_YCbCrMatrix }];
+    let values: [&CFType; 2] = [atoms.as_ref(), matrix.as_ref()];
     let extensions = CFDictionary::<CFString, CFType>::from_slices(&keys, &values);
     let mut out: *const CMFormatDescription = ptr::null();
     let status = unsafe {

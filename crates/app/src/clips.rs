@@ -1,12 +1,21 @@
-//! The clip library on disk: find finished clips and hand them off to the OS file
-//! manager or default player.
+//! The clip library on disk: find finished clips (and screenshots) and hand
+//! them off to the OS file manager or default player.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::SystemTime;
 
 use chrono::{DateTime, Local, NaiveDate, NaiveDateTime};
 
 const VIDEO_EXTS: &[&str] = &["mp4", "mkv", "mov", "webm", "avi"];
+/// Pictures: screenshots, ours or put in the library some other way.
+const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "webp"];
+
+/// Whether the file at `path` is a picture (a screenshot), not a video.
+pub fn is_image(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| IMAGE_EXTS.contains(&e.to_ascii_lowercase().as_str()))
+}
 
 #[derive(Debug, Clone)]
 pub struct Clip {
@@ -24,9 +33,17 @@ pub struct Clip {
     pub original: Option<PathBuf>,
     /// The library's folder it's in (its game's), if it isn't loose in the library.
     pub folder: Option<String>,
+    /// What's kept beside it, in bytes: an edited clip's untouched original
+    /// and its edit (`.hesteclips/<id>/`). 0 for a clip never edited.
+    pub kept_bytes: u64,
 }
 
 impl Clip {
+    /// A screenshot, not a video.
+    pub fn is_image(&self) -> bool {
+        is_image(&self.path)
+    }
+
     /// When the clip was captured: parsed from our `clip_YYYY-MM-DD_HH-MM-SS` names
     /// (stable even if the file is copied), else the file's modified time.
     pub fn captured_at(&self) -> NaiveDateTime {
@@ -34,11 +51,12 @@ impl Clip {
             .unwrap_or_else(|| DateTime::<Local>::from(self.modified).naive_local())
     }
 
-    /// Timestamp from our own names: `clip_…`/`recording_…` + `YYYY-MM-DD_HH-MM-SS`,
-    /// optionally followed by a suffix (e.g. ` (edit)` on an edited copy).
+    /// Timestamp from our own names: `clip_…`/`recording_…`/`screenshot_…` +
+    /// `YYYY-MM-DD_HH-MM-SS`, optionally followed by a suffix (e.g. ` (edit)`
+    /// on an edited copy).
     fn own_timestamp(&self) -> Option<NaiveDateTime> {
         let stem = self.path.file_stem()?.to_string_lossy().into_owned();
-        let ts = stem.strip_prefix("clip_").or_else(|| stem.strip_prefix("recording_"))?;
+        let ts = stem.strip_prefix("clip_").or_else(|| stem.strip_prefix("recording_")).or_else(|| stem.strip_prefix("screenshot_"))?;
         NaiveDateTime::parse_from_str(ts.get(..19)?, "%Y-%m-%d_%H-%M-%S").ok()
     }
 
@@ -62,19 +80,24 @@ impl Clip {
 
     /// Human-readable size, e.g. "1.4 GB".
     pub fn human_size(&self) -> String {
-        let b = self.size_bytes as f64;
-        const KB: f64 = 1024.0;
-        const MB: f64 = KB * 1024.0;
-        const GB: f64 = MB * 1024.0;
-        if b >= GB {
-            format!("{:.1} GB", b / GB)
-        } else if b >= MB {
-            format!("{:.0} MB", b / MB)
-        } else if b >= KB {
-            format!("{:.0} KB", b / KB)
-        } else {
-            format!("{b} B")
-        }
+        human_bytes(self.size_bytes)
+    }
+}
+
+/// A size as a clip's is shown: "1.4 GB", "312 MB", "48 KB".
+pub fn human_bytes(bytes: u64) -> String {
+    let b = bytes as f64;
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    if b >= GB {
+        format!("{:.1} GB", b / GB)
+    } else if b >= MB {
+        format!("{:.0} MB", b / MB)
+    } else if b >= KB {
+        format!("{:.0} KB", b / KB)
+    } else {
+        format!("{b} B")
     }
 }
 
@@ -83,12 +106,65 @@ impl Clip {
 pub fn scan(lib: &Path) -> Vec<Clip> {
     // Only edited clips have ids; skip reading metadata when nothing's been edited.
     let any_edits = lib.join(crate::store::DIR).is_dir();
-    let mut clips = scan_dir(lib, lib, None, any_edits);
+    let mut ids = Ids::of(lib);
+    let mut clips = scan_dir(lib, lib, None, any_edits, &mut ids);
     for folder in folders(lib) {
-        clips.extend(scan_dir(lib, &lib.join(&folder), Some(&folder), any_edits));
+        clips.extend(scan_dir(lib, &lib.join(&folder), Some(&folder), any_edits, &mut ids));
     }
+    ids.keep();
     clips.sort_by(|a, b| b.captured_at().cmp(&a.captured_at()));
     clips
+}
+
+/// Ids read from the clips' files ([`crate::store::read_id`]), by path, with
+/// the file as it was then ([`Stamp`]), so a scan reads the id again only
+/// from a file that's new or changed since the last. Reading one opens the
+/// file's index (`moov`), or runs ffprobe on a file that isn't MP4; a scan
+/// read every clip's, and every clip saved rescans the library one to three
+/// times. (What's kept beside an edited clip, its original and its folder's
+/// size, is still looked up on every scan: that changes without the clip.)
+static IDS: Mutex<BTreeMap<PathBuf, (Stamp, Option<String>)>> = Mutex::new(BTreeMap::new());
+
+/// What tells a file from the one an id was read from: its size, and when
+/// it was modified and made, as the thumbnails' cache tells them apart. A
+/// saved edit is a new file renamed into the clip's place, which on NTFS
+/// keeps the made time (the name's, through tunneling) and is given the
+/// modified time back (`keep_date`): its size is what tells it apart, and an
+/// edit is encoded afresh, all but never the same size to the byte.
+type Stamp = (u64, Option<SystemTime>, Option<SystemTime>);
+
+/// The ids of one library's clips known from the last scan, and those seen
+/// in this one.
+struct Ids {
+    known: BTreeMap<PathBuf, (Stamp, Option<String>)>,
+    seen: BTreeMap<PathBuf, (Stamp, Option<String>)>,
+}
+
+impl Ids {
+    /// What's known of `lib`'s clips, taken out (another library's stay).
+    fn of(lib: &Path) -> Self {
+        let mut all = IDS.lock().unwrap();
+        let (known, rest): (BTreeMap<_, _>, BTreeMap<_, _>) = std::mem::take(&mut *all).into_iter().partition(|(path, _)| path.starts_with(lib));
+        *all = rest;
+        Self { known, seen: BTreeMap::new() }
+    }
+
+    /// The id of the clip at `path` (`meta`: its metadata): as read before
+    /// when it's the same file, else read now.
+    fn get(&mut self, path: &Path, meta: &std::fs::Metadata) -> Option<String> {
+        let stamp = (meta.len(), meta.modified().ok(), meta.created().ok());
+        let id = match self.known.remove(path) {
+            Some((was, id)) if was == stamp => id,
+            _ => crate::store::read_id(path),
+        };
+        self.seen.insert(path.to_path_buf(), (stamp, id.clone()));
+        id
+    }
+
+    /// Kept for the next scan: the clips seen in this one (not those gone).
+    fn keep(self) {
+        IDS.lock().unwrap().extend(self.seen);
+    }
 }
 
 /// The library's folders, by name. Hidden ones (`.hesteclips`, the edits)
@@ -113,7 +189,7 @@ pub fn stamp(lib: &Path) -> Vec<Option<SystemTime>> {
 }
 
 /// The clips directly in `dir`, which is `lib` or its `folder`.
-fn scan_dir(lib: &Path, dir: &Path, folder: Option<&str>, any_edits: bool) -> Vec<Clip> {
+fn scan_dir(lib: &Path, dir: &Path, folder: Option<&str>, any_edits: bool, ids: &mut Ids) -> Vec<Clip> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -131,15 +207,18 @@ fn scan_dir(lib: &Path, dir: &Path, folder: Option<&str>, any_edits: bool) -> Ve
                 .and_then(|e| e.to_str())
                 .map(|e| VIDEO_EXTS.contains(&e.to_ascii_lowercase().as_str()))
                 .unwrap_or(false);
-            if !ext_ok {
+            let image = is_image(&path);
+            if !ext_ok && !image {
                 return None;
             }
             let meta = entry.metadata().ok()?;
             if !meta.is_file() {
                 return None;
             }
-            let id = if any_edits { crate::store::read_id(&path) } else { None };
+            // Only videos are edited.
+            let id = if any_edits && !image { ids.get(&path, &meta) } else { None };
             let original = id.as_deref().and_then(|id| crate::store::find_original(lib, id));
+            let kept_bytes = id.as_deref().map_or(0, |id| dir_bytes(&crate::store::assets_dir(lib, id)));
             Some(Clip {
                 name: path.file_name()?.to_string_lossy().into_owned(),
                 modified: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
@@ -148,10 +227,17 @@ fn scan_dir(lib: &Path, dir: &Path, folder: Option<&str>, any_edits: bool) -> Ve
                 id,
                 original,
                 folder: folder.map(str::to_owned),
+                kept_bytes,
                 path,
             })
         })
         .collect()
+}
+
+/// The bytes in the files directly in `dir` (0 if there's no such folder).
+fn dir_bytes(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
+    entries.flatten().filter_map(|e| e.metadata().ok()).filter(|m| m.is_file()).map(|m| m.len()).sum()
 }
 
 /// The folder for clips with no game.
@@ -279,14 +365,17 @@ pub fn day_label(day: NaiveDate) -> String {
 }
 
 /// Friendly title for a file stem: "clip_2026-10-01_14-51-01" → "14:51:01",
-/// "recording_…" → "Recording 14:51:01", and with what happened in the game
-/// ("clip_… - 3 kills on Mirage") → "3 kills on Mirage · 14:51:01"; anything
-/// else (a renamed clip) as is.
+/// "recording_…" → "Recording 14:51:01", "screenshot_…" → "Screenshot
+/// 14:51:01", and with what happened in the game ("clip_… - 3 kills on
+/// Mirage") → "3 kills on Mirage · 14:51:01"; anything else (a renamed clip)
+/// as is.
 pub fn title_for_stem(stem: &str) -> String {
     let (kind, rest) = if let Some(r) = stem.strip_prefix("clip_") {
         ("", r)
     } else if let Some(r) = stem.strip_prefix("recording_") {
         ("Recording ", r)
+    } else if let Some(r) = stem.strip_prefix("screenshot_") {
+        ("Screenshot ", r)
     } else {
         return stem.to_owned();
     };
@@ -395,6 +484,7 @@ mod tests {
     fn titles_and_names() {
         assert_eq!(title_for_stem("clip_2026-10-01_14-51-01"), "14:51:01");
         assert_eq!(title_for_stem("recording_2026-10-01_14-51-01"), "Recording 14:51:01");
+        assert_eq!(title_for_stem("screenshot_2026-10-01_14-51-01 (2)"), "Screenshot 14:51:01 (2)");
         assert_eq!(title_for_stem("clip_2026-10-01_14-51-01 (edit)"), "14:51:01 (edit)");
         assert_eq!(title_for_stem("Ace clutch"), "Ace clutch");
         assert_eq!(title_for_stem("clip_2026-10-01_14-51-01 - 3 kills on Mirage"), "3 kills on Mirage · 14:51:01");
@@ -423,16 +513,53 @@ mod tests {
         std::fs::write(lib.join("clip_2026-10-01_14-51-01.mp4"), b"x").unwrap();
         std::fs::write(lib.join("osu!").join("clip_2026-10-02_14-51-01.mp4"), b"x").unwrap();
         std::fs::write(lib.join("osu!").join(".clip_2026-10-02_14-52-01.mp4"), b"x").unwrap();
+        std::fs::write(lib.join("osu!").join("screenshot_2026-10-02_14-53-01.png"), b"x").unwrap();
+        std::fs::write(lib.join("osu!").join(".screenshot_2026-10-02_14-54-01.png"), b"x").unwrap();
+        std::fs::write(lib.join("notes.txt"), b"x").unwrap();
         std::fs::write(lib.join(".hesteclips").join("abcdef12").join("original.mp4"), b"x").unwrap();
         let found: Vec<(String, Option<String>)> = scan(&lib).into_iter().map(|c| (c.name, c.folder)).collect();
         assert_eq!(
             found,
-            [("clip_2026-10-02_14-51-01.mp4".to_owned(), Some("osu!".to_owned())), ("clip_2026-10-01_14-51-01.mp4".to_owned(), None)]
+            [
+                ("screenshot_2026-10-02_14-53-01.png".to_owned(), Some("osu!".to_owned())),
+                ("clip_2026-10-02_14-51-01.mp4".to_owned(), Some("osu!".to_owned())),
+                ("clip_2026-10-01_14-51-01.mp4".to_owned(), None)
+            ]
         );
         assert_eq!(free_path(&lib, "clip_2026-10-01_14-51-01.mp4"), lib.join("clip_2026-10-01_14-51-01 (2).mp4"));
         assert_eq!(free_path(&lib, "new.mp4"), lib.join("new.mp4"));
         assert!(path_for_folder(&lib, "OSU!", &lib.join("osu!")).is_ok());
         assert!(path_for_folder(&lib, "osu!", &lib.join("Desktop")).is_err());
+        std::fs::remove_dir_all(&lib).unwrap();
+    }
+
+    /// An MP4 holding just its comment (QuickTime's way): `moov/udta/©cmt`.
+    fn mp4_with_comment(text: &str) -> Vec<u8> {
+        let boxed = |kind: &[u8; 4], body: &[u8]| [&((body.len() + 8) as u32).to_be_bytes()[..], kind, body].concat();
+        let cmt = [&(text.len() as u16).to_be_bytes()[..], &[0, 0], text.as_bytes()].concat();
+        boxed(b"moov", &boxed(b"udta", &boxed(b"\xa9cmt", &cmt)))
+    }
+
+    /// A clip's id is read from its file once: a scan reads it again only
+    /// when the file has changed (its size, or when it was modified or made).
+    #[test]
+    fn ids_are_read_again_only_from_changed_files() {
+        let lib = std::env::temp_dir().join(format!("hc-ids-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&lib);
+        std::fs::create_dir_all(lib.join(crate::store::DIR)).unwrap();
+        let clip = lib.join("clip_2026-10-01_14-51-01.mp4");
+        let id = || scan(&lib).into_iter().find(|c| c.path == clip).and_then(|c| c.id);
+        std::fs::write(&clip, mp4_with_comment("hesteclips: id=aaaaaaaa")).unwrap();
+        assert_eq!(id().as_deref(), Some("aaaaaaaa"));
+        // Written over with as many bytes, and its time put back: the same
+        // file as far as can be told, so not read.
+        let modified = std::fs::metadata(&clip).unwrap().modified().unwrap();
+        std::fs::write(&clip, mp4_with_comment("hesteclips: id=bbbbbbbb")).unwrap();
+        std::fs::File::options().write(true).open(&clip).unwrap().set_modified(modified).unwrap();
+        assert_eq!(id().as_deref(), Some("aaaaaaaa"), "read again");
+        // Another size: read.
+        std::fs::write(&clip, mp4_with_comment("hesteclips: id=cccccccccc")).unwrap();
+        assert_eq!(id().as_deref(), Some("cccccccccc"));
         std::fs::remove_dir_all(&lib).unwrap();
     }
 

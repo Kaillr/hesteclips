@@ -5,7 +5,8 @@
 //! there and the preview shows the same picture. Its full height always
 //! shows (only the sides are trimmed, by at most a fifth).
 //!
-//! On Windows and macOS the pictures are exact frames from the GPU's video decoder, in
+//! The pictures are exact frames from the in-process decoder (the GPU's on
+//! Windows and macOS, libavcodec on Linux: on the card there), in
 //! stretches of a fixed number of frames laid end to end from the clip's
 //! start (the last one to its end), as many frames as fit a thumbnail at
 //! this zoom: they stay put while panning. A picture shows only its own frame:
@@ -16,7 +17,7 @@
 //! clip's keyframes, from `media::keyframe_strip`: the ones to show are
 //! decided before any is decoded, so each appears once.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 
 use egui::{Color32, Pos2, Rect, Vec2};
@@ -27,7 +28,14 @@ const HEIGHT: u32 = 112;
 /// At most this many keyframe thumbnails, however long the clip.
 const MAX_THUMBS: usize = 160;
 
-pub enum Filmstrip {
+pub struct Filmstrip {
+    /// The file it shows (the player and the editor hand it on, to the one
+    /// showing the same file).
+    source: PathBuf,
+    kind: Kind,
+}
+
+enum Kind {
     #[cfg(hw_decode)]
     Exact(exact::Exact),
     Keys(Keys),
@@ -35,46 +43,57 @@ pub enum Filmstrip {
 
 impl Filmstrip {
     pub fn build(ctx: &egui::Context, source: &Path, info: &ClipInfo) -> Self {
+        let kind = Self::kind(ctx, source, info);
+        Self { source: source.to_path_buf(), kind }
+    }
+
+    fn kind(ctx: &egui::Context, source: &Path, info: &ClipInfo) -> Kind {
         #[cfg(hw_decode)]
         if std::env::var_os("HESTECLIPS_NO_HW_DECODE").is_none() {
-            return Self::Exact(exact::Exact::open(ctx, source, info));
+            return Kind::Exact(exact::Exact::open(ctx, source, info));
         }
         let _ = info;
-        Self::Keys(Keys::build(ctx, source))
+        Kind::Keys(Keys::build(ctx, source))
+    }
+
+    /// The file it shows.
+    pub fn source(&self) -> &Path {
+        &self.source
     }
 
     /// Paint into `lane`, which shows `from..to` seconds of a clip `dur` long.
     pub fn paint(&mut self, ui: &egui::Ui, lane: Rect, from: f64, to: f64, dur: f64) {
         // The decoder couldn't open the clip: keyframes instead.
         #[cfg(hw_decode)]
-        if let Self::Exact(e) = self {
+        if let Kind::Exact(e) = &self.kind {
             if e.failed() {
-                *self = Self::Keys(Keys::build(ui.ctx(), &e.source));
+                self.kind = Kind::Keys(Keys::build(ui.ctx(), &e.source));
             }
         }
-        match self {
+        match &mut self.kind {
             #[cfg(hw_decode)]
-            Self::Exact(e) => e.paint(ui, lane, from, to, dur),
-            Self::Keys(k) => k.paint(ui, lane, from, to, dur),
+            Kind::Exact(e) => e.paint(ui, lane, from, to, dur),
+            Kind::Keys(k) => k.paint(ui, lane, from, to, dur),
         }
     }
 
     /// The clip's file was renamed: the open decoder keeps reading it; only
     /// a fallback that opens it again needs the new name.
     pub fn renamed(&mut self, to: &Path) {
-        match self {
+        self.source = to.to_path_buf();
+        match &mut self.kind {
             #[cfg(hw_decode)]
-            Self::Exact(e) => e.source = to.to_path_buf(),
-            Self::Keys(_) => {}
+            Kind::Exact(e) => e.source = to.to_path_buf(),
+            Kind::Keys(_) => {}
         }
     }
 
     /// The decoded thumbnail nearest `t`, if any (a rough hover preview).
     pub fn near(&self, t: f64) -> Option<&egui::TextureHandle> {
-        match self {
+        match &self.kind {
             #[cfg(hw_decode)]
-            Self::Exact(e) => e.near(t),
-            Self::Keys(k) => k.near(t),
+            Kind::Exact(e) => e.near(t),
+            Kind::Keys(k) => k.near(t),
         }
     }
 }
@@ -117,6 +136,70 @@ mod exact {
     /// Thumbnails kept, at ~90 KB each.
     const CACHE: usize = 800;
 
+    /// The filmstrip's decoders: on Linux on the card where it can
+    /// (the pictures made small there: no CPU), but on the CPU while
+    /// playback is short of the card's video decoder (a 1440p 540 fps clip
+    /// needs nearly all of it: sharing it, playback showed 400 frames a
+    /// second, not 540), as it always was elsewhere: the platform's own.
+    struct Decoders {
+        path: PathBuf,
+        width: u32,
+        fps: f64,
+        card: Option<Decoder>,
+        cpu: Option<Decoder>,
+        /// The CPU's couldn't open: the card's does it all.
+        cpu_failed: bool,
+    }
+
+    impl Decoders {
+        fn open(path: &Path, width: u32, fps: f64) -> anyhow::Result<Self> {
+            let mut d = Self { path: path.to_path_buf(), width, fps, card: None, cpu: None, cpu_failed: false };
+            #[cfg(target_os = "linux")]
+            if std::env::var_os("HESTECLIPS_CPU_DECODE").is_none()
+                && let Some(card) = capture::decode::Card::background()
+            {
+                match Decoder::open_rgba_card(path, width, &card) {
+                    Ok(mut dec) => {
+                        dec.set_fps(fps);
+                        d.card = Some(dec);
+                    }
+                    Err(e) => eprintln!("filmstrip: decoding on the CPU ({e:#})"),
+                }
+            }
+            if d.card.is_none() {
+                d.cpu = Some(d.open_cpu()?);
+            }
+            Ok(d)
+        }
+
+        fn open_cpu(&self) -> anyhow::Result<Decoder> {
+            let mut dec = Decoder::open_rgba(&self.path, self.width)?;
+            dec.set_fps(self.fps);
+            Ok(dec)
+        }
+
+        /// Frame `i`'s picture, from the card's decoder unless playback is
+        /// short of it.
+        fn frame(&mut self, i: u64) -> anyhow::Result<Option<Picture>> {
+            let short = capture::playback_short();
+            if short && self.card.is_some() && self.cpu.is_none() && !self.cpu_failed {
+                match self.open_cpu() {
+                    Ok(dec) => self.cpu = Some(dec),
+                    Err(e) => {
+                        eprintln!("filmstrip: can't decode on the CPU meanwhile ({e:#})");
+                        self.cpu_failed = true;
+                    }
+                }
+            }
+            match (&mut self.card, &mut self.cpu) {
+                (Some(_), Some(cpu)) if short => cpu.frame(i),
+                (Some(card), _) => card.frame(i),
+                (None, Some(cpu)) => cpu.frame(i),
+                (None, None) => anyhow::bail!("no decoder"),
+            }
+        }
+    }
+
     pub struct Exact {
         pub source: std::path::PathBuf,
         /// The decoder couldn't open the clip.
@@ -149,7 +232,7 @@ mod exact {
                 // The filmstrip's decoding yields to everything else.
                 crate::video::lower_priority();
                 // Opened here, not on the UI thread: it takes a few hundred ms.
-                let mut dec = match Decoder::open_rgba(&path, width) {
+                let mut dec = match Decoders::open(&path, width, fps) {
                     Ok(d) => d,
                     Err(e) => {
                         eprintln!("filmstrip: hardware decoder unavailable, using keyframes: {e:#}");
@@ -158,7 +241,6 @@ mod exact {
                         return;
                     }
                 };
-                dec.set_fps(fps);
                 // Wait for a list; work through it, switching to a newer one
                 // the moment it arrives.
                 let Ok(mut list) = want_rx.recv() else { return };

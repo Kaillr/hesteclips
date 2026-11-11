@@ -21,7 +21,7 @@ use egui::{Pos2, Vec2, vec2};
 
 use crate::clips::Clip;
 use crate::collections::Collections;
-use crate::library::{Filter, View};
+use crate::library::{Filter, ShowKind, View};
 use crate::settings::LibrarySort;
 use crate::theme;
 
@@ -56,16 +56,26 @@ pub enum GridItem {
 pub struct Group {
     pub day: Option<chrono::NaiveDate>,
     pub items: Vec<GridItem>,
-    /// How many of them are clips (not ones being made).
+    /// How many of them are clips (not ones being made), and of those, how
+    /// many are screenshots.
     pub clips: usize,
+    pub shots: usize,
 }
 
 /// What the library shows, worked out once per change.
 #[derive(Default)]
 pub struct Shown {
     key: Option<ShownKey>,
-    /// The clips in the filter, before the search.
+    /// The clips in the filter, before the search, and of those how many are
+    /// screenshots.
     pub in_filter: usize,
+    pub shots_in_filter: usize,
+    /// The clips and the screenshots here and found by the search, whichever
+    /// kind is shown: what the heading counts, and picks between.
+    pub found: (usize, usize),
+    /// Whether the library has any screenshots (then clips or screenshots
+    /// can be chosen).
+    pub any_shots: bool,
     /// The clips shown, in order (indices into the library's list).
     pub clips: Vec<usize>,
     pub groups: Vec<Group>,
@@ -86,6 +96,7 @@ struct ShownKey {
     library: u64,
     collections: u64,
     filter: Filter,
+    kind: ShowKind,
     query: String,
     sort: LibrarySort,
     lengths: u64,
@@ -101,6 +112,7 @@ pub struct Inputs<'a> {
     pub library_version: u64,
     pub collections: &'a Collections,
     pub filter: &'a Filter,
+    pub kind: ShowKind,
     pub query: &'a str,
     pub sort: LibrarySort,
     pub lengths_version: u64,
@@ -121,6 +133,7 @@ impl Shown {
             library: inp.library_version,
             collections: inp.collections.version(),
             filter: inp.filter.clone(),
+            kind: inp.kind,
             query: query.clone(),
             sort: inp.sort,
             lengths: if inp.sort == LibrarySort::Longest { inp.lengths_version } else { 0 },
@@ -133,11 +146,21 @@ impl Shown {
         }
         let clips = inp.clips;
         let sets = inp.collections.sets();
-        let in_filter = |c: &Clip| match inp.filter {
+        let in_place = |c: &Clip| match inp.filter {
             Filter::Collection(id) => sets.get(id).is_some_and(|s| s.contains(&c.path)),
             f => f.matches(c, inp.collections),
         };
+        let in_filter = |c: &Clip| inp.kind.matches(c) && in_place(c);
         let matches = |c: &Clip| query.is_empty() || c.title().to_lowercase().contains(&query) || c.folder.as_ref().is_some_and(|f| f.to_lowercase().contains(&query));
+        // Here and found by the search, of each kind, whichever kind is shown.
+        let (mut found_clips, mut found_shots) = (0, 0);
+        for c in clips.iter().filter(|c| in_place(c) && matches(c)) {
+            if c.is_image() {
+                found_shots += 1;
+            } else {
+                found_clips += 1;
+            }
+        }
         let filtered: Vec<usize> = (0..clips.len()).filter(|&i| in_filter(&clips[i])).collect();
         let mut shown: Vec<usize> = filtered.iter().copied().filter(|&i| matches(&clips[i])).collect();
         match inp.sort {
@@ -154,6 +177,9 @@ impl Shown {
         self.groups = group(clips, &shown, inp.sort, &query, inp.placeholders, &inp.new_renders, today);
         self.days = self.groups.iter().filter_map(|g| g.day).collect();
         self.in_filter = filtered.len();
+        self.shots_in_filter = filtered.iter().filter(|&&i| clips[i].is_image()).count();
+        self.found = (found_clips, found_shots);
+        self.any_shots = clips.iter().any(Clip::is_image);
         self.clips = shown;
         let (games, collections) = views(clips, inp.collections, &sets);
         self.games = games;
@@ -183,16 +209,18 @@ fn group(clips: &[Clip], shown: &[usize], sort: LibrarySort, query: &str, placeh
     let mut live: Vec<GridItem> = (0..placeholders).map(GridItem::Placeholder).chain(new_renders.iter().map(|&i| GridItem::NewRender(i))).collect();
     let by_day = sort.by_day();
     if !live.is_empty() && query.is_empty() && by_day && sort == LibrarySort::Newest {
-        groups.push(Group { day: Some(today), items: std::mem::take(&mut live), clips: 0 });
+        groups.push(Group { day: Some(today), items: std::mem::take(&mut live), clips: 0, shots: 0 });
     }
     for &i in shown {
         let day = by_day.then(|| clips[i].day());
+        let shot = usize::from(clips[i].is_image());
         match groups.last_mut() {
             Some(g) if g.day == day => {
                 g.items.push(GridItem::Clip(i));
                 g.clips += 1;
+                g.shots += shot;
             }
-            _ => groups.push(Group { day, items: vec![GridItem::Clip(i)], clips: 1 }),
+            _ => groups.push(Group { day, items: vec![GridItem::Clip(i)], clips: 1, shots: shot }),
         }
     }
     if !live.is_empty() {
@@ -205,9 +233,9 @@ fn group(clips: &[Clip], shown: &[usize], sort: LibrarySort, query: &str, placeh
                     live.append(&mut g.items);
                     g.items = live;
                 }
-                None => groups.push(Group { day: None, items: live, clips: 0 }),
+                None => groups.push(Group { day: None, items: live, clips: 0, shots: 0 }),
             },
-            _ => groups.push(Group { day: Some(today), items: live, clips: 0 }),
+            _ => groups.push(Group { day: Some(today), items: live, clips: 0, shots: 0 }),
         }
     }
     groups
@@ -277,12 +305,11 @@ struct Index {
     days: HashMap<chrono::NaiveDate, usize>,
 }
 
-/// What a card or heading is followed by from one layout to the next.
+/// What a card is followed by from one layout to the next.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Key {
     Clip(PathBuf),
     Placeholder(usize),
-    Day(chrono::NaiveDate),
 }
 
 impl Layout {
@@ -476,12 +503,45 @@ impl Moves {
         }
     }
 
+    /// Whether any of these cards (a day's) were shown before the change:
+    /// then they slide to their places, and the day's heading goes with them.
+    /// None (switching between games with no clip in common): the heading
+    /// has nothing to travel with, and appears in place with its clips.
+    pub fn carries(&self, mut keys: impl Iterator<Item = Key>) -> bool {
+        match &self.before {
+            Some(b) => keys.any(|k| b.layout.card(&k).is_some()),
+            None => false,
+        }
+    }
+
+    /// Where a day's heading (now at `target`) is drawn. `carried`: see
+    /// [`Moves::carries`]; a heading with none of its clips carried over
+    /// doesn't slide, even if the same day was shown before: it fades in
+    /// (and stays put if it's where it was).
+    pub fn place_day(&self, d: chrono::NaiveDate, target: Pos2, carried: bool, now: f64, view: (f32, f32)) -> Placed {
+        let Some(b) = &self.before else { return Placed { at: target, shown: 1.0 } };
+        let t = ((now - b.changed) as f32 / SLIDE).clamp(0.0, 1.0);
+        if t >= 1.0 {
+            return Placed { at: target, shown: 1.0 };
+        }
+        let e = theme::ease_out(t);
+        let was = b.layout.day(d);
+        if carried && let Some(from) = was {
+            let from = b.start(from, target, view);
+            return Placed { at: from + (target - from) * e, shown: 1.0 };
+        }
+        // Nothing carried over: in place; solid if the same heading was
+        // already there, else fading in like the cards under it.
+        let there = was.is_some_and(|w| (w.y - target.y).abs() < 0.5);
+        Placed { at: target, shown: if there { 1.0 } else { e } }
+    }
+
     /// Where `key` (now at `target`, content coordinates) is drawn, given
     /// the view now (top, bottom, content coordinates). `day`: the day the
-    /// card is under (its heading's key): a card that wasn't shown before
-    /// moves with its day's heading as it fades in, so a day's cards and its
-    /// heading arrive together (switching between games with no clip in
-    /// common, every card is new).
+    /// card is under, when that heading slides ([`Moves::carries`]): a card
+    /// that wasn't shown before moves with its day's heading as it fades in,
+    /// so a day's cards and its heading arrive together. `None`: it fades in
+    /// where it is.
     pub fn place(&self, key: &Key, target: Pos2, now: f64, view: (f32, f32), day: Option<chrono::NaiveDate>) -> Placed {
         let Some(b) = &self.before else { return Placed { at: target, shown: 1.0 } };
         let t = ((now - b.changed) as f32 / SLIDE).clamp(0.0, 1.0);
@@ -489,11 +549,7 @@ impl Moves {
             return Placed { at: target, shown: 1.0 };
         }
         let e = theme::ease_out(t);
-        let from = match key {
-            Key::Day(d) => b.layout.day(*d),
-            k => b.layout.card(k),
-        };
-        if let Some(from) = from {
+        if let Some(from) = b.layout.card(key) {
             let from = b.start(from, target, view);
             return Placed { at: from + (target - from) * e, shown: 1.0 };
         }
@@ -538,13 +594,14 @@ mod tests {
             id: None,
             original: None,
             folder: Some(folder.into()),
+            kept_bytes: 0,
         }
     }
 
     fn layout_of(clips: &[Clip], filter: &Filter, width: f32) -> (Shown, Layout) {
         let cols = Collections::default();
         let mut shown = Shown::default();
-        shown.update(Inputs { clips, library_version: 1, collections: &cols, filter, query: "", sort: LibrarySort::Newest, lengths_version: 0, placeholders: 0, new_renders: Vec::new(), renders: &[] }, false, |_| None);
+        shown.update(Inputs { clips, library_version: 1, collections: &cols, filter, kind: ShowKind::All, query: "", sort: LibrarySort::Newest, lengths_version: 0, placeholders: 0, new_renders: Vec::new(), renders: &[] }, false, |_| None);
         let l = Layout::new(&shown.groups, Metrics::for_width(width), |_| 1.0, |it| key_for(it, clips, &[]));
         (shown, l)
     }
@@ -631,12 +688,12 @@ mod tests {
         assert_eq!((p.at, p.shown), (target, 1.0));
     }
 
-    /// Two games with no clip in common: every card is new, and each moves
-    /// with its day's heading (from where the heading was) while it fades
-    /// in, so a day arrives together instead of its heading sliding past
-    /// cards that are already in place.
+    /// Two games with no clip in common: every card is new, so nothing slides:
+    /// the days' headings stay where they are and the cards fade in beside
+    /// them. (A heading that slid past cards already in place, or on its own
+    /// for a day both games have, looked like it moved for no reason.)
     #[test]
-    fn new_cards_move_with_their_day() {
+    fn nothing_slides_when_no_clip_is_carried_over() {
         // Days 1-3: osu! has one clip a day, Dota 2 has ten a day, so in Dota 2
         // day 2's heading is far lower than in osu!.
         let mut clips: Vec<Clip> = (0..30).map(|i| clip(i, "Dota 2")).collect();
@@ -645,26 +702,83 @@ mod tests {
             c.path = PathBuf::from(format!("/lib/osu!/clip_2026-01-{:02}_09-00-00.mp4", d + 1));
             clips.push(c);
         }
-        let (_, osu) = layout_of(&clips, &Filter::Folder("osu!".into()), 900.0);
-        let (_, dota) = layout_of(&clips, &Filter::Folder("Dota 2".into()), 900.0);
+        let (shown, osu) = layout_of(&clips, &Filter::Folder("osu!".into()), 900.0);
+        let (dota_shown, dota) = layout_of(&clips, &Filter::Folder("Dota 2".into()), 900.0);
         let mut m = Moves::default();
         let id = |s| LayoutId { shown: s, metrics: (4, 900) };
         let view = (0.0, 2000.0);
+        let before: Vec<Vec<(Key, GridItem)>> = shown.groups.iter().map(|g| g.items.iter().map(|it| (key_for(it, &clips, &[]), it.clone())).collect()).collect();
         m.update(id(1), 0.0, false, || osu.clone(), |_| unreachable!(), |_| {}, Vec::new);
         m.set_view(view);
-        m.update(id(2), 10.0, false, || dota.clone(), |_| unreachable!(), |_| {}, Vec::new);
+        m.update(id(2), 10.0, false, || dota.clone(), |_| unreachable!(), |_| {}, || before.clone());
         let day = chrono::NaiveDate::from_ymd_opt(2026, 1, 2).unwrap();
         let (was, is) = (osu.day(day).unwrap(), dota.day(day).unwrap());
-        assert!(is.y - was.y > 100.0, "the heading moves down");
+        assert!(is.y - was.y > 100.0, "the heading is lower in the new view");
+
+        // Nothing of Dota 2's day 2 was shown before.
+        let group = dota_shown.groups.iter().find(|g| g.day == Some(day)).unwrap();
+        let keys = || group.items.iter().map(|it| key_for(it, &clips, &[]));
+        assert!(!m.carries(keys()));
+        // So the heading is already where it goes (not sliding from where the
+        // other game's was), fading in with the cards.
+        let mid = 10.0 + f64::from(SLIDE) / 2.0;
+        let heading = m.place_day(day, is, false, mid, view);
+        assert_eq!(heading.at, is);
+        assert!(heading.shown > 0.0 && heading.shown < 1.0, "fading in, not solid");
+        // The cards too: in place, fading in.
         let card = Key::Clip(clips[15].path.clone());
         let target = dota.card(&card).unwrap();
-        let p = m.place(&card, target, 10.0, view, Some(day));
-        assert_eq!(p.shown, 0.0);
-        assert!((p.at.y - (target.y - (is.y - was.y))).abs() < 0.5, "starts as far up as its heading: {} vs {}", p.at.y, target.y);
-        let heading = m.place(&Key::Day(day), is, 10.0 + f64::from(SLIDE) / 2.0, view, None);
-        let p = m.place(&card, target, 10.0 + f64::from(SLIDE) / 2.0, view, Some(day));
-        assert!(((p.at.y - target.y) - (heading.at.y - is.y)).abs() < 0.5, "travels with it");
-        assert_eq!(m.place(&card, target, 10.0 + f64::from(SLIDE), view, Some(day)).at, target);
+        let p = m.place(&card, target, mid, view, None);
+        assert_eq!(p.at, target);
+        assert!(p.shown > 0.0 && p.shown < 1.0);
+        assert_eq!(m.place(&card, target, 10.0 + f64::from(SLIDE), view, None).shown, 1.0);
+    }
+
+    /// A heading slides only when a clip under it was shown before: it goes
+    /// with its clips. Showing the same day in another view, with the heading
+    /// where it was and no clip in common, it stays solid, and doesn't move.
+    #[test]
+    fn a_heading_slides_with_its_clips_only() {
+        let clips: Vec<Clip> = (0..30).map(|i| clip(i, "osu!")).collect();
+        let (all_shown, all) = layout_of(&clips, &Filter::All, 900.0);
+        let (few_shown, few) = layout_of(&clips[..15], &Filter::All, 900.0);
+        let mut m = Moves::default();
+        let id = |s| LayoutId { shown: s, metrics: (4, 900) };
+        let view = (0.0, 2000.0);
+        let before: Vec<Vec<(Key, GridItem)>> = all_shown.groups.iter().map(|g| g.items.iter().map(|it| (key_for(it, &clips, &[]), it.clone())).collect()).collect();
+        m.update(id(1), 0.0, false, || all.clone(), |_| unreachable!(), |_| {}, Vec::new);
+        m.set_view(view);
+        m.update(id(2), 10.0, false, || few.clone(), |_| unreachable!(), |_| {}, || before.clone());
+        let day = few_shown.groups.iter().find_map(|g| g.day).unwrap();
+        let group = few_shown.groups.iter().find(|g| g.day == Some(day)).unwrap();
+        // Its clips were shown before: it's carried, and slides from where it was.
+        assert!(m.carries(group.items.iter().map(|it| key_for(it, &clips, &[]))));
+        let (was, is) = (all.day(day).unwrap(), few.day(day).unwrap());
+        let start = m.place_day(day, is, true, 10.0, view);
+        assert_eq!(start.at, was);
+        assert_eq!(m.place_day(day, is, true, 10.0 + f64::from(SLIDE), view).at, is);
+    }
+
+    /// What the heading counts and picks between: the clips and the
+    /// screenshots here (found by the search, while searching), whichever
+    /// kind is shown, so with one picked the other's number is still there to
+    /// switch to.
+    #[test]
+    fn found_counts_both_kinds_whichever_is_shown() {
+        let mut clips: Vec<Clip> = (0..5).map(|i| clip(i, "osu!")).collect();
+        clips.extend((5..8).map(|i| Clip { path: PathBuf::from(format!("/lib/osu!/screenshot_2026-01-01_12-00-{i:02}.png")), ..clip(i, "osu!") }));
+        clips.push(clip(9, "CS2"));
+        let cols = Collections::default();
+        let osu = Filter::Folder("osu!".into());
+        let inp = |kind, q: &'static str| Inputs { clips: &clips, library_version: 1, collections: &cols, filter: &osu, kind, query: q, sort: LibrarySort::Newest, lengths_version: 0, placeholders: 0, new_renders: Vec::new(), renders: &[] };
+        let mut shown = Shown::default();
+        for kind in [ShowKind::All, ShowKind::Clips, ShowKind::Screenshots] {
+            shown.update(inp(kind, ""), false, |_| None);
+            assert_eq!(shown.found, (5, 3), "showing {kind:?}");
+        }
+        assert_eq!(shown.clips.len(), 3, "the screenshots shown");
+        shown.update(inp(ShowKind::Clips, "screenshot"), false, |_| None);
+        assert_eq!((shown.found, shown.clips.len()), ((0, 3), 0), "searching: what it finds of each");
     }
 
     /// Worked out again only when something changed.
@@ -673,7 +787,7 @@ mod tests {
         let clips: Vec<Clip> = (0..50).map(|i| clip(i, "osu!")).collect();
         let cols = Collections::default();
         let mut shown = Shown::default();
-        let inp = |q: &'static str| Inputs { clips: &clips, library_version: 1, collections: &cols, filter: &Filter::All, query: q, sort: LibrarySort::Newest, lengths_version: 0, placeholders: 0, new_renders: Vec::new(), renders: &[] };
+        let inp = |q: &'static str| Inputs { clips: &clips, library_version: 1, collections: &cols, filter: &Filter::All, kind: ShowKind::All, query: q, sort: LibrarySort::Newest, lengths_version: 0, placeholders: 0, new_renders: Vec::new(), renders: &[] };
         assert!(shown.update(inp(""), false, |_| None));
         assert!(!shown.update(inp(""), false, |_| None));
         assert!(shown.update(inp("12"), false, |_| None));

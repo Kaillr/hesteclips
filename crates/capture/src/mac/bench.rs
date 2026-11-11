@@ -16,7 +16,7 @@ use objc2_video_toolbox::{VTSessionSetProperty, kVTCompressionPropertyKey_Priori
 
 use super::camera::CameraLayer;
 use super::decode::{Decoder, Output};
-use super::gpu::{FramePool, Gpu};
+use super::gpu::{Compositor, Draw, FramePool, camera_rects};
 use super::video::{Frames, Picture};
 use crate::avwriter::SendFormat;
 use crate::sck::{Encoder, host_now, probe_video_format};
@@ -30,14 +30,18 @@ fn settings(fps: u32, kbps: u32) -> EncodeSettings {
         container_ext: "mp4".into(),
         fps,
         blend_samples: 1,
+        blend_shape: Default::default(),
         video_bitrate_kbps: kbps,
-        target_height: None,
+        size: Default::default(),
         use_hardware: true,
         replay_seconds: 60,
-        video: VideoSource::Screen { id: String::new(), hook: Default::default() },
+        video: VideoSource::Screen { id: String::new(), hook: Default::default(), method: Default::default() },
         away_screen: None,
         webcam: None,
+        layers: crate::layers::main_only(),
+        screen: Arc::new(Mutex::new(crate::ScreenPlacement::whole(crate::Framing::Fit))),
         sources: Vec::new(),
+        stream: None,
     }
 }
 
@@ -69,7 +73,7 @@ pub fn save_render(screen: &Path, camera: Option<&Path>, out: &Path, mode: Rende
     if let Some(c) = &mut cam {
         c.set_fps(30.0);
     }
-    let gpu = Gpu::new()?;
+    let gpu = Compositor::new()?;
     let pool = FramePool::new(w, h)?;
     let s = settings(60, kbps);
     let (encoder, writer) = if matches!(mode, RenderMode::Full) {
@@ -113,7 +117,15 @@ pub fn save_render(screen: &Path, camera: Option<&Path>, out: &Path, mode: Rende
         }
         let buf = pool.take()?;
         let ct = Instant::now();
-        gpu.compose(surface.buffer(), cam_frame.as_ref().map(|c| c.buffer()), placement.unwrap_or_else(Placement::hidden), &buf)?;
+        let (bw, bh) = super::video::size_of(surface.buffer());
+        let mut draws = vec![super::gpu::ScreenRects::copied(bw, bh).draw(surface.buffer())];
+        if let (Some(c), Some(p)) = (&cam_frame, placement) {
+            let (cw, ch) = super::video::size_of(c.buffer());
+            if let Some((src, dest)) = camera_rects(p, (cw as u32, ch as u32), (bw as u32, bh as u32)) {
+                draws.push(Draw::cover(c.buffer(), src, dest).turned(p.turns, p.flip_h, p.flip_v));
+            }
+        }
+        gpu.compose(&draws, &buf, &pool)?;
         compose_time += ct.elapsed();
         if let Some(e) = &encoder {
             e.encode(&buf, p.index as i64, 60);
@@ -245,8 +257,8 @@ fn spawn_sampler(stop: Arc<AtomicBool>) -> thread::JoinHandle<(Vec<f64>, Vec<f64
 /// Record the main display (and the webcam, as `mode` says) for `secs` into
 /// files in `dir`, and report what it cost.
 pub fn live(mode: LiveMode, secs: f64, camera: &str, dir: &Path, kbps: u32, cam_kbps: u32, target_height: Option<u32>) -> Result<()> {
-    let source = VideoSource::Screen { id: String::new(), hook: Default::default() };
-    let (content, display, (w, h)) = super::video::plan(&source, target_height)?;
+    let source = VideoSource::Screen { id: String::new(), hook: Default::default(), method: Default::default() };
+    let (content, display, (w, h)) = super::video::plan(&source, crate::VideoSize { short_side: target_height, ..Default::default() })?;
     let fps = 60;
     let s = settings(fps, kbps);
     let webcam = (mode != LiveMode::Screen).then(|| {
@@ -255,15 +267,17 @@ pub fn live(mode: LiveMode, secs: f64, camera: &str, dir: &Path, kbps: u32, cam_
     });
     // The camera opens first (as it does in the app, kept open by the Sources page).
     if let Some(wc) = &webcam {
-        super::camera::keep_open(Some((wc.device.clone(), None)));
+        super::camera::keep_open(vec![(wc.device.clone(), None)]);
         let deadline = Instant::now() + Duration::from_secs(5);
-        while super::camera::frame_size().is_none() && Instant::now() < deadline {
+        while super::camera::frame_size(&wc.device).is_none() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(50));
         }
     }
-    let picture = Picture::start(&source, &content, &display, (w, h), fps, None)?;
+    let picture = Picture::start(&source, &content, &display, (w, h), fps, None, crate::ScreenPlacement::whole(crate::Framing::Fit))?;
     let composite = if mode == LiveMode::Composited { webcam.as_ref() } else { None };
-    let mut frames = Frames::new(picture.latest.clone(), composite, w, h, 0)?;
+    let whole = Arc::new(Mutex::new(crate::ScreenPlacement::whole(crate::Framing::Fit)));
+    let layers = crate::layers::with_webcam(composite, false);
+    let mut frames = Frames::new(picture.latest.clone(), layers, whole, Some(picture.ctl()), w, h, fps, 0)?;
 
     let t0 = Arc::new(Mutex::new(0.0));
     let screen_stats = Arc::new(Mutex::new(Stats::default()));
@@ -274,7 +288,7 @@ pub fn live(mode: LiveMode, secs: f64, camera: &str, dir: &Path, kbps: u32, cam_
     let screen_enc = Encoder::new(w, h, &s, stx)?;
 
     let cam_parts = if mode == LiveMode::Separate {
-        let (cw, ch) = super::camera::frame_size().context("the camera isn't delivering")?;
+        let (cw, ch) = super::camera::frame_size(camera).context("the camera isn't delivering")?;
         let cs = settings(30, cam_kbps);
         let out = dir.join("live_Separate_camera.mp4");
         let writer = video_writer(&out, cw, ch, &cs)?;
@@ -301,7 +315,7 @@ pub fn live(mode: LiveMode, secs: f64, camera: &str, dir: &Path, kbps: u32, cam_
         let enc_ptr = &cam_parts.as_ref().unwrap().0 as *const Encoder as usize;
         let h = thread::spawn(move || {
             let enc = unsafe { &*(enc_ptr as *const Encoder) };
-            let mut layer = CameraLayer::new(&wc);
+            let mut layer = CameraLayer::new(&wc.device, wc.format, false);
             let late = pace(30, secs, start, enc, || layer.latest().map(|f| Arc::new(super::video::Buffer(f.buffer.clone()))));
             let _ = tx.send(late);
         });
@@ -328,7 +342,7 @@ pub fn live(mode: LiveMode, secs: f64, camera: &str, dir: &Path, kbps: u32, cam_
         let r = writer.join();
         (stats, out, size, r)
     });
-    super::camera::keep_open(None);
+    super::camera::keep_open(Vec::new());
 
     let avg = |v: &[f64]| if v.is_empty() { 0.0 } else { v.iter().sum::<f64>() / v.len() as f64 };
     let mut ss = screen_stats.lock().unwrap();

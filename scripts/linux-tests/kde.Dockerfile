@@ -5,7 +5,7 @@
 FROM fedora:42
 RUN dnf install -y --setopt=install_weak_deps=False \
     kwin-wayland plasma-workspace kf6-kservice pipewire wireplumber dbus-daemon \
-    gcc clang-devel pipewire-devel dbus-devel alsa-lib-devel \
+    gcc clang-devel pipewire-devel dbus-devel alsa-lib-devel ffmpeg-free-devel \
     ffmpeg-free procps-ng mesa-dri-drivers foot \
     && dnf clean all && (setcap -r /usr/bin/kwin_wayland || true)
 RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal

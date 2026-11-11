@@ -1,5 +1,5 @@
 //! Hear a microphone live ("Listen" on the Sources page), to check it works
-//! and how it sounds.
+//! and how it sounds. (Linux: `linux::monitor`.)
 //!
 //! The mic goes straight to the default output, not through the mixer (which
 //! runs deliberately behind, for the meters and the recording): its own input
@@ -24,14 +24,8 @@ const BUFFER_SECS: f32 = 0.005;
 const MAX_QUEUE: f32 = 0.02;
 
 /// The input's error handler.
-#[cfg(not(target_os = "linux"))]
 fn input_errors(device: &str) -> impl FnMut(cpal::Error) + Send + 'static {
     crate::sources::quiet_xruns(format!("{device} (Listen)"))
-}
-
-#[cfg(target_os = "linux")]
-fn input_errors(_: &str) -> impl FnMut(cpal::Error) + Send + 'static {
-    |e| eprintln!("mic monitor (input): {e}")
 }
 
 /// A microphone being played live; stops when dropped.
@@ -77,15 +71,32 @@ impl MicMonitor {
         } + crate::mixer::Denoise::FRAME as f32 / in_rate;
 
         let q = queue.clone();
-        // You hear it as it's recorded: with noise removal, cleaned (switching
-        // fades, as in the recording). It always comes a frame, 10 ms, later.
-        let mut denoise = crate::mixer::Denoise::new(channel.denoise_flag());
+        // You hear it as it's recorded: its first two channels (a mono mic's
+        // one on both), with Mono as loud as the louder side, and with noise
+        // removal, cleaned (switching fades, as in the recording). It always
+        // comes a frame, 10 ms, later.
+        let mut sides = crate::mixer::Mono::new(channel.mono_flag());
+        let mut denoise = crate::mixer::Denoise::new(channel.denoise_mode());
+        let mut frames = Vec::new();
         let mut mono = Vec::new();
+        // Both streams' threads are taken on by Windows' multimedia
+        // scheduler the first time through, as a recording mic's is (see
+        // `sources::start_mic`): with 5 ms buffers, they're the first to be
+        // late while a game keeps every core busy.
+        #[cfg(target_os = "windows")]
+        let mut scheduled = false;
         let in_stream = input.build_input_stream::<f32, _, _>(
             in_stream_config,
             move |data, _| {
+                #[cfg(target_os = "windows")]
+                if !std::mem::replace(&mut scheduled, true) {
+                    crate::win::system::multimedia_thread("Audio");
+                }
+                frames.clear();
+                frames.extend(data.chunks(in_channels).map(|f| [f[0], f[1.min(in_channels - 1)]]));
+                sides.process(&mut frames);
                 mono.clear();
-                mono.extend(data.chunks(in_channels).map(|f| f.iter().sum::<f32>() / in_channels as f32));
+                mono.extend(frames.iter().map(|f| (f[0] + f[1]) * 0.5));
                 let out = denoise.process_mono(&mono);
                 let mut q = q.lock().unwrap();
                 q.extend(out);
@@ -107,9 +118,15 @@ impl MicMonitor {
         // that moves by a whole millisecond.
         let mut smooth = 0.0f32;
         let (q, lat) = (queue, latency_us.clone());
+        #[cfg(target_os = "windows")]
+        let mut scheduled = false;
         let out_stream = output.build_output_stream::<f32, _, _>(
             out_stream_config,
             move |out: &mut [f32], info| {
+                #[cfg(target_os = "windows")]
+                if !std::mem::replace(&mut scheduled, true) {
+                    crate::win::system::multimedia_thread("Audio");
+                }
                 let gain = channel.gain();
                 let mut q = q.lock().unwrap();
                 let queued = q.len() as f32 / in_rate;
@@ -138,7 +155,7 @@ impl MicMonitor {
                     lat.store(((smooth * 1000.0).round() * 1000.0) as u32, Ordering::Relaxed);
                 }
             },
-            |e| eprintln!("mic monitor (output): {e}"),
+            |e| crate::eprintln_later!("mic monitor (output): {e}"),
             None,
         )?;
         in_stream.play()?;

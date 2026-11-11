@@ -12,6 +12,10 @@
 //! what was in focus longest in it: a replay clip's window, a recording's
 //! whole length. So clipping a browser with a game open in the background
 //! files the clip under Desktop, not the game.
+//!
+//! With "Record whole sessions" on, it also looks every couple of seconds
+//! whether a game on the list is open (see `sessions.rs`), and keeps the
+//! moments marked during a recording (Save clip, while recording).
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -20,18 +24,18 @@ use std::time::Duration;
 
 use crate::discord::Game;
 
-/// What's being captured, as the focus history needs it.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Capturing {
-    Off,
-    /// The replay buffer: clips are of the last this many seconds.
-    Buffer(u32),
-    Record,
+/// What's being captured, as the focus history needs it: clipping and
+/// recording can run at once (streaming needs nothing of it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Capturing {
+    /// Clipping: clips are of the last this many seconds.
+    pub buffer: Option<u32>,
+    pub record: bool,
 }
 
 #[derive(Default)]
 struct State {
-    capturing: Option<Capturing>,
+    capturing: Capturing,
     /// The games and apps list: (id, name).
     apps: Vec<(String, String)>,
     /// The replay buffer: what was in focus each second, newest last (`None`:
@@ -42,8 +46,14 @@ struct State {
     /// Games by where their app is installed, so the stores' files are read
     /// once per app.
     by_path: HashMap<PathBuf, Option<String>>,
-    /// When the current capture started.
+    /// When the recording started.
     started: Option<std::time::Instant>,
+    /// A recording: the moments marked in it.
+    marks: Vec<std::time::Instant>,
+    /// Whether to look if a game on the list is open.
+    watching: bool,
+    /// A game on the list was open at the last look.
+    listed_open: bool,
 }
 
 /// What happened in the game in a clip, as it's saved.
@@ -53,6 +63,8 @@ pub struct Details {
     pub summary: Option<String>,
     /// Each kill: how long before the clip's end, and what it was.
     pub moments: Vec<(Duration, String)>,
+    /// A recording's marks: how long before its end each was.
+    pub marks: Vec<Duration>,
 }
 
 /// Notes what's in focus while capture runs.
@@ -70,23 +82,34 @@ impl Tracker {
         let t = tracker.clone();
         std::thread::Builder::new()
             .name("games".into())
-            .spawn(move || loop {
-                std::thread::sleep(Duration::from_secs(1));
-                sample(&t);
+            .spawn(move || {
+                for tick in 0u64.. {
+                    std::thread::sleep(Duration::from_secs(1));
+                    sample(&t);
+                    if tick % 2 == 0 {
+                        look(&t);
+                    }
+                }
             })
             .expect("spawn games thread");
         tracker
     }
 
     /// Keep up with the capture and the games and apps list (cheap when
-    /// nothing changed). A new capture starts a new history.
+    /// nothing changed). Clipping or a recording that starts starts a new
+    /// history of its own.
     pub fn set(&self, capturing: Capturing, apps: &[(String, String)]) {
         let mut s = self.state.lock().unwrap();
-        if s.capturing.as_ref() != Some(&capturing) {
-            s.recent.clear();
-            s.totals.clear();
-            s.capturing = Some(capturing);
-            s.started = Some(std::time::Instant::now());
+        if s.capturing != capturing {
+            if capturing.buffer.is_none() || s.capturing.buffer.is_none() {
+                s.recent.clear();
+            }
+            if capturing.record != s.capturing.record {
+                s.totals.clear();
+                s.marks.clear();
+                s.started = capturing.record.then(std::time::Instant::now);
+            }
+            s.capturing = capturing;
         }
         if s.apps != apps {
             s.apps = apps.to_vec();
@@ -112,26 +135,52 @@ impl Tracker {
     /// What happened in the game in a replay clip saved now ("3 kills on
     /// Mirage", and when each kill was), if the game reports it.
     pub fn clip_details(&self) -> Details {
-        let secs = match self.state.lock().unwrap().capturing {
-            Some(Capturing::Buffer(secs)) => secs,
-            _ => return Details::default(),
-        };
+        let Some(secs) = self.state.lock().unwrap().capturing.buffer else { return Details::default() };
         let now = std::time::Instant::now();
         let Some(since) = now.checked_sub(Duration::from_secs(secs.into())) else { return Details::default() };
-        Details { summary: self.events.summary(since), moments: self.events.moments(since, now) }
+        Details { summary: self.events.summary(since), moments: self.events.moments(since, now), marks: Vec::new() }
     }
 
-    /// What happened in the game during the recording that's being stopped.
+    /// What happened in the game during the recording that's being stopped,
+    /// and the moments marked in it.
     pub fn recording_details(&self) -> Details {
-        let Some(started) = self.state.lock().unwrap().started else { return Details::default() };
-        Details { summary: self.events.summary(started), moments: self.events.moments(started, std::time::Instant::now()) }
+        let s = self.state.lock().unwrap();
+        let Some(started) = s.started else { return Details::default() };
+        let now = std::time::Instant::now();
+        let marks = s.marks.iter().map(|at| now.saturating_duration_since(*at)).collect();
+        drop(s);
+        Details { summary: self.events.summary(started), moments: self.events.moments(started, now), marks }
+    }
+
+    /// Mark this moment in the recording, if one runs. Whether it did.
+    pub fn mark(&self) -> bool {
+        let mut s = self.state.lock().unwrap();
+        if !s.capturing.record {
+            return false;
+        }
+        s.marks.push(std::time::Instant::now());
+        true
+    }
+
+    /// Look whether a game on the list is open, or stop looking.
+    pub fn watch(&self, on: bool) {
+        let mut s = self.state.lock().unwrap();
+        s.watching = on;
+        if !on {
+            s.listed_open = false;
+        }
+    }
+
+    /// A game on the list was open at the last look (while watching).
+    pub fn listed_open(&self) -> bool {
+        self.state.lock().unwrap().listed_open
     }
 
     /// The app in focus now and the game it is, if it's one.
     pub fn focused(&self) -> Option<(String, Game)> {
         let (id, path) = capture::foreground_app_path()?;
         let apps = self.state.lock().unwrap().apps.clone();
-        let game = identify(&id, self.installed(&path), &apps)?;
+        let game = identify(&id, &path, self.installed(&path), &apps)?;
         Some((id, game))
     }
 
@@ -166,28 +215,45 @@ fn longest(counts: impl Iterator<Item = (Option<String>, u32)>) -> Option<String
 /// Note what's in focus now.
 fn sample(tracker: &Tracker) {
     let state = &tracker.state;
-    let seconds = match state.lock().unwrap().capturing {
-        Some(Capturing::Buffer(secs)) => Some(secs.max(1) as usize),
-        Some(Capturing::Record) => None,
-        _ => return,
-    };
+    let capturing = state.lock().unwrap().capturing;
+    if capturing.buffer.is_none() && !capturing.record {
+        return;
+    }
     let game = tracker.focused().map(|(_, g)| g.name);
     let mut s = state.lock().unwrap();
-    match seconds {
-        Some(window) => {
-            s.recent.push_back(game);
-            while s.recent.len() > window {
-                s.recent.pop_front();
-            }
+    if let Some(secs) = s.capturing.buffer {
+        s.recent.push_back(game.clone());
+        while s.recent.len() > secs.max(1) as usize {
+            s.recent.pop_front();
         }
-        None => *s.totals.entry(game).or_default() += 1,
     }
+    if s.capturing.record {
+        *s.totals.entry(game).or_default() += 1;
+    }
+}
+
+/// Look whether a game on the list is open (has a window), while watching.
+fn look(tracker: &Tracker) {
+    let apps = {
+        let s = tracker.state.lock().unwrap();
+        if !s.watching {
+            return;
+        }
+        s.apps.clone()
+    };
+    let open = !apps.is_empty() && {
+        let windowed = capture::list_windowed_apps();
+        apps.iter().any(|(id, _)| windowed.iter().any(|w| w.id.eq_ignore_ascii_case(id)))
+    };
+    let mut s = tracker.state.lock().unwrap();
+    // Turned off while looking: stays off.
+    s.listed_open = open && s.watching;
 }
 
 /// The game an app is, if it's one: Discord's name for it, else its store
 /// folder's (`by_place`), else its name on the games and apps list.
-fn identify(id: &str, by_place: Option<String>, apps: &[(String, String)]) -> Option<Game> {
-    crate::discord::known_game(id)
+fn identify(id: &str, path: &Path, by_place: Option<String>, apps: &[(String, String)]) -> Option<Game> {
+    crate::discord::known_game(id, path)
         .or_else(|| by_place.map(|name| Game { name, icon: None }))
         .or_else(|| apps.iter().find(|(a, _)| a.eq_ignore_ascii_case(id)).map(|(_, name)| Game { name: name.clone(), icon: None }))
 }

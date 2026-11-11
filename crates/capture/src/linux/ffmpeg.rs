@@ -1,8 +1,9 @@
 //! Encoding with ffmpeg, which the app needs anyway (editing, thumbnails):
 //! H.264 from NV12 frames, AAC from the mixer's PCM, each in its own ffmpeg
 //! process fed through a pipe. ffmpeg gives us the GPU's encoder where there
-//! is one — NVENC on NVIDIA, VA-API on AMD and Intel — and x264 or OpenH264
-//! otherwise, whichever the installed ffmpeg has.
+//! is one — VA-API on AMD and Intel, NVENC on NVIDIA where ours (`nvenc`)
+//! can't start — and x264 or OpenH264 otherwise, whichever the installed
+//! ffmpeg has.
 //!
 //! What comes back is a raw stream (H.264 Annex B with an access unit
 //! delimiter before each frame, AAC in ADTS frames), cut into packets here and
@@ -14,7 +15,8 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use std::thread::{self, JoinHandle};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -23,6 +25,7 @@ use crate::EncodeSettings;
 use crate::mixer::RATE;
 use crate::mp4file::{EncodedFrame, VideoFrame};
 use crate::mp4mux::{AvcConfig, annexb_to_avcc};
+use crate::stream::StreamFrame;
 use crate::writer::{AacPacket, Command as WriterCommand, Media};
 
 /// The ffmpeg to run: one shipped next to the app wins over the one on `PATH`
@@ -81,35 +84,51 @@ impl Codec {
         matches!(self, Codec::Nvenc | Codec::Vaapi)
     }
 
-    /// ffmpeg's arguments to encode `width`×`height` NV12 from stdin to
-    /// H.264 Annex B on stdout.
-    fn args(self, width: u32, height: u32, fps: u32, kbps: u32, gop: u32) -> Vec<String> {
+    /// ffmpeg's arguments to encode NV12 `input` big from stdin to H.264
+    /// Annex B on stdout, `output` big (made that size here where they
+    /// differ, each pixel the average of what it covers). A stream's
+    /// (`stream`, `crate::stream`): a constant bitrate over a second's
+    /// buffer, as the services ask.
+    fn args(self, input: (u32, u32), output: (u32, u32), fps: u32, kbps: u32, gop: u32, stream: bool) -> Vec<String> {
         let mut a: Vec<String> = Vec::new();
         let mut push = |s: &[&str]| a.extend(s.iter().map(|s| s.to_string()));
         if self == Codec::Vaapi {
             let device = render_node().unwrap_or_else(|| "/dev/dri/renderD128".into());
             push(&["-init_hw_device", &format!("vaapi=va:{device}"), "-filter_hw_device", "va"]);
         }
-        push(&["-f", "rawvideo", "-pix_fmt", "nv12", "-video_size", &format!("{width}x{height}"), "-framerate", &fps.to_string()]);
+        push(&["-f", "rawvideo", "-pix_fmt", "nv12", "-video_size", &format!("{}x{}", input.0, input.1), "-framerate", &fps.to_string()]);
         push(&["-color_range", "tv", "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"]);
         push(&["-i", "pipe:0"]);
+        let mut filters = Vec::new();
+        if input != output {
+            filters.push(format!("scale={}:{}:flags=area", output.0, output.1));
+        }
         if self == Codec::Vaapi {
-            push(&["-vf", "format=nv12,hwupload"]);
+            filters.push("format=nv12,hwupload".to_owned());
+        }
+        if !filters.is_empty() {
+            push(&["-vf", &filters.join(",")]);
         }
         push(&["-c:v", self.ffmpeg_name()]);
-        let (rate, max, buf) = (format!("{kbps}k"), format!("{}k", kbps * 3 / 2), format!("{}k", kbps * 2));
+        let (rate, max, buf) = match stream {
+            true => (format!("{kbps}k"), format!("{kbps}k"), format!("{kbps}k")),
+            false => (format!("{kbps}k"), format!("{}k", kbps * 3 / 2), format!("{}k", kbps * 2)),
+        };
         // No B-frames, so frames come out in the order they went in: the Nth
         // packet is the Nth frame. Encoders tuned for low delay, so a clip
         // saved right after a moment has that moment in it.
         match self {
             Codec::Nvenc => push(&[
-                "-preset", "p4", "-tune", "ll", "-rc", "vbr", "-b:v", &rate, "-maxrate", &max, "-bufsize", &buf, "-profile:v", "high",
-                "-zerolatency", "1",
+                "-preset", "p4", "-tune", "ll", "-rc", if stream { "cbr" } else { "vbr" }, "-b:v", &rate, "-maxrate", &max, "-bufsize", &buf,
+                "-profile:v", "high", "-zerolatency", "1",
             ]),
-            Codec::Vaapi => push(&["-rc_mode", "VBR", "-b:v", &rate, "-maxrate", &max, "-bufsize", &buf, "-profile:v", "high"]),
-            Codec::X264 => push(&[
-                "-preset", "veryfast", "-tune", "zerolatency", "-b:v", &rate, "-maxrate", &max, "-bufsize", &buf, "-profile:v", "high",
-            ]),
+            Codec::Vaapi => push(&["-rc_mode", if stream { "CBR" } else { "VBR" }, "-b:v", &rate, "-maxrate", &max, "-bufsize", &buf, "-profile:v", "high"]),
+            Codec::X264 => {
+                push(&["-preset", "veryfast", "-tune", "zerolatency", "-b:v", &rate, "-maxrate", &max, "-bufsize", &buf, "-profile:v", "high"]);
+                if stream {
+                    push(&["-x264-params", "nal-hrd=cbr"]);
+                }
+            }
             Codec::OpenH264 => push(&["-rc_mode", "bitrate", "-allow_skip_frames", "0", "-b:v", &rate, "-maxrate", &max]),
         }
         push(&["-g", &gop.to_string(), "-bf", "0", "-fps_mode", "passthrough"]);
@@ -135,18 +154,29 @@ fn render_node() -> Option<String> {
 /// ffmpeg can list NVENC without an NVIDIA card, or VA-API without a driver
 /// that encodes H.264). Found once per run.
 pub fn encoder(hardware: bool) -> Result<Codec> {
-    static HW: OnceLock<Option<Codec>> = OnceLock::new();
-    static SW: OnceLock<Option<Codec>> = OnceLock::new();
+    // What was found, kept: unless the graphics card's encoder was wanted
+    // and only the CPU's worked, which may have been a moment's hiccup (the
+    // card still letting go of an app that just quit): looked for again on
+    // the next start.
+    static FOUND: Mutex<[Option<Codec>; 2]> = Mutex::new([None, None]);
+    if let Some(c) = FOUND.lock().unwrap()[usize::from(hardware)] {
+        return Ok(c);
+    }
     let candidates: &[Codec] =
         if hardware { &[Codec::Nvenc, Codec::Vaapi, Codec::X264, Codec::OpenH264] } else { &[Codec::X264, Codec::OpenH264] };
-    let found = (if hardware { &HW } else { &SW }).get_or_init(|| {
-        let listed = ffmpeg().arg("-encoders").output().ok().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
-        candidates
-            .iter()
-            .copied()
-            .filter(|c| listed.split_whitespace().any(|w| w == c.ffmpeg_name()))
-            .find(|c| works(*c))
+    let listed = ffmpeg().arg("-encoders").output().ok().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+    let gpu = |c: &Codec| matches!(c, Codec::Nvenc | Codec::Vaapi);
+    let found = candidates.iter().copied().filter(|c| listed.split_whitespace().any(|w| w == c.ffmpeg_name())).find(|c| {
+        // A card's encoder gets a second try a moment later.
+        works(*c) || (gpu(c) && {
+            thread::sleep(Duration::from_millis(300));
+            works(*c)
+        })
     });
+    let has_gpu_encoder = candidates.iter().any(|c| gpu(c) && listed.split_whitespace().any(|w| w == c.ffmpeg_name()));
+    if found.is_some_and(|c| !hardware || gpu(&c) || !has_gpu_encoder) {
+        FOUND.lock().unwrap()[usize::from(hardware)] = found;
+    }
     found.ok_or_else(|| {
         anyhow!(
             "ffmpeg can't encode H.264 here: install an ffmpeg with libx264 (on Fedora, RPM Fusion's `ffmpeg`), \
@@ -159,14 +189,24 @@ pub fn encoder(hardware: bool) -> Result<Codec> {
 fn works(codec: Codec) -> bool {
     let (w, h) = (320, 180);
     let mut child = match ffmpeg()
-        .args(codec.args(w, h, 30, 1000, 30))
+        .args(codec.args((w, h), (w, h), 30, 1000, 30, false))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
     {
         Ok(c) => c,
         Err(_) => return false,
+    };
+    // All of it: the reason is near the top, under lines ffmpeg prints
+    // whatever went wrong.
+    let errors = {
+        let mut stderr = child.stderr.take().unwrap();
+        thread::spawn(move || {
+            let mut text = String::new();
+            let _ = stderr.read_to_string(&mut text);
+            text
+        })
     };
     let frame = vec![128u8; (w * h * 3 / 2) as usize];
     let mut stdin = child.stdin.take().unwrap();
@@ -180,16 +220,45 @@ fn works(codec: Codec) -> bool {
     let mut out = Vec::new();
     let _ = child.stdout.take().unwrap().read_to_end(&mut out);
     let _ = writer.join();
-    let ok = child.wait().is_ok_and(|s| s.success());
-    ok && split_access_units(&mut out, true).len() == 5
+    let ok = child.wait().is_ok_and(|s| s.success()) && split_access_units(&mut out, true).len() == 5;
+    if !ok {
+        let why = errors.join().unwrap_or_default();
+        eprintln!("video encoder {} didn't work: {}", codec.ffmpeg_name(), why_encoder_failed(&why));
+    }
+    ok
+}
+
+/// What in ffmpeg's errors says why an encoder didn't work: its own lines,
+/// without the ones ffmpeg adds whatever the reason ("Nothing was written
+/// into output file", "Task finished with error code"…).
+fn why_encoder_failed(stderr: &str) -> String {
+    const GENERIC: &[&str] = &[
+        "Error while opening encoder",
+        "Error sending frames to consumers",
+        "Task finished with error code",
+        "Terminating thread with return code",
+        "Could not open encoder before EOF",
+        "Nothing was written into output file",
+        "Error parsing global options",
+    ];
+    let lines: Vec<&str> =
+        stderr.lines().map(str::trim).filter(|l| !l.is_empty() && !GENERIC.iter().any(|g| l.contains(g))).collect();
+    match lines.as_slice() {
+        [] => stderr.lines().last().unwrap_or("no output").trim().to_string(),
+        _ => lines.join(" | "),
+    }
 }
 
 // ---------------------------------------------------------------------------
 // H.264
 // ---------------------------------------------------------------------------
 
-/// Frames waiting for ffmpeg before the pacer starts dropping them.
-const QUEUE: usize = 4;
+/// Frames waiting for ffmpeg before the pacer starts dropping them: a
+/// quarter of a second's, so a busy moment (a compile on every core) is
+/// waited out instead of dropped. Only taken while ffmpeg is behind.
+fn queue_len(fps: u32) -> usize {
+    (fps as usize / 4).clamp(4, 60)
+}
 
 /// A running H.264 encoder.
 pub(crate) struct H264 {
@@ -208,8 +277,30 @@ impl H264 {
         let codec = encoder(s.use_hardware)?;
         eprintln!("video encoder: {} ({}x{} at {} fps)", codec.label(), width, height, s.fps);
         let gop = crate::keyframe_every(s.fps);
+        let args = codec.args((width, height), (width, height), s.fps, s.video_bitrate_kbps.max(100), gop, false);
+        Self::spawn(codec, args, s.fps, None, out)
+    }
+
+    /// The encoder of one of a stream's pictures (`crate::stream`, its
+    /// `rendition`): frames `input` big made `output` big (by ffmpeg, where
+    /// they differ), `fps` a second at a constant `kbps`, a keyframe every
+    /// two seconds (where a connection can start), as the services ask; its
+    /// frames go to `out` as the stream's own. The graphics card's encoder
+    /// where ffmpeg has one that works (`hardware`), as a recording's.
+    pub(crate) fn stream(input: (u32, u32), output: (u32, u32), fps: u32, kbps: u32, hardware: bool, rendition: usize, out: Sender<WriterCommand>) -> Result<Self> {
+        let codec = encoder(hardware)?;
+        let kbps = kbps.max(100);
+        let args = codec.args(input, output, fps, kbps, fps.max(1) * 2, true);
+        let encoder = Self::spawn(codec, args, fps, Some(rendition), out)?;
+        eprintln!("stream: {} at {}x{}, {fps} fps, {kbps} kb/s", codec.label(), output.0, output.1);
+        Ok(encoder)
+    }
+
+    /// Run ffmpeg with `args`, its frames to `out` (`stream`: as one of the
+    /// stream's pictures, which), frame N at N/`fps`.
+    fn spawn(codec: Codec, args: Vec<String>, fps: u32, stream: Option<usize>, out: Sender<WriterCommand>) -> Result<Self> {
         let mut child = ffmpeg()
-            .args(codec.args(width, height, s.fps, s.video_bitrate_kbps.max(100), gop))
+            .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -219,7 +310,7 @@ impl H264 {
         let stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
         let errors = spawn_stderr(stderr);
-        let (tx, rx) = mpsc::sync_channel::<(Vec<u8>, i64)>(QUEUE);
+        let (tx, rx) = mpsc::sync_channel::<(Vec<u8>, i64)>(queue_len(fps));
         let (spare_tx, spare) = mpsc::channel();
         // The frame numbers sent, in order: the Nth packet back is the Nth sent.
         let sent = Arc::new(Mutex::new(VecDeque::<i64>::new()));
@@ -228,15 +319,13 @@ impl H264 {
             thread::Builder::new().name("h264-in".into()).spawn(move || feed(stdin, rx, sent, spare_tx))?
         };
         let child = Arc::new(Mutex::new(child));
-        let reader = {
-            let fps = s.fps;
-            thread::Builder::new().name("h264-out".into()).spawn(move || {
-                if let Err(e) = read_video(stdout, fps, &sent, &out) {
-                    let detail = errors.join().unwrap_or_default();
-                    eprintln!("video encoder ({}) stopped: {e:#}{}", codec.ffmpeg_name(), detail.map(|d| format!("\n{d}")).unwrap_or_default());
-                }
-            })?
-        };
+        let reader = thread::Builder::new().name("h264-out".into()).spawn(move || {
+            if let Err(e) = read_video(stdout, fps, &sent, &out, stream) {
+                let detail = errors.join().unwrap_or_default();
+                let what = if stream.is_some() { "the stream's video encoder" } else { "video encoder" };
+                eprintln!("{what} ({}) stopped: {e:#}{}", codec.ffmpeg_name(), detail.map(|d| format!("\n{d}")).unwrap_or_default());
+            }
+        })?;
         Ok(Self { tx: Some(tx), spare, spare_tx, feeder: Some(feeder), reader: Some(reader), child })
     }
 
@@ -294,8 +383,9 @@ fn feed(mut stdin: ChildStdin, rx: Receiver<(Vec<u8>, i64)>, sent: Arc<Mutex<Vec
 }
 
 /// Read ffmpeg's H.264 output, one access unit per frame, and pass each to
-/// the writer as frame `sent[k]`.
-fn read_video(mut stdout: impl Read, fps: u32, sent: &Mutex<VecDeque<i64>>, out: &Sender<WriterCommand>) -> Result<()> {
+/// the writer as frame `sent[k]` (`stream`: as a frame of that one of the
+/// stream's pictures).
+fn read_video(mut stdout: impl Read, fps: u32, sent: &Mutex<VecDeque<i64>>, out: &Sender<WriterCommand>, stream: Option<usize>) -> Result<()> {
     let mut pending = Vec::with_capacity(1 << 20);
     let mut chunk = vec![0u8; 1 << 18];
     let mut config: Option<AvcConfig> = None;
@@ -315,10 +405,14 @@ fn read_video(mut stdout: impl Read, fps: u32, sent: &Mutex<VecDeque<i64>>, out:
             let n = sent.lock().unwrap().pop_front().unwrap_or(last + 1);
             last = n;
             let key = frame.idr;
-            let media = Media::Video {
-                frame: VideoFrame(Arc::new(EncodedFrame { data: Arc::from(frame.data), config: if key { config.clone() } else { None } })),
-                pts: n as f64 / fps as f64,
-                key,
+            let pts = n as f64 / fps as f64;
+            let media = match stream {
+                Some(rendition) => Media::Stream(StreamFrame { rendition, data: Arc::from(frame.data), avcc: config.as_ref().filter(|_| key).map(|c| Arc::from(c.record())), pts, key }),
+                None => Media::Video {
+                    frame: VideoFrame(Arc::new(EncodedFrame { data: Arc::from(frame.data), config: if key { config.clone() } else { None } })),
+                    pts,
+                    key,
+                },
             };
             if out.send(WriterCommand::Media(media)).is_err() {
                 bail!("the file writer stopped");
@@ -484,5 +578,30 @@ mod tests {
         f.extend([1, 2, 3]);
         assert_eq!(adts_frame(&f), Some((7, 10)));
         assert_eq!(adts_frame(&f[..9]), None);
+    }
+
+    #[test]
+    fn encoder_errors_keep_the_reason() {
+        // ffmpeg 9's output with no NVIDIA driver loaded.
+        let nvenc = "[h264_nvenc @ 0x555d] Cannot load libcuda.so.1
+[vost#0:0/h264_nvenc @ 0x555d] [enc:h264_nvenc @ 0x555d] Error while opening encoder - maybe incorrect parameters such as bit_rate, rate, width or height.
+[vf#0:0 @ 0x555d] Error sending frames to consumers: Operation not permitted
+[vf#0:0 @ 0x555d] Task finished with error code: -1 (Operation not permitted)
+[vf#0:0 @ 0x555d] Terminating thread with return code -1 (Operation not permitted)
+[vost#0:0/h264_nvenc @ 0x555d] [enc:h264_nvenc @ 0x555d] Could not open encoder before EOF
+[vost#0:0/h264_nvenc @ 0x555d] Task finished with error code: -22 (Invalid argument)
+[vost#0:0/h264_nvenc @ 0x555d] Terminating thread with return code -22 (Invalid argument)
+[out#0/h264 @ 0x555d] Nothing was written into output file, because at least one of its streams received no packets.
+";
+        assert_eq!(why_encoder_failed(nvenc), "[h264_nvenc @ 0x555d] Cannot load libcuda.so.1");
+        // And with no VA-API driver that starts.
+        let vaapi = "[VAAPI @ 0x5645] libva: /usr/lib/dri/nouveau_drv_video.so init failed
+[VAAPI @ 0x5645] Failed to initialise VAAPI connection: 2 (resource allocation failed).
+Device creation failed: -5.
+Failed to set value 'vaapi=va:/dev/dri/renderD128' for option 'init_hw_device': Input/output error
+Error parsing global options: Input/output error
+";
+        assert!(why_encoder_failed(vaapi).starts_with("[VAAPI @ 0x5645] libva: /usr/lib/dri/nouveau_drv_video.so init failed | "));
+        assert_eq!(why_encoder_failed("Unknown thing\n"), "Unknown thing");
     }
 }

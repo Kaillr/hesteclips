@@ -2,9 +2,10 @@
 //! all in-process — no external tools.
 //!
 //! - **Video**: an `SCStream` delivers screen frames (already scaled to the output
-//!   size, NV12). A pacer thread feeds the newest frame to a VideoToolbox H.264
-//!   encoder at exactly `fps`, so the output is constant frame rate even when the
-//!   screen is static and SCK sends nothing.
+//!   size, NV12). A pacer thread (`crate::mac::blend`) makes a frame every 1/fps
+//!   of the picture that was up at its time, or a blend of several, for a
+//!   VideoToolbox H.264 encoder: constant frame rate even when the screen is
+//!   static and SCK sends nothing.
 //! - **Desktop and app audio**: one audio-only `SCStream` per source
 //!   ([`SystemAudio`]), filtered to that app (or to everything minus the apps
 //!   added separately). **Mics** use cpal.
@@ -20,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -33,7 +34,7 @@ use objc2::{AllocAnyThread, DefinedClass, define_class, msg_send};
 use objc2_core_audio_types::{
     AudioBuffer, AudioBufferList, AudioStreamBasicDescription, kAudioFormatFlagIsNonInterleaved,
 };
-use objc2_core_foundation::{CFBoolean, CFDictionary, CFNumber, CFRetained, CFString, CFType};
+use objc2_core_foundation::{CFArray, CFBoolean, CFDictionary, CFNumber, CFRetained, CFString, CFType};
 use objc2_core_media::{
     CMAudioFormatDescriptionGetStreamBasicDescription, CMBlockBuffer, CMClock, CMSampleBuffer, CMTime,
     kCMSampleAttachmentKey_NotSync,
@@ -48,12 +49,12 @@ use objc2_core_video::{
 use objc2_foundation::{NSArray, NSError, NSObject, NSObjectProtocol};
 use objc2_screen_capture_kit::{
     SCContentFilter, SCDisplay, SCRunningApplication, SCStream,
-    SCStreamConfiguration, SCStreamOutput, SCStreamOutputType,
+    SCStreamConfiguration, SCStreamDelegate, SCStreamOutput, SCStreamOutputType,
 };
 use objc2_video_toolbox::{
     VTCompressionSession, VTEncodeInfoFlags, VTSessionSetProperty,
     kVTCompressionPropertyKey_AllowFrameReordering, kVTCompressionPropertyKey_AverageBitRate,
-    kVTCompressionPropertyKey_ColorPrimaries, kVTCompressionPropertyKey_ExpectedFrameRate,
+    kVTCompressionPropertyKey_ColorPrimaries, kVTCompressionPropertyKey_DataRateLimits, kVTCompressionPropertyKey_ExpectedFrameRate,
     kVTCompressionPropertyKey_MaxKeyFrameInterval,
     kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, kVTCompressionPropertyKey_ProfileLevel,
     kVTCompressionPropertyKey_RealTime, kVTCompressionPropertyKey_TransferFunction,
@@ -63,137 +64,94 @@ use objc2_video_toolbox::{
 };
 
 use crate::aac::AacEncoder;
-use crate::mixer::{self, Channel, Clock, LiveAudio, SourceFeed, SourceStatus};
-use crate::output::{in_progress, timestamp};
-use crate::sources::{AudioCapture, AudioSource, SourceKind, mix_inputs, track_layout};
+use crate::mixer::{self, Channel, Clock, LiveAudio, MixChange, MixInput, SourceFeed, SourceStatus};
+use crate::outputs::{Capture, Outputs};
+use crate::shutter::Shutter;
+use crate::sources::{AudioCapture, AudioSource, Retry, SourceKind, mix_inputs, track_layout};
+use crate::stream::{StreamFrame, StreamSettings};
 use crate::avwriter::{SendFormat, SendSample};
 use crate::writer::{self, Layout, Media, Writer};
-use crate::mac::blend::{Blender, spawn_blend_pacer};
+use crate::mac::blend::{BlendChange, Blender, Mix, PacerCtl, StreamOut, spawn_blend_pacer};
 use crate::mac::video::{self, Frames, Picture, pick_display, shareable_content};
-use crate::{EncodeSettings, Mode, Recorder};
+use crate::{BlendShape, EncodeSettings, Mode, Recorder, VideoSource};
 
 use crate::AUDIO_BITRATE;
 
 pub struct SckRecorder {
-    session: Option<Session>,
-    mode: Option<Mode>,
-    current_file: Option<PathBuf>,
-    replay_seconds: u32,
-    output_dir: PathBuf,
-    container_ext: String,
+    outputs: Outputs<Session>,
     live: Arc<LiveAudio>,
 }
 
 impl SckRecorder {
     /// `live` receives the meters and supplies each source's volume.
     pub fn new(live: Arc<LiveAudio>) -> Self {
-        Self {
-            session: None,
-            mode: None,
-            current_file: None,
-            replay_seconds: 60,
-            output_dir: PathBuf::from("."),
-            container_ext: "mp4".to_string(),
-            live,
-        }
+        Self { outputs: Outputs::new(), live }
     }
 }
 
 impl Recorder for SckRecorder {
     fn start(&mut self, mode: Mode, settings: &EncodeSettings) -> Result<()> {
-        if self.session.is_some() {
-            let _ = self.stop(None);
-        }
-        self.replay_seconds = settings.replay_seconds;
-        self.output_dir = settings.output_dir.clone();
-        // AVAssetWriter writes MP4 and MOV; MKV isn't one of them.
-        self.container_ext = if settings.container_ext == "mov" { "mov".into() } else { "mp4".into() };
-        std::fs::create_dir_all(&settings.output_dir)?;
-
-        let s = settings.clone();
-        let target = match mode {
-            Mode::Record => {
-                let file = self.output_dir.join(format!("recording_{}.{}", timestamp(), self.container_ext));
-                self.current_file = Some(file.clone());
-                Target::Record(in_progress(&file))
-            }
-            Mode::ReplayBuffer => {
-                self.current_file = None;
-                Target::Replay(settings.replay_seconds as f64)
-            }
-        };
-        self.session = Some(Session::start(&s, target, &self.live)?);
-        self.mode = Some(mode);
-        Ok(())
+        let live = self.live.clone();
+        // AVAssetWriter writes MP4 and MOV by the file's name.
+        self.outputs.start(mode, settings, |s, _mov| Session::start(s, &live))
     }
 
     fn save_clip(&mut self, dir: &Path) -> Result<crate::PendingClip> {
-        let session = self.session.as_ref().filter(|_| self.mode == Some(Mode::ReplayBuffer));
-        let session = session.context("replay buffer is not running")?;
-        std::fs::create_dir_all(dir)?;
-        writer::request_clip(&session.writer_tx, dir, &self.container_ext, self.replay_seconds as f64)
+        self.outputs.save_clip(dir)
     }
 
-    fn stop(&mut self, dir: Option<&Path>) -> Result<Option<PathBuf>> {
-        let finished = self.session.take().map(Session::finish);
-        let file = self.current_file.take();
-        let was_record = self.mode == Some(Mode::Record);
-        self.mode = None;
-        if !was_record {
-            return Ok(None);
-        }
-        let Some(file) = file else { return Ok(None) };
-        let partial = in_progress(&file);
-        if let Some(Err(e)) = finished {
-            // A fragmented MP4 is still playable up to the failure: keep what we got.
-            if !partial.exists() {
-                return Err(e.context("recording failed"));
-            }
-            eprintln!("recording ended with an error: {e:#}");
-        }
-        if !partial.exists() {
-            bail!("recording failed — nothing was written");
-        }
-        let file = crate::output::destination(&file, dir);
-        crate::output::finish_rename(&partial, &file).context("couldn't finish the recording")?;
-        Ok(Some(file))
+    fn stop(&mut self, mode: Mode, dir: Option<&Path>) -> Result<Option<PathBuf>> {
+        self.outputs.stop(mode, dir)
     }
 
-    fn is_running(&self) -> bool {
-        self.session.is_some()
+    fn stop_all(&mut self) {
+        self.outputs.stop_all();
+    }
+
+    fn running(&self) -> crate::Running {
+        self.outputs.running()
     }
 
     fn set_replay_seconds(&mut self, seconds: u32) {
-        self.replay_seconds = seconds;
-        if let Some(session) = self.session.as_ref().filter(|_| self.mode == Some(Mode::ReplayBuffer)) {
-            let _ = session.writer_tx.send(writer::Command::SetWindow(seconds as f64));
-        }
+        self.outputs.set_replay_seconds(seconds);
     }
 
     fn update_video(&mut self, video: &crate::VideoSource) -> bool {
-        self.session.as_mut().and_then(|s| s.video.as_mut()).is_some_and(|p| p.update(video))
+        let Some(session) = self.outputs.session.as_mut() else { return false };
+        let updated = session.video.as_mut().is_some_and(|p| p.update(video));
+        if updated {
+            // How fast it can be looked at follows (a display's refresh).
+            session.source = video.clone();
+        }
+        updated
     }
 
     fn set_mic(&mut self, id: &str, device: &str) -> bool {
-        self.session.as_mut().and_then(|s| s.audio.as_mut()).is_some_and(|a| a.set_mic(id, device))
+        self.outputs.session.as_mut().and_then(|s| s.audio.as_mut()).is_some_and(|a| a.set_mic(id, device))
+    }
+
+    fn set_blend(&mut self, looks: u32, shape: BlendShape) -> bool {
+        self.outputs.session.as_mut().is_some_and(|s| s.set_blend(looks, shape))
+    }
+
+    fn set_sources(&mut self, sources: &[AudioSource]) -> bool {
+        self.outputs.session.as_mut().is_some_and(|s| s.set_sources(sources, &self.live))
+    }
+
+    /// Every pixel of the display recorded, or of the game's or app's
+    /// window: a capture of its own (`mac::shot`), of the window the running
+    /// capture records, if one runs.
+    fn screenshot(&mut self, video: &VideoSource) -> Result<crate::PendingShot> {
+        let running = self.outputs.session.as_ref().and_then(|s| s.video.as_ref()).map(|p| p.latest.clone());
+        crate::mac::shot::take(video, running.as_deref())
     }
 }
 
 impl Drop for SckRecorder {
     /// Dropping (app quit) must still finalise the file.
     fn drop(&mut self) {
-        if self.session.is_some() {
-            let _ = self.stop(None);
-        }
+        self.outputs.stop_all();
     }
-}
-
-/// Where a session's media goes.
-enum Target {
-    /// Straight to this (hidden, partial) file.
-    Record(PathBuf),
-    /// An in-memory ring of this many seconds.
-    Replay(f64),
 }
 
 // ---------------------------------------------------------------------------
@@ -213,15 +171,69 @@ struct Session {
     pacer: Option<(Arc<AtomicBool>, JoinHandle<()>)>,
     audio: Option<AudioCapture>,
     mixer: Option<(Arc<AtomicBool>, JoinHandle<()>)>,
+    /// Sources added to the running mixer and taken out of it.
+    mix_changes: Option<Sender<MixChange>>,
     /// AAC encoder threads, one per track; they end when the mixer drops its senders.
     encoders: Vec<JoinHandle<()>>,
     writer_tx: Sender<writer::Command>,
     writer: Option<Writer>,
+    /// Frames a second, the frame's size, and whether only the media engine
+    /// encodes: what the stream's own encoder is set up from.
+    fps: u32,
+    size: (usize, usize),
+    hardware: bool,
+    /// What's recorded: how often it can be looked at follows from it.
+    source: VideoSource,
+    /// Frame blending as the pacer has it (or will, at its next frame):
+    /// looks a frame, and how they're weighed.
+    blend: (u32, Shutter),
+    /// What's changed in the running pacer: frame blending, and the stream's
+    /// pictures.
+    ctl: PacerCtl,
+}
+
+impl Capture for Session {
+    fn writer(&self) -> &Sender<writer::Command> {
+        &self.writer_tx
+    }
+
+    /// The stream's own pictures, one for each rendition
+    /// (`stream::renditions`: as many as the places streamed to want
+    /// different ones): a frame for every `every` the pacer makes, at the
+    /// rendition's size (scaled by Metal) and rate, through a VideoToolbox
+    /// encoder of its own.
+    fn stream_video(&mut self, stream: Option<&StreamSettings>) -> Result<()> {
+        let Some(st) = stream else {
+            *self.ctl.stream.lock().unwrap_or_else(PoisonError::into_inner) = Some(Vec::new());
+            return Ok(());
+        };
+        if self.pacer.is_none() {
+            bail!("the capture can't stream");
+        }
+        let (renditions, _) = crate::stream::renditions(st, self.fps);
+        let mut outs = Vec::with_capacity(renditions.len());
+        for (i, r) in renditions.iter().enumerate() {
+            let every = (self.fps / r.fps.max(1)).max(1) as i64;
+            let (w, h) = crate::output_size(self.size.0 as u32, self.size.1 as u32, r.short_side);
+            let setup = Setup { fps: r.fps, kbps: r.kbps, hardware: self.hardware, stream: Some(i) };
+            let encoder = Encoder::stream(w as usize, h as usize, setup, self.writer_tx.clone())?;
+            outs.push(StreamOut::start(every, self.size, (w as usize, h as usize), r.fps, encoder)?);
+            eprintln!("stream: VideoToolbox at {w}×{h}, {} fps, {} kb/s", r.fps, r.kbps);
+        }
+        *self.ctl.stream.lock().unwrap_or_else(PoisonError::into_inner) = Some(outs);
+        Ok(())
+    }
+
+    fn finish(self) -> Result<()> {
+        self.end()
+    }
 }
 
 impl Session {
-    fn start(s: &EncodeSettings, target: Target, live: &Arc<LiveAudio>) -> Result<Self> {
-        let (content, display, (width, height)) = video::plan(&s.video, s.target_height)?;
+    fn start(s: &EncodeSettings, live: &Arc<LiveAudio>) -> Result<Self> {
+        // How it keeps up (the warnings by the recorder) counts from here.
+        crate::capture_started();
+        let (content, display, (width, height)) = video::plan(&s.video, s.size)?;
         // The away screen, converted once (recording the whole screen too:
         // it can switch to games and apps while it runs).
         let away = match &s.away_screen {
@@ -240,14 +252,29 @@ impl Session {
             audio_titles: titles.clone(),
             comment,
         };
-        let writer = match target {
-            Target::Record(file) => Writer::record(file, layout, s.fps),
-            Target::Replay(seconds) => Writer::replay(seconds, layout, s.fps),
-        };
+        let writer = Writer::new(layout, s.fps);
         let writer_tx = writer.tx.clone();
 
-        let mut session =
-            Self { video: None, pacer: None, audio: None, mixer: None, encoders: Vec::new(), writer_tx, writer: Some(writer) };
+        // With blending, the screen is looked at faster than the frame
+        // rate, never faster than the display shows new pictures.
+        let looks = blend_looks(&s.video, s.fps, s.blend_samples);
+        let shutter = Shutter::new(looks, s.blend_shape);
+        let mut session = Self {
+            video: None,
+            pacer: None,
+            audio: None,
+            mixer: None,
+            mix_changes: None,
+            encoders: Vec::new(),
+            writer_tx,
+            writer: Some(writer),
+            fps: s.fps,
+            size: (width, height),
+            hardware: s.use_hardware,
+            source: s.video.clone(),
+            blend: (looks, shutter),
+            ctl: PacerCtl::default(),
+        };
         let started = (|| -> Result<()> {
             // One PCM channel + AAC thread per track, in layout order: the mix,
             // each own track, the rest.
@@ -264,8 +291,11 @@ impl Session {
             let rest_track = if has_rest { tracks.next() } else { None };
             session.audio = Some(audio);
             let stop = Arc::new(AtomicBool::new(false));
-            let mixer = mixer::spawn_mixer(
+            let (mix_changes, changes) = mpsc::channel();
+            session.mix_changes = Some(mix_changes);
+            let mixer = mixer::spawn_changing_mixer(
                 inputs,
+                changes,
                 mix_track,
                 rest_track,
                 live.clone(),
@@ -277,36 +307,91 @@ impl Session {
             session.mixer = Some((stop, mixer));
 
             let encoder = Encoder::new(width, height, s, session.writer_tx.clone())?;
-            // With blending, the screen is looked at faster than the frame
-            // rate, never faster than the display shows new pictures.
-            let looks = blend_looks(s);
-            let picture = Picture::start(&s.video, &content, &display, (width, height), s.fps * looks, away)?;
-            // A webcam that can't open doesn't stop the recording: its status
-            // says why, and the picture goes on without it.
-            let frames = Frames::new(picture.latest.clone(), s.webcam.as_ref(), width, height, crate::preview::new_producer())?;
+            let placed = *s.screen.lock().unwrap();
+            let picture = Picture::start(&s.video, &content, &display, (width, height), s.fps * looks, away, placed)?;
+            // A layer that can't open (a webcam, a window) doesn't stop the
+            // recording: its status says why, and the picture goes on
+            // without it.
+            let frames = Frames::new(picture.latest.clone(), s.layers.clone(), s.screen.clone(), Some(picture.ctl()), width, height, s.fps, crate::preview::new_producer())?;
             let latest = picture.latest.clone();
             session.video = Some(picture);
-            session.pacer = Some(if looks > 1 {
-                let blender = Blender::new(width, height)?;
-                spawn_blend_pacer(s.fps, looks, latest, blender, frames, encoder, clock)
-            } else {
-                spawn_pacer(s.fps, frames, encoder, clock)
-            });
+            // Not blended too, a frame takes the picture that was up at its
+            // time, by when the screen showed it, its look kept halfway
+            // between the screen's pictures (as on Windows). Taken as the
+            // newest one when the frame was due, a game at the frame rate whose
+            // pictures came near those times had one in a frame twice and
+            // the next in none, by chance: measured, up to 1 frame in 5.
+            let mix = if looks > 1 { Mix::Blend(Blender::new(width, height, shutter.frames_open())?) } else { Mix::one() };
+            let ctl = session.ctl.clone();
+            session.pacer = Some(spawn_blend_pacer(s.fps, looks, shutter, latest, mix, frames, encoder, clock, ctl));
             Ok(())
         })();
         if let Err(e) = started {
-            let _ = session.finish();
+            let _ = session.end();
             return Err(e);
         }
         Ok(session)
     }
 
-    /// Stop capturing and finish the file (record) or drop the ring (replay).
-    fn finish(mut self) -> Result<()> {
+    /// Capture these audio sources from now on, without restarting (see
+    /// [`Recorder::set_sources`]): the capture starts and stops them, and
+    /// the mixer takes them in and out.
+    fn set_sources(&mut self, sources: &[AudioSource], live: &LiveAudio) -> bool {
+        let (Some(audio), Some(changes)) = (self.audio.as_mut(), &self.mix_changes) else { return false };
+        let (added, gone) = audio.set_sources(sources, live);
+        for source in gone {
+            eprintln!("audio source \"{}\": taken out while capturing", source.name);
+            let _ = changes.send(MixChange::Remove(source.id));
+        }
+        for (source, feed) in added {
+            eprintln!("audio source \"{}\": added while capturing, into the mix", source.name);
+            let input = MixInput { channel: live.channel(&source.id), id: source.id, feed, in_mix: source.in_mix, track: None };
+            let _ = changes.send(MixChange::Add(input));
+        }
+        true
+    }
+
+    /// Change frame blending while it runs: the pacer takes it up at its
+    /// next frame (its blender made here, so the pacer doesn't wait for
+    /// Metal), and the screen is looked at as fast as the looks need (the
+    /// stream set up again for that rate). False if it can't.
+    fn set_blend(&mut self, looks: u32, shape: BlendShape) -> bool {
+        let (Some(picture), Some(_)) = (&self.video, &self.pacer) else { return false };
+        let looks = blend_looks(&self.source, self.fps, looks);
+        let shutter = Shutter::new(looks, shape);
+        if self.blend == (looks, shutter) {
+            return true;
+        }
+        let mix = if looks > 1 {
+            match Blender::new(self.size.0, self.size.1, shutter.frames_open()) {
+                Ok(b) => Mix::Blend(b),
+                Err(e) => {
+                    eprintln!("frame blending couldn't change: {e:#}");
+                    return false;
+                }
+            }
+        } else {
+            Mix::one()
+        };
+        *self.ctl.blend.lock().unwrap_or_else(PoisonError::into_inner) = Some(BlendChange { looks, shutter, mix });
+        self.blend = (looks, shutter);
+        picture.set_rate(self.fps * looks);
+        true
+    }
+
+    /// Stop capturing and finish what the writer was doing (a recording's
+    /// file; the ring's let go).
+    fn end(mut self) -> Result<()> {
         // The pacer flushes the video encoder on its way out.
         if let Some((stop, handle)) = self.pacer.take() {
             stop.store(true, Ordering::Relaxed);
             let _ = handle.join();
+        }
+        // A stream the pacer stopped before it took it up: finished here
+        // (its encoders would hold the writer open).
+        let pending = self.ctl.stream.lock().unwrap_or_else(PoisonError::into_inner).take();
+        for s in pending.into_iter().flatten() {
+            s.finish();
         }
         if let Some(picture) = self.video.take() {
             picture.stop();
@@ -328,11 +413,12 @@ impl Session {
     }
 }
 
-/// Looks at the screen per frame for frame blending: as asked, but no more
-/// than the display can show new pictures in a frame's time (1: no blending).
-fn blend_looks(s: &EncodeSettings) -> u32 {
-    let asked = s.blend_samples.max(1);
-    let most = crate::max_blend_rate(&s.video).map_or(asked, |hz| (hz / s.fps.max(1)).max(1));
+/// Looks at the screen per frame for frame blending: `asked`, but no more
+/// than the display `video` shows can show new pictures in a frame's time
+/// at `fps` (1: no blending).
+fn blend_looks(video: &VideoSource, fps: u32, asked: u32) -> u32 {
+    let asked = asked.max(1);
+    let most = crate::max_blend_rate(video).map_or(asked, |hz| (hz / fps.max(1)).max(1));
     asked.min(most)
 }
 
@@ -366,11 +452,6 @@ pub(crate) fn host_now() -> f64 {
 // ---------------------------------------------------------------------------
 // ScreenCaptureKit
 // ---------------------------------------------------------------------------
-
-/// Wrapper to move ObjC/CF objects that are thread-safe in practice (retain counts
-/// are atomic; we never mutate them concurrently) across threads.
-struct SendBox<T>(T);
-unsafe impl<T> Send for SendBox<T> {}
 
 /// What an audio stream's callbacks feed: a source's audio.
 struct Shared {
@@ -413,7 +494,7 @@ impl StreamOutput {
 
 /// SCK delivers float32, usually non-interleaved; flatten to interleaved f32.
 /// Returns the samples and the channel count.
-fn interleaved_pcm(sample: &CMSampleBuffer) -> Option<(Vec<f32>, usize)> {
+pub(crate) fn interleaved_pcm(sample: &CMSampleBuffer) -> Option<(Vec<f32>, usize)> {
     unsafe {
         let desc = sample.format_description()?;
         let asbd: &AudioStreamBasicDescription = &*CMAudioFormatDescriptionGetStreamBasicDescription(&desc);
@@ -454,13 +535,49 @@ fn interleaved_pcm(sample: &CMSampleBuffer) -> Option<(Vec<f32>, usize)> {
     }
 }
 
+/// Why the system stopped a stream, once it has (from its delegate).
+#[derive(Default)]
+pub(crate) struct Stopped(std::sync::Mutex<Option<String>>);
+
+impl Stopped {
+    pub(crate) fn take(&self) -> Option<String> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).take()
+    }
+}
+
+define_class!(
+    // SAFETY: NSObject has no subclassing requirements; no Drop impl.
+    #[unsafe(super(NSObject))]
+    #[ivars = Arc<Stopped>]
+    pub(crate) struct StreamWatch;
+
+    unsafe impl NSObjectProtocol for StreamWatch {}
+
+    unsafe impl SCStreamDelegate for StreamWatch {
+        #[unsafe(method(stream:didStopWithError:))]
+        fn did_stop(&self, _stream: &SCStream, error: &NSError) {
+            let why = format!("{} (error {})", error.localizedDescription(), error.code());
+            *self.ivars().0.lock().unwrap_or_else(PoisonError::into_inner) = Some(why);
+        }
+    }
+);
+
+impl StreamWatch {
+    pub(crate) fn new(stopped: Arc<Stopped>) -> Retained<Self> {
+        let this = Self::alloc().set_ivars(stopped);
+        unsafe { msg_send![super(this), init] }
+    }
+}
+
 /// An audio-only stream: everything the Mac plays (`include == false`, minus
-/// `apps`) or just `apps` (`include == true`).
+/// `apps`) or just `apps` (`include == true`). `watch` hears when the system
+/// stops it.
 fn make_audio_stream(
     display: &SCDisplay,
     apps: &[Retained<SCRunningApplication>],
     include: bool,
     output: &StreamOutput,
+    watch: &StreamWatch,
 ) -> Result<Retained<SCStream>> {
     unsafe {
         let filter = audio_filter(display, apps, include);
@@ -476,7 +593,7 @@ fn make_audio_stream(
         // Don't record our own clip previews. Note this excludes by *responsible*
         // app: under `cargo run`, sounds played from the same terminal are muted too.
         config.setExcludesCurrentProcessAudio(true);
-        let stream = SCStream::initWithFilter_configuration_delegate(SCStream::alloc(), &filter, &config, None);
+        let stream = SCStream::initWithFilter_configuration_delegate(SCStream::alloc(), &filter, &config, Some(ProtocolObject::from_ref(watch)));
         let queue = DispatchQueue::new("hesteclips.sck.audio", None);
         stream
             .addStreamOutput_type_sampleHandlerQueue_error(ProtocolObject::from_ref(output), SCStreamOutputType::Audio, Some(&queue))
@@ -515,13 +632,13 @@ fn await_completion(call: impl FnOnce(&block2::DynBlock<dyn Fn(*mut NSError)>)) 
     }
 }
 
-fn start_capture(stream: &SCStream) -> Result<()> {
+pub(crate) fn start_capture(stream: &SCStream) -> Result<()> {
     let _one = STARTING.lock();
     await_completion(|h| unsafe { stream.startCaptureWithCompletionHandler(Some(h)) })
         .map_err(|e| anyhow::anyhow!("couldn't start screen capture: {e}"))
 }
 
-fn stop_capture(stream: &SCStream) {
+pub(crate) fn stop_capture(stream: &SCStream) {
     let _ = await_completion(|h| unsafe { stream.stopCaptureWithCompletionHandler(Some(h)) });
 }
 
@@ -536,6 +653,15 @@ fn stop_capture(stream: &SCStream) {
 pub(crate) struct SystemAudio {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    /// Sources added and taken out while it runs, for its thread.
+    changes: Sender<TapChange>,
+}
+
+/// A source added to a [`SystemAudio`] that runs, or taken out.
+enum TapChange {
+    Add(AudioSource, Arc<SourceFeed>, Arc<Channel>),
+    /// By its id.
+    Remove(String),
 }
 
 /// One desktop/app source and its stream, owned by the `SystemAudio` thread.
@@ -543,9 +669,82 @@ struct Tap {
     source: AudioSource,
     feed: Arc<SourceFeed>,
     channel: Arc<Channel>,
-    stream: Option<(Retained<SCStream>, Retained<StreamOutput>)>,
+    stream: Option<Running>,
     /// Pids the current filter was built from, to notice changes.
     pids: Option<Vec<i32>>,
+    restart: Restart,
+}
+
+impl Tap {
+    fn new(source: AudioSource, feed: Arc<SourceFeed>, channel: Arc<Channel>) -> Self {
+        Self { source, feed, channel, stream: None, pids: None, restart: Restart::default() }
+    }
+
+    fn say(&self, line: &str) {
+        eprintln!("{} audio source \"{}\": {line}", chrono::Local::now().format("%H:%M:%S"), self.source.name);
+    }
+
+    /// Stop its stream: it's Off.
+    fn stop(&mut self) {
+        if let Some(running) = self.stream.take() {
+            stop_capture(&running.stream);
+        }
+        self.channel.set_status(SourceStatus::Off);
+    }
+}
+
+/// A tap's stream while it runs: what it feeds, and what hears when the
+/// system stops it (kept as long as the stream, which holds neither).
+struct Running {
+    stream: Retained<SCStream>,
+    _output: Retained<StreamOutput>,
+    _watch: Retained<StreamWatch>,
+    stopped: Arc<Stopped>,
+}
+
+/// When a tap's stream is started again, and what the log last said of it.
+/// A start that failed, or a stream the system stopped (the person stopping
+/// it from the menu bar, the display it's on going), is tried again a second
+/// later, then twice as long after each failure in a row, up to every 10 s
+/// (`sources::Retry`); one that had run a while starts over at a second.
+/// Each failure is said once. A start that failed was tried, and said, at
+/// every rescan (every second); a stream the system stopped went silent,
+/// Live all the same, until the capture restarted.
+#[derive(Debug, Default)]
+struct Restart {
+    retry: Option<Retry>,
+    /// When it last started.
+    started: Option<Instant>,
+    /// The failure the log last said.
+    said: String,
+}
+
+impl Restart {
+    /// A stream that ran this long without stopping had worked: a stop after
+    /// it is tried again a second later, not later than the one before.
+    const WORKED: Duration = Duration::from_secs(10);
+
+    /// Whether to try starting it at `now`.
+    fn due(&self, now: Instant) -> bool {
+        self.retry.is_none_or(|r| r.due(now))
+    }
+
+    /// Its start failed, or it stopped, at `now`, for `why`: what to log, if
+    /// it isn't what was said last.
+    fn failed(&mut self, why: String, now: Instant) -> Option<String> {
+        let worked = self.started.take().is_some_and(|t| now.duration_since(t) >= Self::WORKED);
+        self.retry = Some(Retry::after(self.retry.filter(|_| !worked), now));
+        (why != self.said).then(|| {
+            self.said.clone_from(&why);
+            why
+        })
+    }
+
+    /// It started at `now`: what to log, if a failure was said.
+    fn started(&mut self, now: Instant) -> Option<String> {
+        self.started = Some(now);
+        (!std::mem::take(&mut self.said).is_empty()).then(|| "started again".to_owned())
+    }
 }
 
 impl SystemAudio {
@@ -556,38 +755,88 @@ impl SystemAudio {
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
         let (ready_tx, ready_rx) = mpsc::channel();
+        let (changes, changed) = mpsc::channel();
         let thread = thread::spawn(move || {
-            let mut taps: Vec<Tap> = sources
-                .into_iter()
-                .map(|(source, feed, channel)| Tap { source, feed, channel, stream: None, pids: None })
-                .collect();
+            let mut taps: Vec<Tap> = sources.into_iter().map(|(source, feed, channel)| Tap::new(source, feed, channel)).collect();
             let mut first = true;
-            while !stop2.load(Ordering::Relaxed) {
+            let mut ended = false;
+            while !ended && !stop2.load(Ordering::Relaxed) {
                 sync_taps(&mut taps);
                 if std::mem::take(&mut first) {
                     let _ = ready_tx.send(());
                 }
+                // Until the next rescan, or a source added or taken out:
+                // then at once, so one added starts now, and the desktop
+                // leaves out an app added on its own, or no longer does.
                 let until = Instant::now() + Self::RESCAN;
                 while Instant::now() < until && !stop2.load(Ordering::Relaxed) {
-                    thread::sleep(Duration::from_millis(50));
+                    match changed.recv_timeout(Duration::from_millis(50)) {
+                        Ok(change) => {
+                            change_taps(&mut taps, change);
+                            while let Ok(change) = changed.try_recv() {
+                                change_taps(&mut taps, change);
+                            }
+                            break;
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        // Let go of without being stopped.
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            ended = true;
+                            break;
+                        }
+                    }
                 }
             }
-            for tap in &taps {
-                if let Some((stream, _)) = &tap.stream {
-                    stop_capture(stream);
-                }
-                tap.channel.set_status(SourceStatus::Off);
+            for tap in &mut taps {
+                tap.stop();
             }
         });
         // Give the first scan a moment, so capture starts with the audio running.
         let _ = ready_rx.recv_timeout(Duration::from_secs(5));
-        Ok(Self { stop, thread: Some(thread) })
+        Ok(Self { stop, thread: Some(thread), changes })
+    }
+
+    /// Capture `source` too, into `feed`, while it runs: started by its
+    /// thread, at once (not waited for).
+    pub(crate) fn add(&self, source: AudioSource, feed: Arc<SourceFeed>, channel: Arc<Channel>) {
+        let _ = self.changes.send(TapChange::Add(source, feed, channel));
+    }
+
+    /// Stop capturing the source `id`, while it runs: by its thread, at
+    /// once (not waited for).
+    pub(crate) fn remove(&self, id: &str) {
+        let _ = self.changes.send(TapChange::Remove(id.to_owned()));
     }
 
     pub(crate) fn stop(mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(t) = self.thread.take() {
             let _ = t.join();
+        }
+    }
+}
+
+/// A source added or taken out, on the taps' thread: the next scan starts
+/// one added (and has the desktop leave it out, if it leaves out apps with
+/// their own source); one taken out stops now.
+fn change_taps(taps: &mut Vec<Tap>, change: TapChange) {
+    match change {
+        TapChange::Add(source, feed, channel) => {
+            // One with its id is never there already, but if it were, this
+            // one takes its place.
+            if let Some(at) = taps.iter().position(|t| t.source.id == source.id) {
+                taps.remove(at).stop();
+            }
+            let tap = Tap::new(source, feed, channel);
+            tap.say("added");
+            taps.push(tap);
+        }
+        TapChange::Remove(id) => {
+            if let Some(at) = taps.iter().position(|t| t.source.id == id) {
+                let mut tap = taps.remove(at);
+                tap.stop();
+                tap.say("taken out");
+            }
         }
     }
 }
@@ -626,7 +875,7 @@ fn sync_taps(taps: &mut [Tap]) {
     for tap in taps.iter_mut() {
         let (include, wanted): (bool, Vec<&str>) = match &tap.source.kind {
             SourceKind::App { bundle_id } => (true, vec![bundle_id.as_str()]),
-            SourceKind::Desktop { exclude_app_sources: true } => (false, app_sources.iter().map(String::as_str).collect()),
+            SourceKind::Desktop { exclude_app_sources: true, .. } => (false, app_sources.iter().map(String::as_str).collect()),
             _ => (false, Vec::new()),
         };
         let apps: Vec<Retained<SCRunningApplication>> = running
@@ -636,6 +885,15 @@ fn sync_taps(taps: &mut [Tap]) {
             .collect();
         let mut pids: Vec<i32> = apps.iter().map(|a| unsafe { a.processID() }).collect();
         pids.sort_unstable();
+        let now = Instant::now();
+        // Stopped by the system: let go of, and started again when it's due.
+        if let Some(why) = tap.stream.as_ref().and_then(|r| r.stopped.take()) {
+            tap.stream = None;
+            tap.pids = None;
+            if let Some(line) = tap.restart.failed(format!("stopped ({why}); starting it again"), now) {
+                tap.say(&line);
+            }
+        }
 
         if include && apps.is_empty() {
             // Nothing to listen to until the app opens. A stream left over from a
@@ -645,16 +903,29 @@ fn sync_taps(taps: &mut [Tap]) {
         }
         if tap.pids.as_ref() != Some(&pids) {
             match &tap.stream {
-                Some((stream, _)) => {
+                Some(running) => {
                     let filter = audio_filter(&display, &apps, include);
-                    let _ = await_completion(|h| unsafe { stream.updateContentFilter_completionHandler(&filter, Some(h)) });
+                    let _ = await_completion(|h| unsafe { running.stream.updateContentFilter_completionHandler(&filter, Some(h)) });
                 }
                 None => {
+                    if !tap.restart.due(now) {
+                        tap.channel.set_status(SourceStatus::Unavailable);
+                        continue;
+                    }
                     let output = StreamOutput::new(Arc::new(Shared { audio: Some(tap.feed.clone()) }));
-                    match make_audio_stream(&display, &apps, include, &output).and_then(|st| start_capture(&st).map(|_| st)) {
-                        Ok(stream) => tap.stream = Some((stream, output)),
+                    let stopped = Arc::new(Stopped::default());
+                    let watch = StreamWatch::new(stopped.clone());
+                    match make_audio_stream(&display, &apps, include, &output, &watch).and_then(|st| start_capture(&st).map(|_| st)) {
+                        Ok(stream) => {
+                            tap.stream = Some(Running { stream, _output: output, _watch: watch, stopped });
+                            if let Some(line) = tap.restart.started(Instant::now()) {
+                                tap.say(&line);
+                            }
+                        }
                         Err(e) => {
-                            eprintln!("audio source \"{}\": {e}", tap.source.name);
+                            if let Some(line) = tap.restart.failed(format!("{e:#}"), Instant::now()) {
+                                tap.say(&line);
+                            }
                             tap.channel.set_status(SourceStatus::Unavailable);
                             continue;
                         }
@@ -665,62 +936,6 @@ fn sync_taps(taps: &mut [Tap]) {
         }
         tap.channel.set_status(SourceStatus::Live);
     }
-}
-
-// ---------------------------------------------------------------------------
-// Pacer: constant frame rate
-// ---------------------------------------------------------------------------
-
-/// Encode the newest screen frame every 1/fps on the host clock. SCK only sends
-/// frames when the screen changes; repeating the last one keeps the output CFR.
-/// Frame N is stamped N/fps seconds after t0, the same clock the audio uses.
-///
-/// When the encoder can't keep up (a big frame at a high rate is more than
-/// the hardware does: ~60 fps at 3600×2338 on an M4 Pro), slots are skipped
-/// rather than queued: the pacer always encodes the slot that's due now, and
-/// a skipped slot shows the previous picture a little longer. Video never
-/// falls behind real time, so it stays in sync and nothing piles up.
-fn spawn_pacer(fps: u32, mut frames: Frames, encoder: Encoder, clock: Arc<Clock>) -> (Arc<AtomicBool>, JoinHandle<()>) {
-    let stop = Arc::new(AtomicBool::new(false));
-    let stop2 = stop.clone();
-    let encoder = SendBox(encoder);
-    let handle = thread::spawn(move || {
-        let encoder = encoder;
-        let fps_f = fps as f64;
-        let t0 = host_now();
-        clock.set(t0);
-        let mut next: i64 = 0;
-        let mut skipped = 0u64;
-        let mut note = |n: i64| {
-            let before = skipped;
-            skipped += n as u64;
-            // Once per doubling, so a long session doesn't flood the log.
-            if before.checked_ilog2() != skipped.checked_ilog2() {
-                eprintln!("video encoder is behind: {skipped} frames skipped so far");
-            }
-        };
-        while !stop2.load(Ordering::Relaxed) {
-            let due = ((host_now() - t0) * fps_f) as i64;
-            if next <= due {
-                // Missed slots (the encoder or the system stalled) are skipped.
-                if due > next {
-                    note(due - next);
-                }
-                if let Some(frame) = frames.next() {
-                    if !encoder.0.encode(&frame.0, due, fps) {
-                        note(1);
-                    }
-                }
-                next = due + 1;
-            }
-            let wait = t0 + next as f64 / fps_f - host_now();
-            if wait > 0.0 {
-                thread::sleep(Duration::from_secs_f64(wait));
-            }
-        }
-        encoder.0.finish();
-    });
-    (stop, handle)
 }
 
 // ---------------------------------------------------------------------------
@@ -738,28 +953,74 @@ pub(crate) struct Encoder {
     ctx: *mut EncodedSink,
 }
 
+/// How an encoder is set up.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Setup {
+    pub fps: u32,
+    pub kbps: u32,
+    /// The media engine only (else VideoToolbox's software encoder too).
+    pub hardware: bool,
+    /// For a stream (`crate::stream`): a constant bitrate and a keyframe
+    /// every two seconds, as the services ask, and its frames handed over
+    /// as the stream's own, this one of its pictures (its rendition).
+    pub stream: Option<usize>,
+}
+
 /// Where encoded frames go.
 pub(crate) struct EncodedSink {
     pub(crate) tx: Option<Sender<writer::Command>>,
     /// Catches the format description of the first frame (`probe_video_format`).
     pub(crate) probe: Option<Sender<CFRetained<objc2_core_media::CMFormatDescription>>>,
+    /// A stream's encoder: its frames are the stream's own (this one of its
+    /// pictures).
+    stream: Option<usize>,
     /// Frames handed to the encoder and not called back yet.
     in_flight: AtomicUsize,
+    /// When each frame in the encoder went in, oldest first (they come back
+    /// in order: no B-frames), and how long those back were held, for the
+    /// encode report (`crate::mac::blend`).
+    held: Mutex<Held>,
+}
+
+impl EncodedSink {
+    fn new(tx: Option<Sender<writer::Command>>, probe: Option<Sender<CFRetained<objc2_core_media::CMFormatDescription>>>, stream: Option<usize>) -> Self {
+        Self { tx, probe, stream, in_flight: AtomicUsize::new(0), held: Mutex::default() }
+    }
+
+    fn held(&self) -> std::sync::MutexGuard<'_, Held> {
+        self.held.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// How long the encoder held frames: when each in it went in, and of those
+/// back since the report last asked, altogether, the most, and how many.
+#[derive(Default)]
+struct Held {
+    since: std::collections::VecDeque<Instant>,
+    total: Duration,
+    most: Duration,
+    count: u32,
 }
 
 impl Encoder {
     pub(crate) fn new(width: usize, height: usize, s: &EncodeSettings, tx: Sender<writer::Command>) -> Result<Self> {
-        Self::with_sink(width, height, s, EncodedSink { tx: Some(tx), probe: None, in_flight: AtomicUsize::new(0) })
+        Self::with_sink(width, height, Setup::of(s), EncodedSink::new(Some(tx), None, None))
     }
 
-    fn with_sink(width: usize, height: usize, s: &EncodeSettings, sink: EncodedSink) -> Result<Self> {
+    /// One of a stream's encoders (`setup.stream`: which of its pictures):
+    /// its frames go to `tx` as the stream's own.
+    pub(crate) fn stream(width: usize, height: usize, setup: Setup, tx: Sender<writer::Command>) -> Result<Self> {
+        Self::with_sink(width, height, setup, EncodedSink::new(Some(tx), None, setup.stream))
+    }
+
+    fn with_sink(width: usize, height: usize, s: Setup, sink: EncodedSink) -> Result<Self> {
         unsafe {
-            let spec_key = if s.use_hardware {
+            let spec_key = if s.hardware {
                 kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder
             } else {
                 kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder
             };
-            let spec = CFDictionary::<CFString, CFType>::from_slices(&[spec_key], &[CFBoolean::new(s.use_hardware)]);
+            let spec = CFDictionary::<CFString, CFType>::from_slices(&[spec_key], &[CFBoolean::new(s.hardware)]);
             let ctx = Box::into_raw(Box::new(sink));
             let mut out: *mut VTCompressionSession = ptr::null_mut();
             let status = VTCompressionSession::create(
@@ -780,13 +1041,28 @@ impl Encoder {
             };
             let session = CFRetained::from_raw(session);
 
-            let gop = crate::keyframe_every(s.fps);
+            // A stream: a keyframe every two seconds (where a connection
+            // can start), as the services ask.
+            let gop = if s.stream.is_some() { s.fps.max(1) * 2 } else { crate::keyframe_every(s.fps) };
             let set = |key: &CFString, value: &CFType| VTSessionSetProperty(&session, key, Some(value));
             set(kVTCompressionPropertyKey_RealTime, CFBoolean::new(true));
             set(kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_H264_High_AutoLevel);
             // No B-frames: frames come out in order, so decode time = presentation time.
             set(kVTCompressionPropertyKey_AllowFrameReordering, CFBoolean::new(false));
-            set(kVTCompressionPropertyKey_AverageBitRate, &CFNumber::new_i64(s.video_bitrate_kbps as i64 * 1000));
+            let bitrate = s.kbps.max(100) as i64 * 1000;
+            // A stream's bitrate is constant (what the services ask for, and
+            // what a connection can be counted on to carry), where the media
+            // engine can (Apple silicon, macOS 13 on: its key by name, so an
+            // older macOS without it still starts); else its mean, with no
+            // more than that in any second.
+            let constant = s.stream.is_some() && set(&CFString::from_static_str("ConstantBitRate"), &CFNumber::new_i64(bitrate)) == 0;
+            if !constant {
+                set(kVTCompressionPropertyKey_AverageBitRate, &CFNumber::new_i64(bitrate));
+            }
+            if s.stream.is_some() && !constant {
+                let limits = CFArray::<CFNumber>::from_retained_objects(&[CFNumber::new_i64(bitrate / 8), CFNumber::new_f64(1.0)]);
+                set(kVTCompressionPropertyKey_DataRateLimits, limits.as_ref());
+            }
             set(kVTCompressionPropertyKey_ExpectedFrameRate, &CFNumber::new_i32(s.fps as i32));
             set(kVTCompressionPropertyKey_MaxKeyFrameInterval, &CFNumber::new_i32(gop as i32));
             set(kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, &CFNumber::new_f64(gop as f64 / s.fps.max(1) as f64));
@@ -805,6 +1081,7 @@ impl Encoder {
             return false;
         }
         sink.in_flight.fetch_add(1, Ordering::Relaxed);
+        sink.held().since.push_back(Instant::now());
         unsafe {
             let status = self.session.encode_frame(
                 frame,
@@ -817,7 +1094,8 @@ impl Encoder {
             if status != 0 {
                 // No callback comes for a frame refused outright.
                 sink.in_flight.fetch_sub(1, Ordering::Relaxed);
-                eprintln!("VideoToolbox encode error {status}");
+                sink.held().since.pop_back();
+                crate::eprintln_later!("VideoToolbox encode error {status}");
             }
         }
         true
@@ -827,6 +1105,20 @@ impl Encoder {
     #[allow(dead_code)]
     pub(crate) fn in_flight(&self) -> usize {
         unsafe { &*self.ctx }.in_flight.load(Ordering::Relaxed)
+    }
+
+    /// Places free in the encoder's queue before a frame is skipped.
+    pub(crate) fn free(&self) -> usize {
+        QUEUE.saturating_sub(unsafe { &*self.ctx }.in_flight.load(Ordering::Relaxed))
+    }
+
+    /// How long the encoder held the frames it gave back since this was last
+    /// asked: altogether, the most, and how many.
+    pub(crate) fn held(&self) -> (Duration, Duration, u32) {
+        let mut held = unsafe { &*self.ctx }.held();
+        let out = (held.total, held.most, held.count);
+        (held.total, held.most, held.count) = (Duration::ZERO, Duration::ZERO, 0);
+        out
     }
 
     /// Flush pending frames, then release the sink.
@@ -851,10 +1143,30 @@ unsafe extern "C-unwind" fn on_encoded(
     let Some(sink) = (unsafe { (ctx as *const EncodedSink).as_ref() }) else { return };
     // Called once per frame handed in, encoded or dropped.
     sink.in_flight.fetch_sub(1, Ordering::Relaxed);
+    {
+        let mut held = sink.held();
+        if let Some(at) = held.since.pop_front() {
+            let took = at.elapsed();
+            held.total += took;
+            held.most = held.most.max(took);
+            held.count += 1;
+        }
+    }
     let Some(sample) = (unsafe { sample.as_ref() }).filter(|_| status == 0) else { return };
     if let Some(probe) = &sink.probe {
         if let Some(fmt) = unsafe { sample.format_description() } {
             let _ = probe.send(fmt);
+        }
+        return;
+    }
+    if let Some(rendition) = sink.stream {
+        match stream_frame(sample, rendition) {
+            Ok(frame) => {
+                if let Some(tx) = &sink.tx {
+                    let _ = tx.send(writer::Command::Media(Media::Stream(frame)));
+                }
+            }
+            Err(e) => crate::eprintln_later!("stream: {e:#}"),
         }
         return;
     }
@@ -866,6 +1178,39 @@ unsafe extern "C-unwind" fn on_encoded(
     }
 }
 
+/// A frame of the stream's picture `rendition`, as VideoToolbox encoded it:
+/// its NAL units with their 4-byte lengths, and on keyframes the decoder's
+/// set-up (an `avcC` record of the SPS and PPS, which VideoToolbox keeps
+/// beside them).
+fn stream_frame(sample: &CMSampleBuffer, rendition: usize) -> Result<StreamFrame> {
+    let block = unsafe { sample.data_buffer() }.context("an encoded frame with no data")?;
+    let len = unsafe { block.data_length() };
+    let mut data = vec![0u8; len];
+    if len > 0 {
+        let status = unsafe { block.copy_data_bytes(0, len, NonNull::new(data.as_mut_ptr().cast()).context("no room for a frame")?) };
+        if status != 0 {
+            bail!("couldn't read an encoded frame (error {status})");
+        }
+    }
+    let pts = unsafe { sample.presentation_time_stamp().seconds() };
+    let key = is_keyframe(sample);
+    let avcc = match key {
+        true => {
+            let format = unsafe { sample.format_description() }.context("a keyframe with no format")?;
+            Some(Arc::from(crate::mac::export::avc_config(&format)?.record()))
+        }
+        false => None,
+    };
+    Ok(StreamFrame { rendition, data: Arc::from(data), avcc, pts, key })
+}
+
+impl Setup {
+    /// A recording's, as `s` asks.
+    fn of(s: &EncodeSettings) -> Self {
+        Self { fps: s.fps, kbps: s.video_bitrate_kbps, hardware: s.use_hardware, stream: None }
+    }
+}
+
 /// The H.264 format description our encoder settings produce, from encoding one
 /// blank frame — the writer must know each track's format before the first frame.
 pub(crate) fn probe_video_format(
@@ -874,7 +1219,7 @@ pub(crate) fn probe_video_format(
     s: &EncodeSettings,
 ) -> Result<CFRetained<objc2_core_media::CMFormatDescription>> {
     let (tx, rx) = mpsc::channel();
-    let enc = Encoder::with_sink(width, height, s, EncodedSink { tx: None, probe: Some(tx), in_flight: AtomicUsize::new(0) })?;
+    let enc = Encoder::with_sink(width, height, Setup::of(s), EncodedSink::new(None, Some(tx), None))?;
     let mut pb: *mut CVPixelBuffer = ptr::null_mut();
     let status = unsafe {
         objc2_core_video::CVPixelBufferCreate(
@@ -893,7 +1238,7 @@ pub(crate) fn probe_video_format(
     rx.recv_timeout(Duration::from_secs(5)).context("the H.264 encoder produced nothing")
 }
 
-fn is_keyframe(sample: &CMSampleBuffer) -> bool {
+pub(crate) fn is_keyframe(sample: &CMSampleBuffer) -> bool {
     unsafe {
         let Some(attachments) = sample.sample_attachments_array(false) else { return true };
         if attachments.count() == 0 {
@@ -908,12 +1253,154 @@ fn is_keyframe(sample: &CMSampleBuffer) -> bool {
 /// For `examples/vt_limits`: can the hardware encoder open at this size?
 pub(crate) fn probe_encoder(width: usize, height: usize) -> String {
     let s = EncodeSettings {
-        output_dir: std::env::temp_dir(), container_ext: "mp4".into(), fps: 60, blend_samples: 1, video_bitrate_kbps: 20000, target_height: None,
-        use_hardware: true, replay_seconds: 5, video: crate::VideoSource::Screen { id: String::new(), hook: Default::default() },
-        away_screen: None, webcam: None, sources: Vec::new(),
+        output_dir: std::env::temp_dir(), container_ext: "mp4".into(), fps: 60, blend_samples: 1, blend_shape: Default::default(), video_bitrate_kbps: 20000, size: Default::default(),
+        use_hardware: true, replay_seconds: 5, video: crate::VideoSource::Screen { id: String::new(), hook: Default::default(), method: Default::default() },
+        away_screen: None, webcam: None, layers: crate::layers::main_only(), screen: std::sync::Arc::new(std::sync::Mutex::new(crate::ScreenPlacement::whole(crate::Framing::Fit))), sources: Vec::new(),
+        stream: None,
     };
     match probe_video_format(width, height, &s) {
         Ok(_) => "ok".into(),
         Err(e) => format!("{e:#}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sources::AudioSource;
+
+    /// Clipping, going live, frame blending changed while it runs, and a
+    /// recording beside them, all from one capture: each gets what it
+    /// should (`crate::outputs::tests::everything_at_once`). Needs ffmpeg
+    /// and ffprobe on `PATH`, and Screen Recording allowed to the terminal.
+    #[test]
+    #[ignore = "captures the screen and streams it to a local server: cargo test -p capture everything_at_once -- --ignored --nocapture"]
+    fn everything_at_once() {
+        let mut rec = SckRecorder::new(Arc::new(LiveAudio::default()));
+        crate::outputs::tests::everything_at_once(&mut rec);
+    }
+
+    /// Sources added to and taken out of a running capture of desktop and
+    /// app sound are taken up at once, not at its next rescan. (An app that
+    /// doesn't run: nothing's captured. Without Screen Recording allowed it's
+    /// Unavailable rather than waiting for its app, taken up all the same.)
+    #[test]
+    fn a_running_capture_takes_sources_added_and_taken_out() {
+        let live = LiveAudio::new();
+        let channel = live.channel("app");
+        let system = SystemAudio::start(Vec::new()).unwrap();
+        let until = |done: &dyn Fn(SourceStatus) -> bool| {
+            let t = Instant::now();
+            while !done(channel.status()) && t.elapsed() < Duration::from_secs(3) {
+                thread::sleep(Duration::from_millis(5));
+            }
+            t.elapsed()
+        };
+        let app = AudioSource { id: "app".into(), name: "No such app".into(), kind: SourceKind::App { bundle_id: "io.github.hesteclips.no-such-app".into() }, in_mix: true, own_track: false };
+        system.add(app, SourceFeed::new(mixer::RATE, Arc::new(Clock::default())), channel.clone());
+        let took = until(&|s| s != SourceStatus::Off);
+        assert!(took < Duration::from_millis(500), "added: taken up after {took:?}");
+        assert_ne!(channel.status(), SourceStatus::Live, "its app doesn't run");
+        system.remove("app");
+        let took = until(&|s| s == SourceStatus::Off);
+        assert!(took < Duration::from_millis(500), "taken out: Off after {took:?}");
+        system.stop();
+    }
+
+    /// A microphone added to a running capture (started with the desktop's
+    /// sound) is captured and mixed at once, and taken out again; the clip
+    /// saved after is whole, its one track the mix. Uses the default mic,
+    /// the screen and the desktop's sound: Screen Recording and the
+    /// microphone allowed to the terminal.
+    #[test]
+    #[ignore = "captures the screen, the desktop's sound and a microphone: cargo test -p capture sources_while_capturing -- --ignored --nocapture"]
+    fn sources_while_capturing() {
+        use crate::sources::{AudioSource, SourceKind};
+        let live = LiveAudio::new();
+        let mut rec = SckRecorder::new(live.clone());
+        let mic_name = crate::audio::list_audio_devices().default_input.expect("a microphone");
+        let desktop = AudioSource { id: "desktop".into(), name: "Desktop".into(), kind: SourceKind::Desktop { exclude_app_sources: false, leave_out: Vec::new() }, in_mix: true, own_track: false };
+        let mic = AudioSource { id: "mic".into(), name: "Mic".into(), kind: SourceKind::Microphone { device: mic_name }, in_mix: true, own_track: false };
+        let screen = crate::list_screens().into_iter().next().expect("a screen");
+        let dir = std::env::temp_dir().join(format!("hc-live-sources-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let settings = EncodeSettings {
+            output_dir: dir.clone(), container_ext: "mp4".into(), fps: 30, blend_samples: 1, blend_shape: Default::default(), video_bitrate_kbps: 6000,
+            size: crate::VideoSize { short_side: Some(720), shape: None, exact: None }, use_hardware: true, replay_seconds: 10,
+            video: VideoSource::Screen { id: screen.id, hook: Default::default(), method: Default::default() },
+            away_screen: None, webcam: None, layers: crate::layers::main_only(), screen: Arc::new(Mutex::new(crate::ScreenPlacement::whole(crate::Framing::Fit))),
+            sources: vec![desktop.clone()], stream: None,
+        };
+        rec.start(Mode::ReplayBuffer, &settings).unwrap();
+        let status = |id: &str| live.channel(id).status();
+        let wait = |id: &str, want: SourceStatus| {
+            let t = Instant::now();
+            while status(id) != want {
+                assert!(t.elapsed() < Duration::from_secs(5), "{id}: {:?}, not {want:?}", status(id));
+                thread::sleep(Duration::from_millis(10));
+            }
+            t.elapsed()
+        };
+        wait("desktop", SourceStatus::Live);
+        assert!(rec.set_sources(&[desktop.clone(), mic.clone()]), "taken while capturing");
+        eprintln!("mic live {:?} after it was added", wait("mic", SourceStatus::Live));
+        // Its sound reaches the mix: a mic always hears something.
+        let _ = live.channel("mic").meter.take();
+        thread::sleep(Duration::from_millis(1500));
+        let heard = live.channel("mic").meter.take();
+        assert!(heard.max_peak() > 0.0, "the mic's sound is mixed: {heard:?}");
+        assert!(rec.set_sources(std::slice::from_ref(&desktop)));
+        eprintln!("mic off {:?} after it was taken out", wait("mic", SourceStatus::Off));
+        assert_eq!(status("desktop"), SourceStatus::Live, "the desktop's sound goes on");
+        thread::sleep(Duration::from_millis(500));
+        let clip = rec.save_clip(&dir).unwrap().finish().expect("a clip");
+        rec.stop_all();
+        let out = std::process::Command::new("ffprobe").args(["-v", "error", "-show_entries", "stream=codec_type:format=duration", "-of", "csv=p=0"]).arg(&clip).output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        eprintln!("clip: {text}");
+        assert_eq!(text.lines().filter(|l| l.starts_with("audio")).count(), 1, "one track, the mix: {text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A desktop or app sound stream that keeps failing to start is tried
+    /// again a second later, then later and later, up to every 10 s, and its
+    /// failure is said once.
+    #[test]
+    fn a_failing_start_is_tried_later_and_later_and_said_once() {
+        let t = Instant::now();
+        let at = |s: f64| t + Duration::from_secs_f64(s);
+        let mut restart = Restart::default();
+        assert!(restart.due(t), "the first try is at once");
+        assert_eq!(restart.failed("can't".into(), t).as_deref(), Some("can't"));
+        assert!(!restart.due(at(0.9)) && restart.due(at(1.0)));
+        let mut tries = Vec::new();
+        let mut now = 1.0;
+        for _ in 0..6 {
+            while !restart.due(at(now)) {
+                now += 0.25;
+            }
+            tries.push(now);
+            assert_eq!(restart.failed("can't".into(), at(now)), None, "said once");
+        }
+        let gaps: Vec<f64> = tries.windows(2).map(|w| w[1] - w[0]).collect();
+        assert_eq!(gaps, [2.0, 4.0, 8.0, 10.0, 10.0]);
+    }
+
+    /// A stream the system stops after it ran a while is started again a
+    /// second later; one stopped again soon after that waits longer.
+    #[test]
+    fn a_stream_that_ran_a_while_starts_over_at_a_second() {
+        let t = Instant::now();
+        let at = |s: f64| t + Duration::from_secs_f64(s);
+        let mut restart = Restart::default();
+        assert_eq!(restart.started(t), None, "nothing had been said");
+        assert!(restart.failed("stopped".into(), at(60.0)).is_some());
+        assert!(!restart.due(at(60.9)) && restart.due(at(61.0)), "a second after it stopped");
+        assert_eq!(restart.started(at(61.0)).as_deref(), Some("started again"));
+        // Stopped again 3 s in: said again (it had started since), and two
+        // seconds later this time.
+        assert!(restart.failed("stopped".into(), at(64.0)).is_some());
+        assert!(!restart.due(at(65.9)) && restart.due(at(66.0)));
     }
 }

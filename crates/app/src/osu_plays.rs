@@ -1,5 +1,5 @@
-//! osu!: what was played in a clip, for its name — "412pp · 98.52% FC ·
-//! +HDDT · Freedom Dive [FOUR DIMENSIONS]".
+//! osu!: what was played in a clip, for its name — "412pp 98.52% FC
+//! +HDDT Freedom Dive [FOUR DIMENSIONS]".
 //!
 //! osu! has no API of its own; tosu (or the older gosumemory) reads it and
 //! serves what it's doing on `127.0.0.1:24050`. We read tosu's v2 data, else
@@ -247,7 +247,7 @@ fn name(play: &Play, f: &GameTitles) -> String {
             }
         }
     }
-    let full = parts.join(" · ");
+    let full = parts.join(" ");
     if full.chars().count() <= MAX_TITLE {
         return full;
     }
@@ -513,7 +513,7 @@ mod tests {
             t.update(at(s), other());
         }
         let title = t.title(at(0), at(55), &fields());
-        assert_eq!(title.as_deref(), Some("412pp · 98.52% FC · +HDDT · FREEDOM DiVE [FOUR DIMENSIONS]"));
+        assert_eq!(title.as_deref(), Some("412pp 98.52% FC +HDDT FREEDOM DiVE [FOUR DIMENSIONS]"));
         // Long after, nothing of it is in the clip.
         assert_eq!(t.title(at(100), at(130), &fields()), None);
         // A minute's clip that only caught its last seconds: not the map's.
@@ -535,14 +535,14 @@ mod tests {
             t.update(at(s), playing(0.025 * (s - 5) as f64, 95.0, 1));
         }
         t.update(at(22), other());
-        assert_eq!(t.title(at(0), at(25), &fields()).as_deref(), Some("Quit at 40% · +HDDT · FREEDOM DiVE [FOUR DIMENSIONS]"));
+        assert_eq!(t.title(at(0), at(25), &fields()).as_deref(), Some("Quit at 40% +HDDT FREEDOM DiVE [FOUR DIMENSIONS]"));
         // A fail.
         let mut failing = playing(0.64, 80.0, 30).unwrap();
         failing.failed = true;
         t.update(at(30), playing(0.6, 80.0, 30));
         t.update(at(40), Some(failing));
         t.update(at(42), other());
-        assert_eq!(t.title(at(29), at(45), &fields()).as_deref(), Some("Failed at 64% · +HDDT · FREEDOM DiVE [FOUR DIMENSIONS]"));
+        assert_eq!(t.title(at(29), at(45), &fields()).as_deref(), Some("Failed at 64% +HDDT FREEDOM DiVE [FOUR DIMENSIONS]"));
     }
 
     #[test]
@@ -552,7 +552,7 @@ mod tests {
         t.update(t0, playing(0.1, 99.1, 0));
         t.update(t0 + Duration::from_secs(5), playing(0.2, 98.93, 0));
         let f = GameTitles { osu_mods: false, osu_stars: true, osu_artist: true, ..GameTitles::default() };
-        assert_eq!(t.title(t0, t0 + Duration::from_secs(5), &f).as_deref(), Some("98.93% · 500x · 7.83★ · xi - FREEDOM DiVE [FOUR DIMENSIONS]"));
+        assert_eq!(t.title(t0, t0 + Duration::from_secs(5), &f).as_deref(), Some("98.93% 500x 7.83★ xi - FREEDOM DiVE [FOUR DIMENSIONS]"));
     }
 
     #[test]
@@ -571,7 +571,7 @@ mod tests {
             on_results: false,
         };
         let title = name(&play, &fields());
-        assert!(title.starts_with("350pp · 3 misses · 97.10% · aaa"), "{title}");
+        assert!(title.starts_with("350pp 3 misses 97.10% aaa"), "{title}");
         assert_eq!(title.chars().count(), MAX_TITLE);
         assert!(title.ends_with('…'));
     }
@@ -580,14 +580,14 @@ mod tests {
     #[test]
     fn parts_in_the_chosen_order() {
         use crate::settings::OsuPart;
-        assert_eq!(example(&GameTitles::default()), "412pp · 3 misses · 97.10% · +HDDT · FREEDOM DiVE [FOUR DIMENSIONS]");
+        assert_eq!(example(&GameTitles::default()), "412pp 3 misses 97.10% +HDDT FREEDOM DiVE [FOUR DIMENSIONS]");
         let f = GameTitles {
             osu_order: vec![OsuPart::Map, OsuPart::Accuracy, OsuPart::Pp],
             osu_misses: false,
             osu_mods: false,
             ..GameTitles::default()
         };
-        assert_eq!(example(&f), "FREEDOM DiVE [FOUR DIMENSIONS] · 97.10% · 412pp");
+        assert_eq!(example(&f), "FREEDOM DiVE [FOUR DIMENSIONS] 97.10% 412pp");
     }
 
     #[test]

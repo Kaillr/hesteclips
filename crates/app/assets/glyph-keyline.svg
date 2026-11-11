@@ -1,7 +1,9 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="204.95 213.2 560 560">
-  <!-- Windows icon: icon.svg without the macOS plate, cropped to the glyph.
-       The black knockout strokes become an outline that keeps the white glyph
-       visible on light backgrounds. -->
+  <!-- The glyph with a keyline: icon-mac.svg without the macOS plate, cropped
+       to it, its black knockout strokes left in as a dark edge that keeps the
+       white glyph clear of a light bar. For small sizes only (the tray, and
+       the app icon at 32 px and below, see scripts/icons.sh): there it's a
+       pixel or less; bigger, it's a heavy outline. -->
   <!-- Glyph (horse + clapperboard) at 66% of the plate width, optically centred:
        its mass sits right/low, so it's nudged up-left. Clapper stripes removed so
        the sticks read as solid shapes; the gaps between horse, sticks and board are

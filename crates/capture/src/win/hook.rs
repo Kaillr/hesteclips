@@ -36,7 +36,7 @@ use windows::Win32::UI::WindowsAndMessaging::{GA_ROOT, GetAncestor, GetWindowThr
 use windows::core::PCWSTR;
 
 use super::d3d::{Gpu, Latest};
-use super::quad::{Placement, Quad};
+use super::quad::{Placement, Quad, fit_within};
 
 /// The hook's files, next to the app (`game-hook\`), or in `target\game-hook`
 /// for a development build (`scripts/fetch-game-hook.ps1`).
@@ -65,7 +65,8 @@ const NEEDS_HOOK: &[&str] = &["osu!.exe", "GeometryDash.exe"];
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Plan {
     Hook,
-    /// Windows' capture, switching to the hook if its picture freezes.
+    /// Windows' capture (or Desktop Duplication), switching to the hook if
+    /// the game's pictures stop reaching it.
     Watch,
     Wgc,
 }
@@ -74,7 +75,7 @@ pub(crate) enum Plan {
 /// log.
 pub(crate) fn plan(exe: &str, window: HWND, settings: &crate::GameHook) -> (Plan, String) {
     if !available() {
-        return (Plan::Wgc, "the hook's files aren't there".into());
+        return (Plan::Wgc, "the hook's files aren't there; a build of your own gets them with scripts/fetch-game-hook.ps1".into());
     }
     // For testing: `HESTECLIPS_FORCE_HOOK=<exe>[,…]` hooks those whatever they are.
     if std::env::var("HESTECLIPS_FORCE_HOOK").is_ok_and(|v| v.split(',').any(|e| e.eq_ignore_ascii_case(exe))) {
@@ -403,17 +404,22 @@ fn run(dir: &Path, gpu: &Gpu, window: HWND, latest: &Arc<Latest>, fps: u32, stop
         (*hook_info).frame_interval = 1_000_000_000 / (4 * fps.max(1) as u64);
     }
     let event = |name: &str| open_event(&format!("{name}{pid}")).with_context(|| format!("the hook has no {name} event"));
-    let (hook_stop, hook_init, hook_ready, hook_exit) = (event("CaptureHook_Stop")?, event("CaptureHook_Initialize")?, event("CaptureHook_HookReady")?, event("CaptureHook_Exit")?);
+    let (hook_stop, hook_init, hook_exit) = (event("CaptureHook_Stop")?, event("CaptureHook_Initialize")?, event("CaptureHook_Exit")?);
     unsafe { SetEvent(hook_init.0) }?;
 
+    // Which of the hook's pictures was opened last (see `picture_number`),
+    // and a newer one seen on the look before: opened a look after it shows
+    // up, by when the hook has said how big it is (it says that after).
+    let mut opened = picture_number(hook_info);
+    let mut noticed = None;
     // Already capturing for someone else (a preview closing as a recording
-    // starts): its picture, until the hook says there's a new one.
-    let mut source: Option<Source> = if unsafe { (*hook_info).hook_ver_major } != 0 { Source::open(gpu, unsafe { &*hook_info }, window).ok() } else { None };
+    // starts, or OBS): its picture, until the hook starts over.
+    let mut source: Option<Source> = opened.and_then(|_| Source::open(gpu, unsafe { &*hook_info }, window).ok());
     if let Some(s) = &source {
         eprintln!("game hook: capturing {}×{} ({}), already running", s.cx, s.cy, s.kind());
     }
-    // Nothing yet a few seconds in: the other one may have taken the hook's
-    // "ready" signal. Asking it to stop makes it start over, and signal again.
+    // Nothing yet a few seconds in (a hook that stopped capturing, and
+    // wasn't asked to start again): asking it to stop makes it start over.
     let mut nudged = false;
     let quad = Quad::new(gpu)?;
     let target = super::quad::target_view(gpu, &latest.texture)?;
@@ -431,9 +437,11 @@ fn run(dir: &Path, gpu: &Gpu, window: HWND, latest: &Arc<Latest>, fps: u32, stop
         if !super::system::window_alive(window) {
             break Ok(());
         }
-        // A new picture to copy from: the first, or after the game resized
-        // or reset its graphics.
-        if hook_ready.signalled() {
+        // A new picture to copy from: the first, or the hook started over
+        // (the game resized or reset its graphics, or a capturer asked).
+        let number = picture_number(hook_info).filter(|n| opened != Some(*n));
+        if number.is_some() && number == noticed {
+            opened = number;
             source = None;
             match Source::open(gpu, unsafe { &*hook_info }, window) {
                 Ok(s) => {
@@ -449,6 +457,8 @@ fn run(dir: &Path, gpu: &Gpu, window: HWND, latest: &Arc<Latest>, fps: u32, stop
                 }
                 Err(e) => break Err(e),
             }
+        } else if let Some(n) = number {
+            noticed = Some(n);
         } else if source.is_none() {
             if Instant::now() > deadline {
                 break Err(anyhow::anyhow!("the hook loaded but sent no picture (is the game drawing?)"));
@@ -463,31 +473,34 @@ fn run(dir: &Path, gpu: &Gpu, window: HWND, latest: &Arc<Latest>, fps: u32, stop
         if let Some(s) = source.as_ref().filter(|_| !super::system::window_hidden(window)) {
             // Into a slot of its own: whether it's new is known a few
             // milliseconds on (`Changes`), and the picture is kept till then.
-            let (i, picture, slot_target) = changes.slot();
-            let mut at = windows::Win32::Foundation::POINT::default();
-            let _ = unsafe { windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut at) };
-            match &s.signature_view {
-                // Copied only if it changed.
-                Some(view) => {
-                    let mut failed = None;
-                    changes.read(gpu, &quad, i, view, (s.cx, s.cy), (at.x, at.y), &mut || {
-                        s.copy(gpu, &quad, &slot_target, &picture, &mutexes).unwrap_or_else(|e| {
-                            failed = Some(e);
-                            None
-                        })
-                    });
-                    if let Some(e) = failed {
-                        eprintln!("game hook: {e:#}");
+            // None: every slot is still waiting on a comparison (the graphics
+            // card is behind), so this look is skipped, not its pictures.
+            if let Some((i, picture, slot_target)) = changes.slot(gpu) {
+                let mut at = windows::Win32::Foundation::POINT::default();
+                let _ = unsafe { windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut at) };
+                match &s.signature_view {
+                    // Copied only if it changed.
+                    Some(view) => {
+                        let mut failed = None;
+                        changes.read(gpu, &quad, i, view, (s.cx, s.cy), (at.x, at.y), &mut || {
+                            s.copy(gpu, &quad, &slot_target, &picture, &mutexes).unwrap_or_else(|e| {
+                                failed = Some(e);
+                                None
+                            })
+                        });
+                        if let Some(e) = failed {
+                            eprintln!("game hook: {e:#}");
+                        }
                     }
+                    None => match s.copy(gpu, &quad, &slot_target, &picture, &mutexes) {
+                        Ok(Some(size)) => {
+                            changes.submit(gpu, &quad, i, size, (at.x, at.y));
+                            unsafe { gpu.context.Flush() };
+                        }
+                        Ok(None) => {}
+                        Err(e) => eprintln!("game hook: {e:#}"),
+                    },
                 }
-                None => match s.copy(gpu, &quad, &slot_target, &picture, &mutexes) {
-                    Ok(Some(size)) => {
-                        changes.submit(gpu, &quad, i, size, (at.x, at.y));
-                        unsafe { gpu.context.Flush() };
-                    }
-                    Ok(None) => {}
-                    Err(e) => eprintln!("game hook: {e:#}"),
-                },
             }
         }
         // What's new goes up, with the cursor drawn on it.
@@ -500,9 +513,25 @@ fn run(dir: &Path, gpu: &Gpu, window: HWND, latest: &Arc<Latest>, fps: u32, stop
             next = now;
         }
     };
-    let _ = unsafe { SetEvent(hook_stop.0) };
+    // Stopped, unless something else still keeps it capturing (OBS, or our
+    // capture taking over from this one): stopping makes it start over, and
+    // that one's picture would stop meanwhile.
     drop(keepalive);
+    if open_mutex(&format!("CaptureHook_KeepAlive{pid}")).is_none() {
+        let _ = unsafe { SetEvent(hook_stop.0) };
+    }
     result
+}
+
+/// The number of the picture the hook copies the game's into, once it has
+/// one: it goes up each time the hook starts over. Told by the hook's info,
+/// not its "ready" signal: only one capturer gets that, and with another one
+/// capturing the game too (OBS, or another HesteClips), this one waited for a
+/// picture that never came, and the recording stayed frozen (issue #11).
+fn picture_number(info: *const HookInfo) -> Option<u32> {
+    // Written by the hook, in the game's process, at any time.
+    let (major, number) = unsafe { ((&raw const (*info).hook_ver_major).read_volatile(), (&raw const (*info).map_id).read_volatile()) };
+    (major != 0).then_some(number)
 }
 
 /// How often to look at the hook's copy of the game's picture, for `fps`
@@ -621,21 +650,13 @@ impl Source {
                     dest: [0.0, 0.0, w as f32, h as f32],
                     uv: if self.flip { [0.0, 1.0, 1.0, 0.0] } else { [0.0, 0.0, 1.0, 1.0] },
                     clip: RECT { left: 0, top: 0, right: w as i32, bottom: h as i32 },
+                    turns: 0,
                 };
                 quad.draw(gpu, target, (latest.width, latest.height), &view, &at, true);
             }
         }
         Ok(Some((w, h)))
     }
-}
-
-/// `w`×`h` shrunk (keeping its shape) to fit in `max_w`×`max_h`, if it's bigger.
-fn fit_within(w: u32, h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
-    if w <= max_w && h <= max_h {
-        return (w, h);
-    }
-    let scale = (max_w as f64 / w as f64).min(max_h as f64 / h as f64);
-    (((w as f64 * scale) as u32).max(2) & !1, ((h as f64 * scale) as u32).max(2) & !1)
 }
 
 /// The hook's log, which it writes to a pipe named after the game's process:
@@ -741,11 +762,5 @@ mod tests {
         assert_eq!(std::mem::offset_of!(HookInfo, frame_interval), 56);
         assert_eq!(std::mem::offset_of!(HookInfo, offsets), 68);
         assert_eq!(std::mem::size_of::<GraphicsOffsets>(), 76);
-    }
-
-    #[test]
-    fn fits() {
-        assert_eq!(fit_within(1920, 1080, 2560, 1440), (1920, 1080));
-        assert_eq!(fit_within(3840, 2160, 1920, 1080), (1920, 1080));
     }
 }

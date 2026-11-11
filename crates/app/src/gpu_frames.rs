@@ -30,6 +30,11 @@
 //! Needs wgpu on the platform's backend (DX12 is asked for at startup on
 //! Windows; macOS only has Metal) and, on Windows, the decoder on the same
 //! graphics card; otherwise frames come back as RGBA as before.
+//!
+//! - **Linux** (and wherever ffmpeg decodes instead): ffmpeg's NV12 frames,
+//!   at the video's own size, uploaded into textures (`upload`); decoded on
+//!   the card where it can, into buffers of the renderer's, which the card
+//!   copies into those textures.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -46,6 +51,10 @@ pub use dx12::{Frames, share_luid};
 mod metal;
 #[cfg(target_os = "macos")]
 pub use metal::{Frames, available};
+mod upload;
+#[cfg(target_os = "linux")]
+pub use upload::{Frames, Ring, card};
+pub use upload::{Uploads, can_upload};
 
 static RENDER: OnceLock<RenderState> = OnceLock::new();
 
@@ -112,9 +121,17 @@ impl Planes {
 }
 
 impl Shown {
-    /// Draw it into `rect` (with the high-quality filter).
-    pub fn paint(&self, ui: &egui::Ui, rect: egui::Rect) {
-        ui.painter().add(egui_wgpu::Callback::new_paint_callback(rect, Draw(self.clone(), rect)));
+    /// Its size in pixels.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn size(&self) -> (u32, u32) {
+        let s = self.planes.views()[0].texture().size();
+        (s.width, s.height)
+    }
+
+    /// Draw it into `rect` (with the high-quality filter), cut to
+    /// `painter`'s clip.
+    pub fn paint(&self, painter: &egui::Painter, rect: egui::Rect) {
+        painter.add(egui_wgpu::Callback::new_paint_callback(rect, Draw(self.clone(), rect)));
     }
 
     /// Its colours, blurred very wide, over `cover` (clipped to `painter`'s
@@ -135,6 +152,18 @@ impl Shown {
         }
         RowsKey { place, planes, kind: self.planes.kind() }
     }
+}
+
+/// Out of sight nothing is drawn, so nothing submits work to the graphics
+/// card, and nothing has the renderer let go of what drawing was done with:
+/// what a decoder closed meanwhile held may wait for that to be freed (a
+/// paused clip let go of while minimized measured 2 GB still held). Done
+/// here as a frame would: an empty submission, waited for (at most 50 ms),
+/// and the renderer polled.
+pub fn settle() {
+    let Some(rs) = RENDER.get() else { return };
+    let index = rs.queue.submit(std::iter::empty());
+    let _ = rs.device.poll(wgpu::PollType::Wait { submission_index: Some(index), timeout: Some(std::time::Duration::from_millis(50)) });
 }
 
 /// Forget a player's bind groups (its frames' pools) so their textures are
@@ -1089,7 +1118,9 @@ mod tests {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor { backends: wgpu::Backends::METAL, ..wgpu::InstanceDescriptor::new_without_display_handle() });
         let adapter = pollster::block_on(instance.request_adapter(&Default::default())).expect("adapter");
         let (device, _queue) = pollster::block_on(adapter.request_device(&Default::default())).expect("device");
-        let preview = capture::preview::VideoPreview::start(&capture::VideoSource::Screen { id: String::new(), hook: Default::default() }, Some(720), 30, None, None);
+        let whole = std::sync::Arc::new(std::sync::Mutex::new(capture::ScreenPlacement::whole(capture::Framing::Fit)));
+        let size = capture::VideoSize { short_side: Some(720), ..Default::default() };
+        let preview = capture::preview::VideoPreview::start(&capture::VideoSource::Screen { id: String::new(), hook: Default::default(), method: Default::default() }, size, 30, None, None, capture::layers::main_only(), whole);
         let frame = (0..100)
             .find_map(|_| {
                 capture::preview::request();
@@ -1148,6 +1179,113 @@ mod tests {
             assert!(mean < 1.5, "mean difference {mean}");
             assert!(bias.iter().all(|b| b.abs() < 0.75), "colour shifted: {bias:?}");
         }
+    }
+
+    /// A frame ffmpeg decoded to NV12, uploaded and drawn by the real filter,
+    /// matches ffmpeg's own conversion of it: at 1:1 and shrunk (Lanczos both).
+    /// `cargo test -p hesteclips uploaded -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs a graphics card"]
+    fn uploaded_nv12_matches_ffmpeg() {
+        let dir = std::env::temp_dir().join(format!("hc-upload-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("clip.mp4");
+        let (w, h) = (1280u32, 720u32);
+        let made = media::ffmpeg()
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i", &format!("testsrc2=s={w}x{h}:r=30:d=2")])
+            .args(["-vf", "scale=out_color_matrix=bt709:out_range=tv,format=yuv420p", "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"])
+            .args(["-color_range", "tv", "-c:v", "libx264", "-crf", "12"])
+            .arg(&clip)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let info = media::probe(&clip).unwrap();
+        assert!(!info.bt601);
+        let t = 1.0;
+        let nv12 = media::nv12_at(&clip, t, (w, h)).unwrap();
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter = pollster::block_on(instance.request_adapter(&Default::default())).expect("adapter");
+        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).expect("device");
+        let (y, cbcr) = upload::upload_for_test(&device, &queue, w, h, &nv12);
+        let shown = Shown { key: (0, 0), planes: Planes::Nv12 { y, cbcr, bt601: false } };
+        for out_w in [w, 854] {
+            let out_h = ((out_w as f64 * h as f64 / w as f64 / 2.0).round() as u32) * 2;
+            let ours = render(&device, &queue, &shown, (out_w, out_h), wgpu::TextureFormat::Rgba8Unorm);
+            let ff = media::ffmpeg()
+                .args(["-v", "error", "-ss", &format!("{t:.4}"), "-i"])
+                .arg(&clip)
+                .args(["-vf", &format!("scale={out_w}:{out_h}:flags=lanczos+accurate_rnd+full_chroma_int:in_color_matrix=bt709:out_range=full,format=rgba"), "-frames:v", "1", "-f", "rawvideo", "-"])
+                .output()
+                .unwrap()
+                .stdout;
+            assert_eq!(ff.len(), ours.len());
+            let diffs: Vec<u32> = ours.iter().zip(&ff).enumerate().filter(|(i, _)| i % 4 != 3).map(|(_, (a, b))| (*a as i32 - *b as i32).unsigned_abs()).collect();
+            let mean = diffs.iter().sum::<u32>() as f64 / diffs.len() as f64;
+            let bias: Vec<f64> = (0..3).map(|c| ours.iter().skip(c).step_by(4).zip(ff.iter().skip(c).step_by(4)).map(|(a, b)| *a as f64 - *b as f64).sum::<f64>() / (ours.len() / 4) as f64).collect();
+            println!("{out_w}x{out_h}: mean |diff| {mean:.2}, bias r/g/b {:.2} {:.2} {:.2}", bias[0], bias[1], bias[2]);
+            assert!(mean < 1.5, "mean difference {mean}");
+            assert!(bias.iter().all(|b| b.abs() < 0.75), "colour shifted: {bias:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A frame decoded on the card into the renderer's memory, copied
+    /// into textures as the player does and drawn by the real filter,
+    /// matches ffmpeg's own conversion of it: at 1:1 and shrunk (Lanczos
+    /// both). A height that isn't a whole number of macroblocks (1080).
+    /// `cargo test -p hesteclips card_frame -- --ignored --nocapture`
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs a card that decodes (HESTECLIPS_DECODE=vaapi for VA-API)"]
+    fn card_frame_matches_ffmpeg() {
+        let dir = std::env::temp_dir().join(format!("hc-card-frame-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("clip.mp4");
+        let (w, h) = (1920u32, 1080u32);
+        let made = media::ffmpeg()
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i", &format!("testsrc2=s={w}x{h}:r=30:d=2")])
+            .args(["-vf", "scale=out_color_matrix=bt709:out_range=tv,format=yuv420p", "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"])
+            .args(["-color_range", "tv", "-c:v", "libx264", "-crf", "12"])
+            .arg(&clip)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor { backends: wgpu::Backends::VULKAN, ..wgpu::InstanceDescriptor::new_without_display_handle() });
+        let adapter = pollster::block_on(instance.request_adapter(&Default::default())).expect("adapter");
+        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).expect("device");
+        let card = match capture::decode::Card::new(&device, &queue) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("skipped: {e:#}");
+                return;
+            }
+        };
+        let mut dec = capture::decode::Decoder::open_card(&clip, &card).unwrap();
+        dec.set_fps(30.0);
+        let n = 30u64;
+        let pic = dec.frame(n).unwrap().unwrap();
+        let capture::decode::Nv12::Card(f) = &pic.gpu.as_ref().unwrap().nv12 else { panic!("not on the card") };
+        let (y, cbcr) = upload::card_for_test(&device, &queue, w, h, f);
+        let shown = Shown { key: (0, 0), planes: Planes::Nv12 { y, cbcr, bt601: false } };
+        for out_w in [w, 1280] {
+            let out_h = ((out_w as f64 * h as f64 / w as f64 / 2.0).round() as u32) * 2;
+            let ours = render(&device, &queue, &shown, (out_w, out_h), wgpu::TextureFormat::Rgba8Unorm);
+            let ff = media::ffmpeg()
+                .args(["-v", "error", "-i"])
+                .arg(&clip)
+                .args(["-vf", &format!("select=eq(n\\,{n}),scale={out_w}:{out_h}:flags=lanczos+accurate_rnd+full_chroma_int:in_color_matrix=bt709:out_range=full,format=rgba"), "-frames:v", "1", "-f", "rawvideo", "-"])
+                .output()
+                .unwrap()
+                .stdout;
+            assert_eq!(ff.len(), ours.len());
+            let diffs: Vec<u32> = ours.iter().zip(&ff).enumerate().filter(|(i, _)| i % 4 != 3).map(|(_, (a, b))| (*a as i32 - *b as i32).unsigned_abs()).collect();
+            let mean = diffs.iter().sum::<u32>() as f64 / diffs.len() as f64;
+            let bias: Vec<f64> = (0..3).map(|c| ours.iter().skip(c).step_by(4).zip(ff.iter().skip(c).step_by(4)).map(|(a, b)| *a as f64 - *b as f64).sum::<f64>() / (ours.len() / 4) as f64).collect();
+            println!("{out_w}x{out_h}: mean |diff| {mean:.2}, bias r/g/b {:.2} {:.2} {:.2}", bias[0], bias[1], bias[2]);
+            assert!(mean < 1.5, "mean difference {mean}");
+            assert!(bias.iter().all(|b| b.abs() < 0.75), "colour shifted: {bias:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The stage's light, as the app makes it: `frames` taken in one after

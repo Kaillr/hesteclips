@@ -12,7 +12,9 @@
 //! Producers overlap for a moment when one takes over from another (a stopping
 //! recording still finishing as the preview capture starts), so each has a
 //! generation and only the newest may publish: the picture never flips back to
-//! what the old one shows.
+//! what the old one shows. One can also start over another that keeps
+//! running (all of the screen, to crop on, while clipping): once it stops, the
+//! one under it is shown again.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -29,7 +31,7 @@ pub struct PreviewFrame {
     pub width: u32,
     pub height: u32,
     /// The size being recorded: the picture's own, except on Linux and
-    /// Windows, where it's shrunk to about the size it's shown at.
+    /// Windows past 1440p (a 4K recording's is shrunk to 1440p).
     pub recorded: (u32, u32),
     pub rgba: Vec<u8>,
     #[cfg(target_os = "macos")]
@@ -43,13 +45,20 @@ pub struct PreviewFrame {
     pub app: Option<String>,
 }
 
-static LATEST: Mutex<Option<Arc<PreviewFrame>>> = Mutex::new(None);
+/// The newest frame, and the producers running, oldest first: only the
+/// newest one's frames are shown.
+static SHOWN: Mutex<Shown> = Mutex::new(Shown { frame: None, producers: Vec::new() });
 static SEQ: AtomicU64 = AtomicU64::new(0);
 static REQUESTED: Mutex<Option<Instant>> = Mutex::new(None);
 /// The newest frame has been taken by the UI: time for another.
 static TAKEN: AtomicBool = AtomicBool::new(true);
-/// The newest producer; older ones' frames are dropped.
+/// The last generation handed out.
 static GENERATION: AtomicU64 = AtomicU64::new(0);
+
+struct Shown {
+    frame: Option<Arc<PreviewFrame>>,
+    producers: Vec<u64>,
+}
 
 /// Ask for preview frames. Call every UI frame while the preview is on screen;
 /// producers stop shortly after the calls stop.
@@ -61,7 +70,7 @@ pub fn request() {
 /// made.
 pub fn latest() -> Option<Arc<PreviewFrame>> {
     TAKEN.store(true, Ordering::Release);
-    LATEST.lock().unwrap().clone()
+    SHOWN.lock().unwrap().frame.clone()
 }
 
 /// Whether to make a frame now: someone looked at the preview recently, and
@@ -73,11 +82,13 @@ pub(crate) fn wants_frame() -> bool {
 
 #[cfg_attr(not(any(target_os = "windows", target_os = "macos", target_os = "linux")), allow(dead_code))]
 /// Register a new producer, which from now on is the only one whose frames are
-/// shown. Returns its generation.
+/// shown, until it stops ([`clear`]). Returns its generation.
 #[cfg_attr(not(any(target_os = "windows", target_os = "macos", target_os = "linux")), allow(dead_code))]
 pub(crate) fn new_producer() -> u64 {
     let generation = GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
-    *LATEST.lock().unwrap() = None; // the old picture isn't what's captured anymore
+    let mut shown = SHOWN.lock().unwrap();
+    shown.producers.push(generation);
+    shown.frame = None; // the old picture isn't what's captured anymore
     TAKEN.store(true, Ordering::Release);
     generation
 }
@@ -106,21 +117,25 @@ pub(crate) fn publish(generation: u64, (width, height): (u32, u32), recorded: (u
 pub(crate) fn publish_frame(generation: u64, mut frame: PreviewFrame) -> Arc<PreviewFrame> {
     frame.seq = SEQ.fetch_add(1, Ordering::Relaxed) + 1;
     let frame = Arc::new(frame);
-    let mut latest = LATEST.lock().unwrap();
-    if GENERATION.load(Ordering::Acquire) == generation {
+    let mut shown = SHOWN.lock().unwrap();
+    if shown.producers.last() == Some(&generation) {
         TAKEN.store(false, Ordering::Release);
-        *latest = Some(frame.clone());
+        shown.frame = Some(frame.clone());
     }
     frame
 }
 
 /// A producer stopped: forget its last frame, unless a newer one took over.
+/// One that started before it and runs on is shown again (from its next
+/// frame).
 #[cfg_attr(not(any(target_os = "windows", target_os = "macos", target_os = "linux")), allow(dead_code))]
 pub(crate) fn clear(generation: u64) {
-    let mut latest = LATEST.lock().unwrap();
-    if GENERATION.load(Ordering::Acquire) == generation {
-        *latest = None;
+    let mut shown = SHOWN.lock().unwrap();
+    if shown.producers.last() == Some(&generation) {
+        shown.frame = None;
+        TAKEN.store(true, Ordering::Release);
     }
+    shown.producers.retain(|g| *g != generation);
 }
 
 /// A capture made only for the preview, for while nothing records: what a
@@ -138,45 +153,49 @@ pub struct VideoPreview {
 }
 
 impl VideoPreview {
-    /// `target_height`, `fps`, `away_screen` and `webcam` as in
+    /// `size`, `fps`, `away_screen`, `webcam`, `layers` and `screen` as in
     /// [`crate::EncodeSettings`].
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         source: &VideoSource,
-        target_height: Option<u32>,
+        size: crate::VideoSize,
         fps: u32,
         away_screen: Option<std::sync::Arc<crate::StillImage>>,
         webcam: Option<crate::webcam::Webcam>,
+        layers: crate::SharedLayers,
+        screen: crate::SharedScreen,
     ) -> Self {
         #[cfg(target_os = "windows")]
         {
-            Self { inner: crate::win::PreviewCapture::start(source.clone(), target_height, fps, away_screen, webcam) }
+            let _ = webcam;
+            Self { inner: crate::win::PreviewCapture::start(source.clone(), size, fps, away_screen, layers, screen) }
         }
         #[cfg(target_os = "macos")]
         {
-            Self { inner: crate::mac::preview::PreviewCapture::start(source.clone(), target_height, fps, away_screen, webcam) }
+            let _ = webcam;
+            Self { inner: crate::mac::preview::PreviewCapture::start(source.clone(), size, fps, away_screen, layers, screen) }
         }
-        // No away screen: it's for games and apps, which Linux doesn't record.
         #[cfg(target_os = "linux")]
         {
-            let _ = away_screen;
-            Self { inner: crate::linux::PreviewCapture::start(source.clone(), target_height, fps, webcam) }
+            let _ = webcam;
+            Self { inner: crate::linux::PreviewCapture::start(source.clone(), size, fps, away_screen, layers, screen) }
         }
         #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
         {
-            let _ = (source, target_height, fps, away_screen, webcam);
+            let _ = (source, size, fps, away_screen, webcam, layers, screen);
             Self {}
         }
     }
 
     /// Change what the preview shows without restarting it, if the change
-    /// allows (a different list of games and apps). Returns whether it did.
+    /// allows (a different list of games and apps; on Linux, anything it
+    /// shows). Returns whether it did.
     pub fn update(&self, source: &VideoSource) -> bool {
-        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
         {
             self.inner.update(source)
         }
-        // Only the screen: nothing changes without a restart.
-        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
         {
             let _ = source;
             false
